@@ -967,6 +967,7 @@ pub(super) struct PlannedArrowExpression {
     callable: SourceCallablePlan,
     parameter_initializers: Vec<PlannedParameterInitializer>,
     expression_statement: Option<PlannedArrowExpressionStatement>,
+    loop_body: Option<Box<PlannedLoopFunctionStatements>>,
     body: PlannedArrowBody,
 }
 
@@ -8073,7 +8074,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             ));
                         }
                         let index = locals.len();
-                        locals.push(self.finish_local_declaration(local)?);
+                        let variable = self.finish_local_declaration(local)?;
+                        if variable.binding == VariableBindingKind::Let
+                            && !self.assignable_mutable_variables.insert(variable.symbol)
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolShape(variable.symbol),
+                            ));
+                        }
+                        locals.push(variable);
                         statements.push(PlannedLoopFunctionStatement::Local(index));
                     }
                     SourceLoopFunctionStatementSyntax::Expression { expression, .. } => {
@@ -12911,12 +12920,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
         } else {
             let container_record = self.node(container)?;
-            let NodeData::FunctionDeclaration(function) = &container_record.data else {
-                return Ok(false);
+            let body = match &container_record.data {
+                NodeData::FunctionDeclaration(function)
+                    if container_record.kind == SyntaxKind::FunctionDeclaration =>
+                {
+                    function.body
+                }
+                NodeData::FunctionExpression(function)
+                    if container_record.kind == SyntaxKind::FunctionExpression =>
+                {
+                    Some(function.body)
+                }
+                _ => return Ok(false),
             };
-            if container_record.kind != SyntaxKind::FunctionDeclaration
-                || function.body != iteration_record.parent
-            {
+            if body != iteration_record.parent {
                 return Ok(false);
             }
         }
@@ -13299,6 +13316,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 callable,
                 parameter_initializers,
                 expression_statement,
+                loop_body: None,
                 body,
             })
         })();
@@ -13466,9 +13484,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
 
         let statements = body.statements.nodes.clone();
+        let mut loop_body = None;
         let body = match statements.as_slice() {
             [] => PlannedArrowBody::Empty,
-            [statement] => {
+            [statement]
+                if self.node(self.reference(*statement))?.kind == SyntaxKind::ReturnStatement =>
+            {
                 let statement = self.reference(*statement);
                 let statement_record = self.node(statement)?;
                 let NodeData::ReturnStatement(return_statement) = &statement_record.data else {
@@ -13497,7 +13518,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                 }
             }
-            _ => return Err(unsupported()),
+            _ => {
+                let syntax = plan_source_loop_function_statements_syntax(
+                    self.arena, self.bound, store, &callable,
+                )
+                .map_err(|error| match error {
+                    SourceFunctionStatementsError::Unsupported(_) => unsupported(),
+                    error => Self::function_statements_plan_error(&callable, error),
+                })?;
+                loop_body = Some(Box::new(
+                    self.finish_loop_function_statements(&callable, syntax)?,
+                ));
+                PlannedArrowBody::Empty
+            }
         };
 
         Ok(PlannedExpression::new(
@@ -13506,6 +13539,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 callable,
                 parameter_initializers: Vec::new(),
                 expression_statement: None,
+                loop_body,
                 body,
             })),
         ))
@@ -15115,7 +15149,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 | SyntaxKind::QuestionQuestionToken
         );
         let comma = operator_kind == SyntaxKind::CommaToken;
-        let Some(operator_text) = binary_operator_text(operator_kind) else {
+        let assignment = operator_kind == SyntaxKind::EqualsToken
+            && self.is_immediately_invoked_closure_assignment(expression)?;
+        let Some(operator_text) = (if assignment {
+            Some("=")
+        } else {
+            binary_operator_text(operator_kind)
+        }) else {
             return Err(self.unsupported(
                 operator,
                 operator_kind,
@@ -15152,11 +15192,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
 
         let mut left_plan = self.plan_expression(left)?;
-        if !logical && !comma && !primitive_binary_operand_plan_is_supported(&left_plan) {
+        if !logical
+            && !comma
+            && !assignment
+            && !primitive_binary_operand_plan_is_supported(&left_plan)
+        {
             return Err(self.unsupported(left, left_kind, SourceSyntaxRole::BinaryOperand));
         }
+        if assignment && !self.captured_closure_assignment_target_is_mutable(&left_plan) {
+            return Err(self.unsupported(left, left_kind, SourceSyntaxRole::BinaryOperand));
+        }
+        if assignment {
+            self.admit_captured_closure_assignment_value(right)?;
+        }
         let mut right_plan = self.plan_expression(right)?;
-        if !logical && !comma && !primitive_binary_operand_plan_is_supported(&right_plan) {
+        if !logical
+            && !comma
+            && !assignment
+            && !primitive_binary_operand_plan_is_supported(&right_plan)
+        {
             return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
         }
         let parent = DirectBinaryParent {
@@ -15187,6 +15241,133 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }))
         };
         Ok(PlannedExpression::new(expression, kind))
+    }
+
+    /// Proves that an assignment is the concise body of an exact closure IIFE.
+    fn is_immediately_invoked_closure_assignment(
+        &self,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let mut current = expression;
+        loop {
+            let Some(parent) = self.node(current)?.parent.map(|node| self.reference(node)) else {
+                return Ok(false);
+            };
+            let record = self.node(parent)?;
+            match &record.data {
+                NodeData::ParenthesizedExpression(parenthesized)
+                    if record.kind == SyntaxKind::ParenthesizedExpression
+                        && parenthesized.expression == current.node =>
+                {
+                    current = parent;
+                }
+                NodeData::ArrowFunction(arrow)
+                    if record.kind == SyntaxKind::ArrowFunction
+                        && arrow.body == current.node
+                        && arrow.parameters.nodes.is_empty() =>
+                {
+                    current = parent;
+                    break;
+                }
+                _ => return Ok(false),
+            }
+        }
+
+        loop {
+            let Some(parent) = self.node(current)?.parent.map(|node| self.reference(node)) else {
+                return Ok(false);
+            };
+            let record = self.node(parent)?;
+            match &record.data {
+                NodeData::ParenthesizedExpression(parenthesized)
+                    if record.kind == SyntaxKind::ParenthesizedExpression
+                        && parenthesized.expression == current.node =>
+                {
+                    current = parent;
+                }
+                NodeData::CallExpression(call)
+                    if record.kind == SyntaxKind::CallExpression
+                        && call.expression == current.node =>
+                {
+                    return Ok(is_immediately_invoked_source_callable(self.arena, parent));
+                }
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    fn captured_closure_assignment_target_is_mutable(
+        &self,
+        expression: &PlannedExpression,
+    ) -> bool {
+        match &expression.kind {
+            PlannedExpressionKind::Identifier(read) => {
+                read.kind == PlannedIdentifierReadKind::Variable
+                    && self
+                        .assignable_mutable_variables
+                        .contains(&read.value_symbol)
+            }
+            PlannedExpressionKind::Parenthesized(inner) => {
+                self.captured_closure_assignment_target_is_mutable(inner)
+            }
+            PlannedExpressionKind::Array(targets)
+            | PlannedExpressionKind::Object {
+                properties: targets,
+                ..
+            } => {
+                !targets.is_empty()
+                    && targets
+                        .iter()
+                        .all(|target| self.captured_closure_assignment_target_is_mutable(target))
+            }
+            _ => false,
+        }
+    }
+
+    fn admit_captured_closure_assignment_value(
+        &mut self,
+        expression: NodeRef,
+    ) -> Result<(), SourceCheckError> {
+        let mut pending = vec![expression];
+        while let Some(value) = pending.pop() {
+            let record = self.node(value)?;
+            let children = match &record.data {
+                NodeData::ParenthesizedExpression(parenthesized)
+                    if record.kind == SyntaxKind::ParenthesizedExpression =>
+                {
+                    vec![parenthesized.expression]
+                }
+                NodeData::ArrayLiteralExpression(array)
+                    if record.kind == SyntaxKind::ArrayLiteralExpression =>
+                {
+                    array.elements.nodes.clone()
+                }
+                NodeData::ObjectLiteralExpression(object)
+                    if record.kind == SyntaxKind::ObjectLiteralExpression =>
+                {
+                    object
+                        .properties
+                        .nodes
+                        .iter()
+                        .filter_map(|property| {
+                            self.arena.get(*property).and_then(|record| {
+                                let NodeData::PropertyAssignment(property) = &record.data else {
+                                    return None;
+                                };
+                                Some(property.initializer)
+                            })
+                        })
+                        .collect()
+                }
+                NodeData::BinaryExpression(_) if record.kind == SyntaxKind::BinaryExpression => {
+                    self.primitive_binary_position_roots.insert(value);
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            };
+            pending.extend(children.into_iter().map(|child| self.reference(child)));
+        }
+        Ok(())
     }
 
     fn plan_literal_plus_chain(
@@ -19353,6 +19534,122 @@ fn check_expression_type(
                 resolution.result_type,
             ))
         }
+        PlannedExpressionKind::Binary(binary) if binary.operator == SyntaxKind::EqualsToken => {
+            let target = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                &binary.left,
+                None,
+                deferred,
+            )?;
+            let destructuring = match (&binary.left.kind, &binary.right.kind) {
+                (PlannedExpressionKind::Array(targets), PlannedExpressionKind::Array(values)) => {
+                    Some((targets.as_slice(), values.as_slice(), None))
+                }
+                (
+                    PlannedExpressionKind::Object {
+                        plan: target_plan,
+                        properties: targets,
+                    },
+                    PlannedExpressionKind::Object {
+                        plan: value_plan,
+                        properties: values,
+                    },
+                ) if target_plan.properties.len() == value_plan.properties.len()
+                    && target_plan
+                        .properties
+                        .iter()
+                        .zip(&value_plan.properties)
+                        .all(|(target, value)| target.name == value.name) =>
+                {
+                    Some((targets.as_slice(), values.as_slice(), Some(value_plan)))
+                }
+                _ => None,
+            };
+            if let Some((targets, values, object)) = destructuring {
+                if targets.len() != values.len() || targets.is_empty() {
+                    return Err(SourceCheckError::PrimitiveOperator(binary.node));
+                }
+                let mut assigned_types = Vec::with_capacity(values.len());
+                for (target, value) in targets.iter().zip(values) {
+                    let checked_target = check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        current_flow_types,
+                        preflighted_type_import_value_uses,
+                        target,
+                        None,
+                        deferred,
+                    )?;
+                    let assigned = check_assignment_to_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        current_flow_types,
+                        preflighted_type_import_value_uses,
+                        deferred,
+                        checked_target.result,
+                        None,
+                        value,
+                        target.node,
+                        None,
+                    )?;
+                    assigned_types.push(assigned.assigned_type);
+                }
+                let result = if let Some(object) = object {
+                    super::object_members::publish_object_literal(store, object, &assigned_types)
+                        .map_err(source_object_execution_error)?
+                } else {
+                    let element = store.expression_union_type_with_global_types(
+                        global_types,
+                        &assigned_types,
+                        UnionReduction::Subtype,
+                    )?;
+                    let array = store.create_canonical_array_type(global_types, element, false)?;
+                    store.create_array_literal_type(global_types, array)?
+                };
+                publish_expression_type(store, binary.right.node, result)?;
+                publish_expression_type(store, binary.node, result)?;
+                return Ok(CheckedExpressionTypes::leaf(result, result));
+            }
+            let assignment = check_assignment_to_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                deferred,
+                target.result,
+                None,
+                &binary.right,
+                binary.left.node,
+                Some(binary.node),
+            )?;
+            Ok(CheckedExpressionTypes::leaf(
+                assignment.assigned_type,
+                assignment.assigned_type,
+            ))
+        }
         PlannedExpressionKind::Binary(binary) => {
             let mut left = check_expression_type(
                 store,
@@ -19862,6 +20159,49 @@ fn check_planned_arrow_argument(
             materialize_anonymous_source_function_expression(store, &arrow.callable)
                 .map_err(SourcePlanner::callable_plan_error)?;
         preflight_source_expression_cache(store, expression, type_)?;
+        if let Some(statements) = &arrow.loop_body {
+            let mut staged_values = HashMap::new();
+            let mut value_order = Vec::new();
+            check_planned_loop_function_statements(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                &HashMap::new(),
+                deferred,
+                &arrow.callable,
+                statements,
+                &mut staged_values,
+                &mut value_order,
+            )?;
+            for symbol in value_order {
+                let type_ = staged_values[&symbol];
+                let mut links = store
+                    .value_symbol_links(symbol)
+                    .cloned()
+                    .unwrap_or_default();
+                if links
+                    .resolved_type
+                    .is_some_and(|existing| existing != type_)
+                    || links.write_type.is_some()
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::InvalidValueLinks(symbol),
+                    ));
+                }
+                links.resolved_type = Some(type_);
+                if !store.set_value_symbol_links(symbol, links) {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::ValueTypePublication(symbol),
+                    ));
+                }
+            }
+        }
         let body = match &arrow.body {
             PlannedArrowBody::Empty => None,
             PlannedArrowBody::Return { expression, .. } => Some(expression),
@@ -53397,6 +53737,196 @@ class Foo2 {
             variable_value_type(&context, &source, file, "arrow"),
             number
         );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn nested_loop_iifes_preserve_captured_types_and_real_call_signatures() {
+        let source = parsed(concat!(
+            "function repeat(flag: boolean): void { ",
+            "while (flag) { ",
+            "let value = 1; ",
+            "(function () { return value; })(); (() => value)(); ",
+            "} } ",
+            "function iterate(input: object): void { ",
+            "for (let key in input) { ",
+            "(function () { return key; })(); (() => key)(); ",
+            "} }",
+        ));
+        let file = FileId::new(8_716);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let expected = [
+            bootstrap.number_type,
+            bootstrap.number_type,
+            bootstrap.string_type,
+            bootstrap.string_type,
+        ];
+        let calls = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::CallExpression(call) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(source.arena.id(), file, node),
+                    NodeRef::new(source.arena.id(), file, call.expression),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), expected.len());
+        for ((call, callee), expected) in calls.into_iter().zip(expected) {
+            let callable = resolved_node_type(&context, callee);
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_eq!(resolved_node_type(&context, call), expected);
+            assert_eq!(
+                context
+                    .store()
+                    .signature_links(call)
+                    .and_then(|links| links.resolved_signature.signature()),
+                Some(signature),
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn closure_iifes_check_captured_scalar_and_destructuring_assignments() {
+        let source = parsed(concat!(
+            "function count(): void { ",
+            "for (let index = 0; index < 3; ++index) { ",
+            "(() => index = index + 1)(); ",
+            "(() => [index] = [index + 1])(); ",
+            "(() => ({ value: index } = { value: index + 1 }))(); ",
+            "} } ",
+            "function repeat(flag: boolean): void { ",
+            "while (flag) { let value = 1; (() => value = value + 1)(); } ",
+            "}",
+        ));
+        let file = FileId::new(8_717);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let assignments = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::BinaryExpression(binary) = &record.data else {
+                    return None;
+                };
+                (source.arena.get(binary.operator_token)?.kind == SyntaxKind::EqualsToken)
+                    .then_some((
+                        NodeRef::new(source.arena.id(), file, node),
+                        NodeRef::new(source.arena.id(), file, binary.left),
+                        NodeRef::new(source.arena.id(), file, binary.right),
+                    ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assignments.len(), 4);
+        for (assignment, left, right) in assignments {
+            let result = resolved_node_type(&context, assignment);
+            assert_eq!(resolved_node_type(&context, right), result);
+            match source.arena.get(left.node).unwrap().kind {
+                SyntaxKind::Identifier => assert_eq!(result, number),
+                SyntaxKind::ArrayLiteralExpression => {
+                    let NodeData::ArrayLiteralExpression(array) =
+                        &source.arena.get(right.node).unwrap().data
+                    else {
+                        panic!("expected the assigned array expression")
+                    };
+                    let [element] = array.elements.nodes.as_slice() else {
+                        panic!("expected one assigned array element")
+                    };
+                    let element = NodeRef::new(source.arena.id(), file, *element);
+                    assert_eq!(resolved_node_type(&context, element), number);
+                }
+                SyntaxKind::ObjectLiteralExpression => {
+                    assert_eq!(object_property_type(&context, right, "value"), number);
+                }
+                kind => panic!("unexpected closure assignment target {kind:?}"),
+            }
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn directive_function_iifes_check_the_captured_loop_assignment_fixture() {
+        let source = parsed(concat!(
+            "(function() {\n",
+            "  \"use strict\";\n",
+            "  for (let i = 0; i < 4; i++) {\n",
+            "    (() => [i] = [i + 1])();\n",
+            "  }\n",
+            "})();\n",
+            "(function() {\n",
+            "  \"use strict\";\n",
+            "  for (let i = 0; i < 4; i++) {\n",
+            "    (() => ({a:i} = {a:i + 1}))();\n",
+            "  }\n",
+            "})();",
+        ));
+        let file = FileId::new(8_718);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let (_, bound) = context.file(file).unwrap();
+        for (node, record) in source.arena.iter() {
+            let reference = NodeRef::new(source.arena.id(), file, node);
+            match record.kind {
+                SyntaxKind::FunctionExpression => {
+                    let callable = resolved_node_type(&context, reference);
+                    let signature = context
+                        .store()
+                        .source_callable_provenance(callable)
+                        .unwrap()
+                        .signature;
+                    assert_eq!(
+                        context
+                            .store()
+                            .signature(signature)
+                            .unwrap()
+                            .resolved_return_type(),
+                        Some(void),
+                    );
+                }
+                SyntaxKind::VariableDeclaration => {
+                    let symbol = bound.symbol(reference).unwrap();
+                    assert_eq!(
+                        context
+                            .store()
+                            .value_symbol_links(symbol)
+                            .and_then(|links| links.resolved_type),
+                        Some(number),
+                    );
+                }
+                _ => {}
+            }
+        }
         assert!(context.diagnostics().is_empty());
 
         let warm = observable_state(&context, file);

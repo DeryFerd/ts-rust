@@ -2569,7 +2569,9 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
         &self,
         function: NodeId,
     ) -> Option<UnsupportedFlowKind> {
-        if self.supported_async_arrow_invocation(function) {
+        if self.supported_async_arrow_invocation(function)
+            || self.supported_immediately_invoked_closure(function)
+        {
             return None;
         }
         self.is_directly_invoked_function(function).then(|| {
@@ -2726,6 +2728,71 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             && identifier.flow_node.is_none()
     }
 
+    /// Keeps authenticated zero-argument closure calls inside their real flow containers.
+    fn supported_immediately_invoked_closure(&self, function: NodeId) -> bool {
+        if self.current.is_none_or(|flow| self.is_unreachable(flow)) {
+            return false;
+        }
+        let Some(record) = self.ast.get(function) else {
+            return false;
+        };
+        let parameters = match &record.data {
+            NodeData::FunctionExpression(data)
+                if record.kind == SyntaxKind::FunctionExpression
+                    && data.name.is_none()
+                    && data.asterisk_token.is_none()
+                    && data.type_parameters.is_none() =>
+            {
+                &data.parameters
+            }
+            NodeData::ArrowFunction(data)
+                if record.kind == SyntaxKind::ArrowFunction
+                    && data.asterisk_token.is_none()
+                    && data.type_parameters.is_none() =>
+            {
+                &data.parameters
+            }
+            _ => return false,
+        };
+        if record.flags.0 != 0 || !parameters.nodes.is_empty() || parameters.has_trailing_comma {
+            return false;
+        }
+
+        let mut expression = function;
+        loop {
+            let Some(parent) = self.ast.get(expression).and_then(|node| node.parent) else {
+                return false;
+            };
+            let Some(parent_record) = self.ast.get(parent) else {
+                return false;
+            };
+            if parent_record.flags.0 != 0 {
+                return false;
+            }
+            match &parent_record.data {
+                NodeData::ParenthesizedExpression(parenthesized)
+                    if parent_record.kind == SyntaxKind::ParenthesizedExpression
+                        && parenthesized.expression == expression =>
+                {
+                    expression = parent;
+                }
+                NodeData::CallExpression(call)
+                    if parent_record.kind == SyntaxKind::CallExpression
+                        && call.expression == expression =>
+                {
+                    return call.arguments.nodes.is_empty()
+                        && !call.arguments.has_trailing_comma
+                        && call.arguments.range.end == parent_record.range.end
+                        && call.question_dot_token.is_none()
+                        && call.symbol.is_none()
+                        && call.type_arguments.is_none()
+                        && call.facts == 0;
+                }
+                _ => return false,
+            }
+        }
+    }
+
     fn is_immediately_invoked_function(&self, function: NodeId) -> bool {
         self.is_directly_invoked_function(function)
             && !self.is_async_function(function)
@@ -2875,6 +2942,62 @@ mod tests {
                 .unwrap();
             assert_eq!(graph.container_is_complete(declaration), Some(true));
             assert!(graph.container_start(declaration).is_some());
+        }
+    }
+
+    #[test]
+    fn authenticated_loop_iifes_keep_outer_and_closure_flow_complete() {
+        for (index, source) in [
+            concat!(
+                "function iterate(value: object) { ",
+                "for (let key in value) { (function () { return key; })(); } ",
+                "}",
+            ),
+            concat!(
+                "function count() { ",
+                "for (let index = 0; index < 1; ++index) { ",
+                "(() => [index] = [index + 1])(); ",
+                "} }",
+            ),
+            concat!(
+                "(function () { ",
+                "\"use strict\"; ",
+                "for (let index = 0; index < 1; ++index) { (() => index)(); } ",
+                "})();",
+            ),
+            "(async () => 1)();",
+            concat!(
+                "function f1() { ",
+                "(async () => { await 10; throw new Error(); })(); ",
+                "var value = 1; ",
+                "}",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{source}");
+            let file = FileId::new(160 + u32::try_from(index).unwrap());
+            let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+            let graph = result
+                .flow_graph(&parsed.arena, parsed.source_file)
+                .expect("program-bound source has a flow graph");
+
+            assert!(graph.is_complete(), "{source}: {:?}", graph.unsupported());
+            for (node, record) in parsed.arena.iter() {
+                if !matches!(
+                    record.kind,
+                    SyntaxKind::FunctionDeclaration
+                        | SyntaxKind::FunctionExpression
+                        | SyntaxKind::ArrowFunction
+                ) {
+                    continue;
+                }
+                let node = NodeRef::new(parsed.arena.id(), file, node);
+                assert_eq!(graph.container_is_complete(node), Some(true), "{source}");
+                assert!(graph.container_start(node).is_some(), "{source}");
+            }
         }
     }
 

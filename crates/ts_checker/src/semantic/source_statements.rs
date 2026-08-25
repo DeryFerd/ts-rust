@@ -3779,31 +3779,30 @@ impl SyntaxPlanner<'_> {
         {
             return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(declaration).into());
         }
-        if self.callable.family != SourceCallableFamily::FunctionDeclaration {
-            return Err(self.unsupported(
-                declaration,
-                self.node(declaration)?.kind,
-                SourceFunctionStatementsRole::Callable,
-            ));
-        }
-
         let record = self.node(declaration)?;
-        let NodeData::FunctionDeclaration(function) = &record.data else {
-            return Err(self.unsupported(
-                declaration,
-                record.kind,
-                SourceFunctionStatementsRole::Callable,
-            ));
+        let valid_callable = match &record.data {
+            NodeData::FunctionDeclaration(function) => {
+                self.callable.family == SourceCallableFamily::FunctionDeclaration
+                    && record.kind == SyntaxKind::FunctionDeclaration
+                    && function.body == Some(self.callable.body.node)
+                    && function.type_
+                        == self
+                            .callable
+                            .return_type
+                            .type_node()
+                            .map(|type_node| type_node.node)
+            }
+            NodeData::FunctionExpression(function) => {
+                self.callable.family == SourceCallableFamily::ArrowFunction
+                    && record.kind == SyntaxKind::FunctionExpression
+                    && function.body == self.callable.body.node
+                    && function.name.is_none()
+                    && function.parameters.nodes.is_empty()
+                    && function.type_.is_none()
+            }
+            _ => false,
         };
-        if record.kind != SyntaxKind::FunctionDeclaration
-            || function.body != Some(self.callable.body.node)
-            || function.type_
-                != self
-                    .callable
-                    .return_type
-                    .type_node()
-                    .map(|type_node| type_node.node)
-        {
+        if !valid_callable {
             return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
         }
 
