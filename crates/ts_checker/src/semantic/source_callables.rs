@@ -293,7 +293,7 @@ pub(super) struct SourceCallablePlan {
 }
 
 impl SourceCallablePlan {
-    /// Installs a callable JSDoc annotation on its authenticated source parameter.
+    /// Installs a callable `JSDoc` annotation on its authenticated source parameter.
     pub(super) fn set_jsdoc_function_parameter_type(
         &mut self,
         store: &CanonicalTypeMapperStore,
@@ -6039,7 +6039,7 @@ fn hydrate_warm_jsdoc_function_parameter(
     plan.set_jsdoc_function_parameter_type(store, declaration, type_)
 }
 
-/// Publishes a JavaScript function whose real parameter owns a JSDoc callable type.
+/// Publishes a JavaScript function whose real parameter owns a `JSDoc` callable type.
 pub(super) fn publish_jsdoc_parameterized_source_callable(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,

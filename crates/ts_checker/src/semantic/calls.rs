@@ -15,8 +15,8 @@ use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, RelationUnavailable, SignatureId, TypeId,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::ValidatedSingleCallable,
-    signatures::SignatureFlags,
-    type_records::TypeData,
+    signatures::{Signature, SignatureFlags},
+    type_records::{TypeData, TypeRecord},
     types::TypeFlags,
 };
 
@@ -296,14 +296,14 @@ fn reorder_direct_call_candidates<'a>(
 ) -> Result<Vec<&'a ValidatedSingleCallable>, DirectCallError> {
     let shared_declaration_owner = store
         .type_payload(callee)
-        .and_then(|record| record.symbol())
+        .and_then(TypeRecord::symbol)
         .and_then(|owner| store.symbol(owner))
         .and_then(|owner| owner.declarations())
         .is_some_and(|declarations| {
             callables.iter().all(|callable| {
                 store
                     .signature(callable.signature)
-                    .and_then(|signature| signature.declaration())
+                    .and_then(Signature::declaration)
                     .is_some_and(|declaration| declarations.contains(&declaration))
             })
         });

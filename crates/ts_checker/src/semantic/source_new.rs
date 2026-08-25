@@ -2252,7 +2252,7 @@ fn materialize_global_date_constructor(
     Ok(())
 }
 
-/// Publishes only the selected real ArrayConstructor declaration and instance.
+/// Publishes only the selected real `ArrayConstructor` declaration and instance.
 fn materialize_global_array_constructor(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,

@@ -4402,7 +4402,7 @@ fn plan_ambient_module_reexport(
                 .map(|target| {
                     store
                         .symbol(target)
-                        .and_then(|record| record.export_symbol())
+                        .and_then(ts_binder::semantic::Symbol::export_symbol)
                         .unwrap_or(target)
                 })
                 .and_then(|target| store.get_merged_symbol(target))
@@ -7071,9 +7071,6 @@ fn namespace_annotations<'plan>(
                 annotations.push(*annotation);
                 declarations.push(member);
             }
-            SourceNamespaceMemberPlan::TypeAlias { deferred: true, .. } => {
-                declarations.push(member);
-            }
             SourceNamespaceMemberPlan::Interface {
                 annotations: interface_annotations,
                 generic,
@@ -7086,7 +7083,8 @@ fn namespace_annotations<'plan>(
                 }));
                 declarations.push(member);
             }
-            SourceNamespaceMemberPlan::EmptyEnum { .. }
+            SourceNamespaceMemberPlan::TypeAlias { deferred: true, .. }
+            | SourceNamespaceMemberPlan::EmptyEnum { .. }
             | SourceNamespaceMemberPlan::Function { .. }
             | SourceNamespaceMemberPlan::DeferredAmbientFunction { .. }
             | SourceNamespaceMemberPlan::DeferredAmbientClass { .. } => {
