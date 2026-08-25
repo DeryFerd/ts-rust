@@ -9893,41 +9893,33 @@ mod tests {
 
     #[test]
     fn unsupported_declared_call_members_reject_before_signature_publication() {
-        // Generic and rest signatures have authenticated providers. Only
-        // unsupported member shapes must reject before signature publication.
-        for (index, member) in [
-            "(value?: number): string;",
-            "new (value: number): string; (value: number): string;",
-            "value: number; (value: number): string;",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let parsed = parsed(&format!(
-                "interface Callable {{ {member} }} function use(callable: Callable): string {{ return callable(1); }}"
-            ));
-            let file = FileId::new(482 + u32::try_from(index).unwrap());
-            let call = calls(&parsed, file)
-                .into_iter()
-                .next()
-                .expect("fixture contains one direct call");
-            let declarations = parsed
-                .arena
-                .iter()
-                .filter(|(_, record)| record.kind == SyntaxKind::CallSignature)
-                .map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node))
-                .collect::<Vec<_>>();
-            let mut context = context(&parsed, file);
+        // Generic, rest, and mixed call signatures have authenticated
+        // providers. Unsupported call shapes must reject before publication.
+        let parsed = parsed(concat!(
+            "interface Callable { (value?: number): string; } ",
+            "function use(callable: Callable): string { return callable(1); }",
+        ));
+        let file = FileId::new(482);
+        let call = calls(&parsed, file)
+            .into_iter()
+            .next()
+            .expect("fixture contains one direct call");
+        let declarations = parsed
+            .arena
+            .iter()
+            .filter(|(_, record)| record.kind == SyntaxKind::CallSignature)
+            .map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node))
+            .collect::<Vec<_>>();
+        let mut context = context(&parsed, file);
 
-            assert!(context.check_source_file(file).is_err());
-            assert!(context.store().type_node_links(call).is_none());
-            assert!(context.store().signature_links(call).is_none());
-            assert!(
-                declarations
-                    .iter()
-                    .all(|declaration| context.store().signature_links(*declaration).is_none())
-            );
-        }
+        assert!(context.check_source_file(file).is_err());
+        assert!(context.store().type_node_links(call).is_none());
+        assert!(context.store().signature_links(call).is_none());
+        assert!(
+            declarations
+                .iter()
+                .all(|declaration| context.store().signature_links(*declaration).is_none())
+        );
 
         let parsed = parsed(concat!(
             "interface Callable { (value: number): string; } ",

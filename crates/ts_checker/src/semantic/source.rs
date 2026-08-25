@@ -37159,6 +37159,32 @@ pub(super) fn check_source_file(
     }
     for statement in &statements {
         match statement {
+            PlannedStatement::Variables(variables) => {
+                for variable in variables {
+                    let (PlannedVariableInitializer::AbsentAnnotated, Some(type_node)) =
+                        (&variable.initializer, variable.type_node)
+                    else {
+                        continue;
+                    };
+                    session.reset_query();
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        &mut type_import_preflight_diagnostics,
+                    )?
+                    .with_type_reference_alias_targets(
+                        type_import_capabilities
+                            .get(&type_node)
+                            .map_or([].as_slice(), Vec::as_slice)
+                            .iter()
+                            .copied(),
+                    )?
+                    .preflight_type_from_type_node(type_node)?;
+                }
+            }
             PlannedStatement::Class(class) => {
                 if let Some(annotation) = class.constructor_interface_annotation() {
                     session.reset_query();
