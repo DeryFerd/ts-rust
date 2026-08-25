@@ -21,7 +21,8 @@ use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
     CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
     CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
-    ResolvedSignatureState, SignatureId, SignatureLinks, TypeId, TypeNodeLinks, ValueSymbolLinks,
+    ResolvedSignatureState, SignatureId, SignatureLinks, TypeDisplayUnavailable, TypeId,
+    TypeNodeLinks, ValueSymbolLinks,
     bootstrap::UnionReduction,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::{
@@ -33,6 +34,7 @@ use super::{
     },
     declared::{cached_ordinary_type_parameter_owner, execute_type_parameter, type_list_key},
     formatter::{
+        FunctionTypeDisplayUnavailable,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
         type_to_string_with_host_global_types_and_flags,
     },
@@ -5853,11 +5855,13 @@ fn call_trivia_has_line_break(text: &str) -> Option<bool> {
     None
 }
 
+#[allow(clippy::too_many_arguments)] // Lazy display retries share the call's active query session.
 fn recover_non_callable_source_call(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     plan: &SourceCallPlan,
     callee_type: TypeId,
@@ -5905,12 +5909,14 @@ fn recover_non_callable_source_call(
         } else if namespace_import.is_some() {
             "{ default: () => void; }".to_owned()
         } else {
-            type_to_string_with_host_global_types_and_flags(
+            format_non_callable_source_type(
                 store,
                 host,
                 global_types,
+                options,
+                session,
+                diagnostics,
                 callee_type,
-                source_call_display_flags(options),
             )?
         };
         let detail = Diagnostic::with_arguments(
@@ -5961,6 +5967,55 @@ fn recover_non_callable_source_call(
         merge_retry_diagnostic(diagnostics, diagnostic);
     }
     Ok(CheckedSourceCall { return_type })
+}
+
+fn format_non_callable_source_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    type_: TypeId,
+) -> Result<String, SourceCheckError> {
+    let mut resolved_signatures = HashSet::new();
+    loop {
+        match type_to_string_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            type_,
+            source_call_display_flags(options),
+        ) {
+            Ok(display) => return Ok(display),
+            Err(
+                error @ TypeDisplayUnavailable::FunctionType {
+                    type_id,
+                    reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
+                },
+            ) => {
+                let StoredSingleCallableValidation::Valid { callable, .. } =
+                    validate_stored_single_callable(store, type_id)
+                else {
+                    return Err(error.into());
+                };
+                if callable.return_type.is_some() || !resolved_signatures.insert(callable.signature)
+                {
+                    return Err(error.into());
+                }
+                resolve_signature_return(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    callable.signature,
+                )?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn tagged_template_argument_type(
@@ -6202,6 +6257,7 @@ pub(super) fn check_direct_source_call(
                     host,
                     global_types,
                     options,
+                    session,
                     diagnostics,
                     plan,
                     callee_type,
@@ -11324,6 +11380,78 @@ mod tests {
             ),
             counts
         );
+    }
+
+    #[test]
+    fn noncallable_unions_resolve_lazy_function_returns_before_display() {
+        let parsed = parsed(concat!(
+            "declare const value: { label: string } | ((input: string) => void); ",
+            "value('input');",
+        ));
+        let file = FileId::new(4_921);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("fixture must contain one invalid union call")
+        };
+        let call = *call;
+        let function_type = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .expect("the union must retain one lazy function constituent");
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the non-callable union must retain one TS2349 diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2349);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            concat!(
+                "This expression is not callable.\n",
+                "  Type '{ label: string; } | ((input: string) => void)' has no call signatures.",
+            ),
+        );
+        let signature = context
+            .store()
+            .signature_links(function_type)
+            .and_then(|links| links.resolved_signature.signature())
+            .expect("the function constituent must retain its authenticated source signature");
+        assert!(
+            context
+                .store()
+                .signature(signature)
+                .is_some_and(|signature| {
+                    signature.resolved_return_type()
+                        == Some(context.store().intrinsic_bootstrap().unwrap().void_type)
+                })
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature()),
+            Some(bootstrap.unknown_signature),
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(call)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.error_type),
+        );
+        let warm = call_publication_state(&context, call);
+
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(call_publication_state(&context, call), warm);
     }
 
     #[test]
