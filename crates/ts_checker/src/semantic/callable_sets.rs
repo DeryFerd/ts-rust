@@ -1275,8 +1275,10 @@ pub(super) fn validate_stored_declared_method_callable_set(
                 && owner_record.object_flags()
                     == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
         };
-        let allowed_owner_flags =
-            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+        let allowed_owner_flags = SymbolFlags::INTERFACE
+            | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            | SymbolFlags::NAMESPACE_MODULE
+            | SymbolFlags::TRANSIENT;
         if declarations.is_empty()
             || authenticated_owner != owner_symbol
             || interface_owner

@@ -1422,7 +1422,12 @@ fn valid_interface_method_signatures(
         return None;
     };
     let signatures = object.structured.signatures.as_deref()?;
+    let merged_namespace_interface = owner_record.flags().contains(SymbolFlags::NAMESPACE_MODULE)
+        && store
+            .authenticated_interface_method_owner(method)
+            .is_some_and(|(authenticated_owner, _)| authenticated_owner == owner);
     if owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+        && !merged_namespace_interface
         || declarations.is_empty()
         || declarations.len() != signatures.len()
         || record.flags() != TypeFlags::OBJECT

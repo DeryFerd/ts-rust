@@ -1746,8 +1746,35 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let interface = self.symbol(owner)?;
         let owner_declarations = interface.declarations()?;
         let interface_type = self.declared_type_links(owner)?.declared_type?;
-        let allowed_owner_flags =
-            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+        let merged_namespace = interface.flags().contains(SymbolFlags::NAMESPACE_MODULE);
+        let allowed_owner_flags = SymbolFlags::INTERFACE
+            | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            | SymbolFlags::NAMESPACE_MODULE
+            | SymbolFlags::TRANSIENT;
+        let valid_namespace_owner = !merged_namespace
+            || interface.flags().without(
+                SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE | SymbolFlags::TRANSIENT,
+            ) == SymbolFlags::NONE
+                && interface.value_declaration().is_none()
+                && interface.parent().is_none()
+                && interface
+                    .exports()
+                    .and_then(|exports| self.symbol_table(exports))
+                    .is_some_and(|exports| {
+                        exports.iter().all(|(_, export)| {
+                            self.symbol(export).is_some_and(|record| {
+                                record
+                                    .flags()
+                                    .intersects(SymbolFlags::TYPE | SymbolFlags::NAMESPACE)
+                                    && !record.flags().intersects(SymbolFlags::VALUE)
+                                    && self.get_parent_of_symbol(export) == Some(owner)
+                                    && self.get_merged_symbol(export) == Some(export)
+                            })
+                        })
+                    })
+                && owner_declarations.iter().any(|declaration| {
+                    self.source_node_kind(*declaration) == Some(SyntaxKind::ModuleDeclaration)
+                });
         if declarations.is_empty()
             || method.flags() != SymbolFlags::METHOD
             || method.check_flags() != CheckFlags::NONE
@@ -1761,6 +1788,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || self.get_merged_symbol(symbol) != Some(symbol)
             || interface.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
             || interface.flags().without(allowed_owner_flags) != SymbolFlags::NONE
+            || !valid_namespace_owner
             || interface.check_flags() != CheckFlags::NONE
             || self.get_merged_symbol(owner) != Some(owner)
             || self.types.get(interface_type).is_none()
@@ -1895,7 +1923,44 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 }
             }
         }
-        None
+
+        if self.source_node_kind(owner_declaration) != Some(SyntaxKind::InterfaceDeclaration)
+            || !matches!(
+                self.source_node_parent(owner_declaration),
+                Some(SourceNodeParent::Parent(block))
+                    if self.source_node_kind(block) == Some(SyntaxKind::ModuleBlock)
+            )
+        {
+            return None;
+        }
+        let owner = self
+            .links
+            .declared_type
+            .find_key(|owner| {
+                self.symbol(*owner).is_some_and(|interface| {
+                    interface
+                        .flags()
+                        .contains(SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE)
+                        && interface
+                            .declarations()
+                            .is_some_and(|declarations| declarations.contains(&owner_declaration))
+                })
+            })
+            .copied()?;
+        let owner_type = self.declared_type_links(owner)?.declared_type?;
+        let members = self
+            .symbol(owner)
+            .and_then(Symbol::members)
+            .and_then(|members| self.symbol_table(members))?;
+        members.iter().find_map(|(_, member)| {
+            let method = self.get_merged_symbol(member)?;
+            (self
+                .symbol(method)
+                .and_then(Symbol::declarations)
+                .is_some_and(|declarations| declarations.contains(&declaration))
+                && self.authenticated_interface_method_owner(method) == Some((owner, owner_type)))
+            .then_some(method)
+        })
     }
 
     fn node_is_interface_method(&self, node: NodeRef) -> bool {

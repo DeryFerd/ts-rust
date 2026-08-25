@@ -36,6 +36,7 @@ use super::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
     },
     signatures::SignatureFlags,
+    source_namespaces::authenticated_merged_namespace_interface,
     store::SourceNodeParent,
     type_records::{
         ConstrainedTypeData, InterfaceTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState,
@@ -1379,12 +1380,15 @@ pub(super) fn plan_interface(
     else {
         return Err(PropertyObjectError::InvalidInterfaceSymbol(symbol));
     };
+    let merged_namespace_interface =
+        authenticated_merged_namespace_interface(store, host, symbol).is_some();
     // `resolveDeclaredMembers` reads the merged symbol's member table
     // independently of its value side. A function-scoped value declaration
     // such as the standard library's `declare var Object` is therefore inert
     // for this property-only interface plan.
     let mut interface_declarations = Vec::new();
     let mut value_declarations = Vec::new();
+    let mut namespace_declarations = Vec::new();
     let mut seen_declarations = HashSet::new();
     for candidate in declarations {
         if !seen_declarations.insert(*candidate) {
@@ -1412,6 +1416,11 @@ pub(super) fn plan_interface(
             (SyntaxKind::VariableDeclaration, NodeData::VariableDeclaration(_)) => {
                 value_declarations.push(*candidate);
             }
+            (SyntaxKind::ModuleDeclaration, NodeData::ModuleDeclaration(_))
+                if merged_namespace_interface =>
+            {
+                namespace_declarations.push(*candidate);
+            }
             _ => {
                 return Err(PropertyObjectError::InvalidInterface {
                     declaration: *candidate,
@@ -1428,6 +1437,11 @@ pub(super) fn plan_interface(
             SymbolFlags::NONE
         } else {
             SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        }
+        | if namespace_declarations.is_empty() {
+            SymbolFlags::NONE
+        } else {
+            SymbolFlags::NAMESPACE_MODULE
         };
     let valid_value_declaration = match symbol_record.value_declaration() {
         None => value_declarations.is_empty(),
@@ -1436,7 +1450,9 @@ pub(super) fn plan_interface(
     if symbol_record.flags().without(SymbolFlags::TRANSIENT) != expected_symbol_flags
         || symbol_record.check_flags() != CheckFlags::NONE
         || !valid_value_declaration
-        || symbol_record.exports().is_some()
+        || merged_namespace_interface != !namespace_declarations.is_empty()
+        || merged_namespace_interface && !value_declarations.is_empty()
+        || symbol_record.exports().is_some() != merged_namespace_interface
         || symbol_record.export_symbol().is_some()
     {
         return Err(PropertyObjectError::InvalidInterface {

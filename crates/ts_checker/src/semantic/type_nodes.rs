@@ -4723,9 +4723,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if self.plan.interfaces.contains_key(&symbol) {
             return Ok(());
         }
-        if authenticated_merged_namespace_interface(self.store, self.host, symbol).is_some() {
-            return Ok(());
-        }
         let declaration = self
             .store
             .symbol(symbol)
@@ -14858,6 +14855,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             if parameter_count == 0
                 && !planner.is_default_library_template_strings_array(symbol)
                 && !planner.is_canonical_global_jsx_element(symbol)
+                && authenticated_merged_namespace_interface(planner.store, planner.host, symbol)
+                    .is_none()
             {
                 planner.plan_property_interface(symbol)?;
             } else if parameter_count != 0 && planner.has_generic_interface_heritage(symbol)? {

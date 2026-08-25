@@ -35663,7 +35663,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_namespace_interface_method_reads_are_unsupported_not_invalid_caches() {
+    fn merged_namespace_interface_methods_preserve_namespace_value_diagnostics() {
         let declarations = parsed(concat!(
             "declare module 'foo' { ",
             "namespace B { export interface A {} } ",
@@ -35672,9 +35672,10 @@ mod tests {
             "}",
         ));
         let importer = parsed(concat!(
-            "import foo = require('foo'); ",
-            "declare var z: foo; ",
-            "z.bar('hello'); ",
+            "///<reference path='aliasOnMergedModuleInterface_0.ts' />\n",
+            "import foo = require('foo')\n",
+            "declare var z: foo;\n",
+            "z.bar('hello');\n",
             "var x: foo.A = foo.bar('hello');",
         ));
         let declaration_file = FileId::new(9_850);
@@ -35701,25 +35702,28 @@ mod tests {
                 .bind_typescript_declaration_slice(&source.arena, file)
                 .unwrap();
         }
-        let specifier = importer
+        let import_declaration = importer
             .arena
             .iter()
-            .find_map(|(_, record)| {
-                let NodeData::ImportEqualsDeclaration(import) = &record.data else {
-                    return None;
-                };
-                let NodeData::ExternalModuleReference(reference) =
-                    &importer.arena.get(import.module_reference)?.data
-                else {
-                    return None;
-                };
-                Some(NodeRef::new(
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ImportEqualsDeclaration).then_some(NodeRef::new(
                     importer.arena.id(),
                     importer_file,
-                    reference.expression,
+                    node,
                 ))
             })
             .unwrap();
+        let NodeData::ImportEqualsDeclaration(import) =
+            &importer.arena.get(import_declaration.node).unwrap().data
+        else {
+            panic!("expected one import-equals declaration")
+        };
+        let NodeData::ExternalModuleReference(reference) =
+            &importer.arena.get(import.module_reference).unwrap().data
+        else {
+            panic!("expected one external module reference")
+        };
+        let specifier = NodeRef::new(importer.arena.id(), importer_file, reference.expression);
         let access = importer
             .arena
             .iter()
@@ -35732,6 +35736,24 @@ mod tests {
                     Some(NodeData::Identifier(identifier)) if identifier.text == "z"
                 )
                 .then_some(NodeRef::new(importer.arena.id(), importer_file, node))
+            })
+            .unwrap();
+        let invalid_receiver = importer
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::PropertyAccessExpression(access) = &record.data else {
+                    return None;
+                };
+                matches!(
+                    importer.arena.get(access.expression).map(|receiver| &receiver.data),
+                    Some(NodeData::Identifier(identifier)) if identifier.text == "foo"
+                )
+                .then_some(NodeRef::new(
+                    importer.arena.id(),
+                    importer_file,
+                    access.expression,
+                ))
             })
             .unwrap();
         let mut context = CanonicalCheckerContext::new_with_module_resolutions(
@@ -35757,14 +35779,99 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(
-            context.check_source_file(importer_file),
-            Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Property(node)))
-                if node == access
-        ));
-        assert!(context.store().type_node_links(access).is_none());
-        assert!(context.store().symbol_node_links(access).is_none());
-        assert!(!is_type_checked(&context, importer_file));
+        context.check_source_file(importer_file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected exactly one namespace value diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2708);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Cannot use namespace 'foo' as a value."
+        );
+        assert_eq!(diagnostic.node, Some(invalid_receiver));
+        assert_eq!(node_text(&importer, diagnostic.node.unwrap()), "foo");
+        let receiver_start = usize::try_from(
+            importer
+                .arena
+                .get(invalid_receiver.node)
+                .unwrap()
+                .range
+                .start
+                .get(),
+        )
+        .unwrap();
+        let prefix = &importer.arena.source_text().unwrap()[..receiver_start];
+        assert_eq!(prefix.lines().count(), 5);
+        assert_eq!(prefix.rsplit('\n').next().unwrap().len() + 1, 16);
+
+        let method = context
+            .store()
+            .symbol_node_links(access)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        assert_eq!(
+            context.store().symbol(method).unwrap().flags(),
+            SymbolFlags::METHOD
+        );
+        let method_type = resolved_node_type(&context, access);
+        assert_eq!(
+            context.store().value_symbol_links(method),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(method_type),
+                ..ValueSymbolLinks::default()
+            })
+        );
+
+        let (_, bound) = context.file(importer_file).unwrap();
+        let alias = bound.symbol(import_declaration).unwrap();
+        assert!(context.store().value_symbol_links(alias).is_none());
+        let owner = resolved_import_target(&context, alias);
+        let receiver_type = variable_value_type(&context, &importer, importer_file, "z");
+        assert_eq!(
+            context.store().authenticated_interface_method_owner(method),
+            Some((owner, receiver_type))
+        );
+
+        let annotation = variable_type_node(&importer, importer_file, "x");
+        let annotated_type = resolved_node_type(&context, annotation);
+        assert_eq!(
+            variable_value_type(&context, &importer, importer_file, "x"),
+            annotated_type
+        );
+        let [signature] = context
+            .store()
+            .type_payload(method_type)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .unwrap()
+        else {
+            panic!("expected one merged-interface method signature")
+        };
+        assert_eq!(
+            crate::semantic::structured_members::valid_interface_method_value(
+                context.store(),
+                method,
+                method_type,
+            ),
+            Some(*signature)
+        );
+        assert_eq!(
+            context.store().interface_method_linked_type(*signature),
+            Some(method_type)
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(*signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            Some(annotated_type)
+        );
+        assert!(is_type_checked(&context, importer_file));
+
+        let warm = observable_state(&context, importer_file);
+        context.recheck_source_file(importer_file).unwrap();
+        assert_eq!(observable_state(&context, importer_file), warm);
     }
 
     #[test]

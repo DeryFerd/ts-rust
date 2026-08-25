@@ -1909,9 +1909,44 @@ fn resolve_namespace_property(
                 .and_then(|links| links.declared_type)
                 == Some(receiver_type)
         {
-            return Err(SourcePropertyError::Unsupported(
-                SourcePropertyUnsupported::Access(plan.node),
-            ));
+            let members = owner
+                .members()
+                .and_then(|members| store.symbol_table(members))
+                .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+            let Some(symbol) = members.get_source(&plan.name) else {
+                return Ok(None);
+            };
+            let symbol = store
+                .get_merged_symbol(symbol)
+                .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+            let method = store
+                .symbol(symbol)
+                .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+            if method.flags() != SymbolFlags::METHOD {
+                return Ok(None);
+            }
+            let links = store
+                .value_symbol_links(symbol)
+                .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+            let type_ = links
+                .resolved_type
+                .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+            if store.authenticated_interface_method_owner(symbol) != Some((module, receiver_type))
+                || links
+                    != &(ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..ValueSymbolLinks::default()
+                    })
+                || !matches!(
+                    validate_stored_callable_set(store, type_),
+                    StoredCallableSetValidation::Valid { ref projection, .. }
+                        if projection.construct_signatures.is_empty()
+                            && !projection.call_signatures.is_empty()
+                )
+            {
+                return Err(SourcePropertyError::InvalidCache(plan.node));
+            }
+            return Ok(Some(NamespaceProperty::Present { symbol, type_ }));
         }
         if merged_interface_namespace
             && alias_module == Some(module)
