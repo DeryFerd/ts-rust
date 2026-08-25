@@ -6,9 +6,10 @@
 //! retains a single dependency graph and resolution stack. Call and construct
 //! signatures retain authenticated generic parameters, overload order, and
 //! supported rest parameters. Interface and type-literal call signatures can
-//! appear beside ordinary properties. Type-literal calls may retain an implicit
-//! `any` return and trailing implicit `any[]` rest parameter. Construct
-//! signatures can also retain trailing optional `any` parameters.
+//! appear beside ordinary properties. Type-literal calls may retain trailing
+//! optional `any` parameters, an implicit `any` return, and a trailing implicit
+//! `any[]` rest parameter. Construct signatures can also retain trailing
+//! optional `any` parameters.
 //! Named interface and type-literal methods retain their own binder symbols,
 //! authenticated method type parameters, annotated required or optional
 //! parameters, and authenticated array, tuple, or inferred rest parameters.
@@ -902,7 +903,9 @@ pub(super) fn validate_stored_declared_call_set(
                 != 0
             || signature_record.resolved_min_argument_count() != -1
             || minimum > fixed_parameter_count
-            || !construct && minimum != fixed_parameter_count
+            || !construct
+                && minimum != fixed_parameter_count
+                && store.source_node_kind(provider_declaration) != Some(SyntaxKind::TypeLiteral)
             || !super::callable_sets::valid_declared_method_type_parameters(
                 store,
                 signature_record,
@@ -979,7 +982,9 @@ pub(super) fn validate_stored_declared_call_set(
                 || declared_signature_parameter_is_optional(store, *parameter_declaration, *type_)
                     .is_none_or(|optional| {
                         optional
-                            != (construct
+                            != ((construct
+                                || store.source_node_kind(provider_declaration)
+                                    == Some(SyntaxKind::TypeLiteral))
                                 && parameter_index >= minimum
                                 && parameter_index < fixed_parameter_count)
                     })
@@ -7262,7 +7267,7 @@ fn plan_call_signature(
         let optional = if let Some(token) = data.question_token {
             let token = NodeRef::new(parameter.arena, parameter.file, token);
             let token_record = preflight_node(store, host, token).map_err(|_| unsupported())?;
-            if !is_construct
+            if !is_construct && !type_literal_call
                 || rest.is_some()
                 || token_record.kind != SyntaxKind::QuestionToken
                 || !matches!(token_record.data, NodeData::Token(_))
@@ -7287,7 +7292,9 @@ fn plan_call_signature(
         } else {
             false
         };
-        if optional_seen && !optional && rest.is_none() || implicit_any_rest && optional {
+        if optional_seen && !optional && (rest.is_none() || implicit_any_rest)
+            || implicit_any_rest && optional
+        {
             return Err(unsupported());
         }
         optional_seen |= optional;

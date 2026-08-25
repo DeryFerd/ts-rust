@@ -38016,6 +38016,364 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep optional arity, overload selection, and warm identity together.
+    fn optional_type_literal_call_overloads_preserve_literal_specialization_and_properties() {
+        use crate::semantic::calls::{
+            DirectCallApplicability, DirectCallForm, DirectCallRequest, resolve_direct_call,
+        };
+
+        let mut fixture = global_array_fixture(concat!(
+            "type Callable = { ",
+            "(value?: any): boolean; ",
+            "readonly label?: string; ",
+            "(value: 'specific'): number; ",
+            "enabled: boolean; ",
+            "};",
+        ));
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let alias =
+            canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Callable");
+        let literal = alias_parts(&fixture, "Callable").2;
+        let plan = {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            object_members::plan_type_literal(&fixture.store, &host, literal, Some(alias)).unwrap()
+        };
+        let [general_plan, specialized_plan] = plan.call_signatures.as_slice() else {
+            panic!("the callable type literal must retain both source-ordered overloads")
+        };
+        assert_eq!(general_plan.min_argument_count(), 0);
+        assert_eq!(specialized_plan.min_argument_count(), 1);
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| (property.name.as_str(), property.optional, property.readonly))
+                .collect::<Vec<_>>(),
+            [("label", true, true), ("enabled", false, false)],
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable =
+            query_global_declared(&mut fixture, &global_types, alias, &mut diagnostics).unwrap();
+        let TypeData::Object(object) = fixture.store.type_payload(callable).unwrap().data() else {
+            panic!("optional call overloads must retain their anonymous type literal")
+        };
+        let [general, specialized] = object.structured.signatures.as_deref().unwrap() else {
+            panic!("published call overloads must remain in declaration order")
+        };
+        let general = *general;
+        let specialized = *specialized;
+        assert_eq!(object.structured.call_signature_count, 2);
+        assert_eq!(
+            object.structured.properties.as_deref(),
+            Some(
+                plan.properties
+                    .iter()
+                    .map(|property| property.symbol)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            ),
+        );
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (any, boolean, number, string) = (
+            bootstrap.any_type,
+            bootstrap.boolean_type,
+            bootstrap.number_type,
+            bootstrap.string_type,
+        );
+        let specific = fixture
+            .store
+            .callable_signature_parameter_types(specialized)
+            .unwrap()[0];
+        let general_record = fixture.store.signature(general).unwrap();
+        assert_eq!(general_record.declaration(), Some(general_plan.declaration));
+        assert_eq!(general_record.min_argument_count(), 0);
+        assert_eq!(general_record.resolved_return_type(), Some(boolean));
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(general),
+            Some([any].as_slice()),
+        );
+        let specialized_record = fixture.store.signature(specialized).unwrap();
+        assert_eq!(
+            specialized_record.declaration(),
+            Some(specialized_plan.declaration),
+        );
+        assert_eq!(
+            specialized_record.flags(),
+            SignatureFlags::HAS_LITERAL_TYPES
+        );
+        assert_eq!(specialized_record.min_argument_count(), 1);
+        assert_eq!(specialized_record.resolved_return_type(), Some(number));
+        for (property, expected_type) in plan.properties.iter().zip([string, boolean]) {
+            assert_eq!(
+                fixture.store.value_symbol_links(property.symbol),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(expected_type),
+                    ..ValueSymbolLinks::default()
+                }),
+            );
+        }
+        assert_eq!(
+            fixture
+                .store
+                .symbol(plan.properties[0].symbol)
+                .unwrap()
+                .flags(),
+            SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL,
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol(plan.properties[0].symbol)
+                .unwrap()
+                .check_flags(),
+            CheckFlags::READONLY,
+        );
+
+        let StoredCallableSetValidation::Valid {
+            projection, edges, ..
+        } = validate_stored_callable_set(&fixture.store, callable)
+        else {
+            panic!("optional call overloads must retain authenticated callable provenance")
+        };
+        let [general_projection, specialized_projection] = projection.call_signatures.as_ref()
+        else {
+            panic!("callable projection must preserve both original overload identities")
+        };
+        assert_eq!(general_projection.signature, general);
+        assert_eq!(general_projection.min_argument_count, 0);
+        assert_eq!(general_projection.parameters, [any]);
+        assert_eq!(specialized_projection.signature, specialized);
+        assert_eq!(specialized_projection.min_argument_count, 1);
+        assert_eq!(specialized_projection.parameters, [specific]);
+        assert_eq!(edges, vec![any, boolean, specific, number, string, boolean]);
+
+        let no_arguments = [];
+        let specific_arguments = [specific];
+        let general_arguments = [string];
+        let calls = [
+            (no_arguments.as_slice(), general, boolean),
+            (specific_arguments.as_slice(), specialized, number),
+            (general_arguments.as_slice(), general, boolean),
+        ];
+        for (arguments, expected_signature, expected_return) in calls {
+            let resolution = resolve_direct_call(
+                &mut fixture.store,
+                &global_types,
+                false,
+                DirectCallRequest {
+                    form: DirectCallForm::Call,
+                    optional_chain: false,
+                    type_argument_count: 0,
+                    has_spread_argument: false,
+                    callee: callable,
+                    arguments,
+                },
+            )
+            .unwrap();
+            assert_eq!(resolution.projection.signature, expected_signature);
+            assert_eq!(resolution.projection.return_type, expected_return);
+            assert_eq!(
+                resolution.applicability,
+                DirectCallApplicability::Applicable
+            );
+        }
+
+        let warm = function_store_state(&fixture.store);
+        for (arguments, expected_signature, expected_return) in calls {
+            let resolution = resolve_direct_call(
+                &mut fixture.store,
+                &global_types,
+                false,
+                DirectCallRequest {
+                    form: DirectCallForm::Call,
+                    optional_chain: false,
+                    type_argument_count: 0,
+                    has_spread_argument: false,
+                    callee: callable,
+                    arguments,
+                },
+            )
+            .unwrap();
+            assert_eq!(resolution.projection.signature, expected_signature);
+            assert_eq!(resolution.projection.return_type, expected_return);
+        }
+        assert_eq!(
+            query_global_declared(&mut fixture, &global_types, alias, &mut diagnostics),
+            Ok(callable),
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn optional_type_literal_call_parameters_keep_any_identity_and_reject_forged_links() {
+        for strict_null_checks in [false, true] {
+            let mut fixture = fixture_with_intrinsic(
+                concat!(
+                    "type Callable = { ",
+                    "(required: string, first?: any, second?: any); ",
+                    "readonly ready?: boolean; ",
+                    "};",
+                ),
+                IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+            );
+            let alias =
+                canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Callable");
+            let literal = alias_parts(&fixture, "Callable").2;
+            let plan = {
+                let host = post_global_host(
+                    &fixture.parsed.arena,
+                    fixture.files.get(&fixture.file).unwrap(),
+                );
+                object_members::plan_type_literal(&fixture.store, &host, literal, Some(alias))
+                    .unwrap()
+            };
+            let [planned] = plan.call_signatures.as_slice() else {
+                panic!("the callable type literal must retain one optional-parameter signature")
+            };
+            assert_eq!(planned.min_argument_count(), 1);
+            assert!(planned.implicit_any_return);
+
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let TypeData::Object(object) = fixture.store.type_payload(callable).unwrap().data()
+            else {
+                panic!("optional parameters must retain their source-owned type literal")
+            };
+            let [signature] = object.structured.signatures.as_deref().unwrap() else {
+                panic!("the optional parameter list must publish one exact signature")
+            };
+            let signature = *signature;
+            let record = fixture.store.signature(signature).unwrap();
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let (any, boolean, string) = (
+                bootstrap.any_type,
+                bootstrap.boolean_type,
+                bootstrap.string_type,
+            );
+            assert_eq!(record.min_argument_count(), 1);
+            assert_eq!(record.resolved_return_type(), Some(any));
+            assert_eq!(
+                fixture.store.callable_signature_parameter_types(signature),
+                Some([string, any, any].as_slice()),
+            );
+            assert_eq!(
+                object_members::validate_stored_declared_call_set(&fixture.store, callable),
+                object_members::StoredDeclaredCallSetValidation::Valid(vec![
+                    string, any, any, any, boolean,
+                ]),
+            );
+            let optional = planned.parameters[2].symbol;
+            let original = fixture.store.value_symbol_links(optional).unwrap().clone();
+
+            let warm = function_store_state(&fixture.store);
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(callable),
+            );
+            assert_eq!(function_store_state(&fixture.store), warm);
+
+            assert!(fixture.store.set_value_symbol_links(
+                optional,
+                ValueSymbolLinks {
+                    resolved_type: Some(string),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            assert!(matches!(
+                validate_stored_callable_set(&fixture.store, callable),
+                StoredCallableSetValidation::Malformed { .. }
+            ));
+            let poisoned = function_store_state(&fixture.store);
+            assert!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .is_err(),
+            );
+            assert_eq!(function_store_state(&fixture.store), poisoned);
+            assert!(fixture.store.set_value_symbol_links(optional, original));
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(callable),
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn optional_type_literal_call_parameters_keep_unsupported_shapes_atomic() {
+        for (source, owner_kind) in [
+            (
+                "type Invalid = { (value?: string): boolean };",
+                SyntaxKind::TypeAliasDeclaration,
+            ),
+            (
+                "type Invalid = { (value?: any, ...rest): boolean };",
+                SyntaxKind::TypeAliasDeclaration,
+            ),
+            (
+                "type Invalid = { <T>(value?: T): boolean };",
+                SyntaxKind::TypeAliasDeclaration,
+            ),
+            (
+                "interface Invalid { (value?: any): boolean; }",
+                SyntaxKind::InterfaceDeclaration,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = canonical_fixture_symbol(&fixture, owner_kind, "Invalid");
+            let before = function_store_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            assert!(
+                matches!(
+                    query_declared(
+                        &mut fixture,
+                        owner,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::UnsupportedSyntax {
+                            kind: SyntaxKind::CallSignature,
+                            ..
+                        }
+                    ))
+                ),
+                "source: {source}",
+            );
+            assert_eq!(function_store_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
     fn callable_type_literal_properties_reject_forged_identity_and_links_atomically() {
         for corruption in 0..3 {
             let mut fixture = fixture(concat!(
