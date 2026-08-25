@@ -118,6 +118,42 @@ fn canonical_program_honors_javascript_function_expando_jsdoc_annotations() {
 }
 
 #[test]
+fn canonical_program_checks_jsdoc_boolean_constructor_field_assignments() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/input.js",
+            concat!(
+                "class C {\n",
+                "  constructor() {\n",
+                "    /** @type {boolean} */\n",
+                "    this.a = true;\n",
+                "    this.a = !!this.a;\n",
+                "  }\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+    let mut options = javascript_options();
+    options.check_js = true;
+    options.no_implicit_any = true;
+
+    let program = Program::try_new_with_canonical_checker(
+        &filesystem,
+        "/project",
+        &["input.js".to_owned()],
+        options,
+    )
+    .unwrap();
+
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+}
+
+#[test]
 fn unchecked_javascript_es_modules_share_one_bundler_graph() {
     let filesystem = MemoryFileSystem::new(true);
     filesystem

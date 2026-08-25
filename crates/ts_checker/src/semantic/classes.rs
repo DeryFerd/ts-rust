@@ -29,6 +29,8 @@
 //! and constructor-local symbols. Exported ambient declaration-file classes
 //! may also retain generic parameters and bodyless constructors. Decorated
 //! parameters remain restricted to one authenticated string parameter.
+//! Checked JavaScript constructors also admit one binder-owned boolean field
+//! introduced by `@type {boolean}` and updated with an exact `!!this.field`.
 //! A derived constructor may retain one public, interface-typed parameter
 //! property and forward one primitive interface property to its base.
 //! A parameterless derived constructor may forward to an authenticated
@@ -75,6 +77,7 @@ use super::{
         preflight_node, type_list_key,
     },
     interface_heritage::{DirectInterfaceBaseKind, plan_direct_interface_heritage},
+    jsdoc::{JsDocIntrinsicType, JsDocType, leading_jsdoc_comment},
     links::{SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks},
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation, plan_interface,
@@ -169,6 +172,13 @@ struct ClassConstructorParameterPropertyPlan {
 struct ClassConstructorParameterDecoratorPlan {
     node: NodeRef,
     symbol: SemanticSymbolId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JavaScriptConstructorBooleanAssignment {
+    expression: NodeRef,
+    name: NodeRef,
+    right: NodeRef,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -317,6 +327,7 @@ pub(super) struct ClassPropertyPlan {
     readonly: bool,
     ambient_private_modifier: Option<NodeRef>,
     parameter_property: bool,
+    javascript_constructor_assignment: bool,
 }
 
 impl ClassPropertyPlan {
@@ -1627,6 +1638,268 @@ fn plan_constructor_parameter(
     })
 }
 
+fn javascript_constructor_boolean_assignment(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    body: NodeRef,
+    statement: NodeRef,
+) -> Option<JavaScriptConstructorBooleanAssignment> {
+    let statement_record = preflight_node(store, host, statement).ok()?;
+    let NodeData::ExpressionStatement(expression_statement) = &statement_record.data else {
+        return None;
+    };
+    let expression = NodeRef::new(
+        statement.arena,
+        statement.file,
+        expression_statement.expression,
+    );
+    let expression_record = preflight_node(store, host, expression).ok()?;
+    let NodeData::BinaryExpression(assignment) = &expression_record.data else {
+        return None;
+    };
+    let operator = NodeRef::new(expression.arena, expression.file, assignment.operator_token);
+    let operator_record = preflight_node(store, host, operator).ok()?;
+    let left = NodeRef::new(expression.arena, expression.file, assignment.left);
+    let left_record = preflight_node(store, host, left).ok()?;
+    let NodeData::PropertyAccessExpression(access) = &left_record.data else {
+        return None;
+    };
+    let receiver = NodeRef::new(left.arena, left.file, access.expression);
+    let receiver_record = preflight_node(store, host, receiver).ok()?;
+    let NodeData::KeywordExpression(this) = &receiver_record.data else {
+        return None;
+    };
+    let name = NodeRef::new(left.arena, left.file, access.name);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return None;
+    };
+    let right = NodeRef::new(expression.arena, expression.file, assignment.right);
+    let right_record = preflight_node(store, host, right).ok()?;
+
+    (statement_record.kind == SyntaxKind::ExpressionStatement
+        && statement_record.parent == Some(body.node)
+        && statement_record.flags.0 == 0
+        && expression_statement.flow_node.is_none()
+        && expression_record.kind == SyntaxKind::BinaryExpression
+        && expression_record.parent == Some(statement.node)
+        && expression_record.flags.0 == 0
+        && assignment.symbol.is_none()
+        && assignment.type_.is_none()
+        && assignment.modifiers.is_none()
+        && assignment.facts == 0
+        && operator_record.kind == SyntaxKind::EqualsToken
+        && operator_record.parent == Some(expression.node)
+        && operator_record.flags.0 == 0
+        && matches!(operator_record.data, NodeData::Token(_))
+        && left_record.kind == SyntaxKind::PropertyAccessExpression
+        && left_record.parent == Some(expression.node)
+        && left_record.flags.0 == 0
+        && access.flow_node.is_none()
+        && access.question_dot_token.is_none()
+        && access.facts == 0
+        && receiver_record.kind == SyntaxKind::ThisKeyword
+        && receiver_record.parent == Some(left.node)
+        && receiver_record.flags.0 == 0
+        && this.flow_node.is_none()
+        && name_record.kind == SyntaxKind::Identifier
+        && name_record.parent == Some(left.node)
+        && name_record.flags.0 == 0
+        && identifier.flow_node.is_none()
+        && !identifier.text.is_empty()
+        && right_record.parent == Some(expression.node)
+        && right_record.flags.0 == 0)
+        .then_some(JavaScriptConstructorBooleanAssignment {
+            expression,
+            name,
+            right,
+        })
+}
+
+#[allow(clippy::too_many_lines)] // Keep constructor, JSDoc, and repeated property ownership together.
+fn plan_javascript_constructor_boolean_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    constructor: NodeRef,
+    instance_members: Option<SymbolTableId>,
+) -> Result<Option<ClassPropertyPlan>, ClassError> {
+    let Some((arena, bound)) = host.source(constructor) else {
+        return Ok(None);
+    };
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_javascript_file() || facts.is_declaration_file())
+    {
+        return Ok(None);
+    }
+    let constructor_record = preflight_node(store, host, constructor)?;
+    let NodeData::ConstructorDeclaration(constructor_data) = &constructor_record.data else {
+        return Ok(None);
+    };
+    let Some(body) = constructor_data.body else {
+        return Ok(None);
+    };
+    let body = NodeRef::new(constructor.arena, constructor.file, body);
+    let body_record = preflight_node(store, host, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Ok(None);
+    };
+    let [first, second] = block.statements.nodes.as_slice() else {
+        return Ok(None);
+    };
+    let first_statement = NodeRef::new(constructor.arena, constructor.file, *first);
+    let second_statement = NodeRef::new(constructor.arena, constructor.file, *second);
+    let Some(first) = javascript_constructor_boolean_assignment(store, host, body, first_statement)
+    else {
+        return Ok(None);
+    };
+    let Some(second) =
+        javascript_constructor_boolean_assignment(store, host, body, second_statement)
+    else {
+        return Ok(None);
+    };
+    let Some(annotation) = leading_jsdoc_comment(arena, first_statement)
+        .map_err(|_| invariant(ClassInvariant::InvalidProperty(first.expression)))?
+    else {
+        return Ok(None);
+    };
+    if !annotation.diagnostics().is_empty()
+        || annotation
+            .type_tag()
+            .and_then(|tag| tag.type_expression())
+            .is_none_or(|annotation| {
+                !matches!(
+                    annotation.type_(),
+                    JsDocType::Intrinsic(JsDocIntrinsicType::Boolean)
+                )
+            })
+    {
+        return Ok(None);
+    }
+
+    let first_value = preflight_node(store, host, first.right)?;
+    if !matches!(
+        (&first_value.data, first_value.kind),
+        (
+            NodeData::KeywordExpression(keyword),
+            SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+        ) if keyword.flow_node.is_none()
+    ) {
+        return Ok(None);
+    }
+    let first_name = preflight_node(store, host, first.name)?;
+    let second_name = preflight_node(store, host, second.name)?;
+    let (NodeData::Identifier(first_name), NodeData::Identifier(second_name)) =
+        (&first_name.data, &second_name.data)
+    else {
+        return Ok(None);
+    };
+    if first_name.text != second_name.text {
+        return Ok(None);
+    }
+
+    let outer_record = preflight_node(store, host, second.right)?;
+    let NodeData::PrefixUnaryExpression(outer) = &outer_record.data else {
+        return Ok(None);
+    };
+    let inner = NodeRef::new(second.right.arena, second.right.file, outer.operand);
+    let inner_record = preflight_node(store, host, inner)?;
+    let NodeData::PrefixUnaryExpression(inner_expression) = &inner_record.data else {
+        return Ok(None);
+    };
+    let read = NodeRef::new(inner.arena, inner.file, inner_expression.operand);
+    let read_record = preflight_node(store, host, read)?;
+    let NodeData::PropertyAccessExpression(read_access) = &read_record.data else {
+        return Ok(None);
+    };
+    let read_receiver = NodeRef::new(read.arena, read.file, read_access.expression);
+    let receiver_record = preflight_node(store, host, read_receiver)?;
+    let read_name = NodeRef::new(read.arena, read.file, read_access.name);
+    let read_name_record = preflight_node(store, host, read_name)?;
+    if outer_record.kind != SyntaxKind::PrefixUnaryExpression
+        || outer.operator != SyntaxKind::ExclamationToken
+        || inner_record.kind != SyntaxKind::PrefixUnaryExpression
+        || inner_record.parent != Some(second.right.node)
+        || inner_record.flags.0 != 0
+        || inner_expression.operator != SyntaxKind::ExclamationToken
+        || read_record.kind != SyntaxKind::PropertyAccessExpression
+        || read_record.parent != Some(inner.node)
+        || read_record.flags.0 != 0
+        || read_access.flow_node.is_some()
+        || read_access.question_dot_token.is_some()
+        || read_access.facts != 0
+        || receiver_record.kind != SyntaxKind::ThisKeyword
+        || receiver_record.parent != Some(read.node)
+        || receiver_record.flags.0 != 0
+        || !matches!(
+            &receiver_record.data,
+            NodeData::KeywordExpression(keyword) if keyword.flow_node.is_none()
+        )
+        || read_name_record.kind != SyntaxKind::Identifier
+        || read_name_record.parent != Some(read.node)
+        || read_name_record.flags.0 != 0
+        || !matches!(
+            &read_name_record.data,
+            NodeData::Identifier(identifier)
+                if identifier.flow_node.is_none() && identifier.text == first_name.text
+        )
+    {
+        return Ok(None);
+    }
+
+    let Some(property) = bound.symbol(first.expression) else {
+        return Ok(None);
+    };
+    let Some(record) = store.symbol(property) else {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(
+            first.expression,
+        )));
+    };
+    if bound.symbol(second.expression) != Some(property)
+        || record.flags() != SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+        || record.check_flags() != CheckFlags::NONE
+        || record.name().as_utf8() != Some(first_name.text.as_str())
+        || record.declarations() != Some(&[first.expression, second.expression])
+        || record.value_declaration() != Some(first.expression)
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent() != Some(owner)
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(property) != Some(property)
+        || instance_members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(&first_name.text))
+            != Some(property)
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(
+            first.expression,
+        )));
+    }
+
+    Ok(Some(ClassPropertyPlan {
+        declaration: first.expression,
+        symbol: property,
+        name_node: first.name,
+        type_node: first.right,
+        initializer_node: Some(first.right),
+        initializer_text: None,
+        initializer_string: None,
+        initializer_parameter_name: None,
+        initializer_assertion: None,
+        merged_interface_annotation: None,
+        auto_accessor: false,
+        name: first_name.text.clone(),
+        side: ClassPropertySide::Instance,
+        optional: false,
+        definite: false,
+        readonly: false,
+        ambient_private_modifier: None,
+        parameter_property: false,
+        javascript_constructor_assignment: true,
+    }))
+}
+
 fn plan_constructor(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1693,7 +1966,16 @@ fn plan_constructor(
             {
                 return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
             }
-            if !block.statements.nodes.is_empty() {
+            if !block.statements.nodes.is_empty()
+                && plan_javascript_constructor_boolean_property(
+                    store,
+                    host,
+                    owner,
+                    declaration,
+                    instance_members,
+                )?
+                .is_none()
+            {
                 return Err(unsupported(ClassUnsupported::Member {
                     node: declaration,
                     kind: SyntaxKind::Constructor,
@@ -4454,6 +4736,7 @@ fn plan_property(
         readonly,
         ambient_private_modifier: None,
         parameter_property: false,
+        javascript_constructor_assignment: false,
     })
 }
 
@@ -4582,6 +4865,7 @@ fn plan_ambient_private_implicit_any_property(
         readonly: false,
         ambient_private_modifier: Some(modifier),
         parameter_property: false,
+        javascript_constructor_assignment: false,
     })
 }
 
@@ -6237,6 +6521,7 @@ fn plan_class_declaration(
                     readonly: parameter_property.readonly,
                     ambient_private_modifier: None,
                     parameter_property: true,
+                    javascript_constructor_assignment: false,
                 };
                 if !instance_names.insert(property.name.clone()) {
                     return Err(unsupported(ClassUnsupported::DuplicateProperty(
@@ -6258,6 +6543,21 @@ fn plan_class_declaration(
                         parameter.declaration,
                     )));
                 }
+            }
+            if let Some(property) = plan_javascript_constructor_boolean_property(
+                store,
+                host,
+                symbol,
+                member,
+                instance_members,
+            )? {
+                if !instance_names.insert(property.name.clone()) {
+                    return Err(unsupported(ClassUnsupported::DuplicateProperty(
+                        property.declaration,
+                    )));
+                }
+                properties.push(property.clone());
+                instance_properties.push(property);
             }
             constructor = Some(planned);
             continue;
@@ -7093,6 +7393,15 @@ fn property_initializer_fresh_literal_type(
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(initializer)))?;
+    if property.javascript_constructor_assignment {
+        return match store.source_node_kind(initializer) {
+            Some(SyntaxKind::TrueKeyword) => Ok(Some(bootstrap.true_type)),
+            Some(SyntaxKind::FalseKeyword) => Ok(Some(bootstrap.false_type)),
+            _ => Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                initializer,
+            ))),
+        };
+    }
     let regular = if let Some(value) = property.initializer_string.as_deref() {
         let Some(regular) = bootstrap.cached_string_literal_type(value) else {
             return Ok(None);
@@ -7184,6 +7493,23 @@ fn planned_property_type(
             node: property.type_node,
             kind: record.kind,
         }));
+    }
+    if property.javascript_constructor_assignment {
+        if property.initializer_node != Some(property.type_node)
+            || !matches!(
+                (&record.data, record.kind),
+                (
+                    NodeData::KeywordExpression(keyword),
+                    SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+                ) if keyword.flow_node.is_none()
+            )
+        {
+            return Err(invariant(ClassInvariant::InvalidPlan(property.declaration)));
+        }
+        return store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.boolean_type)
+            .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(property.type_node)));
     }
     if let Some(modifier) = property.ambient_private_modifier {
         let NodeData::Identifier(identifier) = &record.data else {
@@ -7957,7 +8283,10 @@ fn validate_property_cache_state(
         || property.initializer_assertion.is_some()
     {
         Some(property_type)
-    } else if property.initializer_text.is_some() || property.initializer_string.is_some() {
+    } else if property.initializer_text.is_some()
+        || property.initializer_string.is_some()
+        || property.javascript_constructor_assignment
+    {
         property_initializer_fresh_literal_type(store, property)?
     } else {
         None
@@ -8072,7 +8401,10 @@ fn exact_property_type_links(
         || property.initializer_assertion.is_some()
     {
         Some(property_type)
-    } else if property.initializer_text.is_some() || property.initializer_string.is_some() {
+    } else if property.initializer_text.is_some()
+        || property.initializer_string.is_some()
+        || property.javascript_constructor_assignment
+    {
         property_initializer_fresh_literal_type(store, property)
             .ok()
             .flatten()
@@ -14798,38 +15130,51 @@ fn publish_class_property(
     property: &ClassPropertyPlan,
     property_type: TypeId,
 ) {
-    let (initializer_type, regular_type) =
-        if let Some(number) = property_initializer_number(property) {
-            let regular = store
-                .regular_number_literal_type(number)
-                .expect("the class transaction prepared its numeric field literal");
-            (
-                Some(
-                    store
-                        .fresh_type_of_literal_type(regular)
-                        .expect("the prepared numeric field literal retains its fresh type"),
-                ),
-                Some(regular),
-            )
-        } else if let Some(value) = property.initializer_string.as_deref() {
-            let regular = store
-                .regular_string_literal_type(value.to_owned())
-                .expect("the class transaction prepared its string field literal");
-            (
-                Some(
-                    store
-                        .fresh_type_of_literal_type(regular)
-                        .expect("the prepared string field literal retains its fresh type"),
-                ),
-                Some(regular),
-            )
-        } else if property.initializer_parameter_name.is_some()
-            || property.initializer_assertion.is_some()
-        {
-            (Some(property_type), None)
-        } else {
-            (None, None)
-        };
+    let (initializer_type, regular_type) = if property.javascript_constructor_assignment {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .expect("an authenticated constructor assignment retains intrinsic types");
+        match store.source_node_kind(property.type_node) {
+            Some(SyntaxKind::TrueKeyword) => {
+                (Some(bootstrap.true_type), Some(bootstrap.regular_true_type))
+            }
+            Some(SyntaxKind::FalseKeyword) => (
+                Some(bootstrap.false_type),
+                Some(bootstrap.regular_false_type),
+            ),
+            _ => unreachable!("the constructor property retained a boolean literal"),
+        }
+    } else if let Some(number) = property_initializer_number(property) {
+        let regular = store
+            .regular_number_literal_type(number)
+            .expect("the class transaction prepared its numeric field literal");
+        (
+            Some(
+                store
+                    .fresh_type_of_literal_type(regular)
+                    .expect("the prepared numeric field literal retains its fresh type"),
+            ),
+            Some(regular),
+        )
+    } else if let Some(value) = property.initializer_string.as_deref() {
+        let regular = store
+            .regular_string_literal_type(value.to_owned())
+            .expect("the class transaction prepared its string field literal");
+        (
+            Some(
+                store
+                    .fresh_type_of_literal_type(regular)
+                    .expect("the prepared string field literal retains its fresh type"),
+            ),
+            Some(regular),
+        )
+    } else if property.initializer_parameter_name.is_some()
+        || property.initializer_assertion.is_some()
+    {
+        (Some(property_type), None)
+    } else {
+        (None, None)
+    };
     if property.ambient_private_modifier.is_none() {
         let node_type = if property.initializer_node == Some(property.type_node) {
             initializer_type.expect("an inferred field retains its initializer type")
@@ -14885,7 +15230,7 @@ fn publish_class_property(
             },
         ));
     }
-    if !property.auto_accessor {
+    if !property.auto_accessor && !property.javascript_constructor_assignment {
         assert!(store.set_source_property_readonly(property.symbol, property.readonly));
     }
     let resolved_type =
@@ -16911,6 +17256,94 @@ fn exact_stored_private_assertion_property(
             })
 }
 
+fn exact_stored_javascript_constructor_property(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    property: SemanticSymbolId,
+) -> Option<NodeRef> {
+    let record = store.symbol(property)?;
+    let [first, second] = record.declarations()? else {
+        return None;
+    };
+    let first = *first;
+    let second = *second;
+    let bootstrap = store.intrinsic_bootstrap()?;
+    if record.flags() != SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+        || record.check_flags() != CheckFlags::NONE
+        || record.value_declaration() != Some(first)
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent() != Some(owner)
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(property) != Some(property)
+        || store.value_symbol_links(property)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(bootstrap.boolean_type),
+                ..ValueSymbolLinks::default()
+            })
+        || store
+            .symbol(owner)
+            .and_then(Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(record.name()))
+            != Some(property)
+    {
+        return None;
+    }
+
+    let mut constructor = None;
+    for declaration in [first, second] {
+        let SourceNodeParent::Parent(statement) = store.source_node_parent(declaration)? else {
+            return None;
+        };
+        let SourceNodeParent::Parent(body) = store.source_node_parent(statement)? else {
+            return None;
+        };
+        let SourceNodeParent::Parent(current) = store.source_node_parent(body)? else {
+            return None;
+        };
+        if store.source_node_kind(declaration) != Some(SyntaxKind::BinaryExpression)
+            || store.source_node_kind(statement) != Some(SyntaxKind::ExpressionStatement)
+            || store.source_node_kind(body) != Some(SyntaxKind::Block)
+            || store.source_node_kind(current) != Some(SyntaxKind::Constructor)
+            || store.source_node_parent(current)
+                != Some(SourceNodeParent::Parent(owner_declaration))
+            || constructor.is_some_and(|previous| previous != current)
+        {
+            return None;
+        }
+        constructor = Some(current);
+    }
+
+    let mut literal = None;
+    for index in (0..first.node.index()).rev() {
+        let node = NodeRef::new(
+            first.arena,
+            first.file,
+            ts_ast::NodeId::new(u32::try_from(index).ok()?),
+        );
+        if store.source_node_parent(node) != Some(SourceNodeParent::Parent(first)) {
+            continue;
+        }
+        let expected = match store.source_node_kind(node) {
+            Some(SyntaxKind::TrueKeyword) => bootstrap.true_type,
+            Some(SyntaxKind::FalseKeyword) => bootstrap.false_type,
+            _ => continue,
+        };
+        if literal.replace((node, expected)).is_some() {
+            return None;
+        }
+    }
+    let (literal, expected) = literal?;
+    (store.type_node_links(literal)
+        == Some(&TypeNodeLinks {
+            resolved_type: Some(expected),
+            ..TypeNodeLinks::default()
+        }))
+    .then_some(first)
+}
+
 fn exact_stored_property(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
@@ -16920,6 +17353,14 @@ fn exact_stored_property(
     let record = store.symbol(property)?;
     if record.flags().intersects(SymbolFlags::ACCESSOR) {
         return exact_stored_merged_auto_accessor(store, owner, owner_declaration, property);
+    }
+    if record.flags() == SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT {
+        return exact_stored_javascript_constructor_property(
+            store,
+            owner,
+            owner_declaration,
+            property,
+        );
     }
     let [declaration] = record.declarations()? else {
         return None;

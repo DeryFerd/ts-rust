@@ -50766,6 +50766,109 @@ mod tests {
     }
 
     #[test]
+    fn javascript_constructor_jsdoc_boolean_assignments_publish_one_binder_owned_field() {
+        let source = parse_javascript_source_file(concat!(
+            "class C { constructor() { ",
+            "/** @type {boolean} */ this.a = true; ",
+            "this.a = !!this.a; ",
+            "} }",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_574);
+        let mut context = javascript_context(
+            file,
+            &source,
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let owner = global_symbol(&context, "C");
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        let [property] = members.declared_instance_properties() else {
+            panic!("the constructor must publish its one binder-owned instance property")
+        };
+        let record = context.store().symbol(*property).unwrap();
+        assert_eq!(record.name().as_utf8(), Some("a"));
+        assert_eq!(
+            record.flags(),
+            SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+        );
+        assert_eq!(record.declarations().unwrap().len(), 2);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(*property)
+                .and_then(|links| links.resolved_type),
+            Some(context.store().intrinsic_bootstrap().unwrap().boolean_type),
+        );
+        let first_value = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TrueKeyword).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            resolved_node_type(&context, first_value),
+            context.store().intrinsic_bootstrap().unwrap().true_type,
+        );
+        assert_eq!(
+            validate_class_heritage_members(context.store(), members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_constructor_jsdoc_boolean_assignments_reject_poisoned_field_cache() {
+        let source = parse_javascript_source_file(concat!(
+            "class C { constructor() { ",
+            "/** @type {boolean} */ this.a = true; ",
+            "this.a = !!this.a; ",
+            "} }",
+        ));
+        let file = FileId::new(8_575);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let owner = global_symbol(&context, "C");
+        let property = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("a"))
+            .unwrap();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        mark_source_unchecked(&mut context, file);
+        let poisoned = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Class(_))
+        ));
+        assert_eq!(observable_state(&context, file), poisoned);
+    }
+
+    #[test]
     fn javascript_class_expandos_are_typed_unsupported_before_class_publication() {
         for (index, source_text) in [
             "class C { static blah1 = 123; } C.blah2 = 456;",
