@@ -94,7 +94,8 @@ use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callables::{
-        StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
+        CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
+        validate_stored_single_callable,
     },
     classes::{
         ClassConstructorVisibility, ClassGrammarDiagnostic, ClassGrammarDiagnosticPlan,
@@ -36978,6 +36979,100 @@ fn cached_javascript_function_expando_object_type(
     Ok(Some(cached))
 }
 
+fn declared_callable_expando_property_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    assignment: &PlannedArrowExpandoAssignment,
+    target: TypeId,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let invalid = || {
+        SourceCheckError::Assignment(AssignmentInvariant::InvalidSymbolShape(
+            assignment.property_symbol,
+        ))
+    };
+    let variable = store
+        .symbol(assignment.variable_symbol)
+        .ok_or_else(invalid)?;
+    let declaration = variable.value_declaration().ok_or_else(invalid)?;
+    let declaration_record = host.node(declaration).ok_or_else(invalid)?;
+    let NodeData::VariableDeclaration(variable_data) = &declaration_record.data else {
+        return Err(invalid());
+    };
+    let Some(annotation) = variable_data
+        .type_
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return Ok(None);
+    };
+    let annotation_record = host.node(annotation).ok_or_else(invalid)?;
+    let NodeData::TypeLiteralNode(_) = &annotation_record.data else {
+        return Err(invalid());
+    };
+    let target_record = store.type_payload(target).ok_or_else(invalid)?;
+    let TypeData::Object(object) = target_record.data() else {
+        return Err(invalid());
+    };
+    let target_owner = target_record.symbol().ok_or_else(invalid)?;
+    let target_owner_record = store.symbol(target_owner).ok_or_else(invalid)?;
+    let property = store
+        .symbol(assignment.property_symbol)
+        .ok_or_else(invalid)?;
+    let declared = object
+        .structured
+        .members
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get(property.name()))
+        .ok_or_else(invalid)?;
+    let declared_record = store.symbol(declared).ok_or_else(invalid)?;
+    let [declared_declaration] = declared_record.declarations().ok_or_else(invalid)? else {
+        return Err(invalid());
+    };
+    let links = store.value_symbol_links(declared).ok_or_else(invalid)?;
+    let property_type = links.resolved_type.ok_or_else(invalid)?;
+    let flags = declared_record.flags();
+    if declaration_record.kind != SyntaxKind::VariableDeclaration
+        || annotation_record.kind != SyntaxKind::TypeLiteral
+        || annotation_record.parent != Some(declaration.node)
+        || store
+            .type_node_links(annotation)
+            .and_then(|links| links.resolved_type)
+            != Some(target)
+        || target_owner_record.flags() != SymbolFlags::TYPE_LITERAL
+        || target_owner_record.declarations() != Some(&[annotation])
+        || object.structured.members != target_owner_record.members()
+        || !store.type_has_declared_call_set_provenance(target)
+        || !matches!(
+            validate_stored_single_callable(store, target),
+            StoredSingleCallableValidation::Valid {
+                family: CallableFamily::DeclaredCallSignatures,
+                ..
+            }
+        )
+        || !(flags == SymbolFlags::PROPERTY
+            || flags == (SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL))
+        || declared_record.check_flags() != CheckFlags::NONE
+        || declared_record.name() != property.name()
+        || declared_record.value_declaration() != Some(*declared_declaration)
+        || declared_record.parent() != Some(target_owner)
+        || declared_record.members().is_some()
+        || declared_record.exports().is_some()
+        || declared_record.export_symbol().is_some()
+        || store.get_merged_symbol(declared) != Some(declared)
+        || store.source_node_kind(*declared_declaration) != Some(SyntaxKind::PropertySignature)
+        || store.source_node_parent(*declared_declaration)
+            != Some(super::store::SourceNodeParent::Parent(annotation))
+        || links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(property_type),
+                ..ValueSymbolLinks::default()
+            })
+        || store.type_payload(property_type).is_none()
+    {
+        return Err(invalid());
+    }
+    Ok(Some(property_type))
+}
+
 fn non_module_value_augmentation_diagnostic(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -47399,11 +47494,15 @@ pub(super) fn check_source_file(
                     None,
                     &mut deferred,
                 )?;
+                let Some(callable) = store.source_callable_type_for_owner(assignment.owner_symbol)
+                else {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.owner_symbol),
+                    ));
+                };
                 if current_flow_types.get(&assignment.variable_symbol) != Some(&receiver.result)
-                    || store.source_callable_type_for_owner(assignment.owner_symbol)
-                        != Some(receiver.result)
                     || !matches!(
-                        validate_stored_source_callable(store, receiver.result),
+                        validate_stored_source_callable(store, callable),
                         StoredSourceCallableValidation::Valid(_)
                     )
                 {
@@ -47411,10 +47510,47 @@ pub(super) fn check_source_file(
                         AssignmentInvariant::InvalidSymbolShape(assignment.owner_symbol),
                     ));
                 }
+                let declared_property_type = if receiver.result == callable {
+                    None
+                } else {
+                    Some(
+                        declared_callable_expando_property_type(
+                            store,
+                            host,
+                            &assignment,
+                            receiver.result,
+                        )?
+                        .ok_or(SourceCheckError::Assignment(
+                            AssignmentInvariant::InvalidSymbolShape(assignment.owner_symbol),
+                        ))?,
+                    )
+                };
 
-                let (property_type, assigned_type) = if let Some(annotation) =
-                    &assignment.jsdoc_type
-                {
+                let (property_type, assigned_type) = if let Some(target) = declared_property_type {
+                    if assignment.jsdoc_type.is_some() {
+                        return Err(SourceCheckError::Assignment(
+                            AssignmentInvariant::InvalidSymbolShape(assignment.property_symbol),
+                        ));
+                    }
+                    let checked = check_assignment_to_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        &mut deferred,
+                        target,
+                        None,
+                        &assignment.right,
+                        assignment.left,
+                        Some(assignment.expression),
+                    )?;
+                    (target, checked.assigned_type)
+                } else if let Some(annotation) = &assignment.jsdoc_type {
                     let target = match cached_javascript_function_expando_object_type(
                         store,
                         &assignment,
@@ -78142,6 +78278,73 @@ class Foo2 {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn annotated_callable_array_properties_suppress_only_their_own_expando_diagnostics() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parsed(concat!(
+            "const example: { (): void; items?: string[] } = () => undefined;\n",
+            "example.items = [];\n",
+            "function f1() {}\n",
+            "f1.a = [];\n",
+            "const f2 = function () {};\n",
+            "f2.a = [];\n",
+            "const f3 = () => {};\n",
+            "f3.a = [];\n",
+            "const f4: { (): void; a: string[] } = () => {};\n",
+            "f4.a = [];\n",
+            "const f5: { (): void; a: string[] } = function () {};\n",
+            "f5.a = [];\n",
+        ));
+        let library_file = FileId::new(8_469);
+        let file = FileId::new(8_470);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 3);
+        for (diagnostic, expected) in diagnostics.iter().zip(["f1.a", "f2.a", "f3.a"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 7008);
+            assert_eq!(diagnostic.diagnostic.arguments, ["a", "any[]"]);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), expected);
+        }
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for index in [0, 4, 5] {
+            let (left, _) = assignment_parts(&source, file, index);
+            let expression = NodeRef::new(
+                source.arena.id(),
+                file,
+                source.arena.get(left.node).unwrap().parent.unwrap(),
+            );
+            let (_, bound) = context.file(file).unwrap();
+            let property = bound.symbol(expression).unwrap();
+            let property_type = context
+                .store()
+                .value_symbol_links(property)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(resolved_node_type(&context, left), property_type);
+            assert_eq!(
+                context
+                    .store()
+                    .canonical_array_element_type(context.global_types(), property_type),
+                Ok(Some(string)),
+            );
+        }
+
+        let expected_diagnostics = context.diagnostics().clone();
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(context.diagnostics(), &expected_diagnostics);
     }
 
     #[test]

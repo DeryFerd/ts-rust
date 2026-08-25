@@ -2097,7 +2097,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || owner.declarations() != Some(&[declaration])
             || owner.value_declaration() != Some(declaration)
             || owner.members().is_some()
-            || owner.exports().is_some()
             || owner.parent().is_some()
             || owner.export_symbol().is_some()
         {
@@ -2122,9 +2121,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if symbol.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE {
             return symbol.parent().is_none()
                 && self.source_node_kind(anchor_declaration)
-                    == Some(SyntaxKind::VariableDeclaration);
+                    == Some(SyntaxKind::VariableDeclaration)
+                && (owner.exports().is_none()
+                    || self.source_contextual_variable_expando_exports_are_exact(
+                        declaration,
+                        owner_symbol,
+                        anchor_declaration,
+                    ));
         }
-        if symbol.flags() != SymbolFlags::PROPERTY
+        if owner.exports().is_some()
+            || symbol.flags() != SymbolFlags::PROPERTY
             || self.source_node_kind(anchor_declaration) != Some(SyntaxKind::PropertyAssignment)
             || self.source_node_parent(declaration)
                 != Some(SourceNodeParent::Parent(anchor_declaration))
@@ -2160,6 +2166,124 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .and_then(|members| self.symbol_table(members))
                 .and_then(|members| members.get(symbol.name()))
                 == Some(anchor)
+    }
+
+    fn source_contextual_variable_expando_exports_are_exact(
+        &self,
+        declaration: NodeRef,
+        owner_symbol: SemanticSymbolId,
+        variable: NodeRef,
+    ) -> bool {
+        let Some(owner) = self.symbol(owner_symbol) else {
+            return false;
+        };
+        let Some(exports) = owner
+            .exports()
+            .and_then(|exports| self.symbol_table(exports))
+        else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(list)) = self.source_node_parent(variable) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(variable_statement)) = self.source_node_parent(list)
+        else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(variable_statement)
+        else {
+            return false;
+        };
+        let Some(facts) = self.source_node_facts.get(&declaration.arena) else {
+            return false;
+        };
+        let mut annotations = facts.iter().enumerate().filter_map(|(index, facts)| {
+            let facts = facts.as_ref()?;
+            (facts.kind == SyntaxKind::TypeLiteral && facts.parent == Some(variable.node))
+                .then_some(index)
+        });
+        let Some(annotation) = annotations.next() else {
+            return false;
+        };
+        let Ok(annotation) = u32::try_from(annotation) else {
+            return false;
+        };
+        let annotation = NodeRef::new(declaration.arena, declaration.file, NodeId::new(annotation));
+        let Some(target) = self
+            .type_node_links(annotation)
+            .and_then(|links| links.resolved_type)
+        else {
+            return false;
+        };
+        if exports.is_empty()
+            || annotations.next().is_some()
+            || self.source_node_parent(declaration) != Some(SourceNodeParent::Parent(variable))
+            || self.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+            || self.source_node_kind(variable_statement) != Some(SyntaxKind::VariableStatement)
+            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || !self.type_has_declared_call_set_provenance(target)
+        {
+            return false;
+        }
+
+        exports.iter().all(|(name, property_symbol)| {
+            let Some(property) = self.symbol(property_symbol) else {
+                return false;
+            };
+            let Some([assignment]) = property.declarations() else {
+                return false;
+            };
+            let assignment = *assignment;
+            let Some(SourceNodeParent::Parent(statement)) = self.source_node_parent(assignment)
+            else {
+                return false;
+            };
+            let matching_declared_property = self.links.value_symbol.find_key(|candidate| {
+                let Some(declared) = self.symbol(*candidate) else {
+                    return false;
+                };
+                let Some([property_declaration]) = declared.declarations() else {
+                    return false;
+                };
+                let Some(target_owner) = declared.parent().and_then(|owner| self.symbol(owner))
+                else {
+                    return false;
+                };
+                let flags = declared.flags();
+                (flags == SymbolFlags::PROPERTY
+                    || flags == (SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL))
+                    && declared.name() == name
+                    && declared.check_flags() == CheckFlags::NONE
+                    && declared.value_declaration() == Some(*property_declaration)
+                    && declared.members().is_none()
+                    && declared.exports().is_none()
+                    && declared.export_symbol().is_none()
+                    && self.get_merged_symbol(*candidate) == Some(*candidate)
+                    && target_owner.flags() == SymbolFlags::TYPE_LITERAL
+                    && target_owner.declarations() == Some(&[annotation])
+                    && self.source_node_kind(*property_declaration)
+                        == Some(SyntaxKind::PropertySignature)
+                    && self.source_node_parent(*property_declaration)
+                        == Some(SourceNodeParent::Parent(annotation))
+                    && self
+                        .value_symbol_links(*candidate)
+                        .and_then(|links| links.resolved_type)
+                        .is_some_and(|type_| self.types.get(type_).is_some())
+            });
+            property.flags() == (SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT)
+                && property.check_flags() == CheckFlags::NONE
+                && property.name() == name
+                && property.value_declaration() == Some(assignment)
+                && property.members().is_none()
+                && property.exports().is_none()
+                && property.parent() == Some(owner_symbol)
+                && property.export_symbol().is_none()
+                && self.get_merged_symbol(property_symbol) == Some(property_symbol)
+                && self.source_node_kind(assignment) == Some(SyntaxKind::BinaryExpression)
+                && self.source_node_kind(statement) == Some(SyntaxKind::ExpressionStatement)
+                && self.source_node_parent(statement) == Some(SourceNodeParent::Parent(source))
+                && matching_declared_property.is_some()
+        })
     }
 
     pub(super) fn source_callable_provenance(

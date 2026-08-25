@@ -27,6 +27,7 @@ use super::{
     source_callables::{
         SourceCallableError, SourceCallableFamily, SourceCallableInvariant, SourceCallablePlan,
         SourceCallableUnsupported, plan_source_callable,
+        source_arrow_owner_expando_exports_are_valid,
     },
     variables::{
         VariableBindingKind, VariableInvariant, VariablePlanError, VariableUnsupported,
@@ -628,6 +629,85 @@ fn contextual_declared_call_signature_shape(
     Ok((call.parameters.nodes.len(), return_type))
 }
 
+fn contextual_declared_expando_exports_are_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    variable_declaration: NodeRef,
+    type_node: NodeRef,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+) -> bool {
+    let Some((arena, bound)) = host.source(declaration) else {
+        return false;
+    };
+    let Some(target_record) = host.node(type_node) else {
+        return false;
+    };
+    let NodeData::TypeLiteralNode(_) = &target_record.data else {
+        return false;
+    };
+    let Some(target_owner) = bound.symbol(type_node) else {
+        return false;
+    };
+    let Some(target_owner_record) = store.symbol(target_owner) else {
+        return false;
+    };
+    let Some(target_members) = target_owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+    else {
+        return false;
+    };
+    let Some(exports) = store
+        .symbol(owner_symbol)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+    else {
+        return false;
+    };
+    if target_record.kind != SyntaxKind::TypeLiteral
+        || target_record.parent != Some(variable_declaration.node)
+        || target_owner_record.flags() != SymbolFlags::TYPE_LITERAL
+        || target_owner_record.declarations() != Some(&[type_node])
+        || store.get_merged_symbol(target_owner) != Some(target_owner)
+        || !source_arrow_owner_expando_exports_are_valid(store, owner_symbol, declaration)
+    {
+        return false;
+    }
+
+    exports.iter().all(|(name, property)| {
+        let Some(declared) = target_members.get(name) else {
+            return false;
+        };
+        let Some(declared_record) = store.symbol(declared) else {
+            return false;
+        };
+        let Some(assignment) = store
+            .symbol(property)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+        else {
+            return false;
+        };
+        let Some(statement) = host
+            .node(assignment)
+            .and_then(|record| record.parent)
+            .map(|node| NodeRef::new(assignment.arena, assignment.file, node))
+        else {
+            return false;
+        };
+        declared_record.flags().contains(SymbolFlags::PROPERTY)
+            && declared_record.parent() == Some(target_owner)
+            && declared_record.name() == name
+            && matches!(
+                super::assignment::plan_arrow_expando_assignment(arena, bound, store, statement),
+                Ok(Some(plan))
+                    if plan.expression == assignment
+                        && plan.owner_symbol == owner_symbol
+                        && plan.property_symbol == property
+            )
+    })
+}
+
 #[allow(clippy::too_many_lines)] // Keep the read-only alias and intersection proof atomic.
 fn contextual_function_type_syntax(
     store: &CanonicalTypeMapperStore,
@@ -1119,7 +1199,16 @@ pub(super) fn plan_contextual_source_arrow(
     }
     // Contextual arrows use a separate planner, but retain the same pinned
     // expando ownership: valid property assignments live in owner exports.
-    if owner.exports().is_some() {
+    if owner.exports().is_some()
+        && !contextual_declared_expando_exports_are_exact(
+            store,
+            host,
+            variable_declaration,
+            type_node,
+            initializer,
+            owner_symbol,
+        )
+    {
         return Err(contextual_unsupported(
             SourceContextualArrowUnsupported::ExpandoProperties(initializer),
         ));
@@ -3750,6 +3839,60 @@ mod tests {
                 before,
             );
         }
+    }
+
+    #[test]
+    fn contextual_callable_array_expandos_require_a_matching_declared_property() {
+        for source in [
+            concat!(
+                "const callback: { (): void; items?: string[] } = () => undefined; ",
+                "callback.items = [];",
+            ),
+            concat!(
+                "const callback: { (): void; items: string[] } = () => {}; ",
+                "callback.items = [];",
+            ),
+        ] {
+            let fixture = Fixture::new(source);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            let plan = fixture.contextual_plan(0).unwrap();
+
+            assert!(plan.parameters.is_empty());
+            assert_eq!(plan.contextual_signature_shape.parameter_count, 0);
+            assert!(
+                fixture
+                    .store
+                    .symbol(plan.owner_symbol)
+                    .unwrap()
+                    .exports()
+                    .is_some()
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+                "{source}",
+            );
+        }
+
+        let mismatched = Fixture::new(concat!(
+            "const callback: { (): void; other: string[] } = () => {}; ",
+            "callback.items = [];",
+        ));
+        assert!(matches!(
+            mismatched.contextual_plan(0),
+            Err(SourceContextualArrowError::Unsupported(
+                SourceContextualArrowUnsupported::ExpandoProperties(_)
+            ))
+        ));
     }
 
     #[test]

@@ -2049,9 +2049,17 @@ impl CommonJsAssignmentPlanner<'_> {
         let NodeData::VariableDeclaration(variable_data) = &variable_node.data else {
             return Err(AssignmentInvariant::InvalidSymbolShape(variable_symbol).into());
         };
-        if variable_data.type_.is_some()
-            || variable_data.initializer != Some(initializer.node)
+        if variable_data.initializer != Some(initializer.node)
             || self.node(initializer)?.parent != Some(variable_declaration.node)
+            || variable_data.type_.is_some_and(|annotation| {
+                facts.is_javascript_file()
+                    || !self.annotated_callable_array_expando_is_exact(
+                        variable_declaration,
+                        self.reference(annotation),
+                        &property_name.text,
+                        right,
+                    )
+            })
         {
             return Err(AssignmentPlanError::Unsupported(
                 AssignmentUnsupported::NonOrdinaryVariable(variable_declaration),
@@ -2105,6 +2113,136 @@ impl CommonJsAssignmentPlanner<'_> {
             owner_symbol,
             property_symbol,
         }))
+    }
+
+    /// Authenticates the declared callable-array property behind a typed expando.
+    fn annotated_callable_array_expando_is_exact(
+        &self,
+        variable: NodeRef,
+        annotation: NodeRef,
+        property_name: &str,
+        right: NodeRef,
+    ) -> bool {
+        let Some(annotation_record) = self.arena.get(annotation.node) else {
+            return false;
+        };
+        let NodeData::TypeLiteralNode(literal) = &annotation_record.data else {
+            return false;
+        };
+        let Some(owner_symbol) = self.bound.symbol(annotation) else {
+            return false;
+        };
+        let Some(owner) = self.store.symbol(owner_symbol) else {
+            return false;
+        };
+        let Some(property_symbol) = owner
+            .members()
+            .and_then(|members| self.store.symbol_table(members))
+            .and_then(|members| members.get_source(property_name))
+        else {
+            return false;
+        };
+        let Some(property) = self.store.symbol(property_symbol) else {
+            return false;
+        };
+        let Some([property_declaration]) = property.declarations() else {
+            return false;
+        };
+        let property_declaration = *property_declaration;
+        let Some(property_record) = self.arena.get(property_declaration.node) else {
+            return false;
+        };
+        let NodeData::PropertySignatureDeclaration(property_data) = &property_record.data else {
+            return false;
+        };
+        let array_type = self.reference(property_data.type_);
+        let Some(array_record) = self.arena.get(array_type.node) else {
+            return false;
+        };
+        let NodeData::ArrayTypeNode(array) = &array_record.data else {
+            return false;
+        };
+        let element = self.reference(array.element_type);
+        let Some(element_record) = self.arena.get(element.node) else {
+            return false;
+        };
+        let Some(right_record) = self.arena.get(right.node) else {
+            return false;
+        };
+        let NodeData::ArrayLiteralExpression(value) = &right_record.data else {
+            return false;
+        };
+        let mut signatures = literal.members.nodes.iter().filter_map(|member| {
+            let member = self.reference(*member);
+            let record = self.arena.get(member.node)?;
+            (record.kind == SyntaxKind::CallSignature).then_some((member, record))
+        });
+        let Some((signature, signature_record)) = signatures.next() else {
+            return false;
+        };
+        let NodeData::CallSignatureDeclaration(call) = &signature_record.data else {
+            return false;
+        };
+        let Some(return_type) = call.type_.map(|node| self.reference(node)) else {
+            return false;
+        };
+        let Some(return_record) = self.arena.get(return_type.node) else {
+            return false;
+        };
+        let property_flags = property.flags();
+
+        annotation_record.kind == SyntaxKind::TypeLiteral
+            && annotation_record.parent == Some(variable.node)
+            && annotation_record.flags.0 == 0
+            && literal.symbol.is_none()
+            && literal.members.nodes.len() == 2
+            && !literal.members.has_trailing_comma
+            && owner.flags() == SymbolFlags::TYPE_LITERAL
+            && owner.check_flags() == CheckFlags::NONE
+            && owner.declarations() == Some(&[annotation])
+            && owner.value_declaration().is_none()
+            && owner.exports().is_none()
+            && owner.parent().is_none()
+            && owner.export_symbol().is_none()
+            && self.store.get_merged_symbol(owner_symbol) == Some(owner_symbol)
+            && (property_flags == SymbolFlags::PROPERTY
+                || property_flags == (SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL))
+            && property.check_flags() == CheckFlags::NONE
+            && property.name().as_utf8() == Some(property_name)
+            && property.value_declaration() == Some(property_declaration)
+            && property.members().is_none()
+            && property.exports().is_none()
+            && property.parent() == Some(owner_symbol)
+            && property.export_symbol().is_none()
+            && self.store.get_merged_symbol(property_symbol) == Some(property_symbol)
+            && property_record.kind == SyntaxKind::PropertySignature
+            && property_record.parent == Some(annotation.node)
+            && property_record.flags.0 == 0
+            && property_data.symbol.is_none()
+            && property_data.modifiers.is_none()
+            && array_record.kind == SyntaxKind::ArrayType
+            && array_record.parent == Some(property_declaration.node)
+            && array_record.flags.0 == 0
+            && element_record.kind == SyntaxKind::StringKeyword
+            && element_record.parent == Some(array_type.node)
+            && element_record.flags.0 == 0
+            && signature_record.parent == Some(annotation.node)
+            && signature_record.flags.0 == 0
+            && call.full_signature.is_none()
+            && call.next_container.is_none()
+            && call.symbol.is_none()
+            && call.type_parameters.is_none()
+            && call.parameters.nodes.is_empty()
+            && !call.parameters.has_trailing_comma
+            && return_record.kind == SyntaxKind::VoidKeyword
+            && return_record.parent == Some(signature.node)
+            && return_record.flags.0 == 0
+            && signatures.next().is_none()
+            && right_record.kind == SyntaxKind::ArrayLiteralExpression
+            && right_record.flags.0 == 0
+            && value.elements.nodes.is_empty()
+            && !value.elements.has_trailing_comma
+            && value.facts == 0
     }
 
     fn plan_named(
@@ -4787,6 +4925,89 @@ mod tests {
                 })),
             );
             assert_eq!(observable_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn annotated_callable_array_expandos_require_exact_declared_properties() {
+        for source in [
+            concat!(
+                "const callback: { (): void; items?: string[] } = () => undefined; ",
+                "callback.items = [];",
+            ),
+            concat!(
+                "const callback: { (): void; items: string[] } = () => {}; ",
+                "callback.items = [];",
+            ),
+            concat!(
+                "const callback: { (): void; items: string[] } = function () {}; ",
+                "callback.items = [];",
+            ),
+        ] {
+            let fixture = Fixture::new(source);
+            let statement = fixture.expression_statement(0);
+            let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+            let NodeData::PropertyAccessExpression(access) =
+                &fixture.parsed.arena.get(left.node).unwrap().data
+            else {
+                panic!("expected the annotated callable property")
+            };
+            let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, access.expression);
+            let declaration = fixture.variable_declaration("callback");
+            let NodeData::VariableDeclaration(variable) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected the annotated callable declaration")
+            };
+            let initializer = NodeRef::new(
+                fixture.parsed.arena.id(),
+                fixture.file,
+                variable.initializer.unwrap(),
+            );
+            let before = observable_state(&fixture.store);
+
+            assert_eq!(
+                fixture.arrow_expando_plan(0),
+                Ok(Some(ArrowExpandoAssignmentPlan {
+                    expression,
+                    left,
+                    right,
+                    receiver,
+                    variable_symbol: fixture.bound.symbol(declaration).unwrap(),
+                    owner_symbol: fixture.bound.symbol(initializer).unwrap(),
+                    property_symbol: fixture.bound.symbol(expression).unwrap(),
+                })),
+                "{source}",
+            );
+            assert_eq!(observable_state(&fixture.store), before, "{source}");
+        }
+
+        for source in [
+            "const callback: () => void = () => {}; callback.items = [];",
+            concat!(
+                "const callback: { (): void; other: string[] } = () => {}; ",
+                "callback.items = [];",
+            ),
+            concat!(
+                "const callback: { (): void; items: number[] } = () => {}; ",
+                "callback.items = [];",
+            ),
+            concat!(
+                "const callback: { (): void; items: string[] } = () => {}; ",
+                "callback.items = ['value'];",
+            ),
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture.variable_declaration("callback");
+            let before = observable_state(&fixture.store);
+
+            assert!(matches!(
+                fixture.arrow_expando_plan(0),
+                Err(AssignmentPlanError::Unsupported(
+                    AssignmentUnsupported::NonOrdinaryVariable(node)
+                )) if node == declaration
+            ));
+            assert_eq!(observable_state(&fixture.store), before, "{source}");
         }
     }
 

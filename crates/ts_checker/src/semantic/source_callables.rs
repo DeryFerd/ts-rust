@@ -23,8 +23,9 @@ use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     callables::{
-        StoredSingleCallableValidation, ValidatedSingleCallParameterDisplay,
-        ValidatedSingleCallSignatureDisplay, validate_stored_single_callable,
+        CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallParameterDisplay,
+        ValidatedSingleCallSignatureDisplay, ValidatedSingleCallable,
+        validate_stored_single_callable,
     },
     declared::{
         cached_ordinary_type_parameter_owner, explicit_type_parameter_symbols, preflight_node,
@@ -7905,7 +7906,17 @@ fn publish_prepared_contextual_source_callable(
             && owner.declarations() == Some(&[prepared.declaration])
             && owner.value_declaration() == Some(prepared.declaration)
             && owner.members().is_none()
-            && owner.exports().is_none()
+            && (owner.exports().is_none()
+                || prepared.variable_symbol.is_some_and(|anchor| {
+                    authenticated_contextual_declared_call_target(
+                        store,
+                        prepared.declaration,
+                        prepared.owner_symbol,
+                        anchor,
+                        prepared.contextual_target,
+                    )
+                    .is_some()
+                }))
             && owner.parent().is_none()
             && owner.export_symbol().is_none()
             && store.get_merged_symbol(prepared.owner_symbol) == Some(prepared.owner_symbol)
@@ -7941,7 +7952,24 @@ fn publish_prepared_contextual_source_callable(
         matches!(
             validate_stored_function_type(store, prepared.contextual_target),
             StoredFunctionTypeValidation::Valid(_)
-        )
+        ) || prepared.variable_symbol.is_some_and(|anchor| {
+            authenticated_contextual_declared_call_target(
+                store,
+                prepared.declaration,
+                prepared.owner_symbol,
+                anchor,
+                prepared.contextual_target,
+            )
+            .is_some_and(|target| {
+                target.parameters.len() == parameter_count
+                    && target.min_argument_count == parameter_count
+                    && target
+                        .parameters
+                        .iter()
+                        .zip(prepared.parameters)
+                        .all(|(expected, actual)| *expected == actual.type_)
+            })
+        })
     };
     let parameters_valid = prepared
         .parameters
@@ -8104,6 +8132,104 @@ fn publish_prepared_contextual_source_callable(
         )));
     }
     Ok(type_)
+}
+
+fn authenticated_contextual_declared_call_target(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    variable_symbol: SemanticSymbolId,
+    target: TypeId,
+) -> Option<ValidatedSingleCallable> {
+    let owner = store.symbol(owner_symbol)?;
+    let exports = owner
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))?;
+    let variable = store.symbol(variable_symbol)?;
+    let [variable_declaration] = variable.declarations()? else {
+        return None;
+    };
+    let target_record = store.type_payload(target)?;
+    let TypeData::Object(object) = target_record.data() else {
+        return None;
+    };
+    let target_owner = target_record.symbol()?;
+    let target_owner_record = store.symbol(target_owner)?;
+    let [target_declaration] = target_owner_record.declarations()? else {
+        return None;
+    };
+    let target_members = object
+        .structured
+        .members
+        .and_then(|members| store.symbol_table(members))?;
+    if exports.is_empty()
+        || variable.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+        || store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+        || store.source_node_parent(declaration)
+            != Some(SourceNodeParent::Parent(*variable_declaration))
+        || store.source_node_kind(*target_declaration) != Some(SyntaxKind::TypeLiteral)
+        || store.source_node_parent(*target_declaration)
+            != Some(SourceNodeParent::Parent(*variable_declaration))
+        || store
+            .type_node_links(*target_declaration)
+            .and_then(|links| links.resolved_type)
+            != Some(target)
+        || target_owner_record.flags() != SymbolFlags::TYPE_LITERAL
+        || object.structured.members != target_owner_record.members()
+        || !store.type_has_declared_call_set_provenance(target)
+        || !source_arrow_owner_expando_exports_are_valid(store, owner_symbol, declaration)
+        || !store.source_contextual_callable_anchor_is_exact(
+            declaration,
+            owner_symbol,
+            variable_symbol,
+        )
+        || exports.iter().any(|(name, property)| {
+            let Some(declared) = target_members.get(name) else {
+                return true;
+            };
+            let Some(declared_record) = store.symbol(declared) else {
+                return true;
+            };
+            let Some([property_declaration]) = declared_record.declarations() else {
+                return true;
+            };
+            let flags = declared_record.flags();
+            !(flags == SymbolFlags::PROPERTY
+                || flags == (SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL))
+                || declared_record.check_flags() != CheckFlags::NONE
+                || declared_record.name() != name
+                || declared_record.parent() != Some(target_owner)
+                || declared_record.value_declaration() != Some(*property_declaration)
+                || store.source_node_kind(*property_declaration)
+                    != Some(SyntaxKind::PropertySignature)
+                || store.source_node_parent(*property_declaration)
+                    != Some(SourceNodeParent::Parent(*target_declaration))
+                || store
+                    .value_symbol_links(declared)
+                    .and_then(|links| links.resolved_type)
+                    .is_none_or(|type_| store.type_payload(type_).is_none())
+                || store
+                    .symbol(property)
+                    .is_none_or(|record| record.parent() != Some(owner_symbol))
+        })
+    {
+        return None;
+    }
+
+    let StoredSingleCallableValidation::Valid {
+        family: CallableFamily::DeclaredCallSignatures,
+        callable,
+        ..
+    } = validate_stored_single_callable(store, target)
+    else {
+        return None;
+    };
+    let signature = store.signature(callable.signature)?;
+    (signature.type_parameters().is_empty()
+        && !signature.has_rest_parameter()
+        && callable.rest_parameter.is_none()
+        && callable.return_type.is_some())
+    .then_some(callable)
 }
 
 fn valid_direct_call_contextual_target(
@@ -9472,7 +9598,19 @@ pub(super) fn validate_stored_source_callable(
             && (owner.flags() != SymbolFlags::FUNCTION
                 || owner.declarations() != Some(&[declaration])
                 || !source_arrow_owner_expando_exports_are_valid(store, owner_symbol, declaration)
-                || contextual.is_some() && owner.exports().is_some())
+                || owner.exports().is_some()
+                    && contextual.is_some_and(|(target, anchor)| {
+                        anchor.is_none_or(|anchor| {
+                            authenticated_contextual_declared_call_target(
+                                store,
+                                declaration,
+                                owner_symbol,
+                                anchor,
+                                target,
+                            )
+                            .is_none()
+                        })
+                    }))
         || family == SourceCallableFamily::FunctionDeclaration
             && !valid_source_function_owner_shape(store, owner_symbol, declaration)
         || owner.check_flags() != CheckFlags::NONE
@@ -9645,7 +9783,19 @@ pub(super) fn validate_stored_source_callable(
                 matches!(
                     validate_stored_function_type(store, target),
                     StoredFunctionTypeValidation::Valid(_)
-                )
+                ) || variable.is_some_and(|anchor| {
+                    authenticated_contextual_declared_call_target(
+                        store,
+                        declaration,
+                        owner_symbol,
+                        anchor,
+                        target,
+                    )
+                    .is_some_and(|target| {
+                        expected_parameter_types == Some(target.parameters.as_slice())
+                            && target.min_argument_count == target.parameters.len()
+                    })
+                })
             };
         let rest_valid = if signature_record
             .flags()
