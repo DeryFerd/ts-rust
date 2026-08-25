@@ -30797,6 +30797,11 @@ mod tests {
             CanonicalCheckerOptions {
                 allow_unreachable_code: Some(false),
                 isolated_modules: true,
+                no_implicit_any: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
                 ..CanonicalCheckerOptions::default()
             },
         );
@@ -30818,6 +30823,53 @@ mod tests {
         );
         assert_eq!(node_text(&source, diagnostics[2].node.unwrap()), "1 / 0");
         assert_eq!(node_text(&source, diagnostics[3].node.unwrap()), "missing");
+        let enumeration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::EnumDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .expect("the function must contain its local enum declaration");
+        let (_, bound) = context.file(file).unwrap();
+        let enum_owner = bound.symbol(enumeration).unwrap();
+        let enum_type = context
+            .store()
+            .declared_type_links(enum_owner)
+            .and_then(|links| links.declared_type)
+            .expect("the local enum must retain its declared type");
+        let function = function_symbol(&context, &source, file, "invalid");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(function)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            Some(enum_type),
+        );
+        assert!(
+            context
+                .store()
+                .type_node_links(diagnostics[3].node.unwrap())
+                .is_none()
+        );
+        assert!(
+            context
+                .store()
+                .symbol_node_links(diagnostics[3].node.unwrap())
+                .is_none()
+        );
         let warm = observable_state(&context, file);
 
         context.recheck_source_file(file).unwrap();

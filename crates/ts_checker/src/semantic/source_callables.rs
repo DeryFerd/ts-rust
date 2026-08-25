@@ -7562,6 +7562,7 @@ fn valid_inferred_source_callable_return_capability(
     type_: TypeId,
 ) -> bool {
     canonical_lazy_global_jsx_element_return(store, type_)
+        || super::enums::is_canonical_enum_union(store, type_)
         || match array_targets {
             Some(targets) => store
                 .validate_cached_array_capability_with_array_targets(targets, type_)
@@ -8173,7 +8174,9 @@ pub(super) fn validate_stored_source_callable(
         if !valid_return {
             return StoredSourceCallableValidation::Malformed;
         }
-        if !canonical_lazy_global_jsx_element_return(store, return_type) {
+        if !canonical_lazy_global_jsx_element_return(store, return_type)
+            && !super::enums::is_canonical_enum_union(store, return_type)
+        {
             edges.push(return_type);
         }
         return StoredSourceCallableValidation::Valid(edges);
