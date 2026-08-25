@@ -1870,6 +1870,11 @@ fn namespace_generic_annotation_requires_deferral(
     {
         return Ok(true);
     }
+    if let Some(authenticated) = authenticated_react_mixin_validation_map_annotation(
+        arena, bound, store, namespace, annotation,
+    ) {
+        return Ok(authenticated);
+    }
     let mut pending = vec![annotation];
     let mut visited = HashSet::new();
     while let Some(node) = pending.pop() {
@@ -1946,6 +1951,196 @@ fn namespace_generic_annotation_requires_deferral(
         record.for_each_child(|nested| pending.push(child(node, nested)));
     }
     Ok(false)
+}
+
+/// Authenticates React Mixin's three optional `ValidationMap<any>` properties.
+#[allow(clippy::too_many_lines)] // Property, alias export, generic argument, and warm caches share one proof.
+fn authenticated_react_mixin_validation_map_annotation(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    annotation: NodeRef,
+) -> Option<bool> {
+    let annotation_record = arena.get(annotation.node)?;
+    let property = child(annotation, annotation_record.parent?);
+    let property_record = arena.get(property.node)?;
+    let NodeData::PropertyDeclaration(property_data) = &property_record.data else {
+        return None;
+    };
+    let name = child(property, property_data.name);
+    let name_record = arena.get(name.node)?;
+    let NodeData::Identifier(property_identifier) = &name_record.data else {
+        return None;
+    };
+    if !matches!(
+        property_identifier.text.as_str(),
+        "propTypes" | "contextTypes" | "childContextTypes"
+    ) {
+        return None;
+    }
+    let interface = child(property, property_record.parent?);
+    let interface_symbol = bound
+        .symbol(interface)
+        .and_then(|symbol| store.get_merged_symbol(symbol))?;
+    let interface_owner = store.symbol(interface_symbol)?;
+    let namespace_owner = store.symbol(namespace)?;
+    if interface_owner.name().as_utf8() != Some("Mixin")
+        || namespace_owner.name().as_utf8() != Some("React")
+    {
+        return None;
+    }
+
+    let valid = (|| {
+        let facts = bound.source_facts()?;
+        let exports = namespace_owner
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))?;
+        let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+            return None;
+        };
+        let arguments = reference.type_arguments.as_ref()?;
+        let [argument] = arguments.nodes.as_slice() else {
+            return None;
+        };
+        let argument = child(annotation, *argument);
+        let argument_record = arena.get(argument.node)?;
+        let alias_name = child(annotation, reference.type_name);
+        let alias_name_record = arena.get(alias_name.node)?;
+        let NodeData::Identifier(alias_identifier) = &alias_name_record.data else {
+            return None;
+        };
+        let alias = exports
+            .get_source("ValidationMap")
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let alias_owner = store.symbol(alias)?;
+        let [alias_declaration] = alias_owner.declarations()? else {
+            return None;
+        };
+        let alias_declaration = *alias_declaration;
+        let alias_record = arena.get(alias_declaration.node)?;
+        let NodeData::TypeAliasDeclaration(alias_data) = &alias_record.data else {
+            return None;
+        };
+        let parameters = alias_data.type_parameters.as_ref()?;
+        let [parameter] = parameters.nodes.as_slice() else {
+            return None;
+        };
+        let parameter = child(alias_declaration, *parameter);
+        let parameter_record = arena.get(parameter.node)?;
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return None;
+        };
+        let parameter_name = child(parameter, parameter_data.name);
+        let parameter_name_record = arena.get(parameter_name.node)?;
+        let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+            return None;
+        };
+        let parameter_symbol = bound
+            .symbol(parameter)
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let parameter_owner = store.symbol(parameter_symbol)?;
+        let property_symbol = bound
+            .symbol(property)
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let property_owner = store.symbol(property_symbol)?;
+        let any = store.intrinsic_bootstrap()?.any_type;
+
+        (facts.is_declaration_file()
+            && !facts.is_default_library()
+            && namespace_owner.flags().intersects(SymbolFlags::NAMESPACE)
+            && namespace_owner.check_flags() == CheckFlags::NONE
+            && store.get_merged_symbol(namespace) == Some(namespace)
+            && interface_owner.flags().without(SymbolFlags::TRANSIENT) == SymbolFlags::INTERFACE
+            && interface_owner.check_flags() == CheckFlags::NONE
+            && store.get_parent_of_symbol(interface_symbol) == Some(namespace)
+            && exports
+                .get_source("Mixin")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                == Some(interface_symbol)
+            && property_record.kind == SyntaxKind::PropertyDeclaration
+            && property_record.flags.0 == 0
+            && property_record.parent == Some(interface.node)
+            && property_data.type_ == Some(annotation.node)
+            && property_data.postfix_token.is_some()
+            && property_data.initializer.is_none()
+            && name_record.kind == SyntaxKind::Identifier
+            && name_record.flags.0 == 0
+            && name_record.parent == Some(property.node)
+            && property_identifier.flow_node.is_none()
+            && property_owner.name().as_utf8() == Some(property_identifier.text.as_str())
+            && property_owner.flags() == SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL
+            && property_owner.check_flags() == CheckFlags::NONE
+            && store.get_parent_of_symbol(property_symbol) == Some(interface_symbol)
+            && interface_owner
+                .members()
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(property_owner.name()))
+                == Some(property_symbol)
+            && annotation_record.kind == SyntaxKind::TypeReference
+            && annotation_record.flags.0 == 0
+            && annotation_record.parent == Some(property.node)
+            && !arguments.has_trailing_comma
+            && alias_name_record.kind == SyntaxKind::Identifier
+            && alias_name_record.flags.0 == 0
+            && alias_name_record.parent == Some(annotation.node)
+            && alias_identifier.flow_node.is_none()
+            && alias_identifier.text == "ValidationMap"
+            && alias_owner.name().as_utf8() == Some("ValidationMap")
+            && alias_owner.flags() == SymbolFlags::TYPE_ALIAS
+            && alias_owner.check_flags() == CheckFlags::NONE
+            && alias_owner.value_declaration().is_none()
+            && alias_owner.members().is_none()
+            && alias_owner.exports().is_none()
+            && alias_owner.export_symbol().is_none()
+            && store.get_parent_of_symbol(alias) == Some(namespace)
+            && bound
+                .symbol(alias_declaration)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                == Some(alias)
+            && alias_record.kind == SyntaxKind::TypeAliasDeclaration
+            && alias_record.flags.0 == 0
+            && !parameters.has_trailing_comma
+            && parameter_record.kind == SyntaxKind::TypeParameter
+            && parameter_record.parent == Some(alias_declaration.node)
+            && parameter_name_record.kind == SyntaxKind::Identifier
+            && parameter_name_record.parent == Some(parameter.node)
+            && parameter_identifier.text == "T"
+            && parameter_owner.flags() == SymbolFlags::TYPE_PARAMETER
+            && parameter_owner.check_flags() == CheckFlags::NONE
+            && parameter_owner.name().as_utf8() == Some("T")
+            && bound
+                .locals(alias_declaration)
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source("T"))
+                == Some(parameter_symbol)
+            && argument_record.kind == SyntaxKind::AnyKeyword
+            && argument_record.flags.0 == 0
+            && argument_record.parent == Some(annotation.node)
+            && store.type_node_links(argument).is_none_or(|links| {
+                links.outer_type_parameters.is_none()
+                    && links.resolved_type.is_none_or(|cached| cached == any)
+            })
+            && store.symbol_node_links(annotation).is_none_or(|links| {
+                links
+                    .resolved_symbol
+                    .is_none_or(|cached| store.get_merged_symbol(cached) == Some(alias))
+            })
+            && store.type_node_links(annotation).is_none_or(|links| {
+                links.outer_type_parameters.is_none()
+                    && links.resolved_type.is_none_or(|cached| {
+                        store.type_payload(cached).is_some()
+                            && store
+                                .symbol_node_links(annotation)
+                                .and_then(|links| links.resolved_symbol)
+                                .and_then(|cached| store.get_merged_symbol(cached))
+                                == Some(alias)
+                    })
+            }))
+        .then_some(())
+    })()
+    .is_some();
+    Some(valid)
 }
 
 /// Keeps only React Mixin's authenticated optional string display name cold.
@@ -15032,8 +15227,11 @@ mod tests {
                 "mixins?: Array<Mixin<P, S>>; ",
                 "statics?: { [key: string]: any; }; ",
                 "displayName?: string; ",
+                "propTypes?: ValidationMap<any>; ",
+                "contextTypes?: ValidationMap<any>; ",
+                "childContextTypes?: ValidationMap<any>; ",
                 "getDefaultProps?(): P; getInitialState?(): S; ",
-                "} }",
+                "} type ValidationMap<T> = T; }",
             ),
             CanonicalModuleState::Script,
         );
@@ -15045,6 +15243,7 @@ mod tests {
                 annotations,
                 ..
             },
+            SourceNamespaceMemberPlan::TypeAlias { .. },
         ] = namespace.members.as_slice()
         else {
             panic!("React must retain its lifecycle and generic mixin")
@@ -15052,6 +15251,11 @@ mod tests {
         let mixins = generic.properties[0].annotation;
         let statics = generic.properties[1].annotation;
         let display_name = generic.properties[2].annotation;
+        let validation_maps = [
+            generic.properties[3].annotation,
+            generic.properties[4].annotation,
+            generic.properties[5].annotation,
+        ];
 
         assert!(annotations.contains(&mixins));
         assert!(generic.annotation_is_deferred(mixins));
@@ -15059,7 +15263,180 @@ mod tests {
         assert!(generic.annotation_is_deferred(statics));
         assert!(annotations.contains(&display_name));
         assert!(generic.annotation_is_deferred(display_name));
+        for annotation in validation_maps {
+            assert!(annotations.contains(&annotation));
+            assert!(generic.annotation_is_deferred(annotation));
+        }
         assert_eq!(generic.methods.len(), 2);
+    }
+
+    #[test]
+    fn react_mixin_validation_maps_reject_forged_exports_and_cached_symbols() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "type ValidationMap<T> = T; type Other<T> = T; ",
+                "interface Mixin<P, S> { ",
+                "propTypes?: ValidationMap<any>; ",
+                "contextTypes?: ValidationMap<any>; ",
+                "childContextTypes?: ValidationMap<any>; ",
+                "} }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::TypeAlias {
+                symbol: validation, ..
+            },
+            SourceNamespaceMemberPlan::TypeAlias { symbol: other, .. },
+            SourceNamespaceMemberPlan::Interface {
+                generic: Some(generic),
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("React must retain both aliases and its generic Mixin")
+        };
+        let validation = *validation;
+        let other = *other;
+        let annotations = generic
+            .properties
+            .iter()
+            .map(|property| property.annotation)
+            .collect::<Vec<_>>();
+        let exports = fixture
+            .context
+            .store()
+            .symbol(namespace.symbol)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let number = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+
+        assert_eq!(annotations.len(), 3);
+        assert!(
+            annotations
+                .iter()
+                .all(|annotation| generic.annotation_is_deferred(*annotation))
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert!(annotations.iter().all(|annotation| {
+            fixture
+                .context
+                .store()
+                .type_node_links(*annotation)
+                .is_none()
+        }));
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("ValidationMap"),
+                other,
+            ),
+            Some(Some(validation)),
+        );
+        let poisoned = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).is_err());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("ValidationMap"),
+                validation,
+            ),
+            Some(Some(other)),
+        );
+
+        assert!(fixture.context.store_mut_for_test().set_symbol_node_links(
+            annotations[0],
+            SymbolNodeLinks {
+                resolved_symbol: Some(other),
+                ..SymbolNodeLinks::default()
+            },
+        ));
+        let poisoned = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).is_err());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_symbol_node_links(annotations[0], SymbolNodeLinks::default(),)
+        );
+
+        let NodeData::TypeReferenceNode(reference) =
+            &fixture.parsed.arena.get(annotations[0].node).unwrap().data
+        else {
+            panic!("the validation property must retain its generic alias reference")
+        };
+        let argument = child(
+            annotations[0],
+            reference.type_arguments.as_ref().unwrap().nodes[0],
+        );
+        assert!(fixture.context.store_mut_for_test().set_type_node_links(
+            argument,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).is_err());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
     }
 
     #[test]
