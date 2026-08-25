@@ -6680,11 +6680,11 @@ fn check_jsx_source_spread(
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Vec<CheckedJsxAttribute>, SourceCheckError> {
-    let node = match &spread.value {
-        JsxScalarPlan::Identifier { node, .. }
-        | JsxScalarPlan::Property { node, .. }
-        | JsxScalarPlan::Call { node, .. } => node,
-        _ => return Err(unsupported(spread.node, SyntaxKind::JsxSpreadAttribute)),
+    let (JsxScalarPlan::Identifier { node, .. }
+    | JsxScalarPlan::Property { node, .. }
+    | JsxScalarPlan::Call { node, .. }) = &spread.value
+    else {
+        return Err(unsupported(spread.node, SyntaxKind::JsxSpreadAttribute));
     };
     let type_ = execute_scalar(
         store,
