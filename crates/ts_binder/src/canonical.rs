@@ -7854,10 +7854,19 @@ object.arguments = object.eval;
             .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
 
-        let diagnostics = binder.file(file).unwrap().diagnostics();
+        let bound = binder.file(file).unwrap();
+        let diagnostics = bound.diagnostics();
+        let traversal = bound.traversal_order().collect::<Vec<_>>();
+        assert!(diagnostics.windows(2).all(|pair| {
+            position(&traversal, pair[0].node.node) < position(&traversal, pair[1].node.node)
+        }));
+
+        let mut source_order = diagnostics.iter().collect::<Vec<_>>();
+        source_order
+            .sort_by_key(|diagnostic| parsed.arena.get(diagnostic.node.node).unwrap().range.start);
         assert_eq!(
-            diagnostics
-                .iter()
+            source_order
+                .into_iter()
                 .map(|diagnostic| {
                     assert_eq!(diagnostic.diagnostic.code(), 1100);
                     assert_eq!(diagnostic.node.arena, parsed.arena.id());
@@ -7886,10 +7895,6 @@ object.arguments = object.eval;
                 "eval",
             ]
         );
-        assert!(diagnostics.windows(2).all(|pair| {
-            parsed.arena.get(pair[0].node.node).unwrap().range.start
-                < parsed.arena.get(pair[1].node.node).unwrap().range.start
-        }));
     }
 
     #[test]
