@@ -23,12 +23,18 @@ use ts_binder::{
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, SignatureId, TypeId,
+    array_types::CanonicalArrayTargets,
     bootstrap::UnionReduction,
     declared::{
         cached_ordinary_type_parameter_owner, preflight_node, preflight_type_parameter_symbol,
         type_list_key,
     },
     global_types::preflight_generic_global_type_target,
+    instantiate::{InstantiationLimits, InstantiationSession},
+    instantiated_members::{
+        demand_instantiated_property_type, resolve_members_with_array_targets,
+        validate_generic_interface_members,
+    },
     interface_heritage::{
         DirectInterfaceBaseKind, DirectInterfaceHeritageError, DirectInterfaceHeritagePlan,
         plan_direct_interface_heritage,
@@ -12692,6 +12698,51 @@ fn validated_module_namespace_spread_donor(
     Some(result)
 }
 
+fn validated_generic_interface_spread_donor(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_: TypeId,
+) -> Option<Vec<ResolvedObjectProperty>> {
+    validate_direct_generic_reference(store, type_).ok()?;
+    let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
+    let members = resolve_members_with_array_targets(store, type_, array_targets).ok()?;
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    let mut result = Vec::with_capacity(members.properties().len());
+
+    for symbol in members.properties() {
+        let property = store.symbol(*symbol)?;
+        let name = property.name().as_utf8()?.to_owned();
+        let readonly = property.check_flags().contains(CheckFlags::READONLY);
+        if !property.flags().contains(SymbolFlags::PROPERTY)
+            || property.flags().contains(SymbolFlags::OPTIONAL)
+            || property.check_flags().bits()
+                & !(CheckFlags::INSTANTIATED | CheckFlags::READONLY).bits()
+                != 0
+            || property.name().is_reserved_member_name()
+            || property.name().is_private_identifier()
+            || property.name().is_late_bound()
+            || store.get_merged_symbol(*symbol) != Some(*symbol)
+        {
+            return None;
+        }
+        let property_type =
+            demand_instantiated_property_type(store, type_, *symbol, array_targets, &mut session)
+                .ok()?;
+        result.push(ResolvedObjectProperty {
+            name,
+            type_: property_type,
+            readonly,
+            optional: false,
+        });
+    }
+
+    (validate_generic_interface_members(store, type_, array_targets)
+        .ok()?
+        .as_ref()
+        == Some(&members))
+    .then_some(result)
+}
+
 fn spread_union_property_type(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
@@ -12859,6 +12910,17 @@ fn validate_spread_donor(
         .is_some_and(|symbol| symbol.flags() == SymbolFlags::VALUE_MODULE)
     {
         return validated_module_namespace_spread_donor(store, type_).map_or(
+            SpreadDonorValidation::Malformed,
+            SpreadDonorValidation::Valid,
+        );
+    }
+    if record.object_flags().intersects(ObjectFlags::REFERENCE)
+        && record
+            .symbol()
+            .and_then(|symbol| store.symbol(symbol))
+            .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::INTERFACE))
+    {
+        return validated_generic_interface_spread_donor(store, global_types, type_).map_or(
             SpreadDonorValidation::Malformed,
             SpreadDonorValidation::Valid,
         );

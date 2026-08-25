@@ -52632,6 +52632,136 @@ mod tests {
     }
 
     #[test]
+    fn commented_generic_function_result_spreads_instantiate_interface_properties() {
+        let source = parsed(concat!(
+            "interface Box<T> { readonly value: T; label: string; } ",
+            "declare function identity<T>(value: Box<T>): Box<T>; ",
+            "declare const numbers: Box<number>; ",
+            "declare const texts: Box<string>; ",
+            "const numeric = { .../*#__PURE__*/identity(numbers), after: true }; ",
+            "const textual = { ...\n/*#__PURE__*/\nidentity(texts) }; ",
+            "const frozen = { ...identity(numbers) } as const;",
+        ));
+        let file = FileId::new(9_828);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "numeric"))
+                .unwrap(),
+            "{ value: number; label: string; after: boolean; }",
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "textual"))
+                .unwrap(),
+            "{ value: string; label: string; }",
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "frozen"))
+                .unwrap(),
+            "{ readonly value: number; readonly label: string; }",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn generic_function_result_spreads_retain_authorized_array_properties() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parsed(concat!(
+            "interface Box<T> { values: T[]; selected: T; } ",
+            "declare function identity<T>(value: Box<T>): Box<T>; ",
+            "declare const numbers: Box<number>; ",
+            "const copied = { ...identity(numbers) };",
+        ));
+        let library_file = FileId::new(9_829);
+        let file = FileId::new(9_830);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "copied"))
+                .unwrap(),
+            "{ values: number[]; selected: number; }",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn poisoned_generic_spread_donor_proxies_fail_atomically_and_recover() {
+        let source = parsed(concat!(
+            "interface Box<T> { value: T; } ",
+            "declare function identity<T>(value: Box<T>): Box<T>; ",
+            "declare const input: Box<number>; ",
+            "const copied = { ...identity(input) };",
+        ));
+        let file = FileId::new(9_831);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let copied = variable_initializer(&source, file, "copied");
+        let copied_type = resolved_node_type(&context, copied);
+        let donor = variable_value_type(&context, &source, file, "input");
+        let property = declared_object_property_symbol(&context, donor, "value");
+        let expected = context
+            .store()
+            .value_symbol_links(property)
+            .cloned()
+            .unwrap();
+        let mut poisoned_links = expected.clone();
+        poisoned_links.write_type =
+            Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+
+        mark_source_unchecked(&mut context, file);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(property, poisoned_links)
+        );
+        let poisoned = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::ObjectLiteral(
+                SourceObjectLiteralError::InvalidCache {
+                    node,
+                    type_: None,
+                }
+            )) if node == copied
+        ));
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(property, expected)
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(resolved_node_type(&context, copied), copied_type);
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
     fn imported_module_namespace_spreads_preserve_export_values_and_warm_identity() {
         let provider = parsed(concat!(
             "export const count: number = 1; ",
