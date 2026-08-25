@@ -1681,12 +1681,12 @@ impl CanonicalTypeMapperStore {
         let parameter = mapped
             .type_parameter
             .ok_or(MappedTypeError::InvalidMappedType(instantiated))?;
-        let mapper = mapped
+        let instantiation_mapper = mapped
             .object
             .mapper
             .ok_or(MappedTypeError::InvalidMappedType(instantiated))?;
         let Some(TypeMapperApplication::Composite { first, second }) =
-            self.mapper_application(mapper, shape.parameter)
+            self.mapper_application(instantiation_mapper, shape.parameter)
         else {
             return Err(MappedTypeError::InvalidMappedType(instantiated));
         };
@@ -1766,7 +1766,7 @@ impl CanonicalTypeMapperStore {
         Ok(())
     }
 
-    /// Rebinds the authenticated `prop-types` RequiredKeys mapped lookup.
+    /// Rebinds the authenticated `prop-types` `RequiredKeys` mapped lookup.
     ///
     /// Both the mapped parameter and its conditional check retain their
     /// original declaration while the source and `keyof` identities follow
@@ -1807,14 +1807,14 @@ impl CanonicalTypeMapperStore {
         let parameter_mapper = self
             .new_simple_type_mapper(shape.parameter, parameter)
             .ok_or(MappedTypeError::InvalidTypeParameter(shape.parameter))?;
-        let mapper = self
+        let instantiation_mapper = self
             .combine_type_mappers(Some(parameter_mapper), outer_mapper)
             .ok_or(MappedTypeError::InvalidMappedType(shape.mapped))?;
         if !self.set_type_parameter_resolution(
             parameter,
             Some(constraint),
             Some(shape.parameter),
-            Some(mapper),
+            Some(instantiation_mapper),
             None,
         ) {
             return Err(MappedTypeError::InvalidTypeParameter(parameter));
@@ -1831,7 +1831,7 @@ impl CanonicalTypeMapperStore {
             .alloc_indexed_access_type(shape.source_argument, parameter, AccessFlags::NONE)
             .ok_or(MappedTypeError::Capacity)?;
         let template = self
-            .alloc_conditional_type(root, check, extends_type, Some(mapper), None)
+            .alloc_conditional_type(root, check, extends_type, Some(instantiation_mapper), None)
             .ok_or(MappedTypeError::InvalidMappedType(shape.mapped))?;
         let mapped = self
             .alloc_mapped_type(
@@ -1840,19 +1840,21 @@ impl CanonicalTypeMapperStore {
                 Some(shape.declaration),
             )
             .ok_or(MappedTypeError::Capacity)?;
-        if !self.set_object_target_and_mapper(mapped, Some(shape.mapped), Some(mapper))
-            || !self.set_mapped_type_resolution(
-                mapped,
-                Some(shape.declaration),
-                Some(parameter),
-                Some(constraint),
-                None,
-                Some(template),
-                Some(shape.source_argument),
-                None,
-                false,
-            )
-        {
+        if !self.set_object_target_and_mapper(
+            mapped,
+            Some(shape.mapped),
+            Some(instantiation_mapper),
+        ) || !self.set_mapped_type_resolution(
+            mapped,
+            Some(shape.declaration),
+            Some(parameter),
+            Some(constraint),
+            None,
+            Some(template),
+            Some(shape.source_argument),
+            None,
+            false,
+        ) {
             return Err(MappedTypeError::InvalidMappedType(mapped));
         }
         let indexed = self
@@ -1868,7 +1870,7 @@ impl CanonicalTypeMapperStore {
         Ok(indexed)
     }
 
-    /// Validates an instantiated RequiredKeys lookup and its conditional mapper.
+    /// Validates an instantiated `RequiredKeys` lookup and its conditional mapper.
     pub(super) fn validate_prop_types_required_keys_instantiation(
         &self,
         alias: SemanticSymbolId,
@@ -1899,11 +1901,11 @@ impl CanonicalTypeMapperStore {
         let result = self
             .type_payload(instantiated)
             .ok_or(MappedTypeError::InvalidMappedType(instantiated))?;
-        let TypeData::IndexedAccess(indexed) = result.data() else {
+        let TypeData::IndexedAccess(indexed_access) = result.data() else {
             return Err(MappedTypeError::InvalidMappedType(instantiated));
         };
         let mapped_record = self
-            .type_payload(indexed.object_type)
+            .type_payload(indexed_access.object_type)
             .ok_or(MappedTypeError::InvalidMappedType(instantiated))?;
         let TypeData::Mapped(mapped) = mapped_record.data() else {
             return Err(MappedTypeError::InvalidMappedType(instantiated));
@@ -1911,12 +1913,12 @@ impl CanonicalTypeMapperStore {
         let parameter = mapped
             .type_parameter
             .ok_or(MappedTypeError::InvalidMappedType(instantiated))?;
-        let mapper = mapped
+        let instantiation_mapper = mapped
             .object
             .mapper
             .ok_or(MappedTypeError::InvalidMappedType(instantiated))?;
         let Some(TypeMapperApplication::Composite { first, second }) =
-            self.mapper_application(mapper, shape.parameter)
+            self.mapper_application(instantiation_mapper, shape.parameter)
         else {
             return Err(MappedTypeError::InvalidMappedType(instantiated));
         };
@@ -1941,8 +1943,8 @@ impl CanonicalTypeMapperStore {
             || result.object_flags() != ObjectFlags::NONE
             || result.symbol().is_some()
             || result.alias().is_some()
-            || indexed.index_type != constraint
-            || indexed.access_flags != AccessFlags::NONE
+            || indexed_access.index_type != constraint
+            || indexed_access.access_flags != AccessFlags::NONE
             || mapped_record.flags() != TypeFlags::OBJECT
             || !mapped_record
                 .object_flags()
@@ -1957,7 +1959,7 @@ impl CanonicalTypeMapperStore {
             || mapped.name_type.is_some()
             || mapped.contains_error
             || parameter == shape.parameter
-            || mapped_type_parameter_owner(self, indexed.object_type, parameter)
+            || mapped_type_parameter_owner(self, indexed_access.object_type, parameter)
                 != Some(shape.parameter_symbol)
             || self.type_mapper_has_exact_endpoints(first, &[shape.parameter], &[parameter])
                 != Some(true)
@@ -1968,7 +1970,7 @@ impl CanonicalTypeMapperStore {
             ) != Some(true)
             || template.root != original.root
             || template.extends_type != original.extends_type
-            || template.mapper != Some(mapper)
+            || template.mapper != Some(instantiation_mapper)
             || template.combined_mapper.is_some()
             || check.object_type != shape.source_argument
             || check.index_type != parameter
@@ -1980,7 +1982,7 @@ impl CanonicalTypeMapperStore {
             .object_flags()
             .contains(ObjectFlags::MEMBERS_RESOLVED)
         {
-            let member_shape = validate_mapped_shape(self, indexed.object_type)
+            let member_shape = validate_mapped_shape(self, indexed_access.object_type)
                 .map_err(|_| MappedTypeError::InvalidMappedType(instantiated))?;
             let (properties, indexes) =
                 plan_mapped_members(self, &member_shape, MappedTypeModifiers::NONE)
