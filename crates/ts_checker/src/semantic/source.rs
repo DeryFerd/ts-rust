@@ -39992,9 +39992,9 @@ mod tests {
 
     #[test]
     fn recovered_bigint_import_names_preserve_parser_diagnostics_and_ts1141() {
-        for (index, text) in [
-            r#"import { 0n as foo } from "./foo";"#,
-            r#"import { foo as 0n } from "./foo";"#,
+        for (index, (text, expected_specifier)) in [
+            (r#"import { 0n as foo } from "./foo";"#, "0n as foo"),
+            (r#"import { foo as 0n } from "./foo";"#, "0n"),
         ]
         .into_iter()
         .enumerate()
@@ -40017,16 +40017,23 @@ mod tests {
 
             context.check_source_file(file).unwrap();
 
-            let [diagnostic] = context.diagnostics().as_slice() else {
-                panic!("expected one recovered module-specifier diagnostic for {text}")
+            let [specifier_diagnostic, missing_name] = context.diagnostics().as_slice() else {
+                panic!(
+                    "expected recovered module-specifier and missing-name diagnostics for {text}"
+                )
             };
-            assert_eq!(diagnostic.diagnostic.code(), 1141);
-            let specifier = diagnostic.node.expect("specifier diagnostic node");
+            assert_eq!(specifier_diagnostic.diagnostic.code(), 1141);
+            let specifier = specifier_diagnostic
+                .node
+                .expect("specifier diagnostic node");
             assert!(matches!(
                 source.arena.get(specifier.node).map(|record| record.kind),
                 Some(SyntaxKind::AsExpression | SyntaxKind::BigIntLiteral)
             ));
-            assert!(node_text(&source, specifier).contains("0n"));
+            assert_eq!(node_text(&source, specifier), expected_specifier);
+            assert_eq!(missing_name.diagnostic.code(), 2304);
+            assert_eq!(node_text(&source, missing_name.node.unwrap()), "from");
+            assert_eq!(missing_name.diagnostic.arguments, ["from"]);
 
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();
