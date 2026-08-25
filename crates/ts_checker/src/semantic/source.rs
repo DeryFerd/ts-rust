@@ -989,7 +989,15 @@ struct PlannedObjectVariable {
     elements: Vec<PlannedObjectVariableElement>,
     binding: VariableBindingKind,
     type_node: Option<NodeRef>,
+    circular: Option<PlannedCircularObjectBinding>,
     initializer: PlannedExpression,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlannedCircularObjectBinding {
+    symbol: SemanticSymbolId,
+    name: NodeRef,
+    reference: NodeRef,
 }
 
 #[derive(Clone, Debug)]
@@ -15900,7 +15908,27 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             exported,
         )
         .map_err(Self::variable_plan_error)?;
-        let initializer = self.plan_expression(initializer)?;
+        let circular =
+            self.circular_object_binding_reference(binding, type_node, initializer, &bindings)?;
+        if let Some(circular) = circular
+            && (!self.prior_variables.insert(circular.symbol)
+                || !self.readable_variables.insert(circular.symbol))
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(circular.symbol),
+            ));
+        }
+        let initializer = self.plan_expression(initializer);
+        if let Some(circular) = circular {
+            if !self.prior_variables.remove(&circular.symbol)
+                || !self.readable_variables.remove(&circular.symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(circular.symbol),
+                ));
+            }
+        }
+        let initializer = initializer?;
         let mut elements = Vec::with_capacity(bindings.len());
         for element in bindings {
             if self.node(element.name)?.parent != Some(element.element.node) {
@@ -15938,8 +15966,108 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             elements,
             binding,
             type_node,
+            circular,
             initializer,
         })
+    }
+
+    fn circular_object_binding_reference(
+        &self,
+        binding: VariableBindingKind,
+        type_node: Option<NodeRef>,
+        initializer: NodeRef,
+        bindings: &[PlannedObjectBindingElement],
+    ) -> Result<Option<PlannedCircularObjectBinding>, SourceCheckError> {
+        if !self.no_implicit_any || binding != VariableBindingKind::Const || bindings.len() < 2 {
+            return Ok(None);
+        }
+        let Some(type_node) = type_node else {
+            return Ok(None);
+        };
+        let annotation = self.node(type_node)?;
+        let NodeData::UnionTypeNode(union) = &annotation.data else {
+            return Ok(None);
+        };
+        let [first, second] = union.types.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let first = self.reference(*first);
+        let second = self.reference(*second);
+        let first_record = self.node(first)?;
+        let second_record = self.node(second)?;
+        if annotation.kind != SyntaxKind::UnionType
+            || annotation.flags.0 != 0
+            || union.types.has_trailing_comma
+            || first_record.parent != Some(type_node.node)
+            || second_record.parent != Some(type_node.node)
+            || !matches!(
+                (first_record.kind, second_record.kind),
+                (SyntaxKind::StringKeyword, SyntaxKind::NumberKeyword)
+                    | (SyntaxKind::NumberKeyword, SyntaxKind::StringKeyword)
+            )
+            || bindings.iter().any(|binding| {
+                binding.computed_key.is_some()
+                    || !binding.parent_properties.is_empty()
+                    || binding.initializer.is_some()
+                    || binding.rest
+            })
+        {
+            return Ok(None);
+        }
+
+        let object_record = self.node(initializer)?;
+        let NodeData::ObjectLiteralExpression(object) = &object_record.data else {
+            return Ok(None);
+        };
+        if object_record.kind != SyntaxKind::ObjectLiteralExpression
+            || object.properties.nodes.len() != bindings.len()
+            || object.properties.has_trailing_comma
+        {
+            return Ok(None);
+        }
+
+        let mut circular = None;
+        for property in &object.properties.nodes {
+            let property = self.reference(*property);
+            let record = self.node(property)?;
+            let NodeData::ShorthandPropertyAssignment(shorthand) = &record.data else {
+                if record.kind != SyntaxKind::PropertyAssignment {
+                    return Ok(None);
+                }
+                continue;
+            };
+            let reference = self.reference(shorthand.name);
+            let name = self.node(reference)?;
+            let NodeData::Identifier(identifier) = &name.data else {
+                return Ok(None);
+            };
+            let Some(binding) = bindings.iter().find(|binding| {
+                self.node(binding.name).is_ok_and(|record| {
+                    matches!(&record.data, NodeData::Identifier(name)
+                        if name.text == identifier.text)
+                })
+            }) else {
+                return Ok(None);
+            };
+            if record.kind != SyntaxKind::ShorthandPropertyAssignment
+                || record.parent != Some(initializer.node)
+                || name.kind != SyntaxKind::Identifier
+                || name.parent != Some(property.node)
+                || name.flags.0 != 0
+                || identifier.flow_node.is_some()
+                || self.bound.symbol(binding.element) != Some(binding.symbol)
+                || circular
+                    .replace(PlannedCircularObjectBinding {
+                        symbol: binding.symbol,
+                        name: binding.name,
+                        reference,
+                    })
+                    .is_some()
+            {
+                return Ok(None);
+            }
+        }
+        Ok(circular)
     }
 
     fn plan_array_variable_declaration(
@@ -34138,6 +34266,12 @@ fn object_binding_property_type(
             .map_err(|error| super::relater::union_validation_unavailable(receiver, error))?;
         store.resolved_own_property(object, property_name)?;
     } else if receiver != unknown
+        && !primitive_union_object_binding_lacks_property(
+            store,
+            global_types,
+            receiver,
+            property_name,
+        )?
         && let Some(property) = store.resolved_own_property(receiver, property_name)?
     {
         return if property.optional && options.intrinsic.strict_null_checks {
@@ -34173,6 +34307,80 @@ fn object_binding_property_type(
         },
     );
     Ok(error)
+}
+
+fn primitive_union_object_binding_lacks_property(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    receiver: TypeId,
+    name: &str,
+) -> Result<bool, SourceCheckError> {
+    let Some(TypeData::Union(union)) = store.type_payload(receiver).map(TypeRecord::data) else {
+        return Ok(false);
+    };
+    let [first, second] = union.union.types.as_slice() else {
+        return Ok(false);
+    };
+    let first_flags = store
+        .type_payload(*first)
+        .map(TypeRecord::flags)
+        .ok_or(RelationUnavailable::Type(*first))?;
+    let second_flags = store
+        .type_payload(*second)
+        .map(TypeRecord::flags)
+        .ok_or(RelationUnavailable::Type(*second))?;
+    if !matches!(
+        (first_flags, second_flags),
+        (TypeFlags::STRING, TypeFlags::NUMBER) | (TypeFlags::NUMBER, TypeFlags::STRING)
+    ) {
+        return Ok(false);
+    }
+    store.validate_union_constituent_with_global_types(global_types, receiver)?;
+    let empty = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?
+        .empty_object_type;
+
+    for wrapper in [global_types.string_type, global_types.number_type] {
+        if wrapper == empty {
+            return Ok(true);
+        }
+        let record = store
+            .type_payload(wrapper)
+            .ok_or(RelationUnavailable::Type(wrapper))?;
+        let owner = record
+            .symbol()
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(wrapper))?;
+        let symbol = store
+            .symbol(owner)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(wrapper))?;
+        if !symbol.flags().contains(SymbolFlags::INTERFACE)
+            || store.get_merged_symbol(owner) != Some(owner)
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(wrapper).into());
+        }
+        let Some(members) = symbol.members() else {
+            return Ok(true);
+        };
+        let table = store
+            .symbol_table(members)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(wrapper))?;
+        let Some(property) = table.get_source(name) else {
+            return Ok(true);
+        };
+        let property_record = store
+            .symbol(property)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(wrapper))?;
+        if property_record.name().as_utf8() != Some(name)
+            || store.get_parent_of_symbol(property) != Some(owner)
+            || store.get_merged_symbol(property) != Some(property)
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(wrapper).into());
+        }
+    }
+    Ok(false)
 }
 
 fn object_binding_rest_type(
@@ -46041,6 +46249,26 @@ pub(super) fn check_source_file(
                 }
             }
             PlannedStatement::ObjectVariable(variable) => {
+                let circular_flow_types = variable
+                    .circular
+                    .map(|circular| {
+                        let any = store
+                            .intrinsic_bootstrap()
+                            .ok_or(SourceCheckError::LiteralCache(
+                                SourceLiteralCacheError::BootstrapUninitialized,
+                            ))?
+                            .any_type;
+                        let mut flow_types = current_flow_types.clone();
+                        if flow_types.insert(circular.symbol, any).is_some() {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::DuplicateCurrentFlowType(circular.symbol),
+                            ));
+                        }
+                        Ok(flow_types)
+                    })
+                    .transpose()?;
+                let initializer_flow_types =
+                    circular_flow_types.as_ref().unwrap_or(&current_flow_types);
                 let initializer = if let Some(type_node) = variable.type_node {
                     check_planned_assignment(
                         store,
@@ -46050,7 +46278,7 @@ pub(super) fn check_source_file(
                         options,
                         session,
                         diagnostics,
-                        &current_flow_types,
+                        initializer_flow_types,
                         &preflighted_type_import_value_uses,
                         &mut deferred,
                         type_node,
@@ -46071,7 +46299,7 @@ pub(super) fn check_source_file(
                         options,
                         session,
                         diagnostics,
-                        &current_flow_types,
+                        initializer_flow_types,
                         &preflighted_type_import_value_uses,
                         &variable.initializer,
                         None,
@@ -46199,6 +46427,39 @@ pub(super) fn check_source_file(
                             checked.result,
                         )?;
                     }
+                    if let Some(circular) = variable.circular
+                        && binding.symbol == circular.symbol
+                    {
+                        let name_record =
+                            host.node(circular.name)
+                                .ok_or(SourceCheckError::Provenance(
+                                    SourceCheckProvenanceError::MissingNode(circular.name),
+                                ))?;
+                        let NodeData::Identifier(name) = &name_record.data else {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidBindingPattern(circular.name),
+                            ));
+                        };
+                        type_ = store
+                            .intrinsic_bootstrap()
+                            .ok_or(SourceCheckError::LiteralCache(
+                                SourceLiteralCacheError::BootstrapUninitialized,
+                            ))?
+                            .any_type;
+                        merge_retry_diagnostic(
+                            diagnostics,
+                            CanonicalCheckerDiagnostic {
+                                node: Some(circular.name),
+                                range_override: None,
+                                diagnostic: Diagnostic::with_arguments(
+                                    message_by_code(7022)
+                                        .ok_or(SourceCheckError::MissingDiagnostic(7022))?,
+                                    [name.text.clone()],
+                                ),
+                                related_information: Vec::new(),
+                            },
+                        );
+                    }
                     stage_value_type(
                         store,
                         &mut staged_value_types,
@@ -46224,6 +46485,38 @@ pub(super) fn check_source_file(
                             VariableInvariant::DuplicateCurrentFlowType(binding.symbol),
                         ));
                     }
+                }
+                if let Some(circular) = variable.circular {
+                    let name_record =
+                        host.node(circular.name)
+                            .ok_or(SourceCheckError::Provenance(
+                                SourceCheckProvenanceError::MissingNode(circular.name),
+                            ))?;
+                    let NodeData::Identifier(name) = &name_record.data else {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidBindingPattern(circular.name),
+                        ));
+                    };
+                    merge_retry_diagnostic(
+                        diagnostics,
+                        CanonicalCheckerDiagnostic {
+                            node: Some(circular.reference),
+                            range_override: None,
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(2448)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(2448))?,
+                                [name.text.clone()],
+                            ),
+                            related_information: vec![CanonicalCheckerRelatedInformation {
+                                node: Some(circular.name),
+                                diagnostic: Diagnostic::with_arguments(
+                                    message_by_code(2728)
+                                        .ok_or(SourceCheckError::MissingDiagnostic(2728))?,
+                                    [name.text.clone()],
+                                ),
+                            }],
+                        },
+                    );
                 }
             }
             PlannedStatement::ArrayVariable(variable) => {
@@ -79274,6 +79567,127 @@ class Foo2 {
         );
         context.check_source_file(file).unwrap();
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn circular_object_bindings_preserve_exact_diagnostics_and_shorthand_identity() {
+        let source = parsed("const { count, value }: string | number = { count: 0, value };");
+        let file = FileId::new(10_319);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322, 2339, 2339, 7022, 2448],
+        );
+        assert_eq!(node_text(&source, diagnostics[1].node.unwrap()), "count");
+        assert_eq!(node_text(&source, diagnostics[2].node.unwrap()), "value");
+        assert_eq!(node_text(&source, diagnostics[3].node.unwrap()), "value");
+        assert_eq!(node_text(&source, diagnostics[4].node.unwrap()), "value");
+        let [related] = diagnostics[4].related_information.as_slice() else {
+            panic!("the circular read must retain its real declaration")
+        };
+        assert_eq!(related.diagnostic.code(), 2728);
+        assert_eq!(node_text(&source, related.node.unwrap()), "value");
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "value"),
+            context.store().intrinsic_bootstrap().unwrap().any_type,
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn primitive_union_object_bindings_report_ordered_missing_properties() {
+        let source = parsed("const { first, second }: string | number = { first: 1, second: 2 };");
+        let file = FileId::new(10_320);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322, 2339, 2339],
+        );
+        assert_eq!(node_text(&source, diagnostics[1].node.unwrap()), "first");
+        assert_eq!(node_text(&source, diagnostics[2].node.unwrap()), "second");
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn circular_object_bindings_reject_forged_self_reference_links_before_publication() {
+        let source = parsed("const { count, value }: string | number = { count: 0, value };");
+        let file = FileId::new(10_321);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let binding = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::BindingElement(element) = &record.data else {
+                    return None;
+                };
+                let name = element.name.and_then(|name| source.arena.get(name))?;
+                matches!(&name.data, NodeData::Identifier(identifier)
+                    if identifier.text == "value")
+                .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(binding).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let links = ValueSymbolLinks {
+            resolved_type: Some(bootstrap.any_type),
+            write_type: Some(bootstrap.number_type),
+            ..ValueSymbolLinks::default()
+        };
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(symbol, links)
+        );
+        let before = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(VariableInvariant::InvalidValueLinks(actual)))
+                if actual == symbol
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
     }
 
     #[test]
