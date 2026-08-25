@@ -2470,6 +2470,47 @@ mod tests {
     }
 
     #[test]
+    fn literal_computed_binding_defaults_preserve_object_rest_exclusions() {
+        let fixture = binding_fixture(
+            "const { ['optional']: selected = 'fallback', ...remaining } = input;",
+            10_322,
+        );
+        let declaration = binding_declaration(&fixture);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let planned = plan_top_level_object_binding_elements(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            declaration,
+            VariableBindingKind::Const,
+            false,
+        )
+        .unwrap();
+
+        let [selected, rest] = planned.as_slice() else {
+            panic!("expected one defaulted computed binding and one object rest binding")
+        };
+        assert_eq!(selected.property_name, "optional");
+        assert!(selected.computed_key.is_some());
+        assert!(selected.initializer.is_some());
+        assert!(rest.rest);
+        assert_eq!(rest.excluded_properties, vec!["optional".to_owned()]);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
     fn dynamic_computed_object_keys_do_not_forge_rest_exclusions() {
         let fixture = binding_fixture("const { [key]: selected, ...remaining } = input;", 10_321);
         let declaration = binding_declaration(&fixture);

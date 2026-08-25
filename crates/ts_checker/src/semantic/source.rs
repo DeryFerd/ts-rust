@@ -15701,7 +15701,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 .arena
                                 .get(*element)
                                 .and_then(|element| match &element.data {
-                                    NodeData::BindingElement(element) => element.property_name,
+                                    NodeData::BindingElement(element)
+                                        if element.initializer.is_none() =>
+                                    {
+                                        element.property_name
+                                    }
                                     _ => None,
                                 })
                                 .and_then(|name| self.arena.get(name))
@@ -79112,6 +79116,112 @@ class Foo2 {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn computed_object_binding_defaults_preserve_literal_keys_and_rest_exclusions() {
+        let source = parsed(concat!(
+            "interface Input { optional?: string; kept: number; remaining: boolean; } ",
+            "declare const input: Input; ",
+            "const { ['optional']: direct = 'fallback' } = input; ",
+            "const key = 'optional'; ",
+            "const { [key]: constant = 'fallback' } = input; ",
+            "const { [`optional`]: selected = 'fallback', ...rest } = input;",
+        ));
+        let file = FileId::new(10_317);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for name in ["direct", "constant", "selected"] {
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, name),
+                string,
+                "{name}",
+            );
+        }
+        let rest = object_binding_value_type(&context, &source, file, "rest");
+        assert_eq!(
+            context.type_to_string(rest).unwrap(),
+            "{ kept: number; remaining: boolean; }",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn computed_object_binding_defaults_reject_poisoned_symbol_links() {
+        let source = parsed(concat!(
+            "interface Input { optional?: string; } ",
+            "declare const input: Input; ",
+            "const { ['optional']: selected = 'fallback' } = input;",
+        ));
+        let file = FileId::new(10_318);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let binding = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::BindingElement(element) = &record.data else {
+                    return None;
+                };
+                let name = element.name.and_then(|name| source.arena.get(name))?;
+                matches!(&name.data, NodeData::Identifier(identifier)
+                    if identifier.text == "selected")
+                .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(binding).unwrap();
+        let expected = context.store().value_symbol_links(symbol).cloned().unwrap();
+        let mut poisoned = expected.clone();
+        poisoned.write_type = Some(context.store().intrinsic_bootstrap().unwrap().number_type);
+        mark_source_unchecked(&mut context, file);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(symbol, poisoned)
+        );
+        let before = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(VariableInvariant::InvalidValueLinks(actual)))
+                if actual == symbol
+        ));
+        assert_eq!(observable_state(&context, file), before);
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(symbol, expected)
+        );
+        context.check_source_file(file).unwrap();
+        assert!(is_type_checked(&context, file));
     }
 
     #[test]
