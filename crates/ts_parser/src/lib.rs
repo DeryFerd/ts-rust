@@ -8217,11 +8217,8 @@ impl<'a> Parser<'a> {
                 SyntaxKind::OpenBraceToken => {
                     let expression_start = self.current.range.start;
                     self.current = self.scanner.scan();
-                    let expression = if self.current.kind == SyntaxKind::CloseBraceToken {
-                        None
-                    } else {
-                        Some(self.parse_binary_expression(0))
-                    };
+                    let expression = (self.current.kind != SyntaxKind::CloseBraceToken)
+                        .then(|| self.parse_binary_expression(0));
                     let end = if self.current.kind == SyntaxKind::CloseBraceToken {
                         let end = self.current.range.end;
                         self.current = self.scanner.scan_jsx_token();
@@ -8255,14 +8252,14 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        if self.current.kind == SyntaxKind::ConflictMarkerTrivia {
-            while children.last().is_some_and(|child| {
+        while self.current.kind == SyntaxKind::ConflictMarkerTrivia
+            && children.last().is_some_and(|child| {
                 self.arena
                     .get(*child)
                     .is_some_and(|node| node.kind == SyntaxKind::JsxTextAllWhiteSpaces)
-            }) {
-                children.pop();
-            }
+            })
+        {
+            children.pop();
         }
         children
     }

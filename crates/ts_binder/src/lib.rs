@@ -1345,6 +1345,8 @@ impl<'a> Binder<'a> {
         container: NodeId,
         parent_symbol: Option<SymbolId>,
     ) {
+        const BLOCK_SCOPED_FLAGS: u32 = (1 << 0) | (1 << 1) | (1 << 2);
+
         self.result.containers.insert(list_id, container);
         let Some(node) = self.arena.get(list_id) else {
             return;
@@ -1352,7 +1354,6 @@ impl<'a> Binder<'a> {
         let NodeData::VariableDeclarationList(data) = &node.data else {
             return;
         };
-        const BLOCK_SCOPED_FLAGS: u32 = (1 << 0) | (1 << 1) | (1 << 2);
         let block_scoped = node.flags.0 & BLOCK_SCOPED_FLAGS != 0;
         let flags = if block_scoped {
             SymbolFlags::BLOCK_SCOPED_VARIABLE
