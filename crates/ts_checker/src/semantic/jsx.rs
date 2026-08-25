@@ -4758,6 +4758,27 @@ fn resolve_namespace_component_type(
         let NodeData::Identifier(identifier) = &name_record.data else {
             return Err(SourceCheckError::Property(name));
         };
+        if identifier.text == "ComponentType" {
+            if annotation_record.kind != SyntaxKind::TypeReference
+                || reference.type_arguments.is_some()
+                || name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(annotation.node)
+                || identifier.flow_node.is_some()
+            {
+                return Err(SourceCheckError::Property(annotation));
+            }
+            validate_legacy_react_fragment_component_type(
+                store,
+                host,
+                member.namespace,
+                annotation,
+                name,
+            )?;
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Property(annotation),
+            ));
+        }
         let arguments = reference
             .type_arguments
             .as_ref()
@@ -4821,6 +4842,209 @@ fn resolve_namespace_component_type(
     publish_type_links(store, annotation, type_)?;
     publish_attribute_value_links(store, member.member, type_, declaration)?;
     Ok(type_)
+}
+
+#[allow(clippy::too_many_lines)] // The legacy alias and both component owners require one proof.
+fn validate_legacy_react_fragment_component_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: SemanticSymbolId,
+    annotation: NodeRef,
+    name: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let namespace_record = store
+        .symbol(namespace)
+        .ok_or(SourceCheckError::Property(annotation))?;
+    let exports = namespace_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or(SourceCheckError::Property(annotation))?;
+    let alias = exports
+        .get_source("ComponentType")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(SourceCheckError::Property(annotation))?;
+    let alias_record = store
+        .symbol(alias)
+        .ok_or(SourceCheckError::Property(annotation))?;
+    let [declaration] = alias_record
+        .declarations()
+        .ok_or(SourceCheckError::Property(annotation))?
+    else {
+        return Err(SourceCheckError::Property(annotation));
+    };
+    let declaration = *declaration;
+    let declaration_record = host
+        .node(declaration)
+        .ok_or(SourceCheckError::Property(annotation))?;
+    let NodeData::TypeAliasDeclaration(alias_data) = &declaration_record.data else {
+        return Err(SourceCheckError::Property(annotation));
+    };
+    let parameters = alias_data
+        .type_parameters
+        .as_ref()
+        .ok_or(SourceCheckError::Property(annotation))?;
+    let [parameter] = parameters.nodes.as_slice() else {
+        return Err(SourceCheckError::Property(annotation));
+    };
+    let parameter = child_ref(declaration, *parameter);
+    let parameter_record = host
+        .node(parameter)
+        .ok_or(SourceCheckError::Property(annotation))?;
+    let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Err(SourceCheckError::Property(annotation));
+    };
+    let parameter_name = child_ref(parameter, parameter_data.name);
+    let parameter_name_record = host
+        .node(parameter_name)
+        .ok_or(SourceCheckError::Property(annotation))?;
+    let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+        return Err(SourceCheckError::Property(annotation));
+    };
+    let default = parameter_data
+        .default_type
+        .map(|default| child_ref(parameter, default))
+        .ok_or(SourceCheckError::Property(annotation))?;
+    let default_record = host
+        .node(default)
+        .ok_or(SourceCheckError::Property(annotation))?;
+    let NodeData::TypeLiteralNode(default_data) = &default_record.data else {
+        return Err(SourceCheckError::Property(annotation));
+    };
+    let union = child_ref(declaration, alias_data.type_);
+    let union_record = host
+        .node(union)
+        .ok_or(SourceCheckError::Property(annotation))?;
+    let NodeData::UnionTypeNode(union_data) = &union_record.data else {
+        return Err(SourceCheckError::Property(annotation));
+    };
+    let [class, function] = union_data.types.nodes.as_slice() else {
+        return Err(SourceCheckError::Property(annotation));
+    };
+    let facts = host
+        .bound_file(declaration)
+        .and_then(ts_binder::BoundFile::source_facts)
+        .ok_or(SourceCheckError::Property(annotation))?;
+    if !facts.is_declaration_file()
+        || facts.is_default_library()
+        || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+        || namespace_record.check_flags() != CheckFlags::NONE
+        || namespace_record.name().as_utf8() != Some("React")
+        || alias_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::TYPE_ALIAS
+        || alias_record.check_flags() != CheckFlags::NONE
+        || alias_record.name().as_utf8() != Some("ComponentType")
+        || store.get_parent_of_symbol(alias) != Some(namespace)
+        || !host.symbol_matches(store, declaration, alias)
+        || declaration_record.kind != SyntaxKind::TypeAliasDeclaration
+        || declaration_record.flags.0 != 0
+        || parameters.has_trailing_comma
+        || parameter_record.kind != SyntaxKind::TypeParameter
+        || parameter_record.flags.0 != 0
+        || parameter_record.parent != Some(declaration.node)
+        || parameter_data.constraint.is_some()
+        || parameter_name_record.kind != SyntaxKind::Identifier
+        || parameter_name_record.flags.0 != 0
+        || parameter_name_record.parent != Some(parameter.node)
+        || parameter_identifier.flow_node.is_some()
+        || parameter_identifier.text != "P"
+        || default_record.kind != SyntaxKind::TypeLiteral
+        || default_record.flags.0 != 0
+        || default_record.parent != Some(parameter.node)
+        || !default_data.members.nodes.is_empty()
+        || union_record.kind != SyntaxKind::UnionType
+        || union_record.flags.0 != 0
+        || union_record.parent != Some(declaration.node)
+        || union_data.types.has_trailing_comma
+    {
+        return Err(SourceCheckError::Property(annotation));
+    }
+    let mut resolver = host.name_resolver_host(store)?;
+    if resolver
+        .resolve_entity_name(name, SymbolFlags::TYPE)
+        .map_err(super::DeclaredTypeError::from)?
+        .and_then(|resolved| store.get_merged_symbol(resolved))
+        != Some(alias)
+    {
+        return Err(SourceCheckError::Property(annotation));
+    }
+
+    for (component, expected) in [
+        (*class, "ComponentClass"),
+        (*function, "StatelessComponent"),
+    ] {
+        let component = child_ref(union, component);
+        let component_record = host
+            .node(component)
+            .ok_or(SourceCheckError::Property(annotation))?;
+        let NodeData::TypeReferenceNode(reference) = &component_record.data else {
+            return Err(SourceCheckError::Property(annotation));
+        };
+        let component_name = child_ref(component, reference.type_name);
+        let component_name_record = host
+            .node(component_name)
+            .ok_or(SourceCheckError::Property(annotation))?;
+        let NodeData::Identifier(identifier) = &component_name_record.data else {
+            return Err(SourceCheckError::Property(annotation));
+        };
+        let arguments = reference
+            .type_arguments
+            .as_ref()
+            .ok_or(SourceCheckError::Property(annotation))?;
+        let [argument] = arguments.nodes.as_slice() else {
+            return Err(SourceCheckError::Property(annotation));
+        };
+        let argument = child_ref(component, *argument);
+        let argument_record = host
+            .node(argument)
+            .ok_or(SourceCheckError::Property(annotation))?;
+        let NodeData::TypeReferenceNode(argument_reference) = &argument_record.data else {
+            return Err(SourceCheckError::Property(annotation));
+        };
+        let argument_name = child_ref(argument, argument_reference.type_name);
+        let argument_name_record = host
+            .node(argument_name)
+            .ok_or(SourceCheckError::Property(annotation))?;
+        let NodeData::Identifier(argument_identifier) = &argument_name_record.data else {
+            return Err(SourceCheckError::Property(annotation));
+        };
+        let symbol = exports
+            .get_source(expected)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or(SourceCheckError::Property(annotation))?;
+        let owner = store
+            .symbol(symbol)
+            .ok_or(SourceCheckError::Property(annotation))?;
+        if component_record.kind != SyntaxKind::TypeReference
+            || component_record.flags.0 != 0
+            || component_record.parent != Some(union.node)
+            || arguments.has_trailing_comma
+            || component_name_record.kind != SyntaxKind::Identifier
+            || component_name_record.flags.0 != 0
+            || component_name_record.parent != Some(component.node)
+            || identifier.flow_node.is_some()
+            || identifier.text != expected
+            || argument_record.kind != SyntaxKind::TypeReference
+            || argument_record.flags.0 != 0
+            || argument_record.parent != Some(component.node)
+            || argument_reference.type_arguments.is_some()
+            || argument_name_record.kind != SyntaxKind::Identifier
+            || argument_name_record.flags.0 != 0
+            || argument_name_record.parent != Some(argument.node)
+            || argument_identifier.flow_node.is_some()
+            || argument_identifier.text != parameter_identifier.text
+            || owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some(expected)
+            || store.get_parent_of_symbol(symbol) != Some(namespace)
+            || resolver
+                .resolve_entity_name(component_name, SymbolFlags::TYPE)
+                .map_err(super::DeclaredTypeError::from)?
+                .and_then(|resolved| store.get_merged_symbol(resolved))
+                != Some(symbol)
+        {
+            return Err(SourceCheckError::Property(annotation));
+        }
+    }
+    Ok(())
 }
 
 fn authenticated_fragment_component_attributes(
@@ -7335,14 +7559,39 @@ mod runtime_tests {
         context: crate::semantic::CanonicalCheckerContext<'static>,
     }
 
+    const LEGACY_REACT_FRAGMENT_COMPONENT_DECLARATIONS: &str = concat!(
+        "type ComponentType<P = {}> = ComponentClass<P> | StatelessComponent<P>; ",
+        "interface ComponentClass<P = {}> { new(props: P): ReactElement; } ",
+        "interface StatelessComponent<P = {}> { ",
+        "(props: P & { children?: ReactNode; }): ReactElement; ",
+        "} ",
+        "const Fragment: ComponentType; ",
+    );
+
     impl ReactFragmentFixture {
         fn new(source: &str, file: FileId, runtime: CanonicalJsxRuntime) -> Self {
-            let library: &'static ParseResult = Box::leak(Box::new(parse_source_file(concat!(
+            Self::with_fragment_declaration(
+                source,
+                file,
+                runtime,
+                concat!(
+                    "interface ExoticComponent<P = {}> { (props: P): JSX.Element; } ",
+                    "const Fragment: ExoticComponent<{ children?: ReactNode; }>; ",
+                ),
+            )
+        }
+
+        fn with_fragment_declaration(
+            source: &str,
+            file: FileId,
+            runtime: CanonicalJsxRuntime,
+            fragment_declaration: &str,
+        ) -> Self {
+            let library_source = [
                 "declare namespace React { ",
                 "interface ReactElement { marker: string; } ",
                 "type ReactNode = ReactElement | string | number | boolean | null | undefined; ",
-                "interface ExoticComponent<P = {}> { (props: P): JSX.Element; } ",
-                "const Fragment: ExoticComponent<{ children?: ReactNode; }>; ",
+                fragment_declaration,
                 "} ",
                 "declare namespace JSX { ",
                 "interface Element extends React.ReactElement {} ",
@@ -7350,7 +7599,10 @@ mod runtime_tests {
                 "interface IntrinsicElements { ",
                 "main: { children?: React.ReactNode; }; div: {}; span: {}; ",
                 "} }",
-            ))));
+            ]
+            .concat();
+            let library: &'static ParseResult =
+                Box::leak(Box::new(parse_source_file(&library_source)));
             let parsed: &'static ParseResult = Box::leak(Box::new(parse_jsx_source_file(source)));
             assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -7734,6 +7986,102 @@ mod runtime_tests {
                 .value_symbol_links(fragment)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn legacy_react_fragment_component_types_are_authenticated_capability_boundaries() {
+        let mut fixture = ReactFragmentFixture::with_fragment_declaration(
+            "const view = <><div /></>;",
+            FileId::new(8_197),
+            CanonicalJsxRuntime::Classic,
+            LEGACY_REACT_FRAGMENT_COMPONENT_DECLARATIONS,
+        );
+        let globals = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .globals;
+        let namespace = fixture
+            .context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("React"))
+            .unwrap();
+        let exports = fixture.context.store().symbol(namespace).unwrap().exports();
+        let exports = exports
+            .and_then(|exports| fixture.context.store().symbol_table(exports))
+            .unwrap();
+        let alias = exports.get_source("ComponentType").unwrap();
+        let fragment = exports.get_source("Fragment").unwrap();
+        let declaration = fixture
+            .context
+            .store()
+            .symbol(fragment)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .unwrap();
+        let (arena, _) = fixture.context.file(declaration.file).unwrap();
+        let NodeData::VariableDeclaration(variable) = &arena.get(declaration.node).unwrap().data
+        else {
+            panic!("React.Fragment must retain its ambient variable declaration")
+        };
+        let annotation = child_ref(declaration, variable.type_.unwrap());
+
+        assert_eq!(
+            fixture.context.check_source_file(fixture.file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Property(annotation),
+            )),
+        );
+        assert!(fixture.context.store().type_alias_links(alias).is_none());
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(fragment)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_react_fragment_component_types_reject_forged_alias_ownership() {
+        let mut fixture = ReactFragmentFixture::with_fragment_declaration(
+            "const view = <><div /></>;",
+            FileId::new(8_198),
+            CanonicalJsxRuntime::Classic,
+            LEGACY_REACT_FRAGMENT_COMPONENT_DECLARATIONS,
+        );
+        let globals = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .globals;
+        let namespace = fixture
+            .context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("React"))
+            .unwrap();
+        let alias = fixture
+            .context
+            .store()
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("ComponentType"))
+            .unwrap();
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_symbol_relationships(alias, None, None, None, None,)
+        );
+
+        assert!(matches!(
+            fixture.context.check_source_file(fixture.file),
+            Err(SourceCheckError::Property(_))
+        ));
     }
 
     #[test]
