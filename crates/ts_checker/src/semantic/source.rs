@@ -15430,11 +15430,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         if self.node(expression)?.parent != Some(statement.node) {
                             return Err(unsupported());
                         }
-                        let body = self.plan_arrow_return_expression(statement, expression)?;
-                        if matches!(body, PlannedArrowBody::ReturnJsx { .. }) {
-                            return Err(unsupported());
-                        }
-                        body
+                        self.plan_arrow_return_expression(statement, expression)?
                     }
                 }
             }
@@ -23712,26 +23708,53 @@ fn check_planned_arrow_argument(
                 }
             }
         }
-        let body = match &arrow.body {
-            PlannedArrowBody::Empty => None,
-            PlannedArrowBody::Return { expression, .. } => Some(expression),
-            PlannedArrowBody::ReturnJsx { .. } => return Err(SourceCheckError::Arrow(expression)),
-        };
-        publish_checked_source_callable_return(
-            store,
-            host,
-            global_types,
-            source,
-            options,
-            session,
-            diagnostics,
-            current_flow_types,
-            preflighted_type_import_value_uses,
-            deferred,
-            &arrow.callable,
-            signature,
-            body,
-        )?;
+        if let PlannedArrowBody::ReturnJsx {
+            expression: jsx_expression,
+            element,
+            ..
+        } = &arrow.body
+        {
+            let mut jsx_diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = store.check_jsx_element_with_global_types(
+                host,
+                global_types,
+                *element,
+                options,
+                &mut jsx_diagnostics,
+            );
+            merge_retry_diagnostics(diagnostics, jsx_diagnostics);
+            let return_type = result?;
+            publish_parenthesized_jsx_expression_types(
+                store,
+                host,
+                *jsx_expression,
+                *element,
+                return_type,
+            )?;
+            publish_inferred_source_callable_return(store, &arrow.callable, signature, return_type)
+                .map_err(SourcePlanner::callable_plan_error)?;
+        } else {
+            let body = match &arrow.body {
+                PlannedArrowBody::Empty => None,
+                PlannedArrowBody::Return { expression, .. } => Some(expression),
+                PlannedArrowBody::ReturnJsx { .. } => unreachable!("JSX returns were handled"),
+            };
+            publish_checked_source_callable_return(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                deferred,
+                &arrow.callable,
+                signature,
+                body,
+            )?;
+        }
         publish_expression_type(store, expression, type_)?;
         return Ok(CheckedExpressionTypes::leaf(type_, type_));
     }
@@ -64916,6 +64939,115 @@ class Foo2 {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn object_property_functions_publish_jsx_return_types_and_replay_warm() {
+        let declarations = parsed(concat!(
+            "declare namespace JSX { ",
+            "interface Element {} ",
+            "interface IntrinsicElements { div: { label: string } } ",
+            "}",
+        ));
+        let source = ts_parser::parse_jsx_source_file(concat!(
+            "const view = { render: (function () { return (<div label=\"ready\" />); }) }; ",
+            "const result = view.render();",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let declarations_file = FileId::new(9_984);
+        let file = FileId::new(9_985);
+        let mut context = context(
+            &[(declarations_file, &declarations), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let object = variable_initializer(&source, file, "view");
+        let function = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let element = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::JsxSelfClosingElement).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(function).unwrap();
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let element_type = resolved_node_type(&context, element);
+        assert_eq!(object_property_type(&context, object, "render"), callable);
+        assert_eq!(resolved_node_type(&context, function), callable);
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(element_type),
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "result"),
+            element_type
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn object_property_function_jsx_returns_preserve_attribute_diagnostics() {
+        let declarations = parsed(concat!(
+            "declare namespace JSX { ",
+            "interface Element {} ",
+            "interface IntrinsicElements { div: { label: string } } ",
+            "}",
+        ));
+        let source = ts_parser::parse_jsx_source_file(
+            "const view = { render: function () { return <div label={1} />; } };",
+        );
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let declarations_file = FileId::new(9_986);
+        let file = FileId::new(9_987);
+        let mut context = context(
+            &[(declarations_file, &declarations), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one JSX attribute type mismatch")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
