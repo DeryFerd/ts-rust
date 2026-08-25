@@ -2343,6 +2343,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             UnsupportedSourceSyntax::Class(statement),
                         ));
                     };
+                    if is_javascript_file
+                        && let Some(symbol) = self.bound.symbol(statement)
+                        && let Some(grammar) =
+                            self.plan_javascript_jsdoc_ambient_heritage_class(statement, symbol)?
+                    {
+                        statements.push(PlannedStatement::ClassGrammar(grammar));
+                        continue;
+                    }
                     if class.modifiers.as_ref().is_some_and(|modifiers| {
                         matches!(
                             modifiers.list.nodes.as_slice(),
@@ -2546,12 +2554,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 {
                                     return Err(SourceCheckError::Class(statement));
                                 }
-                                statements.push(PlannedStatement::ClassGrammar(grammar));
-                                continue;
-                            }
-                            if let Some(grammar) = self
-                                .plan_javascript_jsdoc_ambient_heritage_class(statement, symbol)?
-                            {
                                 statements.push(PlannedStatement::ClassGrammar(grammar));
                                 continue;
                             }
@@ -9456,6 +9458,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         {
             return Ok(false);
         }
+        let Ok(planned_namespace) = plan_source_namespace(arena, bound, store, declaration) else {
+            return Ok(false);
+        };
+        if planned_namespace.declaration != declaration
+            || planned_namespace.symbol != namespace
+            || !planned_namespace.ambient
+        {
+            return Ok(false);
+        }
         for name in [actual_member, expected_member] {
             let Some(symbol) = exports
                 .get_source(name)
@@ -9469,6 +9480,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             let Some([member_declaration]) = member.declarations() else {
                 return Ok(false);
             };
+            let Some(SourceNamespaceMemberPlan::DeferredAmbientClass {
+                declaration: planned_declaration,
+                symbol: planned_symbol,
+                type_parameters,
+                members,
+                annotations,
+            }) = planned_namespace.members.iter().find(|planned| {
+                matches!(
+                    planned,
+                    SourceNamespaceMemberPlan::DeferredAmbientClass {
+                        symbol: planned_symbol,
+                        ..
+                    } if *planned_symbol == symbol
+                )
+            })
+            else {
+                return Ok(false);
+            };
             let Some(member_record) = arena.get(member_declaration.node) else {
                 return Ok(false);
             };
@@ -9477,9 +9506,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             };
             if member.flags() != SymbolFlags::CLASS
                 || member.check_flags() != CheckFlags::NONE
-                || member.parent() != Some(namespace)
+                || member
+                    .parent()
+                    .and_then(|parent| store.get_merged_symbol(parent))
+                    != Some(namespace)
+                || store.get_parent_of_symbol(symbol) != Some(namespace)
                 || member.value_declaration() != Some(*member_declaration)
                 || member.export_symbol().is_some()
+                || planned_declaration != member_declaration
+                || *planned_symbol != symbol
+                || !type_parameters.is_empty()
+                || !members.is_empty()
+                || !annotations.is_empty()
                 || member_declaration.file != declaration.file
                 || member_record.kind != SyntaxKind::ClassDeclaration
                 || member_record.parent != module.body
@@ -48054,6 +48092,8 @@ class Foo2 {
         )
         .unwrap();
 
+        context.check_source_file(ambient_file).unwrap();
+        assert!(context.diagnostics().is_empty());
         context.check_source_file(source_file).unwrap();
 
         let [diagnostic] = context.diagnostics().as_slice() else {
