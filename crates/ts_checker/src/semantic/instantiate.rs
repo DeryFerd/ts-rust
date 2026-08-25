@@ -863,9 +863,53 @@ fn authenticated_global_concat_array_reference(
     .then_some(reference)
 }
 
+fn authenticated_instantiable_interface_reference(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<DirectGenericReference> {
+    let reference = validate_direct_generic_reference(store, type_).ok()?;
+    if let Some(targets) = array_targets
+        && [targets.array_type(), targets.readonly_array_type()].contains(&reference.target)
+    {
+        return store
+            .canonical_array_reference_with_targets(targets, type_)
+            .ok()?
+            .map(|_| reference);
+    }
+    if let Some(concat) = authenticated_global_concat_array_reference(store, type_) {
+        return Some(concat);
+    }
+
+    let target = store.type_payload(reference.target)?;
+    let symbol = target.symbol()?;
+    let owner = store.symbol(symbol)?;
+    let declarations = owner.declarations()?;
+    (matches!(target.data(), TypeData::Interface(_))
+        && target.object_flags().contains(ObjectFlags::INTERFACE)
+        && !target.object_flags().contains(ObjectFlags::CLASS)
+        && owner.flags().contains(SymbolFlags::INTERFACE)
+        && owner
+            .flags()
+            .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+            == SymbolFlags::NONE
+        && owner.check_flags() == CheckFlags::NONE
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            == Some(reference.target)
+        && !declarations.is_empty()
+        && declarations.iter().all(|declaration| {
+            store.source_node_kind(*declaration) == Some(SyntaxKind::InterfaceDeclaration)
+        }))
+    .then_some(reference)
+}
+
 fn supported_instantiable_union_constituent(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
     match store.type_payload(type_).map(TypeRecord::data) {
         Some(
@@ -877,7 +921,7 @@ fn supported_instantiable_union_constituent(
             | TypeData::StringMapping(_),
         ) => true,
         Some(TypeData::TypeReference(_)) => {
-            authenticated_global_concat_array_reference(store, type_).is_some()
+            authenticated_instantiable_interface_reference(store, type_, array_targets).is_some()
         }
         _ => false,
     }
@@ -968,7 +1012,8 @@ fn validate_instantiable_member_type_worker(
                 Err(InstantiationError::UnsupportedUnionConstituent(type_))
             } else {
                 data.union.types.iter().try_for_each(|constituent| {
-                    if !supported_instantiable_union_constituent(store, *constituent) {
+                    if !supported_instantiable_union_constituent(store, *constituent, array_targets)
+                    {
                         return Err(InstantiationError::UnsupportedUnionConstituent(
                             *constituent,
                         ));
@@ -1269,9 +1314,11 @@ fn instantiated_member_union_matches(
                 substituted
             }
             TypeData::TypeReference(_) => {
-                let Some(reference) =
-                    authenticated_global_concat_array_reference(store, *constituent)
-                else {
+                let Some(reference) = authenticated_instantiable_interface_reference(
+                    store,
+                    *constituent,
+                    array_targets,
+                ) else {
                     return Err(InstantiationError::UnsupportedUnionConstituent(
                         *constituent,
                     ));
@@ -1977,7 +2024,7 @@ fn instantiate_union(
         if store.type_payload(*constituent).is_none() {
             return Err(InstantiationError::InvalidType(*constituent));
         }
-        if !supported_instantiable_union_constituent(store, *constituent) {
+        if !supported_instantiable_union_constituent(store, *constituent, array_targets) {
             return Err(InstantiationError::UnsupportedUnionConstituent(
                 *constituent,
             ));

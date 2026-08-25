@@ -52379,6 +52379,98 @@ class Foo2 {
     }
 
     #[test]
+    fn recursive_generic_interface_unions_keep_explicit_members_before_inherited_proxies() {
+        let source = parsed(concat!(
+            "interface Array<Value> {} ",
+            "interface ReadonlyArray<Value> {} ",
+            "type Tree<Value> = Top<Value> | Virtual<Value>; ",
+            "interface NodeBase<Value> { subs: Tree<Value>[]; } ",
+            "interface Top<Value> extends NodeBase<Value> { type: 'top'; } ",
+            "interface Virtual<Value> extends NodeBase<Value> { type: 'virtual'; } ",
+            "let value: Tree<string>;",
+        ));
+        let file = FileId::new(8_687);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let tree = variable_value_type(&context, &source, file, "value");
+        let TypeData::Union(union) = context.store().type_payload(tree).unwrap().data() else {
+            panic!("the recursive tree alias must retain its generic interface union")
+        };
+        let constituents = union.union.types.clone();
+        assert_eq!(constituents.len(), 2);
+        let globals = context.global_types().clone();
+        let array_target = super::super::instantiated_members::GenericInterfaceArrayTarget::new(
+            globals.array_type,
+        );
+
+        for constituent in constituents {
+            let members = context
+                .store_mut_for_test()
+                .resolve_generic_interface_members(constituent, Some(array_target))
+                .unwrap();
+            assert_eq!(
+                members
+                    .properties()
+                    .iter()
+                    .map(|property| context.store().symbol(*property).unwrap().name().as_utf8())
+                    .collect::<Vec<_>>(),
+                [Some("type"), Some("subs")],
+            );
+            let inherited = context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(constituent, "subs", Some(array_target))
+                .unwrap()
+                .unwrap()
+                .type_id();
+            let array = context
+                .store()
+                .canonical_array_reference(&globals, inherited)
+                .unwrap()
+                .unwrap();
+            assert_eq!(array.element_type, tree);
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn circular_generic_interface_access_reports_all_upstream_diagnostics_without_cache_cycles() {
+        let source = parsed(concat!(
+            "interface Array<Value> {} ",
+            "interface ReadonlyArray<Value> {} ",
+            "type Mxs = Mx<'list', Mxs['p1']>; ",
+            "interface Mx<Value, Result> { p1: Value; p2: Result; } ",
+            "type ArrElem = ['list', ArrElem[number][0]][]; ",
+            "type TupleElem = [['list', TupleElem[0][0]]];",
+        ));
+        let file = FileId::new(8_688);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [4109, 4110, 4110],
+        );
+        assert!(context.store().type_resolution_is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(context.diagnostics().len(), 3);
+    }
+
+    #[test]
     fn simple_interfaces_and_nested_object_literals_check_and_reuse_warm_identity() {
         let source = parsed(concat!(
             "interface Leaf { value: string } ",
