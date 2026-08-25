@@ -3238,6 +3238,17 @@ fn execute_jsx_element(
                     },
                 )?;
                 if !type_arguments.is_empty() {
+                    for argument in type_arguments {
+                        check_intrinsic_type_argument(
+                            store,
+                            host,
+                            source.3,
+                            plan.opening,
+                            *argument,
+                            options,
+                            diagnostics,
+                        )?;
+                    }
                     emit_intrinsic_type_argument_diagnostic(
                         arena,
                         plan.opening,
@@ -8161,6 +8172,85 @@ fn checked_jsx_children_name(
     })
 }
 
+/// Checks rejected intrinsic type arguments without hiding missing nested names.
+fn check_intrinsic_type_argument(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    parent: NodeRef,
+    argument: NodeRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<(), SourceCheckError> {
+    let result = if let Some(global_types) = global_types {
+        CanonicalTypeQuery::new_with_global_types(store, host, global_types, options, diagnostics)?
+            .get_type_from_type_node(argument)
+    } else {
+        CanonicalTypeQuery::new(store, host, options, diagnostics)?
+            .get_type_from_type_node(argument)
+    };
+    match result {
+        Ok(_) => Ok(()),
+        Err(super::DeclaredTypeError::TypeNodeUnavailable(
+            super::type_nodes::TypeNodeUnavailable::MissingTypeReference(missing),
+        )) if missing == argument => {
+            let record = host
+                .node(argument)
+                .ok_or(SourceCheckError::Property(argument))?;
+            let NodeData::TypeReferenceNode(reference) = &record.data else {
+                return Err(SourceCheckError::Property(argument));
+            };
+            let name = child_ref(argument, reference.type_name);
+            let name_record = host.node(name).ok_or(SourceCheckError::Property(name))?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(SourceCheckError::Property(name));
+            };
+            if record.kind != SyntaxKind::TypeReference
+                || record.flags.0 != 0
+                || record.parent != Some(parent.node)
+                || name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(argument.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+                || reference.type_arguments.as_ref().is_some_and(|arguments| {
+                    arguments.nodes.is_empty() || arguments.has_trailing_comma
+                })
+                || store
+                    .type_node_links(argument)
+                    .is_some_and(|links| links != &TypeNodeLinks::default())
+                || [argument, name].into_iter().any(|node| {
+                    store
+                        .symbol_node_links(node)
+                        .is_some_and(|links| links != &SymbolNodeLinks::default())
+                })
+            {
+                return Err(SourceCheckError::Property(argument));
+            }
+            let nested = reference
+                .type_arguments
+                .as_ref()
+                .map(|arguments| arguments.nodes.clone())
+                .unwrap_or_default();
+            let text = identifier.text.clone();
+            add_diagnostic(diagnostics, name, 2304, [text])?;
+            for nested in nested {
+                check_intrinsic_type_argument(
+                    store,
+                    host,
+                    global_types,
+                    argument,
+                    child_ref(argument, nested),
+                    options,
+                    diagnostics,
+                )?;
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn emit_intrinsic_type_argument_diagnostic(
     arena: &NodeArena,
     opening: NodeRef,
@@ -10736,6 +10826,204 @@ mod runtime_tests {
                 .and_then(|links| links.declared_type),
             Some(intrinsic_type),
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep nested missing names, TS2558 ranges, and warm caches together.
+    fn intrinsic_type_arguments_check_references_and_preserve_exact_diagnostics() {
+        let source = concat!(
+            "type Existing = string;\n",
+            "declare namespace JSX {\n",
+            "  interface Element {}\n",
+            "  interface IntrinsicElements { div: any; }\n",
+            "}\n",
+            "const primitive = <div<   number> />;\n",
+            "const direct = <div< Missing>></div>;\n",
+            "const nested = <div<Missing<AlsoMissing>> />;\n",
+            "const named = <div<Existing> />;\n",
+        );
+        let mut fixture = RuntimeFixture::new(source, FileId::new(8_206));
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let namespace = fixture
+            .store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let existing = fixture
+            .store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source("Existing"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("JSX"), namespace),
+            Some(None),
+        );
+        let primitive = fixture.expression("primitive");
+        let direct = fixture.expression("direct");
+        let nested = fixture.expression("nested");
+        let named = fixture.expression("named");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for expression in [primitive, direct, nested, named] {
+            fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        }
+
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2558, 2304, 2558, 2304, 2304, 2558, 2558],
+        );
+        let missing = diagnostics
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.diagnostic.code() == 2304)
+            .map(|diagnostic| {
+                let NodeData::Identifier(name) = &fixture
+                    .parsed
+                    .arena
+                    .get(diagnostic.node.unwrap().node)
+                    .unwrap()
+                    .data
+                else {
+                    panic!("the missing type name must own TS2304")
+                };
+                name.text.as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(missing, ["Missing", "Missing", "AlsoMissing"]);
+        let ranges = diagnostics
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.diagnostic.code() == 2558)
+            .map(|diagnostic| {
+                let range = diagnostic.range_override.unwrap().range();
+                let start = usize::try_from(range.start.get()).unwrap();
+                let end = usize::try_from(range.end.get()).unwrap();
+                &source[start..end]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranges,
+            ["number", "Missing", "Missing<AlsoMissing>", "Existing"],
+        );
+
+        let references = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::TypeReferenceNode(reference) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) =
+                    &fixture.parsed.arena.get(reference.type_name)?.data
+                else {
+                    return None;
+                };
+                matches!(name.text.as_str(), "Existing" | "Missing" | "AlsoMissing").then_some((
+                    name.text.as_str(),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    child_ref(
+                        NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                        reference.type_name,
+                    ),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let (_, named_argument, _) = references
+            .iter()
+            .find(|(name, _, _)| *name == "Existing")
+            .copied()
+            .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(named_argument)
+                .and_then(|links| links.resolved_type),
+            Some(string),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol_node_links(named_argument)
+                .and_then(|links| links.resolved_symbol),
+            Some(existing),
+        );
+        for (name, reference, identifier) in &references {
+            if *name == "Existing" {
+                continue;
+            }
+            assert!(fixture.store.type_node_links(*reference).is_none());
+            assert!(fixture.store.symbol_node_links(*reference).is_none());
+            assert!(fixture.store.symbol_node_links(*identifier).is_none());
+        }
+        let NodeData::JsxElement(direct_element) =
+            &fixture.parsed.arena.get(direct.node).unwrap().data
+        else {
+            panic!("the direct missing reference belongs to a paired intrinsic element")
+        };
+        let direct_opening = child_ref(direct, direct_element.opening_element);
+        let (_, missing_reference, missing_name) = references
+            .iter()
+            .find(|(name, reference, _)| {
+                *name == "Missing"
+                    && fixture
+                        .parsed
+                        .arena
+                        .get(reference.node)
+                        .is_some_and(|record| record.parent == Some(direct_opening.node))
+            })
+            .copied()
+            .unwrap();
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+            fixture.store.index_info_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            diagnostics.as_slice().to_vec(),
+        );
+        for expression in [primitive, direct, nested, named] {
+            fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        }
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                fixture.store.index_info_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                diagnostics.as_slice().to_vec(),
+            ),
+            warm,
+        );
+
+        assert!(fixture.store.set_symbol_node_links(
+            missing_name,
+            SymbolNodeLinks {
+                resolved_symbol: Some(existing),
+            },
+        ));
+        let before = fixture.store.checker_link_allocated_lengths();
+        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
+        assert!(matches!(
+            fixture.store.check_jsx_element(
+                &host,
+                direct,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(SourceCheckError::Property(node)) if node == missing_reference
+        ));
+        assert_eq!(fixture.store.checker_link_allocated_lengths(), before);
     }
 
     #[test]
