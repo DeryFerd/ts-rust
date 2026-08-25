@@ -1489,8 +1489,8 @@ fn plan_constructor_parameter(
         [] => (None, None),
         [(decorator, SyntaxKind::Decorator)] => (Some(*decorator), None),
         [(_, SyntaxKind::PublicKeyword)] => (None, Some(false)),
-        [(_, SyntaxKind::ReadonlyKeyword)] => (None, Some(true)),
-        [
+        [(_, SyntaxKind::ReadonlyKeyword)]
+        | [
             (_, SyntaxKind::PublicKeyword),
             (_, SyntaxKind::ReadonlyKeyword),
         ] => (None, Some(true)),
@@ -16999,8 +16999,12 @@ fn exact_stored_constructor_parameter_property(
             Some(SyntaxKind::ReadonlyKeyword) if !readonly_modifier => {
                 readonly_modifier = true;
             }
-            Some(SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword)
-            | Some(SyntaxKind::PublicKeyword | SyntaxKind::ReadonlyKeyword) => return None,
+            Some(
+                SyntaxKind::PrivateKeyword
+                | SyntaxKind::ProtectedKeyword
+                | SyntaxKind::PublicKeyword
+                | SyntaxKind::ReadonlyKeyword,
+            ) => return None,
             _ => {}
         }
     }
