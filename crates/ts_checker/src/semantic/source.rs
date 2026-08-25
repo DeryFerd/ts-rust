@@ -123,14 +123,15 @@ use super::{
     },
     instantiate::InstantiationSession,
     jsdoc::{
-        JsDocImportType, JsDocType, JsDocTypeParameterBinding, PlannedJavaScriptDeclaration,
-        PlannedJavaScriptJsDoc, PlannedJsDocType, ResolvedJsDocSatisfiesSignature,
-        ResolvedJsDocSignature, append_javascript_jsdoc_diagnostics,
-        bind_planned_jsdoc_type_parameters, leading_jsdoc_comment, plan_javascript_source_jsdoc,
-        preflight_planned_jsdoc_type, preflight_source_jsdoc_function_type,
-        preflight_source_jsdoc_satisfies_type, resolve_planned_jsdoc_callback_signature,
-        resolve_planned_jsdoc_signature, resolve_planned_jsdoc_type,
-        resolve_source_jsdoc_function_type, resolve_source_jsdoc_satisfies_signature,
+        JsDocImportType, JsDocIntrinsicType, JsDocType, JsDocTypeParameterBinding,
+        PlannedJavaScriptDeclaration, PlannedJavaScriptJsDoc, PlannedJsDocType,
+        ResolvedJsDocSatisfiesSignature, ResolvedJsDocSignature,
+        append_javascript_jsdoc_diagnostics, bind_planned_jsdoc_type_parameters,
+        leading_jsdoc_comment, plan_javascript_source_jsdoc, preflight_planned_jsdoc_type,
+        preflight_source_jsdoc_function_type, preflight_source_jsdoc_satisfies_type,
+        resolve_planned_jsdoc_callback_signature, resolve_planned_jsdoc_signature,
+        resolve_planned_jsdoc_type, resolve_source_jsdoc_function_type,
+        resolve_source_jsdoc_satisfies_signature,
     },
     logical_operators::{
         LogicalBinaryError, LogicalBinaryInvariant, LogicalBinaryRequest, LogicalBinaryUnsupported,
@@ -7051,20 +7052,23 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .ok_or(SourceCheckError::Assignment(
                 AssignmentInvariant::InvalidSymbol(owner_symbol),
             ))?;
-        if property.flags() != (SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT)
-            || property.parent() != Some(owner_symbol)
-            || property.name().as_utf8() != Some(object_identifier.text.as_str())
-            || callable
-                .exports()
-                .and_then(|exports| store.symbol_table(exports))
-                .and_then(|exports| exports.get(property.name()))
-                != Some(property_symbol)
+        if property.name().as_utf8() != Some(object_identifier.text.as_str())
             || self
                 .bound
                 .locals(self.bound.source_file())
                 .and_then(|locals| store.symbol_table(locals))
                 .and_then(|locals| locals.get_source(&receiver_identifier.text))
                 != Some(owner.variable_symbol)
+        {
+            return Ok(None);
+        }
+        if property.flags() != (SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT)
+            || property.parent() != Some(owner_symbol)
+            || callable
+                .exports()
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get(property.name()))
+                != Some(property_symbol)
         {
             return Err(SourceCheckError::Assignment(
                 AssignmentInvariant::InvalidSymbolShape(property_symbol),
@@ -36688,6 +36692,7 @@ fn cached_javascript_function_expando_object_type(
         .properties
         .as_deref()
         .ok_or_else(invalid)?;
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
     if record.flags() != TypeFlags::OBJECT
         || record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
         || record.symbol().is_some()
@@ -36718,6 +36723,19 @@ fn cached_javascript_function_expando_object_type(
         } else {
             CheckFlags::NONE
         };
+        let cached_type = store
+            .value_symbol_links(*symbol)
+            .and_then(|links| links.resolved_type);
+        let expected_type = if property.is_optional() {
+            None
+        } else {
+            match property.type_() {
+                JsDocType::Intrinsic(JsDocIntrinsicType::Boolean) => Some(bootstrap.boolean_type),
+                JsDocType::Intrinsic(JsDocIntrinsicType::Number) => Some(bootstrap.number_type),
+                JsDocType::Intrinsic(JsDocIntrinsicType::String) => Some(bootstrap.string_type),
+                _ => None,
+            }
+        };
         if members.get_source(property.name()) != Some(*symbol)
             || record.flags() != expected_flags
             || record.check_flags() != expected_checks
@@ -36728,10 +36746,8 @@ fn cached_javascript_function_expando_object_type(
             || record.exports().is_some()
             || record.parent().is_some()
             || record.export_symbol().is_some()
-            || store
-                .value_symbol_links(*symbol)
-                .and_then(|links| links.resolved_type)
-                .is_none_or(|type_| store.type_payload(type_).is_none())
+            || cached_type.is_none_or(|type_| store.type_payload(type_).is_none())
+            || expected_type.is_some_and(|expected| cached_type != Some(expected))
         {
             return Err(invalid());
         }
@@ -47141,11 +47157,13 @@ pub(super) fn check_source_file(
                 if bound
                     .source_facts()
                     .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
-                    || store
-                        .symbol(assignment.owner_symbol)
-                        .and_then(ts_binder::semantic::Symbol::value_declaration)
-                        .and_then(|declaration| store.source_node_kind(declaration))
-                        == Some(SyntaxKind::FunctionDeclaration)
+                    || matches!(
+                        store
+                            .symbol(assignment.owner_symbol)
+                            .and_then(ts_binder::semantic::Symbol::value_declaration)
+                            .and_then(|declaration| store.source_node_kind(declaration)),
+                        Some(SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionExpression)
+                    )
                 {
                     let links = ValueSymbolLinks {
                         resolved_type: Some(property_type),
@@ -77185,6 +77203,71 @@ class Foo2 {
     }
 
     #[test]
+    fn typescript_function_expression_expandos_publish_properties_before_later_reads() {
+        let source = parsed(concat!(
+            "const f = function () {}; ",
+            "f.a = 1; ",
+            "const x = f.a; ",
+            "export {};",
+        ));
+        let file = FileId::new(8_489);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let function = variable_initializer(&source, file, "f");
+        let (left, right) = assignment_parts(&source, file, 0);
+        let assignment = NodeRef::new(
+            source.arena.id(),
+            file,
+            source.arena.get(left.node).unwrap().parent.unwrap(),
+        );
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(function).unwrap();
+        let property = bound.symbol(assignment).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source("a")),
+            Some(property),
+        );
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(property)
+                .and_then(|links| links.resolved_type),
+            Some(number),
+        );
+        assert_eq!(resolved_node_type(&context, left), number);
+        assert_eq!(
+            resolved_node_type(&context, assignment),
+            resolved_node_type(&context, right),
+        );
+        let read = variable_initializer(&source, file, "x");
+        assert_eq!(variable_value_type(&context, &source, file, "x"), number);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(read)
+                .and_then(|links| links.resolved_symbol),
+            Some(property),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn javascript_function_expando_jsdoc_annotations_type_properties_and_reads() {
         for (index, (source_text, object_property, incompatible)) in [
             (
@@ -77517,6 +77600,112 @@ class Foo2 {
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn unrelated_nested_assignments_after_jsdoc_expandos_remain_unsupported() {
+        for (index, unrelated) in ["other.value.ready = true;", "work.other.ready = true;"]
+            .into_iter()
+            .enumerate()
+        {
+            let source = parse_javascript_source_file(&format!(
+                "function work() {{}}\n\
+                 function other() {{}}\n\
+                 /** @type {{{{ ready: boolean }}}} */\n\
+                 work.value = {{ ready: false }};\n\
+                 {unrelated}",
+            ));
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let file = FileId::new(8_490 + u32::try_from(index).unwrap());
+            let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+            let cold = observable_state(&context, file);
+
+            for _ in 0..2 {
+                assert!(matches!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Assignment(_)
+                    ))
+                ));
+                assert_eq!(observable_state(&context, file), cold);
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn javascript_jsdoc_expando_object_rejects_poisoned_primitive_member_types() {
+        for (index, (annotation, initializer)) in
+            [("boolean", "true"), ("number", "1"), ("string", "'ready'")]
+                .into_iter()
+                .enumerate()
+        {
+            let source = parse_javascript_source_file(&format!(
+                "function work() {{}}\n\
+                 /** @type {{{{ ready: {annotation} }}}} */\n\
+                 work.value = {{ ready: {initializer} }};",
+            ));
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let file = FileId::new(8_492 + u32::try_from(index).unwrap());
+            let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+
+            let owner = function_symbol(&context, &source, file, "work");
+            let property = context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source("value"))
+                .unwrap();
+            let object_type = context
+                .store()
+                .value_symbol_links(property)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let TypeData::Object(object) =
+                context.store().type_payload(object_type).unwrap().data()
+            else {
+                panic!("expected one JSDoc-defined object property")
+            };
+            let member = context
+                .store()
+                .symbol_table(object.structured.members.unwrap())
+                .and_then(|members| members.get_source("ready"))
+                .unwrap();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let poisoned = if annotation == "string" {
+                bootstrap.number_type
+            } else {
+                bootstrap.string_type
+            };
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                member,
+                ValueSymbolLinks {
+                    resolved_type: Some(poisoned),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+            );
+
+            assert!(matches!(
+                context.recheck_source_file(file),
+                Err(SourceCheckError::Variable(VariableInvariant::InvalidValueLinks(symbol)))
+                    if symbol == property
+            ));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                ),
+                before,
+            );
         }
     }
 
