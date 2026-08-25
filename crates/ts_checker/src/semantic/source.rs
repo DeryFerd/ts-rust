@@ -1074,7 +1074,7 @@ struct PlannedArrow {
 
 #[derive(Clone, Debug)]
 pub(super) struct PlannedArrowExpression {
-    callable: SourceCallablePlan,
+    pub(super) callable: SourceCallablePlan,
     parameter_initializers: Vec<PlannedParameterInitializer>,
     expression_statement: Option<PlannedArrowExpressionStatement>,
     loop_body: Option<Box<PlannedLoopFunctionStatements>>,
