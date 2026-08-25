@@ -8820,7 +8820,7 @@ export = equalsValue;
         let exports = binder
             .symbol_store()
             .symbol(module)
-            .and_then(|record| record.exports())
+            .and_then(super::super::semantic::Symbol::exports)
             .and_then(|exports| binder.symbol_store().symbol_table(exports))
             .unwrap();
         let star = exports
