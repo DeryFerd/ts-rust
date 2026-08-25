@@ -30,7 +30,7 @@ use super::{
         cached_ordinary_type_parameter_owner, explicit_type_parameter_symbols, preflight_node,
         type_list_key,
     },
-    functions::{StoredFunctionTypeValidation, validate_stored_function_type},
+    functions::{StoredFunctionTypeValidation, plan_function_type, validate_stored_function_type},
     jsdoc::{
         JsDocIntrinsicType, JsDocType, PlannedJsDocType, ResolvedJsDocSignature,
         plan_javascript_source_jsdoc,
@@ -4891,6 +4891,14 @@ fn validate_exact_generic_annotation_shape(
                 &plan.type_parameters,
             )?;
         }
+        if !exact && !parameter.rest {
+            exact = is_exact_source_fixed_generic_parameter_annotation(
+                store,
+                host,
+                parameter.identity_node,
+                plan.array_targets,
+            )?;
+        }
         if parameter.is_implicit_any()
             || parameter.initializer.is_some()
             || parameter.rest && !exact_array
@@ -4989,6 +4997,64 @@ fn is_exact_jsdoc_generic_union_annotation(
         }
     }
     Ok(undefined && generic)
+}
+
+/// Accepts fixed primitive parameters and fully proven unary primitive callbacks.
+fn is_exact_source_fixed_generic_parameter_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    annotation: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, SourceCallableError> {
+    let record = preflight_node(store, host, annotation)?;
+    if fixed_generic_intrinsic_annotation_kind(record.kind)
+        || is_null_literal_type(store, host, annotation)?
+    {
+        return Ok(true);
+    }
+    if record.kind != SyntaxKind::FunctionType {
+        return Ok(false);
+    }
+    let Ok(callback) = plan_function_type(store, host, annotation, None, false, array_targets)
+    else {
+        return Ok(false);
+    };
+    let [parameter] = callback.parameters.as_slice() else {
+        return Ok(false);
+    };
+    if !callback.type_parameters.is_empty()
+        || callback.flags != SignatureFlags::NONE
+        || callback.min_argument_count != 1
+        || parameter.optional
+    {
+        return Ok(false);
+    }
+    let parameter_record = preflight_node(store, host, parameter.type_node)?;
+    let return_record = preflight_node(store, host, callback.return_type)?;
+    Ok(
+        (fixed_generic_intrinsic_annotation_kind(parameter_record.kind)
+            || is_null_literal_type(store, host, parameter.type_node)?)
+            && (fixed_generic_intrinsic_annotation_kind(return_record.kind)
+                || is_null_literal_type(store, host, callback.return_type)?),
+    )
+}
+
+const fn fixed_generic_intrinsic_annotation_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::AnyKeyword
+            | SyntaxKind::UnknownKeyword
+            | SyntaxKind::StringKeyword
+            | SyntaxKind::NumberKeyword
+            | SyntaxKind::BigIntKeyword
+            | SyntaxKind::BooleanKeyword
+            | SyntaxKind::SymbolKeyword
+            | SyntaxKind::VoidKeyword
+            | SyntaxKind::UndefinedKeyword
+            | SyntaxKind::NullKeyword
+            | SyntaxKind::NeverKeyword
+            | SyntaxKind::ObjectKeyword
+    )
 }
 
 fn exact_ambient_generic_constructor_parameter(
@@ -7798,13 +7864,15 @@ pub(super) fn publish_source_callable_parameter_types(
                             callable.plan.array_targets,
                             supplied_base,
                             type_parameters,
-                        ) || callable.plan.family == SourceCallableFamily::ArrowFunction
-                            && valid_optional_generic_source_parameter_type(
-                                store,
-                                callable.plan.array_targets,
-                                supplied_base,
-                                type_parameters,
-                            ))
+                        ) || !parameter.rest
+                            && valid_fixed_generic_source_parameter_type(store, supplied_base)
+                            || callable.plan.family == SourceCallableFamily::ArrowFunction
+                                && valid_optional_generic_source_parameter_type(
+                                    store,
+                                    callable.plan.array_targets,
+                                    supplied_base,
+                                    type_parameters,
+                                ))
                     })
             {
                 return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
@@ -8948,12 +9016,12 @@ fn valid_stored_generic_source_signature(
         store.source_node_kind(declaration) == Some(SyntaxKind::ArrowFunction)
     });
     let has_rest = signature.flags() == SignatureFlags::HAS_REST_PARAMETER;
+    let fixed_parameter_count = signature
+        .parameters()
+        .len()
+        .saturating_sub(usize::from(has_rest));
     (signature.flags() == SignatureFlags::NONE || has_rest)
-        && minimum_argument_count
-            <= signature
-                .parameters()
-                .len()
-                .saturating_sub(usize::from(has_rest))
+        && minimum_argument_count <= fixed_parameter_count
         && parameter_types.is_none_or(|types| {
             types.len() == signature.parameters().len()
                 && types.iter().enumerate().all(|(index, type_)| {
@@ -8962,13 +9030,15 @@ fn valid_stored_generic_source_signature(
                         array_targets,
                         *type_,
                         type_parameters,
-                    ) || (index >= minimum_argument_count || generic_arrow)
-                        && valid_optional_generic_source_parameter_type(
-                            store,
-                            array_targets,
-                            *type_,
-                            type_parameters,
-                        )
+                    ) || index < fixed_parameter_count
+                        && valid_fixed_generic_source_parameter_type(store, *type_)
+                        || (index >= minimum_argument_count || generic_arrow)
+                            && valid_optional_generic_source_parameter_type(
+                                store,
+                                array_targets,
+                                *type_,
+                                type_parameters,
+                            )
                 })
         })
 }
@@ -9010,7 +9080,82 @@ fn valid_optional_generic_source_parameter_type(
         .filter(|candidate| *candidate != undefined)
         .all(|candidate| {
             valid_generic_source_parameter_type(store, array_targets, candidate, type_parameters)
+                || valid_fixed_generic_source_parameter_type(store, candidate)
         })
+}
+
+/// Authenticates source-independent primitive or unary callback parameters.
+pub(super) fn valid_fixed_generic_source_parameter_type(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> bool {
+    if valid_fixed_generic_intrinsic_type(store, type_) {
+        return true;
+    }
+    if !matches!(
+        validate_stored_function_type(store, type_),
+        StoredFunctionTypeValidation::Valid(_)
+    ) {
+        return false;
+    }
+    let StoredSingleCallableValidation::Valid { callable, .. } =
+        validate_stored_single_callable(store, type_)
+    else {
+        return false;
+    };
+    let Some(signature) = store.signature(callable.signature) else {
+        return false;
+    };
+    let [parameter] = callable.parameters.as_slice() else {
+        return false;
+    };
+    let Some(declaration) = signature.declaration() else {
+        return false;
+    };
+    let Some((return_annotation, null_literal_identity)) =
+        store.function_signature_return_annotation(callable.signature)
+    else {
+        return false;
+    };
+    let return_annotation_valid = if null_literal_identity {
+        store.source_node_kind(return_annotation) == Some(SyntaxKind::LiteralType)
+    } else {
+        store
+            .source_node_kind(return_annotation)
+            .is_some_and(fixed_generic_intrinsic_annotation_kind)
+    };
+    signature.type_parameters().is_empty()
+        && signature.flags() == SignatureFlags::NONE
+        && callable.min_argument_count == 1
+        && callable.rest_parameter.is_none()
+        && store.source_node_parent(return_annotation)
+            == Some(SourceNodeParent::Parent(declaration))
+        && return_annotation_valid
+        && valid_fixed_generic_intrinsic_type(store, *parameter)
+        && callable
+            .return_type
+            .is_none_or(|return_type| valid_fixed_generic_intrinsic_type(store, return_type))
+}
+
+fn valid_fixed_generic_intrinsic_type(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    [
+        bootstrap.any_type,
+        bootstrap.unknown_type,
+        bootstrap.undefined_type,
+        bootstrap.null_type,
+        bootstrap.string_type,
+        bootstrap.number_type,
+        bootstrap.bigint_type,
+        bootstrap.boolean_type,
+        bootstrap.es_symbol_type,
+        bootstrap.void_type,
+        bootstrap.never_type,
+        bootstrap.non_primitive_type,
+    ]
+    .contains(&type_)
 }
 
 fn valid_generic_source_parameter_type(
@@ -17262,7 +17407,7 @@ mod tests {
             "function f<T extends T>(value: T): T { return value; }",
             "function f<T extends string | number>(value: T): T { return value; }",
             "function f<T extends string = number>(): string { return ''; }",
-            "function f<T>(value: string): T { return value as T; }",
+            "function f<T>(value: (item: T) => T): T { return value as any; }",
             "function f<T>(value: T): { value: T } { return { value }; }",
         ]
         .into_iter()

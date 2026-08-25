@@ -2,8 +2,9 @@
 //!
 //! The full-vector branch admits one stored signature with ordered type
 //! parameters, fixed or optional parameters whose targets are naked type
-//! parameters or canonical nested Array/interface references, authenticated
-//! homogeneous Array rest parameters, and a mapper-supported return. It owns
+//! parameters, canonical nested Array/interface references, or authenticated
+//! fixed primitives and callbacks, homogeneous Array rest parameters, and a
+//! mapper-supported return. It owns
 //! declaration-order
 //! inference/default/constraint finalization, overload-failure projection, and
 //! exact checked-instantiation cache publication. Recovery signatures remain a
@@ -41,7 +42,10 @@ use super::{
     keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type},
     reference_types::{DirectGenericReference, validate_direct_generic_reference},
     signatures::{IndexFlags, SignatureFlags},
-    source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
+    source_callables::{
+        StoredSourceCallableValidation, valid_fixed_generic_source_parameter_type,
+        validate_stored_source_callable,
+    },
     store::CachedSignatureLookup,
     type_records::TypeData,
     types::{ObjectFlags, TypeFlags, VarianceFlags},
@@ -1345,6 +1349,8 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
             &mut Vec::new(),
         )?;
         if !valid_template
+            && !(index < fixed_parameter_count
+                && valid_fixed_generic_source_parameter_type(store, projected))
             && (index < minimum_argument_count
                 || optional_generic_parameter_template(
                     store,
@@ -1595,15 +1601,15 @@ fn optional_generic_parameter_template(
     {
         return Err(GenericCallVectorInvariant::CallableSignatureMismatch(signature).into());
     }
-    validate_generic_parameter_template(
+    let generic = validate_generic_parameter_template(
         store,
         template,
         type_parameters,
         array_targets,
         signature,
         &mut Vec::new(),
-    )
-    .map(|valid| valid.then_some(template))
+    )?;
+    Ok((generic || valid_fixed_generic_source_parameter_type(store, template)).then_some(template))
 }
 
 fn validate_generic_call_type_parameter(
@@ -2032,6 +2038,9 @@ fn infer_generic_call_type_arguments(
         } else {
             parameter
         };
+        if valid_fixed_generic_source_parameter_type(store, parameter) {
+            continue;
+        }
         collect_generic_call_inferences(
             store,
             shape.array_targets,
@@ -2989,6 +2998,9 @@ fn generic_call_type_instantiation_matches(
     if let Some(index) = sources.iter().position(|source| *source == template) {
         return targets.get(index).copied() == Some(actual);
     }
+    if valid_fixed_generic_source_parameter_type(store, template) {
+        return template == actual;
+    }
     let Some(template_record) = store.type_payload(template) else {
         return false;
     };
@@ -3454,8 +3466,11 @@ fn demand_generic_call_vector_parameter(
             signature,
         },
     )?;
-    let resolved =
-        instantiate_type_with_session(store, template, mapper, shape.array_targets, session)?;
+    let resolved = if valid_fixed_generic_source_parameter_type(store, template) {
+        template
+    } else {
+        instantiate_type_with_session(store, template, mapper, shape.array_targets, session)?
+    };
     links.resolved_type = Some(resolved);
     assert!(
         store.set_value_symbol_links(parameter, links),
@@ -6366,6 +6381,150 @@ mod tests {
                 actual: 0,
             },
         );
+    }
+
+    #[test]
+    fn generic_array_rest_parameters_keep_fixed_primitive_prefix_out_of_inference() {
+        let mut store = initialized_store();
+        let targets = canonical_array_targets(&mut store);
+        let (mut callable, _) = rest_vector_callable(&mut store, targets, 1, true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let prefix = store.signature(callable.signature).unwrap().parameters()[0];
+        assert!(store.set_value_symbol_links(
+            prefix,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        callable.parameters[0] = string;
+        let label = fresh_string(&mut store, "label");
+        let first = fresh_number(&mut store, 1.0);
+        let second = fresh_number(&mut store, 2.0);
+
+        let inferred = project_array_vector(
+            &mut store,
+            targets,
+            &callable,
+            vector_request(callable.owner, None, &[label, first, second]),
+        )
+        .unwrap();
+        assert_eq!(
+            inferred.applicability,
+            GenericCallVectorApplicability::Applicable,
+        );
+        assert_eq!(inferred.projection.instantiation.type_arguments, [number]);
+        assert_eq!(
+            demand_vector_parameter(
+                &mut store,
+                &callable,
+                &inferred,
+                &inferred.projection.instantiation,
+                0,
+            ),
+            string,
+        );
+        let result = demand_vector_return(
+            &mut store,
+            &callable,
+            &inferred,
+            &inferred.projection.instantiation,
+        );
+        assert_eq!(
+            store
+                .canonical_array_reference_with_targets(targets, result)
+                .unwrap()
+                .unwrap()
+                .element_type,
+            number,
+        );
+
+        let warm = vector_cache_graph_counts(&store);
+        let repeated = project_array_vector(
+            &mut store,
+            targets,
+            &callable,
+            vector_request(callable.owner, None, &[label, second]),
+        )
+        .unwrap();
+        assert_eq!(
+            repeated.projection.instantiation.signature,
+            inferred.projection.instantiation.signature,
+        );
+        assert_eq!(vector_cache_graph_counts(&store), warm);
+
+        let wrong_prefix = project_array_vector(
+            &mut store,
+            targets,
+            &callable,
+            vector_request(callable.owner, None, &[first, second]),
+        )
+        .unwrap();
+        assert_eq!(
+            wrong_prefix.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable {
+                index: 0,
+                argument_type: first,
+                parameter_type: string,
+            },
+        );
+
+        let wrong_rest = project_array_vector(
+            &mut store,
+            targets,
+            &callable,
+            vector_request(callable.owner, None, &[label, first, label]),
+        )
+        .unwrap();
+        assert_eq!(
+            wrong_rest.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable {
+                index: 2,
+                argument_type: label,
+                parameter_type: number,
+            },
+        );
+    }
+
+    #[test]
+    fn generic_fixed_parameters_reject_unauthenticated_objects_before_cache_writes() {
+        let mut store = initialized_store();
+        let targets = canonical_array_targets(&mut store);
+        let (mut callable, _) = rest_vector_callable(&mut store, targets, 1, true);
+        let forged = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        let prefix = store.signature(callable.signature).unwrap().parameters()[0];
+        assert!(store.set_value_symbol_links(
+            prefix,
+            ValueSymbolLinks {
+                resolved_type: Some(forged),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        callable.parameters[0] = forged;
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let before = vector_cache_graph_counts(&store);
+
+        assert_eq!(
+            project_array_vector(
+                &mut store,
+                targets,
+                &callable,
+                vector_request(callable.owner, None, &[forged, number]),
+            ),
+            Err(GenericCallVectorError::Unsupported(
+                GenericCallVectorUnsupported::NonNakedParameter {
+                    signature: callable.signature,
+                    index: 0,
+                    type_: forged,
+                },
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
     }
 
     #[test]

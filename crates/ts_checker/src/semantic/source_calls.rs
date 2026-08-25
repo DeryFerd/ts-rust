@@ -53,7 +53,10 @@ use super::{
         merge_retry_diagnostics, primitive_binary_operator_text,
         retry_source_generic_member_failure,
     },
-    source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
+    source_callables::{
+        StoredSourceCallableValidation, valid_fixed_generic_source_parameter_type,
+        validate_stored_source_callable,
+    },
     source_imports::synthetic_source_import_origin,
     type_nodes::CanonicalTypeQuery,
     type_records::{TypeData, TypeRecord},
@@ -136,8 +139,8 @@ pub(super) struct CheckedSourceCall {
 /// Returns an authenticated parameter context for an object, array, arrow, or template.
 ///
 /// Array and object arguments can retain a shared indexed context when
-/// overload parameter identities differ. A constrained generic string
-/// parameter also provides the context required by interpolated templates.
+/// overload parameter identities differ. Generic signatures provide context
+/// for authenticated fixed parameters and constrained interpolated templates.
 pub(super) fn source_call_argument_contextual_type(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -177,24 +180,22 @@ pub(super) fn source_call_argument_contextual_type(
         let Some(signature) = store.signature(callable.signature) else {
             return Err(SourceCheckError::Call(plan.node));
         };
-        if !signature.type_parameters().is_empty() {
-            if projection.call_signatures.len() == 1
-                && matches!(argument.kind, PlannedExpressionKind::Template(_))
-                && let Some(parameter) = callable.parameters.get(parameter_index).copied()
-                && signature.type_parameters().contains(&parameter)
-                && let Some(TypeData::TypeParameter(data)) =
-                    store.type_payload(parameter).map(TypeRecord::data)
-                && data.constraint.is_some_and(|constraint| {
-                    store.type_payload(constraint).is_some_and(|record| {
-                        record.flags().intersects(
-                            TypeFlags::STRING_LIKE | TypeFlags::UNION | TypeFlags::INTERSECTION,
-                        )
-                    })
+        if !signature.type_parameters().is_empty()
+            && projection.call_signatures.len() == 1
+            && matches!(argument.kind, PlannedExpressionKind::Template(_))
+            && let Some(parameter) = callable.parameters.get(parameter_index).copied()
+            && signature.type_parameters().contains(&parameter)
+            && let Some(TypeData::TypeParameter(data)) =
+                store.type_payload(parameter).map(TypeRecord::data)
+            && data.constraint.is_some_and(|constraint| {
+                store.type_payload(constraint).is_some_and(|record| {
+                    record.flags().intersects(
+                        TypeFlags::STRING_LIKE | TypeFlags::UNION | TypeFlags::INTERSECTION,
+                    )
                 })
-            {
-                return Ok(Some(parameter));
-            }
-            return Ok(None);
+            })
+        {
+            return Ok(Some(parameter));
         }
         let parameter_type = match callable.parameters.get(parameter_index).copied() {
             Some(parameter) => Some(parameter),
@@ -207,6 +208,11 @@ pub(super) fn source_call_argument_contextual_type(
         let Some(parameter_type) = parameter_type else {
             return Ok(None);
         };
+        if !signature.type_parameters().is_empty()
+            && !valid_fixed_generic_source_parameter_type(store, parameter_type)
+        {
+            return Ok(None);
+        }
         parameter_types.push(parameter_type);
     }
 
@@ -7902,6 +7908,335 @@ mod tests {
                 .map(|call| call_publication_state(&context, *call))
                 .collect::<Vec<_>>(),
             cold_calls
+        );
+    }
+
+    #[test]
+    fn generic_fixed_callbacks_contextualize_parameters_and_reuse_checked_signatures() {
+        let text = concat!(
+            "declare function apply<T>(callback: (value: number) => number, input: T): T;\n",
+            "apply(value => value, 'same');\n",
+            "apply(value => 'wrong', 'other');\n",
+            "apply(value => value, 'same');",
+        );
+        let source = parsed(text);
+        let file = FileId::new(4_918);
+        let mut context = context_with_options(
+            &source,
+            file,
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let mut call_nodes = calls(&source, file);
+        call_nodes.sort_by_key(|call| source.arena.get(call.node).unwrap().range.start);
+        let [first, wrong, repeated] = call_nodes.as_slice() else {
+            panic!("expected three generic calls with fixed callbacks")
+        };
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one fixed callback return-type diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            concat!(
+                "Argument of type '(value: number) => string' is not assignable to parameter ",
+                "of type '(value: number) => number'.\n",
+                "  Type 'string' is not assignable to type 'number'.",
+            ),
+        );
+        let range = source
+            .arena
+            .get(diagnostic.node.unwrap().node)
+            .unwrap()
+            .range;
+        assert_eq!(
+            &text[usize::try_from(range.start.get()).unwrap()
+                ..usize::try_from(range.end.get()).unwrap()],
+            "value => 'wrong'",
+        );
+
+        let callback_target = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .and_then(|node| context.store().type_node_links(node))
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let (_, bound) = context.file(file).unwrap();
+        for (node, record) in source.arena.iter() {
+            if record.kind != SyntaxKind::ArrowFunction {
+                continue;
+            }
+            let arrow = NodeRef::new(source.arena.id(), file, node);
+            let NodeData::ArrowFunction(syntax) = &record.data else {
+                unreachable!("the syntax kind identifies an arrow")
+            };
+            let parameter = NodeRef::new(source.arena.id(), file, syntax.parameters.nodes[0]);
+            let parameter = bound.symbol(parameter).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(parameter)
+                    .and_then(|links| links.resolved_type),
+                Some(number),
+            );
+            let owner = bound.symbol(arrow).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let provenance = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap();
+            assert_eq!(provenance.contextual_target, Some(callback_target));
+            assert!(provenance.contextual_variable.is_none());
+        }
+
+        let signature = |call| {
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap()
+        };
+        assert_eq!(signature(*first), signature(*repeated));
+        assert_ne!(signature(*wrong), signature(*first));
+
+        let cold = call_nodes
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            call_nodes
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold,
+        );
+    }
+
+    #[test]
+    fn generic_fixed_prefixes_preserve_rest_inference_and_exact_argument_diagnostics() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let text = concat!(
+            "declare function collect<T>(label: string, ...values: T[]): T[];\n",
+            "declare function choose<T>(value: T, radix?: number): T;\n",
+            "const first = collect('left', 1, 2);\n",
+            "const repeated = collect('right', 3);\n",
+            "const wrongLabel = collect(1, 2);\n",
+            "const mixed = collect('left', 1, 'wrong');\n",
+            "const explicit = collect<number>('left', 1, 'wrong');\n",
+            "const missing = collect();\n",
+            "const selected = choose('value', 2);\n",
+            "const wrongOptional = choose('value', 'wrong');",
+        );
+        let source = parsed(text);
+        let library_file = FileId::new(4_922);
+        let source_file = FileId::new(4_923);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+        let mut call_nodes = calls(&source, source_file);
+        call_nodes.sort_by_key(|call| source.arena.get(call.node).unwrap().range.start);
+        let [
+            first,
+            repeated,
+            wrong_label,
+            mixed,
+            explicit,
+            missing,
+            selected,
+            wrong_optional,
+        ] = call_nodes.as_slice()
+        else {
+            panic!("expected eight generic fixed-prefix calls")
+        };
+
+        context.check_source_file(source_file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for call in [*first, *repeated] {
+            let result = context
+                .store()
+                .type_node_links(call)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .canonical_array_element_type(context.global_types(), result)
+                    .unwrap(),
+                Some(number),
+            );
+        }
+        let signature = |call| {
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap()
+        };
+        assert_eq!(signature(*first), signature(*repeated));
+        assert_ne!(signature(*wrong_label), signature(*first));
+        assert_ne!(signature(*mixed), signature(*first));
+        assert_ne!(signature(*explicit), signature(*first));
+        assert!(context.store().signature(signature(*missing)).is_some());
+        assert!(
+            context
+                .store()
+                .type_node_links(*selected)
+                .and_then(|links| links.resolved_type)
+                .and_then(|type_| context.store().type_payload(type_))
+                .is_some_and(|record| record.flags().intersects(TypeFlags::STRING_LITERAL))
+        );
+        assert_ne!(signature(*wrong_optional), signature(*selected));
+
+        let expected = [
+            (
+                2345,
+                "1",
+                "Argument of type 'number' is not assignable to parameter of type 'string'.",
+            ),
+            (
+                2345,
+                "'wrong'",
+                "Argument of type 'string' is not assignable to parameter of type 'number'.",
+            ),
+            (
+                2345,
+                "'wrong'",
+                "Argument of type 'string' is not assignable to parameter of type 'number'.",
+            ),
+            (2555, "collect", "Expected at least 1 arguments, but got 0."),
+            (
+                2345,
+                "'wrong'",
+                "Argument of type 'string' is not assignable to parameter of type 'number'.",
+            ),
+        ];
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), expected.len(), "{diagnostics:?}");
+        for (diagnostic, (code, expected_text, expected_message)) in
+            diagnostics.iter().zip(expected)
+        {
+            assert_eq!(diagnostic.diagnostic.code(), code);
+            assert_eq!(diagnostic.diagnostic.render().unwrap(), expected_message);
+            let range = source
+                .arena
+                .get(diagnostic.node.unwrap().node)
+                .unwrap()
+                .range;
+            assert_eq!(
+                &text[usize::try_from(range.start.get()).unwrap()
+                    ..usize::try_from(range.end.get()).unwrap()],
+                expected_text,
+            );
+        }
+
+        let cold = call_nodes
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, source_file);
+        context.check_source_file(source_file).unwrap();
+        assert_eq!(
+            call_nodes
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold,
+        );
+    }
+
+    #[test]
+    fn strict_optional_fixed_generic_parameters_retain_their_canonical_union() {
+        let source = parsed(concat!(
+            "declare function choose<T>(value: T, radix?: number): T; ",
+            "const omitted = choose('same'); ",
+            "const supplied = choose('same', 2); ",
+            "const invalid = choose('same', 'wrong');",
+        ));
+        let file = FileId::new(4_924);
+        let mut context = context_with_options(
+            &source,
+            file,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let mut call_nodes = calls(&source, file);
+        call_nodes.sort_by_key(|call| source.arena.get(call.node).unwrap().range.start);
+        let [omitted, supplied, invalid] = call_nodes.as_slice() else {
+            panic!("expected three strict optional fixed-parameter calls")
+        };
+
+        context.check_source_file(file).unwrap();
+
+        let signature = |call| {
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap()
+        };
+        assert_eq!(signature(*omitted), signature(*supplied));
+        assert_ne!(signature(*invalid), signature(*omitted));
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one strict optional fixed-parameter mismatch")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+
+        let declaration = first_function_symbol(&source, &context, file);
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(declaration)
+            .unwrap();
+        let original = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let optional = context
+            .store()
+            .callable_signature_parameter_types(original)
+            .unwrap()[1];
+        let TypeData::Union(union) = context.store().type_payload(optional).unwrap().data() else {
+            panic!("strict optional fixed parameters must retain number | undefined")
+        };
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert!(union.union.types.contains(&bootstrap.number_type));
+        assert!(union.union.types.contains(&bootstrap.undefined_type));
+
+        let cold = call_nodes
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            call_nodes
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold,
         );
     }
 
