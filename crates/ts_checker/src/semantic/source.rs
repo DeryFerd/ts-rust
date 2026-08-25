@@ -2436,6 +2436,42 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         )));
                         continue;
                     }
+                    if class.modifiers.as_ref().is_some_and(|modifiers| {
+                        matches!(
+                            modifiers.list.nodes.as_slice(),
+                            [modifier]
+                                if self
+                                    .arena
+                                    .get(*modifier)
+                                    .is_some_and(|node| node.kind == SyntaxKind::AbstractKeyword)
+                        )
+                    }) {
+                        let Some((store, host)) = self.semantic else {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Class(statement),
+                            ));
+                        };
+                        let symbol =
+                            self.bound
+                                .symbol(statement)
+                                .ok_or(SourceCheckError::Provenance(
+                                    SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
+                                ))?;
+                        if let Some(grammar) = plan_class_grammar_diagnostics(store, host, symbol)
+                            && grammar.declaration == statement
+                            && grammar.symbol == symbol
+                            && matches!(
+                                grammar.diagnostics.as_slice(),
+                                [diagnostic] if diagnostic.code == 1245
+                            )
+                        {
+                            statements.push(PlannedStatement::ClassGrammar(grammar));
+                            continue;
+                        }
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Class(statement),
+                        ));
+                    }
                     let export_modifier = self.validate_class_declaration_modifiers(
                         statement,
                         node.range,

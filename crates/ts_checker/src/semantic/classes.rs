@@ -19,6 +19,7 @@
 //! plus unannotated private instance fields with the implicit `any` type.
 //! Invalid method overload chains preserve their merged binder symbols and
 //! report exact implementation-name, missing-body, and duplicate-body errors.
+//! Abstract methods retain exact invalid-class and implemented-method errors.
 //! Direct classes can also retain one string-to-number index signature.
 //! Annotated fields admit one authenticated ambient-function decorator.
 //! One direct getter/setter pair can expose an annotated numeric property.
@@ -9894,6 +9895,122 @@ fn plan_class_method_overload_diagnostics(
     Some(diagnostics)
 }
 
+fn plan_abstract_class_method_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    members: &ts_ast::NodeList,
+    abstract_class: bool,
+) -> Option<Vec<ClassGrammarDiagnostic>> {
+    let [member] = members.nodes.as_slice() else {
+        return None;
+    };
+    let member = NodeRef::new(declaration.arena, declaration.file, *member);
+    let record = preflight_node(store, host, member).ok()?;
+    let NodeData::MethodDeclaration(method) = &record.data else {
+        return None;
+    };
+    let modifiers = method.modifiers.as_ref()?;
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return None;
+    };
+    let modifier = NodeRef::new(member.arena, member.file, *modifier);
+    let modifier_record = preflight_node(store, host, modifier).ok()?;
+    let (name, name_text) = accessor_name(store, host, member, method.name).ok()?;
+    let name_record = preflight_node(store, host, name).ok()?;
+    let source = host
+        .source(modifier)
+        .and_then(|(arena, _)| arena.source_text())?;
+    if record.kind != SyntaxKind::MethodDeclaration
+        || record.flags.0 != 0
+        || record.parent != Some(declaration.node)
+        || method.asterisk_token.is_some()
+        || method.end_flow_node.is_some()
+        || method.flow_node.is_some()
+        || method.full_signature.is_some()
+        || method.next_container.is_some()
+        || method.postfix_token.is_some()
+        || method.symbol.is_some()
+        || method.type_.is_some()
+        || method.type_parameters.is_some()
+        || method.facts != 0
+        || method.parameters.has_trailing_comma
+        || !method.parameters.nodes.is_empty()
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifiers.list.range.start != record.range.start
+        || modifiers.list.range.end > name_record.range.start
+        || modifier_record.kind != SyntaxKind::AbstractKeyword
+        || modifier_record.flags.0 != 0
+        || modifier_record.parent != Some(member.node)
+        || !matches!(modifier_record.data, NodeData::Token(_))
+        || modifier_record.range.start != record.range.start
+        || modifier_record.range.end > modifiers.list.range.end
+        || source.get(
+            usize::try_from(modifier_record.range.start.get()).ok()?
+                ..usize::try_from(modifier_record.range.end.get()).ok()?,
+        ) != Some("abstract")
+        || name_record.flags.0 != 0
+        || name_record.range.end > method.parameters.range.start
+    {
+        return None;
+    }
+
+    let symbol = bound_symbol(store, host, member)?;
+    let symbol_record = store.symbol(symbol)?;
+    let table = store
+        .symbol(owner)
+        .and_then(Symbol::members)
+        .and_then(|members| store.symbol_table(members))?;
+    if symbol_record.flags() != SymbolFlags::METHOD
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(name_text.as_str())
+        || symbol_record.declarations() != Some(&[member])
+        || symbol_record.value_declaration() != Some(member)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || table.len() != 1
+        || table.get_source(&name_text) != Some(symbol)
+        || store
+            .signature_links(member)
+            .is_some_and(|links| links != &SignatureLinks::default())
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return None;
+    }
+
+    if let Some(body) = method.body {
+        validate_empty_class_grammar_body(store, host, member, body, method.parameters.range.end)?;
+    } else if abstract_class {
+        return None;
+    }
+
+    let mut diagnostics = Vec::with_capacity(2);
+    if !abstract_class {
+        diagnostics.push(ClassGrammarDiagnostic {
+            node: modifier,
+            range_override: None,
+            code: 1244,
+            arguments: Vec::new(),
+        });
+    }
+    if method.body.is_some() {
+        diagnostics.push(ClassGrammarDiagnostic {
+            node: name,
+            range_override: None,
+            code: 1245,
+            arguments: vec![name_text],
+        });
+    }
+    Some(diagnostics)
+}
+
 /// Authenticates supported class grammar failures without publishing class types.
 pub(super) fn plan_class_grammar_diagnostics(
     store: &CanonicalTypeMapperStore,
@@ -9943,8 +10060,8 @@ pub(super) fn plan_class_grammar_diagnostics(
     {
         return None;
     }
-    let ambient = match class.modifiers.as_ref() {
-        None => false,
+    let (ambient, abstract_class) = match class.modifiers.as_ref() {
+        None => (false, false),
         Some(modifiers) => {
             let [modifier] = modifiers.list.nodes.as_slice() else {
                 return None;
@@ -9954,11 +10071,15 @@ pub(super) fn plan_class_grammar_diagnostics(
             let source = host
                 .source(modifier)
                 .and_then(|(arena, _)| arena.source_text())?;
+            let (expected, ambient, abstract_class) = match modifier_record.kind {
+                SyntaxKind::DeclareKeyword => ("declare", true, false),
+                SyntaxKind::AbstractKeyword => ("abstract", false, true),
+                _ => return None,
+            };
             if modifiers.flags.0 != 0
                 || modifiers.list.has_trailing_comma
                 || modifiers.list.range.start != record.range.start
                 || modifiers.list.range.end > name_record.range.start
-                || modifier_record.kind != SyntaxKind::DeclareKeyword
                 || modifier_record.flags.0 != 0
                 || modifier_record.parent != Some(declaration.node)
                 || !matches!(modifier_record.data, NodeData::Token(_))
@@ -9967,11 +10088,11 @@ pub(super) fn plan_class_grammar_diagnostics(
                 || source.get(
                     usize::try_from(modifier_record.range.start.get()).ok()?
                         ..usize::try_from(modifier_record.range.end.get()).ok()?,
-                ) != Some("declare")
+                ) != Some(expected)
             {
                 return None;
             }
-            true
+            (ambient, abstract_class)
         }
     };
     let parent = NodeRef::new(declaration.arena, declaration.file, record.parent?);
@@ -9994,6 +10115,28 @@ pub(super) fn plan_class_grammar_diagnostics(
     let exports = owner.exports()?;
     validate_prototype(store, symbol, exports).ok()?;
     let export_table = store.symbol_table(exports)?;
+
+    if !ambient
+        && class.heritage_clauses.is_none()
+        && export_table.len() == 1
+        && let Some(diagnostics) = plan_abstract_class_method_diagnostics(
+            store,
+            host,
+            symbol,
+            declaration,
+            &class.members,
+            abstract_class,
+        )
+    {
+        return Some(ClassGrammarDiagnosticPlan {
+            declaration,
+            symbol,
+            diagnostics,
+        });
+    }
+    if abstract_class {
+        return None;
+    }
 
     if !ambient
         && class.heritage_clauses.is_none()
@@ -16884,6 +17027,176 @@ mod tests {
                     file,
                     CanonicalSourceFileFacts::new(
                         EscapedName::source("\"/class-overloads.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                [(file, &parsed.arena)].into_iter().collect(),
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+
+            context.check_source_file(file).unwrap();
+
+            assert_eq!(
+                context
+                    .diagnostics()
+                    .as_slice()
+                    .iter()
+                    .map(|diagnostic| diagnostic.diagnostic.code())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{source}",
+            );
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            );
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn abstract_method_grammar_preserves_modifier_and_implementation_spans() {
+        let cases = [
+            (
+                "class A { abstract foo(); }",
+                &[1244][..],
+                &["abstract"][..],
+            ),
+            (
+                "class A { abstract foo() {} }",
+                &[1244, 1245][..],
+                &["abstract", "foo"][..],
+            ),
+            (
+                "abstract class A { abstract foo() {} }",
+                &[1245][..],
+                &["foo"][..],
+            ),
+        ];
+
+        for (source, expected_codes, expected_spans) in cases {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "A");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            let grammar = plan_class_grammar_diagnostics(&fixture.store, &host, owner)
+                .unwrap_or_else(|| panic!("expected abstract method diagnostics for {source}"));
+
+            assert_eq!(
+                grammar
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                expected_codes,
+                "{source}",
+            );
+            let spans = grammar
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    let range = fixture
+                        .parsed
+                        .arena
+                        .get(diagnostic.node.node)
+                        .unwrap()
+                        .range;
+                    &source[range.start.get() as usize..range.end.get() as usize]
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(spans, expected_spans, "{source}");
+            if let Some(diagnostic) = grammar
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == 1245)
+            {
+                assert_eq!(diagnostic.arguments, ["foo"], "{source}");
+            }
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+                "{source}",
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn abstract_method_grammar_rejects_valid_and_unsupported_shapes() {
+        for source in [
+            "abstract class A { abstract foo(); }",
+            "class A { abstract foo(value: string); }",
+            "abstract class A { abstract foo() { return; } }",
+            "class A { foo() {} }",
+        ] {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "A");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+
+            assert!(
+                plan_class_grammar_diagnostics(&fixture.store, &host, owner).is_none(),
+                "{source}",
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn abstract_method_source_diagnostics_replay_without_class_publication() {
+        let cases = [
+            (
+                "class A { abstract foo(); } class B { abstract foo() {} }",
+                &[1244, 1244, 1245][..],
+            ),
+            ("abstract class A { abstract foo() {} }", &[1245][..]),
+        ];
+
+        for (index, (source, expected)) in cases.into_iter().enumerate() {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(3_911 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/abstract-methods.ts\""),
                         CanonicalSourceLanguage::TypeScript,
                         false,
                         CanonicalModuleState::Script,
