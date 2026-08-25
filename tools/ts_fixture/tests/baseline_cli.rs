@@ -142,12 +142,11 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
         None,
     );
     repository.write_case(
-        "spreadElementUnsupported",
+        "generatorUnsupported",
         concat!(
             "// @module: esnext\n",
             "// @filename: unsupported.ts\n",
-            "const source = [1, 2];\n",
-            "const value = [...source];\n",
+            "function* unsupported() { yield 1; }\n",
         ),
         None,
     );
@@ -165,7 +164,7 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
     );
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("MISMATCH testdata/tests/cases/compiler/spreadElementUnsupported.ts"));
+    assert!(stdout.contains("MISMATCH testdata/tests/cases/compiler/generatorUnsupported.ts"));
     assert!(stdout.contains("unsupported_details=1"));
     assert!(stdout.contains("fatal_invariants=0"));
     let scorecard: serde_json::Value =
@@ -187,7 +186,7 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
     assert_eq!(variants[0]["frontierBlocker"], serde_json::Value::Null);
     assert_eq!(
         variants[1]["case"],
-        "testdata/tests/cases/compiler/spreadElementUnsupported.ts"
+        "testdata/tests/cases/compiler/generatorUnsupported.ts"
     );
     assert_eq!(variants[1]["status"], "unsupported_detail");
     assert_eq!(variants[1]["outcomeClass"], "checker_capability");
@@ -1460,8 +1459,7 @@ fn semantic_artifacts_remain_not_reached_after_a_checker_capability() {
         concat!(
             "// @module: esnext\n",
             "// @filename: unsupported.ts\n",
-            "const source = [1, 2];\n",
-            "const value = [...source];\n",
+            "function* unsupported() { yield 1; }\n",
         ),
         None,
     );
