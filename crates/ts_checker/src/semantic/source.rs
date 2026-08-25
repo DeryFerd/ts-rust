@@ -105,8 +105,10 @@ use super::{
     },
     signatures::ElementFlags,
     source_arrows::{
-        ResolvedSourceContextualArrowPlan, SourceArrowBodyPlan, SourceArrowError, SourceArrowPlan,
-        SourceContextualArrowError, SourceContextualArrowPlan, SourceContextualParameterOrigin,
+        ResolvedSourceContextualArrowPlan, SourceArrowBodyPlan, SourceArrowError,
+        SourceArrowInvariant, SourceArrowPlan, SourceArrowUnsupported, SourceContextualArrowError,
+        SourceContextualArrowInvariant, SourceContextualArrowPlan,
+        SourceContextualArrowUnsupported, SourceContextualParameterOrigin,
         SourceContextualSignatureShape, plan_array_arrow_identifier_statement,
         plan_contextual_source_arrow, plan_jsdoc_contextual_source_arrow, plan_source_arrow,
         plan_source_arrow_value, resolve_contextual_arrow_parameter_origins,
@@ -5352,10 +5354,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     fn arrow_plan_error(error: SourceArrowError) -> SourceCheckError {
         let node = error.node();
         match error {
+            SourceArrowError::Unsupported(SourceArrowUnsupported::Variable(reason)) => {
+                Self::variable_plan_error(VariablePlanError::Unsupported(reason))
+            }
             SourceArrowError::Unsupported(_) => {
                 SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(
                     node.expect("source arrow unsupported errors retain their syntax node"),
                 ))
+            }
+            SourceArrowError::Invariant(SourceArrowInvariant::Variable(reason)) => {
+                Self::variable_plan_error(VariablePlanError::Invariant(reason))
             }
             SourceArrowError::Invariant(_) => SourceCheckError::Arrow(
                 node.expect("source arrow invariant errors retain their syntax node"),
@@ -5368,11 +5376,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     fn contextual_arrow_plan_error(error: SourceContextualArrowError) -> SourceCheckError {
         let node = error.node();
         match error {
+            SourceContextualArrowError::Unsupported(
+                SourceContextualArrowUnsupported::Variable(reason),
+            ) => Self::variable_plan_error(VariablePlanError::Unsupported(reason)),
             SourceContextualArrowError::Unsupported(_) => {
                 SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(
                     node.expect("contextual arrow unsupported errors retain their syntax node"),
                 ))
             }
+            SourceContextualArrowError::Invariant(SourceContextualArrowInvariant::Variable(
+                reason,
+            )) => Self::variable_plan_error(VariablePlanError::Invariant(reason)),
             SourceContextualArrowError::Invariant(_) => SourceCheckError::Arrow(
                 node.expect("contextual arrow invariant errors retain their syntax node"),
             ),
@@ -45001,6 +45015,38 @@ mod tests {
         );
         assert!(context.store().value_symbol_links(ready_owner).is_none());
         assert!(!is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn redeclared_arrow_variables_remain_typed_unsupported_without_panicking() {
+        for (file, text) in [
+            (
+                FileId::new(8_950),
+                "var shared = (): void => {}; var shared = 1;",
+            ),
+            (
+                FileId::new(8_951),
+                "var shared: () => void = () => {}; var shared: () => void;",
+            ),
+        ] {
+            let source = parsed(text);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let declaration = variable_declaration(&source, file, "shared");
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let before = observable_state(&context, file);
+            let expected = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Variable(
+                VariableUnsupported::NonUniqueDeclaration {
+                    node: declaration,
+                    symbol,
+                    declaration_count: 2,
+                },
+            ));
+
+            assert_eq!(context.check_source_file(file), Err(expected), "{text}");
+            assert_eq!(observable_state(&context, file), before, "{text}");
+            assert!(context.diagnostics().is_empty(), "{text}");
+            assert!(!is_type_checked(&context, file), "{text}");
+        }
     }
 
     #[test]
