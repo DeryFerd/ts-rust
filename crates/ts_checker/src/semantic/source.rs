@@ -63,6 +63,8 @@
 //! that preserves the real `IArguments` assignment diagnostic.
 //! Declaration-only mixed signatures with implicit rest parameters retain a
 //! separate bounded recovery that preserves binder-owned overload identity.
+//! Malformed namespace arrows and unclosed JSX retain separate, fully
+//! authenticated parser-recovery paths without admitting unrelated source.
 
 use std::collections::{HashMap, HashSet};
 
@@ -38785,6 +38787,1278 @@ fn issue_strict_arguments_assignment_diagnostic(
     Ok(())
 }
 
+struct RecoveredArrowSource {
+    failure: NodeRef,
+    unresolved_identifier: Option<NodeRef>,
+    namespace_count: usize,
+    statement_count: usize,
+    arrow_count: usize,
+    recovered_arrow: bool,
+    failure_seen: bool,
+}
+
+impl RecoveredArrowSource {
+    const fn new(failure: NodeRef) -> Self {
+        Self {
+            failure,
+            unresolved_identifier: None,
+            namespace_count: 0,
+            statement_count: 0,
+            arrow_count: 0,
+            recovered_arrow: false,
+            failure_seen: false,
+        }
+    }
+}
+
+fn recovered_source_spelling(arena: &NodeArena, node: NodeRef) -> Option<&str> {
+    let record = arena.get(node.node)?;
+    arena
+        .source_text()?
+        .get(record.range.start.get() as usize..record.range.end.get() as usize)
+}
+
+fn recovered_named_binding(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    scope: NodeRef,
+    declaration: NodeRef,
+    name: &str,
+    flags: SymbolFlags,
+) -> bool {
+    let Some(symbol) = bound.symbol(declaration) else {
+        return false;
+    };
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    owner.flags() == flags
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.name().as_utf8() == Some(name)
+        && owner.declarations() == Some(&[declaration])
+        && owner.value_declaration() == Some(declaration)
+        && owner.members().is_none()
+        && owner.exports().is_none()
+        && owner.parent().is_none()
+        && owner.export_symbol().is_none()
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && bound
+            .locals(scope)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(name))
+            == Some(symbol)
+}
+
+fn recovered_arrow_parameter(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    arrow: NodeRef,
+    parameter: NodeId,
+) -> bool {
+    let Some(parameter) = strict_arguments_child(arena, bound, arrow, parameter) else {
+        return false;
+    };
+    let Some(record) = arena.get(parameter.node) else {
+        return false;
+    };
+    let NodeData::ParameterDeclaration(syntax) = &record.data else {
+        return false;
+    };
+    let Some((name, text)) = recovered_protected_identifier(arena, bound, parameter, syntax.name)
+    else {
+        return false;
+    };
+    if record.kind != SyntaxKind::Parameter
+        || record.flags.0 != 0
+        || syntax.dot_dot_dot_token.is_some()
+        || syntax.initializer.is_some()
+        || syntax.question_token.is_some()
+        || syntax.symbol.is_some()
+        || syntax.facts != 0
+        || syntax.modifiers.is_some()
+        || recovered_source_spelling(arena, name) != Some(text)
+        || !recovered_named_binding(
+            bound,
+            store,
+            arrow,
+            parameter,
+            text,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+        )
+    {
+        return false;
+    }
+
+    let Some(annotation) = syntax.type_ else {
+        return true;
+    };
+    let Some(annotation) = strict_arguments_child(arena, bound, parameter, annotation) else {
+        return false;
+    };
+    let Some(record) = arena.get(annotation.node) else {
+        return false;
+    };
+    let spelling = match record.kind {
+        SyntaxKind::NumberKeyword => "number",
+        SyntaxKind::StringKeyword => "string",
+        _ => return false,
+    };
+    record.flags.0 == 0
+        && matches!(record.data, NodeData::KeywordTypeNode(_))
+        && recovered_source_spelling(arena, annotation) == Some(spelling)
+}
+
+fn recovered_arrow_numeric_variable(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    body: NodeRef,
+    arrow: NodeRef,
+    statement: NodeId,
+    recovery: &mut RecoveredArrowSource,
+) -> bool {
+    recovery.statement_count += 1;
+    if recovery.statement_count > 256 {
+        return false;
+    }
+    let Some(variable) = strict_arguments_variable_statement(arena, bound, store, body, statement)
+    else {
+        return false;
+    };
+    let Some(declaration_id) = arena.get(variable.name.node).and_then(|name| name.parent) else {
+        return false;
+    };
+    let declaration = NodeRef::new(body.arena, body.file, declaration_id);
+    let Some(NodeData::Identifier(name)) = arena.get(variable.name.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some(initializer) = variable.initializer else {
+        return false;
+    };
+    let Some(record) = arena.get(initializer.node) else {
+        return false;
+    };
+    let NodeData::NumericLiteral(literal) = &record.data else {
+        return false;
+    };
+    let statement = NodeRef::new(body.arena, body.file, statement);
+    recovery.failure_seen |= recovery.failure == statement;
+    variable.type_node.is_none()
+        && recovered_source_spelling(arena, variable.name) == Some(name.text.as_str())
+        && recovered_source_spelling(arena, statement).is_some_and(|source| {
+            source
+                .strip_prefix("var")
+                .is_some_and(|suffix| suffix.starts_with(char::is_whitespace))
+        })
+        && recovered_named_binding(
+            bound,
+            store,
+            arrow,
+            declaration,
+            &name.text,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+        )
+        && record.kind == SyntaxKind::NumericLiteral
+        && record.flags.0 == 0
+        && literal.token_flags.0 == 0
+        && recovered_source_spelling(arena, initializer) == Some(literal.text.as_str())
+        && !ts_jsnum::from_string(&literal.text).is_nan()
+}
+
+#[allow(clippy::too_many_lines)] // Validate the complete recovered callable before admission.
+fn recovered_arrow_function(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    initializer: NodeRef,
+    recovery: &mut RecoveredArrowSource,
+) -> bool {
+    recovery.arrow_count += 1;
+    if recovery.arrow_count > 128 {
+        return false;
+    }
+    let Some(record) = arena.get(initializer.node) else {
+        return false;
+    };
+    let NodeData::ArrowFunction(arrow) = &record.data else {
+        return false;
+    };
+    let Some(symbol) = bound.symbol(initializer) else {
+        return false;
+    };
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    if record.kind != SyntaxKind::ArrowFunction
+        || record.flags.0 != 0
+        || record.parent != Some(declaration.node)
+        || arrow.asterisk_token.is_some()
+        || arrow.end_flow_node.is_some()
+        || arrow.flow_node.is_some()
+        || arrow.full_signature.is_some()
+        || arrow.next_container.is_some()
+        || arrow.parameters.has_trailing_comma
+        || arrow.parameters.nodes.len() > 2
+        || arrow.symbol.is_some()
+        || arrow.type_parameters.is_some()
+        || arrow.facts != 0
+        || arrow.modifiers.is_some()
+        || owner.flags() != SymbolFlags::FUNCTION
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name() != ts_binder::InternalSymbolName::Function.as_ref()
+        || owner.declarations() != Some(&[initializer])
+        || owner.value_declaration() != Some(initializer)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || arrow.parameters.nodes.iter().any(|parameter| {
+            !recovered_arrow_parameter(arena, bound, store, initializer, *parameter)
+        })
+    {
+        return false;
+    }
+    recovery.failure_seen |= recovery.failure == initializer;
+
+    if let Some(annotation) = arrow.type_ {
+        let Some(annotation) = strict_arguments_child(arena, bound, initializer, annotation) else {
+            return false;
+        };
+        let Some(record) = arena.get(annotation.node) else {
+            return false;
+        };
+        if record.kind != SyntaxKind::VoidKeyword
+            || record.flags.0 != 0
+            || !matches!(record.data, NodeData::KeywordTypeNode(_))
+            || recovered_source_spelling(arena, annotation) != Some("void")
+        {
+            return false;
+        }
+    }
+
+    let Some(token) =
+        strict_arguments_child(arena, bound, initializer, arrow.equals_greater_than_token)
+    else {
+        return false;
+    };
+    let Some(token_record) = arena.get(token.node) else {
+        return false;
+    };
+    if token_record.kind != SyntaxKind::EqualsGreaterThanToken
+        || !matches!(token_record.data, NodeData::Token(_))
+    {
+        return false;
+    }
+    if token_record.flags.0 == NODE_FLAG_HAS_ERROR
+        && token_record.range.start == token_record.range.end
+    {
+        let Some(source) = arena.source_text() else {
+            return false;
+        };
+        let position = token_record.range.start.get() as usize;
+        if !matches!(source.as_bytes().get(position), Some(b'{' | b';')) {
+            return false;
+        }
+        recovery.recovered_arrow = true;
+    } else if token_record.flags.0 != 0 || recovered_source_spelling(arena, token) != Some("=>") {
+        return false;
+    }
+
+    let Some(body) = strict_arguments_child(arena, bound, initializer, arrow.body) else {
+        return false;
+    };
+    let Some(body_record) = arena.get(body.node) else {
+        return false;
+    };
+    match &body_record.data {
+        NodeData::Block(block) => {
+            if body_record.kind != SyntaxKind::Block
+                || body_record.flags.0 != 0
+                || block.flow_node.is_some()
+                || block.next_container.is_some()
+                || block.statements.has_trailing_comma
+                || block.facts != 0
+            {
+                return false;
+            }
+            let Some(spelling) = recovered_source_spelling(arena, body) else {
+                return false;
+            };
+            if block.statements.nodes.is_empty() {
+                return spelling.starts_with('{') && spelling.ends_with('}');
+            }
+            if spelling.starts_with('{') || !spelling.starts_with("var") {
+                return false;
+            }
+            recovery.recovered_arrow = true;
+            block.statements.nodes.iter().all(|statement| {
+                recovered_arrow_numeric_variable(
+                    arena,
+                    bound,
+                    store,
+                    body,
+                    initializer,
+                    *statement,
+                    recovery,
+                )
+            })
+        }
+        NodeData::Identifier(identifier) => {
+            let Some(source) = arena.source_text() else {
+                return false;
+            };
+            let position = body_record.range.start.get() as usize;
+            let at_missing_expression = position == source.len()
+                || matches!(source.as_bytes().get(position), Some(b'}' | b';'));
+            if body_record.kind != SyntaxKind::Identifier
+                || body_record.flags.0 != NODE_FLAG_HAS_ERROR
+                || body_record.range.start != body_record.range.end
+                || identifier.flow_node.is_some()
+                || !identifier.text.is_empty()
+                || !at_missing_expression
+            {
+                return false;
+            }
+            recovery.recovered_arrow = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn recovered_arrow_variable(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    parent: NodeRef,
+    scope: NodeRef,
+    statement: NodeId,
+    recovery: &mut RecoveredArrowSource,
+) -> bool {
+    let Some(variable) =
+        strict_arguments_variable_statement(arena, bound, store, parent, statement)
+    else {
+        return false;
+    };
+    let Some(declaration_id) = arena.get(variable.name.node).and_then(|name| name.parent) else {
+        return false;
+    };
+    let declaration = NodeRef::new(parent.arena, parent.file, declaration_id);
+    let Some(NodeData::Identifier(name)) = arena.get(variable.name.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some(initializer) = variable.initializer else {
+        return false;
+    };
+    let statement = NodeRef::new(parent.arena, parent.file, statement);
+    if variable.type_node.is_some()
+        || recovered_source_spelling(arena, variable.name) != Some(name.text.as_str())
+        || !recovered_named_binding(
+            bound,
+            store,
+            scope,
+            declaration,
+            &name.text,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+        )
+    {
+        return false;
+    }
+    recovery.failure_seen |= recovery.failure == statement;
+
+    let Some(record) = arena.get(initializer.node) else {
+        return false;
+    };
+    match &record.data {
+        NodeData::ArrowFunction(_) => {
+            recovered_arrow_function(arena, bound, store, declaration, initializer, recovery)
+        }
+        NodeData::ParenthesizedExpression(parenthesized) => {
+            if record.kind != SyntaxKind::ParenthesizedExpression
+                || record.flags.0 != 0
+                || recovered_source_spelling(arena, initializer)
+                    .is_none_or(|source| !source.starts_with('(') || !source.ends_with(')'))
+            {
+                return false;
+            }
+            let Some(identifier) =
+                strict_arguments_child(arena, bound, initializer, parenthesized.expression)
+            else {
+                return false;
+            };
+            let Some(identifier_record) = arena.get(identifier.node) else {
+                return false;
+            };
+            let NodeData::Identifier(name) = &identifier_record.data else {
+                return false;
+            };
+            if identifier_record.kind != SyntaxKind::Identifier
+                || name.flow_node.is_some()
+                || identifier_record.flags.0 != 0
+                    && identifier_record.flags.0 != NODE_FLAG_HAS_ERROR
+            {
+                return false;
+            }
+            if name.text.is_empty() {
+                return identifier_record.flags.0 == NODE_FLAG_HAS_ERROR
+                    && identifier_record.range.start == identifier_record.range.end
+                    && arena.source_text().and_then(|source| {
+                        source
+                            .as_bytes()
+                            .get(identifier_record.range.start.get() as usize)
+                    }) == Some(&b')');
+            }
+            if identifier_record.flags.0 != 0
+                || recovered_source_spelling(arena, identifier) != Some(name.text.as_str())
+                || recovery.unresolved_identifier.is_some()
+            {
+                return false;
+            }
+            recovery.unresolved_identifier = Some(identifier);
+            true
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Parent and lexical scope have distinct binder identities.
+fn recovered_arrow_namespace(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    parent: NodeRef,
+    scope: NodeRef,
+    statement: NodeId,
+    recovery: &mut RecoveredArrowSource,
+    depth: usize,
+) -> bool {
+    recovery.namespace_count += 1;
+    if recovery.namespace_count > 32 || depth > 8 {
+        return false;
+    }
+    let Some(namespace) = strict_arguments_child(arena, bound, parent, statement) else {
+        return false;
+    };
+    let Some(record) = arena.get(namespace.node) else {
+        return false;
+    };
+    let NodeData::ModuleDeclaration(module) = &record.data else {
+        return false;
+    };
+    let Some((name, text)) = recovered_protected_identifier(arena, bound, namespace, module.name)
+    else {
+        return false;
+    };
+    let Some(symbol) = bound.symbol(namespace) else {
+        return false;
+    };
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(body) = module
+        .body
+        .and_then(|body| strict_arguments_child(arena, bound, namespace, body))
+    else {
+        return false;
+    };
+    let Some(body_record) = arena.get(body.node) else {
+        return false;
+    };
+    let NodeData::ModuleBlock(block) = &body_record.data else {
+        return false;
+    };
+    if record.kind != SyntaxKind::ModuleDeclaration
+        || record.flags.0 != 0
+        || module.asterisk_token.is_some()
+        || module.end_flow_node.is_some()
+        || module.flow_node.is_some()
+        || module.keyword != SyntaxKind::NamespaceKeyword
+        || module.local_symbol.is_some()
+        || module.next_container.is_some()
+        || module.symbol.is_some()
+        || module.facts != 0
+        || module.modifiers.is_some()
+        || recovered_source_spelling(arena, name) != Some(text)
+        || !matches!(
+            owner.flags(),
+            SymbolFlags::VALUE_MODULE | SymbolFlags::NAMESPACE_MODULE
+        )
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(text)
+        || owner.declarations() != Some(&[namespace])
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || bound
+            .locals(scope)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(text))
+            != Some(symbol)
+        || body_record.kind != SyntaxKind::ModuleBlock
+        || body_record.flags.0 != 0
+        || block.flow_node.is_some()
+        || block.statements.has_trailing_comma
+        || block.facts != 0
+        || recovered_source_spelling(arena, body)
+            .is_none_or(|source| !source.starts_with('{') || !source.ends_with('}'))
+    {
+        return false;
+    }
+
+    block.statements.nodes.iter().all(|statement| {
+        recovered_arrow_statement(
+            arena,
+            bound,
+            store,
+            body,
+            namespace,
+            *statement,
+            recovery,
+            depth + 1,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // Parent and lexical scope have distinct binder identities.
+fn recovered_arrow_statement(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    parent: NodeRef,
+    scope: NodeRef,
+    statement: NodeId,
+    recovery: &mut RecoveredArrowSource,
+    depth: usize,
+) -> bool {
+    recovery.statement_count += 1;
+    if recovery.statement_count > 256 {
+        return false;
+    }
+    let Some(node) = strict_arguments_child(arena, bound, parent, statement) else {
+        return false;
+    };
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    match &record.data {
+        NodeData::ModuleDeclaration(_) => recovered_arrow_namespace(
+            arena, bound, store, parent, scope, statement, recovery, depth,
+        ),
+        NodeData::VariableStatement(_) => {
+            recovered_arrow_variable(arena, bound, store, parent, scope, statement, recovery)
+        }
+        NodeData::EmptyStatement(empty) => {
+            record.kind == SyntaxKind::EmptyStatement
+                && record.flags.0 == 0
+                && empty.flow_node.is_none()
+                && recovered_source_spelling(arena, node) == Some(";")
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Validate the source before publishing its one real diagnostic.
+fn recover_malformed_arrow_source(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    host: &DeclaredTypeHost<'_>,
+    store: &mut CanonicalTypeMapperStore,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    error: SourceCheckError,
+) -> Result<bool, SourceCheckError> {
+    let failure = match error {
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+            node,
+            kind: SyntaxKind::ArrowFunction,
+            role: SourceSyntaxRole::VariableInitializer,
+        })
+        | SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+            node,
+            kind: SyntaxKind::VariableStatement,
+            role: SourceSyntaxRole::VariableStatement | SourceSyntaxRole::Statement,
+        })
+        | SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(node)) => node,
+        _ => return Ok(false),
+    };
+    let Some(facts) = bound.source_facts() else {
+        return Ok(false);
+    };
+    let Some(source_text) = arena.source_text() else {
+        return Ok(false);
+    };
+    let Some(NodeData::SourceFile(source)) = arena
+        .get(bound.source_file().node)
+        .map(|record| &record.data)
+    else {
+        return Ok(false);
+    };
+    if facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+        || !bound.diagnostics().is_empty()
+        || options.no_implicit_any
+        || options.no_unused_locals
+        || options.no_unused_parameters
+        || options.isolated_modules
+        || source_text.len() > 65_536
+        || source.statements.has_trailing_comma
+        || source.statements.nodes.is_empty()
+    {
+        return Ok(false);
+    }
+
+    let mut recovery = RecoveredArrowSource::new(failure);
+    let root = bound.source_file();
+    if source.statements.nodes.iter().any(|statement| {
+        !recovered_arrow_statement(
+            arena,
+            bound,
+            store,
+            root,
+            root,
+            *statement,
+            &mut recovery,
+            0,
+        )
+    }) || recovery.namespace_count == 0
+        || !recovery.recovered_arrow
+        || !recovery.failure_seen
+    {
+        return Ok(false);
+    }
+
+    let Some(identifier) = recovery.unresolved_identifier else {
+        return Ok(true);
+    };
+    let Some(NodeData::Identifier(name)) = arena.get(identifier.node).map(|node| &node.data) else {
+        return Ok(false);
+    };
+    let mut callback_host = host.name_resolver_host(store)?;
+    let resolved =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(DeclaredTypeError::from)?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(identifier)),
+                &name.text,
+                SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+                None,
+                false,
+                false,
+            )
+            .map_err(DeclaredTypeError::from)?;
+    if resolved.is_some() {
+        return Ok(false);
+    }
+
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return Err(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ));
+    };
+    let error_type = bootstrap.error_type;
+    let read = PlannedIdentifierRead::unresolved(bootstrap.unknown_symbol);
+    let expression = PlannedExpression::new(identifier, PlannedExpressionKind::Identifier(read));
+    let diagnostic =
+        missing_source_identifier_diagnostic(store, host, options, &expression, &name.text)?;
+    if diagnostic.diagnostic.code() != 2304 {
+        return Ok(false);
+    }
+    preflight_source_expression_cache(store, identifier, error_type)?;
+    if !store.try_reserve_type_node_links(usize::from(store.type_node_links(identifier).is_none()))
+    {
+        return Err(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::Capacity,
+        ));
+    }
+    publish_expression_type(store, identifier, error_type)?;
+    merge_retry_diagnostic(diagnostics, diagnostic);
+    Ok(true)
+}
+
+#[derive(Clone, Copy)]
+struct RecoveredJsxVariable<'arena> {
+    declaration: NodeRef,
+    name: &'arena str,
+    symbol: SemanticSymbolId,
+    initializer: Option<NodeRef>,
+    annotation: Option<NodeRef>,
+}
+
+#[allow(clippy::too_many_lines)] // Declaration, modifiers, and binder ownership form one proof.
+fn recovered_jsx_variable<'arena>(
+    arena: &'arena NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeId,
+    flags: u32,
+    declared: bool,
+) -> Option<RecoveredJsxVariable<'arena>> {
+    let root = bound.source_file();
+    let statement = strict_arguments_child(arena, bound, root, statement)?;
+    let statement_record = arena.get(statement.node)?;
+    let NodeData::VariableStatement(syntax) = &statement_record.data else {
+        return None;
+    };
+    if statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || syntax.flow_node.is_some()
+        || syntax.facts != 0
+    {
+        return None;
+    }
+    match (declared, syntax.modifiers.as_ref()) {
+        (true, Some(modifiers)) => {
+            let [modifier] = modifiers.list.nodes.as_slice() else {
+                return None;
+            };
+            let modifier = strict_arguments_child(arena, bound, statement, *modifier)?;
+            let record = arena.get(modifier.node)?;
+            if modifiers.flags.0 != 0
+                || modifiers.list.has_trailing_comma
+                || record.kind != SyntaxKind::DeclareKeyword
+                || record.flags.0 != 0
+                || !matches!(record.data, NodeData::Token(_))
+                || recovered_source_spelling(arena, modifier) != Some("declare")
+            {
+                return None;
+            }
+        }
+        (false, None) => {}
+        _ => return None,
+    }
+
+    let list = strict_arguments_child(arena, bound, statement, syntax.declaration_list)?;
+    let list_record = arena.get(list.node)?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return None;
+    };
+    let [declaration] = declarations.declarations.nodes.as_slice() else {
+        return None;
+    };
+    if list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != flags
+        || declarations.declarations.has_trailing_comma
+        || declarations.facts != 0
+    {
+        return None;
+    }
+    let declaration = strict_arguments_child(arena, bound, list, *declaration)?;
+    let record = arena.get(declaration.node)?;
+    let NodeData::VariableDeclaration(variable) = &record.data else {
+        return None;
+    };
+    let (name, text) = recovered_protected_identifier(arena, bound, declaration, variable.name)?;
+    let symbol = bound.symbol(declaration)?;
+    if record.kind != SyntaxKind::VariableDeclaration
+        || record.flags.0 != 0
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+        || recovered_source_spelling(arena, name) != Some(text)
+        || !recovered_named_binding(
+            bound,
+            store,
+            root,
+            declaration,
+            text,
+            SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        )
+    {
+        return None;
+    }
+
+    Some(RecoveredJsxVariable {
+        declaration,
+        name: text,
+        symbol,
+        initializer: match variable.initializer {
+            Some(initializer) => Some(strict_arguments_child(
+                arena,
+                bound,
+                declaration,
+                initializer,
+            )?),
+            None => None,
+        },
+        annotation: match variable.type_ {
+            Some(annotation) => Some(strict_arguments_child(
+                arena,
+                bound,
+                declaration,
+                annotation,
+            )?),
+            None => None,
+        },
+    })
+}
+
+fn recovered_jsx_empty_block(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    parent: NodeRef,
+    body: NodeId,
+) -> bool {
+    let Some(body) = strict_arguments_child(arena, bound, parent, body) else {
+        return false;
+    };
+    let Some(record) = arena.get(body.node) else {
+        return false;
+    };
+    let NodeData::Block(block) = &record.data else {
+        return false;
+    };
+    record.kind == SyntaxKind::Block
+        && record.flags.0 == 0
+        && block.flow_node.is_none()
+        && block.next_container.is_none()
+        && block.statements.nodes.is_empty()
+        && !block.statements.has_trailing_comma
+        && block.facts == 0
+        && recovered_source_spelling(arena, body)
+            .is_some_and(|source| source.starts_with('{') && source.ends_with('}'))
+}
+
+fn recovered_jsx_object_method<'arena>(
+    arena: &'arena NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    object: NodeRef,
+) -> Option<(NodeRef, &'arena str, SemanticSymbolId)> {
+    let record = arena.get(object.node)?;
+    let NodeData::ObjectLiteralExpression(syntax) = &record.data else {
+        return None;
+    };
+    let [method] = syntax.properties.nodes.as_slice() else {
+        return None;
+    };
+    let object_symbol = bound.symbol(object)?;
+    let object_owner = store.symbol(object_symbol)?;
+    let members = object_owner
+        .members()
+        .and_then(|members| store.symbol_table(members))?;
+    if record.kind != SyntaxKind::ObjectLiteralExpression
+        || record.flags.0 != 0
+        || syntax.properties.has_trailing_comma
+        || syntax.properties.range != record.range
+        || syntax.symbol.is_some()
+        || syntax.facts != 0
+        || object_owner.flags() != SymbolFlags::OBJECT_LITERAL
+        || object_owner.check_flags() != CheckFlags::NONE
+        || object_owner.name() != ts_binder::InternalSymbolName::Object.as_ref()
+        || object_owner.declarations() != Some(&[object])
+        || object_owner.value_declaration() != Some(object)
+        || object_owner.parent().is_some()
+        || object_owner.exports().is_some()
+        || object_owner.export_symbol().is_some()
+        || store.get_merged_symbol(object_symbol) != Some(object_symbol)
+        || members.len() != 1
+    {
+        return None;
+    }
+
+    let method = strict_arguments_child(arena, bound, object, *method)?;
+    let record = arena.get(method.node)?;
+    let NodeData::MethodDeclaration(syntax) = &record.data else {
+        return None;
+    };
+    let (name, text) = recovered_protected_identifier(arena, bound, method, syntax.name)?;
+    let body = syntax.body?;
+    let symbol = bound.symbol(method)?;
+    let owner = store.symbol(symbol)?;
+    (record.kind == SyntaxKind::MethodDeclaration
+        && record.flags.0 == 0
+        && syntax.asterisk_token.is_none()
+        && syntax.end_flow_node.is_none()
+        && syntax.flow_node.is_none()
+        && syntax.full_signature.is_none()
+        && syntax.next_container.is_none()
+        && syntax.parameters.nodes.is_empty()
+        && !syntax.parameters.has_trailing_comma
+        && syntax.postfix_token.is_none()
+        && syntax.symbol.is_none()
+        && syntax.type_.is_none()
+        && syntax.type_parameters.is_none()
+        && syntax.facts == 0
+        && syntax.modifiers.is_none()
+        && recovered_source_spelling(arena, name) == Some(text)
+        && recovered_jsx_empty_block(arena, bound, method, body)
+        && owner.flags() == SymbolFlags::METHOD
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.name().as_utf8() == Some(text)
+        && owner.declarations() == Some(&[method])
+        && owner.value_declaration() == Some(method)
+        && owner.parent() == Some(object_symbol)
+        && owner.members().is_none()
+        && owner.exports().is_none()
+        && owner.export_symbol().is_none()
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && members.get_source(text) == Some(symbol))
+    .then_some((method, text, symbol))
+}
+
+fn recovered_jsx_opening(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    element: NodeRef,
+    opening: NodeId,
+) -> Option<NodeRef> {
+    let opening = strict_arguments_child(arena, bound, element, opening)?;
+    let record = arena.get(opening.node)?;
+    let NodeData::JsxOpeningElement(syntax) = &record.data else {
+        return None;
+    };
+    let attributes = strict_arguments_child(arena, bound, opening, syntax.attributes)?;
+    let attributes_record = arena.get(attributes.node)?;
+    let NodeData::JsxAttributes(attributes_data) = &attributes_record.data else {
+        return None;
+    };
+    if record.kind != SyntaxKind::JsxOpeningElement
+        || record.flags.0 != 0
+        || syntax.type_arguments.is_some()
+        || syntax.facts != 0
+        || attributes_record.kind != SyntaxKind::JsxAttributes
+        || attributes_record.flags.0 != 0
+        || !attributes_data.properties.nodes.is_empty()
+        || attributes_data.properties.has_trailing_comma
+        || attributes_data.symbol.is_some()
+        || attributes_data.facts != 0
+    {
+        return None;
+    }
+    strict_arguments_child(arena, bound, opening, syntax.tag_name)
+}
+
+fn recovered_jsx_missing_closing(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    element: NodeRef,
+    closing: NodeId,
+    eof: u32,
+) -> bool {
+    let Some(closing) = strict_arguments_child(arena, bound, element, closing) else {
+        return false;
+    };
+    let Some(record) = arena.get(closing.node) else {
+        return false;
+    };
+    let NodeData::JsxClosingElement(syntax) = &record.data else {
+        return false;
+    };
+    let Some(name) = strict_arguments_child(arena, bound, closing, syntax.tag_name) else {
+        return false;
+    };
+    let Some(name_record) = arena.get(name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return false;
+    };
+    record.kind == SyntaxKind::JsxClosingElement
+        && record.flags.0 == 0
+        && record.range.start.get() == eof
+        && record.range.end.get() == eof
+        && name_record.kind == SyntaxKind::Identifier
+        && name_record.flags.0 == NODE_FLAG_HAS_ERROR
+        && name_record.range.start.get() == eof
+        && name_record.range.end.get() == eof
+        && identifier.flow_node.is_none()
+        && identifier.text.is_empty()
+}
+
+fn recovered_jsx_text(arena: &NodeArena, bound: &BoundFile, parent: NodeRef, text: NodeId) -> bool {
+    let Some(text) = strict_arguments_child(arena, bound, parent, text) else {
+        return false;
+    };
+    let Some(record) = arena.get(text.node) else {
+        return false;
+    };
+    let NodeData::JsxText(syntax) = &record.data else {
+        return false;
+    };
+    record.kind == SyntaxKind::JsxText
+        && record.flags.0 == 0
+        && !syntax.contains_only_trivia_white_spaces
+        && syntax.token_flags.0 == 0
+        && !syntax.text.is_empty()
+        && recovered_source_spelling(arena, text) == Some(syntax.text.as_str())
+}
+
+fn recovered_jsx_name_resolves(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    host: &DeclaredTypeHost<'_>,
+    store: &CanonicalTypeMapperStore,
+    location: NodeRef,
+    name: &str,
+    expected: SemanticSymbolId,
+) -> Result<bool, SourceCheckError> {
+    let mut callback_host = host.name_resolver_host(store)?;
+    let resolved =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(DeclaredTypeError::from)?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(location)),
+                name,
+                SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+                None,
+                false,
+                false,
+            )
+            .map_err(DeclaredTypeError::from)?;
+    Ok(resolved == Some(expected))
+}
+
+#[allow(clippy::too_many_lines)] // The nested JSX tree must be authenticated as one source.
+fn recover_unclosed_jsx_source(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    host: &DeclaredTypeHost<'_>,
+    store: &CanonicalTypeMapperStore,
+    options: CanonicalCheckerOptions,
+    error: SourceCheckError,
+) -> Result<bool, SourceCheckError> {
+    let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+        node: failure,
+        kind: SyntaxKind::MethodDeclaration,
+        role: SourceSyntaxRole::ObjectProperty,
+    }) = error
+    else {
+        return Ok(false);
+    };
+    let Some(facts) = bound.source_facts() else {
+        return Ok(false);
+    };
+    let Some(source_text) = arena.source_text() else {
+        return Ok(false);
+    };
+    let Some(NodeData::SourceFile(source)) = arena
+        .get(bound.source_file().node)
+        .map(|record| &record.data)
+    else {
+        return Ok(false);
+    };
+    let [factory, object, component, view] = source.statements.nodes.as_slice() else {
+        return Ok(false);
+    };
+    if facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+        || !bound.diagnostics().is_empty()
+        || options.jsx_runtime != super::CanonicalJsxRuntime::Classic
+        || options.no_unused_locals
+        || options.no_unused_parameters
+        || source_text.len() > 65_536
+        || source.statements.has_trailing_comma
+    {
+        return Ok(false);
+    }
+
+    let Some(factory) =
+        recovered_jsx_variable(arena, bound, store, *factory, NODE_FLAG_CONST, true)
+    else {
+        return Ok(false);
+    };
+    let Some(annotation) = factory.annotation else {
+        return Ok(false);
+    };
+    let Some(annotation_record) = arena.get(annotation.node) else {
+        return Ok(false);
+    };
+    if factory.name != "React"
+        || factory.initializer.is_some()
+        || annotation_record.kind != SyntaxKind::AnyKeyword
+        || annotation_record.flags.0 != 0
+        || !matches!(annotation_record.data, NodeData::KeywordTypeNode(_))
+        || recovered_source_spelling(arena, annotation) != Some("any")
+    {
+        return Ok(false);
+    }
+
+    let Some(object_variable) =
+        recovered_jsx_variable(arena, bound, store, *object, NODE_FLAG_LET, false)
+    else {
+        return Ok(false);
+    };
+    let Some(object) = object_variable.initializer else {
+        return Ok(false);
+    };
+    let Some((method, method_name, _)) = recovered_jsx_object_method(arena, bound, store, object)
+    else {
+        return Ok(false);
+    };
+    if object_variable.annotation.is_some() || method != failure {
+        return Ok(false);
+    }
+
+    let Some(component) =
+        recovered_jsx_variable(arena, bound, store, *component, NODE_FLAG_LET, false)
+    else {
+        return Ok(false);
+    };
+    let Some(component_initializer) = component.initializer else {
+        return Ok(false);
+    };
+    let Some(NodeData::ArrowFunction(component_arrow)) = arena
+        .get(component_initializer.node)
+        .map(|record| &record.data)
+    else {
+        return Ok(false);
+    };
+    let mut component_recovery = RecoveredArrowSource::new(failure);
+    if component.annotation.is_some()
+        || component_arrow.type_.is_some()
+        || !component_arrow.parameters.nodes.is_empty()
+        || !recovered_arrow_function(
+            arena,
+            bound,
+            store,
+            component.declaration,
+            component_initializer,
+            &mut component_recovery,
+        )
+        || component_recovery.recovered_arrow
+    {
+        return Ok(false);
+    }
+
+    let Some(view) = recovered_jsx_variable(arena, bound, store, *view, NODE_FLAG_LET, false)
+    else {
+        return Ok(false);
+    };
+    let Some(outer) = view.initializer else {
+        return Ok(false);
+    };
+    let Some(outer_record) = arena.get(outer.node) else {
+        return Ok(false);
+    };
+    let NodeData::JsxElement(outer_element) = &outer_record.data else {
+        return Ok(false);
+    };
+    let [outer_text, inner] = outer_element.children.nodes.as_slice() else {
+        return Ok(false);
+    };
+    let Ok(eof) = u32::try_from(source_text.len()) else {
+        return Ok(false);
+    };
+    if view.annotation.is_some()
+        || outer_record.kind != SyntaxKind::JsxElement
+        || outer_record.flags.0 != 0
+        || outer_record.range.end.get() != eof
+        || outer_element.children.has_trailing_comma
+        || outer_element.facts != 0
+        || !recovered_jsx_text(arena, bound, outer, *outer_text)
+        || !recovered_jsx_missing_closing(arena, bound, outer, outer_element.closing_element, eof)
+    {
+        return Ok(false);
+    }
+    let Some(outer_tag) = recovered_jsx_opening(arena, bound, outer, outer_element.opening_element)
+    else {
+        return Ok(false);
+    };
+    let Some(outer_tag_record) = arena.get(outer_tag.node) else {
+        return Ok(false);
+    };
+    let NodeData::PropertyAccessExpression(access) = &outer_tag_record.data else {
+        return Ok(false);
+    };
+    let Some((receiver, receiver_name)) =
+        recovered_protected_identifier(arena, bound, outer_tag, access.expression)
+    else {
+        return Ok(false);
+    };
+    let Some((property, property_name)) =
+        recovered_protected_identifier(arena, bound, outer_tag, access.name)
+    else {
+        return Ok(false);
+    };
+    if outer_tag_record.kind != SyntaxKind::PropertyAccessExpression
+        || outer_tag_record.flags.0 != 0
+        || access.flow_node.is_some()
+        || access.question_dot_token.is_some()
+        || access.facts != 0
+        || receiver_name != object_variable.name
+        || property_name != method_name
+        || recovered_source_spelling(arena, receiver) != Some(receiver_name)
+        || recovered_source_spelling(arena, property) != Some(property_name)
+    {
+        return Ok(false);
+    }
+
+    let Some(inner) = strict_arguments_child(arena, bound, outer, *inner) else {
+        return Ok(false);
+    };
+    let Some(inner_record) = arena.get(inner.node) else {
+        return Ok(false);
+    };
+    let NodeData::JsxElement(inner_element) = &inner_record.data else {
+        return Ok(false);
+    };
+    let [inner_text] = inner_element.children.nodes.as_slice() else {
+        return Ok(false);
+    };
+    if inner_record.kind != SyntaxKind::JsxElement
+        || inner_record.flags.0 != 0
+        || inner_record.range.end.get() != eof
+        || inner_element.children.has_trailing_comma
+        || inner_element.facts != 0
+        || !recovered_jsx_text(arena, bound, inner, *inner_text)
+        || !recovered_jsx_missing_closing(arena, bound, inner, inner_element.closing_element, eof)
+    {
+        return Ok(false);
+    }
+    let Some(inner_tag) = recovered_jsx_opening(arena, bound, inner, inner_element.opening_element)
+    else {
+        return Ok(false);
+    };
+    let Some(inner_tag_record) = arena.get(inner_tag.node) else {
+        return Ok(false);
+    };
+    let NodeData::Identifier(inner_name) = &inner_tag_record.data else {
+        return Ok(false);
+    };
+    if inner_tag_record.kind != SyntaxKind::Identifier
+        || inner_tag_record.flags.0 != 0
+        || inner_name.flow_node.is_some()
+        || inner_name.text != component.name
+        || recovered_source_spelling(arena, inner_tag) != Some(component.name)
+    {
+        return Ok(false);
+    }
+
+    Ok(recovered_jsx_name_resolves(
+        arena,
+        bound,
+        host,
+        store,
+        receiver,
+        object_variable.name,
+        object_variable.symbol,
+    )? && recovered_jsx_name_resolves(
+        arena,
+        bound,
+        host,
+        store,
+        inner_tag,
+        component.name,
+        component.symbol,
+    )? && recovered_jsx_name_resolves(
+        arena,
+        bound,
+        host,
+        store,
+        outer,
+        factory.name,
+        factory.symbol,
+    )?)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Preserve complete source recovery.
 pub(super) fn recover_strict_arguments_source(
     arena: &NodeArena,
@@ -38797,6 +40071,11 @@ pub(super) fn recover_strict_arguments_source(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     error: SourceCheckError,
 ) -> Result<bool, SourceCheckError> {
+    if recover_malformed_arrow_source(arena, bound, host, store, options, diagnostics, error)?
+        || recover_unclosed_jsx_source(arena, bound, host, store, options, error)?
+    {
+        return Ok(true);
+    }
     if recover_protected_generic_constructor_access(
         arena,
         bound,

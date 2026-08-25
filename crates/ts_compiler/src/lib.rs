@@ -11148,6 +11148,254 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep the complete upstream fixture and baseline together.
+    fn canonical_program_recovers_the_complete_missing_arrow_token_fixture() {
+        let source = concat!(
+            "namespace missingArrowsWithCurly {\n",
+            "    var a = () { };\n",
+            "\n",
+            "    var b = (): void { }\n",
+            "\n",
+            "    var c = (x) { };\n",
+            "\n",
+            "    var d = (x: number, y: string) { };\n",
+            "\n",
+            "    var e = (x: number, y: string): void { };\n",
+            "}\n",
+            "\n",
+            "namespace missingCurliesWithArrow {\n",
+            "    namespace withStatement {\n",
+            "        var a = () => var k = 10;};\n",
+            "\n",
+            "        var b = (): void => var k = 10;}\n",
+            "\n",
+            "        var c = (x) => var k = 10;};\n",
+            "\n",
+            "        var d = (x: number, y: string) => var k = 10;};\n",
+            "\n",
+            "        var e = (x: number, y: string): void => var k = 10;};\n",
+            "\n",
+            "        var f = () => var k = 10;}\n",
+            "    }\n",
+            "\n",
+            "    namespace withoutStatement {\n",
+            "        var a = () => };\n",
+            "\n",
+            "        var b = (): void => }\n",
+            "\n",
+            "        var c = (x) => };\n",
+            "\n",
+            "        var d = (x: number, y: string) => };\n",
+            "\n",
+            "        var e = (x: number, y: string): void => };\n",
+            "\n",
+            "        var f = () => }\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "namespace ce_nEst_pas_une_arrow_function {\n",
+            "    var a = ();\n",
+            "\n",
+            "    var b = (): void;\n",
+            "\n",
+            "    var c = (x);\n",
+            "\n",
+            "    var d = (x: number, y: string);\n",
+            "\n",
+            "    var e = (x: number, y: string): void;\n",
+            "}\n",
+            "\n",
+            "namespace okay {\n",
+            "    var a = () => { };\n",
+            "\n",
+            "    var b = (): void => { }\n",
+            "\n",
+            "    var c = (x) => { };\n",
+            "\n",
+            "    var d = (x: number, y: string) => { };\n",
+            "\n",
+            "    var e = (x: number, y: string): void => { };\n",
+            "}",
+        );
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/arrowFunctionsMissingTokens.ts", source)
+            .unwrap();
+
+        let (program, state) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["arrowFunctionsMissingTokens.ts".to_owned()],
+            CompilerOptions {
+                strict: false,
+                strict_specified: true,
+                no_implicit_any: false,
+                no_implicit_any_specified: true,
+                target: ScriptTarget::Es2015,
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                let file = program
+                    .source_file("/project/arrowFunctionsMissingTokens.ts")
+                    .unwrap();
+                let missing_start = source.find("var c = (x);").unwrap() + "var c = (".len();
+                let identifier = file
+                    .parse
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::Identifier
+                            && record.range.start.get() as usize == missing_start)
+                            .then_some(file.node_ref(node).unwrap())
+                    })
+                    .expect("expected the unresolved parenthesized identifier");
+                let error_type = queries
+                    .context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .error_type;
+                assert_eq!(
+                    queries
+                        .context
+                        .store()
+                        .type_node_links(identifier)
+                        .and_then(|links| links.resolved_type),
+                    Some(error_type)
+                );
+                let before = (
+                    queries.context.store().type_len(),
+                    queries.context.store().symbol_len(),
+                    queries.context.store().signature_len(),
+                    queries.context.store().mapper_len(),
+                    queries.context.store().type_resolution_len(),
+                    queries.context.diagnostics().len(),
+                );
+                queries.context.recheck_source_file(file.id).unwrap();
+                let after = (
+                    queries.context.store().type_len(),
+                    queries.context.store().symbol_len(),
+                    queries.context.store().signature_len(),
+                    queries.context.store().mapper_len(),
+                    queries.context.store().type_resolution_len(),
+                    queries.context.diagnostics().len(),
+                );
+                (before, after)
+            },
+        )
+        .unwrap();
+        let (before, after) = state.unwrap();
+        assert_eq!(before, after);
+
+        let expected = [
+            (2, 16, 1005, "{", "'=>' expected."),
+            (4, 22, 1005, "{", "'=>' expected."),
+            (6, 17, 1005, "{", "'=>' expected."),
+            (8, 36, 1005, "{", "'=>' expected."),
+            (10, 42, 1005, "{", "'=>' expected."),
+            (15, 23, 1005, "var", "'{' expected."),
+            (17, 29, 1005, "var", "'{' expected."),
+            (19, 24, 1005, "var", "'{' expected."),
+            (21, 43, 1005, "var", "'{' expected."),
+            (23, 49, 1005, "var", "'{' expected."),
+            (25, 23, 1005, "var", "'{' expected."),
+            (29, 23, 1109, "}", "Expression expected."),
+            (31, 29, 1109, "}", "Expression expected."),
+            (33, 24, 1109, "}", "Expression expected."),
+            (35, 43, 1109, "}", "Expression expected."),
+            (37, 49, 1109, "}", "Expression expected."),
+            (39, 23, 1109, "}", "Expression expected."),
+            (40, 5, 1128, "}", "Declaration or statement expected."),
+            (41, 1, 1128, "}", "Declaration or statement expected."),
+            (44, 14, 1109, ")", "Expression expected."),
+            (46, 21, 1005, ";", "'=>' expected."),
+            (48, 14, 2304, "x", "Cannot find name 'x'."),
+            (50, 35, 1005, ";", "'=>' expected."),
+            (52, 41, 1005, ";", "'=>' expected."),
+        ];
+        assert_eq!(program.diagnostics().len(), expected.len());
+        for (diagnostic, (line, column, code, spelling, message)) in
+            program.diagnostics().iter().zip(expected)
+        {
+            let line_start = source
+                .lines()
+                .take(line - 1)
+                .map(|line| line.len() + 1)
+                .sum::<usize>();
+            let start = line_start + column - 1;
+            let end = start + spelling.len();
+            assert_eq!(
+                (
+                    diagnostic.file_name.as_deref(),
+                    diagnostic.code,
+                    diagnostic.range,
+                    diagnostic.message.as_str(),
+                ),
+                (
+                    Some("/project/arrowFunctionsMissingTokens.ts"),
+                    Some(code),
+                    Some(TextRange::new(
+                        TextPos::new(u32::try_from(start).unwrap()),
+                        TextPos::new(u32::try_from(end).unwrap()),
+                    )),
+                    message,
+                ),
+                "line {line}, column {column}",
+            );
+            assert_eq!(&source[start..end], spelling);
+        }
+    }
+
+    #[test]
+    fn malformed_arrow_recovery_does_not_hide_unrelated_source() {
+        for source in [
+            concat!(
+                "namespace Recovery {\n",
+                "    var ordinary = () => {};\n",
+                "}\n",
+            ),
+            concat!(
+                "namespace Recovery {\n",
+                "    var recovered = () { };\n",
+                "    var unrelated = unsupported();\n",
+                "}\n",
+            ),
+            concat!(
+                "namespace Recovery {\n",
+                "    var recovered = () { };\n",
+                "    var first = (missing);\n",
+                "    var second = (other);\n",
+                "}\n",
+            ),
+            concat!(
+                "namespace Recovery {\n",
+                "    var recovered = () { };\n",
+                "    class Unrelated { method() {} }\n",
+                "}\n",
+            ),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/input.ts", source).unwrap();
+            let Err(error) = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &["input.ts".to_owned()],
+                CompilerOptions {
+                    strict: false,
+                    strict_specified: true,
+                    no_implicit_any: false,
+                    no_implicit_any_specified: true,
+                    lib: Some(vec!["es5".to_owned()]),
+                    ..CompilerOptions::default()
+                },
+            ) else {
+                panic!("expected unrelated unsupported syntax to remain rejected: {source}");
+            };
+            assert!(error.is_unsupported_boundary(), "{source}: {error:?}");
+        }
+    }
+
+    #[test]
     fn canonical_program_checks_multi_file_primitive_assignments_atomically() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/project/first.ts", r#"const first: number = "wrong";"#)
@@ -11696,6 +11944,165 @@ mod tests {
             Some("/project/component.tsx")
         );
         assert_eq!(diagnostic.code, Some(2322));
+    }
+
+    #[test]
+    fn canonical_program_recovers_complete_unclosed_jsx_tag_fixture() {
+        let source = concat!(
+            "declare const React: any\n",
+            "\n",
+            "let Foo = {\n",
+            "  Bar() {}\n",
+            "}\n",
+            "\n",
+            "let Baz = () => {}\n",
+            "\n",
+            "let x = <    Foo.Bar >Hello\n",
+            "\n",
+            "let y = <   Baz >Hello",
+        );
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/errorSpanForUnclosedJsxTag.tsx", source)
+            .unwrap();
+
+        let (program, state) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["errorSpanForUnclosedJsxTag.tsx".to_owned()],
+            CompilerOptions {
+                jsx: ts_options::JsxEmit::React,
+                target: ScriptTarget::Es2015,
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                let file = program
+                    .source_file("/project/errorSpanForUnclosedJsxTag.tsx")
+                    .unwrap()
+                    .id;
+                let before = (
+                    queries.context.store().type_len(),
+                    queries.context.store().symbol_len(),
+                    queries.context.store().signature_len(),
+                    queries.context.store().mapper_len(),
+                    queries.context.store().type_resolution_len(),
+                    queries.context.diagnostics().len(),
+                );
+                queries.context.recheck_source_file(file).unwrap();
+                let after = (
+                    queries.context.store().type_len(),
+                    queries.context.store().symbol_len(),
+                    queries.context.store().signature_len(),
+                    queries.context.store().mapper_len(),
+                    queries.context.store().type_resolution_len(),
+                    queries.context.diagnostics().len(),
+                );
+                (before, after)
+            },
+        )
+        .unwrap();
+        let (before, after) = state.unwrap();
+        assert_eq!(before, after);
+
+        let foo_start = u32::try_from(source.find("Foo.Bar").unwrap()).unwrap();
+        let baz_start = u32::try_from(source.rfind("Baz").unwrap()).unwrap();
+        let eof = u32::try_from(source.len()).unwrap();
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.file_name.as_deref(),
+                    diagnostic.code,
+                    diagnostic.range,
+                    diagnostic.message.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Some("/project/errorSpanForUnclosedJsxTag.tsx"),
+                    Some(17008),
+                    Some(TextRange::new(
+                        TextPos::new(foo_start),
+                        TextPos::new(foo_start + 7),
+                    )),
+                    "JSX element 'Foo.Bar' has no corresponding closing tag.",
+                ),
+                (
+                    Some("/project/errorSpanForUnclosedJsxTag.tsx"),
+                    Some(17008),
+                    Some(TextRange::new(
+                        TextPos::new(baz_start),
+                        TextPos::new(baz_start + 3),
+                    )),
+                    "JSX element 'Baz' has no corresponding closing tag.",
+                ),
+                (
+                    Some("/project/errorSpanForUnclosedJsxTag.tsx"),
+                    Some(1005),
+                    Some(TextRange::new(TextPos::new(eof), TextPos::new(eof))),
+                    "'</' expected.",
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn unclosed_jsx_recovery_does_not_hide_unrelated_object_methods() {
+        for source in [
+            concat!(
+                "declare const React: any\n",
+                "let Foo = { Bar() { unsupported(); } }\n",
+                "let Baz = () => {}\n",
+                "let x = <Foo.Bar>Hello\n",
+                "let y = <Baz>Hello",
+            ),
+            concat!(
+                "declare const React: any\n",
+                "let Foo = { Bar() {}, Other() {} }\n",
+                "let Baz = () => {}\n",
+                "let x = <Foo.Bar>Hello\n",
+                "let y = <Baz>Hello",
+            ),
+            concat!(
+                "declare const React: any\n",
+                "let Foo = { Other() {} }\n",
+                "let Baz = () => {}\n",
+                "let x = <Foo.Bar>Hello\n",
+                "let y = <Baz>Hello",
+            ),
+            concat!(
+                "declare const React: any\n",
+                "let Foo = { Bar() {} }\n",
+                "let Baz = () => {}\n",
+                "let unrelated = Missing\n",
+                "let x = <Foo.Bar>Hello\n",
+                "let y = <Baz>Hello",
+            ),
+            concat!(
+                "declare const React: any\n",
+                "let Foo = { Bar() {} }\n",
+                "let Baz = () => {}\n",
+                "let x = <Foo.Bar>Hello<Baz>Hello</Baz></Foo.Bar>",
+            ),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/input.tsx", source).unwrap();
+            let Err(error) = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &["input.tsx".to_owned()],
+                CompilerOptions {
+                    jsx: ts_options::JsxEmit::React,
+                    target: ScriptTarget::Es2015,
+                    lib: Some(vec!["es5".to_owned()]),
+                    ..CompilerOptions::default()
+                },
+            ) else {
+                panic!("expected unrelated unsupported JSX syntax to remain rejected: {source}");
+            };
+            assert!(error.is_unsupported_boundary(), "{source}: {error:?}");
+        }
     }
 
     #[test]

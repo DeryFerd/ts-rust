@@ -1015,7 +1015,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// repaired and retried without exposing a partial source result. Safe
     /// canonical memo caches may survive a rejected attempt; diagnostics tied
     /// to those caches stay in context-private retry staging until success.
-    /// Already-diagnosed strict `arguments` collisions use bounded recovery.
+    /// Already-diagnosed strict `arguments` collisions and authenticated
+    /// parser-recovery sources use bounded recovery.
     ///
     /// # Errors
     ///

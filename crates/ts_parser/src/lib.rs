@@ -12605,6 +12605,56 @@ mod tests {
     }
 
     #[test]
+    fn missing_arrow_tokens_preserve_upstream_brace_spans_and_synthetic_tokens() {
+        for source in [
+            "var a = () { };",
+            "var b = (): void { }",
+            "var c = (x) { };",
+            "var d = (x: number, y: string) { };",
+            "var e = (x: number, y: string): void { };",
+        ] {
+            let result = parse_source_file(source);
+            let start = u32::try_from(source.find('{').unwrap()).unwrap();
+            assert_eq!(
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                        diagnostic.message.as_str(),
+                    ))
+                    .collect::<Vec<_>>(),
+                [(Some(1005), start, start + 1, "'=>' expected.")],
+                "{source}"
+            );
+
+            let (list, _) = variable_list(&result, source_statements(&result)[0]);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected the recovered arrow declaration");
+            };
+            let arrow_node = declaration.initializer.unwrap();
+            let NodeData::ArrowFunction(arrow) = &result.arena.get(arrow_node).unwrap().data else {
+                panic!("expected a recovered arrow function");
+            };
+            let token = result.arena.get(arrow.equals_greater_than_token).unwrap();
+            assert_eq!(token.kind, SyntaxKind::EqualsGreaterThanToken);
+            assert_eq!(token.flags, NODE_FLAG_HAS_ERROR);
+            assert_eq!(token.range.start.get(), start);
+            assert_eq!(token.range.end.get(), start);
+            assert_eq!(token.parent, Some(arrow_node));
+            assert_eq!(
+                result.arena.get(arrow.body).unwrap().kind,
+                SyntaxKind::Block
+            );
+        }
+    }
+
+    #[test]
     fn missing_arrow_body_braces_preserve_lexical_declarations_and_exact_ranges() {
         for keyword in ["var", "let", "const"] {
             let source = format!(
