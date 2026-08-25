@@ -1216,7 +1216,7 @@ enum PlannedLoopFunctionStatement {
     ConditionalReturn {
         condition: PlannedExpression,
         returned: NodeRef,
-        expression: Option<PlannedExpression>,
+        expression: Option<Box<PlannedExpression>>,
     },
 }
 
@@ -10462,7 +10462,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             returned,
                             expression: expression
                                 .map(|expression| self.plan_expression(expression))
-                                .transpose()?,
+                                .transpose()?
+                                .map(Box::new),
                         });
                     }
                 }
@@ -30271,7 +30272,7 @@ fn check_planned_loop_function_statements(
                     *returned,
                 )?;
 
-                let type_ = match expression {
+                let type_ = match expression.as_deref() {
                     Some(expression) => {
                         if let Some(annotation) = callable.return_type.type_node() {
                             check_planned_assignment(
@@ -39382,19 +39383,28 @@ fn recover_malformed_arrow_source(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     error: SourceCheckError,
 ) -> Result<bool, SourceCheckError> {
-    let failure = match error {
-        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
-            node,
-            kind: SyntaxKind::ArrowFunction,
-            role: SourceSyntaxRole::VariableInitializer,
-        })
-        | SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
-            node,
-            kind: SyntaxKind::VariableStatement,
-            role: SourceSyntaxRole::VariableStatement | SourceSyntaxRole::Statement,
-        })
-        | SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(node)) => node,
-        _ => return Ok(false),
+    let SourceCheckError::Unsupported(unsupported) = error else {
+        return Ok(false);
+    };
+    let failure = if let UnsupportedSourceSyntax::Arrow(node) = unsupported {
+        node
+    } else {
+        let UnsupportedSourceSyntax::Syntax { node, kind, role } = unsupported else {
+            return Ok(false);
+        };
+        if !matches!(
+            (kind, role),
+            (
+                SyntaxKind::ArrowFunction,
+                SourceSyntaxRole::VariableInitializer,
+            ) | (
+                SyntaxKind::VariableStatement,
+                SourceSyntaxRole::VariableStatement | SourceSyntaxRole::Statement,
+            )
+        ) {
+            return Ok(false);
+        }
+        node
     };
     let Some(facts) = bound.source_facts() else {
         return Ok(false);
