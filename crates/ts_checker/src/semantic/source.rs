@@ -45272,6 +45272,73 @@ mod tests {
     }
 
     #[test]
+    fn derived_super_calls_can_expose_a_public_constructor_over_a_protected_base() {
+        let source = parsed(concat!(
+            "class Base { protected constructor() {} } ",
+            "class Derived extends Base { constructor() { super(); } } ",
+            "const value = new Derived();",
+        ));
+        let file = FileId::new(9_881);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let base = global_symbol(&context, "Base");
+        let derived = global_symbol(&context, "Derived");
+        let base_members = context.get_nongeneric_class_members(base).unwrap();
+        let derived_members = context.get_nongeneric_class_members(derived).unwrap();
+        let call = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::CallExpression(call) = &record.data else {
+                    return None;
+                };
+                source
+                    .arena
+                    .get(call.expression)
+                    .is_some_and(|callee| callee.kind == SyntaxKind::SuperKeyword)
+                    .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .expect("the derived constructor retains its direct super call");
+        let construction = variable_initializer(&source, file, "value");
+        assert_eq!(
+            resolved_node_type(&context, call),
+            context.store().intrinsic_bootstrap().unwrap().void_type,
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature()),
+            Some(base_members.default_construct_signature()),
+        );
+        assert_eq!(
+            resolved_node_type(&context, construction),
+            derived_members.shells().instance_type(),
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature_links(construction)
+                .and_then(|links| links.resolved_signature.signature()),
+            Some(derived_members.default_construct_signature()),
+        );
+        assert_eq!(
+            validate_class_heritage_members(
+                context.store(),
+                derived_members.shells().instance_type(),
+            ),
+            ClassHeritageMembersValidation::Valid,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn derived_constructor_parameter_property_preserves_source_and_signature_identities() {
         for (index, annotation) in ["number", "string"].into_iter().enumerate() {
             let text = format!(

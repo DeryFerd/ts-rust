@@ -31,6 +31,8 @@
 //! parameters remain restricted to one authenticated string parameter.
 //! A derived constructor may retain one public, interface-typed parameter
 //! property and forward one primitive interface property to its base.
+//! A parameterless derived constructor may forward to an authenticated
+//! parameterless public or protected base constructor with `super()`.
 //! Numeric and string instance and static fields retain direct literal
 //! initializers, including inferred readonly literal types.
 //! Private fields, empty methods, and paired accessors retain their class brand.
@@ -114,6 +116,7 @@ struct ClassConstructorPlan {
     visibility: ClassConstructorVisibility,
     parameter: Option<ClassConstructorParameterPlan>,
     parameter_property: Option<ClassConstructorParameterPropertyPlan>,
+    super_call: Option<NodeRef>,
 }
 
 impl ClassConstructorPlan {
@@ -1772,6 +1775,7 @@ fn plan_constructor(
         visibility,
         parameter,
         parameter_property: None,
+        super_call: None,
     })
 }
 
@@ -1876,6 +1880,219 @@ fn validate_constructor_parameter_property_cache(
     Ok(interface_type)
 }
 
+fn validate_derived_super_call_cache(
+    store: &CanonicalTypeMapperStore,
+    call: NodeRef,
+    base_signature: Option<SignatureId>,
+) -> Result<(), ClassError> {
+    let void = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.void_type)
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(call)))?;
+    if store.type_node_links(call).is_some_and(|links| {
+        links != &TypeNodeLinks::default()
+            && links
+                != &(TypeNodeLinks {
+                    resolved_type: Some(void),
+                    ..TypeNodeLinks::default()
+                })
+    }) || store.signature_links(call).is_some_and(|links| {
+        links != &SignatureLinks::default()
+            && base_signature.is_none_or(|signature| {
+                links
+                    != &(SignatureLinks {
+                        resolved_signature: ResolvedSignatureState::Resolved(signature),
+                        ..SignatureLinks::default()
+                    })
+            })
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(call)));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Constructor, super call, owner, and caches form one proof.
+fn plan_zero_argument_derived_constructor(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    class_declaration: NodeRef,
+    declaration: NodeRef,
+    instance_members: Option<SymbolTableId>,
+    base: &ClassMemberPlan,
+) -> Result<ClassConstructorPlan, ClassError> {
+    let reject = || accessor_member_error(declaration, SyntaxKind::Constructor);
+    if base.class.ambient
+        || base.constructor_visibility() == ClassConstructorVisibility::Private
+        || base.class.constructor.is_some_and(|constructor| {
+            constructor.parameter.is_some() || constructor.parameter_property.is_some()
+        })
+    {
+        return Err(reject());
+    }
+
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::ConstructorDeclaration(constructor) = &record.data else {
+        return Err(reject());
+    };
+    if record.kind != SyntaxKind::Constructor
+        || record.flags.0 != 0
+        || record.parent != Some(class_declaration.node)
+        || constructor.asterisk_token.is_some()
+        || constructor.end_flow_node.is_some()
+        || constructor.full_signature.is_some()
+        || constructor.next_container.is_some()
+        || constructor.return_flow_node.is_some()
+        || constructor.symbol.is_some()
+        || constructor.type_.is_some()
+        || constructor.type_parameters.is_some()
+        || constructor.facts != 0
+        || constructor.modifiers.is_some()
+        || constructor.parameters.has_trailing_comma
+        || !constructor.parameters.nodes.is_empty()
+    {
+        return Err(reject());
+    }
+
+    let symbol = bound_symbol(store, host, declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidConstructSignature(owner)))?;
+    let symbol_record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidConstructSignature(owner)))?;
+    let table = instance_members.and_then(|members| store.symbol_table(members));
+    if symbol_record.flags() != SymbolFlags::CONSTRUCTOR
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name() != InternalSymbolName::Constructor.as_ref()
+        || symbol_record.declarations() != Some(&[declaration])
+        || symbol_record.value_declaration().is_some()
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || table.and_then(|table| table.get(InternalSymbolName::Constructor.as_ref()))
+            != Some(symbol)
+    {
+        return Err(invariant(ClassInvariant::InvalidConstructSignature(owner)));
+    }
+
+    let body = constructor
+        .body
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(reject)?;
+    let body_record = preflight_node(store, host, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(reject());
+    };
+    let [statement] = block.statements.nodes.as_slice() else {
+        return Err(reject());
+    };
+    if body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(declaration.node)
+        || body_record.range.start < constructor.parameters.range.end
+        || body_record.range.end != record.range.end
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.facts != 0
+        || block.statements.has_trailing_comma
+    {
+        return Err(reject());
+    }
+    let statement = NodeRef::new(body.arena, body.file, *statement);
+    let statement_record = preflight_node(store, host, statement)?;
+    let NodeData::ExpressionStatement(expression) = &statement_record.data else {
+        return Err(reject());
+    };
+    if statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.flags.0 != 0
+        || statement_record.parent != Some(body.node)
+        || expression.flow_node.is_some()
+    {
+        return Err(reject());
+    }
+
+    let call = NodeRef::new(statement.arena, statement.file, expression.expression);
+    let call_record = preflight_node(store, host, call)?;
+    let NodeData::CallExpression(call_data) = &call_record.data else {
+        return Err(reject());
+    };
+    if call_record.kind != SyntaxKind::CallExpression
+        || call_record.flags.0 != 0
+        || call_record.parent != Some(statement.node)
+        || call_data.question_dot_token.is_some()
+        || call_data.symbol.is_some()
+        || call_data.type_arguments.is_some()
+        || call_data.facts != 0
+        || call_data.arguments.has_trailing_comma
+        || !call_data.arguments.nodes.is_empty()
+    {
+        return Err(reject());
+    }
+    let callee = NodeRef::new(call.arena, call.file, call_data.expression);
+    let callee_record = preflight_node(store, host, callee)?;
+    let NodeData::KeywordExpression(keyword) = &callee_record.data else {
+        return Err(reject());
+    };
+    if callee_record.kind != SyntaxKind::SuperKeyword
+        || callee_record.flags.0 != 0
+        || callee_record.parent != Some(call.node)
+        || keyword.flow_node.is_some()
+    {
+        return Err(reject());
+    }
+
+    let base_signature = base
+        .class
+        .constructor
+        .and_then(|constructor| store.signature_links(constructor.declaration))
+        .and_then(|links| links.resolved_signature.signature())
+        .or_else(|| {
+            store
+                .value_symbol_links(base.class.symbol)
+                .and_then(|links| links.resolved_type)
+                .and_then(|value| store.type_payload(value))
+                .and_then(|value| value.data().structured())
+                .and_then(|value| value.signatures.as_deref())
+                .and_then(|signatures| match signatures {
+                    [signature] => Some(*signature),
+                    _ => None,
+                })
+        });
+    validate_derived_super_call_cache(store, call, base_signature)?;
+    if let Some(links) = store.signature_links(declaration)
+        && links != &SignatureLinks::default()
+    {
+        let ResolvedSignatureState::Resolved(signature) = links.resolved_signature else {
+            return Err(invariant(ClassInvariant::InvalidConstructSignature(owner)));
+        };
+        let Some(instance_type) = store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+        else {
+            return Err(invariant(ClassInvariant::InvalidConstructSignature(owner)));
+        };
+        if links
+            != &(SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            })
+            || !exact_construct_signature(store, signature, instance_type, Some(declaration), None)
+        {
+            return Err(invariant(ClassInvariant::InvalidConstructSignature(owner)));
+        }
+    }
+
+    Ok(ClassConstructorPlan {
+        declaration,
+        symbol,
+        visibility: ClassConstructorVisibility::Public,
+        parameter: None,
+        parameter_property: None,
+        super_call: Some(call),
+    })
+}
+
 fn plan_derived_constructor(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1887,6 +2104,21 @@ fn plan_derived_constructor(
 ) -> Result<ClassConstructorPlan, ClassError> {
     let reject = || accessor_member_error(declaration, SyntaxKind::Constructor);
     let base_plan = plan_nongeneric_class_members(store, host, base.symbol)?;
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::ConstructorDeclaration(constructor) = &record.data else {
+        return Err(reject());
+    };
+    if constructor.parameters.nodes.is_empty() {
+        return plan_zero_argument_derived_constructor(
+            store,
+            host,
+            owner,
+            class_declaration,
+            declaration,
+            instance_members,
+            &base_plan,
+        );
+    }
     let Some(base_constructor) = base_plan.class.constructor else {
         return Err(reject());
     };
@@ -1900,10 +2132,6 @@ fn plan_derived_constructor(
         return Err(reject());
     }
 
-    let record = preflight_node(store, host, declaration)?;
-    let NodeData::ConstructorDeclaration(constructor) = &record.data else {
-        return Err(reject());
-    };
     let [parameter] = constructor.parameters.nodes.as_slice() else {
         return Err(reject());
     };
@@ -2286,6 +2514,7 @@ fn plan_derived_constructor(
         visibility: ClassConstructorVisibility::Public,
         parameter: None,
         parameter_property: Some(parameter_property),
+        super_call: None,
     })
 }
 
@@ -12783,6 +13012,29 @@ fn exact_constructor_parameter_property_state(
             })
 }
 
+fn exact_derived_super_call_state(
+    store: &CanonicalTypeMapperStore,
+    call: NodeRef,
+    base_signature: SignatureId,
+) -> bool {
+    let Some(void) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.void_type)
+    else {
+        return false;
+    };
+    store.type_node_links(call)
+        == Some(&TypeNodeLinks {
+            resolved_type: Some(void),
+            ..TypeNodeLinks::default()
+        })
+        && store.signature_links(call)
+            == Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(base_signature),
+                ..SignatureLinks::default()
+            })
+}
+
 fn completed_derived_class_members(
     store: &CanonicalTypeMapperStore,
     plan: &ClassMemberPlan,
@@ -12909,6 +13161,13 @@ fn completed_derived_class_members(
                     &parameter,
                     base.default_construct_signature,
                 )
+            })
+        || plan
+            .class
+            .constructor
+            .and_then(|constructor| constructor.super_call)
+            .is_some_and(|call| {
+                !exact_derived_super_call_state(store, call, base.default_construct_signature)
             })
     {
         return None;
@@ -14392,6 +14651,19 @@ fn execute_direct_derived_class_members(
         .class
         .constructor
         .and_then(|constructor| constructor.parameter_property);
+    let super_call = plan
+        .class
+        .constructor
+        .and_then(|constructor| constructor.super_call);
+    if let Some(call) = super_call {
+        validate_derived_super_call_cache(
+            store,
+            call,
+            base_state
+                .as_ref()
+                .map(ClassMembers::default_construct_signature),
+        )?;
+    }
     let parameter_property_type = parameter_property
         .map(|parameter| {
             validate_constructor_parameter_property_cache(
@@ -14545,11 +14817,14 @@ fn execute_direct_derived_class_members(
         .filter(|node| store.type_node_links(*node).is_none())
         .count()
     });
+    let missing_super_call_type_node_links =
+        usize::from(super_call.is_some_and(|call| store.type_node_links(call).is_none()));
     let missing_type_node_links = missing_property_type_node_links
         .checked_add(missing_method_type_node_links)
         .and_then(|count| count.checked_add(missing_method_body_type_node_links))
         .and_then(|count| count.checked_add(missing_base_constructor_type_node_links))
         .and_then(|count| count.checked_add(missing_constructor_property_type_node_links))
+        .and_then(|count| count.checked_add(missing_super_call_type_node_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let missing_property_value_links = plan
         .class
@@ -14607,7 +14882,11 @@ fn execute_direct_derived_class_members(
         .count();
     let missing_super_call_signature_links = usize::from(
         parameter_property.is_some_and(|parameter| store.signature_links(parameter.call).is_none()),
-    );
+    )
+    .checked_add(usize::from(
+        super_call.is_some_and(|call| store.signature_links(call).is_none()),
+    ))
+    .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let missing_signature_links = missing_constructor_signature_links
         .checked_add(missing_method_signature_links)
         .and_then(|count| count.checked_add(missing_tagged_signature_links))
@@ -14810,6 +15089,28 @@ fn execute_direct_derived_class_members(
             }
             assert!(store.set_signature_links(
                 parameter.call,
+                SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(
+                        base.default_construct_signature,
+                    ),
+                    ..SignatureLinks::default()
+                },
+            ));
+        }
+        if let Some(call) = constructor.super_call {
+            let void = store
+                .intrinsic_bootstrap()
+                .expect("an authenticated super call retains intrinsic types")
+                .void_type;
+            assert!(store.set_type_node_links(
+                call,
+                TypeNodeLinks {
+                    resolved_type: Some(void),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_signature_links(
+                call,
                 SignatureLinks {
                     resolved_signature: ResolvedSignatureState::Resolved(
                         base.default_construct_signature,
@@ -18858,6 +19159,215 @@ mod tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    fn zero_argument_derived_constructors_publish_authenticated_super_calls() {
+        for (source, base_visibility) in [
+            (
+                "class Base {} class Derived extends Base { constructor() { super(); } }",
+                ClassConstructorVisibility::Public,
+            ),
+            (
+                concat!(
+                    "class Base { constructor() {} } ",
+                    "class Derived extends Base { constructor() { super(); } }",
+                ),
+                ClassConstructorVisibility::Public,
+            ),
+            (
+                concat!(
+                    "class Base { protected constructor() {} } ",
+                    "class Derived extends Base { constructor() { super(); } }",
+                ),
+                ClassConstructorVisibility::Protected,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Derived");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Derived { class, base } = &plan else {
+                panic!("the explicit constructor must retain its direct base")
+            };
+            let constructor = class.class.constructor.unwrap();
+            let call = constructor.super_call.unwrap();
+            assert_eq!(base.constructor_visibility(), base_visibility);
+            assert_eq!(
+                plan.constructor_visibility(),
+                ClassConstructorVisibility::Public
+            );
+            assert!(constructor.parameter.is_none());
+            assert!(constructor.parameter_property.is_none());
+            assert!(fixture.store.type_node_links(call).is_none());
+            assert!(fixture.store.signature_links(call).is_none());
+
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+            let base = members.base().unwrap();
+            let base_value = fixture.store.type_payload(base.value_type()).unwrap();
+            let [base_signature] = base_value
+                .data()
+                .structured()
+                .and_then(|structured| structured.signatures.as_deref())
+                .unwrap()
+            else {
+                panic!("the base value must retain one construct signature")
+            };
+            let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+            assert_eq!(
+                fixture.store.type_node_links(call),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(void),
+                    ..TypeNodeLinks::default()
+                }),
+            );
+            assert_eq!(
+                fixture.store.signature_links(call),
+                Some(&SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(*base_signature),
+                    ..SignatureLinks::default()
+                }),
+            );
+            let own_signature = fixture
+                .store
+                .signature(members.default_construct_signature())
+                .unwrap();
+            assert_eq!(own_signature.declaration(), Some(constructor.declaration));
+            assert!(own_signature.parameters().is_empty());
+            assert_eq!(own_signature.min_argument_count(), 0);
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+                ClassHeritageMembersValidation::Valid,
+            );
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+                Ok(members),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn zero_argument_super_calls_reject_invalid_base_visibility_and_constructor_shapes() {
+        for source in [
+            concat!(
+                "class Base { private constructor() {} } ",
+                "class Derived extends Base { constructor() { super(); } }",
+            ),
+            concat!(
+                "class Base { constructor(value: number) {} } ",
+                "class Derived extends Base { constructor() { super(); } }",
+            ),
+            "class Base {} class Derived extends Base { constructor() {} }",
+            "class Base {} class Derived extends Base { constructor() { super(1); } }",
+            "class Base {} class Derived extends Base { constructor() { super(); super(); } }",
+        ] {
+            let fixture = fixture(source);
+            let base = class_symbol(&fixture, "Base");
+            let owner = class_symbol(&fixture, "Derived");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                matches!(
+                    plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                    Err(ClassError::Unsupported(_)),
+                ),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+            for symbol in [base, owner] {
+                assert!(fixture.store.declared_type_links(symbol).is_none());
+                assert!(fixture.store.value_symbol_links(symbol).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn zero_argument_super_call_poison_rejects_before_either_class_is_published() {
+        for poison_signature in [false, true] {
+            let mut fixture =
+                fixture("class Base {} class Derived extends Base { constructor() { super(); } }");
+            let base = class_symbol(&fixture, "Base");
+            let owner = class_symbol(&fixture, "Derived");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Derived { class, .. } = &plan else {
+                panic!("the fixture retains one explicit derived constructor")
+            };
+            let call = class.class.constructor.unwrap().super_call.unwrap();
+            let (any_signature, number_type) = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                (bootstrap.any_signature, bootstrap.number_type)
+            };
+            if poison_signature {
+                assert!(fixture.store.set_signature_links(
+                    call,
+                    SignatureLinks {
+                        resolved_signature: ResolvedSignatureState::Resolved(any_signature),
+                        ..SignatureLinks::default()
+                    },
+                ));
+            } else {
+                assert!(fixture.store.set_type_node_links(
+                    call,
+                    TypeNodeLinks {
+                        resolved_type: Some(number_type),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+            }
+            let poisoned = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(invariant(ClassInvariant::InvalidPropertyTypeCache(call))),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                poisoned,
+            );
+            for symbol in [base, owner] {
+                assert!(fixture.store.declared_type_links(symbol).is_none());
+                assert!(fixture.store.value_symbol_links(symbol).is_none());
+            }
+        }
     }
 
     #[test]
