@@ -16632,12 +16632,12 @@ mod generic_publication_tests {
     }
 
     #[test]
-    fn generic_interface_methods_preserve_null_overloads_and_tuple_rest_parameters() {
+    fn generic_interface_methods_preserve_optional_annotation_identity_and_tuple_rest() {
         let fixture = interface_fixture(
             concat!(
                 "interface Contract<Value> { ",
                 "then(filter: null): Value; ",
-                "then(filter?: null): Value; ",
+                "then(filter?: ((null))): Value; ",
                 "spread(...values: [value: Value]): Value; ",
                 "}",
             ),
@@ -16653,7 +16653,7 @@ mod generic_publication_tests {
         let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
 
         let [required, optional, spread] = plan.methods.as_slice() else {
-            panic!("the generic interface must preserve both overloads and its tuple rest method")
+            panic!("the generic interface retains two overloads and its tuple-rest method")
         };
         assert_eq!(required.symbol, optional.symbol);
         assert!(required.parameters[0].null_literal_identity);
@@ -16662,6 +16662,18 @@ mod generic_publication_tests {
         assert!(optional.parameters[0].null_literal_identity);
         assert!(optional.parameters[0].optional);
         assert_eq!(optional.minimum_argument_count, 0);
+        assert_eq!(
+            fixture
+                .store
+                .source_node_kind(optional.parameters[0].type_node),
+            Some(SyntaxKind::ParenthesizedType),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .source_node_kind(optional.parameters[0].identity_node),
+            Some(SyntaxKind::LiteralType),
+        );
         assert_eq!(spread.flags, SignatureFlags::HAS_REST_PARAMETER);
         assert_eq!(
             fixture
@@ -16680,7 +16692,7 @@ mod generic_publication_tests {
     }
 
     #[test]
-    fn conditional_then_methods_preserve_authenticated_inferred_rest_parameters() {
+    fn conditional_type_literal_methods_preserve_authenticated_inferred_rest_parameters() {
         let fixture = interface_fixture(
             concat!(
                 "interface Owner {} ",
@@ -16712,10 +16724,10 @@ mod generic_publication_tests {
         let plan = plan_type_literal(&fixture.store, &host, literal, None).unwrap();
 
         let [method] = plan.methods.as_slice() else {
-            panic!("the conditional thenable must retain its binder-owned method")
+            panic!("the conditional thenable retains its binder-owned method")
         };
         let [value, rest] = method.parameters.as_slice() else {
-            panic!("the thenable must retain its inferred value and rest parameters")
+            panic!("the thenable retains its inferred value and rest parameters")
         };
         assert_eq!(method.flags, SignatureFlags::HAS_REST_PARAMETER);
         assert_eq!(method.minimum_argument_count, 1);
@@ -16738,7 +16750,7 @@ mod generic_publication_tests {
     }
 
     #[test]
-    fn generic_interface_methods_reject_non_array_rest_annotations_without_publication() {
+    fn generic_interface_methods_reject_invalid_rest_annotations_before_publication() {
         let fixture = interface_fixture(
             "interface Contract<Value> { spread(...values: string): Value; }",
             3_899,
@@ -16765,6 +16777,117 @@ mod generic_publication_tests {
             ),
             before,
         );
+    }
+
+    #[test]
+    fn optional_generic_methods_publish_exact_signatures_and_replay_warm() {
+        let mut fixture = interface_fixture(
+            "interface Contract<Value> { select(value?: Value): Value; }",
+            3_902,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let [method] = plan.methods.as_slice() else {
+            panic!("the generic interface retains one optional method")
+        };
+        let [parameter] = method.parameters.as_slice() else {
+            panic!("the optional method retains its binder-owned parameter")
+        };
+        assert!(parameter.optional);
+        assert_eq!(method.minimum_argument_count, 0);
+        assert_eq!(
+            fixture.store.source_node_kind(parameter.type_node),
+            Some(SyntaxKind::TypeReference),
+        );
+        assert_eq!(
+            fixture.store.source_node_kind(parameter.identity_node),
+            Some(SyntaxKind::TypeReference),
+        );
+
+        let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+        let target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let value = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(method.return_type)
+        .unwrap();
+        assert!(fixture.store.publish_interface_no_base_resolution(target));
+        assert_eq!(
+            publish_generic_interface_declared_members(&mut fixture.store, &plan, target, &[value]),
+            Ok(target),
+        );
+
+        let callable = fixture
+            .store
+            .value_symbol_links(method.symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let crate::semantic::callable_sets::StoredCallableSetValidation::Valid {
+            projection, ..
+        } = crate::semantic::callable_sets::validate_stored_callable_set(&fixture.store, callable)
+        else {
+            panic!("the optional generic method retains authenticated callable provenance")
+        };
+        let [projected] = projection.call_signatures.as_ref() else {
+            panic!("the optional generic method publishes exactly one signature")
+        };
+        let signature = projected.signature;
+        assert_eq!(projected.parameters, [value]);
+        assert_eq!(projected.min_argument_count, 0);
+        assert_eq!(projected.return_type, Some(value));
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([value].as_slice()),
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                publish_generic_interface_declared_members(
+                    &mut fixture.store,
+                    &plan,
+                    target,
+                    &[value],
+                ),
+                Ok(target),
+            );
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalCheckerOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature),
+                Ok(value),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
