@@ -3707,6 +3707,14 @@ fn jsx_child_is_assignable(
         {
             error
         }
+        Err(error @ RelationUnavailable::InvalidStructuredMembers(invalid))
+            if matches!(
+                store.type_payload(target).map(super::type_records::TypeRecord::data),
+                Some(super::TypeData::Union(union)) if union.union.types.contains(&invalid)
+            ) =>
+        {
+            error
+        }
         Err(error) => return Err(error.into()),
     };
 
@@ -3736,35 +3744,38 @@ fn jsx_child_is_assignable(
         return Err(error.into());
     }
 
-    let plan = match super::object_members::plan_interface(store, host, owner) {
-        Ok(plan) => plan,
-        Err(_) => {
-            let base = resolve_generic_jsx_element_base(
-                store,
-                host,
-                owner,
-                location,
-                global_types,
-                options,
-                diagnostics,
-            )?;
-            if base == target {
-                return Ok(true);
-            }
-            let includes_base = matches!(
-                store.type_payload(target).map(super::type_records::TypeRecord::data),
-                Some(super::TypeData::Union(union)) if union.union.types.contains(&base)
-            );
-            if includes_base {
-                if let Some(global_types) = global_types {
-                    store.validate_union_constituent_with_global_types(global_types, target)?;
-                } else {
-                    store.validate_union_constituent(target)?;
-                }
-                return Ok(true);
-            }
-            return relation(store, base).map_err(Into::into);
+    let Ok(plan) = super::object_members::plan_interface(store, host, owner) else {
+        let base = resolve_generic_jsx_element_base(
+            store,
+            host,
+            owner,
+            location,
+            global_types,
+            options,
+            diagnostics,
+        )?;
+        if matches!(
+            error,
+            RelationUnavailable::InvalidStructuredMembers(invalid) if invalid != base
+        ) {
+            return Err(error.into());
         }
+        if base == target {
+            return Ok(true);
+        }
+        let includes_base = matches!(
+            store.type_payload(target).map(super::type_records::TypeRecord::data),
+            Some(super::TypeData::Union(union)) if union.union.types.contains(&base)
+        );
+        if includes_base {
+            if let Some(global_types) = global_types {
+                store.validate_union_constituent_with_global_types(global_types, target)?;
+            } else {
+                store.validate_union_constituent(target)?;
+            }
+            return Ok(true);
+        }
+        return relation(store, base).map_err(Into::into);
     };
     let mut bases = plan.heritage_base_symbols();
     let Some(base) = bases.next() else {
