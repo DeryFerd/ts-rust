@@ -1904,10 +1904,38 @@ fn authenticated_default_library_math_symbol_tag(
     let Ok(record) = preflight_node(store, host, declaration) else {
         return false;
     };
-    let NodeData::PropertySignatureDeclaration(property) = &record.data else {
+    let (name, type_node, postfix_token, ast_symbol, modifiers, valid_initializer) =
+        match &record.data {
+            NodeData::PropertyDeclaration(property)
+                if record.kind == SyntaxKind::PropertyDeclaration =>
+            {
+                (
+                    property.name,
+                    property.type_,
+                    property.postfix_token,
+                    property.symbol,
+                    property.modifiers.as_ref(),
+                    property.initializer.is_none() && property.facts == 0,
+                )
+            }
+            NodeData::PropertySignatureDeclaration(property)
+                if record.kind == SyntaxKind::PropertySignature =>
+            {
+                (
+                    property.name,
+                    Some(property.type_),
+                    property.postfix_token,
+                    property.symbol,
+                    property.modifiers.as_ref(),
+                    missing_signature_initializer(store, host, declaration, property.initializer),
+                )
+            }
+            _ => return false,
+        };
+    let Some(type_node) = type_node else {
         return false;
     };
-    let name = NodeRef::new(declaration.arena, declaration.file, property.name);
+    let name = NodeRef::new(declaration.arena, declaration.file, name);
     let Ok(name_record) = preflight_node(store, host, name) else {
         return false;
     };
@@ -1934,7 +1962,7 @@ fn authenticated_default_library_math_symbol_tag(
     else {
         return false;
     };
-    let type_node = NodeRef::new(declaration.arena, declaration.file, property.type_);
+    let type_node = NodeRef::new(declaration.arena, declaration.file, type_node);
     let Ok(type_record) = preflight_node(store, host, type_node) else {
         return false;
     };
@@ -1963,13 +1991,11 @@ fn authenticated_default_library_math_symbol_tag(
             && !facts.is_javascript_file()
             && !facts.is_external_or_common_js_module()
     }) && authenticated_global_math_value_declaration(store, host, owner, value_declaration)
-        && record.kind == SyntaxKind::PropertySignature
         && record.flags.0 == 0
-        && property.postfix_token.is_none()
-        && property.symbol.is_none()
-        && missing_signature_initializer(store, host, declaration, property.initializer)
-        && preflight_readonly_modifier(store, host, declaration, property.modifiers.as_ref())
-            == Some(true)
+        && postfix_token.is_none()
+        && ast_symbol.is_none()
+        && valid_initializer
+        && preflight_readonly_modifier(store, host, declaration, modifiers) == Some(true)
         && name_record.kind == SyntaxKind::ComputedPropertyName
         && name_record.flags.0 == 0
         && name_record.parent == Some(declaration.node)
@@ -4640,7 +4666,10 @@ fn plan_members(
         let member_record =
             preflight_node(store, host, member).map_err(|_| invalid_plan(&provisional))?;
         if kind == PropertyObjectKind::Interface
-            && member_record.kind == SyntaxKind::PropertySignature
+            && matches!(
+                member_record.kind,
+                SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature
+            )
             && authenticated_default_library_math_symbol_tag(store, host, symbol, member)
         {
             continue;
