@@ -3614,18 +3614,35 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &self,
         type_: TypeId,
         expected_name: Option<&EscapedName>,
+        global_types: Option<&CanonicalGlobalTypes>,
     ) -> Result<Option<(EscapedName, TypeId)>, LiteralTypeCacheError> {
         let record = self
             .type_payload(type_)
             .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
-        if !record.flags().intersects(TypeFlags::OBJECT)
-            || !record.object_flags().contains(ObjectFlags::OBJECT_LITERAL)
-                && !matches!(
-                    object_members::validate_resolved_declared_property_object(self, type_),
-                    object_members::DeclaredPropertyObjectValidation::Valid(_)
-                )
-        {
+        if !record.flags().intersects(TypeFlags::OBJECT) {
             return Ok(None);
+        }
+        if !record.object_flags().contains(ObjectFlags::OBJECT_LITERAL) {
+            match object_members::validate_resolved_declared_property_object(self, type_) {
+                object_members::DeclaredPropertyObjectValidation::Valid(_) => {}
+                object_members::DeclaredPropertyObjectValidation::Malformed => {
+                    return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                }
+                object_members::DeclaredPropertyObjectValidation::NotDeclared => {
+                    let derived = match global_types {
+                        Some(global_types) => self
+                            .validate_derived_object_literal_with_global_types(type_, global_types),
+                        None => self.validate_derived_object_literal_for_relation(type_),
+                    };
+                    match derived {
+                        DerivedObjectLiteralValidation::Valid { .. } => {}
+                        DerivedObjectLiteralValidation::Invalid => {
+                            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                        }
+                        DerivedObjectLiteralValidation::NotDerived => return Ok(None),
+                    }
+                }
+            }
         }
 
         let properties = record
@@ -3676,12 +3693,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         // unions. The validator admits primitives, literals, recursively
         // canonical unions, and fresh property objects, so the upstream type
         // parameter and class-derivation branches are unreachable here. The
-        // unit-property shortcut is limited to authenticated fresh and
-        // declared property objects. Global-aware calls additionally admit
-        // canonical arrays. The one mixed relation independent of generic
-        // Array members is Array -> regularized empty object; every nonempty
-        // mixed surface remains typed unavailable rather than becoming a
-        // negative answer.
+        // unit-property shortcut is limited to authenticated fresh, declared,
+        // and derived property objects. Global-aware calls additionally admit
+        // canonical arrays and preserve nested derived-array provenance. The
+        // one mixed relation independent of generic Array members is Array ->
+        // regularized empty object; every nonempty mixed surface remains typed
+        // unavailable rather than becoming a negative answer.
         if types.len() < 2 {
             return Ok(());
         }
@@ -3718,7 +3735,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 continue;
             }
 
-            let discriminant = self.subtype_reduction_unit_property(source, None)?;
+            let discriminant = self.subtype_reduction_unit_property(source, None, global_types)?;
             let candidates = types.clone();
             for target in candidates {
                 if source == target {
@@ -3736,7 +3753,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     .ok_or(LiteralTypeCacheError::Capacity)?;
                 if let Some((name, source_type)) = &discriminant
                     && self
-                        .subtype_reduction_unit_property(target, Some(name))?
+                        .subtype_reduction_unit_property(target, Some(name), global_types)?
                         .is_some_and(|(_, target_type)| *source_type != target_type)
                 {
                     continue;
@@ -7963,6 +7980,186 @@ mod tests {
         assert_eq!(
             store.expression_union_type(&[declared, first], UnionReduction::Subtype),
             Ok(mixed_union),
+        );
+    }
+
+    #[test]
+    fn derived_object_subtype_discriminants_preserve_nested_and_contextual_provenance() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface NestedFirst { kind: 'first'; values: number[] } ",
+            "interface NestedSecond { kind: 'second'; values: number[] } ",
+            "interface ContextFirst { kind: 'context-first'; first: number } ",
+            "interface ContextSecond { kind: 'context-second'; second: number } ",
+            "const first: NestedFirst = { kind: 'first', values: [1] }; ",
+            "const second: NestedSecond = { kind: 'second', values: [2] }; ",
+            "const contextFirst: ContextFirst = { kind: 'context-first', first: 1 }; ",
+            "const contextSecond: ContextSecond = { kind: 'context-second', second: 2 };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(152);
+        let mut context = checker_context(file, &parsed);
+        context.check_source_file(file).unwrap();
+
+        let first = checked_expression_type(&context, variable_initializer(&parsed, file, "first"));
+        let second =
+            checked_expression_type(&context, variable_initializer(&parsed, file, "second"));
+        let context_first = checked_expression_type(
+            &context,
+            variable_initializer(&parsed, file, "contextFirst"),
+        );
+        let context_second = checked_expression_type(
+            &context,
+            variable_initializer(&parsed, file, "contextSecond"),
+        );
+        let global_types = context.global_types().clone();
+        let store = context.store_mut_for_test();
+
+        let widened_first = store
+            .get_widened_type_with_global_types(first, &global_types)
+            .unwrap();
+        let widened_second = store
+            .get_widened_type_with_global_types(second, &global_types)
+            .unwrap();
+        for widened in [widened_first, widened_second] {
+            assert!(matches!(
+                store.validate_derived_object_literal_with_global_types(widened, &global_types),
+                DerivedObjectLiteralValidation::Valid { .. }
+            ));
+            let properties = record(store, widened)
+                .data()
+                .structured()
+                .and_then(|structured| structured.properties.as_deref())
+                .unwrap();
+            assert_eq!(properties.len(), 2);
+        }
+
+        let pristine_relations = store.relation_state_snapshot();
+        let widened_union = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[widened_first, widened_second],
+                UnionReduction::Subtype,
+            )
+            .unwrap();
+        let mut expected = [widened_first, widened_second];
+        expected.sort_unstable();
+        assert_eq!(union_types(store, widened_union), expected.as_slice());
+        assert_eq!(store.relation_state_snapshot(), pristine_relations);
+
+        let warm = (
+            store.type_len(),
+            store.symbol_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            store.expression_union_type_with_global_types(
+                &global_types,
+                &[widened_second, widened_first],
+                UnionReduction::Subtype,
+            ),
+            Ok(widened_union),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                store.relation_state_snapshot(),
+            ),
+            warm,
+        );
+
+        let context_union = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[context_first, context_second],
+                UnionReduction::Subtype,
+            )
+            .unwrap();
+        let contextual = store
+            .get_widened_type_with_global_types(context_union, &global_types)
+            .unwrap();
+        let contextual_members = union_types(store, contextual).to_vec();
+        assert_eq!(contextual_members.len(), 2);
+        for member in &contextual_members {
+            let properties = record(store, *member)
+                .data()
+                .structured()
+                .and_then(|structured| structured.properties.as_deref())
+                .unwrap();
+            assert_eq!(properties.len(), 3);
+            let optional = properties
+                .iter()
+                .copied()
+                .find(|property| {
+                    store
+                        .symbol(*property)
+                        .is_some_and(|record| record.flags().contains(SymbolFlags::OPTIONAL))
+                })
+                .unwrap();
+            assert!(store.validate_contextual_widened_object_property(*member, optional));
+        }
+        let contextual_relations = store.relation_state_snapshot();
+        assert_eq!(
+            store.expression_union_type_with_global_types(
+                &global_types,
+                &contextual_members,
+                UnionReduction::Subtype,
+            ),
+            Ok(contextual),
+        );
+        assert_eq!(store.relation_state_snapshot(), contextual_relations);
+
+        let property = record(store, widened_first)
+            .data()
+            .structured()
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| {
+                properties.iter().find(|property| {
+                    store
+                        .symbol(**property)
+                        .is_some_and(|record| record.name().as_utf8() == Some("values"))
+                })
+            })
+            .copied()
+            .unwrap();
+        let expected_links = store.value_symbol_links(property).unwrap().clone();
+        let mut poisoned_links = expected_links.clone();
+        poisoned_links.write_type = Some(store.intrinsic_bootstrap().unwrap().number_type);
+        assert!(store.set_value_symbol_links(property, poisoned_links));
+        let poisoned = (
+            store.type_len(),
+            store.symbol_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            store.expression_union_type_with_global_types(
+                &global_types,
+                &[widened_first, widened_second],
+                UnionReduction::Subtype,
+            ),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(widened_first)),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                store.relation_state_snapshot(),
+            ),
+            poisoned,
+        );
+        assert!(store.set_value_symbol_links(property, expected_links));
+        assert_eq!(
+            store.expression_union_type_with_global_types(
+                &global_types,
+                &[widened_second, widened_first],
+                UnionReduction::Subtype,
+            ),
+            Ok(widened_union),
         );
     }
 
