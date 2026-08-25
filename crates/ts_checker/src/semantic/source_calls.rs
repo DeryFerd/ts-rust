@@ -2397,6 +2397,7 @@ fn shared_array_callback_context(
 /// Array and object arguments can retain a shared indexed context when
 /// overload parameter identities differ. Generic signatures provide context
 /// for authenticated fixed parameters, array callbacks, and constrained templates.
+/// Unary overloaded callbacks retain a shared parameter and prefer informative returns.
 pub(super) fn source_call_argument_contextual_type(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -2493,6 +2494,9 @@ pub(super) fn source_call_argument_contextual_type(
     if matches!(argument.kind, PlannedExpressionKind::Template(_)) {
         return Ok(None);
     }
+    if matches!(argument.kind, PlannedExpressionKind::Arrow(_)) {
+        return Ok(shared_overload_callback_context(store, &parameter_types));
+    }
 
     let bootstrap = store
         .intrinsic_bootstrap()
@@ -2578,6 +2582,53 @@ fn nonnullable_contextual_callback_type(
         }
         _ => contextual_type,
     }
+}
+
+/// Reuses a real unary callback whose input is shared by every overload.
+fn shared_overload_callback_context(
+    store: &CanonicalTypeMapperStore,
+    contexts: &[TypeId],
+) -> Option<TypeId> {
+    let any = store.intrinsic_bootstrap()?.any_type;
+    let mut parameter = None;
+    let mut selected: Option<(TypeId, TypeId)> = None;
+
+    for context in contexts {
+        let StoredSingleCallableValidation::Valid { callable, .. } =
+            validate_stored_single_callable(store, *context)
+        else {
+            return None;
+        };
+        let signature = store.signature(callable.signature)?;
+        let [input] = callable.parameters.as_slice() else {
+            return None;
+        };
+        if !signature.type_parameters().is_empty()
+            || signature.has_rest_parameter()
+            || callable.rest_parameter.is_some()
+            || callable.min_argument_count != 1
+            || parameter.is_some_and(|previous| previous != *input)
+        {
+            return None;
+        }
+        parameter = Some(*input);
+
+        let return_type = callable.return_type?;
+        match selected {
+            None => selected = Some((*context, return_type)),
+            Some((_, previous)) if previous == any && return_type != any => {
+                selected = Some((*context, return_type));
+            }
+            Some((_, previous))
+                if previous != any && return_type != any && previous != return_type =>
+            {
+                return None;
+            }
+            Some(_) => {}
+        }
+    }
+
+    selected.map(|(context, _)| context)
 }
 
 /// Specializes readonly concat calls whose declaration returns mutable arrays.
@@ -9157,6 +9208,233 @@ mod tests {
                 .validate_cached_union_result(callable_union, None),
             Ok(())
         );
+    }
+
+    #[test]
+    fn overload_callback_context_prefers_informative_returns_without_cache_writes() {
+        let parsed = parsed(concat!(
+            "type Broad = (value: 'edge') => any; ",
+            "type Exact = (value: 'edge') => 'edge'; ",
+            "type OtherReturn = (value: 'edge') => 'other'; ",
+            "type OtherInput = (value: 'other') => 'edge'; ",
+            "type Optional = (value?: 'edge') => 'edge'; ",
+            "type Pair = (value: 'edge', other: 'edge') => 'edge';",
+        ));
+        let file = FileId::new(4_888);
+        let mut context = context(&parsed, file);
+        let mut nodes = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some((
+                    record.range.start,
+                    NodeRef::new(parsed.arena.id(), file, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|(start, _)| *start);
+        let [broad, exact, other_return, other_input, optional, pair] = nodes
+            .iter()
+            .map(|(_, node)| context.get_type_from_type_node(*node).unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("the fixture must retain six callback types");
+        let primitive = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let cache_state = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            )
+        };
+        let before = cache_state(context.store());
+
+        assert_eq!(
+            shared_overload_callback_context(context.store(), &[broad, exact]),
+            Some(exact),
+        );
+        assert_eq!(
+            shared_overload_callback_context(context.store(), &[exact, broad]),
+            Some(exact),
+        );
+        for rejected in [other_return, other_input, optional, pair, primitive] {
+            assert_eq!(
+                shared_overload_callback_context(context.store(), &[exact, rejected]),
+                None,
+            );
+        }
+        assert_eq!(shared_overload_callback_context(context.store(), &[]), None);
+        assert_eq!(cache_state(context.store()), before);
+
+        let exact_node = nodes[1].1;
+        let original = context.store().signature_links(exact_node).unwrap().clone();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_links(exact_node, SignatureLinks::default())
+        );
+        let poisoned = cache_state(context.store());
+
+        assert_eq!(
+            shared_overload_callback_context(context.store(), &[broad, exact]),
+            None,
+        );
+        assert_eq!(
+            shared_overload_callback_context(context.store(), &[exact, broad]),
+            None,
+        );
+        assert_eq!(cache_state(context.store()), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_links(exact_node, original)
+        );
+        assert_eq!(
+            shared_overload_callback_context(context.store(), &[broad, exact]),
+            Some(exact),
+        );
+    }
+
+    #[test]
+    fn overloaded_callbacks_preserve_literal_contexts_and_replay_warm() {
+        let parsed = parsed(concat!(
+            "declare function broadFirst(callback: (value: 'edge') => any): void; ",
+            "declare function broadFirst(callback: (value: 'edge') => 'edge'): void; ",
+            "broadFirst(value => value); ",
+            "declare function exactFirst(callback: (value: 'edge') => 'edge'): void; ",
+            "declare function exactFirst(callback: (value: 'edge') => any): void; ",
+            "exactFirst(value => value);",
+        ));
+        let file = FileId::new(4_889);
+        let mut context = context_with_options(
+            &parsed,
+            file,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let literal = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .cached_string_literal_type("edge")
+            .unwrap();
+        let nodes_of_kind = |kind| {
+            let mut nodes = parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == kind).then_some((
+                        record.range.start,
+                        NodeRef::new(parsed.arena.id(), file, node),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            nodes.sort_by_key(|(start, _)| *start);
+            nodes.into_iter().map(|(_, node)| node).collect::<Vec<_>>()
+        };
+        let callback_targets = nodes_of_kind(SyntaxKind::FunctionType)
+            .into_iter()
+            .map(|node| {
+                context
+                    .store()
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let arrows = nodes_of_kind(SyntaxKind::ArrowFunction);
+        assert_eq!(arrows.len(), 2);
+
+        let (_, bound) = context.file(file).unwrap();
+        for (arrow, expected_target) in arrows
+            .iter()
+            .zip([callback_targets[1], callback_targets[2]])
+        {
+            let NodeData::ArrowFunction(syntax) = &parsed.arena.get(arrow.node).unwrap().data
+            else {
+                panic!("each overloaded argument must retain its callback arrow")
+            };
+            let parameter = NodeRef::new(parsed.arena.id(), file, syntax.parameters.nodes[0]);
+            let parameter = bound.symbol(parameter).unwrap();
+            let owner = bound.symbol(*arrow).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let provenance = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap();
+
+            assert_eq!(provenance.contextual_target, Some(expected_target));
+            assert!(provenance.contextual_variable.is_none());
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(parameter)
+                    .and_then(|links| links.resolved_type),
+                Some(literal),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .signature(provenance.signature)
+                    .and_then(super::super::signatures::Signature::resolved_return_type),
+                Some(literal),
+            );
+        }
+
+        let mut call_nodes = calls(&parsed, file);
+        call_nodes.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let declarations = nodes_of_kind(SyntaxKind::FunctionDeclaration);
+        for (call, declaration) in call_nodes.iter().zip([declarations[0], declarations[2]]) {
+            assert_eq!(
+                context
+                    .store()
+                    .signature_links(*call)
+                    .and_then(|links| links.resolved_signature.signature()),
+                context
+                    .store()
+                    .signature_links(declaration)
+                    .and_then(|links| links.resolved_signature.signature()),
+            );
+        }
+        let cold = call_nodes
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        let cold_links = context.store().checker_link_allocated_lengths();
+
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            call_nodes
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold,
+        );
+        assert_eq!(context.store().checker_link_allocated_lengths(), cold_links);
     }
 
     #[test]
