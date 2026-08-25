@@ -4199,14 +4199,19 @@ fn materialize_global_date_constructor(
         .declared_type_links(global.owner)
         .and_then(|links| links.declared_type);
     let annotation = exact_type_cache(store, global.annotation).map_err(|()| invalid())?;
+    let annotation_symbol = exact_symbol_cache(store, global.annotation).map_err(|()| invalid())?;
     let date_value = exact_class_value_type(store, plan.resolved_symbol)?;
     let signature = exact_signature_cache(store, global.declaration).map_err(|()| invalid())?;
     let return_annotation =
         exact_type_cache(store, global.return_annotation).map_err(|()| invalid())?;
+    let return_symbol =
+        exact_symbol_cache(store, global.return_annotation).map_err(|()| invalid())?;
     if signature.is_some()
         || annotation.is_some_and(|type_| Some(type_) != declared)
+        || annotation_symbol.is_some_and(|symbol| symbol != global.owner)
         || date_value.is_some_and(|type_| Some(type_) != declared)
         || return_annotation.is_some_and(|type_| Some(type_) != date_type)
+        || return_symbol.is_some_and(|symbol| symbol != plan.resolved_symbol)
     {
         return Err(invalid());
     }
@@ -4238,11 +4243,14 @@ fn materialize_global_date_constructor(
 
     let missing_type_nodes = usize::from(store.type_node_links(global.annotation).is_none())
         + usize::from(store.type_node_links(global.return_annotation).is_none());
+    let missing_symbol_nodes = usize::from(store.symbol_node_links(global.annotation).is_none())
+        + usize::from(store.symbol_node_links(global.return_annotation).is_none());
     if !store.try_reserve_signatures(1)
         || !store.try_reserve_signature_links(usize::from(
             store.signature_links(global.declaration).is_none(),
         ))
         || !store.try_reserve_type_node_links(missing_type_nodes)
+        || !store.try_reserve_symbol_node_links(missing_symbol_nodes)
         || !store.try_reserve_value_symbol_links(usize::from(
             store.value_symbol_links(plan.resolved_symbol).is_none(),
         ))
@@ -4303,11 +4311,23 @@ fn materialize_global_date_constructor(
             ..TypeNodeLinks::default()
         },
     ));
+    assert!(store.set_symbol_node_links(
+        global.annotation,
+        SymbolNodeLinks {
+            resolved_symbol: Some(global.owner),
+        },
+    ));
     assert!(store.set_type_node_links(
         global.return_annotation,
         TypeNodeLinks {
             resolved_type: Some(instance_type),
             ..TypeNodeLinks::default()
+        },
+    ));
+    assert!(store.set_symbol_node_links(
+        global.return_annotation,
+        SymbolNodeLinks {
+            resolved_symbol: Some(plan.resolved_symbol),
         },
     ));
     assert!(store.set_value_symbol_links(
@@ -5562,12 +5582,17 @@ fn resolved_global_date_constructor(
         .declared_type_links(global.owner)
         .and_then(|links| links.declared_type);
     let annotation = exact_type_cache(store, global.annotation).map_err(|()| invalid())?;
+    let annotation_symbol = exact_symbol_cache(store, global.annotation).map_err(|()| invalid())?;
     let date_value = exact_class_value_type(store, plan.resolved_symbol)?;
     let return_annotation =
         exact_type_cache(store, global.return_annotation).map_err(|()| invalid())?;
+    let return_symbol =
+        exact_symbol_cache(store, global.return_annotation).map_err(|()| invalid())?;
     if annotation.is_some_and(|type_| Some(type_) != value_type)
+        || annotation_symbol.is_some_and(|symbol| symbol != global.owner)
         || date_value.is_some_and(|type_| Some(type_) != value_type)
         || return_annotation.is_some_and(|type_| Some(type_) != instance_type)
+        || return_symbol.is_some_and(|symbol| symbol != plan.resolved_symbol)
     {
         return Err(invalid());
     }
@@ -5648,6 +5673,8 @@ pub(super) fn authenticated_global_date_constructor_return(
         .get_source("DateConstructor")
         .and_then(|symbol| store.get_merged_symbol(symbol))?;
     let date_record = store.symbol(date)?;
+    let value_declaration = date_record.value_declaration()?;
+    let value_annotation = store.source_direct_type_annotation(value_declaration)?;
     let owner_record = store.symbol(owner)?;
     let instance = store.declared_type_links(date)?.declared_type?;
     let constructor = store.declared_type_links(owner)?.declared_type?;
@@ -5674,6 +5701,10 @@ pub(super) fn authenticated_global_date_constructor_return(
             != Some(&ValueSymbolLinks {
                 resolved_type: Some(constructor),
                 ..ValueSymbolLinks::default()
+            })
+        || store.symbol_node_links(value_annotation)
+            != Some(&SymbolNodeLinks {
+                resolved_symbol: Some(owner),
             })
         || !owner_record.flags().contains(SymbolFlags::INTERFACE)
         || owner_record.check_flags() != CheckFlags::NONE
@@ -5724,6 +5755,10 @@ pub(super) fn authenticated_global_date_constructor_return(
             != Some(&TypeNodeLinks {
                 resolved_type: Some(instance),
                 ..TypeNodeLinks::default()
+            })
+        || store.symbol_node_links(return_annotation)
+            != Some(&SymbolNodeLinks {
+                resolved_symbol: Some(date),
             })
         || store.function_signature_return_annotation(signature) != Some((return_annotation, false))
         || store
@@ -7974,6 +8009,23 @@ mod tests {
                 ..TypeNodeLinks::default()
             }),
         );
+        let value_annotation = store
+            .symbol(date)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .and_then(|declaration| store.source_direct_type_annotation(declaration))
+            .unwrap();
+        assert_eq!(
+            store.symbol_node_links(value_annotation),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(owner),
+            }),
+        );
+        assert_eq!(
+            store.symbol_node_links(return_annotation),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(date),
+            }),
+        );
         assert_eq!(
             store.function_signature_return_annotation(signature),
             Some((return_annotation, false)),
@@ -8245,6 +8297,107 @@ mod tests {
             before,
         );
         assert!(context.store().type_node_links(expression).is_none());
+    }
+
+    #[test]
+    fn constructor_date_defaults_reject_poisoned_provider_reference_symbols() {
+        for (index, poison_return) in [false, true].into_iter().enumerate() {
+            let library = global_date_constructor_library();
+            let source = parse_source_file(concat!(
+                "class Model { ",
+                "constructor(readonly timestamp = new Date()) {} ",
+                "}",
+            ));
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(1_873 + offset);
+            let source_file = FileId::new(1_874 + offset);
+            let mut context =
+                global_object_constructor_context(&library, &source, library_file, source_file);
+            let (date, owner, annotation, return_annotation) = {
+                let store = context.store();
+                let globals = store
+                    .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                    .unwrap();
+                let date = globals
+                    .get_source("Date")
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap();
+                let owner = globals
+                    .get_source("DateConstructor")
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap();
+                let annotation = store
+                    .symbol(date)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    .and_then(|declaration| store.source_direct_type_annotation(declaration))
+                    .unwrap();
+                let declaration = store
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+                    .and_then(|symbol| store.symbol(symbol))
+                    .and_then(ts_binder::semantic::Symbol::declarations)
+                    .and_then(|declarations| {
+                        declarations.iter().copied().find(|declaration| {
+                            matches!(
+                                &library.arena.get(declaration.node).unwrap().data,
+                                NodeData::ConstructSignatureDeclaration(signature)
+                                    if signature.parameters.nodes.is_empty()
+                            )
+                        })
+                    })
+                    .unwrap();
+                let return_annotation = store.source_direct_type_annotation(declaration).unwrap();
+                (date, owner, annotation, return_annotation)
+            };
+            let (poisoned_node, wrong_symbol) = if poison_return {
+                (return_annotation, owner)
+            } else {
+                (annotation, date)
+            };
+            assert!(context.store_mut_for_test().set_symbol_node_links(
+                poisoned_node,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(wrong_symbol),
+                },
+            ));
+            let initializer = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        source_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                context.check_source_file(source_file),
+                Err(SourceCheckError::Class(initializer)),
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            assert!(context.store().declared_type_links(date).is_none());
+            assert!(context.store().declared_type_links(owner).is_none());
+            assert!(context.store().type_node_links(initializer).is_none());
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
