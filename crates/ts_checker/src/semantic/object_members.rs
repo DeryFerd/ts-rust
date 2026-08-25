@@ -12690,11 +12690,25 @@ pub(super) fn publish_declared_members(
         .iter()
         .filter(|signature| signature.is_none())
         .count();
+    let missing_predicate_type_links = plan
+        .call_signatures
+        .iter()
+        .filter_map(|signature| signature.type_predicate)
+        .filter(|predicate| store.type_node_links(predicate.node).is_none())
+        .count();
+    let missing_predicate_symbol_links = plan
+        .call_signatures
+        .iter()
+        .filter_map(|signature| signature.type_predicate)
+        .filter(|predicate| store.symbol_node_links(predicate.parameter_name).is_none())
+        .count();
     if !store.try_reserve_index_infos(plan.indexes.len())
         || !store.try_reserve_signatures(cold_signature_count)
         || !store.try_reserve_value_symbol_links(missing_accessor_links)
         || !store.try_reserve_function_signature_return_annotations(annotated_signature_count)
         || !store.try_reserve_callable_signature_parameter_types(plan.call_signatures.len())
+        || !store.try_reserve_type_node_links(missing_predicate_type_links)
+        || !store.try_reserve_symbol_node_links(missing_predicate_symbol_links)
         || !store.try_reserve_declared_call_set_provenance(
             usize::from(!plan.call_signatures.is_empty()),
             plan.call_signatures.len(),
@@ -12907,6 +12921,46 @@ pub(super) fn publish_declared_members(
                     },
                 ));
             }
+        }
+        for (planned, signature) in plan.call_signatures.iter().zip(&signatures) {
+            let Some(predicate) = planned.type_predicate else {
+                continue;
+            };
+            let narrowed = predicate
+                .narrowed_type
+                .and_then(|node| cached_planned_type_identity(store, node))
+                .expect("the declared predicate plan validated its narrowed type");
+            let parameter_name = store
+                .symbol(predicate.parameter_symbol)
+                .and_then(|symbol| symbol.name().as_utf8())
+                .expect("the declared predicate plan validated its parameter")
+                .to_owned();
+            let identity = store
+                .alloc_type_predicate(
+                    predicate.kind,
+                    predicate.parameter_index,
+                    parameter_name,
+                    Some(narrowed),
+                )
+                .expect("the declared predicate plan validated its narrowed type");
+            assert!(store.set_symbol_node_links(
+                predicate.parameter_name,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(predicate.parameter_symbol),
+                },
+            ));
+            let boolean = store
+                .intrinsic_bootstrap()
+                .expect("declared predicate publication requires bootstrap")
+                .boolean_type;
+            assert!(store.set_type_node_links(
+                predicate.node,
+                TypeNodeLinks {
+                    resolved_type: Some(boolean),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_signature_resolved_type_predicate(*signature, Some(identity)));
         }
     }
     Ok(type_)
@@ -18506,7 +18560,7 @@ mod generic_publication_tests {
                 concat!(
                     "interface Constructor { ",
                     "new(value?: any): string; ",
-                    "<T>(value?: T): value is T; ",
+                    "<T>(value?: T): value is string; ",
                     "}",
                 ),
                 SyntaxKind::CallSignature,
