@@ -1378,7 +1378,7 @@ fn unsupported_new_forms_stop_at_typed_boundaries() {
         assert!(context.diagnostics().is_empty());
     }
 
-    let source = "abstract class Model { value!: string; } const model = new Model();";
+    let source = "class Model<T extends string> { value!: string; } const model = new Model();";
     let parsed = parse_source_file(source);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(1_804);
