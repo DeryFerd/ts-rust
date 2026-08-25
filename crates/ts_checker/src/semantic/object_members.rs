@@ -10,7 +10,8 @@
 //! ordinary properties, optional `any` parameters, implicit `any` returns, and
 //! trailing implicit `any[]` rest parameters. Interface constructors may retain
 //! implicit `any` returns, and construct signatures support trailing optional
-//! `any` parameters.
+//! `any` parameters. Interface call signatures may also retain one authenticated
+//! generic identifier predicate with its optional source type parameter.
 //! Named interface and type-literal methods retain their own binder symbols,
 //! authenticated method type parameters, annotated required or optional
 //! parameters, and authenticated array, tuple, tuple-union, or inferred rest
@@ -44,13 +45,17 @@ use super::{
         plan_direct_interface_heritage,
     },
     links::{
-        AliasTargetState, ResolvedSignatureState, SignatureLinks, TypeNodeLinks, ValueSymbolLinks,
+        AliasTargetState, ResolvedSignatureState, SignatureLinks, SymbolNodeLinks, TypeNodeLinks,
+        ValueSymbolLinks,
     },
     reference_types::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
     },
-    signatures::SignatureFlags,
-    source_callables::implicit_any_array_type,
+    signatures::{SignatureFlags, TypePredicateKind},
+    source_callables::{
+        CallableTypePredicatePlan, implicit_any_array_type, plan_callable_type_predicate,
+        valid_planned_callable_type_predicate, valid_stored_callable_type_predicate,
+    },
     source_namespaces::authenticated_merged_namespace_interface,
     store::SourceNodeParent,
     type_records::{
@@ -226,6 +231,7 @@ pub(super) struct PlannedCallSignature {
     pub type_parameters: Vec<PlannedInterfaceMethodTypeParameter>,
     pub parameters: Vec<PlannedCallParameter>,
     pub return_type: NodeRef,
+    pub(super) type_predicate: Option<CallableTypePredicatePlan>,
     return_identity_node: NodeRef,
     return_null_literal_identity: bool,
     flags: SignatureFlags,
@@ -793,6 +799,9 @@ pub(super) fn validate_stored_declared_call_set(
             return StoredDeclaredCallSetValidation::Malformed;
         };
         let return_annotation = store.function_signature_return_annotation(signature);
+        let predicate = return_annotation.is_some_and(|(annotation, _)| {
+            store.source_node_kind(annotation) == Some(SyntaxKind::TypePredicate)
+        });
         let Ok(minimum) = usize::try_from(signature_record.min_argument_count()) else {
             return StoredDeclaredCallSetValidation::Malformed;
         };
@@ -880,13 +889,14 @@ pub(super) fn validate_stored_declared_call_set(
                 && minimum != fixed_parameter_count
                 && store.source_node_kind(provider_declaration) != Some(SyntaxKind::TypeLiteral)
                 && !optional_boolean_call
+                && !predicate
             || !super::callable_sets::valid_declared_method_type_parameters(
                 store,
                 signature_record,
                 declaration,
             )
             || signature_record.this_parameter().is_some()
-            || signature_record.resolved_type_predicate().is_some()
+            || !valid_declared_interface_call_predicate(store, signature)
             || signature_record.target().is_some()
             || signature_record.mapper().is_some()
             || signature_record.isolated_signature_type().is_some()
@@ -960,7 +970,8 @@ pub(super) fn validate_stored_declared_call_set(
                             != ((construct
                                 || store.source_node_kind(provider_declaration)
                                     == Some(SyntaxKind::TypeLiteral)
-                                || optional_boolean_call)
+                                || optional_boolean_call
+                                || predicate)
                                 && parameter_index >= minimum
                                 && parameter_index < fixed_parameter_count)
                     })
@@ -1159,6 +1170,112 @@ fn validate_declared_call_set_member_edges(
     Some(edges)
 }
 
+fn valid_declared_interface_call_predicate(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+) -> bool {
+    let Some(record) = store.signature(signature) else {
+        return false;
+    };
+    let annotation = store
+        .function_signature_return_annotation(signature)
+        .filter(|(annotation, _)| {
+            store.source_node_kind(*annotation) == Some(SyntaxKind::TypePredicate)
+        });
+    let Some((annotation, null_literal_identity)) = annotation else {
+        return record.resolved_type_predicate().is_none();
+    };
+    let Some(declaration) = record.declaration() else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(owner)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let [type_parameter] = record.type_parameters() else {
+        return false;
+    };
+    let [parameter] = record.parameters() else {
+        return false;
+    };
+    let Some(predicate) = record
+        .resolved_type_predicate()
+        .and_then(|predicate| store.type_predicate(predicate))
+    else {
+        return false;
+    };
+    let Some(narrowed) = store.source_direct_type_annotation(annotation) else {
+        return false;
+    };
+    let mut names = (0..annotation.node.index()).filter_map(|index| {
+        let index = u32::try_from(index).ok()?;
+        let node = NodeRef::new(
+            annotation.arena,
+            annotation.file,
+            ts_ast::NodeId::new(index),
+        );
+        (store.source_node_kind(node) == Some(SyntaxKind::Identifier)
+            && store.source_node_parent(node) == Some(SourceNodeParent::Parent(annotation)))
+        .then_some(node)
+    });
+    let Some(name) = names.next() else {
+        return false;
+    };
+
+    !null_literal_identity
+        && names.next().is_none()
+        && store.source_node_kind(declaration) == Some(SyntaxKind::CallSignature)
+        && store.source_node_kind(owner) == Some(SyntaxKind::InterfaceDeclaration)
+        && predicate.kind() == TypePredicateKind::Identifier
+        && predicate.parameter_index() == 0
+        && predicate.type_id() == Some(*type_parameter)
+        && store.callable_signature_parameter_types(signature)
+            == Some(std::slice::from_ref(type_parameter))
+        && cached_planned_type_identity(store, narrowed) == Some(*type_parameter)
+        && store.symbol_node_links(name)
+            == Some(&SymbolNodeLinks {
+                resolved_symbol: Some(*parameter),
+            })
+        && valid_stored_callable_type_predicate(store, record, Some(annotation))
+}
+
+fn valid_optional_generic_predicate_parameter(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    annotation: NodeRef,
+    type_: TypeId,
+) -> bool {
+    let Some(SourceNodeParent::Parent(signature)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(owner)) = store.source_node_parent(signature) else {
+        return false;
+    };
+    let Some(parameter) = cached_ordinary_type_parameter_owner(store, type_) else {
+        return false;
+    };
+    let Some([parameter_declaration]) = store
+        .symbol(parameter)
+        .and_then(ts_binder::semantic::Symbol::declarations)
+    else {
+        return false;
+    };
+
+    store.source_node_kind(signature) == Some(SyntaxKind::CallSignature)
+        && store.source_node_kind(owner) == Some(SyntaxKind::InterfaceDeclaration)
+        && store
+            .source_direct_type_annotation(signature)
+            .is_some_and(|return_type| {
+                store.source_node_kind(return_type) == Some(SyntaxKind::TypePredicate)
+            })
+        && store.source_node_kind(annotation) == Some(SyntaxKind::TypeReference)
+        && cached_planned_type_identity(store, annotation) == Some(type_)
+        && store.source_node_parent(*parameter_declaration)
+            == Some(SourceNodeParent::Parent(signature))
+        && store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| !bootstrap.options.strict_null_checks)
+}
+
 fn declared_signature_parameter_is_optional(
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
@@ -1178,12 +1295,15 @@ fn declared_signature_parameter_is_optional(
         && store.source_node_parent(question) == Some(SourceNodeParent::Parent(declaration));
     if optional {
         let any = store.intrinsic_bootstrap()?.any_type;
-        if (store.source_node_kind(annotation) != Some(SyntaxKind::AnyKeyword) || type_ != any)
+        let ordinary_any =
+            store.source_node_kind(annotation) == Some(SyntaxKind::AnyKeyword) && type_ == any;
+        if !ordinary_any
             && !authenticated_global_boolean_constructor_optional_parameter(
                 store,
                 declaration,
                 type_,
             )
+            && !valid_optional_generic_predicate_parameter(store, declaration, annotation, type_)
         {
             return None;
         }
@@ -7494,6 +7614,36 @@ fn authenticated_global_boolean_constructor_optional_call(
         && store.source_node_kind(return_type) == Some(SyntaxKind::BooleanKeyword)
 }
 
+fn planned_predicate_type_parameter_reference(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    parameters: &[PlannedInterfaceMethodTypeParameter],
+) -> Option<SemanticSymbolId> {
+    let [parameter] = parameters else {
+        return None;
+    };
+    let record = preflight_node(store, host, node).ok()?;
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return None;
+    };
+    let name = NodeRef::new(node.arena, node.file, reference.type_name);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return None;
+    };
+    let symbol = store.symbol(parameter.symbol)?;
+    (record.kind == SyntaxKind::TypeReference
+        && record.flags.0 == 0
+        && reference.type_arguments.is_none()
+        && name_record.kind == SyntaxKind::Identifier
+        && name_record.flags.0 == 0
+        && name_record.parent == Some(node.node)
+        && identifier.flow_node.is_none()
+        && symbol.name().as_utf8() == Some(identifier.text.as_str()))
+    .then_some(parameter.symbol)
+}
+
 fn plan_call_signature(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -7573,6 +7723,9 @@ fn plan_call_signature(
         None if implicit_any_return => declaration,
         None => return Err(unsupported()),
     };
+    let interface_predicate_call = !is_construct
+        && store.source_node_kind(owner) == Some(SyntaxKind::InterfaceDeclaration)
+        && store.source_node_kind(return_type) == Some(SyntaxKind::TypePredicate);
 
     let bound = host.bound_file(declaration).ok_or_else(unsupported)?;
     let raw_call_symbol = bound.symbol(declaration).ok_or_else(unsupported)?;
@@ -7745,7 +7898,25 @@ fn plan_call_signature(
                     type_node,
                     return_type,
                 );
-            if !is_construct && !type_literal_call && !boolean_constructor
+            let annotation_record =
+                preflight_node(store, host, type_node).map_err(|_| unsupported())?;
+            let ordinary_any = annotation_record.kind == SyntaxKind::AnyKeyword
+                && matches!(annotation_record.data, NodeData::KeywordTypeNode(_));
+            let generic_predicate_parameter = interface_predicate_call
+                && planned_predicate_type_parameter_reference(
+                    store,
+                    host,
+                    type_node,
+                    &type_parameters,
+                )
+                .is_some()
+                && store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| !bootstrap.options.strict_null_checks);
+            if !is_construct
+                && !type_literal_call
+                && !boolean_constructor
+                && !generic_predicate_parameter
                 || rest.is_some()
                 || token_record.kind != SyntaxKind::QuestionToken
                 || !matches!(token_record.data, NodeData::Token(_))
@@ -7753,17 +7924,7 @@ fn plan_call_signature(
                 || token_record.parent != Some(parameter.node)
                 || token_record.range.start < name_record.range.end
                 || token_record.range.end > type_start
-                || !boolean_constructor
-                    && (preflight_node(store, host, type_node)
-                        .map_err(|_| unsupported())?
-                        .kind
-                        != SyntaxKind::AnyKeyword
-                        || !matches!(
-                            preflight_node(store, host, type_node)
-                                .map_err(|_| unsupported())?
-                                .data,
-                            NodeData::KeywordTypeNode(_)
-                        ))
+                || !ordinary_any && !boolean_constructor && !generic_predicate_parameter
             {
                 return Err(unsupported());
             }
@@ -7830,12 +7991,48 @@ fn plan_call_signature(
     } else {
         peel_parenthesized_type(store, host, return_type)?
     };
+    let type_predicate = if store.source_node_kind(return_identity_node)
+        == Some(SyntaxKind::TypePredicate)
+    {
+        let predicate = plan_callable_type_predicate(store, host, return_identity_node)
+            .map_err(|_| unsupported())?;
+        let [type_parameter] = type_parameters.as_slice() else {
+            return Err(unsupported());
+        };
+        let [parameter] = parameters.as_slice() else {
+            return Err(unsupported());
+        };
+        let Some(narrowed) = predicate.narrowed_type else {
+            return Err(unsupported());
+        };
+        if !interface_predicate_call
+            || predicate.owner != declaration
+            || predicate.kind != TypePredicateKind::Identifier
+            || predicate.parameter_index != 0
+            || predicate.parameter_symbol != parameter.symbol
+            || planned_predicate_type_parameter_reference(
+                store,
+                host,
+                parameter.type_node,
+                &type_parameters,
+            ) != Some(type_parameter.symbol)
+            || planned_predicate_type_parameter_reference(store, host, narrowed, &type_parameters)
+                != Some(type_parameter.symbol)
+            || flags != SignatureFlags::NONE
+        {
+            return Err(unsupported());
+        }
+        Some(predicate)
+    } else {
+        None
+    };
     Ok(PlannedCallSignature {
         declaration,
         symbol: call_symbol,
         type_parameters,
         parameters,
         return_type,
+        type_predicate,
         return_identity_node,
         return_null_literal_identity: !implicit_any_return
             && is_null_literal_type(store, host, return_identity_node)?,
@@ -10619,6 +10816,55 @@ fn valid_planned_signature_return(
     signature: &PlannedCallSignature,
     type_: TypeId,
 ) -> bool {
+    if let Some(predicate) = signature.type_predicate {
+        let Some(boolean) = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.boolean_type)
+        else {
+            return false;
+        };
+        let [parameter] = signature.parameters.as_slice() else {
+            return false;
+        };
+        let Some(narrowed) = predicate.narrowed_type else {
+            return false;
+        };
+        if signature.implicit_any_return
+            || signature.return_type != predicate.node
+            || signature.return_identity_node != predicate.node
+            || signature.return_null_literal_identity
+            || predicate.owner != signature.declaration
+            || predicate.kind != TypePredicateKind::Identifier
+            || predicate.parameter_index != 0
+            || predicate.parameter_symbol != parameter.symbol
+            || type_ != boolean
+            || cached_planned_type_identity(store, narrowed)
+                != planned_call_parameter_type(store, parameter)
+        {
+            return false;
+        }
+        return match store
+            .signature_links(signature.declaration)
+            .and_then(|links| links.resolved_signature.signature())
+        {
+            Some(signature) => store.signature(signature).is_some_and(|record| {
+                valid_planned_callable_type_predicate(
+                    store,
+                    record,
+                    Some(predicate.node),
+                    Some(predicate),
+                )
+            }),
+            None => {
+                store
+                    .type_node_links(predicate.node)
+                    .is_none_or(|links| links == &TypeNodeLinks::default())
+                    && store
+                        .symbol_node_links(predicate.parameter_name)
+                        .is_none_or(|links| links == &SymbolNodeLinks::default())
+            }
+        };
+    }
     if signature.implicit_any_return {
         let valid_owner = match (
             store.source_node_kind(signature.declaration),
@@ -11065,6 +11311,7 @@ fn authenticated_lazy_global_constructor_signature(
         && plan.heritage.is_none()
         && planned.flags == SignatureFlags::CONSTRUCT
         && planned.type_parameters.is_empty()
+        && planned.type_predicate.is_none()
         && !planned.implicit_any_return
         && !planned.return_null_literal_identity
         && planned.min_argument_count() == 0
@@ -11340,7 +11587,12 @@ fn validate_resolved_call_signature(
         || record.type_parameters() != type_parameters.as_slice()
         || record.this_parameter().is_some()
         || record.parameters() != parameter_symbols.as_slice()
-        || record.resolved_type_predicate().is_some()
+        || !valid_planned_callable_type_predicate(
+            store,
+            record,
+            (!planned.implicit_any_return).then_some(planned.return_identity_node),
+            planned.type_predicate,
+        )
         || record.target().is_some()
         || record.mapper().is_some()
         || record.isolated_signature_type().is_some()
@@ -16659,6 +16911,255 @@ mod generic_publication_tests {
             warm,
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_interface_predicate_calls_preserve_optional_arity_and_constructor_family() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface BulleanConstructor { ",
+                "new(value?: any): any; ",
+                "<Value>(value?: Value): value is Value; ",
+                "}",
+            ),
+            3_921,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let planned = plan
+            .call_signatures
+            .iter()
+            .find(|signature| !signature.is_construct())
+            .unwrap();
+        let predicate = planned.type_predicate.unwrap();
+        assert_eq!(planned.type_parameters.len(), 1);
+        assert_eq!(planned.parameters.len(), 1);
+        assert!(planned.parameters[0].optional);
+        assert_eq!(planned.min_argument_count(), 0);
+        assert_eq!(predicate.kind, TypePredicateKind::Identifier);
+        assert_eq!(predicate.parameter_index, 0);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+
+        let TypeData::Interface(interface) = fixture.store.type_payload(type_).unwrap().data()
+        else {
+            panic!("the mixed predicate declaration must retain its interface owner")
+        };
+        let [call] = interface.declared_call_signatures.as_deref().unwrap() else {
+            panic!("the mixed declaration must retain one generic predicate call")
+        };
+        let call = *call;
+        let [constructor] = interface.declared_construct_signatures.as_deref().unwrap() else {
+            panic!("the mixed declaration must retain its original constructor")
+        };
+        let constructor = *constructor;
+        assert_eq!(
+            interface.reference.object.structured.signatures.as_deref(),
+            Some([call, constructor].as_slice()),
+        );
+        assert_eq!(
+            interface.reference.object.structured.call_signature_count,
+            1
+        );
+        let signature = fixture.store.signature(call).unwrap();
+        let [type_parameter] = signature.type_parameters() else {
+            panic!("the predicate call must retain its original type parameter")
+        };
+        let type_parameter = *type_parameter;
+        let boolean = fixture.store.intrinsic_bootstrap().unwrap().boolean_type;
+        assert_eq!(signature.min_argument_count(), 0);
+        assert_eq!(signature.resolved_return_type(), Some(boolean));
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(call),
+            Some([type_parameter].as_slice()),
+        );
+        let published = signature
+            .resolved_type_predicate()
+            .and_then(|identity| fixture.store.type_predicate(identity))
+            .unwrap();
+        assert_eq!(published.kind(), TypePredicateKind::Identifier);
+        assert_eq!(published.parameter_index(), 0);
+        assert_eq!(published.parameter_name(), "value");
+        assert_eq!(published.type_id(), Some(type_parameter));
+        assert_eq!(
+            fixture.store.symbol_node_links(predicate.parameter_name),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(planned.parameters[0].symbol),
+            }),
+        );
+        assert!(matches!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Valid(_)
+        ));
+        assert!(matches!(
+            super::super::callable_sets::validate_stored_callable_set(&fixture.store, type_),
+            super::super::callable_sets::StoredCallableSetValidation::Valid { .. }
+        ));
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.type_predicate_len(),
+            fixture.store.mapper_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(fixture.symbol),
+            Ok(type_),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.type_predicate_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_interface_predicate_calls_reject_forged_narrowing_and_parameter_edges() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Predicate { ",
+                "new(other?: any): any; ",
+                "<Value>(value?: Value): value is Value; ",
+                "}",
+            ),
+            3_922,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let planned = plan
+            .call_signatures
+            .iter()
+            .find(|signature| !signature.is_construct())
+            .unwrap();
+        let predicate_plan = planned.type_predicate.unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(type_).unwrap().data()
+        else {
+            panic!("Predicate must retain its mixed interface")
+        };
+        let call = interface.declared_call_signatures.as_ref().unwrap()[0];
+        let constructor = interface.declared_construct_signatures.as_ref().unwrap()[0];
+        let wrong_parameter = fixture.store.signature(constructor).unwrap().parameters()[0];
+        let original = fixture
+            .store
+            .signature(call)
+            .and_then(super::super::signatures::Signature::resolved_type_predicate)
+            .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let forged = fixture
+            .store
+            .alloc_type_predicate(TypePredicateKind::Identifier, 0, "value", Some(number))
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_type_predicate(call, Some(forged))
+        );
+        assert!(matches!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Malformed
+        ));
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_type_predicate(call, Some(original))
+        );
+
+        let original_name = fixture
+            .store
+            .symbol_node_links(predicate_plan.parameter_name)
+            .cloned()
+            .unwrap();
+        assert!(fixture.store.set_symbol_node_links(
+            predicate_plan.parameter_name,
+            SymbolNodeLinks {
+                resolved_symbol: Some(wrong_parameter),
+            },
+        ));
+        assert!(matches!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Malformed
+        ));
+        assert!(
+            fixture
+                .store
+                .set_symbol_node_links(predicate_plan.parameter_name, original_name)
+        );
+
+        let narrowed = predicate_plan.narrowed_type.unwrap();
+        let original_narrowed = fixture.store.type_node_links(narrowed).cloned().unwrap();
+        assert!(fixture.store.set_type_node_links(
+            narrowed,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(matches!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Malformed
+        ));
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(narrowed, original_narrowed)
+        );
+        assert!(matches!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Valid(_)
+        ));
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_interface_predicate_calls_reject_unrelated_optional_and_narrowed_types() {
+        for (index, source) in [
+            "interface Invalid { <Value>(value?: Value): Value; }",
+            "interface Invalid { <Value>(value?: Value): other is Value; }",
+            "interface Invalid { <Value>(value?: Value): value is string; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = interface_fixture(source, 3_923 + u32::try_from(index).unwrap());
+            let host = host(&fixture.parsed, &fixture.bound);
+            assert!(matches!(
+                plan_interface(&fixture.store, &host, fixture.symbol),
+                Err(PropertyObjectError::UnsupportedMember { .. })
+            ));
+        }
     }
 
     #[test]

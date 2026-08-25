@@ -1843,7 +1843,7 @@ fn validate_global_wrapper_annotation(
     Ok(())
 }
 
-/// Validates predicate syntax against its exact function-owned parameter.
+/// Validates predicate syntax against its exact callable-owned parameter.
 pub(super) fn plan_callable_type_predicate(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1888,6 +1888,15 @@ pub(super) fn plan_callable_type_predicate(
         }
         NodeData::FunctionTypeNode(function) if owner_record.kind == SyntaxKind::FunctionType => {
             (&function.parameters, function.type_)
+        }
+        NodeData::CallSignatureDeclaration(signature)
+            if owner_record.kind == SyntaxKind::CallSignature
+                && owner_record.parent.is_some_and(|parent| {
+                    store.source_node_kind(NodeRef::new(owner.arena, owner.file, parent))
+                        == Some(SyntaxKind::InterfaceDeclaration)
+                }) =>
+        {
+            (&signature.parameters, signature.type_)
         }
         _ => return Err(invalid()),
     };

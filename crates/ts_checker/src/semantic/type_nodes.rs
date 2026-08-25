@@ -20417,6 +20417,23 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         .ok_or(DeclaredTypeError::Unavailable(
                             DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
                         ))?
+                } else if let Some(predicate) = signature.type_predicate {
+                    if plan.type_predicates.get(&signature.return_type) != Some(&predicate)
+                        || predicate.kind != TypePredicateKind::Identifier
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidFunctionType(signature.return_type),
+                        ));
+                    }
+                    if let Some(narrowed) = predicate.narrowed_type {
+                        self.execute_type_node(narrowed, plan, prepared)?;
+                    }
+                    self.store
+                        .intrinsic_bootstrap()
+                        .map(|bootstrap| bootstrap.boolean_type)
+                        .ok_or(DeclaredTypeError::Unavailable(
+                            DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                        ))?
                 } else {
                     self.execute_type_node(signature.return_type, plan, prepared)?
                 };
@@ -20485,7 +20502,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .map_err(property_object_error);
             }
             let state = state.expect("a no-heritage interface has object-member state");
-            if state.is_resolved() {
+            let resolved = if state.is_resolved() {
                 object_members::validate_resolved_declared_member_types(
                     self.store,
                     &interface,
@@ -20494,7 +20511,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     &call_types,
                 )
                 .map_err(property_object_error)?;
-                Ok(declared_type)
+                declared_type
             } else {
                 object_members::publish_declared_members(
                     self.store,
@@ -20504,8 +20521,41 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     &index_types,
                     &call_types,
                 )
-                .map_err(property_object_error)
+                .map_err(property_object_error)?
+            };
+            for signature in &interface.call_signatures {
+                let Some(predicate) = signature.type_predicate else {
+                    continue;
+                };
+                let actual = self.execute_type_node(predicate.node, plan, prepared)?;
+                let expected = self
+                    .store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.boolean_type)
+                    .ok_or(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                    ))?;
+                if actual != expected {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionType(predicate.node),
+                    ));
+                }
             }
+            if interface
+                .call_signatures
+                .iter()
+                .any(|signature| signature.type_predicate.is_some())
+            {
+                object_members::validate_resolved_declared_member_types(
+                    self.store,
+                    &interface,
+                    &types,
+                    &index_types,
+                    &call_types,
+                )
+                .map_err(property_object_error)?;
+            }
+            Ok(resolved)
         })();
         assert!(self.resolving_property_interfaces.remove(&symbol));
         if result.is_ok() && self.options.no_implicit_any {
