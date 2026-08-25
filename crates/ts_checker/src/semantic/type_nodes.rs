@@ -8517,7 +8517,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             .plan
                             .references
                             .get(argument)
-                            .and_then(|reference| self.store.symbol(reference.symbol))
+                            .map(|reference| reference.symbol)
+                            .or_else(|| {
+                                self.store
+                                    .type_node_links(*argument)
+                                    .and_then(|links| links.resolved_type)
+                                    .and_then(|type_| {
+                                        cached_ordinary_type_parameter_owner(self.store, type_)
+                                    })
+                            })
+                            .and_then(|symbol| self.store.symbol(symbol))
                             .is_some_and(|parameter| {
                                 parameter.flags().contains(SymbolFlags::TYPE_PARAMETER)
                             });
