@@ -33,7 +33,9 @@ use super::{
         DirectInterfaceBaseKind, DirectInterfaceHeritageError, DirectInterfaceHeritagePlan,
         plan_direct_interface_heritage,
     },
-    links::{ResolvedSignatureState, SignatureLinks, TypeNodeLinks, ValueSymbolLinks},
+    links::{
+        AliasTargetState, ResolvedSignatureState, SignatureLinks, TypeNodeLinks, ValueSymbolLinks,
+    },
     reference_types::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
     },
@@ -12560,6 +12562,136 @@ fn validated_javascript_expando_spread_donor(
     Some(result)
 }
 
+fn validated_module_namespace_spread_donor(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<Vec<ResolvedObjectProperty>> {
+    let record = store.type_payload(type_)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    let owner = record.symbol()?;
+    let owner_record = store.symbol(owner)?;
+    let [declaration] = owner_record.declarations()? else {
+        return None;
+    };
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || record.alias().is_some()
+        || !valid_object_tail(object)
+        || object.structured.constrained != ConstrainedTypeData::default()
+        || object.structured.signatures.is_some()
+        || object.structured.call_signature_count != 0
+        || object.structured.index_infos.is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || owner_record.flags() != SymbolFlags::VALUE_MODULE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.value_declaration() != Some(*declaration)
+        || owner_record.members().is_some()
+        || owner_record.parent().is_some()
+        || owner_record.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store.source_node_kind(*declaration) != Some(SyntaxKind::SourceFile)
+        || store.source_node_parent(*declaration) != Some(SourceNodeParent::Root)
+    {
+        return None;
+    }
+    let exports = store
+        .module_symbol_links(owner)
+        .and_then(|links| links.resolved_exports)
+        .or_else(|| owner_record.exports())?;
+    let export_table = store.symbol_table(exports)?;
+    let properties = object.structured.properties.as_deref().unwrap_or_default();
+    if object.structured.properties.is_some() == properties.is_empty() {
+        return None;
+    }
+    let table = match object.structured.members {
+        Some(members) if !properties.is_empty() => Some(store.symbol_table(members)?),
+        None if properties.is_empty() => None,
+        _ => return None,
+    };
+    if table.is_some_and(|table| table.len() != properties.len()) {
+        return None;
+    }
+
+    let mut seen = HashSet::with_capacity(properties.len());
+    let mut result = Vec::with_capacity(properties.len());
+    for symbol in properties {
+        if !seen.insert(*symbol) {
+            return None;
+        }
+        let property = store.symbol(*symbol)?;
+        let links = store.value_symbol_links(*symbol)?;
+        let property_type = links.resolved_type?;
+        let exported = links.target?;
+        let exported_record = store.symbol(exported)?;
+        let name = property.name().as_utf8()?;
+        if property.flags() != SymbolFlags::PROPERTY
+            || property.check_flags() != CheckFlags::NONE
+            || property.name().is_reserved_member_name()
+            || property.name().is_private_identifier()
+            || property.name().is_late_bound()
+            || property.declarations().is_some()
+            || property.value_declaration().is_some()
+            || property.members().is_some()
+            || property.exports().is_some()
+            || property.parent().is_some()
+            || property.export_symbol().is_some()
+            || store.get_merged_symbol(*symbol) != Some(*symbol)
+            || store.get_merged_symbol(exported) != Some(exported)
+            || store.type_payload(property_type).is_none()
+            || table.and_then(|table| table.get(property.name())) != Some(*symbol)
+            || export_table.get(property.name()) != Some(exported)
+            || links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(property_type),
+                    target: Some(exported),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return None;
+        }
+        let value = if exported_record.flags() == SymbolFlags::ALIAS {
+            let alias = store.alias_symbol_links(exported)?;
+            let AliasTargetState::Resolved(value) = alias.alias_target else {
+                return None;
+            };
+            if alias.type_only_declaration.is_some() {
+                return None;
+            }
+            value
+        } else {
+            exported
+        };
+        if store.get_merged_symbol(value) != Some(value)
+            || store
+                .symbol(value)
+                .is_none_or(|value| !value.flags().intersects(SymbolFlags::VALUE))
+            || [exported, value].into_iter().any(|target| {
+                store
+                    .value_symbol_links(target)
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|cached| cached != property_type)
+                    || store
+                        .source_callable_type_for_owner(target)
+                        .is_some_and(|cached| cached != property_type)
+            })
+        {
+            return None;
+        }
+        result.push(ResolvedObjectProperty {
+            name: name.to_owned(),
+            type_: property_type,
+            readonly: false,
+            optional: false,
+        });
+    }
+    Some(result)
+}
+
 fn spread_union_property_type(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
@@ -12717,6 +12849,16 @@ fn validate_spread_donor(
             validated_source_object_spread_donor(store, type_)
         };
         return properties.map_or(
+            SpreadDonorValidation::Malformed,
+            SpreadDonorValidation::Valid,
+        );
+    }
+    if record
+        .symbol()
+        .and_then(|symbol| store.symbol(symbol))
+        .is_some_and(|symbol| symbol.flags() == SymbolFlags::VALUE_MODULE)
+    {
+        return validated_module_namespace_spread_donor(store, type_).map_or(
             SpreadDonorValidation::Malformed,
             SpreadDonorValidation::Valid,
         );

@@ -52577,6 +52577,272 @@ mod tests {
     }
 
     #[test]
+    fn commented_object_spreads_preserve_contextual_function_call_results() {
+        let source = parsed(concat!(
+            "interface Shape { value: 1 | 2; label: string; } ",
+            "declare function identity(value: Shape): Shape; ",
+            "const first = { .../*#__PURE__*/identity({ value: 1, label: 'first' }) }; ",
+            "const second = { ...\n/*#__PURE__*/\nidentity({ value: 2, label: 'second' }), ",
+            "/* retained */ after: true };",
+        ));
+        let file = FileId::new(9_820);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        for (name, expected) in [
+            ("first", "{ value: 1 | 2; label: string; }"),
+            ("second", "{ value: 1 | 2; label: string; after: boolean; }"),
+        ] {
+            assert_eq!(
+                context
+                    .type_to_string(variable_value_type(&context, &source, file, name))
+                    .unwrap(),
+                expected,
+            );
+        }
+        let arguments = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression
+                    && record.parent.is_some_and(|parent| {
+                        source
+                            .arena
+                            .get(parent)
+                            .is_some_and(|parent| parent.kind == SyntaxKind::CallExpression)
+                    }))
+                .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(arguments.len(), 2);
+        for (argument, expected) in arguments.into_iter().zip(["1", "2"]) {
+            assert_eq!(
+                context
+                    .type_to_string(object_property_type(&context, argument, "value"))
+                    .unwrap(),
+                expected,
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn imported_module_namespace_spreads_preserve_export_values_and_warm_identity() {
+        let provider = parsed(concat!(
+            "export const count: number = 1; ",
+            "export const label: string = 'ready';",
+        ));
+        let consumer = parsed(concat!(
+            "import * as values from './provider'; ",
+            "const copied = { .../*#__PURE__*/values, after: true };",
+        ));
+        let provider_file = FileId::new(9_821);
+        let consumer_file = FileId::new(9_822);
+        let files = [(provider_file, &provider), (consumer_file, &consumer)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 1,
+                specifier: 0,
+                target: 0,
+            }],
+        );
+
+        context.check_source_file(provider_file).unwrap();
+        context.check_source_file(consumer_file).unwrap();
+
+        let copied = variable_initializer(&consumer, consumer_file, "copied");
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(
+                    &context,
+                    &consumer,
+                    consumer_file,
+                    "copied",
+                ))
+                .unwrap(),
+            "{ count: number; label: string; after: boolean; }",
+        );
+        assert_eq!(
+            object_property_type(&context, copied, "count"),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, consumer_file);
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(observable_state(&context, consumer_file), warm);
+    }
+
+    #[test]
+    fn imported_module_namespace_spreads_authenticate_renamed_reexports() {
+        let provider = parsed("export const label: string = 'ready';");
+        let bridge = parsed("export { label as renamed } from './provider';");
+        let consumer = parsed(concat!(
+            "import * as values from './bridge'; ",
+            "const copied = { ...values };",
+        ));
+        let provider_file = FileId::new(9_823);
+        let bridge_file = FileId::new(9_824);
+        let consumer_file = FileId::new(9_825);
+        let files = [
+            (provider_file, &provider),
+            (bridge_file, &bridge),
+            (consumer_file, &consumer),
+        ];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[
+                SourceImportRoute {
+                    source: 1,
+                    specifier: 0,
+                    target: 0,
+                },
+                SourceImportRoute {
+                    source: 2,
+                    specifier: 0,
+                    target: 1,
+                },
+            ],
+        );
+
+        context.check_source_file(consumer_file).unwrap();
+
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(
+                    &context,
+                    &consumer,
+                    consumer_file,
+                    "copied",
+                ))
+                .unwrap(),
+            "{ renamed: string; }",
+        );
+        let (_, bound) = context.file(bridge_file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let namespace = context
+            .store()
+            .value_symbol_links(module)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let property = declared_object_property_symbol(&context, namespace, "renamed");
+        let alias = context
+            .store()
+            .value_symbol_links(property)
+            .and_then(|links| links.target)
+            .unwrap();
+        assert_eq!(
+            context.store().symbol(alias).unwrap().flags(),
+            SymbolFlags::ALIAS
+        );
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(alias)
+                .map(|links| links.alias_target),
+            Some(AliasTargetState::Resolved(variable_symbol(
+                &context,
+                &provider,
+                provider_file,
+                "label",
+            ))),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, consumer_file);
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(observable_state(&context, consumer_file), warm);
+    }
+
+    #[test]
+    fn poisoned_module_namespace_spread_donors_fail_without_publication_and_recover() {
+        let provider = parsed("export const value: number = 1;");
+        let consumer = parsed(concat!(
+            "import * as values from './provider'; ",
+            "const copied = { ...values };",
+        ));
+        let provider_file = FileId::new(9_826);
+        let consumer_file = FileId::new(9_827);
+        let files = [(provider_file, &provider), (consumer_file, &consumer)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 1,
+                specifier: 0,
+                target: 0,
+            }],
+        );
+
+        context.check_source_file(provider_file).unwrap();
+        context.check_source_file(consumer_file).unwrap();
+
+        let copied = variable_initializer(&consumer, consumer_file, "copied");
+        let copied_type = resolved_node_type(&context, copied);
+        let (_, bound) = context.file(provider_file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let namespace = context
+            .store()
+            .value_symbol_links(module)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let [property] = context
+            .store()
+            .type_payload(namespace)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .unwrap()
+        else {
+            panic!("expected one projected namespace property")
+        };
+        let property = *property;
+        let expected = context
+            .store()
+            .value_symbol_links(property)
+            .cloned()
+            .unwrap();
+        let mut poisoned_links = expected.clone();
+        poisoned_links.write_type =
+            Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+
+        mark_source_unchecked(&mut context, consumer_file);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(property, poisoned_links)
+        );
+        let poisoned = observable_state(&context, consumer_file);
+
+        assert!(matches!(
+            context.check_source_file(consumer_file),
+            Err(SourceCheckError::ObjectLiteral(
+                SourceObjectLiteralError::InvalidCache {
+                    node,
+                    type_: None,
+                }
+            )) if node == copied
+        ));
+        assert_eq!(observable_state(&context, consumer_file), poisoned);
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, consumer_file));
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(property, expected)
+        );
+        context.check_source_file(consumer_file).unwrap();
+        assert_eq!(resolved_node_type(&context, copied), copied_type);
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, consumer_file));
+    }
+
+    #[test]
     fn readonly_spread_status_follows_the_receiver_and_const_spreads_absorb_any() {
         let source = parsed(concat!(
             "const frozen = { value: 1 } as const; ",
