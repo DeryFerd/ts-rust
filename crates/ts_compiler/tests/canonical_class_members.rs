@@ -1,4 +1,6 @@
-use ts_compiler::{CanonicalProgramCheckFailureClass, Program};
+use ts_ast::{NodeData, NodeRef, SyntaxKind};
+use ts_binder::SymbolFlags;
+use ts_compiler::{CanonicalProgramCheckFailureClass, CanonicalProgramQueries, Program};
 use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind};
 use ts_vfs::{FileSystem, MemoryFileSystem};
 
@@ -124,8 +126,103 @@ fn canonical_program_reports_uninitialized_instance_field() {
     assert_eq!((range.start.get(), range.end.get()), (start, start + 5));
 }
 
+fn assert_exported_class_program_queries(
+    program: &Program,
+    queries: &mut CanonicalProgramQueries<'_>,
+) -> (NodeRef, NodeRef) {
+    let source = program
+        .source_file("/project/main.ts")
+        .expect("the canonical program retains its exported class source");
+    assert_eq!(source.file_name, "/project/main.ts");
+    assert_eq!(source.binding.file_id(), Some(source.id));
+    assert!(!source.is_default_library);
+
+    let NodeData::SourceFile(root) = &source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .unwrap()
+        .data
+    else {
+        panic!("the exported class belongs to the original program source")
+    };
+    let [declaration] = root.statements.nodes.as_slice() else {
+        panic!("the source retains exactly one exported class")
+    };
+    let declaration = source.node_ref(*declaration).unwrap();
+    let NodeData::ClassDeclaration(class) = &source.parse.arena.get(declaration.node).unwrap().data
+    else {
+        panic!("the program statement remains a class declaration")
+    };
+    let class_name = source.node_ref(class.name.unwrap()).unwrap();
+    let [field] = class.members.nodes.as_slice() else {
+        panic!("the exported class retains one optional member")
+    };
+    let field = source.node_ref(*field).unwrap();
+    let NodeData::PropertyDeclaration(property) = &source.parse.arena.get(field.node).unwrap().data
+    else {
+        panic!("the class member remains its original property declaration")
+    };
+    let field_name = source.node_ref(property.name).unwrap();
+    let annotation = source.node_ref(property.type_.unwrap()).unwrap();
+    assert_eq!(
+        source
+            .parse
+            .arena
+            .get(property.postfix_token.unwrap())
+            .unwrap()
+            .kind,
+        SyntaxKind::QuestionToken,
+    );
+
+    let bound_owner = source.binding.exports.get("Exported").unwrap();
+    let bound_class = source.binding.symbols.get(bound_owner).unwrap();
+    assert!(bound_class.flags.contains(SymbolFlags::CLASS));
+    assert_eq!(bound_class.value_declaration, Some(declaration.node));
+    let bound_field = bound_class.members.get("value").unwrap();
+    let bound_property = source.binding.symbols.get(bound_field).unwrap();
+    assert!(bound_property.flags.contains(SymbolFlags::PROPERTY));
+
+    let owner = queries
+        .get_symbol_at_location(declaration)
+        .unwrap()
+        .expect("the exported class retains its canonical declaration symbol");
+    assert_eq!(
+        queries.get_symbol_at_location(class_name).unwrap(),
+        Some(owner)
+    );
+    assert_eq!(queries.symbol_to_string(owner).unwrap(), "Exported");
+    assert_eq!(
+        queries.get_symbol_declarations(owner).unwrap(),
+        &[declaration]
+    );
+    let member = queries
+        .get_symbol_at_location(field)
+        .unwrap()
+        .expect("the optional property retains its canonical member symbol");
+    assert_eq!(
+        queries.get_symbol_at_location(field_name).unwrap(),
+        Some(member)
+    );
+    assert_eq!(queries.symbol_to_string(member).unwrap(), "value");
+    assert_eq!(queries.get_symbol_declarations(member).unwrap(), &[field]);
+    let member_type = queries.get_type_at_location(annotation).unwrap();
+    assert_eq!(queries.type_to_string(member_type).unwrap(), "string");
+    assert_eq!(
+        queries.get_symbol_at_location(declaration).unwrap(),
+        Some(owner)
+    );
+    assert_eq!(queries.get_symbol_at_location(field).unwrap(), Some(member));
+    assert_eq!(
+        queries.get_type_at_location(annotation).unwrap(),
+        member_type
+    );
+
+    (declaration, field)
+}
+
 #[test]
-fn canonical_program_rejects_exported_class_as_a_typed_boundary() {
+fn canonical_program_publishes_exported_class_and_member_symbols() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
         "/project/main.ts",
@@ -133,19 +230,31 @@ fn canonical_program_rejects_exported_class_as_a_typed_boundary() {
     )
     .unwrap();
 
-    let error = Program::try_new_with_canonical_checker(
+    let (program, nodes) = Program::try_new_with_canonical_checker_and_queries(
         &fs,
         "/project",
         &["main.ts".to_owned()],
         canonical_options(),
+        assert_exported_class_program_queries,
     )
-    .unwrap_err();
+    .expect("authenticated exported classes check successfully");
 
+    let (declaration, field) = nodes.expect("the canonical checker runs the symbol queries");
+    assert!(program.diagnostics().is_empty());
     assert_eq!(
-        error.failure_class(),
-        CanonicalProgramCheckFailureClass::Unsupported {
-            capability_code: "E00.SOURCE_SYNTAX",
-        }
+        program
+            .source_file_by_id(declaration.file)
+            .unwrap()
+            .file_name,
+        "/project/main.ts",
+    );
+    assert_eq!(
+        program.node(declaration).unwrap().kind,
+        SyntaxKind::ClassDeclaration
+    );
+    assert_eq!(
+        program.node(field).unwrap().kind,
+        SyntaxKind::PropertyDeclaration
     );
 }
 
