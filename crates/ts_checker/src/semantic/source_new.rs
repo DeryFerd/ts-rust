@@ -2454,8 +2454,21 @@ fn plan_declared_constructor(
 
     let object = plan_declared_constructor_object(arena, bound, store, host, annotation)
         .map_err(|_| reject())?;
+    let authenticated_prototype = matches!(
+        object.properties.as_slice(),
+        [prototype]
+            if prototype.name == "prototype"
+                && prototype.readonly
+                && object.call_signatures.iter().any(|signature| {
+                    host.node(signature.declaration).is_some_and(|record| {
+                        record.kind == SyntaxKind::ConstructSignature
+                            && store.source_node_kind(signature.return_type)
+                                == store.source_node_kind(prototype.type_node)
+                    })
+                })
+    );
     if object.call_signatures.is_empty()
-        || !object.properties.is_empty()
+        || !object.properties.is_empty() && !authenticated_prototype
         || !object.methods.is_empty()
         || !object.spreads.is_empty()
         || !object.indexes.is_empty()
@@ -3322,16 +3335,21 @@ fn materialize_global_object_constructor(
         .declared_type_links(global.owner)
         .and_then(|links| links.declared_type);
     let annotation = exact_type_cache(store, global.annotation).map_err(|()| invalid())?;
+    let annotation_symbol = exact_symbol_cache(store, global.annotation).map_err(|()| invalid())?;
     let object_value = exact_class_value_type(store, plan.resolved_symbol)?;
     let parameter = exact_class_value_type(store, global.parameter.symbol)?;
     let signature = exact_signature_cache(store, global.declaration).map_err(|()| invalid())?;
     let return_annotation =
         exact_type_cache(store, global.return_annotation).map_err(|()| invalid())?;
+    let return_symbol =
+        exact_symbol_cache(store, global.return_annotation).map_err(|()| invalid())?;
     if signature.is_some()
         || annotation.is_some_and(|type_| Some(type_) != declared)
+        || annotation_symbol.is_some_and(|symbol| symbol != global.owner)
         || object_value.is_some_and(|type_| Some(type_) != declared)
         || parameter.is_some_and(|type_| type_ != global.parameter.type_)
         || return_annotation.is_some_and(|type_| type_ != global.object_type)
+        || return_symbol.is_some_and(|symbol| symbol != plan.resolved_symbol)
     {
         return Err(invalid());
     }
@@ -3353,6 +3371,8 @@ fn materialize_global_object_constructor(
 
     let missing_type_nodes = usize::from(store.type_node_links(global.annotation).is_none())
         + usize::from(store.type_node_links(global.return_annotation).is_none());
+    let missing_symbol_nodes = usize::from(store.symbol_node_links(global.annotation).is_none())
+        + usize::from(store.symbol_node_links(global.return_annotation).is_none());
     let missing_value_symbols =
         usize::from(store.value_symbol_links(plan.resolved_symbol).is_none())
             + usize::from(store.value_symbol_links(global.parameter.symbol).is_none());
@@ -3361,6 +3381,7 @@ fn materialize_global_object_constructor(
             store.signature_links(global.declaration).is_none(),
         ))
         || !store.try_reserve_type_node_links(missing_type_nodes)
+        || !store.try_reserve_symbol_node_links(missing_symbol_nodes)
         || !store.try_reserve_value_symbol_links(missing_value_symbols)
         || !store.try_reserve_function_signature_return_annotations(1)
     {
@@ -3408,11 +3429,23 @@ fn materialize_global_object_constructor(
             ..TypeNodeLinks::default()
         },
     ));
+    assert!(store.set_symbol_node_links(
+        global.annotation,
+        SymbolNodeLinks {
+            resolved_symbol: Some(global.owner),
+        },
+    ));
     assert!(store.set_type_node_links(
         global.return_annotation,
         TypeNodeLinks {
             resolved_type: Some(global.object_type),
             ..TypeNodeLinks::default()
+        },
+    ));
+    assert!(store.set_symbol_node_links(
+        global.return_annotation,
+        SymbolNodeLinks {
+            resolved_symbol: Some(plan.resolved_symbol),
         },
     ));
     assert!(store.set_value_symbol_links(
@@ -4355,6 +4388,12 @@ fn resolved_global_object_constructor(
     if exact_type_cache(store, global.annotation)
         .map_err(|()| invalid())?
         .is_some_and(|cached| cached != value_type)
+        || exact_symbol_cache(store, global.annotation)
+            .map_err(|()| invalid())?
+            .is_some_and(|symbol| symbol != global.owner)
+        || exact_symbol_cache(store, global.return_annotation)
+            .map_err(|()| invalid())?
+            .is_some_and(|symbol| symbol != plan.resolved_symbol)
         || exact_class_value_type(store, plan.resolved_symbol)?
             .is_some_and(|cached| cached != value_type)
     {
