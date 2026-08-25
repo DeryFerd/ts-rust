@@ -9658,7 +9658,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             };
         let graph = self.bound.flow_graph();
         if !control.nested_export_diagnostics.is_empty()
-            || self.node(control.condition)?.kind != SyntaxKind::CallExpression
+            || !matches!(
+                self.node(control.condition)?.kind,
+                SyntaxKind::CallExpression
+                    | SyntaxKind::BinaryExpression
+                    | SyntaxKind::ParenthesizedExpression
+            )
             || graph.container_is_complete(callable.declaration) != Some(true)
             || graph.container_start(callable.declaration).is_none()
             || graph.container_return(callable.declaration).is_some()
@@ -9686,8 +9691,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Ok(None);
         }
 
+        self.primitive_binary_position_roots
+            .insert(control.condition);
         let condition = self.plan_expression(control.condition)?;
-        if !self.effect_if_call_is_exact(&condition, true) {
+        if !self.effect_if_condition_is_exact(callable, &condition)? {
             return Err(Self::unsupported_function_body(callable));
         }
         let plan_calls = |planner: &mut Self,
@@ -9709,6 +9716,87 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             then_calls: plan_calls(self, then_nodes)?,
             else_calls: plan_calls(self, else_nodes)?,
         }))
+    }
+
+    fn effect_if_condition_is_exact(
+        &self,
+        callable: &SourceCallablePlan,
+        condition: &PlannedExpression,
+    ) -> Result<bool, SourceCheckError> {
+        let PlannedExpressionKind::Binary(comparison) = &condition.unparenthesized().kind else {
+            return Ok(condition.node == condition.unparenthesized().node
+                && self.effect_if_call_is_exact(condition, true));
+        };
+        if !matches!(
+            comparison.operator,
+            SyntaxKind::LessThanToken
+                | SyntaxKind::LessThanEqualsToken
+                | SyntaxKind::GreaterThanToken
+                | SyntaxKind::GreaterThanEqualsToken
+        ) || !comparison.prefix.is_empty()
+            || comparison.shorthand_assignment.is_some()
+            || !self.effect_if_relational_operand_is_exact(callable, &comparison.left)
+            || !self.effect_if_relational_operand_is_exact(callable, &comparison.right)
+        {
+            return Ok(false);
+        }
+
+        let Some((store, _)) = self.semantic else {
+            return Ok(false);
+        };
+        let boolean = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.boolean_type)
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        let mut expression = condition;
+        loop {
+            preflight_source_expression_cache(store, expression.node, boolean)?;
+            match &expression.kind {
+                PlannedExpressionKind::Parenthesized(inner) => expression = inner,
+                PlannedExpressionKind::Binary(_) => break,
+                _ => return Ok(false),
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn effect_if_relational_operand_is_exact(
+        &self,
+        callable: &SourceCallablePlan,
+        expression: &PlannedExpression,
+    ) -> bool {
+        if expression.node != expression.unparenthesized().node {
+            return false;
+        }
+        match &expression.unparenthesized().kind {
+            PlannedExpressionKind::String(_)
+            | PlannedExpressionKind::Number { .. }
+            | PlannedExpressionKind::BigInt { .. }
+            | PlannedExpressionKind::Boolean(_) => true,
+            PlannedExpressionKind::Identifier(read) => {
+                read.kind == PlannedIdentifierReadKind::Variable
+                    && callable.parameters.iter().any(|parameter| {
+                        parameter.symbol == read.value_symbol
+                            && !parameter.optional
+                            && !parameter.rest
+                            && parameter.explicit_type_node().is_some_and(|annotation| {
+                                self.node(annotation).is_ok_and(|annotation| {
+                                    matches!(
+                                        annotation.kind,
+                                        SyntaxKind::StringKeyword
+                                            | SyntaxKind::NumberKeyword
+                                            | SyntaxKind::BigIntKeyword
+                                            | SyntaxKind::BooleanKeyword
+                                    )
+                                })
+                            })
+                    })
+            }
+            _ => false,
+        }
     }
 
     fn effect_if_branch_call_nodes(
@@ -75348,6 +75436,206 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn effect_only_if_relational_conditions_preserve_boolean_types_and_warm_caches() {
+        let source = parsed(concat!(
+            "declare function consume(value: number): void; ",
+            "function less(value: number) { if (value < 2) consume(value); } ",
+            "function atMost(value: number): void { ",
+            "if ((value <= 2)) { consume(value); } else { consume(3); } ",
+            "} ",
+            "function greater(value: number) { if (2 > value) consume(value); } ",
+            "function atLeast(value: number, limit: number) { ",
+            "if (value >= limit) consume(value); ",
+            "} ",
+        ));
+        let file = FileId::new(9_994);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let boolean = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+        let mut comparisons = 0;
+        let mut wrappers = 0;
+        for (node, record) in source.arena.iter() {
+            let node = NodeRef::new(source.arena.id(), file, node);
+            match record.kind {
+                SyntaxKind::BinaryExpression => {
+                    assert_eq!(resolved_node_type(&context, node), boolean);
+                    comparisons += 1;
+                }
+                SyntaxKind::ParenthesizedExpression => {
+                    assert_eq!(resolved_node_type(&context, node), boolean);
+                    wrappers += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(comparisons, 4);
+        assert_eq!(wrappers, 1);
+        for (name, expected) in [
+            ("less", "(value: number) => void"),
+            ("atMost", "(value: number) => void"),
+            ("greater", "(value: number) => void"),
+            ("atLeast", "(value: number, limit: number) => void"),
+        ] {
+            let owner = function_symbol(&context, &source, file, name);
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            assert_eq!(context.type_to_string(callable).unwrap(), expected);
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn effect_only_if_relational_conditions_preserve_operator_and_argument_diagnostics() {
+        let source = parsed(concat!(
+            "declare function consume(value: number): void; ",
+            "function mixed(value: number): void { ",
+            "if (value < 'limit') consume('wrong'); ",
+            "}",
+        ));
+        let file = FileId::new(9_995);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [operator, argument] = context.diagnostics().as_slice() else {
+            panic!("expected one relational operator diagnostic and one call diagnostic")
+        };
+        assert_eq!(operator.diagnostic.code(), 2365);
+        assert_eq!(
+            node_text(&source, operator.node.unwrap()),
+            "value < 'limit'"
+        );
+        assert_eq!(operator.diagnostic.arguments, ["<", "number", "string"]);
+        assert_eq!(argument.diagnostic.code(), 2345);
+        assert_eq!(node_text(&source, argument.node.unwrap()), "'wrong'");
+        assert_eq!(
+            argument.diagnostic.render().unwrap(),
+            "Argument of type 'string' is not assignable to parameter of type 'number'.",
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn effect_only_if_relational_conditions_reject_equality_and_effectful_operands() {
+        for (index, (annotation, condition)) in [
+            ("number", "value === 2"),
+            ("number", "measure(value) < 2"),
+            ("number", "(decide(value))"),
+            ("any", "value < 2"),
+            ("number", "(value) < 2"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(&format!(
+                "declare function measure(value: number): number; \
+                 declare function decide(value: number): boolean; \
+                 declare function consume(value: number): void; \
+                 function rejected(value: {annotation}) {{ if ({condition}) consume(value); }}",
+            ));
+            let file = FileId::new(9_996 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let owner = function_symbol(&context, &source, file, "rejected");
+            let cold = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(_))
+                ))
+            ));
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(
+                context
+                    .store()
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn effect_only_if_relational_conditions_reject_poisoned_condition_caches() {
+        for (index, poisoned) in ["value < 2", "(value < 2)", "((value < 2))"]
+            .into_iter()
+            .enumerate()
+        {
+            let source = parsed(concat!(
+                "declare function consume(value: number): void; ",
+                "function guarded(value: number) { ",
+                "if (((value < 2))) consume(value); ",
+                "}",
+            ));
+            let file = FileId::new(10_001 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let condition = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let node = NodeRef::new(source.arena.id(), file, node);
+                    (matches!(
+                        record.kind,
+                        SyntaxKind::BinaryExpression | SyntaxKind::ParenthesizedExpression
+                    ) && node_text(&source, node) == poisoned)
+                        .then_some(node)
+                })
+                .unwrap();
+            let owner = function_symbol(&context, &source, file, "guarded");
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let wrong = bootstrap.number_type;
+            let expected = bootstrap.boolean_type;
+            assert!(context.store_mut_for_test().set_type_node_links(
+                condition,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            let cold = observable_state(&context, file);
+            let error = SourceCheckError::Assertion(SourceAssertionError::InvalidExpressionCache {
+                node: condition,
+                cached: Some(wrong),
+                expected,
+            });
+
+            assert_eq!(context.check_source_file(file), Err(error), "{poisoned}");
+            assert_eq!(observable_state(&context, file), cold, "{poisoned}");
+            assert!(
+                context
+                    .store()
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
+            assert!(context.diagnostics().is_empty());
+
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(condition, TypeNodeLinks::default())
+            );
+            context.check_source_file(file).unwrap();
+            assert_eq!(resolved_node_type(&context, condition), expected);
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]
