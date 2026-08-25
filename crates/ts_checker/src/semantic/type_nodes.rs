@@ -125,7 +125,7 @@ impl CanonicalTypeReferenceAliasTarget {
     }
 }
 
-/// Immutable proof for one parser-owned JSDoc import and its CommonJS target.
+/// Immutable proof for one parser-owned `JSDoc` import and its `CommonJS` target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CanonicalJsDocImportTypeTarget {
     local_declaration: NodeRef,
@@ -2320,11 +2320,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .get(&alias)
                 .is_some_and(|alias| !alias.type_parameters.is_empty())
             && recursive_alias.is_none()
-            && !self
+            && self
                 .plan
                 .default_library_mapped_utility_aliases
                 .get(&alias)
-                .is_some_and(|utility| utility.mapped == node)
+                .is_none_or(|utility| utility.mapped != node)
             && !self.is_homomorphic_generic_mapped_alias(alias, mapped)?
         {
             self.validate_record_mapped_alias_plan(alias, mapped)?;
@@ -7774,7 +7774,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let Some(exports) = self
             .store
             .symbol(module)
-            .and_then(|module| module.exports())
+            .and_then(ts_binder::semantic::Symbol::exports)
             .and_then(|exports| self.store.symbol_table(exports))
         else {
             return false;
@@ -7796,16 +7796,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         else {
             return false;
         };
-        let [infer] = infer_arguments.as_slice() else {
+        let [inference] = infer_arguments.as_slice() else {
             return false;
         };
-        let Ok(infer_record) = preflight_node(self.store, self.host, *infer) else {
+        let Ok(inference_record) = preflight_node(self.store, self.host, *inference) else {
             return false;
         };
-        let NodeData::InferTypeNode(inferred) = &infer_record.data else {
+        let NodeData::InferTypeNode(inferred) = &inference_record.data else {
             return false;
         };
-        let inferred_parameter = NodeRef::new(infer.arena, infer.file, inferred.type_parameter);
+        let inferred_parameter =
+            NodeRef::new(inference.arena, inference.file, inferred.type_parameter);
         let Some(inferred_symbol) = self
             .host
             .bound_file(inferred_parameter)
@@ -7814,18 +7815,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         else {
             return false;
         };
-        let Ok(inner_record) = preflight_node(self.store, self.host, when_true) else {
+        let Ok(nested_record) = preflight_node(self.store, self.host, when_true) else {
             return false;
         };
-        let NodeData::ConditionalTypeNode(inner) = &inner_record.data else {
+        let NodeData::ConditionalTypeNode(nested) = &nested_record.data else {
             return false;
         };
-        let inner_check = NodeRef::new(when_true.arena, when_true.file, inner.check_type);
-        let inner_extends = NodeRef::new(when_true.arena, when_true.file, inner.extends_type);
-        let inner_true = NodeRef::new(when_true.arena, when_true.file, inner.true_type);
-        let inner_false = NodeRef::new(when_true.arena, when_true.file, inner.false_type);
+        let nested_check = NodeRef::new(when_true.arena, when_true.file, nested.check_type);
+        let nested_extends = NodeRef::new(when_true.arena, when_true.file, nested.extends_type);
+        let nested_true = NodeRef::new(when_true.arena, when_true.file, nested.true_type);
+        let nested_false = NodeRef::new(when_true.arena, when_true.file, nested.false_type);
         let Some(optional_arguments) = self.prop_types_infer_props_reference(
-            inner_check,
+            nested_check,
             when_true,
             "IsOptional",
             is_optional,
@@ -7836,13 +7837,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let [optional_argument] = optional_arguments.as_slice() else {
             return false;
         };
-        let Ok(inner_extends_record) = preflight_node(self.store, self.host, inner_extends) else {
+        let Ok(nested_extends_record) = preflight_node(self.store, self.host, nested_extends)
+        else {
             return false;
         };
-        let NodeData::LiteralTypeNode(literal) = &inner_extends_record.data else {
+        let NodeData::LiteralTypeNode(literal) = &nested_extends_record.data else {
             return false;
         };
-        let literal = NodeRef::new(inner_extends.arena, inner_extends.file, literal.literal);
+        let literal = NodeRef::new(nested_extends.arena, nested_extends.file, literal.literal);
 
         template_record.kind == SyntaxKind::ConditionalType
             && template_record.parent == Some(mapped.node().node)
@@ -7870,22 +7872,22 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .symbol(is_optional)
                 .is_some_and(|owner| owner.flags() == SymbolFlags::TYPE_ALIAS)
             && self.store.get_parent_of_symbol(is_optional) == Some(module)
-            && infer_record.kind == SyntaxKind::InferType
-            && infer_record.parent == Some(extends.node)
+            && inference_record.kind == SyntaxKind::InferType
+            && inference_record.parent == Some(extends.node)
             && self.store.symbol(inferred_symbol).is_some_and(|owner| {
                 owner.flags() == SymbolFlags::TYPE_PARAMETER && owner.name().as_utf8() == Some("T")
             })
-            && inner_record.kind == SyntaxKind::ConditionalType
-            && inner_record.parent == Some(template.node)
-            && inner_extends_record.kind == SyntaxKind::LiteralType
-            && inner_extends_record.parent == Some(when_true.node)
+            && nested_record.kind == SyntaxKind::ConditionalType
+            && nested_record.parent == Some(template.node)
+            && nested_extends_record.kind == SyntaxKind::LiteralType
+            && nested_extends_record.parent == Some(when_true.node)
             && self
                 .host
                 .node(literal)
                 .is_some_and(|node| node.kind == SyntaxKind::TrueKeyword)
             && self
                 .host
-                .node(inner_true)
+                .node(nested_true)
                 .is_some_and(|node| node.kind == SyntaxKind::NeverKeyword)
             && self
                 .host
@@ -7893,12 +7895,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .is_some_and(|node| node.kind == SyntaxKind::NeverKeyword)
             && self.react_detailed_html_props_parameter_reference(
                 *optional_argument,
-                inner_check,
+                nested_check,
                 "T",
                 inferred_symbol,
             )
             && self.react_detailed_html_props_parameter_reference(
-                inner_false,
+                nested_false,
                 when_true,
                 "K",
                 mapped.type_parameter_symbol(),
@@ -12361,7 +12363,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(self)
     }
 
-    /// Adds one manifest-authenticated CommonJS JSDoc typedef import target.
+    /// Adds one manifest-authenticated `CommonJS` `JSDoc` typedef import target.
     pub(super) fn with_jsdoc_import_type_target(
         mut self,
         target: CanonicalJsDocImportTypeTarget,
@@ -18004,20 +18006,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             };
             instantiated.push(mapped);
         }
-        let result = match self.global_types.as_ref() {
-            Some(global_types) => self.store.expression_union_type_with_global_types(
+        let result = if let Some(global_types) = self.global_types.as_ref() {
+            self.store.expression_union_type_with_global_types(
                 global_types,
                 &instantiated,
                 UnionReduction::Literal,
-            ),
-            None => {
-                let mut prepared = self
-                    .store
-                    .prepare_type_query_types(&[], &[], &[], 1, 0)
-                    .map_err(Self::literal_cache_error)?;
-                self.store
-                    .literal_union_type_prepared(&instantiated, None, &mut prepared)
-            }
+            )
+        } else {
+            let mut prepared = self
+                .store
+                .prepare_type_query_types(&[], &[], &[], 1, 0)
+                .map_err(Self::literal_cache_error)?;
+            self.store
+                .literal_union_type_prepared(&instantiated, None, &mut prepared)
         };
         result.map_err(Self::literal_cache_error)
     }
