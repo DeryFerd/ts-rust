@@ -12890,6 +12890,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         PlannedIdentifierReadKind::Variable | PlannedIdentifierReadKind::Unresolved
                     ) => {}
             PlannedExpressionKind::Boolean(_) => {}
+            PlannedExpressionKind::Call(_)
+                if !contextual && self.is_global_math_random_condition(condition_target) => {}
             _ => {
                 return Err(self.unsupported(
                     condition_target.node,
@@ -13024,6 +13026,67 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         ))
     }
 
+    fn is_global_math_random_condition(&self, expression: &PlannedExpression) -> bool {
+        let Some((store, _)) = self.semantic else {
+            return false;
+        };
+        let PlannedExpressionKind::Call(call) = &expression.kind else {
+            return false;
+        };
+        let PlannedExpressionKind::Property(property) = &call.callee.kind else {
+            return false;
+        };
+        let PlannedExpressionKind::Identifier(receiver) = &property.receiver.kind else {
+            return false;
+        };
+        let Some(call_record) = self.arena.get(call.node.node) else {
+            return false;
+        };
+        let NodeData::CallExpression(call_data) = &call_record.data else {
+            return false;
+        };
+        let Some(property_record) = self.arena.get(call.callee.node.node) else {
+            return false;
+        };
+        let NodeData::PropertyAccessExpression(access) = &property_record.data else {
+            return false;
+        };
+        let Some(NodeData::Identifier(receiver_name)) =
+            self.arena.get(access.expression).map(|record| &record.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::Identifier(method_name)) =
+            self.arena.get(access.name).map(|record| &record.data)
+        else {
+            return false;
+        };
+        let Some(symbol) = store.symbol(receiver.value_symbol) else {
+            return false;
+        };
+        let allowed =
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT;
+        let global = store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Math"))
+            .and_then(|symbol| store.get_merged_symbol(symbol));
+        call_record.kind == SyntaxKind::CallExpression
+            && call_data.expression == call.callee.node.node
+            && call_data.arguments.nodes.is_empty()
+            && call_data.type_arguments.is_none()
+            && property_record.kind == SyntaxKind::PropertyAccessExpression
+            && access.expression == property.receiver.node.node
+            && receiver.kind == PlannedIdentifierReadKind::Variable
+            && receiver_name.text == "Math"
+            && method_name.text == "random"
+            && symbol
+                .flags()
+                .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::INTERFACE)
+            && symbol.flags().without(allowed) == SymbolFlags::NONE
+            && global == Some(receiver.value_symbol)
+    }
+
     fn conditional_scalar_expectation(
         &self,
         expression: &PlannedExpression,
@@ -13055,6 +13118,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             PlannedExpressionKind::Number { .. } => Some(ConditionalScalarFamily::Number),
             PlannedExpressionKind::BigInt { .. } => Some(ConditionalScalarFamily::BigInt),
             PlannedExpressionKind::Boolean(_) => Some(ConditionalScalarFamily::Boolean),
+            PlannedExpressionKind::Call(_) if self.is_global_math_random_condition(expression) => {
+                return Ok(Some(ConditionalScalarExpectation::Dynamic));
+            }
             PlannedExpressionKind::Parenthesized(inner) => {
                 return self.conditional_scalar_expectation(inner);
             }
@@ -14886,6 +14952,7 @@ fn preflight_uncached_conditional_operand_links(
                 .map_err(source_object_execution_error)?;
             return Ok(());
         }
+        PlannedExpressionKind::Call(_) => return Ok(()),
         _ => {}
     }
     if store
@@ -16905,29 +16972,34 @@ fn check_expression_type(
             {
                 return Err(SourceCheckError::Conditional(conditional.node));
             }
-            let condition =
-                if conditional.condition_expectation == ConditionalScalarExpectation::Error {
-                    check_expression_type(
-                        store,
-                        host,
-                        global_types,
-                        source,
-                        options,
-                        session,
-                        diagnostics,
-                        current_flow_types,
-                        preflighted_type_import_value_uses,
-                        &conditional.condition,
-                        None,
-                        deferred,
-                    )?
-                } else {
-                    check_uncached_conditional_scalar(
-                        store,
-                        current_flow_types,
-                        &conditional.condition,
-                    )?
-                };
+            let condition = if conditional.condition_expectation
+                == ConditionalScalarExpectation::Error
+                || conditional.condition_expectation == ConditionalScalarExpectation::Dynamic
+                    && matches!(
+                        conditional.condition.unparenthesized().kind,
+                        PlannedExpressionKind::Call(_)
+                    ) {
+                check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    current_flow_types,
+                    preflighted_type_import_value_uses,
+                    &conditional.condition,
+                    None,
+                    deferred,
+                )?
+            } else {
+                check_uncached_conditional_scalar(
+                    store,
+                    current_flow_types,
+                    &conditional.condition,
+                )?
+            };
             validate_conditional_scalar_expectation(
                 store,
                 &conditional.condition,
@@ -34335,6 +34407,135 @@ mod tests {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep merged Math ownership and intrinsic JSX state together.
+    fn merged_math_globals_drive_intrinsic_union_jsx_tags_cold_and_warm() {
+        let library = parsed("interface Math { random(): number; } declare var Math: Math;");
+        let augmentation = parsed(concat!(
+            "interface Math {} ",
+            "declare namespace JSX { ",
+            "interface Element {} ",
+            "interface ElementChildrenAttribute { children: any; } ",
+            "interface IntrinsicElements { ",
+            "h1: { className: string; key: string; children: string }; ",
+            "h2: { className: string; key: string; children: string }; ",
+            "} }",
+        ));
+        let source = ts_parser::parse_jsx_source_file(concat!(
+            "export {}; ",
+            "const El = Math.random() ? 'h1' : 'h2'; ",
+            "export const tag = <El className='ok' key='key'>{'Title'}</El>;",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(9_478);
+        let augmentation_file = FileId::new(9_479);
+        let file = FileId::new(9_480);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, declaration, default_library, module_state) in [
+            (
+                &library,
+                library_file,
+                true,
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                &augmentation,
+                augmentation_file,
+                true,
+                false,
+                CanonicalModuleState::Script,
+            ),
+            (&source, file, false, false, CanonicalModuleState::External),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/project/math-jsx-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        default_library,
+                        module_state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (library_file, &library.arena),
+                (augmentation_file, &augmentation.arena),
+                (file, &source.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let math = context
+            .store()
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| context.store().symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Math"))
+            .and_then(|symbol| context.store().get_merged_symbol(symbol))
+            .unwrap();
+        assert_eq!(
+            context.store().symbol(math).unwrap().flags(),
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let reads = identifier_expressions(&source, file, "Math");
+        let [read] = reads.as_slice() else {
+            panic!("the upstream-shaped condition contains one Math value read")
+        };
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(*read)
+                .and_then(|links| links.resolved_symbol),
+            Some(math),
+        );
+        let element_type = variable_value_type(&context, &source, file, "El");
+        assert_eq!(
+            context.type_to_string(element_type).unwrap(),
+            "\"h1\" | \"h2\""
+        );
+        let call = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(call)
+                .and_then(|links| links.resolved_type),
+            Some(context.store().intrinsic_bootstrap().unwrap().number_type),
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

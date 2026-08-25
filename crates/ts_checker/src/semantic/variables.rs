@@ -1606,7 +1606,15 @@ fn variable_binding_flags(flags: SymbolFlags) -> Option<SymbolFlags> {
     {
         return None;
     }
-    let allowed = binding | SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE;
+    let merged = flags.intersects(SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE);
+    let allowed = binding
+        | SymbolFlags::INTERFACE
+        | SymbolFlags::NAMESPACE_MODULE
+        | if merged {
+            SymbolFlags::TRANSIENT
+        } else {
+            SymbolFlags::NONE
+        };
     (flags.without(allowed) == SymbolFlags::NONE).then_some(binding)
 }
 
@@ -2447,6 +2455,39 @@ mod tests {
             ))
         );
         assert_eq!(fixture.store.checker_link_allocated_lengths(), poisoned);
+    }
+
+    #[test]
+    fn transient_variable_symbols_require_an_authenticated_merge_facet() {
+        assert_eq!(
+            variable_binding_flags(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    | SymbolFlags::INTERFACE
+                    | SymbolFlags::TRANSIENT,
+            ),
+            Some(SymbolFlags::FUNCTION_SCOPED_VARIABLE),
+        );
+        assert_eq!(
+            variable_binding_flags(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    | SymbolFlags::NAMESPACE_MODULE
+                    | SymbolFlags::TRANSIENT,
+            ),
+            Some(SymbolFlags::FUNCTION_SCOPED_VARIABLE),
+        );
+        assert_eq!(
+            variable_binding_flags(SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT),
+            None,
+        );
+        assert_eq!(
+            variable_binding_flags(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    | SymbolFlags::INTERFACE
+                    | SymbolFlags::FUNCTION
+                    | SymbolFlags::TRANSIENT,
+            ),
+            None,
+        );
     }
 
     #[test]
