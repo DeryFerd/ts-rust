@@ -17359,6 +17359,24 @@ fn check_expression_type(
                 None,
                 deferred,
             )?;
+            let left_recovery = left.primitive_binary_recovery.or_else(|| {
+                shorthand_default_arrow_any_operand_recovery(
+                    store,
+                    host,
+                    binary,
+                    &binary.left,
+                    left.result,
+                )
+            });
+            let right_recovery = right.primitive_binary_recovery.or_else(|| {
+                shorthand_default_arrow_any_operand_recovery(
+                    store,
+                    host,
+                    binary,
+                    &binary.right,
+                    right.result,
+                )
+            });
             let resolution = check_primitive_binary(
                 store,
                 PrimitiveBinaryRequest {
@@ -17368,8 +17386,8 @@ fn check_expression_type(
                     right: binary.right.node,
                     left_type: left.result,
                     right_type: right.result,
-                    left_recovery: left.primitive_binary_recovery,
-                    right_recovery: right.primitive_binary_recovery,
+                    left_recovery,
+                    right_recovery,
                     bigint_exponentiation_target: PrimitiveBigIntExponentiationTarget::Unknown,
                 },
             )
@@ -18954,6 +18972,102 @@ fn primitive_binary_check_error(
         PrimitiveBinaryError::Relation(error) => (*error).into(),
         PrimitiveBinaryError::Display(error) => (*error).into(),
     }
+}
+
+/// Authenticates explicit-any operands in one shorthand default-arrow addition.
+fn shorthand_default_arrow_any_operand_recovery(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    binary: &PrimitiveBinaryPlan,
+    operand: &PlannedExpression,
+    type_: TypeId,
+) -> Option<PrimitiveBinaryRecovery> {
+    let any = store.intrinsic_bootstrap()?.any_type;
+    let PlannedExpressionKind::Identifier(read) = &operand.kind else {
+        return None;
+    };
+    if binary.operator != SyntaxKind::PlusToken
+        || type_ != any
+        || read.kind != PlannedIdentifierReadKind::Variable
+    {
+        return None;
+    }
+
+    let binary_record = host.node(binary.node)?;
+    let arrow = NodeRef::new(binary.node.arena, binary.node.file, binary_record.parent?);
+    let arrow_record = host.node(arrow)?;
+    let NodeData::ArrowFunction(arrow_data) = &arrow_record.data else {
+        return None;
+    };
+    if arrow_record.kind != SyntaxKind::ArrowFunction || arrow_data.body != binary.node.node {
+        return None;
+    }
+
+    let property = NodeRef::new(arrow.arena, arrow.file, arrow_record.parent?);
+    let property_record = host.node(property)?;
+    let NodeData::ShorthandPropertyAssignment(property_data) = &property_record.data else {
+        return None;
+    };
+    let object = NodeRef::new(property.arena, property.file, property_record.parent?);
+    let shorthand = super::object_members::plan_object_assignment_shorthand(store, host, object)
+        .ok()
+        .flatten()?;
+    if property_record.kind != SyntaxKind::ShorthandPropertyAssignment
+        || property_data.object_assignment_initializer != Some(arrow.node)
+        || shorthand.declaration != property
+        || shorthand.initializer != arrow
+    {
+        return None;
+    }
+
+    let parameter_symbol = store.symbol(read.value_symbol)?;
+    let [parameter] = parameter_symbol.declarations()? else {
+        return None;
+    };
+    let parameter = *parameter;
+    let parameter_record = host.node(parameter)?;
+    let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return None;
+    };
+    let annotation = NodeRef::new(parameter.arena, parameter.file, parameter_data.type_?);
+    let annotation_record = host.node(annotation)?;
+    let bound = host.bound_file(arrow)?;
+    let owner = bound.symbol(arrow)?;
+    let callable = store.source_callable_type_for_owner(owner)?;
+    let provenance = store.source_callable_provenance(callable)?;
+    let signature = store.signature(provenance.signature)?;
+    let parameter_index = signature
+        .parameters()
+        .iter()
+        .position(|symbol| *symbol == read.value_symbol)?;
+    if parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.parent != Some(arrow.node)
+        || !arrow_data.parameters.nodes.contains(&parameter.node)
+        || annotation_record.kind != SyntaxKind::AnyKeyword
+        || annotation_record.parent != Some(parameter.node)
+        || bound.symbol(parameter) != Some(read.value_symbol)
+        || bound.container(operand.node) != Some(arrow)
+        || store.get_merged_symbol(read.value_symbol) != Some(read.value_symbol)
+        || parameter_symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || parameter_symbol.check_flags() != CheckFlags::NONE
+        || parameter_symbol.value_declaration() != Some(parameter)
+        || provenance.family != SourceCallableFamily::ArrowFunction
+        || provenance.declaration != arrow
+        || provenance.owner_symbol != owner
+        || store
+            .callable_signature_parameter_types(provenance.signature)
+            .and_then(|parameters| parameters.get(parameter_index))
+            != Some(&any)
+        || store.value_symbol_links(read.value_symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(any),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return None;
+    }
+
+    Some(PrimitiveBinaryRecovery::Any)
 }
 
 fn validate_deferred_assertions(
