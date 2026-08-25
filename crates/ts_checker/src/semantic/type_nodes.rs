@@ -1640,6 +1640,103 @@ fn cached_alias_parameter_symbols(
     .map(Some)
 }
 
+/// Authenticates the bounded display fallback for a cached recursive arrow query.
+pub(super) fn authenticated_pending_recursive_arrow_display(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+) -> bool {
+    if source_callables::validate_stored_source_callable(store, type_)
+        != source_callables::StoredSourceCallableValidation::Pending
+    {
+        return false;
+    }
+    let Some(provenance) = store.source_callable_provenance(type_) else {
+        return false;
+    };
+    let arrow = provenance.declaration;
+    let Some(record) = host.node(arrow) else {
+        return false;
+    };
+    let NodeData::ArrowFunction(function) = &record.data else {
+        return false;
+    };
+    let Some(declaration) = record
+        .parent
+        .map(|parent| NodeRef::new(arrow.arena, arrow.file, parent))
+    else {
+        return false;
+    };
+    let Some(NodeData::VariableDeclaration(variable)) =
+        host.node(declaration).map(|record| &record.data)
+    else {
+        return false;
+    };
+    let Some(variable_symbol) = host
+        .bound_file(declaration)
+        .and_then(|bound| bound.symbol(declaration))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let body = NodeRef::new(arrow.arena, arrow.file, function.body);
+    let Some(NodeData::SatisfiesExpression(satisfaction)) =
+        host.node(body).map(|record| &record.data)
+    else {
+        return false;
+    };
+    let query = NodeRef::new(body.arena, body.file, satisfaction.type_);
+    let Some(NodeData::TypeQueryNode(type_query)) = host.node(query).map(|record| &record.data)
+    else {
+        return false;
+    };
+    let name = NodeRef::new(query.arena, query.file, type_query.expr_name);
+    let Some(NodeData::Identifier(identifier)) = host.node(name).map(|record| &record.data) else {
+        return false;
+    };
+    let Some(owner) = store.symbol(variable_symbol) else {
+        return false;
+    };
+    if provenance.family != SourceCallableFamily::ArrowFunction
+        || provenance.owner_symbol == variable_symbol
+        || variable.initializer != Some(arrow.node)
+        || variable.type_.is_some()
+        || owner.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(identifier.text.as_str())
+        || owner.declarations() != Some(&[declaration])
+        || owner.value_declaration() != Some(declaration)
+        || store.type_node_links(query)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(type_),
+                ..TypeNodeLinks::default()
+            })
+        || store.symbol_node_links(name)
+            != Some(&SymbolNodeLinks {
+                resolved_symbol: Some(variable_symbol),
+            })
+        || store
+            .value_symbol_links(variable_symbol)
+            .is_some_and(|links| {
+                links != &super::ValueSymbolLinks::default()
+                    && links
+                        != &(super::ValueSymbolLinks {
+                            resolved_type: Some(type_),
+                            ..super::ValueSymbolLinks::default()
+                        })
+            })
+    {
+        return false;
+    }
+
+    let aliases = HashMap::new();
+    let planner =
+        TypeQueryPlanner::new(store, host, None, provenance.array_targets, false, &aliases);
+    planner
+        .authenticated_recursive_arrow_type_query(query, declaration, arrow)
+        .is_ok_and(|authenticated| authenticated == Some(type_))
+}
+
 struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     store: &'store CanonicalTypeMapperStore,
     host: &'host DeclaredTypeHost<'arena>,
@@ -26602,12 +26699,12 @@ mod tests {
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalTypeFormatFlags, DeclaredTypeHostError,
         DeclaredTypeLinks, IntrinsicBootstrapOptions, SymbolNodeLinks, TypeAliasLinks,
-        TypeNodeLinks, ValueSymbolLinks,
+        TypeDisplayUnavailable, TypeNodeLinks, ValueSymbolLinks,
         bootstrap::UnionReduction,
         callables::{
             CallableFamily, StoredSingleCallableValidation, validate_stored_single_callable,
         },
-        formatter::type_to_string_with_host_and_flags,
+        formatter::{FunctionTypeDisplayUnavailable, type_to_string_with_host_and_flags},
         global_types::initialize_global_library_types,
         links::{ResolvedSignatureState, SignatureLinks},
         production::GlobalMergeCompletion,
@@ -42503,6 +42600,24 @@ mod tests {
                 .resolved_return_type()
                 .is_none()
         );
+        {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            assert_eq!(
+                type_to_string_with_host_and_flags(
+                    &fixture.store,
+                    &host,
+                    expected,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                ),
+                Err(TypeDisplayUnavailable::FunctionType {
+                    type_id: expected,
+                    reason: FunctionTypeDisplayUnavailable::PendingSignature,
+                }),
+            );
+        }
 
         let before = store_state(&fixture.store);
         {
@@ -42547,6 +42662,23 @@ mod tests {
                 .resolved_return_type()
                 .is_none()
         );
+        let display_state = store_state(&fixture.store);
+        {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            assert_eq!(
+                type_to_string_with_host_and_flags(
+                    &fixture.store,
+                    &host,
+                    expected,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                ),
+                Ok("() => any".to_owned()),
+            );
+        }
+        assert_eq!(store_state(&fixture.store), display_state);
 
         let warm = store_state(&fixture.store);
         assert_eq!(
@@ -42570,6 +42702,25 @@ mod tests {
                 TypeNodeUnavailable::InvalidTypeReference(query),
             )),
         );
+        assert_eq!(store_state(&fixture.store), poisoned);
+        {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            assert_eq!(
+                type_to_string_with_host_and_flags(
+                    &fixture.store,
+                    &host,
+                    expected,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                ),
+                Err(TypeDisplayUnavailable::FunctionType {
+                    type_id: expected,
+                    reason: FunctionTypeDisplayUnavailable::PendingSignature,
+                }),
+            );
+        }
         assert_eq!(store_state(&fixture.store), poisoned);
         assert!(diagnostics.is_empty());
     }

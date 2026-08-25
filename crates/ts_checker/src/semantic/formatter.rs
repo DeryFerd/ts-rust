@@ -51,6 +51,7 @@ use super::{
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
     tuple_types::TupleShape,
+    type_nodes::authenticated_pending_recursive_arrow_display,
     type_records::{
         LiteralTypeData, LiteralValue, TypeCacheState, TypeData, TypeDataKind, TypeRecord,
     },
@@ -1065,6 +1066,13 @@ fn display_object_type(
         .map(|return_type| format!("() => {return_type}"));
         visiting.remove(&type_id);
         return result;
+    }
+
+    if let Some(host) = host
+        && authenticated_pending_recursive_arrow_display(store, host, type_id)
+    {
+        state.add(9);
+        return Ok("() => any".to_owned());
     }
 
     if let Some(projection) = validated_single_callable_display(store, host, global_types, type_id)?
