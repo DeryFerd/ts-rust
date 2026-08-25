@@ -869,6 +869,19 @@ fn evaluate_conditional(
         return Ok(bootstrap.wildcard_type);
     }
 
+    if infer_parameters.is_empty()
+        && let Some(simplified) = trivial_conditional_identity(
+            store,
+            check_type,
+            extends_type,
+            branches,
+            mapped_parameters,
+            type_arguments,
+        )?
+    {
+        return Ok(simplified);
+    }
+
     let mut resolved_check_parameters = HashSet::new();
     for (parameter, argument) in mapped_parameters.iter().zip(type_arguments) {
         if !contains_type_parameter(store, *argument, &HashSet::new())? {
@@ -1067,6 +1080,55 @@ fn evaluate_conditional(
             session,
         )
     }
+}
+
+fn trivial_conditional_identity(
+    store: &CanonicalTypeMapperStore,
+    check_type: TypeId,
+    extends_type: TypeId,
+    branches: ConditionalTypeBranches,
+    mapped_parameters: &[TypeId],
+    type_arguments: &[TypeId],
+) -> Result<Option<TypeId>, ConditionalTypeError> {
+    if mapped_parameters.is_empty() {
+        return Ok(None);
+    }
+
+    let mapped_branch = |branch: TypeId| {
+        mapped_parameters
+            .iter()
+            .position(|parameter| *parameter == branch)
+            .map_or(Ok(branch), |index| {
+                type_arguments.get(index).copied().ok_or(
+                    ConditionalTypeError::InvalidInstantiationArity {
+                        expected: mapped_parameters.len(),
+                        actual: type_arguments.len(),
+                    },
+                )
+            })
+    };
+    let true_type = mapped_branch(branches.true_type)?;
+    let false_type = mapped_branch(branches.false_type)?;
+    if true_type == check_type && false_type == check_type {
+        return Ok(Some(check_type));
+    }
+
+    let never = store
+        .intrinsic_bootstrap()
+        .ok_or(ConditionalTypeError::MissingBootstrap)?
+        .never_type;
+    let extends_flags = type_flags(store, extends_type)?;
+    if true_type == check_type
+        && false_type == never
+        && (check_type == extends_type || extends_flags.intersects(TypeFlags::ANY_OR_UNKNOWN))
+        || true_type == never
+            && false_type == check_type
+            && extends_flags.intersects(TypeFlags::NEVER)
+    {
+        return Ok(Some(check_type));
+    }
+
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)] // Tail recursion retains the current root and active mapper.
@@ -3412,6 +3474,536 @@ mod tests {
                 None,
             ),
             Ok(never)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // All trivial bounds share one root and cache identity proof.
+    fn trivial_distributive_instantiations_preserve_checked_parameter_identity() {
+        #[derive(Clone, Copy)]
+        enum Bound {
+            Never,
+            Checked,
+            Any,
+            Unknown,
+        }
+
+        for (keep_true, bound) in [
+            (false, Bound::Never),
+            (true, Bound::Checked),
+            (true, Bound::Any),
+            (true, Bound::Unknown),
+        ] {
+            let source = if keep_true {
+                "type Select<T, U> = T extends U ? T : never; type Caller<Value> = Value;"
+            } else {
+                "type Select<T, U> = T extends U ? never : T; type Caller<Value> = Value;"
+            };
+            let mut fixture = Fixture::new(source);
+            let node = fixture.conditional();
+            let parameter = fixture.type_parameter("T");
+            let bound_parameter = fixture.type_parameter("U");
+            let checked = fixture.type_parameter("Value");
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let never = bootstrap.never_type;
+            let actual_bound = match bound {
+                Bound::Never => never,
+                Bound::Checked => checked,
+                Bound::Any => bootstrap.any_type,
+                Bound::Unknown => bootstrap.unknown_type,
+            };
+            let branch_types = if keep_true {
+                branches(parameter, never)
+            } else {
+                branches(never, parameter)
+            };
+            let conditional = get_type_from_conditional_type(
+                &mut fixture.store,
+                ConditionalTypeRequest {
+                    node,
+                    check_type: parameter,
+                    extends_type: bound_parameter,
+                    branches: branch_types,
+                    infer_type_parameters: &[],
+                    outer_type_parameters: &[parameter, bound_parameter],
+                    alias: None,
+                },
+                None,
+            )
+            .unwrap();
+            let root = match fixture.store.type_payload(conditional).unwrap().data() {
+                TypeData::Conditional(data) => data.root,
+                _ => panic!("the generic declaration must retain its conditional root"),
+            };
+            let mapper_count = fixture.store.mapper_len();
+            let arguments = [checked, actual_bound];
+
+            assert_eq!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &arguments,
+                        branches: branch_types,
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None,
+                ),
+                Ok(checked),
+            );
+            assert_eq!(fixture.store.mapper_len(), mapper_count);
+            let TypeCacheState::Allocated(cache) = fixture
+                .store
+                .conditional_root(root)
+                .unwrap()
+                .instantiations()
+            else {
+                panic!("the generic conditional root retains its instantiation cache")
+            };
+            assert_eq!(cache.len(), 2);
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.conditional_root_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture
+                    .store
+                    .conditional_root(root)
+                    .unwrap()
+                    .instantiations()
+                    .clone(),
+            );
+            assert_eq!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &arguments,
+                        branches: branch_types,
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None,
+                ),
+                Ok(checked),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.conditional_root_len(),
+                    fixture.store.mapper_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                    fixture
+                        .store
+                        .conditional_root(root)
+                        .unwrap()
+                        .instantiations()
+                        .clone(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One root covers identity, keyof, and deferred cases.
+    fn templated_conditional_identity_simplifies_only_proven_branches() {
+        let mut fixture = Fixture::new(concat!(
+            "type Select<Check, Bound, WhenTrue, WhenFalse> = ",
+            "Check extends Bound ? WhenTrue : WhenFalse; ",
+            "type Caller<Value> = Value;",
+        ));
+        let node = fixture.conditional();
+        let check = fixture.type_parameter("Check");
+        let bound = fixture.type_parameter("Bound");
+        let when_true = fixture.type_parameter("WhenTrue");
+        let when_false = fixture.type_parameter("WhenFalse");
+        let checked = fixture.type_parameter("Value");
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (never, string, number) = (
+            bootstrap.never_type,
+            bootstrap.string_type,
+            bootstrap.number_type,
+        );
+        let keys = fixture
+            .store
+            .alloc_index_type(checked, IndexFlags::NONE)
+            .unwrap();
+        let branch_types = branches(when_true, when_false);
+        let parameters = [check, bound, when_true, when_false];
+        let conditional = get_type_from_conditional_type(
+            &mut fixture.store,
+            ConditionalTypeRequest {
+                node,
+                check_type: check,
+                extends_type: bound,
+                branches: branch_types,
+                infer_type_parameters: &[],
+                outer_type_parameters: &parameters,
+                alias: None,
+            },
+            None,
+        )
+        .unwrap();
+        let root = match fixture.store.type_payload(conditional).unwrap().data() {
+            TypeData::Conditional(data) => data.root,
+            _ => panic!("the generic declaration must retain its conditional root"),
+        };
+
+        for (arguments, expected) in [
+            ([checked, never, never, checked], checked),
+            ([checked, checked, checked, never], checked),
+            ([checked, string, checked, checked], checked),
+            ([keys, never, never, keys], keys),
+            ([keys, keys, keys, never], keys),
+        ] {
+            assert_eq!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &arguments,
+                        branches: branch_types,
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None,
+                ),
+                Ok(expected),
+            );
+        }
+
+        for arguments in [
+            [checked, string, checked, never],
+            [checked, never, number, number],
+        ] {
+            let deferred = get_conditional_type_instantiation(
+                &mut fixture.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &arguments,
+                    branches: branch_types,
+                    alias: None,
+                    for_constraint: false,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            let TypeData::Conditional(data) = fixture.store.type_payload(deferred).unwrap().data()
+            else {
+                panic!("an unproven distributive conditional must remain deferred")
+            };
+            assert_eq!(data.root, root);
+            assert!(data.resolved_true_type.is_none());
+            assert!(data.resolved_false_type.is_none());
+        }
+
+        assert_eq!(
+            get_conditional_type_instantiation(
+                &mut fixture.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &[never, string, number, number],
+                    branches: branch_types,
+                    alias: None,
+                    for_constraint: false,
+                },
+                None,
+                None,
+            ),
+            Ok(never),
+            "equal non-identity branches must not erase distributive never",
+        );
+    }
+
+    #[test]
+    fn extract_against_any_preserves_the_original_concrete_union() {
+        let mut fixture = Fixture::new("type Extract<T, U> = T extends U ? T : never;");
+        let node = fixture.conditional();
+        let parameter = fixture.type_parameter("T");
+        let bound = fixture.type_parameter("U");
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (string, number, any, never) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.any_type,
+            bootstrap.never_type,
+        );
+        let branch_types = branches(parameter, never);
+        let conditional = get_type_from_conditional_type(
+            &mut fixture.store,
+            ConditionalTypeRequest {
+                node,
+                check_type: parameter,
+                extends_type: bound,
+                branches: branch_types,
+                infer_type_parameters: &[],
+                outer_type_parameters: &[parameter, bound],
+                alias: None,
+            },
+            None,
+        )
+        .unwrap();
+        let union = canonical_anonymous_union(&mut fixture.store, &[number, string]).unwrap();
+
+        assert_eq!(
+            get_conditional_type_instantiation(
+                &mut fixture.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &[union, any],
+                    branches: branch_types,
+                    alias: None,
+                    for_constraint: false,
+                },
+                None,
+                None,
+            ),
+            Ok(union),
+        );
+    }
+
+    #[test]
+    fn trivial_conditional_alias_type_nodes_resolve_to_the_checked_identity() {
+        for (source, alias) in [
+            (
+                concat!(
+                    "type Exclude<T, U> = T extends U ? never : T; ",
+                    "type Result<Value> = Exclude<Value, never>;",
+                ),
+                "Exclude",
+            ),
+            (
+                concat!(
+                    "type Extract<T, U> = T extends U ? T : never; ",
+                    "type Result<Value> = Extract<Value, Value>;",
+                ),
+                "Extract",
+            ),
+            (
+                concat!(
+                    "type Extract<T, U> = T extends U ? T : never; ",
+                    "type Result<Value> = Extract<Value, any>;",
+                ),
+                "Extract",
+            ),
+            (
+                concat!(
+                    "type ExcludeWithDefault<T, U, D = never> = T extends U ? D : T; ",
+                    "type Result<Value> = ExcludeWithDefault<Value, never>;",
+                ),
+                "ExcludeWithDefault",
+            ),
+            (
+                concat!(
+                    "type ExtractWithDefault<T, U, D = never> = T extends U ? T : D; ",
+                    "type Result<Value> = ExtractWithDefault<Value, Value>;",
+                ),
+                "ExtractWithDefault",
+            ),
+            (
+                concat!(
+                    "type Select<Check, Bound, WhenTrue, WhenFalse> = ",
+                    "Check extends Bound ? WhenTrue : WhenFalse; ",
+                    "type Result<Value> = Select<Value, never, never, Value>;",
+                ),
+                "Select",
+            ),
+            (
+                concat!(
+                    "type Select<Check, Bound, WhenTrue, WhenFalse> = ",
+                    "Check extends Bound ? WhenTrue : WhenFalse; ",
+                    "type Result<Value> = Select<Value, Value, Value, never>;",
+                ),
+                "Select",
+            ),
+        ] {
+            let mut fixture = Fixture::new(source);
+            let checked = fixture.type_parameter("Value");
+            assert_eq!(fixture.declared_alias("Result"), checked, "{alias}");
+            let conditional = fixture.declared_alias(alias);
+            let TypeData::Conditional(data) =
+                fixture.store.type_payload(conditional).unwrap().data()
+            else {
+                panic!("{alias} must retain its original deferred declaration")
+            };
+            assert!(data.resolved_true_type.is_none());
+            assert!(data.resolved_false_type.is_none());
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.conditional_root_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(fixture.declared_alias("Result"), checked, "{alias}");
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.conditional_root_len(),
+                    fixture.store.mapper_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn nontrivial_conditional_reference_branches_remain_deferred() {
+        let mut fixture = Fixture::new(concat!(
+            "type OnlyText<Input extends string> = Input; ",
+            "type Select<T, U> = T extends U ? OnlyText<number> : T; ",
+            "type Result<Value> = Select<Value, never>;",
+        ));
+        let checked = fixture.type_parameter("Value");
+        let result = fixture.declared_alias("Result");
+        let TypeData::Conditional(data) = fixture.store.type_payload(result).unwrap().data() else {
+            panic!("an unproven conditional branch must remain deferred")
+        };
+        assert_eq!(data.check_type, checked);
+        assert!(data.resolved_true_type.is_none());
+        assert!(data.resolved_false_type.is_none());
+    }
+
+    #[test]
+    fn trivial_conditional_keyof_instantiations_preserve_index_identity() {
+        for source in [
+            concat!(
+                "type Exclude<T, U> = T extends U ? never : T; ",
+                "type Result<Value> = Exclude<keyof Value, never>;",
+            ),
+            concat!(
+                "type Extract<T, U> = T extends U ? T : never; ",
+                "type Result<Value> = Extract<keyof Value, keyof Value>;",
+            ),
+            concat!(
+                "type Select<Check, Bound, WhenTrue, WhenFalse> = ",
+                "Check extends Bound ? WhenTrue : WhenFalse; ",
+                "type Result<Value> = Select<keyof Value, never, never, keyof Value>;",
+            ),
+        ] {
+            let mut fixture = Fixture::new(source);
+            let checked = fixture.type_parameter("Value");
+            let result = fixture.declared_alias("Result");
+            let TypeData::Index(index) = fixture.store.type_payload(result).unwrap().data() else {
+                panic!("the conditional must preserve the generic keyof identity")
+            };
+            assert_eq!(index.target, checked);
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.conditional_root_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(fixture.declared_alias("Result"), result);
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.conditional_root_len(),
+                    fixture.store.mapper_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn trivial_conditional_instantiation_rejects_invalid_root_cache_state() {
+        let mut fixture = Fixture::new(concat!(
+            "type Exclude<T, U> = T extends U ? never : T; ",
+            "type Caller<Value> = Value;",
+        ));
+        let node = fixture.conditional();
+        let parameter = fixture.type_parameter("T");
+        let bound = fixture.type_parameter("U");
+        let checked = fixture.type_parameter("Value");
+        let never = fixture.store.intrinsic_bootstrap().unwrap().never_type;
+        let branch_types = branches(never, parameter);
+        let conditional = get_type_from_conditional_type(
+            &mut fixture.store,
+            ConditionalTypeRequest {
+                node,
+                check_type: parameter,
+                extends_type: bound,
+                branches: branch_types,
+                infer_type_parameters: &[],
+                outer_type_parameters: &[parameter, bound],
+                alias: None,
+            },
+            None,
+        )
+        .unwrap();
+        let root = match fixture.store.type_payload(conditional).unwrap().data() {
+            TypeData::Conditional(data) => data.root,
+            _ => panic!("the generic declaration must retain its conditional root"),
+        };
+        let valid_cache = fixture
+            .store
+            .conditional_root(root)
+            .unwrap()
+            .instantiations()
+            .clone();
+        assert!(
+            fixture
+                .store
+                .set_conditional_root_instantiations(root, TypeCacheState::Unallocated,)
+        );
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.conditional_root_len(),
+            fixture.store.mapper_len(),
+        );
+
+        assert_eq!(
+            get_conditional_type_instantiation(
+                &mut fixture.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &[checked, never],
+                    branches: branch_types,
+                    alias: None,
+                    for_constraint: false,
+                },
+                None,
+                None,
+            ),
+            Err(ConditionalTypeError::InvalidInstantiationCache(root)),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.conditional_root_len(),
+                fixture.store.mapper_len(),
+            ),
+            before,
+        );
+        assert!(
+            fixture
+                .store
+                .set_conditional_root_instantiations(root, valid_cache)
+        );
+        assert_eq!(
+            get_conditional_type_instantiation(
+                &mut fixture.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &[checked, never],
+                    branches: branch_types,
+                    alias: None,
+                    for_constraint: false,
+                },
+                None,
+                None,
+            ),
+            Ok(checked),
         );
     }
 

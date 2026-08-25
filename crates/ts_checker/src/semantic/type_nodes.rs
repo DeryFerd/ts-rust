@@ -19694,6 +19694,45 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         })
     }
 
+    fn deferred_conditional_has_trivial_branches(
+        &self,
+        conditional: &PlannedConditionalType,
+        check_type: TypeId,
+        extends_type: TypeId,
+        plan: &TypeQueryPlan,
+    ) -> bool {
+        let (Some(check_flags), Some(extends_flags)) = (
+            self.store.type_payload(check_type).map(TypeRecord::flags),
+            self.store.type_payload(extends_type).map(TypeRecord::flags),
+        ) else {
+            return false;
+        };
+        conditional.infer_parameters.is_empty()
+            && check_flags.intersects(
+                TypeFlags::TYPE_PARAMETER
+                    | TypeFlags::INDEX
+                    | TypeFlags::INDEXED_ACCESS
+                    | TypeFlags::CONDITIONAL
+                    | TypeFlags::SUBSTITUTION,
+            )
+            && (check_type == extends_type
+                || extends_flags.intersects(TypeFlags::NEVER | TypeFlags::ANY | TypeFlags::UNKNOWN))
+            && [conditional.true_type, conditional.false_type]
+                .into_iter()
+                .all(|branch| match self.store.source_node_kind(branch) {
+                    Some(SyntaxKind::NeverKeyword) => true,
+                    Some(SyntaxKind::TypeReference) => {
+                        plan.references.get(&branch).is_some_and(|reference| {
+                            reference.type_arguments.is_empty()
+                                && reference.import_alias.is_none()
+                                && reference.arity == PlannedTypeReferenceArity::Valid
+                                && conditional.outer_parameters.contains(&reference.symbol)
+                        })
+                    }
+                    _ => false,
+                })
+    }
+
     fn resolve_conditional_branches(
         &mut self,
         conditional: &PlannedConditionalType,
@@ -21895,13 +21934,24 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     &type_arguments,
                 ),
             ) {
-                (Ok(check_type), Ok(extends_type)) => self.conditional_branch_demand(
-                    metadata.type_node,
-                    check_type,
-                    extends_type,
-                    !conditional.infer_parameters.is_empty(),
-                    distributive,
-                )?,
+                (Ok(check_type), Ok(extends_type)) => {
+                    if self.deferred_conditional_has_trivial_branches(
+                        &conditional,
+                        check_type,
+                        extends_type,
+                        plan,
+                    ) {
+                        ConditionalBranchDemand::Both
+                    } else {
+                        self.conditional_branch_demand(
+                            metadata.type_node,
+                            check_type,
+                            extends_type,
+                            !conditional.infer_parameters.is_empty(),
+                            distributive,
+                        )?
+                    }
+                }
                 _ => ConditionalBranchDemand::Both,
             };
             let branches =
