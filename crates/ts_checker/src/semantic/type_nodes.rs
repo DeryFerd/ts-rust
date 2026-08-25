@@ -12858,18 +12858,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 let NodeData::InterfaceDeclaration(interface) = &record.data else {
                     return None;
                 };
-                Some((*declaration, interface))
+                interface
+                    .heritage_clauses
+                    .as_ref()
+                    .map(|clauses| (*declaration, clauses))
             })
         });
-        let Some((declaration, interface)) = interfaces.next() else {
+        let Some((declaration, clauses)) = interfaces.next() else {
             return false;
         };
         if interfaces.next().is_some() {
             return false;
         }
-        let Some(clauses) = interface.heritage_clauses.as_ref() else {
-            return false;
-        };
         let Ok(heritage) = super::interface_heritage::plan_direct_interface_heritage(
             self.store,
             self.host,
@@ -22829,6 +22829,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     return false;
                 }
                 if let NodeData::InterfaceDeclaration(data) = &record.data
+                    && data.heritage_clauses.is_some()
                     && interface.replace((declaration, data)).is_some()
                 {
                     return false;
@@ -35986,7 +35987,15 @@ mod tests {
             "interface HTMLTableDataCellElement extends HTMLTableCellElement { ",
             "addEventListener<Value extends string>(type: Value): void; } ",
             "interface HTMLTableHeaderCellElement extends HTMLTableCellElement { ",
-            "addEventListener<Value extends string>(type: Value): void; }",
+            "addEventListener<Value extends string>(type: Value): void; } ",
+            "interface HTMLFormElement extends HTMLElement { ",
+            "addEventListener<Value extends string>(type: Value): void; } ",
+            "interface HTMLFormElement { [name: string]: unknown; } ",
+            "declare var HTMLFormElement: unknown; ",
+            "interface HTMLSelectElement extends HTMLElement { ",
+            "addEventListener<Value extends string>(type: Value): void; } ",
+            "interface HTMLSelectElement { [index: number]: unknown; } ",
+            "declare var HTMLSelectElement: unknown;",
         ));
         let react = parse_source_file(concat!(
             "declare module 'react' { export = React; namespace React { ",
@@ -35998,6 +36007,8 @@ mod tests {
             "interface VideoHTMLAttributes<T> extends MediaHTMLAttributes<T> {} ",
             "interface TdHTMLAttributes<T> extends HTMLAttributes<T> {} ",
             "interface ThHTMLAttributes<T> extends HTMLAttributes<T> {} ",
+            "interface FormHTMLAttributes<T> extends HTMLAttributes<T> {} ",
+            "interface SelectHTMLAttributes<T> extends HTMLAttributes<T> {} ",
             "interface ClassAttributes<T> {} type ReactNode = unknown; ",
             "type DOMFactory<P, T> = ",
             "(props?: ClassAttributes<T> & P | null, ...children: ReactNode[]) => unknown; ",
@@ -36010,6 +36021,8 @@ mod tests {
             "video: DetailedHTMLFactory<VideoHTMLAttributes<HTMLVideoElement>, HTMLVideoElement>; ",
             "td: DetailedHTMLFactory<TdHTMLAttributes<HTMLTableDataCellElement>, HTMLTableDataCellElement>; ",
             "th: DetailedHTMLFactory<ThHTMLAttributes<HTMLTableHeaderCellElement>, HTMLTableHeaderCellElement>; ",
+            "form: DetailedHTMLFactory<FormHTMLAttributes<HTMLFormElement>, HTMLFormElement>; ",
+            "select: DetailedHTMLFactory<SelectHTMLAttributes<HTMLSelectElement>, HTMLSelectElement>; ",
             "} } }",
         ));
         let (mut context, library_file, react_file) =
@@ -36062,6 +36075,8 @@ mod tests {
             ("video", "HTMLVideoElement"),
             ("td", "HTMLTableDataCellElement"),
             ("th", "HTMLTableHeaderCellElement"),
+            ("form", "HTMLFormElement"),
+            ("select", "HTMLSelectElement"),
         ] {
             let annotation = react_dom_property_annotation(&react, react_file, property);
             let actual = context.get_type_from_type_node(annotation).unwrap();
@@ -36077,6 +36092,31 @@ mod tests {
                 .unwrap();
             let factory = validate_direct_generic_reference(context.store(), actual).unwrap();
             assert_eq!(factory.type_arguments[1], element_type);
+            if matches!(property, "form" | "select") {
+                assert_eq!(
+                    context
+                        .store()
+                        .symbol(element_symbol)
+                        .and_then(ts_binder::semantic::Symbol::declarations)
+                        .unwrap()
+                        .iter()
+                        .filter(|declaration| {
+                            host.node(**declaration).is_some_and(|record| {
+                                record.kind == SyntaxKind::InterfaceDeclaration
+                            })
+                        })
+                        .count(),
+                    2,
+                );
+                let TypeData::Interface(interface) =
+                    context.store().type_payload(element_type).unwrap().data()
+                else {
+                    panic!("reopened DOM declarations must retain their interface identity")
+                };
+                assert!(!interface.base_types_resolved);
+                assert!(!interface.declared_members_resolved);
+                assert!(interface.resolved_base_types.is_none());
+            }
             assert_eq!(
                 validate_direct_generic_reference(context.store(), factory.type_arguments[0])
                     .unwrap()
