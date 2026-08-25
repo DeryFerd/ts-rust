@@ -13256,7 +13256,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
         let root_dom_interface = matches!(
             identifier.text.as_str(),
-            "Document" | "Element" | "HTMLElement" | "SVGElement"
+            "Document" | "Element" | "Event" | "EventTarget" | "HTMLElement" | "SVGElement"
         );
         let intrinsic_element = (identifier.text.starts_with("HTML")
             || identifier.text.starts_with("SVG"))
@@ -37695,7 +37695,13 @@ mod tests {
             "interface SVGElement extends Element, DomExtra, DomMore {} ",
             "declare var SVGElement: unknown; ",
             "interface Document extends DomRoot, DomExtra, DomMore { self: this; } ",
-            "declare var Document: unknown;",
+            "declare var Document: unknown; ",
+            "interface Event { stopPropagation(): void; } ",
+            "declare var Event: unknown; ",
+            "interface EventTarget { ",
+            "addEventListener(type: string, callback: Event | null, options?: boolean): void; ",
+            "dispatchEvent(event: Event): boolean; ",
+            "} declare var EventTarget: unknown;",
         ));
         let source = parse_source_file(concat!(
             "interface Box<Value> {} ",
@@ -37703,7 +37709,9 @@ mod tests {
             "type Html = Box<HTMLElement>; ",
             "type Svg = Box<SVGElement>; ",
             "type DomDocument = Box<Document>; ",
-            "interface AbstractView { document: Document; }",
+            "type NativeEvent = Box<Event>; ",
+            "type EventReceiver = Box<EventTarget>; ",
+            "interface AbstractView { document: Document; event: Event; target: EventTarget; }",
         ));
 
         for is_default_library in [false, true] {
@@ -37715,6 +37723,8 @@ mod tests {
                 ("Html", "HTMLElement"),
                 ("Svg", "SVGElement"),
                 ("DomDocument", "Document"),
+                ("NativeEvent", "Event"),
+                ("EventReceiver", "EventTarget"),
             ]
             .map(|(alias, element)| {
                 let symbols = context.store().symbol_table(globals).unwrap();
@@ -37730,6 +37740,23 @@ mod tests {
                 assert_eq!(store_state(context.store()), before);
                 continue;
             }
+
+            let native_methods = [
+                ("Event", "stopPropagation"),
+                ("EventTarget", "addEventListener"),
+                ("EventTarget", "dispatchEvent"),
+            ]
+            .map(|(owner, name)| {
+                context
+                    .store()
+                    .symbol_table(globals)
+                    .and_then(|globals| globals.get_source(owner))
+                    .and_then(|owner| context.store().symbol(owner))
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|members| context.store().symbol_table(members))
+                    .and_then(|members| members.get_source(name))
+                    .unwrap()
+            });
 
             let mut resolved = Vec::new();
             for (alias, element) in aliases {
@@ -37757,27 +37784,43 @@ mod tests {
                 .and_then(|symbols| symbols.get_source("AbstractView"))
                 .unwrap();
             context.get_declared_type_of_symbol(view).unwrap();
-            let document = context
-                .store()
-                .symbol_table(globals)
-                .and_then(|symbols| symbols.get_source("Document"))
-                .and_then(|symbol| context.store().declared_type_links(symbol))
-                .and_then(|links| links.declared_type)
-                .unwrap();
-            let property = context
-                .store()
-                .symbol(view)
-                .and_then(ts_binder::semantic::Symbol::members)
-                .and_then(|members| context.store().symbol_table(members))
-                .and_then(|members| members.get_source("document"))
-                .unwrap();
-            assert_eq!(
-                context
+            for (name, root) in [
+                ("document", "Document"),
+                ("event", "Event"),
+                ("target", "EventTarget"),
+            ] {
+                let expected = context
                     .store()
-                    .value_symbol_links(property)
-                    .and_then(|links| links.resolved_type),
-                Some(document),
-            );
+                    .symbol_table(globals)
+                    .and_then(|symbols| symbols.get_source(root))
+                    .and_then(|symbol| context.store().declared_type_links(symbol))
+                    .and_then(|links| links.declared_type)
+                    .unwrap();
+                let property = context
+                    .store()
+                    .symbol(view)
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|members| context.store().symbol_table(members))
+                    .and_then(|members| members.get_source(name))
+                    .unwrap();
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(property)
+                        .and_then(|links| links.resolved_type),
+                    Some(expected),
+                );
+            }
+            assert!(native_methods.iter().all(|method| {
+                context.store().value_symbol_links(*method).is_none()
+                    && context
+                        .store()
+                        .symbol(*method)
+                        .and_then(ts_binder::semantic::Symbol::value_declaration)
+                        .is_some_and(|declaration| {
+                            context.store().signature_links(declaration).is_none()
+                        })
+            }));
 
             let warm = store_state(context.store());
             for (alias, expected) in resolved {
