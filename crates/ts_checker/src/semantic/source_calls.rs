@@ -6663,7 +6663,7 @@ mod tests {
             DeclaredPropertyTypeGraphValidation, validate_resolved_declared_property_type_graph,
         },
         reference_types::validate_direct_generic_reference,
-        source::{PlannedIdentifierRead, PlannedIdentifierReadKind},
+        source::{PlannedIdentifierRead, PlannedIdentifierReadKind, SourceSyntaxRole},
         type_records::{LiteralValue, TypeData},
     };
 
@@ -9193,6 +9193,46 @@ mod tests {
                 warm,
             );
         }
+    }
+
+    #[test]
+    fn array_filter_predicate_arrow_rejects_unproven_mixed_union_comparisons() {
+        let library = array_callback_default_library();
+        let source = parsed(concat!(
+            "declare const values: (boolean | string)[]; ",
+            "const filtered: boolean[] = ",
+            "values.filter((value): value is boolean => value !== false);",
+        ));
+        let library_file = FileId::new(4_936);
+        let source_file = FileId::new(4_937);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+        let operand = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::BinaryExpression(binary) = &record.data else {
+                    return None;
+                };
+                (record.kind == SyntaxKind::BinaryExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    binary.left,
+                ))
+            })
+            .unwrap();
+
+        assert!(matches!(
+            context.check_source_file(source_file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    node,
+                    kind: SyntaxKind::Identifier,
+                    role: SourceSyntaxRole::BinaryOperand,
+                }
+            )) if node == operand
+        ));
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

@@ -167,8 +167,8 @@ use super::{
         SourceCallableFamily, SourceCallableParameterPlan, SourceCallablePlan,
         SourceCallableReturnPlan, StoredSourceCallableValidation,
         materialize_anonymous_source_function_expression, materialize_global_wrapper_method,
-        plan_javascript_duplicate_function_implementation, plan_source_callable,
-        publish_array_filter_predicate_source_callable,
+        plan_callable_type_predicate, plan_javascript_duplicate_function_implementation,
+        plan_source_callable, publish_array_filter_predicate_source_callable,
         publish_contextual_direct_call_source_callable, publish_contextual_source_callable,
         publish_inferred_source_callable_return, publish_jsdoc_contextual_source_callable,
         publish_jsdoc_parameterized_source_callable, source_array_filter_predicate_arrow_is_exact,
@@ -25834,6 +25834,20 @@ fn check_expression_type(
                     publish_expression_type(store, node, boolean)?;
                     left = CheckedExpressionTypes::leaf(boolean, boolean);
                 } else {
+                    if let Some(result) = authenticated_filter_predicate_nullish_comparison(
+                        store,
+                        host,
+                        global_types,
+                        binary,
+                        (node, operator),
+                        (left.result, right.result),
+                        current_flow_types,
+                    )? {
+                        publish_expression_type(store, node, result)?;
+                        left = CheckedExpressionTypes::leaf(result, result);
+                        left_node = node;
+                        continue;
+                    }
                     let left_recovery = left.primitive_binary_recovery.or_else(|| {
                         shorthand_default_arrow_any_operand_recovery(
                             store,
@@ -28182,6 +28196,114 @@ fn primitive_binary_check_error(
         PrimitiveBinaryError::Relation(error) => (*error).into(),
         PrimitiveBinaryError::Display(error) => (*error).into(),
     }
+}
+
+/// Admits only a built-in filter predicate parameter compared with nullish syntax.
+#[allow(clippy::too_many_lines)] // The union, callback owner, predicate, and null operand require one proof.
+fn authenticated_filter_predicate_nullish_comparison(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    binary: &PrimitiveBinaryPlan,
+    step: (NodeRef, SyntaxKind),
+    operands: (TypeId, TypeId),
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let (node, operator) = step;
+    let (left_type, right_type) = operands;
+    let PlannedExpressionKind::Identifier(read) = &binary.left.unparenthesized().kind else {
+        return Ok(None);
+    };
+    if node != binary.node
+        || !binary.prefix.is_empty()
+        || !matches!(
+            operator,
+            SyntaxKind::EqualsEqualsEqualsToken | SyntaxKind::ExclamationEqualsEqualsToken
+        )
+        || read.kind != PlannedIdentifierReadKind::Variable
+        || flow_types.get(&read.value_symbol) != Some(&left_type)
+        || !matches!(
+            &binary.right.unparenthesized().kind,
+            PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined
+        )
+        || !matches!(
+            store.type_payload(left_type).map(TypeRecord::data),
+            Some(TypeData::Union(_))
+        )
+    {
+        return Ok(None);
+    }
+
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return Err(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ));
+    };
+    let expected_nullish = match &binary.right.unparenthesized().kind {
+        PlannedExpressionKind::Null => bootstrap.null_type,
+        PlannedExpressionKind::GlobalUndefined => bootstrap.undefined_type,
+        _ => unreachable!("the nullish operand was authenticated above"),
+    };
+    if right_type != expected_nullish {
+        return Ok(None);
+    }
+
+    let Some(binary_record) = host.node(binary.node) else {
+        return Ok(None);
+    };
+    let Some(arrow) = binary_record
+        .parent
+        .map(|parent| NodeRef::new(binary.node.arena, binary.node.file, parent))
+    else {
+        return Ok(None);
+    };
+    let Some(arrow_record) = host.node(arrow) else {
+        return Ok(None);
+    };
+    let NodeData::ArrowFunction(function) = &arrow_record.data else {
+        return Ok(None);
+    };
+    let Some([parameter]) =
+        (!function.parameters.has_trailing_comma).then_some(function.parameters.nodes.as_slice())
+    else {
+        return Ok(None);
+    };
+    let parameter = NodeRef::new(arrow.arena, arrow.file, *parameter);
+    let Some(bound) = host.bound_file(arrow) else {
+        return Ok(None);
+    };
+    let Some(predicate_node) = function
+        .type_
+        .map(|annotation| NodeRef::new(arrow.arena, arrow.file, annotation))
+    else {
+        return Ok(None);
+    };
+    if arrow_record.kind != SyntaxKind::ArrowFunction
+        || function.body != binary.node.node
+        || bound
+            .symbol(parameter)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(read.value_symbol)
+        || bound.container(binary.left.node) != Some(arrow)
+        || store.source_node_kind(predicate_node) != Some(SyntaxKind::TypePredicate)
+        || !source_array_filter_predicate_arrow_is_exact(store, host, arrow)
+            .map_err(SourcePlanner::callable_plan_error)?
+    {
+        return Ok(None);
+    }
+    let predicate = plan_callable_type_predicate(store, host, predicate_node)
+        .map_err(SourcePlanner::callable_plan_error)?;
+    if predicate.owner != arrow
+        || predicate.kind != TypePredicateKind::Identifier
+        || predicate.parameter_index != 0
+        || predicate.parameter_symbol != read.value_symbol
+        || predicate.narrowed_type.is_none()
+    {
+        return Ok(None);
+    }
+
+    store.validate_union_constituent_with_global_types(global_types, left_type)?;
+    Ok(Some(bootstrap.boolean_type))
 }
 
 /// Authenticates explicit-any operands in one shorthand default-arrow addition.
