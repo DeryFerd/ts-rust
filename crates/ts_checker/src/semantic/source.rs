@@ -7,6 +7,7 @@
 //! exact construction of preceding admitted classes, imported ambient classes,
 //! and declared constructors inside top-level values, assignments, property
 //! receivers, statements, and direct top-level function returns,
+//! parser-recovered empty element accesses around preceding class constructions,
 //! top-level literal enums, empty external-module markers, exact
 //! named ESM reexports,
 //! leading direct named ESM value imports, clause-level type-only named ESM
@@ -878,6 +879,16 @@ struct PlannedVariableRedeclaration {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedRecoveredArrayConstruction {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    type_node: Option<NodeRef>,
+    construction: SourceDefaultNewPlan,
+    accesses: Vec<NodeRef>,
+    call: Option<NodeRef>,
+}
+
+#[derive(Clone, Debug)]
 struct PlannedObjectVariable {
     elements: Vec<PlannedObjectBindingElement>,
     binding: VariableBindingKind,
@@ -1395,6 +1406,7 @@ enum PlannedStatement {
     Variables(Vec<PlannedVariable>),
     LexicalBlock(Box<PlannedTopLevelLexicalBlock>),
     RecoveredAnonymousVariables(Vec<PlannedVariable>),
+    RecoveredArrayConstruction(Box<PlannedRecoveredArrayConstruction>),
     VariableRedeclaration(PlannedVariableRedeclaration),
     ComputedVariable(Box<PlannedComputedVariable>),
     ArrayVariable(Box<PlannedArrayVariable>),
@@ -2863,6 +2875,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         exported,
                     )? {
                         statements.push(PlannedStatement::ClassGrammar(grammar));
+                        continue;
+                    }
+                    if let Some(recovered) = self.plan_recovered_array_construction(
+                        statement,
+                        declaration_list,
+                        exported,
+                    )? {
+                        statements.push(PlannedStatement::RecoveredArrayConstruction(Box::new(
+                            recovered,
+                        )));
                         continue;
                     }
                     match self.plan_variable_statement(statement, declaration_list, exported)? {
@@ -10963,6 +10985,289 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(SourceCheckError::Class(expression));
         }
         Ok(Some(grammar))
+    }
+
+    /// Preserves parser-recovered empty indexes on a preceding local class construction.
+    fn plan_recovered_array_construction(
+        &mut self,
+        statement: NodeRef,
+        declaration_list: NodeId,
+        exported: bool,
+    ) -> Result<Option<PlannedRecoveredArrayConstruction>, SourceCheckError> {
+        if exported {
+            return Ok(None);
+        }
+
+        let list = self.reference(declaration_list);
+        let list_record = self.node(list)?;
+        let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+            return Ok(None);
+        };
+        let [declaration] = declarations.declarations.nodes.as_slice() else {
+            return Ok(None);
+        };
+        if list_record.kind != SyntaxKind::VariableDeclarationList
+            || list_record.flags.0 != 0
+            || list_record.parent != Some(statement.node)
+            || declarations.declarations.has_trailing_comma
+            || declarations.facts != 0
+        {
+            return Ok(None);
+        }
+
+        let declaration = self.reference(*declaration);
+        let declaration_record = self.node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Ok(None);
+        };
+        let Some(initializer) = variable.initializer.map(|node| self.reference(node)) else {
+            return Ok(None);
+        };
+        let name = self.reference(variable.name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(None);
+        };
+        if declaration_record.kind != SyntaxKind::VariableDeclaration
+            || declaration_record.flags.0 != 0
+            || declaration_record.parent != Some(list.node)
+            || variable.exclamation_token.is_some()
+            || variable.local_symbol.is_some()
+            || variable.symbol.is_some()
+            || variable.facts != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || self.node(initializer)?.parent != Some(declaration.node)
+        {
+            return Ok(None);
+        }
+        let name_text = identifier.text.clone();
+        let type_node = variable.type_.map(|node| self.reference(node));
+
+        let (mut access, call) = match &self.node(initializer)?.data {
+            NodeData::CallExpression(call) => {
+                let record = self.node(initializer)?;
+                if record.kind != SyntaxKind::CallExpression
+                    || record.flags.0 != 0
+                    || call.question_dot_token.is_some()
+                    || call.symbol.is_some()
+                    || call.type_arguments.is_some()
+                    || call.facts != 0
+                    || call.arguments.has_trailing_comma
+                    || !call.arguments.nodes.is_empty()
+                {
+                    return Ok(None);
+                }
+                (self.reference(call.expression), Some(initializer))
+            }
+            NodeData::ElementAccessExpression(_) => (initializer, None),
+            _ => return Ok(None),
+        };
+
+        let Some((store, host)) = self.semantic else {
+            return Ok(None);
+        };
+        let error_type = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.error_type)
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        let mut accesses = Vec::new();
+        let mut parent = call.unwrap_or(declaration);
+        loop {
+            let record = self.node(access)?;
+            let NodeData::ElementAccessExpression(element) = &record.data else {
+                break;
+            };
+            let receiver = self.reference(element.expression);
+            let receiver_record = self.node(receiver)?;
+            let missing = self.reference(element.argument_expression);
+            let missing_record = self.node(missing)?;
+            let NodeData::Identifier(identifier) = &missing_record.data else {
+                return Ok(None);
+            };
+            let exact_empty_access = self
+                .arena
+                .source_text()
+                .and_then(|source| {
+                    source.get(
+                        usize::try_from(receiver_record.range.end.get()).ok()?
+                            ..usize::try_from(record.range.end.get()).ok()?,
+                    )
+                })
+                .and_then(|suffix| suffix.trim_start().strip_prefix('['))
+                .and_then(|suffix| suffix.strip_suffix(']'))
+                .is_some_and(|argument| argument.trim().is_empty());
+            if record.kind != SyntaxKind::ElementAccessExpression
+                || record.flags.0 != 0
+                || record.parent != Some(parent.node)
+                || element.flow_node.is_some()
+                || element.question_dot_token.is_some()
+                || element.facts != 0
+                || receiver_record.parent != Some(access.node)
+                || record.range.start != receiver_record.range.start
+                || missing_record.kind != SyntaxKind::Identifier
+                || missing_record.flags.0 != NODE_FLAG_HAS_ERROR
+                || missing_record.parent != Some(access.node)
+                || missing_record.range.start != missing_record.range.end
+                || missing_record.range.start < receiver_record.range.end
+                || missing_record.range.end > record.range.end
+                || !identifier.text.is_empty()
+                || identifier.flow_node.is_some()
+                || !exact_empty_access
+            {
+                return Ok(None);
+            }
+            if store
+                .symbol_node_links(access)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+            {
+                return Err(SourceCheckError::Element(access));
+            }
+            if store
+                .type_node_links(missing)
+                .is_some_and(|links| links != &TypeNodeLinks::default())
+                || store
+                    .symbol_node_links(missing)
+                    .is_some_and(|links| links != &SymbolNodeLinks::default())
+            {
+                return Err(SourceCheckError::Element(missing));
+            }
+            preflight_source_expression_cache(store, access, error_type)?;
+            accesses.push(access);
+            parent = access;
+            access = receiver;
+        }
+        if accesses.is_empty() {
+            return Ok(None);
+        }
+        let new_record = self.node(access)?;
+        let NodeData::NewExpression(new_expression) = &new_record.data else {
+            return Ok(None);
+        };
+        if new_record.kind != SyntaxKind::NewExpression
+            || new_record.flags.0 != 0
+            || new_record.parent != Some(parent.node)
+            || new_expression.arguments.is_some()
+            || new_expression.type_arguments.is_some()
+            || new_expression.facts != 0
+        {
+            return Ok(None);
+        }
+        let construction = plan_direct_default_new(
+            self.arena,
+            self.bound,
+            store,
+            host,
+            &self.prior_classes,
+            &self.value_import_bindings,
+            access,
+            false,
+        )
+        .map_err(|error| Self::new_plan_error(access, error))?;
+        if !self
+            .prior_classes
+            .contains_key(&construction.resolved_symbol())
+            || construction
+                .constructor_accessibility_diagnostic(self.arena, self.bound, store, host)
+                .map_err(|error| Self::new_plan_error(access, error))?
+                .is_some()
+        {
+            return Ok(None);
+        }
+        if let Some(call) = call {
+            let call_record = self.node(call)?;
+            let access_record = self.node(accesses[0])?;
+            if call_record.parent != Some(declaration.node)
+                || call_record.range.start != access_record.range.start
+            {
+                return Ok(None);
+            }
+            if store
+                .signature_links(call)
+                .is_some_and(|links| links != &super::links::SignatureLinks::default())
+            {
+                return Err(SourceCheckError::Call(call));
+            }
+            preflight_source_expression_cache(store, call, error_type)?;
+        }
+
+        if let Some(type_node) = type_node {
+            let mut annotation = type_node;
+            for _ in 0..accesses.len() {
+                let record = self.node(annotation)?;
+                let NodeData::ArrayTypeNode(array) = &record.data else {
+                    return Ok(None);
+                };
+                if record.kind != SyntaxKind::ArrayType || record.flags.0 != 0 {
+                    return Ok(None);
+                }
+                let element = self.reference(array.element_type);
+                if self.node(element)?.parent != Some(annotation.node) {
+                    return Ok(None);
+                }
+                annotation = element;
+            }
+            let record = self.node(annotation)?;
+            let NodeData::TypeReferenceNode(reference) = &record.data else {
+                return Ok(None);
+            };
+            let type_name = self.reference(reference.type_name);
+            let type_name_record = self.node(type_name)?;
+            let NodeData::Identifier(type_identifier) = &type_name_record.data else {
+                return Ok(None);
+            };
+            let constructor_record = self.node(construction.constructor())?;
+            let NodeData::Identifier(constructor_identifier) = &constructor_record.data else {
+                return Err(SourceCheckError::Call(construction.node()));
+            };
+            if self.node(type_node)?.parent != Some(declaration.node)
+                || record.kind != SyntaxKind::TypeReference
+                || record.flags.0 != 0
+                || reference.type_arguments.is_some()
+                || type_name_record.kind != SyntaxKind::Identifier
+                || type_name_record.flags.0 != 0
+                || type_name_record.parent != Some(annotation.node)
+                || type_identifier.flow_node.is_some()
+                || type_identifier.text != constructor_identifier.text
+            {
+                return Ok(None);
+            }
+            self.plan_type_import_annotation_root(type_node)?;
+        }
+
+        let symbol = plan_top_level_variable(
+            self.bound,
+            store,
+            declaration,
+            name,
+            &name_text,
+            VariableBindingKind::Var,
+            false,
+        )
+        .map_err(Self::variable_plan_error)?;
+        if !self.prior_variables.insert(symbol)
+            || !self.readable_variables.insert(symbol)
+            || !self.assignable_mutable_variables.insert(symbol)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(symbol),
+            ));
+        }
+        self.default_news.push(construction.clone());
+
+        Ok(Some(PlannedRecoveredArrayConstruction {
+            declaration,
+            symbol,
+            type_node,
+            construction,
+            accesses,
+            call,
+        }))
     }
 
     fn plan_variable_statement(
@@ -29017,6 +29322,97 @@ pub(super) fn check_source_file(
                     }
                 }
             }
+            PlannedStatement::RecoveredArrayConstruction(variable) => {
+                if store
+                    .symbol(variable.symbol)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    != Some(variable.declaration)
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::InvalidSymbolShape(variable.symbol),
+                    ));
+                }
+                preflight_direct_default_new(store, host, &variable.construction).map_err(
+                    |error| SourcePlanner::new_plan_error(variable.construction.node(), error),
+                )?;
+                let checked = check_direct_default_new(store, host, &variable.construction)
+                    .map_err(|error| {
+                        SourcePlanner::new_plan_error(variable.construction.node(), error)
+                    })?;
+                if store
+                    .symbol_node_links(variable.construction.constructor())
+                    .and_then(|links| links.resolved_symbol)
+                    != Some(variable.construction.resolved_symbol())
+                    || store
+                        .type_node_links(variable.construction.constructor())
+                        .and_then(|links| links.resolved_type)
+                        != Some(checked.value_type)
+                    || store
+                        .signature_links(variable.construction.node())
+                        .and_then(|links| links.resolved_signature.signature())
+                        != Some(checked.signature)
+                    || store
+                        .type_node_links(variable.construction.node())
+                        .and_then(|links| links.resolved_type)
+                        != Some(checked.instance_type)
+                {
+                    return Err(SourceCheckError::Call(variable.construction.node()));
+                }
+                let error_type = store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.error_type)
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?;
+                for access in variable.accesses.iter().rev().copied() {
+                    publish_expression_type(store, access, error_type)?;
+                }
+                if let Some(call) = variable.call {
+                    publish_expression_type(store, call, error_type)?;
+                }
+
+                let declared_type = if let Some(type_node) = variable.type_node {
+                    session.reset_query();
+                    let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+                    let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        &mut annotation_diagnostics,
+                    )?
+                    .get_type_from_type_node(type_node);
+                    merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+                    type_?
+                } else {
+                    error_type
+                };
+                stage_value_type(
+                    store,
+                    &mut staged_value_types,
+                    &mut value_order,
+                    variable.symbol,
+                    declared_type,
+                )?;
+                if top_level_declared_types
+                    .insert(variable.symbol, declared_type)
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::DuplicateStagedValueType(variable.symbol),
+                    ));
+                }
+                if !mutable_variables.insert(variable.symbol)
+                    || current_flow_types
+                        .insert(variable.symbol, declared_type)
+                        .is_some()
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
+                    ));
+                }
+            }
             PlannedStatement::VariableRedeclaration(variable) => {
                 let expected = top_level_declared_types
                     .get(&variable.symbol)
@@ -31965,6 +32361,177 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn recovered_empty_array_constructions_preserve_parser_diagnostics_and_variable_types() {
+        let source = parse_source_file(concat!(
+            "class Z { public x = \"\"; }\n",
+            "var a1: Z[] = [];\n",
+            "var a2 = new Z[];\n",
+            "var a3 = new Z[]();\n",
+            "var a4: Z[] = new Z[];\n",
+            "var a5: Z[] = new Z[]();\n",
+            "var a6: Z[][] = new   Z     [      ]   [  ];\n",
+        ));
+        assert_eq!(
+            source
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1011, 1011, 1011, 1011, 1011, 1011],
+        );
+        let file = FileId::new(8_591);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let owner = global_symbol(&context, "Z");
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let instance = context
+            .get_nongeneric_class_members(owner)
+            .unwrap()
+            .shells()
+            .instance_type();
+        let error_type = context.store().intrinsic_bootstrap().unwrap().error_type;
+        for name in ["a1", "a2", "a3", "a4", "a5", "a6"] {
+            let symbol = variable_symbol(&context, &source, file, name);
+            let resolved = context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .expect("a recovered top-level variable retains its checker value");
+            if matches!(name, "a2" | "a3") {
+                assert_eq!(resolved, error_type, "{name}");
+            } else {
+                assert_eq!(
+                    context
+                        .store()
+                        .type_node_links(variable_type_node(&source, file, name))
+                        .and_then(|links| links.resolved_type),
+                    Some(resolved),
+                    "{name}",
+                );
+            }
+        }
+
+        let mut recovered_accesses = 0;
+        let mut recovered_calls = 0;
+        let mut constructions = 0;
+        for (node, record) in source.arena.iter() {
+            let node = NodeRef::new(source.arena.id(), file, node);
+            match &record.data {
+                NodeData::ElementAccessExpression(access) => {
+                    let missing = NodeRef::new(source.arena.id(), file, access.argument_expression);
+                    let NodeData::Identifier(identifier) =
+                        &source.arena.get(missing.node).unwrap().data
+                    else {
+                        panic!("each recovered access retains its missing identifier")
+                    };
+                    if identifier.text.is_empty() {
+                        recovered_accesses += 1;
+                        assert_eq!(
+                            context
+                                .store()
+                                .type_node_links(node)
+                                .and_then(|links| links.resolved_type),
+                            Some(error_type),
+                        );
+                        assert!(context.store().type_node_links(missing).is_none());
+                        assert!(context.store().symbol_node_links(missing).is_none());
+                    }
+                }
+                NodeData::CallExpression(_) => {
+                    recovered_calls += 1;
+                    assert_eq!(
+                        context
+                            .store()
+                            .type_node_links(node)
+                            .and_then(|links| links.resolved_type),
+                        Some(error_type),
+                    );
+                }
+                NodeData::NewExpression(_) => {
+                    constructions += 1;
+                    assert_eq!(
+                        context
+                            .store()
+                            .type_node_links(node)
+                            .and_then(|links| links.resolved_type),
+                        Some(instance),
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(recovered_accesses, 6);
+        assert_eq!(recovered_calls, 2);
+        assert_eq!(constructions, 5);
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn recovered_empty_array_constructions_reject_poisoned_missing_indexes() {
+        let source = parse_source_file("class Model {} var value = new Model[];");
+        assert_eq!(source.diagnostics.len(), 1);
+        let file = FileId::new(8_592);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let owner = global_symbol(&context, "Model");
+        let missing = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(
+                    &record.data,
+                    NodeData::Identifier(identifier)
+                        if identifier.text.is_empty()
+                            && record.flags.0 == NODE_FLAG_HAS_ERROR
+                )
+                .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            missing,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Element(missing)),
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(context.store().declared_type_links(owner).is_none());
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn recovered_empty_array_constructions_do_not_bypass_private_constructors() {
+        let source = parse_source_file(concat!(
+            "class Hidden { private constructor() {} }\n",
+            "var value = new Hidden[];\n",
+        ));
+        assert_eq!(source.diagnostics.len(), 1);
+        let file = FileId::new(8_593);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let owner = global_symbol(&context, "Hidden");
+        let cold = observable_state(&context, file);
+
+        assert!(context.check_source_file(file).is_err());
+        assert_eq!(observable_state(&context, file), cold);
+        assert!(context.store().declared_type_links(owner).is_none());
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
