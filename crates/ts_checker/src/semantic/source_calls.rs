@@ -1,8 +1,8 @@
 //! Exact source integration for identifier, nested, or authenticated property calls.
 //!
-//! This admits `identifier(arguments)`, an authenticated property call,
-//! an already proven call expression, or one exact parenthesized async-arrow
-//! invocation as the callee.
+//! This admits `identifier(arguments)`, authenticated public or private
+//! property calls and tagged templates, proven nested call callees, and exact
+//! parenthesized async-arrow invocations.
 //! Arguments may contain scalar
 //! values, identifier and property reads, object and array literals, arrow
 //! functions, type assertions, nested direct calls, or recursively proven primitive
@@ -612,8 +612,16 @@ pub(super) fn plan_direct_source_call_syntax(
                     return Err(SourceCheckError::Call(node));
                 };
                 if name_record.parent != Some(actual_callee.node)
-                    || name_record.kind != SyntaxKind::Identifier
-                    || !matches!(&name_record.data, NodeData::Identifier(_))
+                    || name_record.flags.0 != 0
+                    || !matches!(
+                        (&name_record.data, name_record.kind),
+                        (NodeData::Identifier(identifier), SyntaxKind::Identifier)
+                            if identifier.flow_node.is_none() && !identifier.text.is_empty()
+                    ) && !matches!(
+                        (&name_record.data, name_record.kind),
+                        (NodeData::PrivateIdentifier(identifier), SyntaxKind::PrivateIdentifier)
+                            if identifier.text.starts_with('#') && identifier.text.len() > 1
+                    )
                 {
                     return Err(SourceCheckError::Unsupported(
                         UnsupportedSourceSyntax::Call(node),
@@ -836,19 +844,50 @@ fn plan_tagged_template_source_call_syntax(
 
     let callee = NodeRef::new(node.arena, node.file, tagged.tag);
     let callee_record = arena.get(tagged.tag).ok_or(SourceCheckError::Call(node))?;
-    if callee_record.parent != Some(node.node)
-        || callee_record.kind != SyntaxKind::Identifier
-        || callee_record.flags.0 != 0
-        || !matches!(
-            &callee_record.data,
-            NodeData::Identifier(identifier)
-                if identifier.flow_node.is_none() && !identifier.text.is_empty()
-        )
-    {
+    if callee_record.parent != Some(node.node) || callee_record.flags.0 != 0 {
         return Err(SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::Call(node),
         ));
     }
+    let (callee_form, callee_diagnostic_node) = match (&callee_record.data, callee_record.kind) {
+        (NodeData::Identifier(identifier), SyntaxKind::Identifier)
+            if identifier.flow_node.is_none() && !identifier.text.is_empty() =>
+        {
+            (SourceCallCalleeForm::Identifier, callee)
+        }
+        (NodeData::PropertyAccessExpression(property), SyntaxKind::PropertyAccessExpression)
+            if property.flow_node.is_none()
+                && property.question_dot_token.is_none()
+                && property.facts == 0 =>
+        {
+            let name = NodeRef::new(node.arena, node.file, property.name);
+            let Some(record) = arena.get(property.name) else {
+                return Err(SourceCheckError::Call(node));
+            };
+            if record.parent != Some(callee.node)
+                || record.flags.0 != 0
+                || !matches!(
+                    (&record.data, record.kind),
+                    (NodeData::Identifier(identifier), SyntaxKind::Identifier)
+                        if identifier.flow_node.is_none() && !identifier.text.is_empty()
+                ) && !matches!(
+                    (&record.data, record.kind),
+                    (NodeData::PrivateIdentifier(identifier), SyntaxKind::PrivateIdentifier)
+                        if identifier.text.starts_with('#') && identifier.text.len() > 1
+                )
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Call(node),
+                ));
+            }
+            (SourceCallCalleeForm::RequiredOwnProperty, name)
+        }
+        _ => {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Call(node),
+            ));
+        }
+    };
 
     let template = NodeRef::new(node.arena, node.file, tagged.template);
     let template_record = arena
@@ -975,8 +1014,8 @@ fn plan_tagged_template_source_call_syntax(
         node,
         callee,
         form: DirectCallForm::TaggedTemplate,
-        callee_form: SourceCallCalleeForm::Identifier,
-        callee_diagnostic_node: callee,
+        callee_form,
+        callee_diagnostic_node,
         type_arguments: None,
         arguments,
         argument_arrow_nodes,
@@ -1214,20 +1253,27 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
                 return false;
             };
             receiver.parent == Some(node.node)
-                && receiver.kind == SyntaxKind::Identifier
                 && receiver.flags.0 == 0
-                && matches!(
-                    &receiver.data,
-                    NodeData::Identifier(identifier) if identifier.flow_node.is_none()
-                )
+                && (matches!(
+                    (&receiver.data, receiver.kind),
+                    (NodeData::Identifier(identifier), SyntaxKind::Identifier)
+                        if identifier.flow_node.is_none()
+                ) || matches!(
+                    (&receiver.data, receiver.kind),
+                    (NodeData::KeywordExpression(keyword), SyntaxKind::ThisKeyword)
+                        if keyword.flow_node.is_none()
+                ))
                 && name.parent == Some(node.node)
-                && name.kind == SyntaxKind::Identifier
                 && name.flags.0 == 0
-                && matches!(
-                    &name.data,
-                    NodeData::Identifier(identifier)
+                && (matches!(
+                    (&name.data, name.kind),
+                    (NodeData::Identifier(identifier), SyntaxKind::Identifier)
                         if identifier.flow_node.is_none() && !identifier.text.is_empty()
-                )
+                ) || matches!(
+                    (&name.data, name.kind),
+                    (NodeData::PrivateIdentifier(identifier), SyntaxKind::PrivateIdentifier)
+                        if identifier.text.starts_with('#') && identifier.text.len() > 1
+                ))
         }
         SyntaxKind::ElementAccessExpression => is_context_insensitive_element_syntax(arena, node),
         SyntaxKind::CallExpression => matches!(&record.data, NodeData::CallExpression(_)),
@@ -3804,6 +3850,90 @@ mod tests {
         .unwrap();
         assert_eq!(plan.form, DirectCallForm::TaggedTemplate);
         assert_eq!(plan.arguments.len(), 2);
+    }
+
+    #[test]
+    fn private_property_tagged_templates_preserve_tag_and_private_substitution() {
+        let parsed = parsed(concat!(
+            "class Model { #tag = null as any; #value = 1; ",
+            "run() { this.#tag`value ${this.#value}`; } }",
+        ));
+        let file = FileId::new(496);
+        let context = context(&parsed, file);
+        let tagged = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TaggedTemplateExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        let syntax = plan_direct_source_call_syntax(&parsed.arena, context.store(), tagged)
+            .expect("a private property tag retains the existing tagged-call capability");
+
+        assert_eq!(syntax.form, DirectCallForm::TaggedTemplate);
+        assert_eq!(
+            syntax.callee_form(),
+            SourceCallCalleeForm::RequiredOwnProperty
+        );
+        let name = parsed
+            .arena
+            .get(syntax.callee_diagnostic_node().node)
+            .unwrap();
+        assert!(matches!(
+            &name.data,
+            NodeData::PrivateIdentifier(identifier) if identifier.text == "#tag"
+        ));
+        let [argument] = syntax.arguments() else {
+            panic!("the private template retains exactly one private substitution")
+        };
+        let NodeData::PropertyAccessExpression(access) =
+            &parsed.arena.get(argument.node).unwrap().data
+        else {
+            panic!("the substitution remains a private property access")
+        };
+        assert!(matches!(
+            &parsed.arena.get(access.name).unwrap().data,
+            NodeData::PrivateIdentifier(identifier) if identifier.text == "#value"
+        ));
+    }
+
+    #[test]
+    fn ordinary_private_method_calls_retain_the_private_name_diagnostic_node() {
+        let parsed = parsed("class Model { #run() {} call() { this.#run(); } }");
+        let file = FileId::new(497);
+        let context = context(&parsed, file);
+        let call = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        let syntax = plan_direct_source_call_syntax(&parsed.arena, context.store(), call)
+            .expect("a private method call retains its authenticated property callee");
+
+        assert_eq!(
+            syntax.callee_form(),
+            SourceCallCalleeForm::RequiredOwnProperty
+        );
+        assert!(matches!(
+            &parsed
+                .arena
+                .get(syntax.callee_diagnostic_node().node)
+                .unwrap()
+                .data,
+            NodeData::PrivateIdentifier(identifier) if identifier.text == "#run"
+        ));
     }
 
     #[test]

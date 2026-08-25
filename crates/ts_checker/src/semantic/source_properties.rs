@@ -307,8 +307,11 @@ fn plan_direct_source_property_syntax_at(
         SourcePropertyPosition::Read => {
             if let Some(parent) = record.parent
                 && let Some(parent_record) = arena.get(parent)
-                && let NodeData::CallExpression(call) = &parent_record.data
-                && call.expression == node.node
+                && match &parent_record.data {
+                    NodeData::CallExpression(call) => call.expression == node.node,
+                    NodeData::TaggedTemplateExpression(tagged) => tagged.tag == node.node,
+                    _ => false,
+                }
             {
                 return Err(SourcePropertyError::Unsupported(
                     SourcePropertyUnsupported::MemberCall(NodeRef::new(
@@ -322,11 +325,17 @@ fn plan_direct_source_property_syntax_at(
                 && call_node.file == node.file
                 && record.parent == Some(call_node.node)
                 && arena.get(call_node.node).is_some_and(|call_record| {
-                    call_record.kind == SyntaxKind::CallExpression
-                        && matches!(
-                            &call_record.data,
-                            NodeData::CallExpression(call) if call.expression == node.node
-                        )
+                    matches!(
+                        (&call_record.data, call_record.kind),
+                        (NodeData::CallExpression(call), SyntaxKind::CallExpression)
+                            if call.expression == node.node
+                    ) || matches!(
+                        (&call_record.data, call_record.kind),
+                        (
+                            NodeData::TaggedTemplateExpression(tagged),
+                            SyntaxKind::TaggedTemplateExpression,
+                        ) if tagged.tag == node.node
+                    )
                 });
             if !exact_call {
                 return Err(SourcePropertyError::Unsupported(
@@ -4060,6 +4069,60 @@ mod tests {
                 enclosing_class: Some(declaration),
             },
         );
+    }
+
+    #[test]
+    fn private_tagged_template_properties_keep_distinct_tag_and_substitution_capabilities() {
+        let parsed = parsed(concat!(
+            "class Model { #tag = null as any; #value = 1; ",
+            "run() { this.#tag`value ${this.#value}`; } }",
+        ));
+        let file = FileId::new(595);
+        let store = registered_store(&parsed, file);
+        let tagged = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TaggedTemplateExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::TaggedTemplateExpression(expression) =
+            &parsed.arena.get(tagged.node).unwrap().data
+        else {
+            panic!("the fixture retains one tagged template")
+        };
+        let tag = NodeRef::new(parsed.arena.id(), file, expression.tag);
+        let tag_syntax =
+            plan_direct_source_property_call_syntax(&parsed.arena, &store, tag, tagged).unwrap();
+        assert_eq!(tag_syntax.name, "#tag");
+        assert!(matches!(
+            plan_direct_source_property_syntax(&parsed.arena, &store, tag),
+            Err(SourcePropertyError::Unsupported(
+                SourcePropertyUnsupported::MemberCall(call)
+            )) if call == tagged
+        ));
+
+        let substitution = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::PropertyAccessExpression(access) = &record.data else {
+                    return None;
+                };
+                matches!(
+                    &parsed.arena.get(access.name)?.data,
+                    NodeData::PrivateIdentifier(identifier) if identifier.text == "#value"
+                )
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let substitution_syntax =
+            plan_direct_source_property_syntax(&parsed.arena, &store, substitution).unwrap();
+        assert_eq!(substitution_syntax.name, "#value");
     }
 
     #[test]

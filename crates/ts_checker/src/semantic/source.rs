@@ -2401,6 +2401,36 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             statements.push(PlannedStatement::ExportedEmptyClass(empty));
                             continue;
                         }
+                        match plan_nongeneric_class_member_query(store, host, symbol) {
+                            Ok(class) => {
+                                if class.export_local().is_none()
+                                    || class.base_plan().is_some_and(|base| {
+                                        self.prior_classes.get(&base.symbol()) != Some(base)
+                                    })
+                                {
+                                    return Err(SourceCheckError::Unsupported(
+                                        UnsupportedSourceSyntax::Class(statement),
+                                    ));
+                                }
+                                preflight_nongeneric_class_member_query(store, host, &class)
+                                    .map_err(|error| Self::class_plan_error(statement, error))?;
+                                if !self.planned_classes.insert(class.symbol()) {
+                                    return Err(SourceCheckError::Class(statement));
+                                }
+                                if let Some(direct) = class.direct_plan()
+                                    && self
+                                        .prior_classes
+                                        .insert(class.symbol(), direct.clone())
+                                        .is_some()
+                                {
+                                    return Err(SourceCheckError::Class(statement));
+                                }
+                                statements.push(PlannedStatement::Class(class));
+                                continue;
+                            }
+                            Err(super::classes::ClassError::Unsupported(_)) => {}
+                            Err(error) => return Err(Self::class_plan_error(statement, error)),
+                        }
                         let class = plan_exported_jsx_arrow_class(store, host, symbol).ok_or(
                             SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(
                                 statement,
@@ -32663,6 +32693,136 @@ mod tests {
         );
         assert!(context.diagnostics().is_empty());
 
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn exported_private_fields_and_return_methods_publish_exact_class_state() {
+        let source = parsed(concat!(
+            "export class Model { #value = 1; ",
+            "getValue() { return this.#value; } }",
+        ));
+        let file = FileId::new(8_394);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let access = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(declaration).unwrap();
+        let local = bound.local_symbol(declaration).unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let value = context
+            .store()
+            .value_symbol_links(owner)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(local)
+                .and_then(|links| links.resolved_type),
+            Some(value),
+        );
+        assert_eq!(resolved_node_type(&context, access), number);
+        let field = context
+            .store()
+            .symbol_node_links(access)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .symbol(field)
+                .is_some_and(|field| field.name().is_private_identifier())
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn private_tagged_template_methods_check_clean_and_replay_warm() {
+        let library = parsed(concat!(
+            "interface Array<T> {} ",
+            "interface Console { log(...values: any[]): void; } ",
+            "declare var console: Console;",
+        ));
+        let source = parsed(concat!(
+            "class Foo { #x = 3; #y = null as any; ",
+            "func() { console.log(this.#y`->>${this.#x}<<-`); } }",
+        ));
+        let library_file = FileId::new(8_396);
+        let file = FileId::new(8_395);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+        let tagged = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TaggedTemplateExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            resolved_node_type(&context, tagged),
+            context.store().intrinsic_bootstrap().unwrap().any_type,
+        );
+        for (node, record) in source.arena.iter() {
+            let NodeData::PropertyAccessExpression(access) = &record.data else {
+                continue;
+            };
+            let NodeData::PrivateIdentifier(_) = &source.arena.get(access.name).unwrap().data
+            else {
+                continue;
+            };
+            let node = NodeRef::new(source.arena.id(), file, node);
+            assert!(
+                context
+                    .store()
+                    .symbol_node_links(node)
+                    .and_then(|links| links.resolved_symbol)
+                    .is_some()
+            );
+        }
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);

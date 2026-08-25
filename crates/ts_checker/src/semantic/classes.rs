@@ -31,6 +31,8 @@
 //! property and forward one primitive interface property to its base.
 //! Numeric instance and static fields can retain a direct numeric initializer.
 //! Private fields, empty methods, and paired accessors retain their class brand.
+//! Private fields also admit `null as any`; methods can return private members
+//! or evaluate one authenticated private tagged-template console call.
 //! One authenticated class/interface merge can retain a string auto-accessor
 //! and its shared binder-owned property symbol in either declaration order.
 //! An instance field may also reference its own constructor parameter and
@@ -72,6 +74,7 @@ use super::{
     reference_types::validate_direct_generic_reference,
     signatures::SignatureFlags,
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
+    source_calls::{SourceCallCalleeForm, plan_direct_source_call_syntax},
     store::{DirectClassHeritageProvenance, SourceNodeParent},
     type_records::{
         ConstrainedTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState, TypeData,
@@ -160,6 +163,8 @@ struct ClassMethodPlan {
     side: ClassPropertySide,
     ambient: bool,
     return_type_node: Option<NodeRef>,
+    private_return: Option<ClassMethodPrivateReturnPlan>,
+    private_tagged_call: Option<ClassMethodPrivateTaggedCallPlan>,
     parameters: Vec<ClassMethodParameterPlan>,
     rest_parameter: Option<ClassMethodRestParameterPlan>,
 }
@@ -172,6 +177,29 @@ struct ClassMethodOverloadDeclaration {
     symbol: SemanticSymbolId,
     side: ClassPropertySide,
     implementation: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClassMethodPrivateReturnPlan {
+    statement: NodeRef,
+    access: NodeRef,
+    receiver: NodeRef,
+    field: SemanticSymbolId,
+    type_: TypeId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClassMethodPrivateTaggedCallPlan {
+    statement: NodeRef,
+    call: NodeRef,
+    tag: NodeRef,
+    template: NodeRef,
+    tag_access: NodeRef,
+    tag_receiver: NodeRef,
+    tag_field: SemanticSymbolId,
+    substitution_access: NodeRef,
+    substitution_receiver: NodeRef,
+    substitution_field: SemanticSymbolId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -244,6 +272,12 @@ enum ClassNamespaceVariablePlan {
     Export(ClassNamespaceExportPlan),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClassPrivateAssertionPlan {
+    operand: NodeRef,
+    annotation: NodeRef,
+}
+
 /// One annotated property, initialized property, or implicit-any ambient private field.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)] // Preserves independent upstream property flags.
@@ -256,6 +290,7 @@ pub(super) struct ClassPropertyPlan {
     initializer_text: Option<String>,
     initializer_string: Option<String>,
     initializer_parameter_name: Option<String>,
+    initializer_assertion: Option<ClassPrivateAssertionPlan>,
     merged_interface_annotation: Option<NodeRef>,
     auto_accessor: bool,
     name: String,
@@ -2478,6 +2513,466 @@ fn class_member_symbol_name_matches(
     }
 }
 
+fn plan_private_method_return(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    method: NodeRef,
+    body: NodeRef,
+    statement: NodeRef,
+    member_tables: (Option<SymbolTableId>, SymbolTableId, ClassPropertySide),
+) -> Result<ClassMethodPrivateReturnPlan, ClassError> {
+    let (instance_members, static_members, side) = member_tables;
+    let reject = || {
+        unsupported(ClassUnsupported::Member {
+            node: method,
+            kind: SyntaxKind::MethodDeclaration,
+        })
+    };
+    let statement_record = preflight_node(store, host, statement)?;
+    let NodeData::ReturnStatement(return_statement) = &statement_record.data else {
+        return Err(reject());
+    };
+    if statement_record.kind != SyntaxKind::ReturnStatement
+        || statement_record.flags.0 != 0
+        || statement_record.parent != Some(body.node)
+        || return_statement.flow_node.is_some()
+        || return_statement.facts != 0
+    {
+        return Err(reject());
+    }
+    let access = return_statement
+        .expression
+        .map(|node| NodeRef::new(method.arena, method.file, node))
+        .ok_or_else(reject)?;
+    let access_record = preflight_node(store, host, access)?;
+    let NodeData::PropertyAccessExpression(property) = &access_record.data else {
+        return Err(reject());
+    };
+    let receiver = NodeRef::new(method.arena, method.file, property.expression);
+    let receiver_record = preflight_node(store, host, receiver)?;
+    let name = NodeRef::new(method.arena, method.file, property.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::PrivateIdentifier(private) = &name_record.data else {
+        return Err(reject());
+    };
+    if access_record.kind != SyntaxKind::PropertyAccessExpression
+        || access_record.flags.0 != 0
+        || access_record.parent != Some(statement.node)
+        || property.flow_node.is_some()
+        || property.question_dot_token.is_some()
+        || property.facts != 0
+        || receiver_record.kind != SyntaxKind::ThisKeyword
+        || !matches!(
+            &receiver_record.data,
+            NodeData::KeywordExpression(keyword) if keyword.flow_node.is_none()
+        )
+        || receiver_record.flags.0 != 0
+        || receiver_record.parent != Some(access.node)
+        || name_record.kind != SyntaxKind::PrivateIdentifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(access.node)
+        || !private.text.starts_with('#')
+        || private.text.len() <= 1
+    {
+        return Err(reject());
+    }
+    let member_table = match side {
+        ClassPropertySide::Instance => instance_members,
+        ClassPropertySide::Static => Some(static_members),
+    };
+    let members = member_table
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(reject)?;
+    let field = members
+        .iter()
+        .find_map(|(_, symbol)| {
+            (authenticated_private_class_symbol_name(store, owner, symbol)
+                == Some(private.text.as_str()))
+            .then_some(symbol)
+        })
+        .ok_or_else(reject)?;
+    let record = store
+        .symbol(field)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(statement)))?;
+    if record.parent() != Some(owner) {
+        return Err(reject());
+    }
+    let type_ = if record.flags() == SymbolFlags::PROPERTY {
+        let declaration = record.value_declaration().ok_or_else(reject)?;
+        let property = plan_property(
+            store,
+            host,
+            owner,
+            declaration,
+            instance_members,
+            static_members,
+        )?;
+        if property.readonly || property.side != side {
+            return Err(reject());
+        }
+        planned_property_type(store, host, &property)?
+    } else if record.flags() == SymbolFlags::ACCESSOR {
+        if side != ClassPropertySide::Instance {
+            return Err(reject());
+        }
+        let Some([getter, setter]) = record.declarations() else {
+            return Err(reject());
+        };
+        let accessor =
+            plan_class_accessor_pair(store, host, owner, *getter, *setter, instance_members)?;
+        plan_accessor_type(store, Some(&accessor))?.ok_or_else(reject)?
+    } else {
+        return Err(reject());
+    };
+    if store.type_node_links(access).is_some_and(|links| {
+        links != &TypeNodeLinks::default()
+            && links
+                != &(TypeNodeLinks {
+                    resolved_type: Some(type_),
+                    ..TypeNodeLinks::default()
+                })
+    }) || store.symbol_node_links(access).is_some_and(|links| {
+        links != &SymbolNodeLinks::default()
+            && links
+                != &(SymbolNodeLinks {
+                    resolved_symbol: Some(field),
+                })
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(access)));
+    }
+    let receiver_type = match side {
+        ClassPropertySide::Instance => store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type),
+        ClassPropertySide::Static => store
+            .value_symbol_links(owner)
+            .and_then(|links| links.resolved_type),
+    };
+    if store.type_node_links(receiver).is_some_and(|links| {
+        links != &TypeNodeLinks::default()
+            && receiver_type.is_none_or(|receiver_type| {
+                links
+                    != &(TypeNodeLinks {
+                        resolved_type: Some(receiver_type),
+                        ..TypeNodeLinks::default()
+                    })
+            })
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+            receiver,
+        )));
+    }
+    Ok(ClassMethodPrivateReturnPlan {
+        statement,
+        access,
+        receiver,
+        field,
+        type_,
+    })
+}
+
+fn plan_tagged_private_access(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    access: NodeRef,
+    parent: NodeRef,
+    expected_type: TypeId,
+    member_tables: (Option<SymbolTableId>, SymbolTableId),
+) -> Option<(NodeRef, SemanticSymbolId)> {
+    let (instance_members, static_members) = member_tables;
+    let record = preflight_node(store, host, access).ok()?;
+    let NodeData::PropertyAccessExpression(property) = &record.data else {
+        return None;
+    };
+    let receiver = NodeRef::new(access.arena, access.file, property.expression);
+    let receiver_record = preflight_node(store, host, receiver).ok()?;
+    let name = NodeRef::new(access.arena, access.file, property.name);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::PrivateIdentifier(private) = &name_record.data else {
+        return None;
+    };
+    if record.kind != SyntaxKind::PropertyAccessExpression
+        || record.flags.0 != 0
+        || record.parent != Some(parent.node)
+        || property.flow_node.is_some()
+        || property.question_dot_token.is_some()
+        || property.facts != 0
+        || receiver_record.kind != SyntaxKind::ThisKeyword
+        || !matches!(
+            &receiver_record.data,
+            NodeData::KeywordExpression(keyword) if keyword.flow_node.is_none()
+        )
+        || receiver_record.flags.0 != 0
+        || receiver_record.parent != Some(access.node)
+        || name_record.kind != SyntaxKind::PrivateIdentifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(access.node)
+    {
+        return None;
+    }
+    let field = instance_members
+        .and_then(|members| store.symbol_table(members))?
+        .iter()
+        .find_map(|(_, symbol)| {
+            (authenticated_private_class_symbol_name(store, owner, symbol)
+                == Some(private.text.as_str()))
+            .then_some(symbol)
+        })?;
+    let declaration = store.symbol(field)?.value_declaration()?;
+    let field = plan_property(
+        store,
+        host,
+        owner,
+        declaration,
+        instance_members,
+        static_members,
+    )
+    .ok()?;
+    if field.readonly
+        || field.side != ClassPropertySide::Instance
+        || planned_property_type(store, host, &field).ok()? != expected_type
+        || store.type_node_links(access).is_some_and(|links| {
+            links != &TypeNodeLinks::default()
+                && links
+                    != &(TypeNodeLinks {
+                        resolved_type: Some(expected_type),
+                        ..TypeNodeLinks::default()
+                    })
+        })
+        || store.symbol_node_links(access).is_some_and(|links| {
+            links != &SymbolNodeLinks::default()
+                && links
+                    != &(SymbolNodeLinks {
+                        resolved_symbol: Some(field.symbol),
+                    })
+        })
+    {
+        return None;
+    }
+    let instance = store
+        .declared_type_links(owner)
+        .and_then(|links| links.declared_type);
+    if store.type_node_links(receiver).is_some_and(|links| {
+        links != &TypeNodeLinks::default()
+            && instance.is_none_or(|instance| {
+                links
+                    != &(TypeNodeLinks {
+                        resolved_type: Some(instance),
+                        ..TypeNodeLinks::default()
+                    })
+            })
+    }) {
+        return None;
+    }
+    Some((receiver, field.symbol))
+}
+
+fn plan_private_tagged_method_call(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    method: NodeRef,
+    body: NodeRef,
+    statement: NodeRef,
+    member_tables: (Option<SymbolTableId>, SymbolTableId),
+) -> Option<ClassMethodPrivateTaggedCallPlan> {
+    let record = preflight_node(store, host, statement).ok()?;
+    let NodeData::ExpressionStatement(expression) = &record.data else {
+        return None;
+    };
+    if record.kind != SyntaxKind::ExpressionStatement
+        || record.flags.0 != 0
+        || record.parent != Some(body.node)
+        || expression.flow_node.is_some()
+    {
+        return None;
+    }
+    let call = NodeRef::new(method.arena, method.file, expression.expression);
+    let call_record = preflight_node(store, host, call).ok()?;
+    let NodeData::CallExpression(outer) = &call_record.data else {
+        return None;
+    };
+    let (arena, bound) = host.source(method)?;
+    let outer_syntax = plan_direct_source_call_syntax(arena, store, call).ok()?;
+    let [tag] = outer_syntax.arguments() else {
+        return None;
+    };
+    let tag = *tag;
+    if call_record.parent != Some(statement.node)
+        || outer_syntax.callee_form() != SourceCallCalleeForm::RequiredOwnProperty
+        || outer_syntax.callee().node != outer.expression
+    {
+        return None;
+    }
+    let log = outer_syntax.callee();
+    let log_record = preflight_node(store, host, log).ok()?;
+    let NodeData::PropertyAccessExpression(log_access) = &log_record.data else {
+        return None;
+    };
+    let console = NodeRef::new(method.arena, method.file, log_access.expression);
+    let console_record = preflight_node(store, host, console).ok()?;
+    let name = NodeRef::new(method.arena, method.file, log_access.name);
+    let name_record = preflight_node(store, host, name).ok()?;
+    if !matches!(
+        &console_record.data,
+        NodeData::Identifier(identifier)
+            if console_record.kind == SyntaxKind::Identifier
+                && console_record.flags.0 == 0
+                && console_record.parent == Some(log.node)
+                && identifier.flow_node.is_none()
+                && identifier.text == "console"
+    ) || !matches!(
+        &name_record.data,
+        NodeData::Identifier(identifier)
+            if name_record.kind == SyntaxKind::Identifier
+                && name_record.flags.0 == 0
+                && name_record.parent == Some(log.node)
+                && identifier.flow_node.is_none()
+                && identifier.text == "log"
+    ) {
+        return None;
+    }
+    let mut callbacks = host.name_resolver_host(store).ok()?;
+    let console_symbol =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callbacks)
+            .ok()?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(console)),
+                "console",
+                SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+                None,
+                false,
+                false,
+            )
+            .ok()??;
+    if store
+        .symbol(console_symbol)
+        .and_then(|symbol| symbol.name().as_utf8())
+        != Some("console")
+    {
+        return None;
+    }
+    let console_owner = store.symbol(console_symbol)?;
+    let [console_declaration] = console_owner.declarations()? else {
+        return None;
+    };
+    let declaration_record = preflight_node(store, host, *console_declaration).ok()?;
+    let NodeData::VariableDeclaration(console_variable) = &declaration_record.data else {
+        return None;
+    };
+    let annotation = NodeRef::new(
+        console_declaration.arena,
+        console_declaration.file,
+        console_variable.type_?,
+    );
+    let annotation_record = preflight_node(store, host, annotation).ok()?;
+    let console_type_is_valid = match &annotation_record.data {
+        NodeData::KeywordTypeNode(_) => annotation_record.kind == SyntaxKind::AnyKeyword,
+        NodeData::TypeReferenceNode(reference) => {
+            let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+            let name_record = preflight_node(store, host, name).ok()?;
+            let console_interface = store
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                .and_then(|globals| globals.get_source("Console"))
+                .and_then(|symbol| store.get_merged_symbol(symbol));
+            annotation_record.kind == SyntaxKind::TypeReference
+                && reference.type_arguments.is_none()
+                && matches!(
+                    &name_record.data,
+                    NodeData::Identifier(identifier)
+                        if name_record.kind == SyntaxKind::Identifier
+                            && identifier.text == "Console"
+                )
+                && console_interface
+                    .and_then(|interface| store.symbol(interface))
+                    .and_then(Symbol::members)
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get_source("log"))
+                    .and_then(|symbol| store.symbol(symbol))
+                    .is_some_and(|method| method.flags() == SymbolFlags::METHOD)
+        }
+        _ => false,
+    };
+    if declaration_record.kind != SyntaxKind::VariableDeclaration
+        || annotation_record.parent != Some(console_declaration.node)
+        || !console_type_is_valid
+    {
+        return None;
+    }
+    let tag_record = preflight_node(store, host, tag).ok()?;
+    let NodeData::TaggedTemplateExpression(tagged) = &tag_record.data else {
+        return None;
+    };
+    let tagged_syntax = plan_direct_source_call_syntax(arena, store, tag).ok()?;
+    let [substitution] = tagged_syntax.arguments() else {
+        return None;
+    };
+    let substitution = *substitution;
+    if tag_record.parent != Some(call.node)
+        || tagged_syntax.callee_form() != SourceCallCalleeForm::RequiredOwnProperty
+        || tagged_syntax.callee().node != tagged.tag
+    {
+        return None;
+    }
+    let template = NodeRef::new(method.arena, method.file, tagged.template);
+    let template_record = preflight_node(store, host, template).ok()?;
+    let NodeData::TemplateExpression(template_data) = &template_record.data else {
+        return None;
+    };
+    let [span] = template_data.template_spans.nodes.as_slice() else {
+        return None;
+    };
+    let span = NodeRef::new(method.arena, method.file, *span);
+    if template_record.parent != Some(tag.node)
+        || preflight_node(store, host, span).ok()?.parent != Some(template.node)
+    {
+        return None;
+    }
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let any = bootstrap.any_type;
+    let number = bootstrap.number_type;
+    let string = bootstrap.string_type;
+    let tag_access = tagged_syntax.callee();
+    let (tag_receiver, tag_field) =
+        plan_tagged_private_access(store, host, owner, tag_access, tag, any, member_tables)?;
+    let (substitution_receiver, substitution_field) = plan_tagged_private_access(
+        store,
+        host,
+        owner,
+        substitution,
+        span,
+        number,
+        member_tables,
+    )?;
+    for (node, expected) in [(template, string), (tag, any)] {
+        if store.type_node_links(node).is_some_and(|links| {
+            links != &TypeNodeLinks::default()
+                && links
+                    != &(TypeNodeLinks {
+                        resolved_type: Some(expected),
+                        ..TypeNodeLinks::default()
+                    })
+        }) {
+            return None;
+        }
+    }
+    Some(ClassMethodPrivateTaggedCallPlan {
+        statement,
+        call,
+        tag,
+        template,
+        tag_access,
+        tag_receiver,
+        tag_field,
+        substitution_access: substitution,
+        substitution_receiver,
+        substitution_field,
+    })
+}
+
 fn plan_method(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2622,6 +3117,8 @@ fn plan_method(
         }
         body_start = type_record.range.end;
     }
+    let mut private_return = None;
+    let mut private_tagged_call = None;
     if ambient {
         if method.body.is_some() || return_type_node.is_none() || body_start != record.range.end {
             return Err(unsupported(ClassUnsupported::Member {
@@ -2654,10 +3151,63 @@ fn plan_method(
             return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
         }
         if !block.statements.nodes.is_empty() {
-            return Err(unsupported(ClassUnsupported::Member {
-                node: declaration,
-                kind: SyntaxKind::MethodDeclaration,
-            }));
+            let [statement] = block.statements.nodes.as_slice() else {
+                return Err(unsupported(ClassUnsupported::Member {
+                    node: declaration,
+                    kind: SyntaxKind::MethodDeclaration,
+                }));
+            };
+            if !method.parameters.nodes.is_empty() {
+                return Err(unsupported(ClassUnsupported::Member {
+                    node: declaration,
+                    kind: SyntaxKind::MethodDeclaration,
+                }));
+            }
+            let statement = NodeRef::new(declaration.arena, declaration.file, *statement);
+            match preflight_node(store, host, statement)?.kind {
+                SyntaxKind::ReturnStatement => {
+                    private_return = Some(plan_private_method_return(
+                        store,
+                        host,
+                        owner,
+                        declaration,
+                        body,
+                        statement,
+                        (instance_members, static_members, side),
+                    )?);
+                }
+                SyntaxKind::ExpressionStatement => {
+                    if side != ClassPropertySide::Instance {
+                        return Err(unsupported(ClassUnsupported::Member {
+                            node: declaration,
+                            kind: SyntaxKind::MethodDeclaration,
+                        }));
+                    }
+                    private_tagged_call = Some(
+                        plan_private_tagged_method_call(
+                            store,
+                            host,
+                            owner,
+                            declaration,
+                            body,
+                            statement,
+                            (instance_members, static_members),
+                        )
+                        .ok_or_else(|| {
+                            unsupported(ClassUnsupported::Member {
+                                node: declaration,
+                                kind: SyntaxKind::MethodDeclaration,
+                            })
+                        })?,
+                    );
+                }
+                _ => {
+                    return Err(unsupported(ClassUnsupported::Member {
+                        node: declaration,
+                        kind: SyntaxKind::MethodDeclaration,
+                    }));
+                }
+            }
         }
     }
 
@@ -2731,6 +3281,8 @@ fn plan_method(
         side,
         ambient,
         return_type_node,
+        private_return,
+        private_tagged_call,
         parameters,
         rest_parameter,
     })
@@ -3305,7 +3857,7 @@ fn plan_property(
     let initializer_node = property
         .initializer
         .map(|initializer| NodeRef::new(member.arena, member.file, initializer));
-    let (initializer_text, initializer_string, initializer_parameter_name) =
+    let (initializer_text, initializer_string, initializer_parameter_name, initializer_assertion) =
         if let Some(initializer_node) = initializer_node {
             let initializer_record = preflight_node(store, host, initializer_node)?;
             if property.postfix_token.is_some()
@@ -3318,39 +3870,41 @@ fn plan_property(
                 return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
             }
             let text = match &initializer_record.data {
-                NodeData::NumericLiteral(literal) => literal.text.as_str(),
-                NodeData::Identifier(identifier) => identifier.text.as_str(),
+                NodeData::NumericLiteral(literal) => Some(literal.text.as_str()),
+                NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
                 NodeData::StringLiteral(literal) if merged_auto_accessor.is_some() => {
-                    literal.text.as_str()
+                    Some(literal.text.as_str())
                 }
+                NodeData::AsExpression(_) if private => None,
                 _ => {
                     return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
                 }
             };
-            let spelling_matches = host
-                .source(initializer_node)
-                .and_then(|(arena, _)| arena.source_text())
-                .is_none_or(|source| {
-                    let spelling = source.get(
-                        initializer_record.range.start.get() as usize
-                            ..initializer_record.range.end.get() as usize,
-                    );
-                    if matches!(initializer_record.data, NodeData::StringLiteral(_)) {
-                        spelling.is_some_and(|spelling| {
-                            spelling
-                                .strip_prefix('"')
-                                .and_then(|value| value.strip_suffix('"'))
-                                .or_else(|| {
-                                    spelling
-                                        .strip_prefix('\'')
-                                        .and_then(|value| value.strip_suffix('\''))
-                                })
-                                == Some(text)
-                        })
-                    } else {
-                        spelling == Some(text)
-                    }
-                });
+            let spelling_matches = text.is_none_or(|text| {
+                host.source(initializer_node)
+                    .and_then(|(arena, _)| arena.source_text())
+                    .is_none_or(|source| {
+                        let spelling = source.get(
+                            initializer_record.range.start.get() as usize
+                                ..initializer_record.range.end.get() as usize,
+                        );
+                        if matches!(initializer_record.data, NodeData::StringLiteral(_)) {
+                            spelling.is_some_and(|spelling| {
+                                spelling
+                                    .strip_prefix('"')
+                                    .and_then(|value| value.strip_suffix('"'))
+                                    .or_else(|| {
+                                        spelling
+                                            .strip_prefix('\'')
+                                            .and_then(|value| value.strip_suffix('\''))
+                                    })
+                                    == Some(text)
+                            })
+                        } else {
+                            spelling == Some(text)
+                        }
+                    })
+            });
             if !spelling_matches {
                 return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
             }
@@ -3366,7 +3920,7 @@ fn plan_property(
                     {
                         return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
                     }
-                    (Some(literal.text.clone()), None, None)
+                    (Some(literal.text.clone()), None, None, None)
                 }
                 NodeData::Identifier(identifier) => {
                     if private
@@ -3381,7 +3935,7 @@ fn plan_property(
                     {
                         return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
                     }
-                    (None, None, Some(identifier.text.clone()))
+                    (None, None, Some(identifier.text.clone()), None)
                 }
                 NodeData::StringLiteral(literal) => {
                     if private
@@ -3394,12 +3948,49 @@ fn plan_property(
                     {
                         return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
                     }
-                    (None, Some(literal.text.clone()), None)
+                    (None, Some(literal.text.clone()), None, None)
+                }
+                NodeData::AsExpression(assertion) => {
+                    let operand = NodeRef::new(member.arena, member.file, assertion.expression);
+                    let annotation = NodeRef::new(member.arena, member.file, assertion.type_);
+                    let operand_record = preflight_node(store, host, operand)?;
+                    let annotation_record = preflight_node(store, host, annotation)?;
+                    if !private
+                        || readonly
+                        || initializer_record.kind != SyntaxKind::AsExpression
+                        || initializer_node != type_node
+                        || property.type_.is_some()
+                        || operand_record.kind != SyntaxKind::NullKeyword
+                        || !matches!(
+                            &operand_record.data,
+                            NodeData::KeywordExpression(keyword) if keyword.flow_node.is_none()
+                        )
+                        || operand_record.flags.0 != 0
+                        || operand_record.parent != Some(initializer_node.node)
+                        || operand_record.range.start != initializer_record.range.start
+                        || annotation_record.kind != SyntaxKind::AnyKeyword
+                        || !matches!(annotation_record.data, NodeData::KeywordTypeNode(_))
+                        || annotation_record.flags.0 != 0
+                        || annotation_record.parent != Some(initializer_node.node)
+                        || annotation_record.range.start < operand_record.range.end
+                        || annotation_record.range.end != initializer_record.range.end
+                    {
+                        return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
+                    }
+                    (
+                        None,
+                        None,
+                        None,
+                        Some(ClassPrivateAssertionPlan {
+                            operand,
+                            annotation,
+                        }),
+                    )
                 }
                 _ => unreachable!("unsupported initializer syntax was rejected above"),
             }
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
     let (optional, definite) = match property.postfix_token {
@@ -3530,6 +4121,7 @@ fn plan_property(
         initializer_text,
         initializer_string,
         initializer_parameter_name,
+        initializer_assertion,
         merged_interface_annotation: merged_auto_accessor.map(|merged| merged.interface_annotation),
         auto_accessor: merged_auto_accessor.is_some(),
         name: property_name.to_owned(),
@@ -3656,6 +4248,7 @@ fn plan_ambient_private_implicit_any_property(
         initializer_text: None,
         initializer_string: None,
         initializer_parameter_name: None,
+        initializer_assertion: None,
         merged_interface_annotation: None,
         auto_accessor: false,
         name: identifier.text.clone(),
@@ -4921,16 +5514,33 @@ fn plan_class_declaration_modifiers(
         return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
     }
 
-    let expected = match modifiers.list.nodes.as_slice() {
-        [_] => &[SyntaxKind::DeclareKeyword][..],
+    let (expected, ambient) = match modifiers.list.nodes.as_slice() {
+        [modifier] => {
+            let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier);
+            match preflight_node(store, host, modifier)?.kind {
+                SyntaxKind::DeclareKeyword => (&[SyntaxKind::DeclareKeyword][..], true),
+                SyntaxKind::ExportKeyword => (&[SyntaxKind::ExportKeyword][..], false),
+                _ => {
+                    return Err(unsupported(ClassUnsupported::DeclarationModifiers(
+                        declaration,
+                    )));
+                }
+            }
+        }
         [_, modifier]
             if host
                 .node(NodeRef::new(declaration.arena, declaration.file, *modifier))
                 .is_some_and(|modifier| modifier.kind == SyntaxKind::DefaultKeyword) =>
         {
-            &[SyntaxKind::ExportKeyword, SyntaxKind::DefaultKeyword][..]
+            (
+                &[SyntaxKind::ExportKeyword, SyntaxKind::DefaultKeyword][..],
+                true,
+            )
         }
-        [_, _] => &[SyntaxKind::ExportKeyword, SyntaxKind::DeclareKeyword][..],
+        [_, _] => (
+            &[SyntaxKind::ExportKeyword, SyntaxKind::DeclareKeyword][..],
+            true,
+        ),
         _ => {
             return Err(unsupported(ClassUnsupported::DeclarationModifiers(
                 declaration,
@@ -4949,7 +5559,7 @@ fn plan_class_declaration_modifiers(
             SyntaxKind::ExportKeyword => "export",
             SyntaxKind::DeclareKeyword => "declare",
             SyntaxKind::DefaultKeyword => "default",
-            _ => unreachable!("only exported ambient class modifiers are planned"),
+            _ => unreachable!("only export, default, and ambient class modifiers are planned"),
         };
         if record.kind != *kind {
             return Err(unsupported(ClassUnsupported::DeclarationModifiers(
@@ -4969,7 +5579,7 @@ fn plan_class_declaration_modifiers(
         previous_end = record.range.end;
     }
 
-    if expected.len() == 1 {
+    if expected.len() == 1 && ambient {
         if owner.parent().is_some() || bound.local_symbol(declaration).is_some() {
             return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
         }
@@ -5040,7 +5650,7 @@ fn plan_class_declaration_modifiers(
         return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
     }
 
-    Ok((true, Some(local)))
+    Ok((ambient, Some(local)))
 }
 
 /// Produces the opaque syntax/binder proof consumed by the class shell
@@ -6178,12 +6788,49 @@ fn planned_property_type(
             || property.initializer_text.is_some()
             || property.initializer_string.is_some()
             || property.initializer_parameter_name.is_some()
+            || property.initializer_assertion.is_some()
             || property.merged_interface_annotation.is_some()
             || property.auto_accessor
             || property.side != ClassPropertySide::Instance
             || property.optional
             || property.definite
             || property.readonly
+        {
+            return Err(invariant(ClassInvariant::InvalidPlan(property.declaration)));
+        }
+        return store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.any_type)
+            .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(property.type_node)));
+    }
+    if let Some(assertion) = property.initializer_assertion {
+        let NodeData::AsExpression(expression) = &record.data else {
+            return Err(invariant(ClassInvariant::InvalidPlan(property.declaration)));
+        };
+        let operand = preflight_node(store, host, assertion.operand)?;
+        let annotation = preflight_node(store, host, assertion.annotation)?;
+        if record.kind != SyntaxKind::AsExpression
+            || property.initializer_node != Some(property.type_node)
+            || property.initializer_text.is_some()
+            || property.initializer_string.is_some()
+            || property.initializer_parameter_name.is_some()
+            || property.readonly
+            || expression.expression != assertion.operand.node
+            || expression.type_ != assertion.annotation.node
+            || operand.kind != SyntaxKind::NullKeyword
+            || !matches!(
+                &operand.data,
+                NodeData::KeywordExpression(keyword) if keyword.flow_node.is_none()
+            )
+            || operand.flags.0 != 0
+            || operand.parent != Some(property.type_node.node)
+            || annotation.kind != SyntaxKind::AnyKeyword
+            || !matches!(annotation.data, NodeData::KeywordTypeNode(_))
+            || annotation.flags.0 != 0
+            || annotation.parent != Some(property.type_node.node)
+            || store
+                .symbol(property.symbol)
+                .is_none_or(|symbol| !symbol.name().is_private_identifier())
         {
             return Err(invariant(ClassInvariant::InvalidPlan(property.declaration)));
         }
@@ -6290,13 +6937,16 @@ fn method_return_type(
         .intrinsic_bootstrap()
         .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(method.declaration)))?;
     let Some(type_node) = method.return_type_node else {
-        return Ok(bootstrap.void_type);
+        return Ok(method
+            .private_return
+            .map_or(bootstrap.void_type, |return_| return_.type_));
     };
     let record = preflight_node(store, host, type_node)?;
     if record.flags.0 != 0
         || record.parent != Some(method.declaration.node)
         || !matches!(record.data, NodeData::KeywordTypeNode(_))
         || !method.ambient
+            && method.private_return.is_none()
             && !matches!(
                 record.kind,
                 SyntaxKind::VoidKeyword | SyntaxKind::AnyKeyword | SyntaxKind::UndefinedKeyword
@@ -6307,7 +6957,18 @@ fn method_return_type(
             kind: SyntaxKind::MethodDeclaration,
         }));
     }
-    primitive_keyword_type(store, type_node, record.kind)
+    let return_type = primitive_keyword_type(store, type_node, record.kind)?;
+    if method
+        .private_return
+        .is_some_and(|return_| return_.type_ != return_type)
+        || method.private_tagged_call.is_some() && return_type != bootstrap.void_type
+    {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: method.declaration,
+            kind: SyntaxKind::MethodDeclaration,
+        }));
+    }
+    Ok(return_type)
 }
 
 fn exact_method_callable(
@@ -6485,6 +7146,133 @@ fn validate_method_cache_state(
         return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
             type_node,
         )));
+    }
+    if let Some(private_return) = method.private_return {
+        if private_return.type_ != return_type
+            || store.source_node_kind(private_return.statement) != Some(SyntaxKind::ReturnStatement)
+            || store.source_node_parent(private_return.access)
+                != Some(SourceNodeParent::Parent(private_return.statement))
+            || store
+                .type_node_links(private_return.access)
+                .is_some_and(|links| {
+                    links != &TypeNodeLinks::default()
+                        && links
+                            != &(TypeNodeLinks {
+                                resolved_type: Some(return_type),
+                                ..TypeNodeLinks::default()
+                            })
+                })
+            || store
+                .symbol_node_links(private_return.access)
+                .is_some_and(|links| {
+                    links != &SymbolNodeLinks::default()
+                        && links
+                            != &(SymbolNodeLinks {
+                                resolved_symbol: Some(private_return.field),
+                            })
+                })
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                private_return.access,
+            )));
+        }
+        let owner = store.symbol(method.symbol).and_then(Symbol::parent);
+        let receiver_type = match method.side {
+            ClassPropertySide::Instance => owner
+                .and_then(|owner| store.declared_type_links(owner))
+                .and_then(|links| links.declared_type),
+            ClassPropertySide::Static => owner
+                .and_then(|owner| store.value_symbol_links(owner))
+                .and_then(|links| links.resolved_type),
+        };
+        if store
+            .type_node_links(private_return.receiver)
+            .is_some_and(|links| {
+                links != &TypeNodeLinks::default()
+                    && receiver_type.is_none_or(|receiver_type| {
+                        links
+                            != &(TypeNodeLinks {
+                                resolved_type: Some(receiver_type),
+                                ..TypeNodeLinks::default()
+                            })
+                    })
+            })
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                private_return.receiver,
+            )));
+        }
+    }
+    if let Some(tagged) = method.private_tagged_call {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(method.declaration)))?;
+        if return_type != bootstrap.void_type
+            || store.source_node_kind(tagged.statement) != Some(SyntaxKind::ExpressionStatement)
+            || store.source_node_parent(tagged.call)
+                != Some(SourceNodeParent::Parent(tagged.statement))
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                tagged.call,
+            )));
+        }
+        for (node, expected) in [
+            (tagged.tag_access, bootstrap.any_type),
+            (tagged.substitution_access, bootstrap.number_type),
+            (tagged.template, bootstrap.string_type),
+            (tagged.tag, bootstrap.any_type),
+        ] {
+            validate_index_type_cache(store, node, expected)?;
+        }
+        if store.signature_links(tagged.tag).is_some_and(|links| {
+            links != &SignatureLinks::default()
+                && links
+                    != &(SignatureLinks {
+                        resolved_signature: ResolvedSignatureState::Resolved(
+                            bootstrap.any_signature,
+                        ),
+                        ..SignatureLinks::default()
+                    })
+        }) {
+            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                tagged.tag,
+            )));
+        }
+        let instance = store
+            .symbol(method.symbol)
+            .and_then(Symbol::parent)
+            .and_then(|owner| store.declared_type_links(owner))
+            .and_then(|links| links.declared_type);
+        for receiver in [tagged.tag_receiver, tagged.substitution_receiver] {
+            if store.type_node_links(receiver).is_some_and(|links| {
+                links != &TypeNodeLinks::default()
+                    && instance.is_none_or(|instance| {
+                        links
+                            != &(TypeNodeLinks {
+                                resolved_type: Some(instance),
+                                ..TypeNodeLinks::default()
+                            })
+                    })
+            }) {
+                return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                    receiver,
+                )));
+            }
+        }
+        for (access, field) in [
+            (tagged.tag_access, tagged.tag_field),
+            (tagged.substitution_access, tagged.substitution_field),
+        ] {
+            if store.symbol_node_links(access).is_some_and(|links| {
+                links != &SymbolNodeLinks::default()
+                    && links
+                        != &(SymbolNodeLinks {
+                            resolved_symbol: Some(field),
+                        })
+            }) {
+                return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(access)));
+            }
+        }
     }
     for parameter in &method.parameters {
         validate_index_type_cache(store, parameter.type_node, parameter.type_)?;
@@ -6750,7 +7538,9 @@ fn validate_property_cache_state(
     property: &ClassPropertyPlan,
     property_type: TypeId,
 ) -> Result<(), ClassError> {
-    let initializer_type = if property.initializer_parameter_name.is_some() {
+    let initializer_type = if property.initializer_parameter_name.is_some()
+        || property.initializer_assertion.is_some()
+    {
         Some(property_type)
     } else if property.initializer_text.is_some() || property.initializer_string.is_some() {
         property_initializer_fresh_literal_type(store, property)?
@@ -6796,6 +7586,13 @@ fn validate_property_cache_state(
     }
     if let Some(annotation) = property.merged_interface_annotation {
         validate_node(annotation, Some(property_type))?;
+    }
+    if let Some(assertion) = property.initializer_assertion {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(property.type_node)))?;
+        validate_node(assertion.operand, Some(bootstrap.null_widening_type))?;
+        validate_node(assertion.annotation, Some(bootstrap.any_type))?;
     }
 
     let expected_check_flags = expected_property_check_flags(property);
@@ -6856,7 +7653,9 @@ fn exact_property_type_links(
                 .type_node_links(property.type_node)
                 .is_none_or(|links| links == &TypeNodeLinks::default());
     }
-    let initializer_type = if property.initializer_parameter_name.is_some() {
+    let initializer_type = if property.initializer_parameter_name.is_some()
+        || property.initializer_assertion.is_some()
+    {
         Some(property_type)
     } else if property.initializer_text.is_some() || property.initializer_string.is_some() {
         property_initializer_fresh_literal_type(store, property)
@@ -6883,6 +7682,20 @@ fn exact_property_type_links(
                     resolved_type: Some(expected),
                     ..TypeNodeLinks::default()
                 })
+        })
+    }) && property.initializer_assertion.is_none_or(|assertion| {
+        store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+            property_type == bootstrap.any_type
+                && store.type_node_links(assertion.operand)
+                    == Some(&TypeNodeLinks {
+                        resolved_type: Some(bootstrap.null_widening_type),
+                        ..TypeNodeLinks::default()
+                    })
+                && store.type_node_links(assertion.annotation)
+                    == Some(&TypeNodeLinks {
+                        resolved_type: Some(bootstrap.any_type),
+                        ..TypeNodeLinks::default()
+                    })
         })
     }) && property
         .merged_interface_annotation
@@ -11771,6 +12584,7 @@ fn publish_class_methods(
     store: &mut CanonicalTypeMapperStore,
     plan: &ClassMemberPlan,
     signature_lists: Vec<PreparedClassMethodSignatures>,
+    instance_type: TypeId,
 ) {
     for ((method, return_type), prepared) in plan
         .class
@@ -11783,6 +12597,78 @@ fn publish_class_methods(
             mut signatures,
             parameters,
         } = prepared;
+        if let Some(tagged) = method.private_tagged_call {
+            let bootstrap = store
+                .intrinsic_bootstrap()
+                .expect("an authenticated private tag retains intrinsic types");
+            let any = bootstrap.any_type;
+            let number = bootstrap.number_type;
+            let string = bootstrap.string_type;
+            let any_signature = bootstrap.any_signature;
+            for (node, type_) in [
+                (tagged.tag_receiver, instance_type),
+                (tagged.substitution_receiver, instance_type),
+                (tagged.tag_access, any),
+                (tagged.substitution_access, number),
+                (tagged.template, string),
+                (tagged.tag, any),
+            ] {
+                assert!(store.set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+            }
+            assert!(store.set_signature_links(
+                tagged.tag,
+                SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(any_signature),
+                    ..SignatureLinks::default()
+                },
+            ));
+            for (node, symbol) in [
+                (tagged.tag_access, tagged.tag_field),
+                (tagged.substitution_access, tagged.substitution_field),
+            ] {
+                assert!(store.set_symbol_node_links(
+                    node,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(symbol),
+                    },
+                ));
+            }
+        }
+        if let Some(private_return) = method.private_return {
+            let receiver_type = match method.side {
+                ClassPropertySide::Instance => instance_type,
+                ClassPropertySide::Static => store
+                    .value_symbol_links(plan.class.symbol)
+                    .and_then(|links| links.resolved_type)
+                    .expect("a private static method retains its published class value"),
+            };
+            assert!(store.set_type_node_links(
+                private_return.receiver,
+                TypeNodeLinks {
+                    resolved_type: Some(receiver_type),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_type_node_links(
+                private_return.access,
+                TypeNodeLinks {
+                    resolved_type: Some(*return_type),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_symbol_node_links(
+                private_return.access,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(private_return.field),
+                },
+            ));
+        }
         if exact_method_callable(store, method, *return_type).is_some() {
             if let Some(type_node) = method.return_type_node {
                 assert!(store.set_type_node_links(
@@ -12055,7 +12941,9 @@ fn publish_class_property(
                 ),
                 Some(regular),
             )
-        } else if property.initializer_parameter_name.is_some() {
+        } else if property.initializer_parameter_name.is_some()
+            || property.initializer_assertion.is_some()
+        {
             (Some(property_type), None)
         } else {
             (None, None)
@@ -12090,6 +12978,27 @@ fn publish_class_property(
             annotation,
             TypeNodeLinks {
                 resolved_type: Some(property_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+    }
+    if let Some(assertion) = property.initializer_assertion {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .expect("an authenticated private assertion retains intrinsic types");
+        let null = bootstrap.null_widening_type;
+        let any = bootstrap.any_type;
+        assert!(store.set_type_node_links(
+            assertion.operand,
+            TypeNodeLinks {
+                resolved_type: Some(null),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(store.set_type_node_links(
+            assertion.annotation,
+            TypeNodeLinks {
+                resolved_type: Some(any),
                 ..TypeNodeLinks::default()
             },
         ));
@@ -12243,6 +13152,12 @@ pub(super) fn execute_nongeneric_class_members(
                         .initializer_node
                         .filter(|initializer| *initializer != property.type_node),
                 )
+                .chain(
+                    property
+                        .initializer_assertion
+                        .into_iter()
+                        .flat_map(|assertion| [assertion.operand, assertion.annotation]),
+                )
                 .chain(property.merged_interface_annotation)
         })
         .filter(|node| store.type_node_links(*node).is_none())
@@ -12268,6 +13183,46 @@ pub(super) fn execute_nongeneric_class_members(
         .iter()
         .flat_map(|method| &method.parameters)
         .filter(|parameter| store.type_node_links(parameter.type_node).is_none())
+        .count();
+    let missing_method_body_type_node_links = plan
+        .class
+        .methods
+        .iter()
+        .flat_map(|method| {
+            method
+                .private_return
+                .into_iter()
+                .flat_map(|return_| [return_.receiver, return_.access])
+                .chain(method.private_tagged_call.into_iter().flat_map(|tagged| {
+                    [
+                        tagged.tag_receiver,
+                        tagged.substitution_receiver,
+                        tagged.tag_access,
+                        tagged.substitution_access,
+                        tagged.template,
+                        tagged.tag,
+                    ]
+                }))
+        })
+        .filter(|node| store.type_node_links(*node).is_none())
+        .count();
+    let missing_method_body_symbol_links = plan
+        .class
+        .methods
+        .iter()
+        .flat_map(|method| {
+            method
+                .private_return
+                .into_iter()
+                .map(|return_| return_.access)
+                .chain(
+                    method
+                        .private_tagged_call
+                        .into_iter()
+                        .flat_map(|tagged| [tagged.tag_access, tagged.substitution_access]),
+                )
+        })
+        .filter(|node| store.symbol_node_links(*node).is_none())
         .count();
     let missing_index_type_node_links = plan.class.index.map_or(0, |index| {
         [index.key_type_node, index.value_type_node]
@@ -12296,6 +13251,7 @@ pub(super) fn execute_nongeneric_class_members(
         .checked_add(missing_method_type_node_links)
         .and_then(|count| count.checked_add(missing_method_rest_type_node_links))
         .and_then(|count| count.checked_add(missing_method_parameter_type_node_links))
+        .and_then(|count| count.checked_add(missing_method_body_type_node_links))
         .and_then(|count| count.checked_add(missing_index_type_node_links))
         .and_then(|count| count.checked_add(missing_accessor_type_node_links))
         .and_then(|count| count.checked_add(missing_constructor_parameter_type_node_links))
@@ -12352,6 +13308,13 @@ pub(super) fn execute_nongeneric_class_members(
         .iter()
         .filter(|method| store.signature_links(method.declaration).is_none())
         .count();
+    let missing_tagged_signature_links = plan
+        .class
+        .methods
+        .iter()
+        .filter_map(|method| method.private_tagged_call)
+        .filter(|tagged| store.signature_links(tagged.tag).is_none())
+        .count();
     let missing_accessor_signature_links = usize::from(
         plan.class
             .accessor
@@ -12360,6 +13323,7 @@ pub(super) fn execute_nongeneric_class_members(
     );
     let missing_signature_links = missing_constructor_signature_links
         .checked_add(missing_method_signature_links)
+        .and_then(|count| count.checked_add(missing_tagged_signature_links))
         .and_then(|count| count.checked_add(missing_accessor_signature_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let missing_value_links = missing_property_value_links
@@ -12386,6 +13350,7 @@ pub(super) fn execute_nongeneric_class_members(
             usize::from(prepared_instance_members.is_some()),
         )
         || !store.try_reserve_type_node_links(missing_type_node_links)
+        || !store.try_reserve_symbol_node_links(missing_method_body_symbol_links)
         || !store.try_reserve_value_symbol_links(missing_value_links)
         || !store.try_reserve_signature_links(missing_signature_links)
     {
@@ -12501,7 +13466,7 @@ pub(super) fn execute_nongeneric_class_members(
         resolved_index_infos.push(info);
     }
     publish_class_accessor(store, plan);
-    publish_class_methods(store, plan, method_signature_lists);
+    publish_class_methods(store, plan, method_signature_lists, shells.instance_type);
     assert!(store.set_interface_declared_members(
         shells.instance_type,
         true,
@@ -12728,6 +13693,12 @@ fn execute_direct_derived_class_members(
                         .initializer_node
                         .filter(|initializer| *initializer != property.type_node),
                 )
+                .chain(
+                    property
+                        .initializer_assertion
+                        .into_iter()
+                        .flat_map(|assertion| [assertion.operand, assertion.annotation]),
+                )
                 .chain(property.merged_interface_annotation)
         })
         .filter(|node| store.type_node_links(*node).is_none())
@@ -12738,6 +13709,29 @@ fn execute_direct_derived_class_members(
         .iter()
         .chain(&base_plan.class.methods)
         .filter_map(|method| method.return_type_node)
+        .filter(|node| store.type_node_links(*node).is_none())
+        .count();
+    let missing_method_body_type_node_links = plan
+        .class
+        .methods
+        .iter()
+        .chain(&base_plan.class.methods)
+        .flat_map(|method| {
+            method
+                .private_return
+                .into_iter()
+                .flat_map(|return_| [return_.receiver, return_.access])
+                .chain(method.private_tagged_call.into_iter().flat_map(|tagged| {
+                    [
+                        tagged.tag_receiver,
+                        tagged.substitution_receiver,
+                        tagged.tag_access,
+                        tagged.substitution_access,
+                        tagged.template,
+                        tagged.tag,
+                    ]
+                }))
+        })
         .filter(|node| store.type_node_links(*node).is_none())
         .count();
     let missing_base_constructor_type_node_links = usize::from(
@@ -12760,6 +13754,7 @@ fn execute_direct_derived_class_members(
     });
     let missing_type_node_links = missing_property_type_node_links
         .checked_add(missing_method_type_node_links)
+        .and_then(|count| count.checked_add(missing_method_body_type_node_links))
         .and_then(|count| count.checked_add(missing_base_constructor_type_node_links))
         .and_then(|count| count.checked_add(missing_constructor_property_type_node_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
@@ -12809,11 +13804,20 @@ fn execute_direct_derived_class_members(
         .chain(&base_plan.class.methods)
         .filter(|method| store.signature_links(method.declaration).is_none())
         .count();
+    let missing_tagged_signature_links = plan
+        .class
+        .methods
+        .iter()
+        .chain(&base_plan.class.methods)
+        .filter_map(|method| method.private_tagged_call)
+        .filter(|tagged| store.signature_links(tagged.tag).is_none())
+        .count();
     let missing_super_call_signature_links = usize::from(
         parameter_property.is_some_and(|parameter| store.signature_links(parameter.call).is_none()),
     );
     let missing_signature_links = missing_constructor_signature_links
         .checked_add(missing_method_signature_links)
+        .and_then(|count| count.checked_add(missing_tagged_signature_links))
         .and_then(|count| count.checked_add(missing_super_call_signature_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let missing_constructor_property_symbol_links = parameter_property.map_or(0, |parameter| {
@@ -12826,6 +13830,28 @@ fn execute_direct_derived_class_members(
         .filter(|node| store.symbol_node_links(*node).is_none())
         .count()
     });
+    let missing_method_body_symbol_links = plan
+        .class
+        .methods
+        .iter()
+        .chain(&base_plan.class.methods)
+        .flat_map(|method| {
+            method
+                .private_return
+                .into_iter()
+                .map(|return_| return_.access)
+                .chain(
+                    method
+                        .private_tagged_call
+                        .into_iter()
+                        .flat_map(|tagged| [tagged.tag_access, tagged.substitution_access]),
+                )
+        })
+        .filter(|node| store.symbol_node_links(*node).is_none())
+        .count();
+    let missing_symbol_links = missing_constructor_property_symbol_links
+        .checked_add(missing_method_body_symbol_links)
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let method_count = plan
         .class
         .methods
@@ -12862,7 +13888,7 @@ fn execute_direct_derived_class_members(
         )
         || !store.try_reserve_declared_type_links(missing_declared_links)
         || !store.try_reserve_type_node_links(missing_type_node_links)
-        || !store.try_reserve_symbol_node_links(missing_constructor_property_symbol_links)
+        || !store.try_reserve_symbol_node_links(missing_symbol_links)
         || !store.try_reserve_value_symbol_links(missing_value_links)
         || !store.try_reserve_signature_links(missing_signature_links)
         || !store.try_reserve_direct_class_heritage_provenance(1)
@@ -13003,7 +14029,7 @@ fn execute_direct_derived_class_members(
     for (property, property_type) in plan.class.properties.iter().zip(&plan.property_types) {
         publish_class_property(store, property, *property_type);
     }
-    publish_class_methods(store, plan, method_signature_lists);
+    publish_class_methods(store, plan, method_signature_lists, instance_type);
     assert!(store.set_interface_declared_members(
         instance_type,
         true,
@@ -13823,6 +14849,103 @@ fn exact_stored_ambient_private_property(
             == Some(property)
 }
 
+fn exact_stored_private_assertion_property(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    property: SemanticSymbolId,
+    type_: TypeId,
+) -> bool {
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    let Some(record) = store.symbol(property) else {
+        return false;
+    };
+    if type_ != bootstrap.any_type
+        || record.flags() != SymbolFlags::PROPERTY
+        || record.check_flags() != CheckFlags::NONE
+        || authenticated_private_class_symbol_name(store, owner, property).is_none()
+    {
+        return false;
+    }
+    let Some(assertion_index) = declaration
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let assertion = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(assertion_index),
+    );
+    let Some(annotation_index) = assertion
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let annotation = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(annotation_index),
+    );
+    let Some(operand_index) = annotation
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let operand = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(operand_index),
+    );
+    let Some(name_index) = operand
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let name = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(name_index),
+    );
+    store.source_node_kind(assertion) == Some(SyntaxKind::AsExpression)
+        && store.source_node_parent(assertion) == Some(SourceNodeParent::Parent(declaration))
+        && store.source_node_kind(annotation) == Some(SyntaxKind::AnyKeyword)
+        && store.source_node_parent(annotation) == Some(SourceNodeParent::Parent(assertion))
+        && store.source_node_kind(operand) == Some(SyntaxKind::NullKeyword)
+        && store.source_node_parent(operand) == Some(SourceNodeParent::Parent(assertion))
+        && store.source_node_kind(name) == Some(SyntaxKind::PrivateIdentifier)
+        && store.source_node_parent(name) == Some(SourceNodeParent::Parent(declaration))
+        && store.type_node_links(assertion)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(bootstrap.any_type),
+                ..TypeNodeLinks::default()
+            })
+        && store.type_node_links(annotation)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(bootstrap.any_type),
+                ..TypeNodeLinks::default()
+            })
+        && store.type_node_links(operand)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(bootstrap.null_widening_type),
+                ..TypeNodeLinks::default()
+            })
+}
+
 fn exact_stored_property(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
@@ -13939,6 +15062,12 @@ fn exact_stored_property(
         owner_declaration,
         property,
         *declaration,
+        property_type,
+    ) || exact_stored_private_assertion_property(
+        store,
+        owner,
+        *declaration,
+        property,
         property_type,
     ) || store
         .source_primitive_type_annotation(*declaration)
@@ -14139,8 +15268,320 @@ fn exact_stored_property(
         .then_some(*declaration)
 }
 
+fn exact_stored_private_method_return(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    body: NodeRef,
+    statement: NodeRef,
+    return_type: TypeId,
+) -> bool {
+    let Some(access_index) = statement
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let access = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(access_index),
+    );
+    let Some(name_index) = access
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let name = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(name_index),
+    );
+    let Some(receiver_index) = name
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let receiver = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(receiver_index),
+    );
+    let Some(field) = store
+        .symbol_node_links(access)
+        .and_then(|links| links.resolved_symbol)
+    else {
+        return false;
+    };
+    let Some(field_record) = store.symbol(field) else {
+        return false;
+    };
+    let static_side = store
+        .symbol(owner)
+        .and_then(Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get(field_record.name()))
+        == Some(field);
+    let receiver_type = if static_side {
+        store
+            .value_symbol_links(owner)
+            .and_then(|links| links.resolved_type)
+    } else {
+        store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+    };
+    let Some(receiver_type) = receiver_type else {
+        return false;
+    };
+    store.source_node_kind(body) == Some(SyntaxKind::Block)
+        && store.source_node_parent(body) == Some(SourceNodeParent::Parent(declaration))
+        && store.source_node_kind(statement) == Some(SyntaxKind::ReturnStatement)
+        && store.source_node_parent(statement) == Some(SourceNodeParent::Parent(body))
+        && store.source_node_kind(access) == Some(SyntaxKind::PropertyAccessExpression)
+        && store.source_node_parent(access) == Some(SourceNodeParent::Parent(statement))
+        && store.source_node_kind(name) == Some(SyntaxKind::PrivateIdentifier)
+        && store.source_node_parent(name) == Some(SourceNodeParent::Parent(access))
+        && store.source_node_kind(receiver) == Some(SyntaxKind::ThisKeyword)
+        && store.source_node_parent(receiver) == Some(SourceNodeParent::Parent(access))
+        && authenticated_private_class_symbol_name(store, owner, field).is_some()
+        && store.symbol(field).is_some_and(|field| {
+            matches!(field.flags(), SymbolFlags::PROPERTY | SymbolFlags::ACCESSOR)
+                && field.parent() == Some(owner)
+        })
+        && store.value_symbol_links(field)
+            == Some(&ValueSymbolLinks {
+                resolved_type: Some(return_type),
+                ..ValueSymbolLinks::default()
+            })
+        && store.type_node_links(receiver)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(receiver_type),
+                ..TypeNodeLinks::default()
+            })
+        && store.type_node_links(access)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(return_type),
+                ..TypeNodeLinks::default()
+            })
+        && store.symbol_node_links(access)
+            == Some(&SymbolNodeLinks {
+                resolved_symbol: Some(field),
+            })
+}
+
+fn exact_stored_private_tagged_access(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    access: NodeRef,
+    expected_parent: NodeRef,
+    instance: TypeId,
+    expected_type: TypeId,
+) -> bool {
+    if store.source_node_kind(access) != Some(SyntaxKind::PropertyAccessExpression)
+        || store.source_node_parent(access) != Some(SourceNodeParent::Parent(expected_parent))
+    {
+        return false;
+    }
+    let Some(symbol) = store
+        .symbol_node_links(access)
+        .and_then(|links| links.resolved_symbol)
+    else {
+        return false;
+    };
+    if authenticated_private_class_symbol_name(store, owner, symbol).is_none()
+        || store.value_symbol_links(symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(expected_type),
+                ..ValueSymbolLinks::default()
+            })
+        || store.type_node_links(access)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(expected_type),
+                ..TypeNodeLinks::default()
+            })
+    {
+        return false;
+    }
+    let mut receiver = None;
+    let mut name = None;
+    for index in 0..access.node.index() {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let child = NodeRef::new(access.arena, access.file, ts_ast::NodeId::new(index));
+        if store.source_node_parent(child) != Some(SourceNodeParent::Parent(access)) {
+            continue;
+        }
+        match store.source_node_kind(child) {
+            Some(SyntaxKind::ThisKeyword) if receiver.is_none() => receiver = Some(child),
+            Some(SyntaxKind::PrivateIdentifier) if name.is_none() => name = Some(child),
+            _ => return false,
+        }
+    }
+    name.is_some()
+        && receiver.is_some_and(|receiver| {
+            store.type_node_links(receiver)
+                == Some(&TypeNodeLinks {
+                    resolved_type: Some(instance),
+                    ..TypeNodeLinks::default()
+                })
+        })
+}
+
+fn exact_stored_private_tagged_method_call(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    body: NodeRef,
+    statement: NodeRef,
+    return_type: TypeId,
+) -> bool {
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    let Some(instance) = store
+        .declared_type_links(owner)
+        .and_then(|links| links.declared_type)
+    else {
+        return false;
+    };
+    let Some(call_index) = statement
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let call = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(call_index),
+    );
+    if return_type != bootstrap.void_type
+        || store.source_node_kind(body) != Some(SyntaxKind::Block)
+        || store.source_node_parent(body) != Some(SourceNodeParent::Parent(declaration))
+        || store.source_node_kind(statement) != Some(SyntaxKind::ExpressionStatement)
+        || store.source_node_parent(statement) != Some(SourceNodeParent::Parent(body))
+        || store.source_node_kind(call) != Some(SyntaxKind::CallExpression)
+        || store.source_node_parent(call) != Some(SourceNodeParent::Parent(statement))
+    {
+        return false;
+    }
+    let mut tag = None;
+    for index in 0..call.node.index() {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let child = NodeRef::new(call.arena, call.file, ts_ast::NodeId::new(index));
+        if store.source_node_parent(child) == Some(SourceNodeParent::Parent(call))
+            && store.source_node_kind(child) == Some(SyntaxKind::TaggedTemplateExpression)
+            && tag.replace(child).is_some()
+        {
+            return false;
+        }
+    }
+    let Some(tag) = tag else {
+        return false;
+    };
+    if store.type_node_links(tag)
+        != Some(&TypeNodeLinks {
+            resolved_type: Some(bootstrap.any_type),
+            ..TypeNodeLinks::default()
+        })
+        || store.signature_links(tag)
+            != Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(bootstrap.any_signature),
+                ..SignatureLinks::default()
+            })
+    {
+        return false;
+    }
+    let mut tag_access = None;
+    let mut template = None;
+    for index in 0..tag.node.index() {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let child = NodeRef::new(tag.arena, tag.file, ts_ast::NodeId::new(index));
+        if store.source_node_parent(child) != Some(SourceNodeParent::Parent(tag)) {
+            continue;
+        }
+        match store.source_node_kind(child) {
+            Some(SyntaxKind::PropertyAccessExpression) if tag_access.is_none() => {
+                tag_access = Some(child);
+            }
+            Some(SyntaxKind::TemplateExpression) if template.is_none() => template = Some(child),
+            _ => return false,
+        }
+    }
+    let (Some(tag_access), Some(template)) = (tag_access, template) else {
+        return false;
+    };
+    if store.type_node_links(template)
+        != Some(&TypeNodeLinks {
+            resolved_type: Some(bootstrap.string_type),
+            ..TypeNodeLinks::default()
+        })
+        || !exact_stored_private_tagged_access(
+            store,
+            owner,
+            tag_access,
+            tag,
+            instance,
+            bootstrap.any_type,
+        )
+    {
+        return false;
+    }
+    let mut substitution = None;
+    for index in 0..template.node.index() {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let span = NodeRef::new(template.arena, template.file, ts_ast::NodeId::new(index));
+        if store.source_node_parent(span) != Some(SourceNodeParent::Parent(template))
+            || store.source_node_kind(span) != Some(SyntaxKind::TemplateSpan)
+        {
+            continue;
+        }
+        for access_index in 0..span.node.index() {
+            let Ok(access_index) = u32::try_from(access_index) else {
+                return false;
+            };
+            let access = NodeRef::new(span.arena, span.file, ts_ast::NodeId::new(access_index));
+            if store.source_node_parent(access) == Some(SourceNodeParent::Parent(span))
+                && store.source_node_kind(access) == Some(SyntaxKind::PropertyAccessExpression)
+                && substitution.replace((access, span)).is_some()
+            {
+                return false;
+            }
+        }
+    }
+    substitution.is_some_and(|(access, span)| {
+        exact_stored_private_tagged_access(
+            store,
+            owner,
+            access,
+            span,
+            instance,
+            bootstrap.number_type,
+        )
+    })
+}
+
 fn exact_stored_method_return_type(
     store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
     declaration: NodeRef,
     return_type: TypeId,
 ) -> bool {
@@ -14182,6 +15623,32 @@ fn exact_stored_method_return_type(
             ts_ast::NodeId::new(previous_index),
         )
     };
+    if !bodyless
+        && store.source_node_kind(previous) == Some(SyntaxKind::ReturnStatement)
+        && store.source_node_parent(previous) == Some(SourceNodeParent::Parent(last))
+    {
+        return exact_stored_private_method_return(
+            store,
+            owner,
+            declaration,
+            last,
+            previous,
+            return_type,
+        );
+    }
+    if !bodyless
+        && store.source_node_kind(previous) == Some(SyntaxKind::ExpressionStatement)
+        && store.source_node_parent(previous) == Some(SourceNodeParent::Parent(last))
+    {
+        return exact_stored_private_tagged_method_call(
+            store,
+            owner,
+            declaration,
+            last,
+            previous,
+            return_type,
+        );
+    }
     if store.source_node_parent(previous) != Some(SourceNodeParent::Parent(declaration)) {
         return false;
     }
@@ -14470,7 +15937,7 @@ fn exact_stored_method(
         && store.source_node_parent(*declaration)
             == Some(SourceNodeParent::Parent(owner_declaration))
         && exact_stored_private_class_member_name(store, owner, *declaration, method)
-        && exact_stored_method_return_type(store, *declaration, return_type)
+        && exact_stored_method_return_type(store, owner, *declaration, return_type)
         && exact_method_value(
             store,
             method,
@@ -16929,6 +18396,392 @@ mod tests {
                 fixture.store.type_len(),
                 fixture.store.signature_len(),
                 fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn private_null_as_any_initializers_preserve_assertion_types_and_replay_warm() {
+        let mut fixture = fixture("class Foo { #x = 3; #y = null as any; }");
+        let owner = class_symbol(&fixture, "Foo");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("a private assertion initializer belongs to one direct class")
+        };
+        let property = class.class.instance_properties[1].clone();
+        let assertion = property.initializer_assertion.unwrap();
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let any = bootstrap.any_type;
+        let null = bootstrap.null_widening_type;
+        assert_eq!(
+            fixture.store.value_symbol_links(property.symbol),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(any),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+        for (node, expected) in [
+            (property.type_node, any),
+            (assertion.annotation, any),
+            (assertion.operand, null),
+        ] {
+            assert_eq!(
+                fixture.store.type_node_links(node),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    ..TypeNodeLinks::default()
+                }),
+            );
+        }
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn private_assertion_initializer_rejects_poisoned_operand_and_annotation() {
+        for poison_operand in [false, true] {
+            let mut fixture = fixture("class Foo { #value = null as any; }");
+            let owner = class_symbol(&fixture, "Foo");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("a private assertion initializer belongs to one direct class")
+            };
+            let assertion = class.class.properties[0].initializer_assertion.unwrap();
+            let node = if poison_operand {
+                assertion.operand
+            } else {
+                assertion.annotation
+            };
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            assert!(fixture.store.set_type_node_links(
+                node,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            let poisoned = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(invariant(ClassInvariant::InvalidPropertyTypeCache(node))),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                poisoned,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn methods_return_private_fields_with_exact_this_and_member_caches() {
+        for (source, expected_name, expected_any, static_side) in [
+            (
+                "class Foo { #value = 1; getValue() { return this.#value; } }",
+                "#value",
+                false,
+                false,
+            ),
+            (
+                "class Foo { #value = null as any; getValue(): any { return this.#value; } }",
+                "#value",
+                true,
+                false,
+            ),
+            (
+                concat!(
+                    "class Foo { get #value(): number { return 1; } ",
+                    "set #value(next) {} getValue(): number { return this.#value; } }",
+                ),
+                "#value",
+                false,
+                false,
+            ),
+            (
+                "class Foo { static #value = 1; static getValue() { return this.#value; } }",
+                "#value",
+                false,
+                true,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Foo");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("a private return belongs to one direct class")
+            };
+            let method = class.class.methods[0].clone();
+            let private_return = method.private_return.unwrap();
+
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+            let expected = if expected_any {
+                fixture.store.intrinsic_bootstrap().unwrap().any_type
+            } else {
+                fixture.store.intrinsic_bootstrap().unwrap().number_type
+            };
+            assert_eq!(
+                authenticated_private_class_symbol_name(
+                    &fixture.store,
+                    owner,
+                    private_return.field,
+                ),
+                Some(expected_name),
+            );
+            assert_eq!(
+                fixture.store.type_node_links(private_return.receiver),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(if static_side {
+                        members.shells().value_type()
+                    } else {
+                        members.shells().instance_type()
+                    }),
+                    ..TypeNodeLinks::default()
+                }),
+            );
+            assert_eq!(
+                fixture.store.type_node_links(private_return.access),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    ..TypeNodeLinks::default()
+                }),
+            );
+            assert_eq!(
+                fixture.store.symbol_node_links(private_return.access),
+                Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(private_return.field),
+                }),
+            );
+            let (_, signature) = exact_method_callable(&fixture.store, &method, expected).unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(expected),
+            );
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+                ClassHeritageMembersValidation::Valid,
+            );
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+                Ok(members),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn private_tagged_template_method_preserves_exact_field_and_template_caches() {
+        let mut fixture = fixture(concat!(
+            "declare const console: any; ",
+            "class Foo { #x = 3; #y = null as any; ",
+            "func() { console.log(this.#y`->>${this.#x}<<-`); } }",
+        ));
+        let owner = class_symbol(&fixture, "Foo");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("a private tagged template belongs to one direct class")
+        };
+        let method = class.class.methods[0].clone();
+        let tagged = method.private_tagged_call.unwrap();
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        for (node, expected) in [
+            (tagged.tag_receiver, members.shells().instance_type()),
+            (
+                tagged.substitution_receiver,
+                members.shells().instance_type(),
+            ),
+            (tagged.tag_access, bootstrap.any_type),
+            (tagged.substitution_access, bootstrap.number_type),
+            (tagged.template, bootstrap.string_type),
+            (tagged.tag, bootstrap.any_type),
+        ] {
+            assert_eq!(
+                fixture.store.type_node_links(node),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    ..TypeNodeLinks::default()
+                }),
+            );
+        }
+        for (access, field) in [
+            (tagged.tag_access, tagged.tag_field),
+            (tagged.substitution_access, tagged.substitution_field),
+        ] {
+            assert_eq!(
+                fixture.store.symbol_node_links(access),
+                Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(field),
+                }),
+            );
+        }
+        assert_eq!(
+            fixture.store.signature_links(tagged.tag),
+            Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(bootstrap.any_signature),
+                ..SignatureLinks::default()
+            }),
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn private_return_methods_reject_poisoned_this_or_access_before_publication() {
+        for poison_receiver in [false, true] {
+            let mut fixture =
+                fixture("class Foo { #value = 1; getValue() { return this.#value; } }");
+            let owner = class_symbol(&fixture, "Foo");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("a private return belongs to one direct class")
+            };
+            let private_return = class.class.methods[0].private_return.unwrap();
+            let node = if poison_receiver {
+                private_return.receiver
+            } else {
+                private_return.access
+            };
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            assert!(fixture.store.set_type_node_links(
+                node,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(invariant(ClassInvariant::InvalidPropertyTypeCache(node))),
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn exported_private_return_classes_preserve_module_and_local_identities() {
+        let parsed = parse_source_file(concat!(
+            "export class Model { #value = 1; ",
+            "getValue() { return this.#value; } }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut fixture =
+            fixture_from_parsed_with_module_state(parsed, CanonicalModuleState::External);
+        let owner = class_symbol(&fixture, "Model");
+        let declaration = class_node(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let local = bound.local_symbol(declaration).unwrap();
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        assert_eq!(plan.export_local(), Some(local));
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
                 fixture.store.checker_link_allocated_lengths(),
             ),
             warm,
