@@ -734,19 +734,31 @@ fn cached_mapped_keyof_type(
                 && let Some(constraint) = mapped.constraint_type
                 && union_contains_exact_keys(store, constraint, &resolved)
             {
+                store
+                    .validate_union_constituent(constraint)
+                    .map_err(|_| NongenericKeyofError::InvalidCachedResult(constraint))?;
                 return Ok(Some(constraint));
             }
-            Ok(store.types().find_map(|(type_, record)| {
-                matches!(
-                    record.data(),
-                    TypeData::Union(union)
-                        if record.alias().is_none()
-                            && union.origin.is_none()
-                            && union.union.types.len() == resolved.len()
-                            && resolved.iter().all(|key| union.union.types.contains(key))
-                )
-                .then_some(type_)
-            }))
+            let mut cached = None;
+            for (type_, record) in store.types() {
+                let TypeData::Union(union) = record.data() else {
+                    continue;
+                };
+                if record.alias().is_some()
+                    || union.origin.is_some()
+                    || union.union.types.len() != resolved.len()
+                    || !resolved.iter().all(|key| union.union.types.contains(key))
+                {
+                    continue;
+                }
+                store
+                    .validate_union_constituent(type_)
+                    .map_err(|_| NongenericKeyofError::InvalidCachedResult(type_))?;
+                if cached.replace(type_).is_some() {
+                    return Err(NongenericKeyofError::InvalidCachedResult(type_));
+                }
+            }
+            Ok(cached)
         }
     }
 }

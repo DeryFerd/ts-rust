@@ -4874,7 +4874,10 @@ mod tests {
         CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore,
         DeclaredTypeHost, IntrinsicBootstrapOptions, TypeData, TypeId,
         declared::{execute_type_parameter, type_list_key},
-        keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type},
+        keyof_types::{
+            NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
+            resolve_nongeneric_keyof_type,
+        },
         links::TypeAliasLinks,
         object_members,
         signatures::IndexFlags,
@@ -6829,6 +6832,125 @@ mod tests {
             members,
         );
         assert_eq!(cache_state(context.store()), warm);
+    }
+
+    #[test]
+    fn remapped_keyof_includes_inherited_properties_and_reuses_its_cached_union() {
+        let parsed = parse_source_file(concat!(
+            "interface Base { inherited: string }\n",
+            "interface Derived { own: number }\n",
+            "interface Derived extends Base {}\n",
+            "type Getters = { [K in keyof Derived as `get${K}`]: Derived[K] };\n",
+            "type Keys = keyof Getters;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let mapped = alias_type(&parsed, &context, "Getters");
+        let keys = alias_type(&parsed, &context, "Keys");
+        let inherited = source_property(&parsed, &context, "inherited");
+        let plan = plan_nongeneric_keyof_type(context.store(), mapped).unwrap();
+        let TypeData::Union(union) = context.store().type_payload(keys).unwrap().data() else {
+            panic!("inherited mapped keys must retain their canonical literal union");
+        };
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(union.union.types.len(), 2);
+        assert!(
+            union.union.types.contains(
+                &bootstrap
+                    .cached_string_literal_type("getinherited")
+                    .unwrap()
+            )
+        );
+        assert!(
+            union
+                .union
+                .types
+                .contains(&bootstrap.cached_string_literal_type("getown").unwrap())
+        );
+
+        let warm = cache_state(context.store());
+        assert_eq!(
+            cached_nongeneric_keyof_type(context.store(), &plan),
+            Ok(Some(keys)),
+        );
+        assert_eq!(
+            resolve_nongeneric_keyof_type(context.store_mut_for_test(), &plan),
+            Ok(keys),
+        );
+        assert_eq!(cache_state(context.store()), warm);
+
+        let property = context
+            .store_mut_for_test()
+            .resolve_mapped_type_property(mapped, "getinherited", MappedTypeModifiers::NONE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .mapped_symbol_links(property.symbol())
+                .and_then(|links| links.synthetic_origin),
+            Some(inherited),
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn remapped_keyof_rejects_poisoned_and_duplicate_cached_unions() {
+        for (name_type, reuses_constraint) in [("`get${K}`", false), ("`${K}`", true)] {
+            let source = format!(
+                "interface Shape {{ first: string; second: number }}\n\
+                 type Remapped = {{ [K in keyof Shape as {name_type}]: Shape[K] }};\n\
+                 type Keys = keyof Remapped;\n",
+            );
+            let parsed = parse_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut context = checker_context(&parsed);
+            context.check_source_file(FileId::new(0)).unwrap();
+            let mapped = alias_type(&parsed, &context, "Remapped");
+            let keys = alias_type(&parsed, &context, "Keys");
+            let plan = plan_nongeneric_keyof_type(context.store(), mapped).unwrap();
+            let (constraint, owner) = {
+                let record = context.store().type_payload(mapped).unwrap();
+                let TypeData::Mapped(mapped) = record.data() else {
+                    unreachable!()
+                };
+                (mapped.constraint_type.unwrap(), record.symbol())
+            };
+            assert_eq!(keys == constraint, reuses_constraint);
+
+            let store = context.store_mut_for_test();
+            assert!(store.set_type_symbol(keys, owner));
+            let poisoned = cache_state(store);
+            assert_eq!(
+                cached_nongeneric_keyof_type(store, &plan),
+                Err(NongenericKeyofError::InvalidCachedResult(keys)),
+            );
+            assert_eq!(
+                resolve_nongeneric_keyof_type(store, &plan),
+                Err(NongenericKeyofError::InvalidCachedResult(keys)),
+            );
+            assert_eq!(cache_state(store), poisoned);
+            assert!(store.set_type_symbol(keys, None));
+            assert_eq!(cached_nongeneric_keyof_type(store, &plan), Ok(Some(keys)));
+
+            if !reuses_constraint {
+                let (object_flags, types) = {
+                    let record = store.type_payload(keys).unwrap();
+                    let TypeData::Union(union) = record.data() else {
+                        unreachable!()
+                    };
+                    (record.object_flags(), union.union.types.clone())
+                };
+                let duplicate = store.alloc_union_type(object_flags, types).unwrap();
+                let before = cache_state(store);
+                assert_eq!(
+                    cached_nongeneric_keyof_type(store, &plan),
+                    Err(NongenericKeyofError::InvalidCachedResult(duplicate)),
+                );
+                assert_eq!(cache_state(store), before);
+            }
+        }
     }
 
     #[test]
