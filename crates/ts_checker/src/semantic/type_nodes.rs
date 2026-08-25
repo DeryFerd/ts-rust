@@ -5759,6 +5759,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || self.resolve_uncached_type_reference_symbol(base).ok() != Some(alias)
             || alias_owner.flags() != SymbolFlags::TYPE_ALIAS
             || alias_owner.check_flags() != CheckFlags::NONE
+            || alias_owner.name().as_utf8() != Some("DOMFactory")
             || self.store.get_parent_of_symbol(alias) != Some(namespace)
             || alias_record.kind != SyntaxKind::TypeAliasDeclaration
             || alias_record.flags.0 != 0
@@ -5784,6 +5785,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || self.resolve_uncached_type_reference_symbol(attributes).ok() != Some(svg_attributes)
             || attributes_owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
             || attributes_owner.check_flags() != CheckFlags::NONE
+            || attributes_owner.name().as_utf8() != Some("SVGAttributes")
             || self.store.get_parent_of_symbol(svg_attributes) != Some(namespace)
             || self
                 .resolve_uncached_type_reference_symbol(nested_element)
