@@ -977,6 +977,7 @@ fn plan_javascript_expando_object_literal(
     Ok(PropertyObjectPlan {
         kind: PropertyObjectKind::ObjectLiteral,
         node,
+        const_context: false,
         declarations: vec![node],
         symbol: owner,
         members: Some(exports),
