@@ -3348,6 +3348,18 @@ mod tests {
             store
                 .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
                 .unwrap();
+            let locals = bound.locals(bound.source_file()).unwrap();
+            let mut symbols = store
+                .symbol_table(locals)
+                .unwrap()
+                .iter()
+                .map(|(name, symbol)| (name.as_bytes().to_vec(), symbol))
+                .collect::<Vec<_>>();
+            symbols.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            let globals = store.intrinsic_bootstrap().unwrap().globals;
+            for (_, symbol) in symbols {
+                store.merge_global_symbol(globals, symbol).unwrap();
+            }
             Self {
                 parsed,
                 file,
