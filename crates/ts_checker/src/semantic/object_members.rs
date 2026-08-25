@@ -1285,14 +1285,18 @@ fn declared_signature_parameter_is_optional(
         return declared_signature_parameter_is_implicit_any_rest(store, declaration, type_)
             .then_some(false);
     };
-    let question_index = annotation.node.index().checked_sub(1)?;
-    let question = NodeRef::new(
-        declaration.arena,
-        declaration.file,
-        ts_ast::NodeId::new(u32::try_from(question_index).ok()?),
-    );
-    let optional = store.source_node_kind(question) == Some(SyntaxKind::QuestionToken)
-        && store.source_node_parent(question) == Some(SourceNodeParent::Parent(declaration));
+    let previous_child = (0..annotation.node.index()).rev().find_map(|index| {
+        let index = u32::try_from(index).ok()?;
+        let node = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            ts_ast::NodeId::new(index),
+        );
+        (store.source_node_parent(node) == Some(SourceNodeParent::Parent(declaration)))
+            .then_some(node)
+    });
+    let optional = previous_child
+        .is_some_and(|node| store.source_node_kind(node) == Some(SyntaxKind::QuestionToken));
     if optional {
         let any = store.intrinsic_bootstrap()?.any_type;
         let ordinary_any =
