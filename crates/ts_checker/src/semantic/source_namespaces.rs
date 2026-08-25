@@ -1728,11 +1728,33 @@ pub(super) fn authenticated_merged_namespace_interface(
 ) -> Option<NodeRef> {
     let record = store.symbol(symbol)?;
     let declarations = record.declarations()?;
-    let owner = store.get_parent_of_symbol(symbol)?;
+    let first = *declarations.first()?;
+    let first_record = host.node(first)?;
+    let block = child(first, first_record.parent?);
+    let block_record = host.node(block)?;
+    let owner_declaration = child(block, block_record.parent?);
+    let (_, first_bound) = host.source(first)?;
+    let owner = first_bound
+        .symbol(owner_declaration)
+        .and_then(|owner| store.get_merged_symbol(owner))?;
     let owner_record = store.symbol(owner)?;
     let exports = record
         .exports()
         .and_then(|exports| store.symbol_table(exports))?;
+    let exported = owner_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get(record.name()))
+        .and_then(|export| store.get_merged_symbol(export));
+    let local = first_bound
+        .locals(owner_declaration)
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get(record.name()))
+        .and_then(|local| store.get_merged_symbol(local));
+    let owner_matches = match store.get_parent_of_symbol(symbol) {
+        Some(parent) => parent == owner && exported == Some(symbol),
+        None => record.parent().is_none() && local == Some(symbol),
+    };
     let allowed = SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE | SymbolFlags::TRANSIENT;
     if !record
         .flags()
@@ -1740,16 +1762,10 @@ pub(super) fn authenticated_merged_namespace_interface(
         || record.flags().without(allowed) != SymbolFlags::NONE
         || record.check_flags() != CheckFlags::NONE
         || record.value_declaration().is_some()
-        || record.members().is_none()
         || record.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
         || !owner_record.flags().intersects(SymbolFlags::MODULE)
-        || owner_record
-            .exports()
-            .and_then(|exports| store.symbol_table(exports))
-            .and_then(|exports| exports.get(record.name()))
-            .and_then(|export| store.get_merged_symbol(export))
-            != Some(symbol)
+        || !owner_matches
         || exports.iter().any(|(_, export)| {
             store
                 .get_merged_symbol(export)
@@ -1788,6 +1804,13 @@ pub(super) fn authenticated_merged_namespace_interface(
             || !host.symbol_matches(store, parent, owner)
             || !bound.contains(declaration)
             || arena.id() != declaration.arena
+            || record.parent().is_none()
+                && bound
+                    .locals(parent)
+                    .and_then(|locals| store.symbol_table(locals))
+                    .and_then(|locals| locals.get(record.name()))
+                    .and_then(|local| store.get_merged_symbol(local))
+                    != Some(symbol)
         {
             return None;
         }
@@ -1797,6 +1820,7 @@ pub(super) fn authenticated_merged_namespace_interface(
                 if node.kind == SyntaxKind::InterfaceDeclaration
                     && data.type_parameters.is_none()
                     && data.heritage_clauses.is_none()
+                    && (data.members.nodes.is_empty() || record.members().is_some())
                     && host
                         .node(child(declaration, data.name))
                         .is_some_and(|name| {

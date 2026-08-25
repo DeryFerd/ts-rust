@@ -10984,6 +10984,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let super::AliasTargetState::Resolved(target) = links.alias_target else {
             return None;
         };
+        let interface = authenticated_merged_namespace_interface(self.store, self.host, target)?;
         if record.flags() != SymbolFlags::ALIAS
             || record.check_flags() != CheckFlags::NONE
             || record.value_declaration().is_some()
@@ -10997,7 +10998,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || bound.symbol(declaration) != Some(alias)
             || self.store.get_merged_symbol(alias) != Some(alias)
             || links.type_only_declaration.is_some()
-            || authenticated_merged_namespace_interface(self.store, self.host, target).is_none()
         {
             return None;
         }
@@ -11039,7 +11039,22 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return None;
         }
 
-        let module = self.store.get_parent_of_symbol(target)?;
+        let interface_record = self.host.node(interface)?;
+        let module_block = NodeRef::new(interface.arena, interface.file, interface_record.parent?);
+        let module_block_record = self.host.node(module_block)?;
+        if module_block_record.kind != SyntaxKind::ModuleBlock {
+            return None;
+        }
+        let module_declaration = NodeRef::new(
+            module_block.arena,
+            module_block.file,
+            module_block_record.parent?,
+        );
+        let module = self
+            .host
+            .bound_file(interface)?
+            .symbol(module_declaration)
+            .and_then(|module| self.store.get_merged_symbol(module))?;
         let module_record = self.store.symbol(module)?;
         let exports = module_record
             .exports()
