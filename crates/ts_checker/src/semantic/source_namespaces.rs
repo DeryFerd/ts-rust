@@ -10991,8 +10991,11 @@ fn ambient_module_collision_export_is_exact(
     {
         return false;
     }
-    if record.flags() != SymbolFlags::ALIAS {
+    if !record.flags().intersects(SymbolFlags::ALIAS) {
         return true;
+    }
+    if record.flags() != SymbolFlags::ALIAS {
+        return false;
     }
 
     let Some([declaration]) = record.declarations() else {
@@ -11019,11 +11022,11 @@ fn ambient_module_collision_export_is_exact(
 
     let mut current = immediate;
     let mut seen = HashSet::new();
-    while store
-        .symbol(current)
-        .is_some_and(|record| record.flags() == SymbolFlags::ALIAS)
-    {
-        if !seen.insert(current) {
+    while let Some(record) = store.symbol(current) {
+        if !record.flags().intersects(SymbolFlags::ALIAS) {
+            break;
+        }
+        if record.flags() != SymbolFlags::ALIAS || !seen.insert(current) {
             return false;
         }
         let Some(links) = store.alias_symbol_links(current) else {
@@ -19396,6 +19399,37 @@ mod tests {
                 .store_mut_for_test()
                 .set_alias_symbol_links(reexported, original_links)
         );
+
+        let owner = context.store().get_parent_of_symbol(reexported).unwrap();
+        for forged in [reexported, imported, assignment] {
+            assert!(context.store_mut_for_test().set_symbol_flags(
+                forged,
+                SymbolFlags::ALIAS | SymbolFlags::NAMESPACE_MODULE,
+                CheckFlags::NONE,
+            ));
+            assert!(
+                !ambient_module_collision_export_is_exact(context.store(), owner, reexported),
+                "mixed alias flags bypassed collision validation for {forged:?}",
+            );
+            assert!(matches!(
+                context.recheck_source_file(second_file),
+                Err(SourceCheckError::Import(declaration)) if declaration == second_declaration
+            ));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().as_slice().to_vec(),
+                ),
+                warm,
+            );
+            assert!(context.store_mut_for_test().set_symbol_flags(
+                forged,
+                SymbolFlags::ALIAS,
+                CheckFlags::NONE,
+            ));
+        }
     }
 
     #[test]
