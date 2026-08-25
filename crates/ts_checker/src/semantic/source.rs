@@ -19317,6 +19317,11 @@ where
             .ok_or(SourceCheckError::LiteralCache(
                 SourceLiteralCacheError::BootstrapUninitialized,
             )),
+        (PlannedExpressionKind::Identifier(read), PreparedExpression::Identifier(_))
+            if read.kind == PlannedIdentifierReadKind::Unresolved =>
+        {
+            check_nested_expression(store, expression, None)
+        }
         (PlannedExpressionKind::Identifier(read), PreparedExpression::Identifier(treatment)) => {
             let raw = *current_flow_types
                 .get(&read.value_symbol)

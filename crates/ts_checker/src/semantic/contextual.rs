@@ -23,8 +23,8 @@ use super::{
     object_members::PlannedProperty,
     relater::ResolvedDeclaredPropertyObject,
     source::{
-        PlannedExpression, PlannedExpressionKind, SourceCheckError, SourceSyntaxRole,
-        UnsupportedSourceSyntax,
+        PlannedExpression, PlannedExpressionKind, PlannedIdentifierReadKind, SourceCheckError,
+        SourceSyntaxRole, UnsupportedSourceSyntax,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -436,6 +436,11 @@ fn prepare_expression(
         | PlannedExpressionKind::GlobalUndefined
         | PlannedExpressionKind::RegularExpression(_) => {
             PreparedExpression::Literal(LiteralTreatment::Identity)
+        }
+        PlannedExpressionKind::Identifier(read)
+            if read.kind == PlannedIdentifierReadKind::Unresolved =>
+        {
+            PreparedExpression::Identifier(LiteralTreatment::Identity)
         }
         PlannedExpressionKind::Identifier(read) => {
             PreparedExpression::Identifier(identifier_treatment(
