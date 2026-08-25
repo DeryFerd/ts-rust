@@ -2190,12 +2190,24 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .declared_type
             .find_key(|owner| {
                 self.symbol(*owner).is_some_and(|interface| {
-                    interface
-                        .flags()
-                        .contains(SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE)
+                    interface.flags().contains(SymbolFlags::INTERFACE)
                         && interface
                             .declarations()
                             .is_some_and(|declarations| declarations.contains(&owner_declaration))
+                        && (interface.flags().contains(SymbolFlags::NAMESPACE_MODULE)
+                            || self.get_parent_of_symbol(*owner).is_some_and(|namespace| {
+                                self.symbol(namespace).is_some_and(|record| {
+                                    record.flags().intersects(SymbolFlags::NAMESPACE)
+                                        && record.check_flags() == CheckFlags::NONE
+                                        && self.get_merged_symbol(namespace) == Some(namespace)
+                                        && record
+                                            .exports()
+                                            .and_then(|exports| self.symbol_table(exports))
+                                            .and_then(|exports| exports.get(interface.name()))
+                                            .and_then(|export| self.get_merged_symbol(export))
+                                            == Some(*owner)
+                                })
+                            }))
                 })
             })
             .copied()?;

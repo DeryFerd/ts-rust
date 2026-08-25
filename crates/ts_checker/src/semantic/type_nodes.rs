@@ -39328,6 +39328,33 @@ mod tests {
             );
             assert_eq!(function_store_state(&fixture.store), warm);
         }
+
+        let namespace = fixture.store.get_parent_of_symbol(contract).unwrap();
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(exports, EscapedName::source("Contract"), method),
+            Some(Some(contract)),
+        );
+        let poisoned = function_store_state(&fixture.store);
+        assert!(matches!(
+            query_signature_return(&mut fixture, method_signature, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(signature),
+            )) if signature == method_signature
+        ));
+        assert_eq!(function_store_state(&fixture.store), poisoned);
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(exports, EscapedName::source("Contract"), contract),
+            Some(Some(method)),
+        );
+        assert_eq!(
+            query_signature_return(&mut fixture, method_signature, &mut diagnostics),
+            Ok(type_parameter),
+        );
         assert!(diagnostics.is_empty());
     }
 
