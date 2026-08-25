@@ -8913,7 +8913,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && target.exports().is_none()
             && target.parent().is_none()
             && target.export_symbol().is_none()
-            && target_declarations == &[target_declaration]
+            && target_declarations == [target_declaration]
             && self
                 .value_import_bindings
                 .get(&target_symbol)
@@ -12330,7 +12330,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     SourceSyntaxRole::VariableInitializer,
                 ));
             }
-        };
+        }
         let Some(condition_expectation) = self.conditional_scalar_expectation(&condition)? else {
             return Err(self.unsupported(
                 condition_target.node,
@@ -13005,14 +13005,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let const_assertion = self.is_const_assertion_type(type_node)?;
         let operand = self.plan_expression(operand)?;
-        let supported_const_operand = match &operand.unparenthesized().kind {
+        let supported_const_operand = matches!(
+            &operand.unparenthesized().kind,
             PlannedExpressionKind::String(_)
-            | PlannedExpressionKind::Number { .. }
-            | PlannedExpressionKind::BigInt { .. }
-            | PlannedExpressionKind::Boolean(_)
-            | PlannedExpressionKind::Object { .. } => true,
-            _ => false,
-        };
+                | PlannedExpressionKind::Number { .. }
+                | PlannedExpressionKind::BigInt { .. }
+                | PlannedExpressionKind::Boolean(_)
+                | PlannedExpressionKind::Object { .. }
+        );
         if const_assertion && !supported_const_operand {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::ConstAssertion(expression),
@@ -16119,7 +16119,7 @@ fn check_expression_type(
     {
         let declaration = store
             .symbol(read.value_symbol)
-            .and_then(|symbol| symbol.value_declaration())
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
             .ok_or(SourceCheckError::Variable(
                 VariableInvariant::InvalidSymbolShape(read.value_symbol),
             ))?;
@@ -17684,7 +17684,14 @@ fn validate_conditional_scalar_expectation(
     match expectation {
         ConditionalScalarExpectation::Exact {
             type_: expected, ..
-        } if type_ == expected => Ok(()),
+        }
+        | ConditionalScalarExpectation::Fixed(expected) => {
+            if type_ == expected {
+                Ok(())
+            } else {
+                Err(SourceCheckError::Conditional(expression.node))
+            }
+        }
         ConditionalScalarExpectation::Literal(family) => {
             let expected = match family {
                 ConditionalScalarFamily::String => TypeFlags::STRING_LITERAL,
@@ -17700,13 +17707,6 @@ fn validate_conditional_scalar_expectation(
             } else {
                 Err(SourceCheckError::Conditional(expression.node))
             }
-        }
-        ConditionalScalarExpectation::Exact { .. } => {
-            Err(SourceCheckError::Conditional(expression.node))
-        }
-        ConditionalScalarExpectation::Fixed(expected) if type_ == expected => Ok(()),
-        ConditionalScalarExpectation::Fixed(_) => {
-            Err(SourceCheckError::Conditional(expression.node))
         }
         ConditionalScalarExpectation::Dynamic => Ok(()),
         ConditionalScalarExpectation::Object
@@ -26233,7 +26233,7 @@ pub(super) fn check_source_file(
                     {
                         let first_declaration = store
                             .symbol(variable.symbol)
-                            .and_then(|symbol| symbol.value_declaration())
+                            .and_then(ts_binder::semantic::Symbol::value_declaration)
                             .ok_or(SourceCheckError::Variable(
                                 VariableInvariant::InvalidSymbolShape(variable.symbol),
                             ))?;
