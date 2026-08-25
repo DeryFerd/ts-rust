@@ -43,6 +43,40 @@ fn canonical_program_binds_javascript_scripts_and_es_modules() {
 }
 
 #[test]
+fn canonical_program_checks_javascript_arrow_expandos() {
+    for binding in ["var", "let", "const"] {
+        let filesystem = MemoryFileSystem::new(true);
+        filesystem
+            .write_file(
+                "/project/input.js",
+                &format!(
+                    "{binding} callback = () => {{}};\n\
+                     callback.value = 1;\n\
+                     const copied = callback.value;\n"
+                ),
+            )
+            .unwrap();
+        let mut options = javascript_options();
+        options.check_js = true;
+
+        let program = Program::try_new_with_canonical_checker(
+            &filesystem,
+            "/project",
+            &["input.js".to_owned()],
+            options,
+        )
+        .unwrap_or_else(|error| panic!("failed to check {binding} arrow expando: {error:?}"));
+
+        assert!(
+            program.diagnostics().is_empty(),
+            "{binding}: {:?}",
+            program.diagnostics(),
+        );
+        assert!(program.source_file("/project/input.js").is_some());
+    }
+}
+
+#[test]
 fn unchecked_javascript_es_modules_share_one_bundler_graph() {
     let filesystem = MemoryFileSystem::new(true);
     filesystem

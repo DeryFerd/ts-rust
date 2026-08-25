@@ -872,17 +872,16 @@ impl CommonJsAssignmentPlanner<'_> {
         }))
     }
 
-    #[allow(clippy::too_many_lines)] // Authenticate the assignment, arrow, and source const.
+    #[allow(clippy::too_many_lines)] // Authenticate the assignment, arrow, and source variable.
     fn plan_arrow_expando(
         &self,
         statement: NodeRef,
     ) -> Result<Option<ArrowExpandoAssignmentPlan>, AssignmentPlanError> {
         self.preflight_program()?;
-        if self
-            .bound
-            .source_facts()
-            .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
-        {
+        let Some(facts) = self.bound.source_facts() else {
+            return Ok(None);
+        };
+        if facts.is_declaration_file() {
             return Ok(None);
         }
 
@@ -1077,8 +1076,7 @@ impl CommonJsAssignmentPlanner<'_> {
         let NodeData::VariableDeclaration(variable_data) = &variable_node.data else {
             return Err(AssignmentInvariant::InvalidSymbolShape(variable_symbol).into());
         };
-        if variable.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
-            || variable_data.type_.is_some()
+        if variable_data.type_.is_some()
             || variable_data.initializer != Some(arrow.node)
             || self.node(arrow)?.parent != Some(variable_declaration.node)
         {
@@ -1097,7 +1095,15 @@ impl CommonJsAssignmentPlanner<'_> {
         let NodeData::VariableDeclarationList(list_data) = &list_node.data else {
             return Err(AssignmentInvariant::InvalidDeclarationList(list).into());
         };
-        if list_node.flags.0 != NODE_FLAG_CONST
+        let binding_matches = if facts.is_javascript_file() {
+            variable.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE && list_node.flags.0 == 0
+                || variable.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    && matches!(list_node.flags.0, NODE_FLAG_LET | NODE_FLAG_CONST)
+        } else {
+            variable.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+                && list_node.flags.0 == NODE_FLAG_CONST
+        };
+        if !binding_matches
             || list_data.declarations.nodes.as_slice() != [variable_declaration.node]
         {
             return Err(AssignmentPlanError::Unsupported(
@@ -3621,6 +3627,52 @@ mod tests {
             })),
         );
         assert_eq!(observable_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn plans_javascript_arrow_expandos_for_all_ordinary_variable_bindings() {
+        for source in [
+            "var callback = () => {}; callback.value = 1;",
+            "let callback = () => {}; callback.value = 1;",
+            "const callback = () => {}; callback.value = 1;",
+        ] {
+            let fixture = Fixture::javascript(source);
+            let statement = fixture.expression_statement(0);
+            let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+            let NodeData::PropertyAccessExpression(access) =
+                &fixture.parsed.arena.get(left.node).unwrap().data
+            else {
+                panic!("expected callback.value property access")
+            };
+            let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, access.expression);
+            let declaration = fixture.variable_declaration("callback");
+            let NodeData::VariableDeclaration(variable) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected callback variable declaration")
+            };
+            let arrow = NodeRef::new(
+                fixture.parsed.arena.id(),
+                fixture.file,
+                variable.initializer.unwrap(),
+            );
+            let before = observable_state(&fixture.store);
+
+            assert_eq!(
+                fixture.arrow_expando_plan(0),
+                Ok(Some(ArrowExpandoAssignmentPlan {
+                    expression,
+                    left,
+                    right,
+                    receiver,
+                    variable_symbol: fixture.bound.symbol(declaration).unwrap(),
+                    owner_symbol: fixture.bound.symbol(arrow).unwrap(),
+                    property_symbol: fixture.bound.symbol(expression).unwrap(),
+                })),
+                "{source}",
+            );
+            assert_eq!(observable_state(&fixture.store), before, "{source}");
+        }
     }
 
     #[test]

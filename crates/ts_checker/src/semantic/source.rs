@@ -41596,11 +41596,14 @@ pub(super) fn check_source_file(
                     assignment.property_symbol,
                     property_type,
                 )?;
-                if store
-                    .symbol(assignment.owner_symbol)
-                    .and_then(ts_binder::semantic::Symbol::value_declaration)
-                    .and_then(|declaration| store.source_node_kind(declaration))
-                    == Some(SyntaxKind::FunctionDeclaration)
+                if bound
+                    .source_facts()
+                    .is_some_and(|facts| facts.is_javascript_file())
+                    || store
+                        .symbol(assignment.owner_symbol)
+                        .and_then(ts_binder::semantic::Symbol::value_declaration)
+                        .and_then(|declaration| store.source_node_kind(declaration))
+                        == Some(SyntaxKind::FunctionDeclaration)
                 {
                     let links = ValueSymbolLinks {
                         resolved_type: Some(property_type),
@@ -69089,6 +69092,101 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_arrow_expandos_preserve_properties_across_variable_bindings() {
+        for (index, source_text) in [
+            "var callback = () => {}; callback.value = 1; const copied = callback.value;",
+            "let callback = () => {}; callback.value = 1; const copied = callback.value;",
+            "const callback = () => {}; callback.value = 1; const copied = callback.value;",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parse_javascript_source_file(source_text);
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let file = FileId::new(8_450 + u32::try_from(index).unwrap());
+            let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+            context.check_source_file(file).unwrap();
+
+            let arrow = variable_initializer(&source, file, "callback");
+            let variable = variable_symbol(&context, &source, file, "callback");
+            let (left, right) = assignment_parts(&source, file, 0);
+            let expression = NodeRef::new(
+                source.arena.id(),
+                file,
+                source.arena.get(left.node).unwrap().parent.unwrap(),
+            );
+            let NodeData::PropertyAccessExpression(access) =
+                &source.arena.get(left.node).unwrap().data
+            else {
+                panic!("expected callback.value property access")
+            };
+            let receiver = NodeRef::new(source.arena.id(), file, access.expression);
+            let (_, bound) = context.file(file).unwrap();
+            let owner = bound.symbol(arrow).unwrap();
+            let property = bound.symbol(expression).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::exports)
+                    .and_then(|exports| context.store().symbol_table(exports))
+                    .and_then(|exports| exports.get_source("value")),
+                Some(property),
+            );
+            assert_eq!(
+                context.store().symbol(property).unwrap().flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT,
+            );
+
+            let callable = variable_value_type(&context, &source, file, "callback");
+            assert_eq!(
+                context.store().source_callable_type_for_owner(owner),
+                Some(callable),
+            );
+            assert_eq!(resolved_node_type(&context, receiver), callable);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(receiver)
+                    .and_then(|links| links.resolved_symbol),
+                Some(variable),
+            );
+
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(property)
+                    .and_then(|links| links.resolved_type),
+                Some(number),
+            );
+            assert_eq!(resolved_node_type(&context, left), number);
+            assert_eq!(
+                resolved_node_type(&context, expression),
+                resolved_node_type(&context, right),
+            );
+            assert_eq!(
+                variable_value_type(&context, &source, file, "copied"),
+                number,
+            );
+            let copied = variable_initializer(&source, file, "copied");
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(copied)
+                    .and_then(|links| links.resolved_symbol),
+                Some(property),
+            );
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]
