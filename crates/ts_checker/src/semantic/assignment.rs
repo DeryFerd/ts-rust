@@ -58,7 +58,7 @@ pub(super) struct CommonJsAssignmentPlan {
     pub(super) target_symbol: SemanticSymbolId,
 }
 
-/// One binder-authenticated property assignment on a preceding source arrow.
+/// One binder-authenticated property assignment on a preceding source callable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ArrowExpandoAssignmentPlan {
     pub(super) expression: NodeRef,
@@ -364,7 +364,7 @@ pub(super) fn plan_commonjs_named_assignment(
     .plan_named(statement)
 }
 
-/// Authenticates `arrow.property = value` against its original binder symbols.
+/// Authenticates source arrow/function-expression expandos against binder symbols.
 pub(super) fn plan_arrow_expando_assignment(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -1842,7 +1842,7 @@ impl CommonJsAssignmentPlanner<'_> {
         }))
     }
 
-    #[allow(clippy::too_many_lines)] // Authenticate the assignment, arrow, and source variable.
+    #[allow(clippy::too_many_lines)] // Authenticate the assignment, callable, and source variable.
     fn plan_arrow_expando(
         &self,
         statement: NodeRef,
@@ -1959,7 +1959,10 @@ impl CommonJsAssignmentPlanner<'_> {
         let Some(arrow) = owner.value_declaration() else {
             return Ok(None);
         };
-        if self.store.source_node_kind(arrow) != Some(SyntaxKind::ArrowFunction) {
+        if !matches!(
+            self.store.source_node_kind(arrow),
+            Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression)
+        ) {
             return Ok(None);
         }
 
@@ -4695,6 +4698,50 @@ mod tests {
                 "{source}",
             );
             assert_eq!(observable_state(&fixture.store), before, "{source}");
+        }
+    }
+
+    #[test]
+    fn anonymous_function_expression_expandos_keep_their_binder_owned_property() {
+        for fixture in [
+            Fixture::new("const callback = function () {}; callback.value = 1; export {};"),
+            Fixture::javascript("var callback = function () {}; callback.value = 1;"),
+            Fixture::javascript("const callback = function () {}; callback.value = 1;"),
+        ] {
+            let statement = fixture.expression_statement(0);
+            let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+            let NodeData::PropertyAccessExpression(access) =
+                &fixture.parsed.arena.get(left.node).unwrap().data
+            else {
+                panic!("expected the anonymous function expando property")
+            };
+            let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, access.expression);
+            let declaration = fixture.variable_declaration("callback");
+            let NodeData::VariableDeclaration(variable) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected the anonymous function variable")
+            };
+            let function = NodeRef::new(
+                fixture.parsed.arena.id(),
+                fixture.file,
+                variable.initializer.unwrap(),
+            );
+            let before = observable_state(&fixture.store);
+
+            assert_eq!(
+                fixture.arrow_expando_plan(0),
+                Ok(Some(ArrowExpandoAssignmentPlan {
+                    expression,
+                    left,
+                    right,
+                    receiver,
+                    variable_symbol: fixture.bound.symbol(declaration).unwrap(),
+                    owner_symbol: fixture.bound.symbol(function).unwrap(),
+                    property_symbol: fixture.bound.symbol(expression).unwrap(),
+                })),
+            );
+            assert_eq!(observable_state(&fixture.store), before);
         }
     }
 

@@ -971,7 +971,7 @@ pub(super) fn source_function_owner_expando_exports_are_valid(
     })
 }
 
-/// Validates retained arrow expando ownership without borrowing source arenas.
+/// Validates arrow/function-expression expando ownership without source arenas.
 pub(super) fn source_arrow_owner_expando_exports_are_valid(
     store: &CanonicalTypeMapperStore,
     owner_symbol: SemanticSymbolId,
@@ -1000,7 +1000,10 @@ pub(super) fn source_arrow_owner_expando_exports_are_valid(
         return false;
     };
     if exports.is_empty()
-        || store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+        || !matches!(
+            store.source_node_kind(declaration),
+            Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression)
+        )
         || store.source_node_kind(variable) != Some(SyntaxKind::VariableDeclaration)
         || store.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
         || store.source_node_kind(variable_statement) != Some(SyntaxKind::VariableStatement)
@@ -8389,9 +8392,7 @@ pub(super) fn materialize_anonymous_source_function_expression(
         || plan.min_argument_count != 0
         || plan.owner_parent.is_some()
         || plan.export_local.is_some()
-        || store
-            .symbol(plan.owner_symbol)
-            .is_none_or(|owner| owner.exports().is_some())
+        || !source_arrow_owner_expando_exports_are_valid(store, plan.owner_symbol, plan.declaration)
     {
         return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
             plan.declaration,
@@ -11307,12 +11308,21 @@ mod tests {
 
     #[test]
     fn anonymous_function_expressions_preserve_binder_ownership_and_warm_signatures() {
-        for (index, javascript) in [false, true].into_iter().enumerate() {
+        for (index, (javascript, expando)) in
+            [(false, false), (true, false), (false, true), (true, true)]
+                .into_iter()
+                .enumerate()
+        {
             let file = FileId::new(1_900 + u32::try_from(index).unwrap());
-            let mut fixture = if javascript {
-                QueryFixture::javascript("const value = function () {};", file)
+            let source = if expando {
+                "const value = function () {}; value.member = 1;"
             } else {
-                QueryFixture::new("const value = function () {};", file)
+                "const value = function () {};"
+            };
+            let mut fixture = if javascript {
+                QueryFixture::javascript(source, file)
+            } else {
+                QueryFixture::new(source, file)
             };
             let declaration = fixture
                 .parsed

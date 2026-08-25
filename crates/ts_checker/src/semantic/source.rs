@@ -77081,6 +77081,7 @@ class Foo2 {
     fn function_expando_empty_arrays_report_implicit_any_at_the_property() {
         for (index, source_text) in [
             "function work() {} work.items = []; export {};",
+            "const work = function () {}; work.items = []; export {};",
             "const work = () => {}; work.items = []; export {};",
         ]
         .into_iter()
