@@ -18170,6 +18170,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         expression: NodeRef,
     ) -> Result<PlannedExpression, SourceCheckError> {
         let mut root = expression;
+        let mut asserted = false;
         while let Some(parent) = self.node(root)?.parent.map(|node| self.reference(node)) {
             let parent_node = self.node(parent)?;
             match &parent_node.data {
@@ -18184,11 +18185,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 {
                     root = parent;
                 }
-                NodeData::AsExpression(assertion) if assertion.expression == root.node => {
+                NodeData::AsExpression(assertion)
+                    if parent_node.kind == SyntaxKind::AsExpression
+                        && assertion.expression == root.node =>
+                {
                     root = parent;
+                    asserted = true;
                 }
-                NodeData::TypeAssertion(assertion) if assertion.expression == root.node => {
+                NodeData::TypeAssertion(assertion)
+                    if parent_node.kind == SyntaxKind::TypeAssertionExpression
+                        && assertion.expression == root.node =>
+                {
                     root = parent;
+                    asserted = true;
                 }
                 NodeData::SatisfiesExpression(assertion) if assertion.expression == root.node => {
                     root = parent;
@@ -18214,7 +18223,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let (contextual, direct_return) = match &owner_record.data {
             NodeData::VariableDeclaration(variable)
                 if owner_record.kind == SyntaxKind::VariableDeclaration
-                    && variable.initializer == Some(root.node) =>
+                    && variable.initializer == Some(root.node)
+                    && !asserted =>
             {
                 (variable.type_.is_some(), false)
             }
@@ -76204,6 +76214,125 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn asserted_conditional_returns_preserve_casts_without_branch_diagnostics() {
+        let source = parsed(concat!(
+            "function asserted(value: boolean): string {\n",
+            "  return (value ? 'ready' : 1) as string;\n",
+            "}\n",
+            "function angle(value: boolean): string {\n",
+            "  return <string>(value ? 'ready' : 1);\n",
+            "}\n",
+            "const concise = (value: boolean): string => ",
+            "(value ? 'ready' : 1) as string;\n",
+            "const blocked = (value: boolean): string => {\n",
+            "  return <string>(value ? 'ready' : 1);\n",
+            "};\n",
+        ));
+        let file = FileId::new(4_821);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let mut assertions = 0;
+        for (node, record) in source.arena.iter() {
+            if !matches!(
+                record.kind,
+                SyntaxKind::AsExpression | SyntaxKind::TypeAssertionExpression
+            ) {
+                continue;
+            }
+            assertions += 1;
+            let assertion = NodeRef::new(source.arena.id(), file, node);
+            assert_eq!(resolved_node_type(&context, assertion), string);
+            let operand = context
+                .store()
+                .assertion_links(assertion)
+                .and_then(|links| links.expr_type)
+                .expect("the assertion must retain its conditional operand");
+            assert!(
+                context
+                    .store()
+                    .type_payload(operand)
+                    .is_some_and(|record| record.flags().intersects(TypeFlags::UNION))
+            );
+        }
+        assert_eq!(assertions, 4);
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn asserted_conditionals_do_not_suppress_unasserted_return_branch_errors() {
+        let source = parsed(concat!(
+            "function direct(value: boolean): string {\n",
+            "  return value ? 'ready' : 1;\n",
+            "}\n",
+            "function asserted(value: boolean): string {\n",
+            "  return (value ? 'ready' : 2) as string;\n",
+            "}\n",
+            "const directArrow = (value: boolean): string => ",
+            "value ? 'ready' : 3;\n",
+            "const assertedArrow = (value: boolean): string => ",
+            "(value ? 'ready' : 4) as string;\n",
+        ));
+        let file = FileId::new(4_822);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, expected) in diagnostics.iter().zip(["1", "3"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), expected);
+            assert_eq!(diagnostic.diagnostic.arguments, ["number", "string"]);
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn asserted_conditional_variable_initializers_remain_unsupported() {
+        let source = parsed(concat!(
+            "const condition: boolean = true; ",
+            "const selected = (condition ? 1 : 2) as number;",
+        ));
+        let file = FileId::new(4_823);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let conditional = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ConditionalExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let before = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    node: conditional,
+                    kind: SyntaxKind::ConditionalExpression,
+                    role: SourceSyntaxRole::VariableInitializer,
+                }
+            )),
+        );
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
