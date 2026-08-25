@@ -6406,7 +6406,7 @@ mod tests {
                     .and_then(|links| links.resolved_type)
                     .expect("Boolean's object argument must preserve its resolved object type");
                 assert!(matches!(
-                    store.type_payload(object_type).map(TypeRecord::data),
+                    store.type_payload(object_type).map(|record| record.data()),
                     Some(TypeData::Object(_)),
                 ));
             }
