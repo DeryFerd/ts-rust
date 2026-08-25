@@ -7543,7 +7543,20 @@ impl<'a> Parser<'a> {
         }
         if matches!(
             self.current.kind,
-            SyntaxKind::VarKeyword | SyntaxKind::ConstKeyword
+            SyntaxKind::VarKeyword
+                | SyntaxKind::ConstKeyword
+                | SyntaxKind::ReturnKeyword
+                | SyntaxKind::ThrowKeyword
+                | SyntaxKind::IfKeyword
+                | SyntaxKind::DoKeyword
+                | SyntaxKind::WhileKeyword
+                | SyntaxKind::ForKeyword
+                | SyntaxKind::SwitchKeyword
+                | SyntaxKind::TryKeyword
+                | SyntaxKind::BreakKeyword
+                | SyntaxKind::ContinueKeyword
+                | SyntaxKind::DebuggerKeyword
+                | SyntaxKind::WithKeyword
         ) || self.current.kind == SyntaxKind::LetKeyword && self.is_let_declaration()
         {
             return self.parse_arrow_body_with_missing_open_brace();
@@ -12676,6 +12689,71 @@ mod tests {
                 (Some(1005), end, end, "'}' expected."),
             ]
         );
+    }
+
+    #[test]
+    fn missing_arrow_body_braces_recover_control_flow_statements_with_exact_ranges() {
+        for (statement, keyword, expected_kind) in [
+            ("return 1;", "return", SyntaxKind::ReturnStatement),
+            ("throw 1;", "throw", SyntaxKind::ThrowStatement),
+            ("if (true) { return 1; }", "if", SyntaxKind::IfStatement),
+            (
+                "while (true) { break; }",
+                "while",
+                SyntaxKind::WhileStatement,
+            ),
+            ("for (;;) { break; }", "for", SyntaxKind::ForStatement),
+            (
+                "switch (1) { default: break; }",
+                "switch",
+                SyntaxKind::SwitchStatement,
+            ),
+            ("try {} catch {}", "try", SyntaxKind::TryStatement),
+        ] {
+            let source = format!("var value = () => {statement}}}; var after = 2;");
+            let result = parse_source_file(&source);
+            let start = u32::try_from(source.find(statement).unwrap()).unwrap();
+            let end = start + u32::try_from(keyword.len()).unwrap();
+            assert_eq!(
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                        diagnostic.message.as_str(),
+                    ))
+                    .collect::<Vec<_>>(),
+                [(Some(1005), start, end, "'{' expected.")],
+                "{source}"
+            );
+
+            let statements = source_statements(&result);
+            assert_eq!(statements.len(), 2, "{source}");
+            let (list, _) = variable_list(&result, statements[0]);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected the arrow's variable declaration");
+            };
+            let arrow_node = declaration.initializer.unwrap();
+            let NodeData::ArrowFunction(arrow) = &result.arena.get(arrow_node).unwrap().data else {
+                panic!("expected an arrow with a recovered block body");
+            };
+            let block_node = result.arena.get(arrow.body).unwrap();
+            let NodeData::Block(block) = &block_node.data else {
+                panic!("expected the recovered arrow block");
+            };
+            let [recovered] = block.statements.nodes.as_slice() else {
+                panic!("expected exactly one recovered control-flow statement");
+            };
+            let recovered = result.arena.get(*recovered).unwrap();
+            assert_eq!(block_node.parent, Some(arrow_node), "{source}");
+            assert_eq!(recovered.parent, Some(arrow.body), "{source}");
+            assert_eq!(recovered.kind, expected_kind, "{source}");
+        }
     }
 
     #[test]
