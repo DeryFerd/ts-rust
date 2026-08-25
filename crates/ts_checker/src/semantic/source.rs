@@ -22,7 +22,7 @@
 //! rest elements, nested object properties, empty patterns, and omitted array positions,
 //! immutable `using` and `await using` resource declarations,
 //! annotated uninitialized non-exported mutable top-level variables,
-//! exact top-level lexical blocks containing a forward read of one numeric const,
+//! exact top-level lexical blocks containing a forward read or omitted array bindings,
 //! top-level `for...in` loops with one lexical binding and expression statements,
 //! top-level `for...of` loops with one const binding and one direct call,
 //! function-owned `for`, `for...in`, `for...of`, and condition loops with lexical captures,
@@ -1716,9 +1716,23 @@ struct TopLevelLexicalBlockSyntax {
 }
 
 #[derive(Clone, Debug)]
-struct PlannedTopLevelLexicalBlock {
-    read: PlannedExpression,
-    variable: PlannedVariable,
+struct TopLevelLexicalArrayBlockSyntax {
+    pattern: NodeRef,
+    initializer: NodeRef,
+    bindings: Vec<PlannedArrayBindingElement>,
+    trailing: Option<(NodeRef, NodeRef, SemanticSymbolId)>,
+}
+
+#[derive(Clone, Debug)]
+enum PlannedTopLevelLexicalBlock {
+    ForwardRead {
+        read: PlannedExpression,
+        variable: PlannedVariable,
+    },
+    ArrayBindings {
+        array: PlannedArrayVariable,
+        trailing: Option<PlannedVariable>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4242,6 +4256,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         block: NodeRef,
     ) -> Result<PlannedTopLevelLexicalBlock, SourceCheckError> {
+        if let Some(syntax) = self.top_level_lexical_array_block_syntax(block)? {
+            return self.plan_top_level_lexical_array_block(syntax);
+        }
         let syntax = self.top_level_lexical_block_syntax(block)?;
         let prior_variables = self.prior_variables.clone();
         let readable_variables = self.readable_variables.clone();
@@ -4269,10 +4286,436 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     VariableInvariant::InvalidSymbolShape(syntax.symbol),
                 ));
             }
-            Ok(PlannedTopLevelLexicalBlock { read, variable })
+            Ok(PlannedTopLevelLexicalBlock::ForwardRead { read, variable })
         })();
         self.prior_variables = prior_variables;
         self.readable_variables = readable_variables;
+        result
+    }
+
+    fn top_level_lexical_array_block_syntax(
+        &self,
+        block: NodeRef,
+    ) -> Result<Option<TopLevelLexicalArrayBlockSyntax>, SourceCheckError> {
+        let source = self.source.node_ref();
+        let record = self.node(block)?;
+        let NodeData::Block(data) = &record.data else {
+            return Ok(None);
+        };
+        let Some(first) = data.statements.nodes.first().copied() else {
+            return Ok(None);
+        };
+        let first = self.reference(first);
+        let first_record = self.node(first)?;
+        let NodeData::VariableStatement(first_data) = &first_record.data else {
+            return Ok(None);
+        };
+        let list = self.reference(first_data.declaration_list);
+        let list_record = self.node(list)?;
+        let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+            return Ok(None);
+        };
+        let [declaration] = declarations.declarations.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let declaration = self.reference(*declaration);
+        let declaration_record = self.node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Ok(None);
+        };
+        let pattern = self.reference(variable.name);
+        let pattern_record = self.node(pattern)?;
+        let NodeData::BindingPattern(elements) = &pattern_record.data else {
+            return Ok(None);
+        };
+        if pattern_record.kind != SyntaxKind::ArrayBindingPattern {
+            return Ok(None);
+        }
+
+        let unsupported =
+            || self.unsupported(block, SyntaxKind::Block, SourceSyntaxRole::Statement);
+        let initializer = variable
+            .initializer
+            .map(|node| self.reference(node))
+            .ok_or_else(unsupported)?;
+        let initializer_record = self.node(initializer)?;
+        let NodeData::Identifier(initializer_name) = &initializer_record.data else {
+            return Err(unsupported());
+        };
+        if record.flags.0 != 0
+            || record.parent != Some(source.node)
+            || data.flow_node.is_some()
+            || data.next_container.is_some()
+            || data.statements.has_trailing_comma
+            || data.facts != 0
+            || data.statements.nodes.len() > 2
+            || self.bound.container(block) != Some(source)
+            || self.bound.block_scope_container(block) != Some(source)
+            || self
+                .bound
+                .source_facts()
+                .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+            || first_record.kind != SyntaxKind::VariableStatement
+            || first_record.flags.0 != 0
+            || first_record.parent != Some(block.node)
+            || first_data.modifiers.is_some()
+            || first_data.flow_node.is_some()
+            || first_data.facts != 0
+            || list_record.kind != SyntaxKind::VariableDeclarationList
+            || list_record.flags.0 != NODE_FLAG_LET
+            || list_record.parent != Some(first.node)
+            || declarations.declarations.range != list_record.range
+            || declarations.declarations.has_trailing_comma
+            || declarations.facts != 0
+            || declaration_record.kind != SyntaxKind::VariableDeclaration
+            || declaration_record.flags.0 != 0
+            || declaration_record.parent != Some(list.node)
+            || variable.exclamation_token.is_some()
+            || variable.local_symbol.is_some()
+            || variable.symbol.is_some()
+            || variable.type_.is_some()
+            || variable.facts != 0
+            || self.bound.symbol(declaration).is_some()
+            || self.bound.local_symbol(declaration).is_some()
+            || pattern_record.flags.0 != 0
+            || pattern_record.parent != Some(declaration.node)
+            || elements.elements.nodes.is_empty()
+            || elements.elements.range != pattern_record.range
+            || elements.facts != 0
+            || initializer_record.kind != SyntaxKind::Identifier
+            || initializer_record.flags.0 != 0
+            || initializer_record.parent != Some(declaration.node)
+            || initializer_name.flow_node.is_some()
+            || initializer_name.text.is_empty()
+            || [first, list, declaration, pattern, initializer]
+                .into_iter()
+                .any(|node| {
+                    self.bound.container(node) != Some(source)
+                        || self.bound.block_scope_container(node) != Some(block)
+                })
+        {
+            return Err(unsupported());
+        }
+
+        let Some((store, _)) = self.semantic else {
+            return Err(unsupported());
+        };
+        let locals = self
+            .bound
+            .locals(block)
+            .and_then(|locals| store.symbol_table(locals))
+            .ok_or_else(unsupported)?;
+        let mut bindings = Vec::with_capacity(elements.elements.nodes.len());
+        let mut omitted = false;
+        for (index, element) in elements.elements.nodes.iter().enumerate() {
+            let element = self.reference(*element);
+            let element_record = self.node(element)?;
+            if element_record.flags.0 != 0
+                || element_record.parent != Some(pattern.node)
+                || element_record.range.start < pattern_record.range.start
+                || element_record.range.end > pattern_record.range.end
+                || self.bound.container(element) != Some(source)
+                || self.bound.block_scope_container(element) != Some(block)
+                || self.bound.local_symbol(element).is_some()
+            {
+                return Err(unsupported());
+            }
+            if matches!(&element_record.data, NodeData::OmittedExpression(_)) {
+                if element_record.kind != SyntaxKind::OmittedExpression
+                    || element_record.range.start != element_record.range.end
+                    || self.bound.symbol(element).is_some()
+                {
+                    return Err(unsupported());
+                }
+                omitted = true;
+                continue;
+            }
+
+            let NodeData::BindingElement(binding) = &element_record.data else {
+                return Err(unsupported());
+            };
+            let name = binding
+                .name
+                .map(|node| self.reference(node))
+                .ok_or_else(unsupported)?;
+            let name_record = self.node(name)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(unsupported());
+            };
+            if element_record.kind != SyntaxKind::BindingElement
+                || binding.dot_dot_dot_token.is_some()
+                || binding.flow_node.is_some()
+                || binding.initializer.is_some()
+                || binding.local_symbol.is_some()
+                || binding.property_name.is_some()
+                || binding.symbol.is_some()
+                || binding.facts != 0
+                || name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(element.node)
+                || name_record.range != element_record.range
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+                || self.bound.container(name) != Some(source)
+                || self.bound.block_scope_container(name) != Some(block)
+            {
+                return Err(unsupported());
+            }
+            let symbol = plan_top_level_variable(
+                self.bound,
+                store,
+                element,
+                name,
+                &identifier.text,
+                VariableBindingKind::Let,
+                false,
+            )
+            .map_err(Self::variable_plan_error)?;
+            if locals.get_source(&identifier.text) != Some(symbol)
+                || bindings
+                    .iter()
+                    .any(|binding: &PlannedArrayBindingElement| binding.symbol == symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidBindingPattern(element),
+                ));
+            }
+            bindings.push(PlannedArrayBindingElement {
+                declaration,
+                pattern,
+                element,
+                index,
+                initializer: None,
+                rest: false,
+                name,
+                symbol,
+            });
+        }
+        if !omitted || bindings.is_empty() {
+            return Err(unsupported());
+        }
+
+        let trailing = match data.statements.nodes.get(1).copied() {
+            None => None,
+            Some(statement) => {
+                let statement = self.reference(statement);
+                let statement_record = self.node(statement)?;
+                let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+                    return Err(unsupported());
+                };
+                let list = self.reference(statement_data.declaration_list);
+                let list_record = self.node(list)?;
+                let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+                    return Err(unsupported());
+                };
+                let [declaration] = declarations.declarations.nodes.as_slice() else {
+                    return Err(unsupported());
+                };
+                let declaration = self.reference(*declaration);
+                let declaration_record = self.node(declaration)?;
+                let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+                    return Err(unsupported());
+                };
+                let name = self.reference(variable.name);
+                let name_record = self.node(name)?;
+                let NodeData::Identifier(identifier) = &name_record.data else {
+                    return Err(unsupported());
+                };
+                let object = variable
+                    .initializer
+                    .map(|node| self.reference(node))
+                    .ok_or_else(unsupported)?;
+                let object_record = self.node(object)?;
+                let NodeData::ObjectLiteralExpression(properties) = &object_record.data else {
+                    return Err(unsupported());
+                };
+                if statement_record.kind != SyntaxKind::VariableStatement
+                    || statement_record.flags.0 != 0
+                    || statement_record.parent != Some(block.node)
+                    || statement_record.range.start < first_record.range.end
+                    || statement_data.modifiers.is_some()
+                    || statement_data.flow_node.is_some()
+                    || statement_data.facts != 0
+                    || list_record.kind != SyntaxKind::VariableDeclarationList
+                    || list_record.flags.0 != NODE_FLAG_LET
+                    || list_record.parent != Some(statement.node)
+                    || declarations.declarations.range != list_record.range
+                    || declarations.declarations.has_trailing_comma
+                    || declarations.facts != 0
+                    || declaration_record.kind != SyntaxKind::VariableDeclaration
+                    || declaration_record.flags.0 != 0
+                    || declaration_record.parent != Some(list.node)
+                    || variable.exclamation_token.is_some()
+                    || variable.local_symbol.is_some()
+                    || variable.symbol.is_some()
+                    || variable.type_.is_some()
+                    || variable.facts != 0
+                    || name_record.kind != SyntaxKind::Identifier
+                    || name_record.flags.0 != 0
+                    || name_record.parent != Some(declaration.node)
+                    || identifier.flow_node.is_some()
+                    || identifier.text.is_empty()
+                    || object_record.kind != SyntaxKind::ObjectLiteralExpression
+                    || object_record.flags.0 != 0
+                    || object_record.parent != Some(declaration.node)
+                    || properties.properties.has_trailing_comma
+                    || properties.properties.nodes.len() != bindings.len()
+                    || properties.symbol.is_some()
+                    || properties.facts != 0
+                    || [statement, list, declaration, name, object]
+                        .into_iter()
+                        .any(|node| {
+                            self.bound.container(node) != Some(source)
+                                || self.bound.block_scope_container(node) != Some(block)
+                        })
+                {
+                    return Err(unsupported());
+                }
+                let mut seen = HashSet::with_capacity(properties.properties.nodes.len());
+                for property in &properties.properties.nodes {
+                    let property = self.reference(*property);
+                    let property_record = self.node(property)?;
+                    let NodeData::ShorthandPropertyAssignment(shorthand) = &property_record.data
+                    else {
+                        return Err(unsupported());
+                    };
+                    let reference = self.reference(shorthand.name);
+                    let reference_record = self.node(reference)?;
+                    let NodeData::Identifier(identifier) = &reference_record.data else {
+                        return Err(unsupported());
+                    };
+                    if property_record.kind != SyntaxKind::ShorthandPropertyAssignment
+                        || property_record.flags.0 != 0
+                        || property_record.parent != Some(object.node)
+                        || shorthand.equals_token.is_some()
+                        || shorthand.object_assignment_initializer.is_some()
+                        || shorthand.postfix_token.is_some()
+                        || shorthand.symbol.is_some()
+                        || shorthand.type_.is_some()
+                        || shorthand.facts != 0
+                        || shorthand.modifiers.is_some()
+                        || reference_record.kind != SyntaxKind::Identifier
+                        || reference_record.flags.0 != 0
+                        || reference_record.parent != Some(property.node)
+                        || identifier.flow_node.is_some()
+                        || !bindings.iter().any(|binding| {
+                            self.node(binding.name).is_ok_and(|record| {
+                                matches!(&record.data, NodeData::Identifier(name)
+                                    if name.text == identifier.text)
+                            })
+                        })
+                        || !seen.insert(identifier.text.as_str())
+                    {
+                        return Err(unsupported());
+                    }
+                }
+                let symbol = plan_top_level_variable(
+                    self.bound,
+                    store,
+                    declaration,
+                    name,
+                    &identifier.text,
+                    VariableBindingKind::Let,
+                    false,
+                )
+                .map_err(Self::variable_plan_error)?;
+                if locals.get_source(&identifier.text) != Some(symbol)
+                    || bindings.iter().any(|binding| binding.symbol == symbol)
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::InvalidBindingPattern(declaration),
+                    ));
+                }
+                Some((list, declaration, symbol))
+            }
+        };
+
+        Ok(Some(TopLevelLexicalArrayBlockSyntax {
+            pattern,
+            initializer,
+            bindings,
+            trailing,
+        }))
+    }
+
+    fn plan_top_level_lexical_array_block(
+        &mut self,
+        syntax: TopLevelLexicalArrayBlockSyntax,
+    ) -> Result<PlannedTopLevelLexicalBlock, SourceCheckError> {
+        let prior_variables = self.prior_variables.clone();
+        let readable_variables = self.readable_variables.clone();
+        let assignable_mutable_variables = self.assignable_mutable_variables.clone();
+        let result = (|| {
+            let initializer = self.plan_expression(syntax.initializer)?;
+            if !matches!(
+                initializer.kind,
+                PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                    kind: PlannedIdentifierReadKind::Variable,
+                    ..
+                })
+            ) {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidBindingPattern(syntax.pattern),
+                ));
+            }
+            let mut elements = Vec::with_capacity(syntax.bindings.len());
+            for binding in syntax.bindings {
+                if !self.prior_variables.insert(binding.symbol)
+                    || !self.readable_variables.insert(binding.symbol)
+                    || !self.assignable_mutable_variables.insert(binding.symbol)
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::InvalidSymbolShape(binding.symbol),
+                    ));
+                }
+                elements.push(PlannedArrayVariableElement {
+                    binding,
+                    initializer: None,
+                });
+            }
+            let trailing = syntax
+                .trailing
+                .map(|(list, declaration, symbol)| {
+                    let variable = self.plan_variable_declaration(
+                        list,
+                        declaration,
+                        VariableBindingKind::Let,
+                        false,
+                    )?;
+                    if variable.symbol != symbol
+                        || variable.type_node.is_some()
+                        || variable.jsdoc_type.is_some()
+                        || variable.evolving_array
+                        || !matches!(
+                            &variable.initializer,
+                            PlannedVariableInitializer::Expression(PlannedExpression {
+                                kind: PlannedExpressionKind::Object { .. },
+                                ..
+                            })
+                        )
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidSymbolShape(symbol),
+                        ));
+                    }
+                    Ok(variable)
+                })
+                .transpose()?;
+
+            Ok(PlannedTopLevelLexicalBlock::ArrayBindings {
+                array: PlannedArrayVariable {
+                    pattern: syntax.pattern,
+                    elements,
+                    binding: VariableBindingKind::Let,
+                    type_node: None,
+                    initializer,
+                },
+                trailing,
+            })
+        })();
+        self.prior_variables = prior_variables;
+        self.readable_variables = readable_variables;
+        self.assignable_mutable_variables = assignable_mutable_variables;
         result
     }
 
@@ -49322,93 +49765,209 @@ pub(super) fn check_source_file(
                     ));
                 }
             }
-            PlannedStatement::LexicalBlock(block) => {
-                let variable = &block.variable;
-                let PlannedVariableInitializer::Expression(initializer) = &variable.initializer
-                else {
-                    return Err(SourceCheckError::Variable(
-                        VariableInvariant::InvalidSymbolShape(variable.symbol),
-                    ));
-                };
-                if variable.binding != VariableBindingKind::Const
-                    || variable.type_node.is_some()
-                    || variable.jsdoc_type.is_some()
-                    || !matches!(initializer.kind, PlannedExpressionKind::Number { .. })
-                {
-                    return Err(SourceCheckError::Variable(
-                        VariableInvariant::InvalidSymbolShape(variable.symbol),
-                    ));
-                }
+            PlannedStatement::LexicalBlock(block) => match block.as_ref() {
+                PlannedTopLevelLexicalBlock::ForwardRead { read, variable } => {
+                    let PlannedVariableInitializer::Expression(initializer) = &variable.initializer
+                    else {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidSymbolShape(variable.symbol),
+                        ));
+                    };
+                    if variable.binding != VariableBindingKind::Const
+                        || variable.type_node.is_some()
+                        || variable.jsdoc_type.is_some()
+                        || !matches!(initializer.kind, PlannedExpressionKind::Number { .. })
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidSymbolShape(variable.symbol),
+                        ));
+                    }
 
-                let diagnostic = source_block_scoped_use_before_declaration(
-                    arena,
-                    bound,
-                    store,
-                    block.read.node,
-                    variable.symbol,
-                    options.isolated_modules,
-                )
-                .map_err(|_| {
-                    SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(
+                    let diagnostic = source_block_scoped_use_before_declaration(
+                        arena,
+                        bound,
+                        store,
+                        read.node,
                         variable.symbol,
-                    ))
-                })?
-                .ok_or(SourceCheckError::Variable(
-                    VariableInvariant::InvalidSymbolShape(variable.symbol),
-                ))?;
-                merge_retry_diagnostic(diagnostics, diagnostic);
+                        options.isolated_modules,
+                    )
+                    .map_err(|_| {
+                        SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(
+                            variable.symbol,
+                        ))
+                    })?
+                    .ok_or(SourceCheckError::Variable(
+                        VariableInvariant::InvalidSymbolShape(variable.symbol),
+                    ))?;
+                    merge_retry_diagnostic(diagnostics, diagnostic);
 
-                let initializer = check_expression_type(
-                    store,
-                    host,
-                    global_types,
-                    source,
-                    options,
-                    session,
-                    diagnostics,
-                    &current_flow_types,
-                    &preflighted_type_import_value_uses,
-                    initializer,
-                    None,
-                    &mut deferred,
-                )?;
-                let declared_type = inferred_variable_type(
-                    store,
-                    global_types,
-                    variable.binding,
-                    initializer.result,
-                )?;
-                let mut block_flow_types = current_flow_types.clone();
-                if block_flow_types
-                    .insert(variable.symbol, declared_type)
-                    .is_some()
-                {
-                    return Err(SourceCheckError::Variable(
-                        VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
-                    ));
+                    let initializer = check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        initializer,
+                        None,
+                        &mut deferred,
+                    )?;
+                    let declared_type = inferred_variable_type(
+                        store,
+                        global_types,
+                        variable.binding,
+                        initializer.result,
+                    )?;
+                    let mut block_flow_types = current_flow_types.clone();
+                    if block_flow_types
+                        .insert(variable.symbol, declared_type)
+                        .is_some()
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
+                        ));
+                    }
+                    check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &block_flow_types,
+                        &preflighted_type_import_value_uses,
+                        read,
+                        None,
+                        &mut deferred,
+                    )?;
+                    stage_value_type(
+                        store,
+                        &mut staged_value_types,
+                        &mut value_order,
+                        variable.symbol,
+                        declared_type,
+                    )?;
                 }
-                check_expression_type(
-                    store,
-                    host,
-                    global_types,
-                    source,
-                    options,
-                    session,
-                    diagnostics,
-                    &block_flow_types,
-                    &preflighted_type_import_value_uses,
-                    &block.read,
-                    None,
-                    &mut deferred,
-                )?;
-                stage_value_type(
-                    store,
-                    &mut staged_value_types,
-                    &mut value_order,
-                    variable.symbol,
-                    declared_type,
-                )?;
-            }
+                PlannedTopLevelLexicalBlock::ArrayBindings { array, trailing } => {
+                    if array.binding != VariableBindingKind::Let
+                        || array.type_node.is_some()
+                        || array.elements.is_empty()
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidBindingPattern(array.pattern),
+                        ));
+                    }
+                    let initializer = check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        &array.initializer,
+                        None,
+                        &mut deferred,
+                    )?;
+                    let mut block_flow_types = current_flow_types.clone();
+                    for element in &array.elements {
+                        if element.initializer.is_some()
+                            || element.binding.initializer.is_some()
+                            || element.binding.rest
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidBindingPattern(element.binding.element),
+                            ));
+                        }
+                        let checked = check_planned_array_binding_element(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            &element.binding,
+                            initializer.result,
+                        )?;
+                        if let Some(diagnostic) = checked.diagnostic {
+                            merge_retry_diagnostic(diagnostics, diagnostic);
+                        }
+                        stage_value_type(
+                            store,
+                            &mut staged_value_types,
+                            &mut value_order,
+                            element.binding.symbol,
+                            checked.type_,
+                        )?;
+                        if block_flow_types
+                            .insert(element.binding.symbol, checked.type_)
+                            .is_some()
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::DuplicateCurrentFlowType(element.binding.symbol),
+                            ));
+                        }
+                    }
+                    if let Some(variable) = trailing {
+                        let PlannedVariableInitializer::Expression(initializer) =
+                            &variable.initializer
+                        else {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolShape(variable.symbol),
+                            ));
+                        };
+                        if variable.binding != VariableBindingKind::Let
+                            || variable.type_node.is_some()
+                            || variable.jsdoc_type.is_some()
+                            || variable.evolving_array
+                            || !matches!(initializer.kind, PlannedExpressionKind::Object { .. })
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolShape(variable.symbol),
+                            ));
+                        }
+                        let initializer = check_expression_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &block_flow_types,
+                            &preflighted_type_import_value_uses,
+                            initializer,
+                            None,
+                            &mut deferred,
+                        )?;
+                        let declared_type = inferred_variable_type(
+                            store,
+                            global_types,
+                            variable.binding,
+                            initializer.result,
+                        )?;
+                        stage_value_type(
+                            store,
+                            &mut staged_value_types,
+                            &mut value_order,
+                            variable.symbol,
+                            declared_type,
+                        )?;
+                        if block_flow_types
+                            .insert(variable.symbol, declared_type)
+                            .is_some()
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
+                            ));
+                        }
+                    }
+                }
+            },
             PlannedStatement::RecoveredAnonymousVariables(variables) => {
                 for variable in variables {
                     let PlannedVariableInitializer::Expression(initializer) = &variable.initializer
@@ -86204,6 +86763,207 @@ class Foo2 {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn lexical_array_binding_blocks_preserve_local_symbols_and_source_diagnostics() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "var results: string[]; ",
+            "{ let [, second, , fourth] = results; ",
+            "let observed = { fourth, second }; }",
+        ));
+        let library_file = FileId::new(10_050);
+        let file = FileId::new(10_051);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one uninitialized block-binding source diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2454);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "results");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Variable 'results' is used before being assigned.",
+        );
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let block = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::Block).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let locals = bound.locals(block).unwrap();
+        for name in ["second", "fourth"] {
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, name),
+                string
+            );
+            let symbol = context
+                .store()
+                .symbol_table(locals)
+                .and_then(|locals| locals.get_source(name))
+                .unwrap();
+            let declaration = context
+                .store()
+                .symbol(symbol)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .unwrap();
+            assert_eq!(bound.block_scope_container(declaration), Some(block));
+        }
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "observed"))
+                .unwrap(),
+            "{ fourth: string; second: string; }",
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn lexical_array_binding_blocks_keep_names_private_and_reject_poisoned_types() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "declare var input: string[]; ",
+            "{ let [, value,] = input; } ",
+            "const outside = value;",
+        ));
+        let library_file = FileId::new(10_052);
+        let file = FileId::new(10_053);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one missing-name diagnostic outside the lexical block")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2304);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "value");
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "value"),
+            string
+        );
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+
+        let binding = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BindingElement).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(binding).unwrap();
+        mark_source_unchecked(&mut context, file);
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::CachedValueTypeMismatch {
+                    symbol,
+                    cached: number,
+                    expected: string,
+                },
+            )),
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+    }
+
+    #[test]
+    fn lexical_array_binding_blocks_reject_forged_block_scope_symbols() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "declare var input: string[]; ",
+            "{ let [, first, , second,] = input; }",
+        ));
+        let library_file = FileId::new(10_054);
+        let file = FileId::new(10_055);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let block = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::Block).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (locals, first, second) = {
+            let (_, bound) = context.file(file).unwrap();
+            let locals = bound.locals(block).unwrap();
+            let table = context.store().symbol_table(locals).unwrap();
+            (
+                locals,
+                table.get_source("first").unwrap(),
+                table.get_source("second").unwrap(),
+            )
+        };
+        let second_declaration = context
+            .store()
+            .symbol(second)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .unwrap();
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                locals,
+                EscapedName::source("second"),
+                first,
+            ),
+            Some(Some(second)),
+        );
+        let cold = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidBindingPattern(second_declaration),
+            )),
+        );
+        assert_eq!(observable_state(&context, file), cold);
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
