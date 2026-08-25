@@ -1448,6 +1448,15 @@ fn resolve_global_array_callback_overloads(
         else {
             return Err(SourceCheckError::Call(site));
         };
+        CanonicalTypeQuery::new_with_global_types(store, host, global_types, options, diagnostics)?
+            .get_return_type_of_signature(callback_signature.signature)?;
+        let StoredSingleCallableValidation::Valid {
+            callable: callback_signature,
+            ..
+        } = validate_stored_single_callable(store, callback)
+        else {
+            return Err(SourceCheckError::Call(site));
+        };
         if callback_signature.parameters.first().copied() != Some(element)
             || callback_signature.rest_parameter.is_some()
             || !valid_global_array_callback_predicate(store, overload, Some(callback))
