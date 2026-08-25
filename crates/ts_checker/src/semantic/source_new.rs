@@ -4570,8 +4570,10 @@ pub(super) fn authenticated_lazy_global_object_constructor_return(
             .callable_signature_parameter_types(signature)
             .is_some()
         || exact_type_cache(store, global.annotation).ok()? != Some(value_type)
+        || exact_symbol_cache(store, global.annotation).ok()? != Some(owner)
         || exact_class_value_type(store, instance).ok()? != Some(value_type)
         || exact_type_cache(store, global.return_annotation).ok()? != Some(global.object_type)
+        || exact_symbol_cache(store, global.return_annotation).ok()? != Some(instance)
         || store.function_signature_return_annotation(signature)
             != Some((global.return_annotation, false))
     {
@@ -6742,6 +6744,79 @@ mod tests {
                 context.get_return_type_of_signature(signature),
                 Ok(expected)
             );
+
+            let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+            let instance = context
+                .store()
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source(name))
+                .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                .unwrap();
+            let owner = context
+                .store()
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source(&format!("{name}Constructor")))
+                .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                .unwrap();
+            let value_annotation = context
+                .store()
+                .symbol(instance)
+                .and_then(|symbol| symbol.value_declaration())
+                .and_then(|declaration| context.store().source_direct_type_annotation(declaration))
+                .unwrap();
+            let return_annotation = context
+                .store()
+                .function_signature_return_annotation(signature)
+                .unwrap()
+                .0;
+            for (annotation, incorrect) in
+                [(value_annotation, instance), (return_annotation, owner)]
+            {
+                let original = context
+                    .store()
+                    .symbol_node_links(annotation)
+                    .cloned()
+                    .unwrap();
+                assert!(context.store_mut_for_test().set_symbol_node_links(
+                    annotation,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(incorrect),
+                    },
+                ));
+                let poisoned = (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                );
+
+                assert!(matches!(
+                    context.get_return_type_of_signature(signature),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        super::super::type_nodes::TypeNodeUnavailable::InvalidFunctionSignature(
+                            actual,
+                        )
+                    )) if actual == signature
+                ));
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().signature_len(),
+                        context.store().symbol_len(),
+                        context.store().checker_link_allocated_lengths(),
+                    ),
+                    poisoned,
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(annotation, original)
+                );
+                assert_eq!(
+                    context.get_return_type_of_signature(signature),
+                    Ok(expected)
+                );
+            }
         }
     }
 
