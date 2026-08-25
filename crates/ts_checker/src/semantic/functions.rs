@@ -521,6 +521,66 @@ pub(super) fn plan_function_type(
         let parameter_symbol_record = store
             .symbol(parameter_symbol)
             .ok_or_else(|| invariant(FunctionTypeInvariant::InvalidParameterSymbol(parameter)))?;
+        if parameter_symbol_record.flags()
+            == SymbolFlags::TYPE_PARAMETER | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            && function
+                .type_parameters
+                .as_ref()
+                .is_some_and(|type_parameters| {
+                    let [type_parameter] = type_parameters.nodes.as_slice() else {
+                        return false;
+                    };
+                    let type_parameter = NodeRef::new(node.arena, node.file, *type_parameter);
+                    let Some(type_parameter_record) = host.node(type_parameter) else {
+                        return false;
+                    };
+                    let NodeData::TypeParameterDeclaration(type_parameter_data) =
+                        &type_parameter_record.data
+                    else {
+                        return false;
+                    };
+                    let type_parameter_name = NodeRef::new(
+                        type_parameter.arena,
+                        type_parameter.file,
+                        type_parameter_data.name,
+                    );
+                    let Some(type_parameter_name_record) = host.node(type_parameter_name) else {
+                        return false;
+                    };
+                    let NodeData::Identifier(type_parameter_identifier) =
+                        &type_parameter_name_record.data
+                    else {
+                        return false;
+                    };
+                    type_parameter_record.kind == SyntaxKind::TypeParameter
+                        && type_parameter_record.flags.0 == 0
+                        && type_parameter_record.parent == Some(node.node)
+                        && type_parameter_name_record.kind == SyntaxKind::Identifier
+                        && type_parameter_name_record.flags.0 == 0
+                        && type_parameter_name_record.parent == Some(type_parameter.node)
+                        && type_parameter_identifier.flow_node.is_none()
+                        && type_parameter_identifier.text == identifier.text
+                        && bound.symbol(type_parameter) == Some(parameter_symbol)
+                        && parameter_symbol_record.check_flags() == CheckFlags::NONE
+                        && parameter_symbol_record.name().as_bytes() == identifier.text.as_bytes()
+                        && parameter_symbol_record.declarations()
+                            == Some([type_parameter, parameter].as_slice())
+                        && parameter_symbol_record.value_declaration() == Some(parameter)
+                        && parameter_symbol_record.members().is_none()
+                        && parameter_symbol_record.exports().is_none()
+                        && parameter_symbol_record.parent().is_none()
+                        && parameter_symbol_record.export_symbol().is_none()
+                        && bound
+                            .locals(node)
+                            .and_then(|locals| store.symbol_table(locals))
+                            .and_then(|locals| locals.get_source(&identifier.text))
+                            == Some(parameter_symbol)
+                })
+        {
+            return Err(FunctionTypeError::Unsupported(
+                FunctionTypeUnsupported::GenericSignature(node),
+            ));
+        }
         if parameter_symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
             || parameter_symbol_record.check_flags() != CheckFlags::NONE
             || parameter_symbol_record.name().as_bytes() != identifier.text.as_bytes()
@@ -3192,6 +3252,79 @@ mod tests {
                 before,
             );
         }
+    }
+
+    #[test]
+    fn generic_type_and_value_parameter_collisions_are_authenticated_boundaries() {
+        let mut fixture = fixture(
+            "declare const parse: <def>(def: def) => def;",
+            FileId::new(95_007),
+        );
+        let function = generic_function_node(&fixture);
+        let NodeData::FunctionTypeNode(syntax) =
+            &fixture.parsed.arena.get(function.node).unwrap().data
+        else {
+            panic!("the fixture must retain one generic function annotation")
+        };
+        let type_parameter = NodeRef::new(
+            function.arena,
+            function.file,
+            syntax.type_parameters.as_ref().unwrap().nodes[0],
+        );
+        let parameter = NodeRef::new(function.arena, function.file, syntax.parameters.nodes[0]);
+        let symbol = fixture.bound.symbol(type_parameter).unwrap();
+        assert_eq!(fixture.bound.symbol(parameter), Some(symbol));
+        assert_eq!(
+            fixture.store.symbol(symbol).unwrap().flags(),
+            SymbolFlags::TYPE_PARAMETER | SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+        );
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            plan_function_type(&fixture.store, &host, function, None, false, None),
+            Err(FunctionTypeError::Unsupported(
+                FunctionTypeUnsupported::GenericSignature(node)
+            )) if node == function
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+
+        assert!(fixture.store.set_symbol_flags(
+            symbol,
+            SymbolFlags::TYPE_PARAMETER
+                | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                | SymbolFlags::PROPERTY,
+            CheckFlags::NONE,
+        ));
+        assert!(matches!(
+            plan_function_type(&fixture.store, &host, function, None, false, None),
+            Err(FunctionTypeError::Invariant(
+                FunctionTypeInvariant::InvalidParameterSymbol(node)
+            )) if node == parameter
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]

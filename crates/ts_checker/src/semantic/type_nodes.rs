@@ -34698,11 +34698,34 @@ mod tests {
     #[test]
     fn recursive_generic_function_parameter_templates_fail_as_typed_unsupported() {
         let mut fixture = fixture(concat!(
-            "type Narrow<Value> = Value extends string ",
-            "? Value : { [Key in keyof Value]: Narrow<Value[Key]> }; ",
-            "declare const parse: <Value>(value: Narrow<Value>) => Value;",
+            "type narrow<def> = def extends string\n",
+            "  ? def\n",
+            "  : def extends [unknown, ...unknown[]]\n",
+            "  ? def\n",
+            "  : {\n",
+            "      [k in keyof def]: narrow<def[k]>;\n",
+            "    };\n",
+            "declare const parse: <def>(def: narrow<def>) => def;\n",
+            "const result = parse([{ a: \"foo\" }]);",
         ));
         let function = variable_type_node(&fixture, "parse");
+        let NodeData::FunctionTypeNode(syntax) =
+            &fixture.parsed.arena.get(function.node).unwrap().data
+        else {
+            panic!("the source fixture must retain its generic function annotation")
+        };
+        let type_parameter = NodeRef::new(
+            function.arena,
+            function.file,
+            syntax.type_parameters.as_ref().unwrap().nodes[0],
+        );
+        let parameter = NodeRef::new(function.arena, function.file, syntax.parameters.nodes[0]);
+        let type_symbol = node_symbol(&fixture, type_parameter);
+        assert_eq!(node_symbol(&fixture, parameter), type_symbol);
+        assert_eq!(
+            fixture.store.symbol(type_symbol).unwrap().flags(),
+            SymbolFlags::TYPE_PARAMETER | SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+        );
         let before = function_store_state(&fixture.store);
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
 
@@ -34710,10 +34733,10 @@ mod tests {
             query_node(&mut fixture, function, &mut diagnostics),
             Err(DeclaredTypeError::TypeNodeUnavailable(
                 TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
                     kind: SyntaxKind::FunctionType,
-                    ..
                 }
-            ))
+            )) if node == function
         ));
         assert_eq!(function_store_state(&fixture.store), before);
         assert!(fixture.store.type_node_links(function).is_none());
