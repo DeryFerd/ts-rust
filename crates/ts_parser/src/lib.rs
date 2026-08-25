@@ -7215,7 +7215,9 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.current.kind != SyntaxKind::CommaToken {
-                if token_starts_argument_expression(self.current.kind) {
+                if self.current.kind == SyntaxKind::DotDotDotToken
+                    || token_starts_argument_expression(self.current.kind)
+                {
                     self.error_current("Expected ','.");
                     trailing = false;
                     continue;
@@ -7837,7 +7839,12 @@ impl<'a> Parser<'a> {
                 trailing = self.current.kind == SyntaxKind::CloseBracketToken;
                 continue;
             }
-            elements.push(self.parse_spread_element_or_expression());
+            let element = self.parse_spread_element_or_expression();
+            let spread = self
+                .arena
+                .get(element)
+                .is_some_and(|node| node.kind == SyntaxKind::SpreadElement);
+            elements.push(element);
             if self.current.kind == SyntaxKind::ColonToken {
                 // Recover an object/type-like `name: value` fragment inside an array as two
                 // elements. This is the same statement-level recovery used after a malformed
@@ -7848,6 +7855,14 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.current.kind != SyntaxKind::CommaToken {
+                if spread
+                    && (self.current.kind == SyntaxKind::DotDotDotToken
+                        || token_starts_argument_expression(self.current.kind))
+                {
+                    self.error_current("Expected ','.");
+                    trailing = false;
+                    continue;
+                }
                 break;
             }
             self.bump();
@@ -7906,6 +7921,19 @@ impl<'a> Parser<'a> {
                 if self.current.kind == SyntaxKind::CommaToken {
                     self.bump();
                     trailing = self.current.kind == SyntaxKind::CloseBraceToken;
+                } else if !matches!(
+                    self.current.kind,
+                    SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
+                ) {
+                    self.error_current("Expected ','.");
+                    if self.current.kind == SyntaxKind::SemicolonToken
+                        && !self
+                            .current
+                            .flags
+                            .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                    {
+                        self.bump();
+                    }
                 }
                 continue;
             }
@@ -12254,6 +12282,329 @@ mod tests {
             &result.arena.get(property.initializer).unwrap().data,
             NodeData::Identifier(identifier) if identifier.text.is_empty()
         ));
+    }
+
+    #[test]
+    fn commented_spreads_and_rest_tokens_preserve_ranges_and_parent_links() {
+        let source = concat!(
+            "const first = { .../*#__PURE__*/identity({ value: 1 }) };\n",
+            "const second = { ...\n/*#__PURE__*/\nidentity({ value: 2 }) };\n",
+            "const values = [.../* first array */items, ...\n/* second array */more];\n",
+            "function collect(first, .../* parameter */\nrest) {\n",
+            "  const { removed, .../* object rest */\nremaining } = input;\n",
+            "  const [head, .../* array rest */\ntail] = items;\n",
+            "  return { .../* returned */\nremaining };\n",
+            "}\n",
+            "const callback = (first, .../* arrow */\nrest) => rest.length;\n",
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(source_statements(&result).len(), 5);
+
+        let mut object_spreads = 0;
+        let mut array_spreads = 0;
+        let mut rest_parameters = 0;
+        let mut rest_bindings = 0;
+        for (node, record) in result.arena.iter() {
+            match &record.data {
+                NodeData::SpreadAssignment(spread) => {
+                    object_spreads += 1;
+                    let expression = result.arena.get(spread.expression).unwrap();
+                    let start = record.range.start.get() as usize;
+                    let expression_start = expression.range.start.get() as usize;
+                    assert_eq!(&source[start..start + 3], "...");
+                    assert!(source[start + 3..expression_start].contains("/*"));
+                    assert_eq!(expression.parent, Some(node));
+                }
+                NodeData::SpreadElement(spread) => {
+                    array_spreads += 1;
+                    let expression = result.arena.get(spread.expression).unwrap();
+                    let start = record.range.start.get() as usize;
+                    let expression_start = expression.range.start.get() as usize;
+                    assert_eq!(&source[start..start + 3], "...");
+                    assert!(source[start + 3..expression_start].contains("/*"));
+                    assert_eq!(expression.parent, Some(node));
+                }
+                NodeData::ParameterDeclaration(parameter)
+                    if parameter.dot_dot_dot_token.is_some() =>
+                {
+                    rest_parameters += 1;
+                    let token = result
+                        .arena
+                        .get(parameter.dot_dot_dot_token.unwrap())
+                        .unwrap();
+                    let name = result.arena.get(parameter.name).unwrap();
+                    assert_eq!(token.kind, SyntaxKind::DotDotDotToken);
+                    assert_eq!(token.parent, Some(node));
+                    assert_eq!(name.parent, Some(node));
+                    assert!(
+                        source[token.range.end.get() as usize..name.range.start.get() as usize]
+                            .contains("/*")
+                    );
+                }
+                NodeData::BindingElement(binding) if binding.dot_dot_dot_token.is_some() => {
+                    rest_bindings += 1;
+                    let token = result
+                        .arena
+                        .get(binding.dot_dot_dot_token.unwrap())
+                        .unwrap();
+                    let name = result.arena.get(binding.name.unwrap()).unwrap();
+                    assert_eq!(token.kind, SyntaxKind::DotDotDotToken);
+                    assert_eq!(token.parent, Some(node));
+                    assert_eq!(name.parent, Some(node));
+                    assert!(
+                        source[token.range.end.get() as usize..name.range.start.get() as usize]
+                            .contains("/*")
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(object_spreads, 3);
+        assert_eq!(array_spreads, 2);
+        assert_eq!(rest_parameters, 2);
+        assert_eq!(rest_bindings, 2);
+    }
+
+    #[test]
+    fn commented_object_spreads_recover_missing_separators_at_the_next_token() {
+        for (source, unexpected, token_length, property_count) in [
+            (
+                "const copy = { .../* kept */donor next: 1 }; const after = 2;",
+                "next",
+                4,
+                2,
+            ),
+            (
+                "const copy = { ...\n/*#__PURE__*/donor\nnext: 1 }; const after = 2;",
+                "next",
+                4,
+                2,
+            ),
+            (
+                "const copy = { ...first .../* kept */second, tail: true }; const after = 2;",
+                ".../* kept */second",
+                3,
+                3,
+            ),
+            (
+                "const copy = { .../* kept */donor; next: 1 }; const after = 2;",
+                "; next",
+                1,
+                2,
+            ),
+        ] {
+            let result = parse_source_file(source);
+            let start = u32::try_from(source.find(unexpected).unwrap()).unwrap();
+            assert_eq!(
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                        diagnostic.message.as_str(),
+                    ))
+                    .collect::<Vec<_>>(),
+                [(Some(1005), start, start + token_length, "',' expected.")],
+                "{source}",
+            );
+
+            let statements = source_statements(&result);
+            assert_eq!(statements.len(), 2, "{source}");
+            let (list, _) = variable_list(&result, statements[0]);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected a recovered object declaration");
+            };
+            let object = declaration.initializer.unwrap();
+            let NodeData::ObjectLiteralExpression(object_data) =
+                &result.arena.get(object).unwrap().data
+            else {
+                panic!("expected the recovered object literal");
+            };
+            assert_eq!(
+                object_data.properties.nodes.len(),
+                property_count,
+                "{source}"
+            );
+            assert_eq!(
+                result
+                    .arena
+                    .get(object_data.properties.nodes[0])
+                    .unwrap()
+                    .kind,
+                SyntaxKind::SpreadAssignment,
+            );
+            for property in &object_data.properties.nodes {
+                assert_eq!(result.arena.get(*property).unwrap().parent, Some(object));
+            }
+        }
+    }
+
+    #[test]
+    fn commented_array_spreads_recover_missing_separators_without_losing_elements() {
+        for (source, unexpected, token_length, second_kind) in [
+            (
+                "const values = [.../* kept */items next]; const after = 1;",
+                "next",
+                4,
+                SyntaxKind::Identifier,
+            ),
+            (
+                "const values = [...\n/* kept */items\nnext]; const after = 1;",
+                "next",
+                4,
+                SyntaxKind::Identifier,
+            ),
+            (
+                "const values = [...items .../* kept */more]; const after = 1;",
+                ".../* kept */more",
+                3,
+                SyntaxKind::SpreadElement,
+            ),
+        ] {
+            let result = parse_source_file(source);
+            let start = u32::try_from(source.find(unexpected).unwrap()).unwrap();
+            assert_eq!(
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                        diagnostic.message.as_str(),
+                    ))
+                    .collect::<Vec<_>>(),
+                [(Some(1005), start, start + token_length, "',' expected.")],
+                "{source}",
+            );
+
+            let statements = source_statements(&result);
+            assert_eq!(statements.len(), 2, "{source}");
+            let (list, _) = variable_list(&result, statements[0]);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected a recovered array declaration");
+            };
+            let array = declaration.initializer.unwrap();
+            let NodeData::ArrayLiteralExpression(array_data) =
+                &result.arena.get(array).unwrap().data
+            else {
+                panic!("expected the recovered array literal");
+            };
+            let [first, second] = array_data.elements.nodes.as_slice() else {
+                panic!("expected both array elements to survive recovery");
+            };
+            assert_eq!(
+                result.arena.get(*first).unwrap().kind,
+                SyntaxKind::SpreadElement,
+            );
+            assert_eq!(result.arena.get(*second).unwrap().kind, second_kind);
+            assert_eq!(result.arena.get(*first).unwrap().parent, Some(array));
+            assert_eq!(result.arena.get(*second).unwrap().parent, Some(array));
+        }
+    }
+
+    #[test]
+    fn consecutive_commented_spread_arguments_recover_the_missing_comma() {
+        let source = concat!(
+            "const value = collect(.../* first */items .../* second */more); ",
+            "const after = 1;",
+        );
+        let result = parse_source_file(source);
+        let start = u32::try_from(source.find(".../* second */more").unwrap()).unwrap();
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.code,
+                    diagnostic.range.start.get(),
+                    diagnostic.range.end.get(),
+                    diagnostic.message.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            [(Some(1005), start, start + 3, "',' expected.")],
+        );
+
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        let (list, _) = variable_list(&result, statements[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected a recovered call declaration");
+        };
+        let call = declaration.initializer.unwrap();
+        let NodeData::CallExpression(call_data) = &result.arena.get(call).unwrap().data else {
+            panic!("expected the recovered call expression");
+        };
+        assert_eq!(call_data.arguments.nodes.len(), 2);
+        for argument in &call_data.arguments.nodes {
+            let node = result.arena.get(*argument).unwrap();
+            assert_eq!(node.kind, SyntaxKind::SpreadElement);
+            assert_eq!(node.parent, Some(call));
+        }
+    }
+
+    #[test]
+    fn commented_spreads_with_missing_operands_keep_exact_terminator_diagnostics() {
+        for (source, terminator) in [
+            ("const value = { .../* missing */ }; const after = 1;", "}"),
+            ("const value = [.../* missing */]; const after = 1;", "]"),
+            (
+                "const value = collect(.../* missing */); const after = 1;",
+                ")",
+            ),
+        ] {
+            let result = parse_source_file(source);
+            let start = u32::try_from(source.find(terminator).unwrap()).unwrap();
+            assert_eq!(
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                        diagnostic.message.as_str(),
+                    ))
+                    .collect::<Vec<_>>(),
+                [(Some(1109), start, start + 1, "Expression expected.")],
+                "{source}",
+            );
+            assert_eq!(source_statements(&result).len(), 2, "{source}");
+
+            let missing = result
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(
+                        &record.data,
+                        NodeData::Identifier(identifier)
+                            if identifier.text.is_empty()
+                                && record.flags == NODE_FLAG_HAS_ERROR
+                    )
+                    .then_some((node, record))
+                })
+                .expect("expected the missing spread operand");
+            assert_eq!(missing.1.range.start.get(), start);
+            assert_eq!(missing.1.range.end.get(), start);
+            let parent = result.arena.get(missing.1.parent.unwrap()).unwrap();
+            assert!(matches!(
+                parent.kind,
+                SyntaxKind::SpreadAssignment | SyntaxKind::SpreadElement
+            ));
+        }
     }
 
     #[test]
