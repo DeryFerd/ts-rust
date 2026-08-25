@@ -4317,7 +4317,7 @@ mod tests {
         assert!(record.has_rest_parameter());
         assert_eq!(record.min_argument_count(), 1);
         assert_eq!(record.parameters(), [first.symbol, rest.symbol].as_slice());
-        assert_eq!(record.resolved_return_type(), Some(string));
+        assert!(record.resolved_return_type().is_none());
         assert_eq!(
             fixture
                 .store
@@ -4339,6 +4339,34 @@ mod tests {
             validate_stored_function_type(&fixture.store, function_type),
             StoredFunctionTypeValidation::Valid(_)
         ));
+
+        {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            assert_eq!(
+                CanonicalTypeQuery::new_with_global_types(
+                    &mut fixture.store,
+                    &host,
+                    &global_types,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature),
+                Ok(string),
+            );
+        }
+        assert_eq!(
+            fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(string),
+        );
 
         let warm = (
             fixture.store.type_len(),
