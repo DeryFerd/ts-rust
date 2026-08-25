@@ -8317,9 +8317,15 @@ mod tests {
         };
         assert_eq!(diagnostic.diagnostic.code(), 2345);
         assert_eq!(diagnostic.node, Some(callback));
+        assert_eq!(diagnostic.range_override, None);
+        assert!(diagnostic.related_information.is_empty());
         assert_eq!(
             diagnostic.diagnostic.render().unwrap(),
-            "Argument of type '() => number' is not assignable to parameter of type '() => string'."
+            concat!(
+                "Argument of type '() => number' is not assignable to parameter of type ",
+                "'() => string'.\n",
+                "  Type 'number' is not assignable to type 'string'.",
+            )
         );
         assert!(context.store().type_node_links(callback).is_some());
         let cold = call_publication_state(&context, call);
