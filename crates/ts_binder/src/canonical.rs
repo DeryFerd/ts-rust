@@ -8696,8 +8696,60 @@ export = equalsValue;
 
     #[test]
     fn empty_import_export_forms_preserve_nil_symbol_tables() {
-        let parsed = parse_source_file("import \"side-effect\"; export {};");
-        let file = FileId::new(54);
+        for (index, text) in [
+            "import \"side-effect\"; export {};",
+            concat!(
+                "import './first'; ",
+                "export {} from './second'; ",
+                "export type {} from './third';",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(text);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(54 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/empty-aliases\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::External,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+
+            let bound = binder.file(file).unwrap();
+            let source = bound.symbol(bound.source_file()).unwrap();
+            assert_eq!(bound.locals(bound.source_file()), None);
+            assert_eq!(
+                binder.symbol_store().symbol(source).unwrap().exports(),
+                None
+            );
+            assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+            assert!(bound.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn side_effect_imports_preserve_ambient_augmentation_order_without_aliases() {
+        let parsed = parse_source_file(concat!(
+            "import './first'; ",
+            "declare module './first' { interface First {} } ",
+            "import './second'; ",
+            "declare module './second' { interface Second {} }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(155);
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -8705,7 +8757,7 @@ export = equalsValue;
                 parsed.source_file,
                 file,
                 CanonicalSourceFileFacts::new(
-                    EscapedName::source("\"/project/empty-aliases\""),
+                    EscapedName::source("\"/project/side-effect-augmentations\""),
                     CanonicalSourceLanguage::TypeScript,
                     false,
                     CanonicalModuleState::External,
@@ -8717,13 +8769,22 @@ export = equalsValue;
             .unwrap();
 
         let bound = binder.file(file).unwrap();
-        let source = bound.symbol(bound.source_file()).unwrap();
-        assert_eq!(bound.locals(bound.source_file()), None);
+        let augmentations = bound.module_augmentations();
+        assert_eq!(augmentations.len(), 2);
         assert_eq!(
-            binder.symbol_store().symbol(source).unwrap().exports(),
-            None
+            augmentations
+                .iter()
+                .map(|augmentation| node_text(&parsed.arena, augmentation.name().node).unwrap())
+                .collect::<Vec<_>>(),
+            ["./first", "./second"],
         );
-        assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+        for import in nodes_of_kind(&parsed.arena, SyntaxKind::ImportDeclaration) {
+            assert!(
+                bound
+                    .symbol(node_ref(&parsed.arena, file, import))
+                    .is_none()
+            );
+        }
         assert!(bound.diagnostics().is_empty());
     }
 

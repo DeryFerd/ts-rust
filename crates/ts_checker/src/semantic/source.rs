@@ -40974,6 +40974,43 @@ mod tests {
     }
 
     #[test]
+    fn side_effect_imports_and_empty_reexports_preserve_cold_targets_and_warm_state() {
+        let source = parsed(concat!(
+            "import './target'; ",
+            "import {} from './target'; ",
+            "export {} from './target'; ",
+            "export type {} from './target';",
+        ));
+        let target = parsed("export const value: number = 1;");
+        let file = FileId::new(9_600);
+        let target_file = FileId::new(9_601);
+        let files = [(file, &source), (target_file, &target)];
+        let routes = (0..4)
+            .map(|specifier| SourceImportRoute {
+                source: 0,
+                specifier,
+                target: 1,
+            })
+            .collect::<Vec<_>>();
+        let mut context = external_context_with_import_routes(&files, &routes);
+        let (_, bound) = context.file(file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        assert!(bound.locals(bound.source_file()).is_none());
+        assert!(context.store().symbol(module).unwrap().exports().is_none());
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+        assert!(!is_type_checked(&context, target_file));
+        assert!(context.store().symbol(module).unwrap().exports().is_none());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn local_named_exports_preserve_function_and_namespace_aliases_in_order() {
         let source = parsed(concat!(
             "function createElement(): any {} ",
@@ -42208,7 +42245,7 @@ mod tests {
         let near_misses = [
             ("export { A };", SourceSyntaxRole::ExportClause),
             (
-                r#"export {} from "./dependency";"#,
+                r#"export * from "./dependency";"#,
                 SourceSyntaxRole::ExportDeclaration,
             ),
             ("export type {};", SourceSyntaxRole::ExportDeclaration),

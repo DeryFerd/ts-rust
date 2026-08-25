@@ -1,10 +1,10 @@
 //! Exact source planning for ESM imports, `JSDoc` imports, and named reexports.
 //!
-//! This slice accepts leading, top-level side-effect imports, default imports,
-//! namespace imports, and named imports, including explicit named `default`
-//! bindings. Imported and exported module names can be identifiers or clean
-//! string literals; local bindings remain identifiers. Alias discovery belongs
-//! to the production alias host. A
+//! This slice accepts leading, top-level side-effect imports and reexports,
+//! default imports, namespace imports, and named imports, including explicit
+//! named `default` bindings. Imported and exported module names can be
+//! identifiers or clean string literals; local bindings remain identifiers.
+//! Alias discovery belongs to the production alias host. A
 //! successful alias may traverse named and explicit default reexports before
 //! reaching an authenticated exported declaration in another retained source.
 //! JavaScript `JSDoc` typedef targets retain their exact parser-owned reparsed
@@ -384,7 +384,6 @@ pub(super) enum SourceImportUnsupported {
     ImportClause(NodeRef),
     ExportClause(NodeRef),
     NamedBindings(NodeRef),
-    EmptyNamedExports(NodeRef),
     Binding(NodeRef),
     ExportBinding(NodeRef),
     TypeOnly(NodeRef),
@@ -492,7 +491,6 @@ impl SourceImportError {
                 | SourceImportUnsupported::ImportClause(node)
                 | SourceImportUnsupported::ExportClause(node)
                 | SourceImportUnsupported::NamedBindings(node)
-                | SourceImportUnsupported::EmptyNamedExports(node)
                 | SourceImportUnsupported::Binding(node)
                 | SourceImportUnsupported::ExportBinding(node)
                 | SourceImportUnsupported::TypeOnly(node)
@@ -1323,7 +1321,7 @@ fn plan_top_level_named_import(
             || !range_contains(clause_record, named_record)
             || named_data.facts != 0
             || named_data.elements.range != named_record.range
-            || named_data.elements.has_trailing_comma
+            || named_data.elements.has_trailing_comma && named_data.elements.nodes.is_empty()
         {
             return Err(unsupported(SourceImportUnsupported::NamedBindings(named)));
         }
@@ -1537,8 +1535,7 @@ fn validate_value_import_attributes(
 
 /// Proves one complete top-level named, namespace, or star reexport without checker writes.
 ///
-/// `export { source as public } from "./target"` and
-/// `export * as public from "./target"` forms retain their exact alias bindings.
+/// Empty, named, and namespace reexports retain their exact alias bindings.
 /// Plain value-star declarations retain the binder-owned `EXPORT_STAR` symbol
 /// and have no immediate alias bindings. Local, type-only star,
 /// attribute-bearing, and `CommonJS` forms require separate support.
@@ -1733,14 +1730,16 @@ pub(super) fn plan_top_level_named_reexport(
         || !range_contains(record, clause_record)
         || named.facts != 0
         || named.elements.range != clause_record.range
-        || named.elements.has_trailing_comma
+        || named.elements.has_trailing_comma && named.elements.nodes.is_empty()
     {
         return Err(unsupported(SourceImportUnsupported::ExportClause(clause)));
     }
     if named.elements.nodes.is_empty() {
-        return Err(unsupported(SourceImportUnsupported::EmptyNamedExports(
-            clause,
-        )));
+        return Ok(SourceNamedReexportPlan {
+            declaration,
+            module_specifier,
+            bindings: Vec::new(),
+        });
     }
 
     let mut aliases = HashSet::with_capacity(named.elements.nodes.len());
@@ -7599,9 +7598,10 @@ mod tests {
         instantiate::InstantiationLimits,
         jsdoc::JsDocType,
         module_resolution::{
-            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifest,
-            CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
-            CanonicalResolvedModuleInput, validate_module_resolution_manifest,
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionLookup,
+            CanonicalModuleResolutionManifest, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+            validate_module_resolution_manifest,
         },
         production::GlobalMergeCompletion,
     };
@@ -8786,6 +8786,132 @@ mod tests {
             assert_eq!(plan.module_specifier.file, fixture.files[0].file);
             assert_eq!(store_state(&fixture.store), before);
         }
+    }
+
+    #[test]
+    fn side_effect_imports_retain_ambient_module_resolution_without_aliases() {
+        let fixture = fixture_with_module_states(
+            &[
+                r#"import "ambient";"#,
+                r#"declare module "ambient" { export interface Value {} }"#,
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[CanonicalModuleState::External, CanonicalModuleState::Script],
+        );
+        let before = store_state(&fixture.store);
+        let plan = fixture.plan_import(0, 0);
+        let CanonicalModuleResolutionLookup::Resolved(resolved) =
+            fixture.manifest.lookup(plan.module_specifier)
+        else {
+            panic!("expected the side-effect import to retain its ambient module target")
+        };
+        let ambient_file = &fixture.files[1];
+        let declaration = ambient_file
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ModuleDeclaration).then_some(NodeRef::new(
+                    ambient_file.parsed.arena.id(),
+                    ambient_file.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let ambient = fixture
+            .bound
+            .get(&ambient_file.file)
+            .and_then(|bound| bound.symbol(declaration))
+            .unwrap();
+
+        assert!(plan.bindings.is_empty());
+        assert!(resolved.is_ambient_module());
+        assert_eq!(resolved.target_symbol(), ambient);
+        assert_eq!(store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn empty_value_and_type_reexports_preserve_module_provenance_without_aliases() {
+        for source in [
+            r#"export {} from "./target";"#,
+            "export { } from\n './target';",
+            r#"export type {} from "./target";"#,
+        ] {
+            let fixture = fixture(
+                &[source, "export const value: number = 1;"],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+            );
+            let before = store_state(&fixture.store);
+            let source_file = &fixture.files[0];
+            let bound = fixture.bound.get(&source_file.file).unwrap();
+            let module = bound.symbol(bound.source_file()).unwrap();
+
+            let plan = fixture.plan_reexport(0, 0);
+
+            assert!(plan.bindings.is_empty());
+            assert_eq!(plan.module_specifier.file, source_file.file);
+            assert!(bound.symbol(plan.declaration).is_none());
+            assert!(fixture.store.symbol(module).unwrap().exports().is_none());
+            assert_eq!(store_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn trailing_named_import_and_reexport_commas_preserve_binder_owned_aliases() {
+        let mut fixture = fixture(
+            &[
+                r#"import { forwarded as local, } from "./middle";"#,
+                r#"export { value as forwarded, } from "./target";"#,
+                "export const value: number = 1;",
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(2),
+                },
+            ],
+        );
+        let import = fixture.plan_import(0, 0);
+        let reexport = fixture.plan_reexport(1, 0);
+        let forwarded = direct_export(&fixture, 1, "forwarded");
+        let value = direct_export(&fixture, 2, "value");
+
+        assert_eq!(import.bindings[0].imported_text, "forwarded");
+        assert_eq!(import.bindings[0].local_text, "local");
+        assert_eq!(reexport.bindings[0].imported_text, "value");
+        assert_eq!(reexport.bindings[0].exported_text, "forwarded");
+
+        let resolved_import = resolve_all(&mut fixture, &import.bindings).unwrap();
+        let resolved_reexport = resolve_all_reexports(&mut fixture, &reexport.bindings).unwrap();
+        assert_eq!(resolved_import[0].immediate_target_symbol, forwarded);
+        assert_eq!(resolved_import[0].target_symbol, value);
+        assert_eq!(resolved_reexport[0].immediate_target_symbol, value);
+        assert_eq!(resolved_reexport[0].target_symbol, value);
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            resolve_all(&mut fixture, &import.bindings).unwrap(),
+            resolved_import,
+        );
+        assert_eq!(
+            resolve_all_reexports(&mut fixture, &reexport.bindings).unwrap(),
+            resolved_reexport,
+        );
+        assert_eq!(store_state(&fixture.store), warm);
     }
 
     #[test]
