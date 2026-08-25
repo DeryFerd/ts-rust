@@ -6635,6 +6635,39 @@ mod tests {
                     "{:?}",
                     artifact.unsupported_details
                 );
+
+                let mut canonical =
+                    compile_case_matrix_with_checker(&case, FixtureChecker::Canonical).unwrap();
+                assert_eq!(canonical.len(), 1);
+                let (variant, canonical) = canonical.remove(0);
+                assert!(
+                    variant.unsupported_details.is_empty(),
+                    "{:?}",
+                    variant.unsupported_details
+                );
+                assert_eq!(canonical.diagnostic_text, compilation.diagnostic_text);
+                let [diagnostic] = canonical.diagnostics.as_slice() else {
+                    panic!(
+                        "expected one canonical strict-mode diagnostic: {:?}",
+                        canonical.diagnostics
+                    )
+                };
+                assert_eq!(diagnostic.code, Some(1100));
+                assert_eq!(
+                    diagnostic.file_name.as_deref(),
+                    Some("/.src/alwaysStrictModule.ts")
+                );
+                assert_eq!(
+                    diagnostic.range,
+                    Some(TextRange::new(TextPos::new(52), TextPos::new(61)))
+                );
+                let canonical_artifact = render_error_baseline(&case, &canonical.diagnostics);
+                assert!(
+                    canonical_artifact.unsupported_details.is_empty(),
+                    "{:?}",
+                    canonical_artifact.unsupported_details
+                );
+                assert_eq!(canonical_artifact.text, artifact.text);
             }
         }
     }

@@ -10423,6 +10423,54 @@ mod tests {
     }
 
     #[test]
+    fn canonical_program_checks_diagnosed_strict_namespace_function_body() {
+        let fs = MemoryFileSystem::new(true);
+        let source = concat!(
+            "namespace M {\n",
+            "    export function f() {\n",
+            "        var arguments = [];\n",
+            "    }\n",
+            "}",
+        );
+        fs.write_file("/.src/alwaysStrictModule.ts", source)
+            .unwrap();
+
+        let program = Program::try_new_with_canonical_checker(
+            &fs,
+            "/.src",
+            &["alwaysStrictModule.ts".to_owned()],
+            CompilerOptions {
+                always_strict: true,
+                module: ModuleKind::CommonJs,
+                module_specified: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected exactly one strict-mode diagnostic: {:?}",
+                program.diagnostics()
+            )
+        };
+        assert_eq!(diagnostic.code, Some(1100));
+        assert_eq!(
+            diagnostic.file_name.as_deref(),
+            Some("/.src/alwaysStrictModule.ts")
+        );
+        assert_eq!(
+            diagnostic.range,
+            Some(TextRange::new(TextPos::new(52), TextPos::new(61)))
+        );
+        assert_eq!(
+            diagnostic.message,
+            "Invalid use of 'arguments' in strict mode."
+        );
+    }
+
+    #[test]
     fn canonical_program_checks_multi_file_primitive_assignments_atomically() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/project/first.ts", r#"const first: number = "wrong";"#)

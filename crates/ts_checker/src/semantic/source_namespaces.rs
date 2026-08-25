@@ -3543,6 +3543,145 @@ fn plan_deferred_ambient_function(
     })
 }
 
+fn strict_namespace_arguments_variable(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    body: NodeRef,
+    statements: &NodeList,
+) -> Result<Option<(NodeRef, NodeRef, NodeRef)>, SourceCheckError> {
+    let [statement_id] = statements.nodes.as_slice() else {
+        return Ok(None);
+    };
+    let statement = child(body, *statement_id);
+    let statement_record = owned_node(arena, bound, store, statement)?;
+    let NodeData::VariableStatement(variable_statement) = &statement_record.data else {
+        return Ok(None);
+    };
+    if statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || statement_record.parent != Some(body.node)
+        || variable_statement.flow_node.is_some()
+        || variable_statement.facts != 0
+        || variable_statement.modifiers.is_some()
+    {
+        return Ok(None);
+    }
+
+    let list = child(statement, variable_statement.declaration_list);
+    let list_record = owned_node(arena, bound, store, list)?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return Ok(None);
+    };
+    let [variable_id] = declarations.declarations.nodes.as_slice() else {
+        return Ok(None);
+    };
+    if list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != 0
+        || list_record.parent != Some(statement.node)
+        || declarations.declarations.has_trailing_comma
+        || declarations.facts != 0
+    {
+        return Ok(None);
+    }
+
+    let variable = child(list, *variable_id);
+    let variable_record = owned_node(arena, bound, store, variable)?;
+    let NodeData::VariableDeclaration(declaration) = &variable_record.data else {
+        return Ok(None);
+    };
+    let Some(initializer) = declaration.initializer else {
+        return Ok(None);
+    };
+    if variable_record.kind != SyntaxKind::VariableDeclaration
+        || variable_record.flags.0 != 0
+        || variable_record.parent != Some(list.node)
+        || declaration.exclamation_token.is_some()
+        || declaration.local_symbol.is_some()
+        || declaration.symbol.is_some()
+        || declaration.type_.is_some()
+        || declaration.facts != 0
+    {
+        return Ok(None);
+    }
+
+    Ok(Some((
+        variable,
+        child(variable, declaration.name),
+        child(variable, initializer),
+    )))
+}
+
+fn diagnosed_strict_namespace_arguments_body(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    function: NodeRef,
+    body: NodeRef,
+    statements: &NodeList,
+) -> Result<bool, SourceCheckError> {
+    if !bound
+        .source_facts()
+        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_always_strict)
+    {
+        return Ok(false);
+    }
+    let Some((variable, name, initializer)) =
+        strict_namespace_arguments_variable(arena, bound, store, body, statements)?
+    else {
+        return Ok(false);
+    };
+
+    let name_record = owned_node(arena, bound, store, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Ok(false);
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(variable.node)
+        || identifier.flow_node.is_some()
+        || identifier.text != "arguments"
+        || !bound
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.node == name && diagnostic.diagnostic.code() == 1100)
+    {
+        return Ok(false);
+    }
+
+    let initializer_record = owned_node(arena, bound, store, initializer)?;
+    let NodeData::ArrayLiteralExpression(array) = &initializer_record.data else {
+        return Ok(false);
+    };
+    if initializer_record.kind != SyntaxKind::ArrayLiteralExpression
+        || initializer_record.flags.0 != 0
+        || initializer_record.parent != Some(variable.node)
+        || !array.elements.nodes.is_empty()
+        || array.elements.has_trailing_comma
+        || array.facts != 0
+    {
+        return Ok(false);
+    }
+
+    let Some(symbol) = bound.symbol(variable) else {
+        return Ok(false);
+    };
+    let Some(record) = store.symbol(symbol) else {
+        return Ok(false);
+    };
+    Ok(record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        && record.check_flags() == CheckFlags::NONE
+        && record.name().as_utf8() == Some("arguments")
+        && record.declarations() == Some(&[variable])
+        && record.value_declaration() == Some(variable)
+        && bound.container(variable) == Some(function)
+        && bound
+            .locals(function)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("arguments"))
+            == Some(symbol))
+}
+
 fn plan_namespace_function(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -3631,8 +3770,16 @@ fn plan_namespace_function(
             || block.flow_node.is_some()
             || block.next_container.is_some()
             || block.facts != 0
-            || !block.statements.nodes.is_empty()
             || block.statements.has_trailing_comma
+            || (!block.statements.nodes.is_empty()
+                && !diagnosed_strict_namespace_arguments_body(
+                    arena,
+                    bound,
+                    store,
+                    declaration,
+                    body,
+                    &block.statements,
+                )?)
         {
             return Err(unsupported(
                 declaration,
@@ -9078,6 +9225,16 @@ mod tests {
         options: CanonicalCheckerOptions,
         declaration_file: bool,
     ) -> Fixture {
+        fixture_with_strict_source_facts(source, module_state, options, declaration_file, false)
+    }
+
+    fn fixture_with_strict_source_facts(
+        source: &'static str,
+        module_state: CanonicalModuleState,
+        options: CanonicalCheckerOptions,
+        declaration_file: bool,
+        always_strict: bool,
+    ) -> Fixture {
         let parsed: &'static ParseResult = Box::leak(Box::new(parse_source_file(source)));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(7_401);
@@ -9096,7 +9253,8 @@ mod tests {
                     CanonicalSourceLanguage::TypeScript,
                     declaration_file,
                     module_state,
-                ),
+                )
+                .with_always_strict(always_strict),
             )
             .unwrap();
         binder
@@ -9860,6 +10018,113 @@ mod tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    fn strict_namespace_arguments_keep_binder_diagnostics_and_warm_callable_state() {
+        let source = "namespace Values { export function read() { var arguments = []; } }";
+        let mut fixture = fixture_with_strict_source_facts(
+            source,
+            CanonicalModuleState::Script,
+            CanonicalCheckerOptions::default(),
+            false,
+            true,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Function {
+                declaration: function_declaration,
+                symbol,
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the diagnosed namespace function must retain its callable plan")
+        };
+        let function_declaration = *function_declaration;
+        let symbol = *symbol;
+        let (_, bound) = fixture.context.file(fixture.file).unwrap();
+        let [diagnostic] = bound.diagnostics() else {
+            panic!("the strict argument must retain exactly one binder diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 1100);
+        assert_eq!(diagnostic.diagnostic.arguments, ["arguments"]);
+        let argument = bound
+            .locals(function_declaration)
+            .and_then(|locals| fixture.context.store().symbol_table(locals))
+            .and_then(|locals| locals.get_source("arguments"))
+            .unwrap();
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(argument)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .is_some()
+        );
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn strict_namespace_arguments_reject_unproven_nonempty_bodies() {
+        for (invalid, always_strict) in [
+            (
+                "namespace Values { export function read() { var arguments = []; } }",
+                false,
+            ),
+            (
+                "namespace Values { export function read() { var arguments = [1]; } }",
+                true,
+            ),
+            (
+                "namespace Values { export function read() { var arguments = []; var other = 1; } }",
+                true,
+            ),
+        ] {
+            let fixture = fixture_with_strict_source_facts(
+                invalid,
+                CanonicalModuleState::Script,
+                CanonicalCheckerOptions::default(),
+                false,
+                always_strict,
+            );
+            let declaration = declaration(&fixture, 0);
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+            assert!(
+                matches!(
+                    plan_source_namespace(arena, bound, fixture.context.store(), declaration),
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Syntax {
+                            kind: SyntaxKind::FunctionDeclaration,
+                            role: SourceSyntaxRole::FunctionDeclaration,
+                            ..
+                        }
+                    ))
+                ),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
