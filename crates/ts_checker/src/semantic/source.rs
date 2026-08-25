@@ -38865,8 +38865,7 @@ fn recovered_arrow_parameter(
     let NodeData::ParameterDeclaration(syntax) = &record.data else {
         return false;
     };
-    let Some((name, text)) = recovered_protected_identifier(arena, bound, parameter, syntax.name)
-    else {
+    let Some((name, text)) = recovered_identifier(arena, bound, parameter, syntax.name) else {
         return false;
     };
     if record.kind != SyntaxKind::Parameter
@@ -39250,8 +39249,7 @@ fn recovered_arrow_namespace(
     let NodeData::ModuleDeclaration(module) = &record.data else {
         return false;
     };
-    let Some((name, text)) = recovered_protected_identifier(arena, bound, namespace, module.name)
-    else {
+    let Some((name, text)) = recovered_identifier(arena, bound, namespace, module.name) else {
         return false;
     };
     let Some(symbol) = bound.symbol(namespace) else {
@@ -39553,7 +39551,7 @@ fn recovered_jsx_variable<'arena>(
     let NodeData::VariableDeclaration(variable) = &record.data else {
         return None;
     };
-    let (name, text) = recovered_protected_identifier(arena, bound, declaration, variable.name)?;
+    let (name, text) = recovered_identifier(arena, bound, declaration, variable.name)?;
     let symbol = bound.symbol(declaration)?;
     if record.kind != SyntaxKind::VariableDeclaration
         || record.flags.0 != 0
@@ -39668,7 +39666,7 @@ fn recovered_jsx_object_method<'arena>(
     let NodeData::MethodDeclaration(syntax) = &record.data else {
         return None;
     };
-    let (name, text) = recovered_protected_identifier(arena, bound, method, syntax.name)?;
+    let (name, text) = recovered_identifier(arena, bound, method, syntax.name)?;
     let body = syntax.body?;
     let symbol = bound.symbol(method)?;
     let owner = store.symbol(symbol)?;
@@ -39969,12 +39967,12 @@ fn recover_unclosed_jsx_source(
         return Ok(false);
     };
     let Some((receiver, receiver_name)) =
-        recovered_protected_identifier(arena, bound, outer_tag, access.expression)
+        recovered_identifier(arena, bound, outer_tag, access.expression)
     else {
         return Ok(false);
     };
     let Some((property, property_name)) =
-        recovered_protected_identifier(arena, bound, outer_tag, access.name)
+        recovered_identifier(arena, bound, outer_tag, access.name)
     else {
         return Ok(false);
     };
