@@ -4841,6 +4841,7 @@ fn validate_exact_generic_annotation_shape(
             .is_some_and(CanonicalSourceFileFacts::is_declaration_file);
     for parameter in &plan.parameters {
         let mut exact = false;
+        let mut exact_array = false;
         for type_parameter in &plan.type_parameters {
             exact |= is_naked_source_type_parameter_annotation(
                 store,
@@ -4850,13 +4851,14 @@ fn validate_exact_generic_annotation_shape(
             )?;
         }
         if !exact && let Some(array_targets) = plan.array_targets {
-            exact = is_exact_source_generic_array_annotation(
+            exact_array = is_exact_source_generic_array_annotation(
                 store,
                 host,
                 parameter.identity_node,
                 &plan.type_parameters,
                 array_targets,
             )?;
+            exact = exact_array;
         }
         if !exact && ambient_namespace {
             exact = exact_ambient_generic_constructor_parameter(
@@ -4891,7 +4893,7 @@ fn validate_exact_generic_annotation_shape(
         }
         if parameter.is_implicit_any()
             || parameter.initializer.is_some()
-            || parameter.rest
+            || parameter.rest && !exact_array
             || !exact
         {
             return Err(SourceCallableError::Unsupported(
@@ -4915,17 +4917,27 @@ fn validate_exact_generic_annotation_shape(
             return_type_parameter = Some(index);
         }
     }
-    if return_type_parameter.is_none()
-        && !is_exact_source_generic_mapper_annotation(
+    if return_type_parameter.is_none() {
+        let exact = is_exact_source_generic_mapper_annotation(
             store,
             host,
             generic_return_identity,
             &plan.type_parameters,
-        )?
-    {
-        return Err(SourceCallableError::Unsupported(
-            SourceCallableUnsupported::GenericSignature(plan.declaration),
-        ));
+        )? || match plan.array_targets {
+            Some(targets) => is_exact_source_generic_array_annotation(
+                store,
+                host,
+                return_identity_node,
+                &plan.type_parameters,
+                targets,
+            )?,
+            None => false,
+        };
+        if !exact {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::GenericSignature(plan.declaration),
+            ));
+        }
     }
     Ok(if plan.type_predicate.is_some() {
         None
@@ -8008,16 +8020,21 @@ pub(super) fn publish_lazy_source_callable_return(
         || annotation != Some(return_type)
         || !plan.type_parameters.is_empty()
             && !planned_type_parameter_ids(store, plan).is_some_and(|type_parameters| {
-                valid_source_generic_mapper_type(store, return_type, &type_parameters)
-                    && valid_stored_source_generic_return_annotation(
-                        store,
-                        return_identity_node,
-                        return_null_literal_identity,
-                        return_type,
-                        plan.generic_return_type_parameter_index
-                            .and_then(|index| type_parameters.get(index).copied()),
-                        &type_parameters,
-                    )
+                valid_source_generic_mapper_type(
+                    store,
+                    return_type,
+                    &type_parameters,
+                    plan.array_targets,
+                ) && valid_stored_source_generic_return_annotation(
+                    store,
+                    return_identity_node,
+                    return_null_literal_identity,
+                    return_type,
+                    plan.generic_return_type_parameter_index
+                        .and_then(|index| type_parameters.get(index).copied()),
+                    &type_parameters,
+                    plan.array_targets,
+                )
             })
     {
         return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
@@ -8870,7 +8887,12 @@ pub(super) fn validate_stored_source_callable(
             cached_annotation_identity(store, return_identity_node, return_null_literal_identity);
         let valid_return = if !type_parameter_edges.is_empty()
             && (store.circular_return_annotation_type(signature).is_some()
-                || !valid_source_generic_mapper_type(store, return_type, &type_parameter_edges)
+                || !valid_source_generic_mapper_type(
+                    store,
+                    return_type,
+                    &type_parameter_edges,
+                    provenance.array_targets,
+                )
                 || !valid_stored_source_generic_return_annotation(
                     store,
                     return_identity_node,
@@ -8878,6 +8900,7 @@ pub(super) fn validate_stored_source_callable(
                     return_type,
                     provenance.generic_return_type_parameter,
                     &type_parameter_edges,
+                    provenance.array_targets,
                 )) {
             false
         } else if let Some(circular_annotation) = store.circular_return_annotation_type(signature) {
@@ -8924,8 +8947,13 @@ fn valid_stored_generic_source_signature(
     let generic_arrow = signature.declaration().is_some_and(|declaration| {
         store.source_node_kind(declaration) == Some(SyntaxKind::ArrowFunction)
     });
-    signature.flags() == SignatureFlags::NONE
-        && minimum_argument_count <= signature.parameters().len()
+    let has_rest = signature.flags() == SignatureFlags::HAS_REST_PARAMETER;
+    (signature.flags() == SignatureFlags::NONE || has_rest)
+        && minimum_argument_count
+            <= signature
+                .parameters()
+                .len()
+                .saturating_sub(usize::from(has_rest))
         && parameter_types.is_none_or(|types| {
             types.len() == signature.parameters().len()
                 && types.iter().enumerate().all(|(index, type_)| {
@@ -9214,6 +9242,7 @@ fn valid_source_generic_mapper_type(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     type_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
     if store
         .intrinsic_bootstrap()
@@ -9233,7 +9262,7 @@ fn valid_source_generic_mapper_type(
             store.validate_union_constituent(type_).is_ok()
         }
         TypeData::TypeReference(_) => {
-            valid_generic_source_parameter_type(store, None, type_, type_parameters)
+            valid_generic_source_parameter_type(store, array_targets, type_, type_parameters)
         }
         _ => false,
     }
@@ -9246,6 +9275,7 @@ fn valid_stored_source_generic_return_annotation(
     return_type: TypeId,
     expected: Option<TypeId>,
     type_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
     if let Some(expected) = expected {
         let Some(symbol) = cached_ordinary_type_parameter_owner(store, expected) else {
@@ -9273,6 +9303,29 @@ fn valid_stored_source_generic_return_annotation(
                     resolved_type: Some(return_type),
                     outer_type_parameters: None,
                 });
+    }
+    if store.source_node_kind(annotation) == Some(SyntaxKind::ArrayType) {
+        let Some(targets) = array_targets else {
+            return false;
+        };
+        let Ok(Some(reference)) =
+            store.canonical_array_reference_with_targets(targets, return_type)
+        else {
+            return false;
+        };
+        return !reference.readonly
+            && !reference.array_literal
+            && store.type_node_links(annotation)
+                == Some(&TypeNodeLinks {
+                    resolved_type: Some(return_type),
+                    outer_type_parameters: None,
+                })
+            && valid_generic_source_parameter_type(
+                store,
+                Some(targets),
+                return_type,
+                type_parameters,
+            );
     }
     if store.source_node_kind(annotation) == Some(SyntaxKind::TypeReference) {
         return valid_named_source_generic_reference(
@@ -9732,16 +9785,21 @@ fn validate_cached_return_type(
     let valid = if !plan.type_parameters.is_empty()
         && (circular_annotation.is_some()
             || !planned_type_parameter_ids(store, plan).is_some_and(|type_parameters| {
-                valid_source_generic_mapper_type(store, resolved, &type_parameters)
-                    && valid_stored_source_generic_return_annotation(
-                        store,
-                        return_identity_node,
-                        return_null_literal_identity,
-                        resolved,
-                        plan.generic_return_type_parameter_index
-                            .and_then(|index| type_parameters.get(index).copied()),
-                        &type_parameters,
-                    )
+                valid_source_generic_mapper_type(
+                    store,
+                    resolved,
+                    &type_parameters,
+                    plan.array_targets,
+                ) && valid_stored_source_generic_return_annotation(
+                    store,
+                    return_identity_node,
+                    return_null_literal_identity,
+                    resolved,
+                    plan.generic_return_type_parameter_index
+                        .and_then(|index| type_parameters.get(index).copied()),
+                    &type_parameters,
+                    plan.array_targets,
+                )
             })) {
         false
     } else if let Some(circular_annotation) = circular_annotation {

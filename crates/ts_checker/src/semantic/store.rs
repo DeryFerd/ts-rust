@@ -6443,8 +6443,15 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                         .is_some_and(|bootstrap| self.types.get(bootstrap.void_type).is_some())
             }
         };
-        let minimum_argument_count_valid = usize::try_from(prepared.min_argument_count)
-            .is_ok_and(|minimum| minimum <= prepared.parameters.len());
+        let has_rest_parameter = prepared.flags == SignatureFlags::HAS_REST_PARAMETER;
+        let minimum_argument_count_valid =
+            usize::try_from(prepared.min_argument_count).is_ok_and(|minimum| {
+                minimum
+                    <= prepared
+                        .parameters
+                        .len()
+                        .saturating_sub(usize::from(has_rest_parameter))
+            });
         let owner_links_cold = self
             .value_symbol_links(prepared.owner_symbol)
             .is_none_or(|links| links == &ValueSymbolLinks::default());
@@ -6464,7 +6471,11 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if prepared.type_parameters.is_empty()
             || prepared.syntax.declaration() != prepared.declaration
             || !source_family_matches
-            || prepared.flags != SignatureFlags::NONE
+            || prepared.flags != SignatureFlags::NONE && !has_rest_parameter
+            || has_rest_parameter
+                && (prepared.family != SourceCallableFamily::FunctionDeclaration
+                    || prepared.parameters.is_empty()
+                    || prepared.array_targets.is_none())
             || !minimum_argument_count_valid
             || !owner_valid
             || !export_route_valid

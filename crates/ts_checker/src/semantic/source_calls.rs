@@ -3030,12 +3030,18 @@ fn prepare_vector_source_call_diagnostic(
     resolution: &GenericCallVectorResolution,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let projection = resolution.projection();
-    let (parameter_count, minimum_argument_count) = store
+    let (parameter_count, minimum_argument_count, has_effective_rest) = store
         .signature(projection.generic_signature)
         .and_then(|signature| {
             usize::try_from(signature.min_argument_count())
                 .ok()
-                .map(|minimum| (signature.parameters().len(), minimum))
+                .map(|minimum| {
+                    (
+                        signature.parameters().len(),
+                        minimum,
+                        signature.has_rest_parameter(),
+                    )
+                })
         })
         .ok_or(SourceCheckError::Call(plan.node))?;
     let diagnostic = match resolution.applicability() {
@@ -3058,16 +3064,21 @@ fn prepare_vector_source_call_diagnostic(
             {
                 return Err(SourceCheckError::Call(plan.node));
             }
+            let (message, expected) = if has_effective_rest {
+                (
+                    message_by_code(2555).ok_or(SourceCheckError::MissingDiagnostic(2555))?,
+                    minimum_argument_count.to_string(),
+                )
+            } else {
+                (
+                    message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
+                    expected_count_text(minimum_argument_count, parameter_count),
+                )
+            };
             CanonicalCheckerDiagnostic {
                 node: Some(plan.callee_diagnostic_node),
                 range_override: None,
-                diagnostic: Diagnostic::with_arguments(
-                    message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
-                    [
-                        expected_count_text(minimum_argument_count, parameter_count),
-                        actual.to_string(),
-                    ],
-                ),
+                diagnostic: Diagnostic::with_arguments(message, [expected, actual.to_string()]),
                 related_information: vec![missing_argument_related_information(
                     store,
                     host,
@@ -3078,7 +3089,8 @@ fn prepare_vector_source_call_diagnostic(
             }
         }
         GenericCallVectorApplicability::TooManyArguments { expected, actual } => {
-            if expected != parameter_count
+            if has_effective_rest
+                || expected != parameter_count
                 || actual != plan.arguments.len()
                 || actual != argument_types.len()
             {
@@ -7890,6 +7902,144 @@ mod tests {
                 .map(|call| call_publication_state(&context, *call))
                 .collect::<Vec<_>>(),
             cold_calls
+        );
+    }
+
+    #[test]
+    fn generic_array_rest_calls_infer_prefixes_defaults_and_reuse_checked_signatures() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parsed(concat!(
+            "declare function collect<T>(...values: T[]): T[]; ",
+            "declare function first<T>(head: T, ...values: T[]): T; ",
+            "declare function fallback<T extends string = string>(...values: T[]): T; ",
+            "const inferred = collect(1, 2, 3); ",
+            "const repeated = collect(4, 5); ",
+            "const explicit = collect<string>('first', 'second'); ",
+            "const selected = first('first', 'second'); ",
+            "const defaulted = fallback(); ",
+            "const invalidConstraint = fallback<number>(1); ",
+            "const wrong = collect<string>('first', 1); ",
+            "const missing = first();",
+        ));
+        let library_file = FileId::new(4_920);
+        let source_file = FileId::new(4_921);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+        let mut call_nodes = calls(&source, source_file);
+        call_nodes.sort_by_key(|call| source.arena.get(call.node).unwrap().range.start);
+        let [
+            inferred,
+            repeated,
+            explicit,
+            selected,
+            defaulted,
+            invalid_constraint,
+            wrong,
+            missing,
+        ] = call_nodes.as_slice()
+        else {
+            panic!("expected eight generic array-rest calls")
+        };
+
+        context.check_source_file(source_file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        for call in [*inferred, *repeated] {
+            let result = context
+                .store()
+                .type_node_links(call)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .canonical_array_element_type(context.global_types(), result)
+                    .unwrap(),
+                Some(number),
+            );
+        }
+        let signature = |call| {
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap()
+        };
+        assert_eq!(signature(*inferred), signature(*repeated));
+        assert!(
+            context
+                .store()
+                .signature(signature(*inferred))
+                .unwrap()
+                .has_rest_parameter()
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(*explicit)
+                .and_then(|links| links.resolved_type)
+                .and_then(|array| {
+                    context
+                        .store()
+                        .canonical_array_element_type(context.global_types(), array)
+                        .unwrap()
+                }),
+            Some(string),
+        );
+        let selected_result = context
+            .store()
+            .type_node_links(*selected)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let TypeData::Union(selected_union) = context
+            .store()
+            .type_payload(selected_result)
+            .unwrap()
+            .data()
+        else {
+            panic!("a naked returned type parameter must preserve its string literals")
+        };
+        assert_eq!(selected_union.union.types.len(), 2);
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(*defaulted)
+                .and_then(|links| links.resolved_type),
+            Some(string),
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(*invalid_constraint)
+                .and_then(|links| links.resolved_type),
+            Some(number),
+        );
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2344, 2345, 2555],
+        );
+        assert_ne!(signature(*wrong), signature(*explicit));
+        assert!(context.store().signature(signature(*missing)).is_some());
+
+        let cold = call_nodes
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, source_file);
+        context.check_source_file(source_file).unwrap();
+        assert_eq!(
+            call_nodes
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold,
         );
     }
 
