@@ -1271,9 +1271,6 @@ fn valid_optional_generic_predicate_parameter(
         && cached_planned_type_identity(store, annotation) == Some(type_)
         && store.source_node_parent(*parameter_declaration)
             == Some(SourceNodeParent::Parent(signature))
-        && store
-            .intrinsic_bootstrap()
-            .is_some_and(|bootstrap| !bootstrap.options.strict_null_checks)
 }
 
 fn declared_signature_parameter_is_optional(
@@ -8199,10 +8196,7 @@ fn plan_call_signature(
                     type_node,
                     &type_parameters,
                 )
-                .is_some()
-                && store
-                    .intrinsic_bootstrap()
-                    .is_some_and(|bootstrap| !bootstrap.options.strict_null_checks);
+                .is_some();
             if !is_construct
                 && !type_literal_call
                 && !boolean_constructor
@@ -15374,6 +15368,20 @@ mod generic_publication_tests {
         file: u32,
         module_state: CanonicalModuleState,
     ) -> Fixture {
+        interface_fixture_with_bootstrap(
+            source,
+            file,
+            module_state,
+            IntrinsicBootstrapOptions::default(),
+        )
+    }
+
+    fn interface_fixture_with_bootstrap(
+        source: &str,
+        file: u32,
+        module_state: CanonicalModuleState,
+        intrinsic: IntrinsicBootstrapOptions,
+    ) -> Fixture {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(file);
@@ -15412,9 +15420,7 @@ mod generic_publication_tests {
                 .register_source_file(&parsed.arena, parsed.source_file, file)
                 .is_some()
         );
-        store
-            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
-            .unwrap();
+        store.initialize_intrinsic_bootstrap(intrinsic).unwrap();
         if module_state == CanonicalModuleState::Script {
             let globals = store.intrinsic_bootstrap().unwrap().globals;
             let global = store.get_parent_of_symbol(symbol).unwrap_or(symbol);
@@ -17377,6 +17383,112 @@ mod generic_publication_tests {
             ),
             warm,
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_interface_predicate_calls_support_strict_null_checks_and_named_constructor_returns()
+    {
+        let intrinsic = IntrinsicBootstrapOptions {
+            strict_null_checks: true,
+            ..IntrinsicBootstrapOptions::default()
+        };
+        let mut fixture = interface_fixture_with_bootstrap(
+            concat!(
+                "interface Bullean {} ",
+                "interface BulleanConstructor { ",
+                "new(v1?: any): Bullean; ",
+                "<T>(v2?: T): v2 is T; ",
+                "}",
+            ),
+            3_926,
+            CanonicalModuleState::Script,
+            intrinsic,
+        );
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.parsed.arena.get(interface.name)?.data
+                else {
+                    return None;
+                };
+                (name.text == "BulleanConstructor").then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let constructor_symbol = fixture.bound.symbol(declaration).unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        fixture
+            .store
+            .merge_global_symbol(globals, constructor_symbol)
+            .unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, constructor_symbol).unwrap();
+        let [constructor, call] = plan.call_signatures.as_slice() else {
+            panic!("BulleanConstructor must preserve its constructor and predicate call")
+        };
+        assert!(constructor.is_construct());
+        assert!(!call.is_construct());
+        assert!(call.parameters[0].optional);
+        assert_eq!(call.min_argument_count(), 0);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let (constructor_type, bullean_type) = {
+            let mut query = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::from(intrinsic),
+                &mut diagnostics,
+            )
+            .unwrap();
+            (
+                query
+                    .get_declared_type_of_symbol(constructor_symbol)
+                    .unwrap(),
+                query.get_declared_type_of_symbol(fixture.symbol).unwrap(),
+            )
+        };
+        let TypeData::Interface(interface) =
+            fixture.store.type_payload(constructor_type).unwrap().data()
+        else {
+            panic!("BulleanConstructor must retain its interface owner")
+        };
+        let [signature] = interface.declared_call_signatures.as_deref().unwrap() else {
+            panic!("BulleanConstructor must retain one generic predicate call")
+        };
+        let [construct] = interface.declared_construct_signatures.as_deref().unwrap() else {
+            panic!("BulleanConstructor must retain one constructor")
+        };
+        let signature = fixture.store.signature(*signature).unwrap();
+        let [type_parameter] = signature.type_parameters() else {
+            panic!("the predicate call must retain its original type parameter")
+        };
+        let predicate = signature
+            .resolved_type_predicate()
+            .and_then(|predicate| fixture.store.type_predicate(predicate))
+            .unwrap();
+        assert_eq!(signature.min_argument_count(), 0);
+        assert_eq!(predicate.parameter_name(), "v2");
+        assert_eq!(predicate.type_id(), Some(*type_parameter));
+        assert_eq!(
+            fixture
+                .store
+                .signature(*construct)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            Some(bullean_type),
+        );
+        assert!(matches!(
+            validate_stored_declared_call_set(&fixture.store, constructor_type),
+            StoredDeclaredCallSetValidation::Valid(_)
+        ));
         assert!(diagnostics.is_empty());
     }
 
