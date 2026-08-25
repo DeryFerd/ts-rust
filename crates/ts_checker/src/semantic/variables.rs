@@ -1,9 +1,9 @@
 //! Read-only symbol planning for the dependency-closed top-level variable slice.
 //!
 //! The source checker owns expression execution and type publication. This module
-//! proves the binder/resolver route for one ordinary top-level variable, one
-//! already-planned local read, or one authenticated ambient global from another
-//! script declaration file without mutating checker state.
+//! proves the binder/resolver route for ordinary top-level variables, object and
+//! array binding elements, already-planned local reads, and authenticated ambient
+//! globals from other script declaration files without mutating checker state.
 
 use std::collections::HashSet;
 
@@ -84,12 +84,23 @@ pub(super) struct PlannedComputedBindingElement {
     pub(super) symbol: SemanticSymbolId,
 }
 
+/// One named property traversed before reaching a nested object binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PlannedObjectBindingProperty {
+    pub(super) property: NodeRef,
+    pub(super) property_name: String,
+}
+
 /// One ordinary object binding whose declaration symbol belongs to its element.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PlannedObjectBindingElement {
     pub(super) element: NodeRef,
     pub(super) property: NodeRef,
     pub(super) property_name: String,
+    pub(super) parent_properties: Vec<PlannedObjectBindingProperty>,
+    pub(super) initializer: Option<NodeRef>,
+    pub(super) rest: bool,
+    pub(super) excluded_properties: Vec<String>,
     pub(super) name: NodeRef,
     pub(super) symbol: SemanticSymbolId,
 }
@@ -100,6 +111,9 @@ pub(super) struct PlannedArrayBindingElement {
     pub(super) declaration: NodeRef,
     pub(super) pattern: NodeRef,
     pub(super) element: NodeRef,
+    pub(super) index: usize,
+    pub(super) initializer: Option<NodeRef>,
+    pub(super) rest: bool,
     pub(super) name: NodeRef,
     pub(super) symbol: SemanticSymbolId,
 }
@@ -560,7 +574,7 @@ pub(super) fn plan_top_level_computed_binding_element(
     })
 }
 
-/// Authenticates every shorthand or explicitly renamed top-level object binding.
+/// Authenticates top-level object bindings and their nested property paths.
 pub(super) fn plan_top_level_object_binding_elements(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -643,7 +657,6 @@ pub(super) fn plan_top_level_object_binding_elements(
     };
     if pattern_record.kind != SyntaxKind::ObjectBindingPattern
         || pattern_record.flags.0 != 0
-        || pattern_data.elements.nodes.is_empty()
         || pattern_data.elements.range != pattern_record.range
         || pattern_data.facts != 0
     {
@@ -654,7 +667,54 @@ pub(super) fn plan_top_level_object_binding_elements(
 
     let mut planned = Vec::with_capacity(pattern_data.elements.nodes.len());
     let mut names = HashSet::with_capacity(pattern_data.elements.nodes.len());
-    for element in &pattern_data.elements.nodes {
+    plan_object_binding_pattern(
+        arena,
+        bound,
+        store,
+        pattern,
+        binding,
+        exported,
+        &[],
+        &mut names,
+        &mut planned,
+    )?;
+    Ok(planned)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_object_binding_pattern(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    pattern: NodeRef,
+    binding: VariableBindingKind,
+    exported: bool,
+    parent_properties: &[PlannedObjectBindingProperty],
+    names: &mut HashSet<SemanticSymbolId>,
+    planned: &mut Vec<PlannedObjectBindingElement>,
+) -> Result<(), VariablePlanError> {
+    let pattern_record = arena
+        .get(pattern.node)
+        .ok_or(VariableInvariant::InvalidBindingPattern(pattern))?;
+    let NodeData::BindingPattern(pattern_data) = &pattern_record.data else {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    };
+    if pattern_record.kind != SyntaxKind::ObjectBindingPattern
+        || pattern_record.flags.0 != 0
+        || pattern_data.elements.range != pattern_record.range
+        || pattern_data.facts != 0
+        || !parent_properties.is_empty() && pattern_data.elements.nodes.is_empty()
+    {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    }
+
+    let source = bound.source_file();
+    let mut excluded_properties = Vec::with_capacity(pattern_data.elements.nodes.len());
+    for (index, element) in pattern_data.elements.nodes.iter().enumerate() {
         let element = NodeRef::new(pattern.arena, pattern.file, *element);
         let element_record = binding_child_node(arena, store, element, pattern)?;
         let NodeData::BindingElement(data) = &element_record.data else {
@@ -662,9 +722,7 @@ pub(super) fn plan_top_level_object_binding_elements(
         };
         if element_record.kind != SyntaxKind::BindingElement
             || element_record.flags.0 != 0
-            || data.dot_dot_dot_token.is_some()
             || data.flow_node.is_some()
-            || data.initializer.is_some()
             || data.local_symbol.is_some()
             || data.symbol.is_some()
             || data.facts != 0
@@ -678,18 +736,6 @@ pub(super) fn plan_top_level_object_binding_elements(
             .map(|node| NodeRef::new(element.arena, element.file, node))
             .ok_or(VariableInvariant::InvalidBindingPattern(element))?;
         let name_record = binding_child_node(arena, store, name, element)?;
-        let NodeData::Identifier(identifier) = &name_record.data else {
-            return Err(VariablePlanError::Unsupported(
-                VariableUnsupported::BindingPattern(name),
-            ));
-        };
-        if name_record.kind != SyntaxKind::Identifier
-            || name_record.flags.0 != 0
-            || identifier.flow_node.is_some()
-            || identifier.text.is_empty()
-        {
-            return Err(VariableInvariant::InvalidBindingPattern(name).into());
-        }
         let property = data
             .property_name
             .map_or(name, |node| NodeRef::new(element.arena, element.file, node));
@@ -730,6 +776,80 @@ pub(super) fn plan_top_level_object_binding_elements(
             return Err(VariableInvariant::InvalidBindingPattern(property).into());
         }
 
+        let initializer = data
+            .initializer
+            .map(|node| NodeRef::new(element.arena, element.file, node));
+        if let Some(initializer) = initializer {
+            let initializer_record = binding_child_node(arena, store, initializer, element)?;
+            if name_record.range.end > initializer_record.range.start
+                || initializer_record.range.end != element_record.range.end
+            {
+                return Err(VariableInvariant::InvalidBindingPattern(initializer).into());
+            }
+        }
+
+        let rest = data.dot_dot_dot_token.is_some();
+        if let Some(spread) = data.dot_dot_dot_token {
+            let spread = NodeRef::new(element.arena, element.file, spread);
+            let spread_record = binding_child_node(arena, store, spread, element)?;
+            if spread_record.kind != SyntaxKind::DotDotDotToken
+                || spread_record.flags.0 != 0
+                || !matches!(spread_record.data, NodeData::Token(_))
+                || spread_record.range.start != element_record.range.start
+                || spread_record.range.end > name_record.range.start
+                || index + 1 != pattern_data.elements.nodes.len()
+                || pattern_data.elements.has_trailing_comma
+                || data.property_name.is_some()
+                || initializer.is_some()
+            {
+                return Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::BindingPattern(element),
+                ));
+            }
+        }
+
+        if name_record.kind == SyntaxKind::ObjectBindingPattern {
+            if rest || initializer.is_some() || data.property_name.is_none() {
+                return Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::BindingPattern(element),
+                ));
+            }
+            if bound.symbol(element).is_some() || bound.local_symbol(element).is_some() {
+                return Err(VariableInvariant::InvalidBindingPattern(element).into());
+            }
+            excluded_properties.push(property_name.clone());
+            let mut nested_properties = parent_properties.to_vec();
+            nested_properties.push(PlannedObjectBindingProperty {
+                property,
+                property_name,
+            });
+            plan_object_binding_pattern(
+                arena,
+                bound,
+                store,
+                name,
+                binding,
+                exported,
+                &nested_properties,
+                names,
+                planned,
+            )?;
+            continue;
+        }
+
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(name),
+            ));
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(VariableInvariant::InvalidBindingPattern(name).into());
+        }
+
         let symbol = plan_top_level_variable(
             bound,
             store,
@@ -751,26 +871,37 @@ pub(super) fn plan_top_level_object_binding_elements(
         {
             return Err(VariableInvariant::InvalidBindingPattern(element).into());
         }
+        if !rest {
+            excluded_properties.push(property_name.clone());
+        }
         planned.push(PlannedObjectBindingElement {
             element,
             property,
             property_name,
+            parent_properties: parent_properties.to_vec(),
+            initializer,
+            rest,
+            excluded_properties: if rest {
+                excluded_properties.clone()
+            } else {
+                Vec::new()
+            },
             name,
             symbol,
         });
     }
-    Ok(planned)
+    Ok(())
 }
 
-/// Proves one top-level `[name]` binding without publishing its type.
-pub(super) fn plan_top_level_array_binding_element(
+/// Authenticates positional array bindings, omitted elements, defaults, and rest.
+pub(super) fn plan_top_level_array_binding_elements(
     arena: &NodeArena,
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
     binding: VariableBindingKind,
     exported: bool,
-) -> Result<PlannedArrayBindingElement, VariablePlanError> {
+) -> Result<Vec<PlannedArrayBindingElement>, VariablePlanError> {
     if bound.node_arena_id() != arena.id()
         || bound.node_arena_revision() != arena.revision()
         || !declaration.is_for(arena.id(), bound.file_id())
@@ -845,14 +976,8 @@ pub(super) fn plan_top_level_array_binding_element(
             VariableUnsupported::BindingPattern(pattern),
         ));
     };
-    let [element] = pattern_data.elements.nodes.as_slice() else {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::BindingPattern(pattern),
-        ));
-    };
     if pattern_record.kind != SyntaxKind::ArrayBindingPattern
         || pattern_record.flags.0 != 0
-        || pattern_data.elements.has_trailing_comma
         || pattern_data.elements.range != pattern_record.range
         || pattern_data.facts != 0
     {
@@ -861,75 +986,159 @@ pub(super) fn plan_top_level_array_binding_element(
         ));
     }
 
-    let element = NodeRef::new(pattern.arena, pattern.file, *element);
-    let element_record = binding_child_node(arena, store, element, pattern)?;
-    let NodeData::BindingElement(element_data) = &element_record.data else {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::BindingPattern(element),
-        ));
-    };
-    if element_record.kind != SyntaxKind::BindingElement
-        || element_record.flags.0 != 0
-        || element_data.dot_dot_dot_token.is_some()
-        || element_data.flow_node.is_some()
-        || element_data.initializer.is_some()
-        || element_data.local_symbol.is_some()
-        || element_data.property_name.is_some()
-        || element_data.symbol.is_some()
-        || element_data.facts != 0
-    {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::BindingPattern(element),
-        ));
+    let mut planned = Vec::with_capacity(pattern_data.elements.nodes.len());
+    let mut names = HashSet::with_capacity(pattern_data.elements.nodes.len());
+    for (index, element) in pattern_data.elements.nodes.iter().enumerate() {
+        let element = NodeRef::new(pattern.arena, pattern.file, *element);
+        let element_record = binding_child_node(arena, store, element, pattern)?;
+        if element_record.kind == SyntaxKind::OmittedExpression {
+            if !matches!(element_record.data, NodeData::OmittedExpression(_))
+                || element_record.flags.0 != 0
+                || element_record.range.start != element_record.range.end
+                || bound.symbol(element).is_some()
+                || bound.local_symbol(element).is_some()
+            {
+                return Err(VariableInvariant::InvalidBindingPattern(element).into());
+            }
+            continue;
+        }
+
+        let NodeData::BindingElement(element_data) = &element_record.data else {
+            return Err(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(element),
+            ));
+        };
+        if element_record.kind != SyntaxKind::BindingElement
+            || element_record.flags.0 != 0
+            || element_data.flow_node.is_some()
+            || element_data.local_symbol.is_some()
+            || element_data.property_name.is_some()
+            || element_data.symbol.is_some()
+            || element_data.facts != 0
+        {
+            return Err(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(element),
+            ));
+        }
+
+        let name = element_data
+            .name
+            .map(|node| NodeRef::new(element.arena, element.file, node))
+            .ok_or(VariableInvariant::InvalidBindingPattern(element))?;
+        let name_record = binding_child_node(arena, store, name, element)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(name),
+            ));
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(VariableInvariant::InvalidBindingPattern(name).into());
+        }
+
+        let initializer = element_data
+            .initializer
+            .map(|node| NodeRef::new(element.arena, element.file, node));
+        if let Some(initializer) = initializer {
+            let initializer_record = binding_child_node(arena, store, initializer, element)?;
+            if name_record.range.end > initializer_record.range.start
+                || initializer_record.range.end != element_record.range.end
+            {
+                return Err(VariableInvariant::InvalidBindingPattern(initializer).into());
+            }
+        }
+
+        let rest = element_data.dot_dot_dot_token.is_some();
+        if let Some(spread) = element_data.dot_dot_dot_token {
+            let spread = NodeRef::new(element.arena, element.file, spread);
+            let spread_record = binding_child_node(arena, store, spread, element)?;
+            if spread_record.kind != SyntaxKind::DotDotDotToken
+                || spread_record.flags.0 != 0
+                || !matches!(spread_record.data, NodeData::Token(_))
+                || spread_record.range.start != element_record.range.start
+                || spread_record.range.end > name_record.range.start
+                || index + 1 != pattern_data.elements.nodes.len()
+                || pattern_data.elements.has_trailing_comma
+                || initializer.is_some()
+            {
+                return Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::BindingPattern(element),
+                ));
+            }
+        } else if initializer.is_none() && name_record.range != element_record.range {
+            return Err(VariableInvariant::InvalidBindingPattern(name).into());
+        }
+
+        let symbol = plan_top_level_variable(
+            bound,
+            store,
+            element,
+            name,
+            &identifier.text,
+            binding,
+            exported,
+        )?;
+        let local = bound.local_symbol(element).unwrap_or(symbol);
+        if !names.insert(symbol)
+            || bound.container(element) != Some(source)
+            || bound.block_scope_container(element) != Some(source)
+            || bound
+                .locals(source)
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&identifier.text))
+                != Some(local)
+        {
+            return Err(VariableInvariant::InvalidBindingPattern(element).into());
+        }
+
+        planned.push(PlannedArrayBindingElement {
+            declaration,
+            pattern,
+            element,
+            index,
+            initializer,
+            rest,
+            name,
+            symbol,
+        });
     }
 
-    let name = element_data
-        .name
-        .map(|node| NodeRef::new(element.arena, element.file, node))
-        .ok_or(VariableInvariant::InvalidBindingPattern(element))?;
-    let name_record = binding_child_node(arena, store, name, element)?;
-    let NodeData::Identifier(identifier) = &name_record.data else {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::BindingPattern(name),
-        ));
-    };
-    if name_record.kind != SyntaxKind::Identifier
-        || name_record.flags.0 != 0
-        || name_record.range != element_record.range
-        || identifier.flow_node.is_some()
-        || identifier.text.is_empty()
-    {
-        return Err(VariableInvariant::InvalidBindingPattern(name).into());
-    }
+    Ok(planned)
+}
 
-    let symbol = plan_top_level_variable(
-        bound,
-        store,
-        element,
-        name,
-        &identifier.text,
-        binding,
-        exported,
-    )?;
-    let local = bound.local_symbol(element).unwrap_or(symbol);
-    if bound.container(element) != Some(source)
-        || bound.block_scope_container(element) != Some(source)
-        || bound
-            .locals(source)
-            .and_then(|locals| store.symbol_table(locals))
-            .and_then(|locals| locals.get_source(&identifier.text))
-            != Some(local)
-    {
-        return Err(VariableInvariant::InvalidBindingPattern(element).into());
+/// Retains the original exact one-element array-binding proof.
+#[cfg(test)]
+pub(super) fn plan_top_level_array_binding_element(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    binding: VariableBindingKind,
+    exported: bool,
+) -> Result<PlannedArrayBindingElement, VariablePlanError> {
+    let planned =
+        plan_top_level_array_binding_elements(arena, bound, store, declaration, binding, exported)?;
+    match planned.as_slice() {
+        [element]
+            if element.index == 0
+                && element.initializer.is_none()
+                && !element.rest
+                && arena.get(element.pattern.node).is_some_and(|record| {
+                    matches!(
+                        &record.data,
+                        NodeData::BindingPattern(pattern) if !pattern.elements.has_trailing_comma
+                    )
+                }) =>
+        {
+            Ok(*element)
+        }
+        _ => Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(declaration),
+        )),
     }
-
-    Ok(PlannedArrayBindingElement {
-        declaration,
-        pattern,
-        element,
-        name,
-        symbol,
-    })
 }
 
 fn binding_child_node<'a>(
@@ -2123,12 +2332,86 @@ mod tests {
     }
 
     #[test]
-    fn object_binding_elements_reject_defaults_rest_nested_names_and_poisoned_links() {
+    fn object_binding_elements_preserve_defaults_nested_paths_and_rest_exclusions() {
+        let fixture = binding_fixture(
+            "const { first = 1, nested: { second: renamed = 2 }, ...remaining } = input;",
+            9_391,
+        );
+        let declaration = binding_declaration(&fixture);
+        let planned = plan_top_level_object_binding_elements(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            declaration,
+            VariableBindingKind::Const,
+            false,
+        )
+        .unwrap();
+
+        let [first, nested, remaining] = planned.as_slice() else {
+            panic!("expected one default, one nested binding, and one rest binding")
+        };
+        assert_eq!(first.property_name, "first");
+        assert!(first.initializer.is_some());
+        assert!(first.parent_properties.is_empty());
+        assert_eq!(nested.property_name, "second");
+        assert_eq!(nested.parent_properties.len(), 1);
+        assert_eq!(nested.parent_properties[0].property_name, "nested");
+        assert!(nested.initializer.is_some());
+        assert!(remaining.rest);
+        assert_eq!(
+            remaining.excluded_properties,
+            vec!["first".to_owned(), "nested".to_owned()],
+        );
+        for element in &planned {
+            assert_eq!(fixture.bound.symbol(element.element), Some(element.symbol));
+            assert!(fixture.store.value_symbol_links(element.symbol).is_none());
+        }
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            plan_top_level_object_binding_elements(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                declaration,
+                VariableBindingKind::Const,
+                false,
+            ),
+            Ok(planned),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+
+        let empty = binding_fixture("const {} = input;", 9_392);
+        let declaration = binding_declaration(&empty);
+        assert_eq!(
+            plan_top_level_object_binding_elements(
+                &empty.parsed.arena,
+                &empty.bound,
+                &empty.store,
+                declaration,
+                VariableBindingKind::Const,
+                false,
+            ),
+            Ok(Vec::new()),
+        );
+    }
+
+    #[test]
+    fn object_binding_elements_reject_unsupported_nested_shapes_and_poisoned_links() {
         for (index, source) in [
-            "const {} = input;",
-            "const { value = 1 } = input;",
-            "const { ...rest } = input;",
-            "const { nested: { value } } = input;",
+            "const { nested: {} } = input;",
+            "const { nested: { value } = {} } = input;",
+            "const { nested: [value] } = input;",
             "const { [key]: value } = input;",
         ]
         .into_iter()
@@ -2322,6 +2605,72 @@ mod tests {
                 warm
             );
         }
+    }
+
+    #[test]
+    fn array_binding_elements_preserve_positions_defaults_rest_and_warm_links() {
+        let fixture = binding_fixture("var [, first, , second = 2, ...remaining] = source;", 9_361);
+        let declaration = binding_declaration(&fixture);
+        let planned = plan_top_level_array_binding_elements(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            declaration,
+            VariableBindingKind::Var,
+            false,
+        )
+        .unwrap();
+
+        let [first, second, remaining] = planned.as_slice() else {
+            panic!("expected two positional bindings and one rest binding")
+        };
+        assert_eq!(first.index, 1);
+        assert!(first.initializer.is_none());
+        assert_eq!(second.index, 3);
+        assert!(second.initializer.is_some());
+        assert_eq!(remaining.index, 4);
+        assert!(remaining.rest);
+        for element in &planned {
+            assert_eq!(fixture.bound.symbol(element.element), Some(element.symbol));
+            assert!(fixture.store.value_symbol_links(element.symbol).is_none());
+        }
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            plan_top_level_array_binding_elements(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                declaration,
+                VariableBindingKind::Var,
+                false,
+            ),
+            Ok(planned),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+
+        let trailing = binding_fixture("var [, value,] = source;", 9_362);
+        let declaration = binding_declaration(&trailing);
+        let planned = plan_top_level_array_binding_elements(
+            &trailing.parsed.arena,
+            &trailing.bound,
+            &trailing.store,
+            declaration,
+            VariableBindingKind::Var,
+            false,
+        )
+        .unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].index, 1);
     }
 
     #[test]

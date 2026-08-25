@@ -1379,6 +1379,7 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
         SyntaxKind::BinaryExpression => {
             is_context_insensitive_primitive_binary_syntax(arena, node)
                 || is_context_insensitive_logical_binary_syntax(arena, node)
+                || is_supported_shorthand_assignment_argument_syntax(arena, node)
         }
         _ => false,
     }
@@ -1419,6 +1420,104 @@ fn is_supported_function_argument_syntax(arena: &NodeArena, node: NodeRef) -> bo
         && body.parent == Some(node.node)
         && body.range.start >= function.parameters.range.end
         && body.range.end <= record.range.end
+}
+
+fn is_supported_shorthand_assignment_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    let NodeData::BinaryExpression(binary) = &record.data else {
+        return false;
+    };
+    let Some(object_record) = arena.get(binary.left) else {
+        return false;
+    };
+    let NodeData::ObjectLiteralExpression(object) = &object_record.data else {
+        return false;
+    };
+    let Some(operator) = arena.get(binary.operator_token) else {
+        return false;
+    };
+    let Some(source) = arena.get(binary.right) else {
+        return false;
+    };
+    let [property] = object.properties.nodes.as_slice() else {
+        return false;
+    };
+    let Some(property_record) = arena.get(*property) else {
+        return false;
+    };
+    let NodeData::ShorthandPropertyAssignment(shorthand) = &property_record.data else {
+        return false;
+    };
+    let (Some(equals), Some(initializer)) = (
+        shorthand.equals_token,
+        shorthand.object_assignment_initializer,
+    ) else {
+        return false;
+    };
+    let Some(name_record) = arena.get(shorthand.name) else {
+        return false;
+    };
+    let NodeData::Identifier(name) = &name_record.data else {
+        return false;
+    };
+    let Some(equals_record) = arena.get(equals) else {
+        return false;
+    };
+    let Some(initializer_record) = arena.get(initializer) else {
+        return false;
+    };
+
+    record.kind == SyntaxKind::BinaryExpression
+        && record.flags.0 == 0
+        && binary.symbol.is_none()
+        && binary.type_.is_none()
+        && binary.facts == 0
+        && binary.modifiers.is_none()
+        && object_record.kind == SyntaxKind::ObjectLiteralExpression
+        && object_record.flags.0 == 0
+        && object_record.parent == Some(node.node)
+        && object.symbol.is_none()
+        && object.facts == 0
+        && object.properties.range == object_record.range
+        && !object.properties.has_trailing_comma
+        && operator.kind == SyntaxKind::EqualsToken
+        && operator.flags.0 == 0
+        && operator.parent == Some(node.node)
+        && matches!(operator.data, NodeData::Token(_))
+        && source.parent == Some(node.node)
+        && object_record.range.end <= operator.range.start
+        && operator.range.end <= source.range.start
+        && property_record.kind == SyntaxKind::ShorthandPropertyAssignment
+        && property_record.flags.0 == 0
+        && property_record.parent == Some(binary.left)
+        && shorthand.postfix_token.is_none()
+        && shorthand.modifiers.is_none()
+        && shorthand.type_.is_none()
+        && shorthand.symbol.is_none()
+        && shorthand.facts == 0
+        && name_record.kind == SyntaxKind::Identifier
+        && name_record.flags.0 == 0
+        && name_record.parent == Some(*property)
+        && name.flow_node.is_none()
+        && !name.text.is_empty()
+        && equals_record.kind == SyntaxKind::EqualsToken
+        && equals_record.flags.0 == 0
+        && equals_record.parent == Some(*property)
+        && matches!(equals_record.data, NodeData::Token(_))
+        && initializer_record.parent == Some(*property)
+        && name_record.range.end <= equals_record.range.start
+        && equals_record.range.end <= initializer_record.range.start
+        && initializer_record.range.end <= property_record.range.end
+        && is_supported_call_argument_syntax(
+            arena,
+            NodeRef::new(node.arena, node.file, initializer),
+        )
+        && is_supported_call_argument_syntax(
+            arena,
+            NodeRef::new(node.arena, node.file, binary.right),
+        )
 }
 
 fn is_supported_arrow_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
@@ -1778,9 +1877,19 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
         PlannedExpressionKind::Binary(binary) => {
             let (left, right) = binary.operands();
             binary.node() == expression.node
-                && primitive_binary_operator_text(binary.operator()).is_some()
-                && is_context_insensitive_primitive_binary_operand_plan(left)
-                && is_context_insensitive_primitive_binary_operand_plan(right)
+                && binary.shorthand_assignment_initializer().map_or_else(
+                    || {
+                        primitive_binary_operator_text(binary.operator()).is_some()
+                            && is_context_insensitive_primitive_binary_operand_plan(left)
+                            && is_context_insensitive_primitive_binary_operand_plan(right)
+                    },
+                    |initializer| {
+                        binary.operator() == SyntaxKind::EqualsToken
+                            && is_supported_call_argument_plan(left)
+                            && is_supported_call_argument_plan(right)
+                            && is_supported_call_argument_plan(initializer)
+                    },
+                )
         }
         PlannedExpressionKind::Logical(binary) => {
             let (left, right) = binary.operands();

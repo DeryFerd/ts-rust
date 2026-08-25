@@ -18,7 +18,9 @@
 //! and assertion predicates, exact direct non-exported
 //! ambient function declarations (including the existing generic callable
 //! closure), initialized identifier-named top-level variables (optionally
-//! exported), immutable `using` and `await using` resource declarations,
+//! exported), object and array binding declarations with authenticated defaults,
+//! rest elements, nested object properties, and omitted array positions,
+//! immutable `using` and `await using` resource declarations,
 //! annotated uninitialized non-exported mutable top-level variables,
 //! exact top-level lexical blocks containing a forward read of one numeric const,
 //! top-level `for...in` loops with one lexical binding and expression statements,
@@ -27,7 +29,8 @@
 //! ordinary direct identifier calls, bounded annotated arrow call arguments,
 //! anonymous zero-parameter function expressions with bounded block bodies,
 //! parenthesized standalone closures, lexical captures, and immediate invocation,
-//! authenticated shorthand object-assignment defaults inside bounded function bodies,
+//! authenticated shorthand object-assignment defaults inside bounded function bodies
+//! and variable initializer expressions,
 //! strict top-level call expression statements, exhaustive grouped literal
 //! switch returns, inferred-void string switches with exact unreachable ranges,
 //! atomic primitive/literal scalar binary and comma operators, flattened long
@@ -55,8 +58,8 @@ use ts_ast::{
     FileId, ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind,
 };
 use ts_binder::{
-    BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags, SemanticSymbolId,
-    SymbolFlags, SymbolTableId,
+    BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags, EscapedName,
+    SemanticSymbolId, SymbolFlags, SymbolTableId,
 };
 use ts_core::TextRange;
 use ts_diagnostics::{Diagnostic, message_by_code};
@@ -157,7 +160,7 @@ use super::{
         source_call_argument_contextual_type,
     },
     source_elements::{
-        SourceElementError, SourceElementPlan, SourceElementUnsupported,
+        CheckedSourceElement, SourceElementError, SourceElementPlan, SourceElementUnsupported,
         check_array_binding_element, check_computed_binding_element, check_direct_source_element,
         check_direct_source_element_write, finish_direct_source_element_plan,
         plan_direct_source_element_syntax, plan_direct_source_element_write_syntax,
@@ -249,7 +252,7 @@ use super::{
         VariableBindingKind, VariablePlanError, plan_cross_file_global_identifier_read,
         plan_declared_value_identifier_read, plan_identifier_read,
         plan_recovered_anonymous_module_identifier_read, plan_recovered_anonymous_module_variable,
-        plan_redeclared_top_level_variable, plan_top_level_array_binding_element,
+        plan_redeclared_top_level_variable, plan_top_level_array_binding_elements,
         plan_top_level_computed_binding_element, plan_top_level_object_binding_elements,
         plan_top_level_variable,
     },
@@ -629,6 +632,7 @@ pub(super) struct PrimitiveBinaryPlan {
     operator: SyntaxKind,
     right: PlannedExpression,
     prefix: Vec<PrimitiveBinaryChainStep>,
+    shorthand_assignment: Option<Box<PlannedObjectAssignmentExpression>>,
 }
 
 #[derive(Clone, Debug)]
@@ -636,6 +640,12 @@ struct PrimitiveBinaryChainStep {
     node: NodeRef,
     operator: SyntaxKind,
     right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedObjectAssignmentExpression {
+    shorthand: super::object_members::PlannedObjectAssignmentShorthand,
+    initializer: PlannedExpression,
 }
 
 /// Fully preflighted logical/coalescing source shape with recursive operands.
@@ -711,6 +721,12 @@ impl PrimitiveBinaryPlan {
 
     pub(super) const fn operands(&self) -> (&PlannedExpression, &PlannedExpression) {
         (&self.left, &self.right)
+    }
+
+    pub(super) fn shorthand_assignment_initializer(&self) -> Option<&PlannedExpression> {
+        self.shorthand_assignment
+            .as_ref()
+            .map(|assignment| &assignment.initializer)
     }
 }
 
@@ -873,9 +889,17 @@ struct PlannedComputedVariable {
 
 #[derive(Clone, Debug)]
 struct PlannedArrayVariable {
-    element: PlannedArrayBindingElement,
+    pattern: NodeRef,
+    elements: Vec<PlannedArrayVariableElement>,
     binding: VariableBindingKind,
+    type_node: Option<NodeRef>,
     initializer: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedArrayVariableElement {
+    binding: PlannedArrayBindingElement,
+    initializer: Option<PlannedExpression>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -897,9 +921,17 @@ struct PlannedRecoveredArrayConstruction {
 
 #[derive(Clone, Debug)]
 struct PlannedObjectVariable {
-    elements: Vec<PlannedObjectBindingElement>,
+    pattern: NodeRef,
+    elements: Vec<PlannedObjectVariableElement>,
     binding: VariableBindingKind,
+    type_node: Option<NodeRef>,
     initializer: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedObjectVariableElement {
+    binding: PlannedObjectBindingElement,
+    initializer: Option<PlannedExpression>,
 }
 
 #[derive(Clone, Debug)]
@@ -12136,7 +12168,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         binding: VariableBindingKind,
         exported: bool,
     ) -> Result<PlannedObjectVariable, SourceCheckError> {
-        let (initializer, type_node) = {
+        let (pattern, initializer, type_node) = {
             let record = self.node(declaration)?;
             let NodeData::VariableDeclaration(variable) = &record.data else {
                 return Err(self.unsupported(
@@ -12153,16 +12185,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             }
             (
+                self.reference(variable.name),
                 variable.initializer.map(|node| self.reference(node)),
                 variable.type_.map(|node| self.reference(node)),
             )
         };
         if let Some(type_node) = type_node {
-            return Err(self.unsupported(
-                type_node,
-                self.node(type_node)?.kind,
-                SourceSyntaxRole::VariableType,
-            ));
+            if self.node(type_node)?.parent != Some(declaration.node) {
+                return Err(self.unsupported(
+                    type_node,
+                    self.node(type_node)?.kind,
+                    SourceSyntaxRole::VariableType,
+                ));
+            }
+            self.plan_type_import_annotation_root(type_node)?;
         }
         let initializer = initializer.ok_or(SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::MissingVariableInitializer(declaration),
@@ -12181,7 +12217,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableDeclaration,
             ));
         };
-        let elements = plan_top_level_object_binding_elements(
+        let bindings = plan_top_level_object_binding_elements(
             self.arena,
             self.bound,
             store,
@@ -12191,12 +12227,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         )
         .map_err(Self::variable_plan_error)?;
         let initializer = self.plan_expression(initializer)?;
-        for element in &elements {
+        let mut elements = Vec::with_capacity(bindings.len());
+        for element in bindings {
             if self.node(element.name)?.parent != Some(element.element.node) {
                 return Err(SourceCheckError::Variable(
                     VariableInvariant::InvalidBindingPattern(element.name),
                 ));
             }
+            let default = element
+                .initializer
+                .map(|initializer| {
+                    self.primitive_binary_position_roots.insert(initializer);
+                    self.plan_expression(initializer)
+                })
+                .transpose()?;
             if !self.prior_variables.insert(element.symbol)
                 || !self.readable_variables.insert(element.symbol)
                 || !binding.is_const() && !self.assignable_mutable_variables.insert(element.symbol)
@@ -12205,10 +12249,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     VariableInvariant::InvalidSymbolShape(element.symbol),
                 ));
             }
+            elements.push(PlannedObjectVariableElement {
+                binding: element,
+                initializer: default,
+            });
         }
         Ok(PlannedObjectVariable {
+            pattern,
             elements,
             binding,
+            type_node,
             initializer,
         })
     }
@@ -12220,7 +12270,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         binding: VariableBindingKind,
         exported: bool,
     ) -> Result<PlannedArrayVariable, SourceCheckError> {
-        let (initializer, type_node) = {
+        let (pattern, initializer, type_node) = {
             let record = self.node(declaration)?;
             let NodeData::VariableDeclaration(variable) = &record.data else {
                 return Err(self.unsupported(
@@ -12240,16 +12290,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             }
             (
+                self.reference(variable.name),
                 variable.initializer.map(|node| self.reference(node)),
                 variable.type_.map(|node| self.reference(node)),
             )
         };
         if let Some(type_node) = type_node {
-            return Err(self.unsupported(
-                type_node,
-                self.node(type_node)?.kind,
-                SourceSyntaxRole::VariableType,
-            ));
+            if self.node(type_node)?.parent != Some(declaration.node) {
+                return Err(self.unsupported(
+                    type_node,
+                    self.node(type_node)?.kind,
+                    SourceSyntaxRole::VariableType,
+                ));
+            }
+            self.plan_type_import_annotation_root(type_node)?;
         }
         let initializer = initializer.ok_or(SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::MissingVariableInitializer(declaration),
@@ -12269,7 +12323,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableDeclaration,
             ));
         };
-        let element = plan_top_level_array_binding_element(
+        let bindings = plan_top_level_array_binding_elements(
             self.arena,
             self.bound,
             store,
@@ -12278,33 +12332,46 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             exported,
         )
         .map_err(Self::variable_plan_error)?;
-        if element.declaration != declaration
-            || self.node(element.pattern)?.parent != Some(declaration.node)
-            || self.node(element.element)?.parent != Some(element.pattern.node)
-            || self.node(element.name)?.parent != Some(element.element.node)
-        {
-            return Err(SourceCheckError::Variable(
-                VariableInvariant::InvalidBindingPattern(declaration),
-            ));
-        }
-
         let initializer = self.plan_expression(initializer)?;
-        if !self.prior_variables.insert(element.symbol)
-            || !self.readable_variables.insert(element.symbol)
-        {
-            return Err(SourceCheckError::Variable(
-                VariableInvariant::InvalidSymbolShape(element.symbol),
-            ));
-        }
-        if !binding.is_const() && !self.assignable_mutable_variables.insert(element.symbol) {
-            return Err(SourceCheckError::Variable(
-                VariableInvariant::InvalidSymbolShape(element.symbol),
-            ));
+        let mut elements = Vec::with_capacity(bindings.len());
+        for element in bindings {
+            if element.declaration != declaration
+                || element.pattern != pattern
+                || self.node(element.pattern)?.parent != Some(declaration.node)
+                || self.node(element.element)?.parent != Some(element.pattern.node)
+                || self.node(element.name)?.parent != Some(element.element.node)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidBindingPattern(declaration),
+                ));
+            }
+
+            let default = element
+                .initializer
+                .map(|initializer| {
+                    self.primitive_binary_position_roots.insert(initializer);
+                    self.plan_expression(initializer)
+                })
+                .transpose()?;
+            if !self.prior_variables.insert(element.symbol)
+                || !self.readable_variables.insert(element.symbol)
+                || !binding.is_const() && !self.assignable_mutable_variables.insert(element.symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(element.symbol),
+                ));
+            }
+            elements.push(PlannedArrayVariableElement {
+                binding: element,
+                initializer: default,
+            });
         }
 
         Ok(PlannedArrayVariable {
-            element,
+            pattern,
+            elements,
             binding,
+            type_node,
             initializer,
         })
     }
@@ -15213,6 +15280,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(SourceCheckError::PrimitiveOperator(operator));
         }
         let operator_kind = operator_record.kind;
+        let assignment = operator_kind == SyntaxKind::EqualsToken
+            && self.is_immediately_invoked_closure_assignment(expression)?;
+        if operator_kind == SyntaxKind::EqualsToken && !assignment {
+            if !self.source_spelling_matches(operator, "=") {
+                return Err(SourceCheckError::PrimitiveOperator(operator));
+            }
+            return self.plan_object_shorthand_assignment_expression(expression, left, right);
+        }
         let logical = matches!(
             operator_kind,
             SyntaxKind::AmpersandAmpersandToken
@@ -15220,8 +15295,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 | SyntaxKind::QuestionQuestionToken
         );
         let comma = operator_kind == SyntaxKind::CommaToken;
-        let assignment = operator_kind == SyntaxKind::EqualsToken
-            && self.is_immediately_invoked_closure_assignment(expression)?;
         let Some(operator_text) = (if assignment {
             Some("=")
         } else {
@@ -15309,6 +15382,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 operator: operator_kind,
                 right: right_plan,
                 prefix: Vec::new(),
+                shorthand_assignment: None,
             }))
         };
         Ok(PlannedExpression::new(expression, kind))
@@ -15441,6 +15515,63 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(())
     }
 
+    fn plan_object_shorthand_assignment_expression(
+        &mut self,
+        expression: NodeRef,
+        object: NodeRef,
+        source: NodeRef,
+    ) -> Result<PlannedExpression, SourceCheckError> {
+        let Some((store, host)) = self.semantic else {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::BinaryExpression,
+                SourceSyntaxRole::BinaryExpression,
+            ));
+        };
+        let shorthand =
+            super::object_members::plan_object_assignment_shorthand(store, host, object)
+                .map_err(|error| self.object_plan_error(error))?
+                .ok_or_else(|| {
+                    self.unsupported(
+                        object,
+                        SyntaxKind::ObjectLiteralExpression,
+                        SourceSyntaxRole::BinaryOperand,
+                    )
+                })?;
+        let target = self.plan_expression(shorthand.name)?;
+        if !matches!(
+            &target.kind,
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                kind: PlannedIdentifierReadKind::Unresolved,
+                ..
+            })
+        ) {
+            return Err(self.unsupported(
+                shorthand.name,
+                SyntaxKind::Identifier,
+                SourceSyntaxRole::BinaryOperand,
+            ));
+        }
+        self.primitive_binary_position_roots
+            .insert(shorthand.initializer);
+        let initializer = self.plan_expression(shorthand.initializer)?;
+        let source = self.plan_expression(source)?;
+        Ok(PlannedExpression::new(
+            expression,
+            PlannedExpressionKind::Binary(Box::new(PrimitiveBinaryPlan {
+                node: expression,
+                left: target,
+                operator: SyntaxKind::EqualsToken,
+                right: source,
+                prefix: Vec::new(),
+                shorthand_assignment: Some(Box::new(PlannedObjectAssignmentExpression {
+                    shorthand,
+                    initializer,
+                })),
+            })),
+        ))
+    }
+
     fn plan_literal_plus_chain(
         &mut self,
         expression: NodeRef,
@@ -15530,6 +15661,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             operator: SyntaxKind::PlusToken,
                             right,
                             prefix,
+                            shorthand_assignment: None,
                         }));
                     }
                     prefix.push(PrimitiveBinaryChainStep {
@@ -19606,6 +19738,88 @@ fn check_expression_type(
                 resolution.result_type,
                 resolution.result_type,
             ))
+        }
+        PlannedExpressionKind::Binary(binary)
+            if binary.operator == SyntaxKind::EqualsToken
+                && binary.shorthand_assignment.is_some() =>
+        {
+            let assignment = binary
+                .shorthand_assignment
+                .as_ref()
+                .ok_or(SourceCheckError::PrimitiveOperator(binary.node))?;
+            let PlannedExpressionKind::Identifier(read) = &binary.left.kind else {
+                return Err(SourceCheckError::PrimitiveOperator(binary.node));
+            };
+            if read.kind != PlannedIdentifierReadKind::Unresolved
+                || binary.left.node != assignment.shorthand.name
+                || !binary.prefix.is_empty()
+                || store
+                    .value_symbol_links(assignment.shorthand.symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+                || store.type_node_links(assignment.shorthand.object).is_some()
+            {
+                return Err(SourceCheckError::PrimitiveOperator(binary.node));
+            }
+
+            let value = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                &binary.right,
+                contextual_type,
+                deferred,
+            )?;
+            let target_record =
+                host.node(assignment.shorthand.name)
+                    .ok_or(SourceCheckError::Provenance(
+                        SourceCheckProvenanceError::MissingNode(assignment.shorthand.name),
+                    ))?;
+            let NodeData::Identifier(identifier) = &target_record.data else {
+                return Err(SourceCheckError::PrimitiveOperator(binary.node));
+            };
+            let name = identifier.text.clone();
+            let error = store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.error_type)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            publish_expression_type(store, assignment.shorthand.name, error)?;
+            merge_retry_diagnostic(
+                diagnostics,
+                CanonicalCheckerDiagnostic {
+                    node: Some(assignment.shorthand.name),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(18_004)
+                            .ok_or(SourceCheckError::MissingDiagnostic(18_004))?,
+                        [name],
+                    ),
+                    related_information: Vec::new(),
+                },
+            );
+            check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                &assignment.initializer,
+                None,
+                deferred,
+            )?;
+            publish_expression_type(store, binary.node, value.result)?;
+            Ok(CheckedExpressionTypes::leaf(value.result, value.result))
         }
         PlannedExpressionKind::Binary(binary) if binary.operator == SyntaxKind::EqualsToken => {
             let target = check_expression_type(
@@ -25756,6 +25970,467 @@ fn inferred_variable_type(
     };
     store
         .get_widened_type_with_global_types(initializer_type, global_types)
+        .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)] // Keeps property diagnostics in the source execution context.
+fn object_binding_property_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    receiver: TypeId,
+    property_node: NodeRef,
+    property_name: &str,
+) -> Result<TypeId, SourceCheckError> {
+    let (any, error, undefined) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| {
+            (
+                bootstrap.any_type,
+                bootstrap.error_type,
+                bootstrap.undefined_or_missing_type,
+            )
+        })
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    if receiver == any || receiver == error {
+        return Ok(receiver);
+    }
+
+    if let Some(property) = store.resolved_own_property(receiver, property_name)? {
+        return if property.optional && options.intrinsic.strict_null_checks {
+            store
+                .expression_union_type_with_global_types(
+                    global_types,
+                    &[property.type_, undefined],
+                    UnionReduction::Literal,
+                )
+                .map_err(Into::into)
+        } else {
+            Ok(property.type_)
+        };
+    }
+
+    let receiver = super::formatter::type_to_string_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        receiver,
+        CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+    )?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(property_node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2339).ok_or(SourceCheckError::MissingDiagnostic(2339))?,
+                [property_name.to_owned(), receiver],
+            ),
+            related_information: Vec::new(),
+        },
+    );
+    Ok(error)
+}
+
+fn object_binding_rest_type(
+    store: &mut CanonicalTypeMapperStore,
+    binding: &PlannedObjectBindingElement,
+    receiver: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let (any, error, empty) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| {
+            (
+                bootstrap.any_type,
+                bootstrap.error_type,
+                bootstrap.empty_object_type,
+            )
+        })
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    if receiver == any || receiver == error {
+        return Ok(receiver);
+    }
+
+    let unsupported = || {
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+            node: binding.element,
+            kind: SyntaxKind::BindingElement,
+            role: SourceSyntaxRole::VariableName,
+        })
+    };
+    let record = store.type_payload(receiver).ok_or_else(unsupported)?;
+    let structured = record.data().structured().ok_or_else(unsupported)?;
+    if structured.signatures.is_some() || structured.index_infos.is_some() {
+        return Err(unsupported());
+    }
+    let symbols = structured.properties.clone().unwrap_or_default();
+    let mut retained = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
+        let name = store
+            .symbol(symbol)
+            .and_then(|symbol| symbol.name().as_utf8())
+            .ok_or_else(unsupported)?
+            .to_owned();
+        if binding.excluded_properties.contains(&name) {
+            continue;
+        }
+        let property = store
+            .resolved_own_property(receiver, &name)?
+            .ok_or_else(unsupported)?;
+        if property.symbol != symbol {
+            return Err(unsupported());
+        }
+        retained.push((name, property.type_, property.optional));
+    }
+    if retained.is_empty() {
+        return Ok(empty);
+    }
+
+    if let Some(cached) = store
+        .value_symbol_links(binding.symbol)
+        .and_then(|links| links.resolved_type)
+    {
+        let record = store.type_payload(cached).ok_or_else(unsupported)?;
+        let structured = record.data().structured().ok_or_else(unsupported)?;
+        let symbols = structured.properties.as_deref().ok_or_else(unsupported)?;
+        if symbols.len() != retained.len()
+            || symbols.iter().zip(&retained).any(|(symbol, expected)| {
+                let Some(record) = store.symbol(*symbol) else {
+                    return true;
+                };
+                record.name().as_utf8() != Some(expected.0.as_str())
+                    || record.flags().contains(SymbolFlags::OPTIONAL) != expected.2
+                    || record.check_flags() != CheckFlags::NONE
+                    || store
+                        .value_symbol_links(*symbol)
+                        .and_then(|links| links.resolved_type)
+                        != Some(expected.1)
+            })
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::CachedValueTypeMismatch {
+                    symbol: binding.symbol,
+                    cached,
+                    expected: receiver,
+                },
+            ));
+        }
+        return Ok(cached);
+    }
+
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_checker_symbol_allocations(retained.len(), 1)
+        || !store.try_reserve_value_symbol_links(retained.len())
+    {
+        return Err(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::Capacity,
+        ));
+    }
+    let members = store.alloc_symbol_table();
+    let mut symbols = Vec::with_capacity(retained.len());
+    for (name, type_, optional) in retained {
+        let flags = if optional {
+            SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL
+        } else {
+            SymbolFlags::PROPERTY
+        };
+        let symbol =
+            store.alloc_transient_symbol(flags, EscapedName::source(&name), CheckFlags::NONE);
+        if !store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ) || store.insert_symbol(members, EscapedName::source(&name), symbol) != Some(None)
+        {
+            return Err(unsupported());
+        }
+        symbols.push(symbol);
+    }
+    let rest = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+        .ok_or_else(unsupported)?;
+    if !store.set_structured_type_members(rest, Some(members), Some(symbols), None, None, None) {
+        return Err(unsupported());
+    }
+    Ok(rest)
+}
+
+fn check_planned_array_binding_element(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    binding: &PlannedArrayBindingElement,
+    receiver: TypeId,
+) -> Result<CheckedSourceElement, SourceCheckError> {
+    let (any, error, undefined) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| {
+            (
+                bootstrap.any_type,
+                bootstrap.error_type,
+                bootstrap.undefined_or_missing_type,
+            )
+        })
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    if receiver == error {
+        return Ok(CheckedSourceElement {
+            type_: error,
+            diagnostic: None,
+        });
+    }
+    if receiver == any {
+        return Ok(CheckedSourceElement {
+            type_: if binding.rest {
+                global_types.any_array_type
+            } else {
+                any
+            },
+            diagnostic: None,
+        });
+    }
+
+    let tuple = store
+        .canonical_tuple_shape(receiver)
+        .map_err(|error| source_contextual_tuple_error(receiver, error))?
+        .map(|tuple| {
+            (
+                tuple.element_types().to_vec(),
+                tuple.element_infos().to_vec(),
+                tuple.combined_flags(),
+            )
+        });
+    if let Some((types, infos, flags)) = tuple {
+        if flags.intersects(ElementFlags::VARIADIC) {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    node: binding.element,
+                    kind: SyntaxKind::BindingElement,
+                    role: SourceSyntaxRole::VariableName,
+                },
+            ));
+        }
+        if binding.rest {
+            let offset = binding.index.min(types.len());
+            let rest_types = if binding.index >= types.len()
+                && infos
+                    .last()
+                    .is_some_and(|info| info.flags().contains(ElementFlags::REST))
+            {
+                &types[types.len() - 1..]
+            } else {
+                &types[offset..]
+            };
+            let rest_infos = if binding.index >= infos.len()
+                && infos
+                    .last()
+                    .is_some_and(|info| info.flags().contains(ElementFlags::REST))
+            {
+                &infos[infos.len() - 1..]
+            } else {
+                &infos[offset..]
+            };
+            let type_ = store
+                .create_canonical_tuple_type(
+                    CanonicalTupleTypeRequest::new(rest_types, rest_infos, false)
+                        .with_array_targets(CanonicalArrayTargets::from_global_types(global_types)),
+                )
+                .map_err(|error| source_contextual_tuple_error(receiver, error))?;
+            return Ok(CheckedSourceElement {
+                type_,
+                diagnostic: None,
+            });
+        }
+
+        let position = if binding.index < types.len() {
+            binding.index
+        } else if infos
+            .last()
+            .is_some_and(|info| info.flags().contains(ElementFlags::REST))
+        {
+            types.len() - 1
+        } else {
+            let receiver_display =
+                super::formatter::type_to_string_with_host_global_types_and_flags(
+                    store,
+                    host,
+                    global_types,
+                    receiver,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                )?;
+            return Ok(CheckedSourceElement {
+                type_: error,
+                diagnostic: Some(CanonicalCheckerDiagnostic {
+                    node: Some(binding.name),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2493).ok_or(SourceCheckError::MissingDiagnostic(2493))?,
+                        [
+                            receiver_display,
+                            types.len().to_string(),
+                            binding.index.to_string(),
+                        ],
+                    ),
+                    related_information: Vec::new(),
+                }),
+            });
+        };
+
+        let mut type_ = types[position];
+        if options.intrinsic.strict_null_checks
+            && (infos[position].flags().contains(ElementFlags::OPTIONAL)
+                || infos[position].flags().contains(ElementFlags::REST)
+                    && options.no_unchecked_indexed_access)
+        {
+            type_ = store.expression_union_type_with_global_types(
+                global_types,
+                &[type_, undefined],
+                UnionReduction::Literal,
+            )?;
+        }
+        return Ok(CheckedSourceElement {
+            type_,
+            diagnostic: None,
+        });
+    }
+
+    let trailing_comma = match host.node(binding.pattern).map(|node| &node.data) {
+        Some(NodeData::BindingPattern(pattern)) => pattern.elements.has_trailing_comma,
+        _ => {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidBindingPattern(binding.pattern),
+            ));
+        }
+    };
+    if !binding.rest && binding.initializer.is_none() && !trailing_comma {
+        return check_array_binding_element(
+            store,
+            host,
+            global_types,
+            options,
+            binding.element,
+            receiver,
+        )
+        .map_err(|error| SourcePlanner::element_plan_error(binding.element, error));
+    }
+
+    let array = store
+        .canonical_array_reference(global_types, receiver)?
+        .ok_or(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Syntax {
+                node: binding.element,
+                kind: SyntaxKind::BindingElement,
+                role: SourceSyntaxRole::VariableName,
+            },
+        ))?;
+    let type_ = if binding.rest {
+        store.create_canonical_array_type(global_types, array.element_type, false)?
+    } else if options.no_unchecked_indexed_access && options.intrinsic.strict_null_checks {
+        store.expression_union_type_with_global_types(
+            global_types,
+            &[array.element_type, undefined],
+            UnionReduction::Literal,
+        )?
+    } else {
+        array.element_type
+    };
+    Ok(CheckedSourceElement {
+        type_,
+        diagnostic: None,
+    })
+}
+
+fn binding_type_without_undefined(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    type_: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    if !bootstrap.options.strict_null_checks || type_ == bootstrap.any_type {
+        return Ok(type_);
+    }
+    let never = bootstrap.never_type;
+    let record = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?;
+    if record.flags().intersects(TypeFlags::UNDEFINED) {
+        return Ok(never);
+    }
+    let TypeData::Union(union) = record.data() else {
+        return Ok(type_);
+    };
+    let constituents = union.union.types.clone();
+    let mut retained = Vec::with_capacity(constituents.len());
+    for constituent in &constituents {
+        let flags = store
+            .type_payload(*constituent)
+            .map(TypeRecord::flags)
+            .ok_or(RelationUnavailable::Type(*constituent))?;
+        if !flags.intersects(TypeFlags::UNDEFINED) {
+            retained.push(*constituent);
+        }
+    }
+    match retained.as_slice() {
+        [] => Ok(never),
+        [only] => Ok(*only),
+        _ if retained.len() == constituents.len() => Ok(type_),
+        _ => store
+            .expression_union_type_with_global_types(
+                global_types,
+                &retained,
+                UnionReduction::Literal,
+            )
+            .map_err(Into::into),
+    }
+}
+
+fn binding_type_with_default(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    binding: VariableBindingKind,
+    property_type: TypeId,
+    default_type: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let (any, error, never) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| {
+            (
+                bootstrap.any_type,
+                bootstrap.error_type,
+                bootstrap.never_type,
+            )
+        })
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    if property_type == any || property_type == error {
+        return Ok(property_type);
+    }
+    let property_type = binding_type_without_undefined(store, global_types, property_type)?;
+    let default_type = inferred_variable_type(store, global_types, binding, default_type)?;
+    if property_type == never {
+        return Ok(default_type);
+    }
+    store
+        .expression_union_type_with_global_types(
+            global_types,
+            &[property_type, default_type],
+            UnionReduction::Subtype,
+        )
         .map_err(Into::into)
 }
 
@@ -32742,153 +33417,229 @@ pub(super) fn check_source_file(
                 }
             }
             PlannedStatement::ObjectVariable(variable) => {
-                let initializer = check_expression_type(
-                    store,
-                    host,
-                    global_types,
-                    source,
-                    options,
-                    session,
-                    diagnostics,
-                    &current_flow_types,
-                    &preflighted_type_import_value_uses,
-                    &variable.initializer,
-                    None,
-                    &mut deferred,
-                )?;
+                let initializer = if let Some(type_node) = variable.type_node {
+                    check_planned_assignment(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        &mut deferred,
+                        type_node,
+                        type_import_capabilities
+                            .get(&type_node)
+                            .map_or(&[], Vec::as_slice),
+                        &variable.initializer,
+                        variable.pattern,
+                        None,
+                    )?
+                    .declared_type
+                } else {
+                    check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        &variable.initializer,
+                        None,
+                        &mut deferred,
+                    )?
+                    .result
+                };
                 for element in &variable.elements {
-                    let type_ = if let Some(property) =
-                        store.resolved_own_property(initializer.result, &element.property_name)?
-                    {
-                        if property.optional && options.intrinsic.strict_null_checks {
-                            let undefined = store
-                                .intrinsic_bootstrap()
-                                .ok_or(SourceCheckError::LiteralCache(
-                                    SourceLiteralCacheError::BootstrapUninitialized,
-                                ))?
-                                .undefined_or_missing_type;
-                            store.expression_union_type_with_global_types(
-                                global_types,
-                                &[property.type_, undefined],
-                                UnionReduction::Literal,
-                            )?
-                        } else {
-                            property.type_
-                        }
-                    } else {
-                        let receiver =
-                            super::formatter::type_to_string_with_host_global_types_and_flags(
-                                store,
-                                host,
-                                global_types,
-                                initializer.result,
-                                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
-                            )?;
-                        merge_retry_diagnostic(
+                    let binding = &element.binding;
+                    let mut receiver = initializer;
+                    for parent in &binding.parent_properties {
+                        receiver = object_binding_property_type(
+                            store,
+                            host,
+                            global_types,
+                            options,
                             diagnostics,
-                            CanonicalCheckerDiagnostic {
-                                node: Some(element.property),
-                                range_override: None,
-                                diagnostic: Diagnostic::with_arguments(
-                                    message_by_code(2339)
-                                        .ok_or(SourceCheckError::MissingDiagnostic(2339))?,
-                                    [element.property_name.clone(), receiver],
-                                ),
-                                related_information: Vec::new(),
-                            },
-                        );
-                        store
-                            .intrinsic_bootstrap()
-                            .ok_or(SourceCheckError::LiteralCache(
-                                SourceLiteralCacheError::BootstrapUninitialized,
-                            ))?
-                            .error_type
+                            receiver,
+                            parent.property,
+                            &parent.property_name,
+                        )?;
+                    }
+
+                    let mut type_ = if binding.rest {
+                        object_binding_rest_type(store, binding, receiver)?
+                    } else {
+                        object_binding_property_type(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            diagnostics,
+                            receiver,
+                            binding.property,
+                            &binding.property_name,
+                        )?
                     };
+                    if let Some(default) = &element.initializer {
+                        let contextual =
+                            binding_type_without_undefined(store, global_types, type_)?;
+                        let checked = check_expression_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &current_flow_types,
+                            &preflighted_type_import_value_uses,
+                            default,
+                            Some(contextual),
+                            &mut deferred,
+                        )?;
+                        type_ = binding_type_with_default(
+                            store,
+                            global_types,
+                            variable.binding,
+                            type_,
+                            checked.result,
+                        )?;
+                    }
                     stage_value_type(
                         store,
                         &mut staged_value_types,
                         &mut value_order,
-                        element.symbol,
+                        binding.symbol,
                         type_,
                     )?;
                     if top_level_declared_types
-                        .insert(element.symbol, type_)
+                        .insert(binding.symbol, type_)
                         .is_some()
                     {
                         return Err(SourceCheckError::Variable(
-                            VariableInvariant::DuplicateStagedValueType(element.symbol),
+                            VariableInvariant::DuplicateStagedValueType(binding.symbol),
                         ));
                     }
-                    if !variable.binding.is_const() && !mutable_variables.insert(element.symbol) {
+                    if !variable.binding.is_const() && !mutable_variables.insert(binding.symbol) {
                         return Err(SourceCheckError::Variable(
-                            VariableInvariant::DuplicateCurrentFlowType(element.symbol),
+                            VariableInvariant::DuplicateCurrentFlowType(binding.symbol),
                         ));
                     }
-                    if current_flow_types.insert(element.symbol, type_).is_some() {
+                    if current_flow_types.insert(binding.symbol, type_).is_some() {
                         return Err(SourceCheckError::Variable(
-                            VariableInvariant::DuplicateCurrentFlowType(element.symbol),
+                            VariableInvariant::DuplicateCurrentFlowType(binding.symbol),
                         ));
                     }
                 }
             }
             PlannedStatement::ArrayVariable(variable) => {
-                let initializer = check_expression_type(
-                    store,
-                    host,
-                    global_types,
-                    source,
-                    options,
-                    session,
-                    diagnostics,
-                    &current_flow_types,
-                    &preflighted_type_import_value_uses,
-                    &variable.initializer,
-                    None,
-                    &mut deferred,
-                )?;
-                let checked = check_array_binding_element(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    variable.element.element,
-                    initializer.result,
-                )
-                .map_err(|error| {
-                    SourcePlanner::element_plan_error(variable.element.element, error)
-                })?;
-                if let Some(diagnostic) = checked.diagnostic {
-                    merge_retry_diagnostic(diagnostics, diagnostic);
-                }
-                stage_value_type(
-                    store,
-                    &mut staged_value_types,
-                    &mut value_order,
-                    variable.element.symbol,
-                    checked.type_,
-                )?;
-                if top_level_declared_types
-                    .insert(variable.element.symbol, checked.type_)
-                    .is_some()
-                {
-                    return Err(SourceCheckError::Variable(
-                        VariableInvariant::DuplicateStagedValueType(variable.element.symbol),
-                    ));
-                }
-                if !variable.binding.is_const()
-                    && !mutable_variables.insert(variable.element.symbol)
-                {
-                    return Err(SourceCheckError::Variable(
-                        VariableInvariant::DuplicateCurrentFlowType(variable.element.symbol),
-                    ));
-                }
-                if current_flow_types
-                    .insert(variable.element.symbol, checked.type_)
-                    .is_some()
-                {
-                    return Err(SourceCheckError::Variable(
-                        VariableInvariant::DuplicateCurrentFlowType(variable.element.symbol),
-                    ));
+                let initializer = if let Some(type_node) = variable.type_node {
+                    check_planned_assignment(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        &mut deferred,
+                        type_node,
+                        type_import_capabilities
+                            .get(&type_node)
+                            .map_or(&[], Vec::as_slice),
+                        &variable.initializer,
+                        variable.pattern,
+                        None,
+                    )?
+                    .declared_type
+                } else {
+                    check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        &variable.initializer,
+                        None,
+                        &mut deferred,
+                    )?
+                    .result
+                };
+                for element in &variable.elements {
+                    let binding = &element.binding;
+                    let checked = check_planned_array_binding_element(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        binding,
+                        initializer,
+                    )?;
+                    if let Some(diagnostic) = checked.diagnostic {
+                        merge_retry_diagnostic(diagnostics, diagnostic);
+                    }
+                    let mut type_ = checked.type_;
+                    if let Some(default) = &element.initializer {
+                        let contextual =
+                            binding_type_without_undefined(store, global_types, type_)?;
+                        let checked = check_expression_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &current_flow_types,
+                            &preflighted_type_import_value_uses,
+                            default,
+                            Some(contextual),
+                            &mut deferred,
+                        )?;
+                        type_ = binding_type_with_default(
+                            store,
+                            global_types,
+                            variable.binding,
+                            type_,
+                            checked.result,
+                        )?;
+                    }
+                    stage_value_type(
+                        store,
+                        &mut staged_value_types,
+                        &mut value_order,
+                        binding.symbol,
+                        type_,
+                    )?;
+                    if top_level_declared_types
+                        .insert(binding.symbol, type_)
+                        .is_some()
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::DuplicateStagedValueType(binding.symbol),
+                        ));
+                    }
+                    if !variable.binding.is_const() && !mutable_variables.insert(binding.symbol) {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::DuplicateCurrentFlowType(binding.symbol),
+                        ));
+                    }
+                    if current_flow_types.insert(binding.symbol, type_).is_some() {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::DuplicateCurrentFlowType(binding.symbol),
+                        ));
+                    }
                 }
             }
             PlannedStatement::ComputedVariable(variable) => {
@@ -49103,6 +49854,88 @@ class Foo2 {
     }
 
     #[test]
+    fn shorthand_destructuring_assignment_reports_ts18004_and_replays_warm() {
+        let source =
+            parse_javascript_source_file("const result = ({ missing = 'fallback' } = {});");
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(9_973);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one unresolved shorthand assignment diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 18_004);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "missing");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            concat!(
+                "No value exists in scope for the shorthand property 'missing'. ",
+                "Either declare one or provide an initializer.",
+            ),
+        );
+
+        let shorthand =
+            source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ShorthandPropertyAssignment)
+                        .then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .unwrap();
+        let object = source
+            .arena
+            .get(shorthand.node)
+            .and_then(|record| record.parent)
+            .map(|node| NodeRef::new(source.arena.id(), file, node))
+            .unwrap();
+        let property = context.file(file).unwrap().1.symbol(shorthand).unwrap();
+        assert!(context.store().value_symbol_links(property).is_none());
+        assert!(context.store().type_node_links(object).is_none());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn shorthand_destructuring_call_arguments_preserve_ts18004_and_warm_identity() {
+        let source = parse_javascript_source_file(concat!(
+            "function consume(value) {} ",
+            "consume(({ missing = 'fallback' } = {}));",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(9_974);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one unresolved shorthand call-argument diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 18_004);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "missing");
+
+        let shorthand =
+            source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ShorthandPropertyAssignment)
+                        .then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .unwrap();
+        let property = context.file(file).unwrap().1.symbol(shorthand).unwrap();
+        assert!(context.store().value_symbol_links(property).is_none());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn shorthand_assignment_rejects_poisoned_pattern_before_source_publication() {
         let source = parsed(concat!(
             "function ff(f: any) {\n",
@@ -55445,6 +56278,136 @@ class Foo2 {
     }
 
     #[test]
+    fn object_bindings_preserve_nested_defaults_rest_properties_and_warm_identity() {
+        let source = parsed(concat!(
+            "interface Input { first?: string; nested: { value: number }; keep: boolean } ",
+            "declare var input: Input; ",
+            "const { first = 'fallback', nested: { value: picked }, ...remaining } = input; ",
+            "const observed = remaining.keep;",
+        ));
+        let file = FileId::new(9_960);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "first"),
+            bootstrap.string_type,
+        );
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "picked"),
+            bootstrap.number_type,
+        );
+        let remaining = object_binding_value_type(&context, &source, file, "remaining");
+        assert_eq!(
+            context.type_to_string(remaining).unwrap(),
+            "{ keep: boolean; }",
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "observed"),
+            bootstrap.boolean_type,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "remaining"),
+            remaining,
+        );
+    }
+
+    #[test]
+    fn annotated_object_binding_defaults_remove_undefined_without_widening() {
+        let source = parsed("const { value = 'fallback' }: { value?: string } = {};");
+        let file = FileId::new(9_961);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "value"),
+            context.store().intrinsic_bootstrap().unwrap().string_type,
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn object_bindings_keep_any_receivers_and_anchor_nested_missing_properties() {
+        let any_source = parsed(concat!(
+            "declare var input: any; ",
+            "const { missing, ...remaining } = input; ",
+            "const observed = missing;",
+        ));
+        let any_file = FileId::new(9_962);
+        let mut any_context = context(
+            &[(any_file, &any_source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        any_context.check_source_file(any_file).unwrap();
+
+        let any = any_context.store().intrinsic_bootstrap().unwrap().any_type;
+        assert_eq!(
+            object_binding_value_type(&any_context, &any_source, any_file, "missing"),
+            any,
+        );
+        assert_eq!(
+            object_binding_value_type(&any_context, &any_source, any_file, "remaining"),
+            any,
+        );
+        assert!(any_context.diagnostics().is_empty());
+        let warm = observable_state(&any_context, any_file);
+        any_context.recheck_source_file(any_file).unwrap();
+        assert_eq!(observable_state(&any_context, any_file), warm);
+
+        let missing_source =
+            parsed("const input = { known: 1 }; const { missing: { value } } = input;");
+        let missing_file = FileId::new(9_963);
+        let mut missing_context = context(
+            &[(missing_file, &missing_source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        missing_context.check_source_file(missing_file).unwrap();
+
+        let [diagnostic] = missing_context.diagnostics().as_slice() else {
+            panic!("expected exactly one missing nested property diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2339);
+        assert_eq!(
+            node_text(&missing_source, diagnostic.node.unwrap()),
+            "missing"
+        );
+        let warm = observable_state(&missing_context, missing_file);
+        missing_context.recheck_source_file(missing_file).unwrap();
+        assert_eq!(observable_state(&missing_context, missing_file), warm);
+    }
+
+    #[test]
     fn imported_object_bindings_reexport_their_binder_owned_local_symbols() {
         let provider = parsed("export const re = { foo: 'ready' };");
         let consumer = parsed(concat!(
@@ -55633,6 +56596,166 @@ class Foo2 {
             "Property '0' does not exist on type 'string[]'.",
         );
 
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn array_bindings_preserve_omitted_positions_and_trailing_commas() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "declare var input: string[]; ",
+            "var [, first, , second,] = input; ",
+            "const observed = second;",
+        ));
+        let library_file = FileId::new(9_964);
+        let file = FileId::new(9_965);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for name in ["first", "second"] {
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, name),
+                string
+            );
+        }
+        assert_eq!(
+            variable_value_type(&context, &source, file, "observed"),
+            string,
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn array_binding_defaults_can_read_prior_bindings_and_rest_stays_an_array() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "declare var input: string[]; ",
+            "const [first = 'fallback', second = first, ...remaining] = input; ",
+            "const observed = second;",
+        ));
+        let library_file = FileId::new(9_966);
+        let file = FileId::new(9_967);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_unchecked_indexed_access: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for name in ["first", "second"] {
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, name),
+                string
+            );
+        }
+        let remaining = object_binding_value_type(&context, &source, file, "remaining");
+        assert_eq!(context.type_to_string(remaining).unwrap(), "string[]");
+        assert_eq!(
+            variable_value_type(&context, &source, file, "observed"),
+            string,
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn tuple_bindings_preserve_positions_rest_types_and_bounds_diagnostics() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "declare var input: [string, number, boolean]; ",
+            "const [first, , third] = input; ",
+            "const [, ...remaining] = input;",
+        ));
+        let library_file = FileId::new(9_968);
+        let file = FileId::new(9_969);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "first"),
+            bootstrap.string_type,
+        );
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "third"),
+            bootstrap.boolean_type,
+        );
+        let remaining = object_binding_value_type(&context, &source, file, "remaining");
+        assert_eq!(
+            context.type_to_string(remaining).unwrap(),
+            "[number, boolean]",
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+
+        let missing = parsed("declare var input: [string]; const [first, second] = input;");
+        let missing_file = FileId::new(9_970);
+        let mut missing_context = self::context(
+            &[(library_file, &library), (missing_file, &missing)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        missing_context.check_source_file(missing_file).unwrap();
+
+        let [diagnostic] = missing_context.diagnostics().as_slice() else {
+            panic!("expected one out-of-bounds tuple binding diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2493);
+        assert_eq!(node_text(&missing, diagnostic.node.unwrap()), "second");
+        let warm = observable_state(&missing_context, missing_file);
+        missing_context.recheck_source_file(missing_file).unwrap();
+        assert_eq!(observable_state(&missing_context, missing_file), warm);
+    }
+
+    #[test]
+    fn annotated_array_bindings_contextualize_tuple_initializers() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed("const [first, second]: [string, number] = ['ready', 1];");
+        let library_file = FileId::new(9_971);
+        let file = FileId::new(9_972);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "first"),
+            bootstrap.string_type,
+        );
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "second"),
+            bootstrap.number_type,
+        );
+        assert!(context.diagnostics().is_empty());
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
