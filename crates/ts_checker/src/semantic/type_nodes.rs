@@ -5984,6 +5984,22 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
         let result = (|| {
             for base in bases {
+                if react_namespace.is_some()
+                    && let Some(NodeData::Identifier(identifier)) =
+                        self.host.node(base.expression).map(|record| &record.data)
+                    && self
+                        .store
+                        .symbol(base.symbol)
+                        .and_then(|owner| owner.name().as_utf8())
+                        != Some(identifier.text.as_str())
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::GenericReferenceUnsupported {
+                            node: base.node,
+                            symbol: base.symbol,
+                        },
+                    ));
+                }
                 if base.kind != DirectInterfaceBaseKind::Interface
                     || base.type_arguments.is_empty() && react_namespace.is_none()
                 {
