@@ -14003,6 +14003,267 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         .then_some(target)
     }
 
+    /// Identifies the binder-owned root of a same-file ambient namespace import.
+    fn ambient_module_namespace_import_alias(
+        &self,
+        reference: NodeRef,
+        name: NodeRef,
+    ) -> Option<SemanticSymbolId> {
+        let (arena, bound) = self.host.source(reference)?;
+        let facts = bound.source_facts()?;
+        if !facts.is_declaration_file()
+            || facts.is_javascript_file()
+            || facts.is_external_or_common_js_module()
+        {
+            return None;
+        }
+        let name_record = self.host.node(name)?;
+        let NodeData::QualifiedName(qualified) = &name_record.data else {
+            return None;
+        };
+        let root = NodeRef::new(name.arena, name.file, qualified.left);
+        let root_record = self.host.node(root)?;
+        let NodeData::Identifier(identifier) = &root_record.data else {
+            return None;
+        };
+        let mut callback_host = self.host.name_resolver_host(self.store).ok()?;
+        let resolved =
+            CanonicalNameResolver::new(arena, bound, self.store.symbol_store(), &mut callback_host)
+                .ok()?
+                .resolve(
+                    Some(CanonicalResolutionLocation::Bound(root)),
+                    &identifier.text,
+                    SymbolFlags::NAMESPACE,
+                    None,
+                    true,
+                    false,
+                );
+        let alias = match resolved {
+            Ok(Some(alias))
+            | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) => alias,
+            Ok(None) | Err(_) => return None,
+        };
+        let record = self.store.symbol(alias)?;
+        let [declaration] = record.declarations()? else {
+            return None;
+        };
+        let facts = self.host.bound_file(*declaration)?.source_facts()?;
+        (record.flags() == SymbolFlags::ALIAS
+            && declaration.is_for(reference.arena, reference.file)
+            && self.store.source_node_kind(*declaration) == Some(SyntaxKind::NamespaceImport)
+            && facts.is_declaration_file()
+            && !facts.is_javascript_file()
+            && !facts.is_external_or_common_js_module())
+        .then_some(alias)
+    }
+
+    /// Resolves a proven exported type through an ambient namespace import.
+    #[allow(clippy::too_many_lines)] // The import, module, cache, and member proofs are inseparable.
+    fn authenticated_ambient_module_namespace_import_alias_target(
+        &self,
+        reference: NodeRef,
+        name: NodeRef,
+        alias: SemanticSymbolId,
+    ) -> Option<SemanticSymbolId> {
+        let record = self.store.symbol(alias)?;
+        let [declaration] = record.declarations()? else {
+            return None;
+        };
+        let declaration = *declaration;
+        let bound = self.host.bound_file(declaration)?;
+        let facts = bound.source_facts()?;
+        if record.flags() != SymbolFlags::ALIAS
+            || record.check_flags() != CheckFlags::NONE
+            || record.value_declaration().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent().is_some()
+            || record.export_symbol().is_some()
+            || !facts.is_declaration_file()
+            || facts.is_javascript_file()
+            || facts.is_external_or_common_js_module()
+            || !declaration.is_for(reference.arena, reference.file)
+            || bound.symbol(declaration) != Some(alias)
+            || self.store.get_merged_symbol(alias) != Some(alias)
+        {
+            return None;
+        }
+
+        let qualified_record = self.host.node(name)?;
+        let NodeData::QualifiedName(qualified) = &qualified_record.data else {
+            return None;
+        };
+        let root = NodeRef::new(name.arena, name.file, qualified.left);
+        let root_record = self.host.node(root)?;
+        let NodeData::Identifier(root_name) = &root_record.data else {
+            return None;
+        };
+        let member = NodeRef::new(name.arena, name.file, qualified.right);
+        let member_record = self.host.node(member)?;
+        let NodeData::Identifier(member_name) = &member_record.data else {
+            return None;
+        };
+        let declaration_record = self.host.node(declaration)?;
+        let NodeData::NamespaceImport(imported) = &declaration_record.data else {
+            return None;
+        };
+        let imported_name = NodeRef::new(declaration.arena, declaration.file, imported.name);
+        let imported_name_record = self.host.node(imported_name)?;
+        let NodeData::Identifier(local_name) = &imported_name_record.data else {
+            return None;
+        };
+        if qualified_record.kind != SyntaxKind::QualifiedName
+            || qualified_record.flags.0 != 0
+            || qualified_record.parent != Some(reference.node)
+            || qualified.flow_node.is_some()
+            || qualified.facts != 0
+            || root_record.kind != SyntaxKind::Identifier
+            || root_record.flags.0 != 0
+            || root_record.parent != Some(name.node)
+            || root_name.flow_node.is_some()
+            || member_record.kind != SyntaxKind::Identifier
+            || member_record.flags.0 != 0
+            || member_record.parent != Some(name.node)
+            || member_name.flow_node.is_some()
+            || declaration_record.kind != SyntaxKind::NamespaceImport
+            || declaration_record.flags.0 != 0
+            || imported.local_symbol.is_some()
+            || imported.symbol.is_some()
+            || imported_name_record.kind != SyntaxKind::Identifier
+            || imported_name_record.flags.0 != 0
+            || imported_name_record.parent != Some(declaration.node)
+            || local_name.flow_node.is_some()
+            || local_name.text != root_name.text
+            || record.name().as_utf8() != Some(local_name.text.as_str())
+        {
+            return None;
+        }
+
+        let clause = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            declaration_record.parent?,
+        );
+        let clause_record = self.host.node(clause)?;
+        let NodeData::ImportClause(import_clause) = &clause_record.data else {
+            return None;
+        };
+        let import = NodeRef::new(clause.arena, clause.file, clause_record.parent?);
+        let import_record = self.host.node(import)?;
+        let NodeData::ImportDeclaration(import_data) = &import_record.data else {
+            return None;
+        };
+        let block = NodeRef::new(import.arena, import.file, import_record.parent?);
+        let block_record = self.host.node(block)?;
+        let NodeData::ModuleBlock(module_block) = &block_record.data else {
+            return None;
+        };
+        let namespace = NodeRef::new(block.arena, block.file, block_record.parent?);
+        let namespace_record = self.host.node(namespace)?;
+        let NodeData::ModuleDeclaration(module) = &namespace_record.data else {
+            return None;
+        };
+        let namespace_name = NodeRef::new(namespace.arena, namespace.file, module.name);
+        let namespace_name_record = self.host.node(namespace_name)?;
+        let specifier = NodeRef::new(import.arena, import.file, import_data.module_specifier);
+        let specifier_record = self.host.node(specifier)?;
+        let NodeData::StringLiteral(module_name) = &specifier_record.data else {
+            return None;
+        };
+        if clause_record.kind != SyntaxKind::ImportClause
+            || clause_record.flags.0 != 0
+            || import_clause.named_bindings != Some(declaration.node)
+            || import_clause.local_symbol.is_some()
+            || import_clause.phase_modifier.is_some()
+            || import_clause.symbol.is_some()
+            || import_clause.facts != 0
+            || import_clause.name.is_some()
+            || import_record.kind != SyntaxKind::ImportDeclaration
+            || import_record.flags.0 != 0
+            || import_data.import_clause != Some(clause.node)
+            || import_data.attributes.is_some()
+            || import_data.flow_node.is_some()
+            || import_data.symbol.is_some()
+            || import_data.facts != 0
+            || import_data.modifiers.is_some()
+            || block_record.kind != SyntaxKind::ModuleBlock
+            || !module_block.statements.nodes.contains(&import.node)
+            || namespace_record.kind != SyntaxKind::ModuleDeclaration
+            || namespace_record.parent != Some(bound.source_file().node)
+            || module.body != Some(block.node)
+            || namespace_name_record.kind != SyntaxKind::StringLiteral
+            || specifier_record.kind != SyntaxKind::StringLiteral
+            || specifier_record.flags.0 != 0
+            || specifier_record.parent != Some(import.node)
+            || module_name.token_flags.0 != 0
+            || module_name.text.is_empty()
+            || bound
+                .locals(namespace)
+                .and_then(|locals| self.store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&local_name.text))
+                .and_then(|candidate| self.store.get_merged_symbol(candidate))
+                != Some(alias)
+        {
+            return None;
+        }
+
+        let mut current = reference;
+        for _ in 0..64 {
+            if current == block {
+                break;
+            }
+            current = NodeRef::new(
+                current.arena,
+                current.file,
+                self.host.node(current)?.parent?,
+            );
+            if current == bound.source_file() {
+                return None;
+            }
+        }
+        if current != block {
+            return None;
+        }
+
+        let quoted_name = EscapedName::source(format!("\"{}\"", module_name.text));
+        let imported_module = bound
+            .locals(bound.source_file())
+            .and_then(|locals| self.store.symbol_table(locals))
+            .and_then(|locals| locals.get(quoted_name.as_ref()))
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+        let module_record = self.store.symbol(imported_module)?;
+        let exports = module_record
+            .exports()
+            .and_then(|exports| self.store.symbol_table(exports))?;
+        if !module_record.flags().intersects(SymbolFlags::MODULE)
+            || exports
+                .get(InternalSymbolName::ExportEquals.as_ref())
+                .is_some()
+        {
+            return None;
+        }
+        if let Some(links) = self.store.alias_symbol_links(alias)
+            && links != &super::AliasSymbolLinks::default()
+            && (links.immediate_target != Some(imported_module)
+                || links.alias_target != super::AliasTargetState::Resolved(imported_module)
+                || links.type_only_declaration.is_some())
+        {
+            return None;
+        }
+
+        let target = exports
+            .get_source(&member_name.text)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+        let target_record = self.store.symbol(target)?;
+        let allowed = SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT;
+        (target_record
+            .flags()
+            .intersects(SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE)
+            && target_record.flags().without(allowed) == SymbolFlags::NONE
+            && self.store.get_parent_of_symbol(target) == Some(imported_module))
+        .then_some(target)
+    }
+
     fn resolve_uncached_type_reference_symbol(
         &self,
         node: NodeRef,
@@ -14102,20 +14363,38 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         reference: NodeRef,
         name: NodeRef,
     ) -> Result<SemanticSymbolId, DeclaredTypeError> {
+        let ambient_alias = self.ambient_module_namespace_import_alias(reference, name);
         let mut callback_host = self.host.name_resolver_host(self.store)?;
         match callback_host.resolve_entity_name(name, SymbolFlags::TYPE) {
-            Ok(Some(symbol)) => self.store.get_merged_symbol(symbol).ok_or({
-                DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol))
-            }),
+            Ok(Some(symbol)) => {
+                let symbol = self.store.get_merged_symbol(symbol).ok_or({
+                    DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol))
+                })?;
+                if let Some(alias) = ambient_alias
+                    && self.authenticated_ambient_module_namespace_import_alias_target(
+                        reference, name, alias,
+                    ) != Some(symbol)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::ImportAliasTypeReference {
+                            node: reference,
+                            alias,
+                        },
+                    ));
+                }
+                Ok(symbol)
+            }
             Ok(None) => Err(type_node_unavailable(
                 TypeNodeUnavailable::MissingTypeReference(reference),
             )),
-            Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) => Err(
-                type_node_unavailable(TypeNodeUnavailable::ImportAliasTypeReference {
-                    node: reference,
-                    alias,
+            Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) => self
+                .authenticated_ambient_module_namespace_import_alias_target(reference, name, alias)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::ImportAliasTypeReference {
+                        node: reference,
+                        alias,
+                    })
                 }),
-            ),
             Err(error) => Err(error.into()),
         }
     }
@@ -33912,6 +34191,31 @@ mod tests {
     }
 
     #[test]
+    fn external_namespace_import_references_still_require_authenticated_aliases() {
+        let mut fixture = fixture_with_module_state(
+            "import * as Remote from 'pkg'; type Bad = Remote.Value;",
+            CanonicalModuleState::External,
+        );
+        let bad = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+        let before = store_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert!(matches!(
+            query_declared(
+                &mut fixture,
+                bad,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::ImportAliasTypeReference { .. }
+            ))
+        ));
+        assert_eq!(store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Keep ambient import identity, both targets, and forged caches together.
     fn ambient_react_type_imports_resolve_cold_and_reject_forged_alias_caches() {
         let PropTypesInferPropsFixture {
@@ -34105,6 +34409,211 @@ mod tests {
             Err(DeclaredTypeError::TypeNodeUnavailable(
                 TypeNodeUnavailable::ImportAliasTypeReference { node, alias }
             )) if node == node_reference && alias == node_alias
+        ));
+        assert_eq!(store_state(&store), poisoned);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold namespace imports, warm replay, and forged owners together.
+    fn ambient_react_namespace_import_types_resolve_cold_and_reject_forged_module_caches() {
+        let PropTypesInferPropsFixture {
+            library,
+            declarations,
+            library_file,
+            declaration_file,
+            files,
+            mut store,
+        } = prop_types_declaration_fixture(
+            parse_source_file("interface LibraryMarker {}"),
+            parse_source_file(concat!(
+                "declare module 'prop-types' { ",
+                "export interface Validator<Value> { value: Value; } ",
+                "export type InferProps<Value> = Value; ",
+                "} ",
+                "declare module 'forged-prop-types' { ",
+                "export interface Validator<Value> { forged: Value; } ",
+                "export type InferProps<Value> = number; ",
+                "} ",
+                "declare module 'react' { ",
+                "import * as PropTypes from 'prop-types'; ",
+                "namespace React { ",
+                "export const validator: PropTypes.Validator<string>; ",
+                "export const inferred: PropTypes.InferProps<string>; ",
+                "} }",
+            )),
+            true,
+        );
+        let bound = files.get(&declaration_file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let declaration = |kind: SyntaxKind, expected: &str| {
+            declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind
+                        && declaration_name(&declarations.arena, record) == Some(expected))
+                    .then_some(NodeRef::new(
+                        declarations.arena.id(),
+                        declaration_file,
+                        node,
+                    ))
+                })
+                .unwrap()
+        };
+        let module = |expected: &str| {
+            declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::ModuleDeclaration(module) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::StringLiteral(name) = &declarations.arena.get(module.name)?.data
+                    else {
+                        return None;
+                    };
+                    (name.text == expected).then_some(NodeRef::new(
+                        declarations.arena.id(),
+                        declaration_file,
+                        node,
+                    ))
+                })
+                .unwrap()
+        };
+        let annotation = |expected: &str| {
+            let declaration = declaration(SyntaxKind::VariableDeclaration, expected);
+            let NodeData::VariableDeclaration(variable) =
+                &declarations.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!("the declaration was selected by its variable syntax")
+            };
+            NodeRef::new(declaration.arena, declaration.file, variable.type_.unwrap())
+        };
+        let binding = declarations
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NamespaceImport).then_some(NodeRef::new(
+                    declarations.arena.id(),
+                    declaration_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let alias = bound.symbol(binding).unwrap();
+        let imported_module = store
+            .get_merged_symbol(bound.symbol(module("prop-types")).unwrap())
+            .unwrap();
+        let forged_module = store
+            .get_merged_symbol(bound.symbol(module("forged-prop-types")).unwrap())
+            .unwrap();
+        let validator = annotation("validator");
+        let inferred = annotation("inferred");
+        let validator_target = bound
+            .symbol(declaration(SyntaxKind::InterfaceDeclaration, "Validator"))
+            .unwrap();
+        let inferred_target = bound
+            .symbol(declaration(SyntaxKind::TypeAliasDeclaration, "InferProps"))
+            .unwrap();
+        assert!(store.alias_symbol_links(alias).is_none());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let validator_type = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(validator)
+        .unwrap();
+        let inferred_type = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(inferred)
+        .unwrap();
+        assert!(store.alias_symbol_links(alias).is_none());
+        for (reference, target) in [(validator, validator_target), (inferred, inferred_target)] {
+            assert_eq!(
+                store
+                    .symbol_node_links(reference)
+                    .and_then(|links| links.resolved_symbol),
+                Some(target),
+            );
+        }
+
+        let cold_replay = store_state(&store);
+        for (reference, expected) in [(validator, validator_type), (inferred, inferred_type)] {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(reference),
+                Ok(expected),
+            );
+        }
+        assert_eq!(store_state(&store), cold_replay);
+
+        assert!(store.set_alias_symbol_links(
+            alias,
+            crate::semantic::AliasSymbolLinks {
+                immediate_target: Some(imported_module),
+                alias_target: crate::semantic::AliasTargetState::Resolved(imported_module),
+                ..crate::semantic::AliasSymbolLinks::default()
+            },
+        ));
+        let warm = store_state(&store);
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(validator),
+            Ok(validator_type),
+        );
+        assert_eq!(store_state(&store), warm);
+
+        assert!(store.set_alias_symbol_links(
+            alias,
+            crate::semantic::AliasSymbolLinks {
+                immediate_target: Some(forged_module),
+                alias_target: crate::semantic::AliasTargetState::Resolved(forged_module),
+                ..crate::semantic::AliasSymbolLinks::default()
+            },
+        ));
+        let poisoned = store_state(&store);
+        let result = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(validator);
+        assert!(matches!(
+            result,
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::ImportAliasTypeReference { node, alias: actual }
+            )) if node == validator && actual == alias
         ));
         assert_eq!(store_state(&store), poisoned);
         assert!(diagnostics.is_empty());
