@@ -2523,13 +2523,77 @@ fn plan_interface_member(
                 if member_record.kind == SyntaxKind::PropertyDeclaration
                     && property.initializer.is_none() =>
             {
-                let annotation = property.type_.ok_or_else(|| {
-                    unsupported(
-                        member,
-                        member_record.kind,
-                        SourceSyntaxRole::InterfaceDeclaration,
-                    )
-                })?;
+                let Some(annotation) = property.type_ else {
+                    let augmentation = record
+                        .parent
+                        .and_then(|body| arena.get(body))
+                        .filter(|body| body.kind == SyntaxKind::ModuleBlock)
+                        .and_then(|body| body.parent)
+                        .map(|namespace| child(declaration, namespace));
+                    let augmentation_name = augmentation
+                        .and_then(|namespace| {
+                            arena.get(namespace.node).map(|record| (namespace, record))
+                        })
+                        .and_then(|(namespace, record)| match &record.data {
+                            NodeData::ModuleDeclaration(module)
+                                if record.kind == SyntaxKind::ModuleDeclaration =>
+                            {
+                                Some(child(namespace, module.name))
+                            }
+                            _ => None,
+                        });
+                    let name = child(member, property.name);
+                    let name_record = owned_node(arena, bound, store, name)?;
+                    let member_symbol =
+                        declaration_symbol(bound, store, member, SymbolFlags::PROPERTY)?;
+                    let member_owner =
+                        store
+                            .symbol(member_symbol)
+                            .ok_or(SourceCheckError::Provenance(
+                                SourceCheckProvenanceError::MissingDeclarationSymbol(member),
+                            ))?;
+                    if generic.is_some()
+                        || augmentation_name.is_none_or(|name| {
+                            !bound
+                                .module_augmentations()
+                                .iter()
+                                .any(|augmentation| augmentation.name() == name)
+                        })
+                        || member_record.flags.0 != 0
+                        || property.postfix_token.is_some()
+                        || property.modifiers.is_some()
+                        || property.symbol.is_some()
+                        || property.facts != 0
+                        || name_record.kind != SyntaxKind::Identifier
+                        || name_record.flags.0 != 0
+                        || name_record.parent != Some(member.node)
+                        || !matches!(
+                            &name_record.data,
+                            NodeData::Identifier(identifier)
+                                if identifier.flow_node.is_none()
+                                    && !identifier.text.is_empty()
+                                    && member_owner.name().as_utf8()
+                                        == Some(identifier.text.as_str())
+                        )
+                        || member_owner.flags() != SymbolFlags::PROPERTY
+                        || member_owner.check_flags() != CheckFlags::NONE
+                        || member_owner.parent() != Some(symbol)
+                        || store.get_merged_symbol(member_symbol) != Some(member_symbol)
+                        || store
+                            .symbol(symbol)
+                            .and_then(ts_binder::semantic::Symbol::members)
+                            .and_then(|members| store.symbol_table(members))
+                            .and_then(|members| members.get(member_owner.name()))
+                            != Some(member_symbol)
+                    {
+                        return Err(unsupported(
+                            member,
+                            member_record.kind,
+                            SourceSyntaxRole::InterfaceDeclaration,
+                        ));
+                    }
+                    continue;
+                };
                 let annotation = child(member, annotation);
                 annotations.push(annotation);
                 if let Some(generic) = generic.as_mut() {

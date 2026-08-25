@@ -343,8 +343,14 @@ pub(super) struct PropertyObjectPlan {
 }
 
 impl PropertyObjectPlan {
-    pub(super) fn property_type_nodes(&self) -> impl ExactSizeIterator<Item = NodeRef> + '_ {
-        self.properties.iter().map(|property| property.type_node)
+    pub(super) fn property_type_nodes(&self) -> impl Iterator<Item = NodeRef> + '_ {
+        self.properties
+            .iter()
+            .filter(|property| {
+                self.kind != PropertyObjectKind::Interface
+                    || property.type_node != property.name_node
+            })
+            .map(|property| property.type_node)
     }
 
     pub(super) fn spread_expression_nodes(&self) -> impl ExactSizeIterator<Item = NodeRef> + '_ {
@@ -5516,6 +5522,82 @@ fn is_reparsed_javascript_typedef_property(
         && host.symbol_matches(store, alias_node, alias_symbol)
 }
 
+fn implicit_any_augmentation_interface_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    interface: NodeRef,
+    property: NodeRef,
+) -> bool {
+    let Some(bound) = host.bound_file(interface) else {
+        return false;
+    };
+    let Some(interface_record) = host.node(interface) else {
+        return false;
+    };
+    let Some(body) = interface_record
+        .parent
+        .map(|node| NodeRef::new(interface.arena, interface.file, node))
+    else {
+        return false;
+    };
+    let Some(body_record) = host.node(body) else {
+        return false;
+    };
+    let Some(namespace) = body_record
+        .parent
+        .map(|node| NodeRef::new(interface.arena, interface.file, node))
+    else {
+        return false;
+    };
+    let Some(namespace_record) = host.node(namespace) else {
+        return false;
+    };
+    let NodeData::ModuleDeclaration(module) = &namespace_record.data else {
+        return false;
+    };
+    let name = NodeRef::new(namespace.arena, namespace.file, module.name);
+    let Some(property_record) = host.node(property) else {
+        return false;
+    };
+    let NodeData::PropertyDeclaration(member) = &property_record.data else {
+        return false;
+    };
+    let property_name = NodeRef::new(property.arena, property.file, member.name);
+
+    interface_record.kind == SyntaxKind::InterfaceDeclaration
+        && body_record.kind == SyntaxKind::ModuleBlock
+        && body_record.parent == Some(namespace.node)
+        && namespace_record.kind == SyntaxKind::ModuleDeclaration
+        && bound
+            .module_augmentations()
+            .iter()
+            .any(|augmentation| augmentation.name() == name)
+        && property_record.kind == SyntaxKind::PropertyDeclaration
+        && property_record.flags.0 == 0
+        && property_record.parent == Some(interface.node)
+        && member.type_.is_none()
+        && member.initializer.is_none()
+        && member.postfix_token.is_none()
+        && member.modifiers.is_none()
+        && member.symbol.is_none()
+        && member.facts == 0
+        && host.node(property_name).is_some_and(|name| {
+            matches!(
+                &name.data,
+                NodeData::Identifier(identifier)
+                    if name.kind == SyntaxKind::Identifier
+                        && name.flags.0 == 0
+                        && name.parent == Some(property.node)
+                        && identifier.flow_node.is_none()
+                        && !identifier.text.is_empty()
+            )
+        })
+        && bound
+            .symbol(interface)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_members(
     store: &CanonicalTypeMapperStore,
@@ -5896,14 +5978,24 @@ fn plan_members(
                 NodeData::PropertyDeclaration(property)
                     if kind != PropertyObjectKind::ObjectLiteral =>
                 {
+                    let implicit_any = kind == PropertyObjectKind::Interface
+                        && property.type_.is_none()
+                        && implicit_any_augmentation_interface_property(
+                            store,
+                            host,
+                            member_owner,
+                            member,
+                        );
                     (
                         property.name,
-                        property.type_,
+                        property
+                            .type_
+                            .or_else(|| implicit_any.then_some(property.name)),
                         property.postfix_token,
                         property.modifiers.as_ref(),
                         None,
                         property.initializer.is_none()
-                            && property.type_.is_some()
+                            && (property.type_.is_some() || implicit_any)
                             && property.symbol.is_none()
                             && property.facts == 0,
                     )
@@ -6045,7 +6137,9 @@ fn plan_members(
                 alias_symbol,
                 member,
             );
-        let valid_value_range = if member_record.kind == SyntaxKind::ShorthandPropertyAssignment {
+        let valid_value_range = if member_record.kind == SyntaxKind::ShorthandPropertyAssignment
+            || kind == PropertyObjectKind::Interface && type_node == name
+        {
             type_node == name && type_record.range == name_record.range
         } else if reparsed_javascript_property {
             type_record.range.start >= member_record.range.start

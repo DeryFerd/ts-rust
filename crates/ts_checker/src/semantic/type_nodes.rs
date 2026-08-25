@@ -18235,8 +18235,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 prepared,
             )?;
             let mut types = Vec::with_capacity(interface.properties.len());
-            for property in interface.property_type_nodes() {
-                types.push(self.execute_type_node(property, plan, prepared)?);
+            for property in &interface.properties {
+                let type_ = if property.type_node == property.name_node {
+                    self.store
+                        .intrinsic_bootstrap()
+                        .map(|bootstrap| bootstrap.any_type)
+                        .ok_or(DeclaredTypeError::Unavailable(
+                            DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                        ))?
+                } else {
+                    self.execute_type_node(property.type_node, plan, prepared)?
+                };
+                types.push(type_);
             }
             for accessor in &interface.accessors {
                 self.execute_type_node(accessor.type_node, plan, prepared)?;
@@ -18356,6 +18366,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         })();
         assert!(self.resolving_property_interfaces.remove(&symbol));
         if result.is_ok() && self.options.no_implicit_any {
+            for property in interface
+                .properties
+                .iter()
+                .filter(|property| property.type_node == property.name_node)
+            {
+                self.diagnostics.lookup_or_issue(
+                    Some(property.name_node),
+                    Diagnostic::with_arguments(
+                        message_by_code(7008).expect("TS7008 is in the diagnostic catalog"),
+                        [property.name.as_str(), "any"],
+                    ),
+                );
+            }
             for signature in interface
                 .call_signatures
                 .iter()
