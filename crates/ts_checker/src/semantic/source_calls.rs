@@ -143,6 +143,607 @@ pub(super) struct CheckedSourceCall {
     pub(super) return_type: TypeId,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GlobalArrayFindIndexParameter {
+    symbol: SemanticSymbolId,
+    annotation: NodeRef,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GlobalArrayFindIndexMethod {
+    owner: SemanticSymbolId,
+    target: TypeId,
+    element: TypeId,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    predicate: GlobalArrayFindIndexParameter,
+    this_arg: GlobalArrayFindIndexParameter,
+    return_annotation: NodeRef,
+}
+
+/// Recognizes only the source spelling of the ES2015 array search method.
+pub(super) fn source_is_global_array_find_index_method(
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> bool {
+    let Some(NodeData::PropertyAccessExpression(access)) =
+        host.node(node).map(|record| &record.data)
+    else {
+        return false;
+    };
+    let name = NodeRef::new(node.arena, node.file, access.name);
+    matches!(
+        host.node(name).map(|record| &record.data),
+        Some(NodeData::Identifier(identifier)) if identifier.text == "findIndex"
+    )
+}
+
+fn plan_global_array_find_index_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    method: NodeRef,
+    declaration: NodeRef,
+    expected_name: &str,
+    optional: bool,
+) -> Result<GlobalArrayFindIndexParameter, SourceCheckError> {
+    let invalid = || SourceCheckError::Call(method);
+    let record = host.node(declaration).ok_or_else(invalid)?;
+    let NodeData::ParameterDeclaration(parameter) = &record.data else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, parameter.name);
+    let name_record = host.node(name).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    let annotation = parameter
+        .type_
+        .map(|annotation| NodeRef::new(declaration.arena, declaration.file, annotation))
+        .ok_or_else(invalid)?;
+    let annotation_record = host.node(annotation).ok_or_else(invalid)?;
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let symbol = bound
+        .symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let symbol_record = store.symbol(symbol).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::Parameter
+        || record.flags.0 != 0
+        || record.parent != Some(method.node)
+        || parameter.dot_dot_dot_token.is_some()
+        || parameter.initializer.is_some()
+        || parameter.symbol.is_some()
+        || parameter.modifiers.is_some()
+        || parameter.facts != 0
+        || parameter.question_token.is_some() != optional
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text != expected_name
+        || annotation_record.flags.0 != 0
+        || annotation_record.parent != Some(declaration.node)
+        || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(expected_name)
+        || symbol_record.declarations() != Some(&[declaration])
+        || symbol_record.value_declaration() != Some(declaration)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent().is_some()
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+    {
+        return Err(invalid());
+    }
+    Ok(GlobalArrayFindIndexParameter { symbol, annotation })
+}
+
+fn plan_global_array_find_index_method(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    receiver: TypeId,
+    site: NodeRef,
+) -> Result<Option<GlobalArrayFindIndexMethod>, SourceCheckError> {
+    let invalid = || SourceCheckError::Call(site);
+    let Some(array) = store
+        .canonical_array_reference(global_types, receiver)
+        .map_err(|_| invalid())?
+    else {
+        return Ok(None);
+    };
+    let (target, owner_name) = if array.readonly {
+        (global_types.readonly_array_type, "ReadonlyArray")
+    } else {
+        (global_types.array_type, "Array")
+    };
+    let target_record = store.type_payload(target).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = target_record.data() else {
+        return Err(invalid());
+    };
+    let [element] = interface
+        .reference
+        .resolved_type_arguments
+        .as_deref()
+        .ok_or_else(invalid)?
+    else {
+        return Err(invalid());
+    };
+    let element = *element;
+    let owner = target_record
+        .symbol()
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    let globals = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .ok_or_else(invalid)?;
+    let allowed_owner_flags =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    if globals
+        .get_source(owner_name)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        != Some(owner)
+        || owner_record.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        || owner_record.flags().without(allowed_owner_flags) != SymbolFlags::NONE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name().as_utf8() != Some(owner_name)
+        || owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(target)
+    {
+        return Err(invalid());
+    }
+    let Some(symbol) = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source("findIndex"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(None);
+    };
+    let method = store.symbol(symbol).ok_or_else(invalid)?;
+    let Some([declaration]) = method.declarations() else {
+        return Ok(None);
+    };
+    let declaration = *declaration;
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let record = host.node(declaration).ok_or_else(invalid)?;
+    let NodeData::MethodSignatureDeclaration(syntax) = &record.data else {
+        return Err(invalid());
+    };
+    let [predicate, this_arg] = syntax.parameters.nodes.as_slice() else {
+        return Ok(None);
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, syntax.name);
+    let name_record = host.node(name).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    let return_annotation = syntax
+        .type_
+        .map(|annotation| NodeRef::new(declaration.arena, declaration.file, annotation))
+        .ok_or_else(invalid)?;
+    let return_record = host.node(return_annotation).ok_or_else(invalid)?;
+    if method.flags() != SymbolFlags::METHOD
+        || method.check_flags() != CheckFlags::NONE
+        || method.name().as_utf8() != Some("findIndex")
+        || method.value_declaration() != Some(declaration)
+        || method.members().is_some()
+        || method.exports().is_some()
+        || method.export_symbol().is_some()
+        || store.get_parent_of_symbol(symbol) != Some(owner)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !host.symbol_matches(store, declaration, symbol)
+        || bound.source_facts().is_none_or(|facts| {
+            !facts.is_default_library()
+                || !facts.is_declaration_file()
+                || facts.is_javascript_file()
+                || facts.is_external_or_common_js_module()
+        })
+        || record.kind != SyntaxKind::MethodSignature
+        || record.flags.0 != 0
+        || syntax.full_signature.is_some()
+        || syntax.next_container.is_some()
+        || syntax.postfix_token.is_some()
+        || syntax.symbol.is_some()
+        || syntax.type_parameters.is_some()
+        || syntax.modifiers.is_some()
+        || syntax.parameters.has_trailing_comma
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text != "findIndex"
+        || return_record.kind != SyntaxKind::NumberKeyword
+        || return_record.flags.0 != 0
+        || return_record.parent != Some(declaration.node)
+    {
+        return Err(invalid());
+    }
+    let predicate = plan_global_array_find_index_parameter(
+        store,
+        host,
+        declaration,
+        NodeRef::new(declaration.arena, declaration.file, *predicate),
+        "predicate",
+        false,
+    )?;
+    let this_arg = plan_global_array_find_index_parameter(
+        store,
+        host,
+        declaration,
+        NodeRef::new(declaration.arena, declaration.file, *this_arg),
+        "thisArg",
+        true,
+    )?;
+    let locals = bound
+        .locals(declaration)
+        .and_then(|locals| store.symbol_table(locals))
+        .ok_or_else(invalid)?;
+    let callback_record = host.node(predicate.annotation).ok_or_else(invalid)?;
+    let NodeData::FunctionTypeNode(callback) = &callback_record.data else {
+        return Err(invalid());
+    };
+    let callback_return = callback
+        .type_
+        .map(|annotation| {
+            NodeRef::new(
+                predicate.annotation.arena,
+                predicate.annotation.file,
+                annotation,
+            )
+        })
+        .ok_or_else(invalid)?;
+    let callback_return_record = host.node(callback_return).ok_or_else(invalid)?;
+    if callback_record.kind != SyntaxKind::FunctionType
+        || callback_record.flags.0 != 0
+        || callback_record.parent
+            != store
+                .symbol(predicate.symbol)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .map(|parameter| parameter.node)
+        || callback.full_signature.is_some()
+        || callback.next_container.is_some()
+        || callback.symbol.is_some()
+        || callback.type_parameters.is_some()
+        || callback.modifiers.is_some()
+        || callback.parameters.has_trailing_comma
+        || callback.parameters.nodes.len() != 3
+        || callback_return_record.kind != SyntaxKind::UnknownKeyword
+        || callback_return_record.flags.0 != 0
+        || callback_return_record.parent != Some(predicate.annotation.node)
+        || store.source_node_kind(this_arg.annotation) != Some(SyntaxKind::AnyKeyword)
+        || locals.len() != 2
+        || locals.get_source("predicate") != Some(predicate.symbol)
+        || locals.get_source("thisArg") != Some(this_arg.symbol)
+    {
+        return Err(invalid());
+    }
+
+    Ok(Some(GlobalArrayFindIndexMethod {
+        owner,
+        target,
+        element,
+        symbol,
+        declaration,
+        predicate,
+        this_arg,
+        return_annotation,
+    }))
+}
+
+/// Publishes the exact default-library `findIndex` method without expanding Array.
+#[allow(clippy::too_many_arguments)] // Method publication retains the caller's checker context.
+pub(super) fn materialize_global_array_find_index_method(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    receiver: TypeId,
+    site: NodeRef,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let Some(plan) =
+        plan_global_array_find_index_method(store, host, global_types, receiver, site)?
+    else {
+        return Ok(None);
+    };
+    let invalid = || SourceCheckError::Call(site);
+    let (any, number, unknown) = {
+        let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+        (
+            bootstrap.any_type,
+            bootstrap.number_type,
+            bootstrap.unknown_type,
+        )
+    };
+    if let Some(links) = store.value_symbol_links(plan.symbol)
+        && links != &ValueSymbolLinks::default()
+    {
+        let type_ = links.resolved_type.ok_or_else(invalid)?;
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(store, type_)
+        else {
+            return Err(invalid());
+        };
+        let [signature] = projection.call_signatures.as_ref() else {
+            return Err(invalid());
+        };
+        if links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+            || !projection.construct_signatures.is_empty()
+            || signature.parameters.len() != 2
+            || signature.min_argument_count != 1
+            || signature.return_type != Some(number)
+            || store
+                .signature(signature.signature)
+                .and_then(super::signatures::Signature::declaration)
+                != Some(plan.declaration)
+        {
+            return Err(invalid());
+        }
+        return Ok(Some(type_));
+    }
+    if [plan.predicate.symbol, plan.this_arg.symbol]
+        .iter()
+        .any(|symbol| {
+            store
+                .value_symbol_links(*symbol)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+        })
+        || store
+            .signature_links(plan.declaration)
+            .is_some_and(|links| links != &SignatureLinks::default())
+    {
+        return Err(invalid());
+    }
+
+    let callback =
+        CanonicalTypeQuery::new_with_global_types(store, host, global_types, options, diagnostics)?
+            .get_type_from_type_node(plan.predicate.annotation)?;
+    let StoredSingleCallableValidation::Valid {
+        callable: callback_signature,
+        ..
+    } = validate_stored_single_callable(store, callback)
+    else {
+        return Err(invalid());
+    };
+    let callback_return =
+        CanonicalTypeQuery::new_with_global_types(store, host, global_types, options, diagnostics)?
+            .get_return_type_of_signature(callback_signature.signature)?;
+    let StoredSingleCallableValidation::Valid {
+        callable: callback_signature,
+        ..
+    } = validate_stored_single_callable(store, callback)
+    else {
+        return Err(invalid());
+    };
+    let [element, index, array] = callback_signature.parameters.as_slice() else {
+        return Err(invalid());
+    };
+    if *element != plan.element
+        || *index != number
+        || callback_return != unknown
+        || callback_signature.return_type != Some(unknown)
+        || callback_signature.rest_parameter.is_some()
+        || callback_signature.min_argument_count != 3
+        || store
+            .canonical_array_reference(global_types, *array)
+            .map_err(|_| invalid())?
+            .is_none_or(|array| {
+                array.element_type != plan.element
+                    || array.readonly != (plan.target == global_types.readonly_array_type)
+            })
+        || store
+            .authenticated_interface_method_owner(plan.symbol)
+            .is_none_or(|(owner, target)| owner != plan.owner || target != plan.target)
+    {
+        return Err(invalid());
+    }
+
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_signatures(1)
+        || !store.try_reserve_signature_links(usize::from(
+            store.signature_links(plan.declaration).is_none(),
+        ))
+        || !store.try_reserve_value_symbol_links(
+            usize::from(store.value_symbol_links(plan.symbol).is_none())
+                + usize::from(store.value_symbol_links(plan.predicate.symbol).is_none())
+                + usize::from(store.value_symbol_links(plan.this_arg.symbol).is_none()),
+        )
+        || !store.try_reserve_function_signature_return_annotations(1)
+        || !store.try_reserve_callable_signature_parameter_types(1)
+    {
+        return Err(invalid());
+    }
+    let type_ = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.symbol))
+        .ok_or_else(invalid)?;
+    let signature = store
+        .alloc_signature(
+            SignatureFlags::NONE,
+            Some(plan.declaration),
+            Vec::new(),
+            None,
+            vec![plan.predicate.symbol, plan.this_arg.symbol],
+            Some(number),
+            None,
+            1,
+        )
+        .ok_or_else(invalid)?;
+    assert!(store.set_signature_links(
+        plan.declaration,
+        SignatureLinks {
+            resolved_signature: ResolvedSignatureState::Resolved(signature),
+            ..SignatureLinks::default()
+        },
+    ));
+    for (symbol, type_) in [
+        (plan.predicate.symbol, callback),
+        (plan.this_arg.symbol, any),
+    ] {
+        assert!(store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+    }
+    assert!(store.set_value_symbol_links(
+        plan.symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        },
+    ));
+    assert!(store.set_structured_type_members(
+        type_,
+        None,
+        None,
+        Some(vec![signature]),
+        None,
+        None
+    ));
+    assert!(store.set_function_signature_return_annotation(
+        signature,
+        plan.return_annotation,
+        false,
+    ));
+    assert!(
+        store.set_callable_signature_parameter_types_batch(vec![(signature, vec![callback, any])])
+    );
+    if !matches!(
+        validate_stored_callable_set(store, type_),
+        StoredCallableSetValidation::Valid { .. }
+    ) {
+        return Err(invalid());
+    }
+    Ok(Some(type_))
+}
+
+fn check_authenticated_array_find_index_call(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    plan: &SourceCallPlan,
+    callee_type: TypeId,
+    argument_types: &[TypeId],
+) -> Result<Option<CheckedSourceCall>, SourceCheckError> {
+    if plan.form != DirectCallForm::Call
+        || plan.type_arguments.is_some()
+        || !(1..=2).contains(&argument_types.len())
+    {
+        return Ok(None);
+    }
+    let PlannedExpressionKind::Property(property) = &plan.callee.unparenthesized().kind else {
+        return Ok(None);
+    };
+    let Some(method) = store.type_payload(callee_type).and_then(TypeRecord::symbol) else {
+        return Ok(None);
+    };
+    let Some(method_record) = store.symbol(method) else {
+        return Err(SourceCheckError::Call(plan.node));
+    };
+    if method_record.flags() != SymbolFlags::METHOD
+        || method_record.name().as_utf8() != Some("findIndex")
+        || store
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            != Some(callee_type)
+    {
+        return Ok(None);
+    }
+    let receiver = store
+        .type_node_links(property.receiver.node)
+        .and_then(|links| links.resolved_type)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let Some(array) = store
+        .canonical_array_reference(global_types, receiver)
+        .map_err(|_| SourceCheckError::Call(plan.node))?
+    else {
+        return Ok(None);
+    };
+    let target = if array.readonly {
+        global_types.readonly_array_type
+    } else {
+        global_types.array_type
+    };
+    if store
+        .authenticated_interface_method_owner(method)
+        .is_none_or(|(_, owner)| owner != target)
+    {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+    let StoredCallableSetValidation::Valid {
+        projection: method_projection,
+        ..
+    } = validate_stored_callable_set(store, callee_type)
+    else {
+        return Err(SourceCheckError::Call(plan.node));
+    };
+    let [method_signature] = method_projection.call_signatures.as_ref() else {
+        return Err(SourceCheckError::Call(plan.node));
+    };
+    let number = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.number_type)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    if !method_projection.construct_signatures.is_empty()
+        || method_signature.parameters.len() != 2
+        || method_signature.min_argument_count != 1
+        || method_signature.return_type != Some(number)
+    {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+    let callback = argument_types[0];
+    let StoredCallableSetValidation::Valid {
+        projection: callback_projection,
+        ..
+    } = validate_stored_callable_set(store, callback)
+    else {
+        return Ok(None);
+    };
+    let Some(callback_signature) = callback_projection.call_signatures.first() else {
+        return Ok(None);
+    };
+    if callback_signature.rest_parameter.is_some()
+        || callback_signature.parameters.len() > 3
+        || callback_signature.min_argument_count > 3
+    {
+        return Ok(None);
+    }
+    for (provided, expected) in [array.element_type, number, receiver]
+        .into_iter()
+        .zip(&callback_signature.parameters)
+    {
+        if !store
+            .is_type_assignable_to_with_global_types(provided, *expected, global_types)
+            .map_err(SourceCheckError::RelationUnavailable)?
+        {
+            return Ok(None);
+        }
+    }
+    if preflight_call_publication(store, plan.node, number)?
+        .is_some_and(|existing| existing != method_signature.signature)
+    {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+    publish_call_links(store, plan.node, method_signature.signature, number)?;
+    Ok(Some(CheckedSourceCall {
+        return_type: number,
+    }))
+}
+
 #[derive(Clone, Debug)]
 struct GlobalArrayCallbackParameter {
     symbol: SemanticSymbolId,
@@ -4975,6 +5576,15 @@ pub(super) fn check_direct_source_call(
     if argument_types.len() != plan.arguments.len() {
         return Err(SourceCheckError::Call(plan.node));
     }
+    if let Some(checked) = check_authenticated_array_find_index_call(
+        store,
+        global_types,
+        plan,
+        callee_type,
+        argument_types,
+    )? {
+        return Ok(checked);
+    }
     let callee_type =
         specialize_readonly_array_concat_callee(store, global_types, plan, callee_type)?;
     if let Some(checked) = check_authenticated_array_callback_call(
@@ -7619,6 +8229,193 @@ mod tests {
                 .and_then(|links| links.resolved_type),
             Some(context.store().intrinsic_bootstrap().unwrap().number_type),
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve both real array owners, signatures, and warm caches.
+    fn array_find_index_preserves_default_library_signatures_and_receiver_elements() {
+        let library = parsed(concat!(
+            "interface Array<T> { ",
+            "findIndex(predicate: (value: T, index: number, obj: T[]) => unknown, ",
+            "thisArg?: any): number; ",
+            "untouched(value: T): void; ",
+            "} interface ReadonlyArray<T> { ",
+            "findIndex(predicate: (value: T, index: number, obj: readonly T[]) => unknown, ",
+            "thisArg?: any): number; ",
+            "}",
+        ));
+
+        for (index, receiver) in ["number[]", "ReadonlyArray<number>"]
+            .into_iter()
+            .enumerate()
+        {
+            let source = parsed(&format!(concat!(
+                "declare function match(value: number): boolean; ",
+                "declare const values: {receiver}; ",
+                "const first: number = values.findIndex(match); ",
+                "const second: number = values.findIndex(match, undefined);",
+            ),));
+            let library_file = FileId::new(4_980 + u32::try_from(index * 2).unwrap());
+            let source_file = FileId::new(4_981 + u32::try_from(index * 2).unwrap());
+            let mut context =
+                context_with_default_library(&library, library_file, &source, source_file);
+
+            context.check_source_file(source_file).unwrap();
+
+            assert!(
+                context.diagnostics().is_empty(),
+                "{:?}",
+                context.diagnostics(),
+            );
+            let call_nodes = calls(&source, source_file);
+            assert_eq!(call_nodes.len(), 2);
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            for call in &call_nodes {
+                assert_eq!(
+                    context
+                        .store()
+                        .type_node_links(*call)
+                        .and_then(|links| links.resolved_type),
+                    Some(number),
+                );
+            }
+            let target = if index == 0 {
+                context.global_types().array_type
+            } else {
+                context.global_types().readonly_array_type
+            };
+            let owner = context
+                .store()
+                .type_payload(target)
+                .and_then(TypeRecord::symbol)
+                .unwrap();
+            let members = context.store().symbol(owner).unwrap().members().unwrap();
+            let method = context
+                .store()
+                .symbol_table(members)
+                .and_then(|members| members.get_source("findIndex"))
+                .unwrap();
+            let callable = context
+                .store()
+                .value_symbol_links(method)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let [signature] = context
+                .store()
+                .type_payload(callable)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.signatures.as_deref())
+                .unwrap()
+            else {
+                panic!("findIndex must retain its one default-library method signature")
+            };
+            let signature = context.store().signature(*signature).unwrap();
+            assert_eq!(signature.parameters().len(), 2);
+            assert_eq!(signature.min_argument_count(), 1);
+            assert_eq!(signature.resolved_return_type(), Some(number));
+            if index == 0 {
+                let untouched = context
+                    .store()
+                    .symbol_table(members)
+                    .and_then(|members| members.get_source("untouched"))
+                    .unwrap();
+                assert!(context.store().value_symbol_links(untouched).is_none());
+            }
+
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                call_nodes
+                    .iter()
+                    .map(|call| call_publication_state(&context, *call))
+                    .collect::<Vec<_>>(),
+            );
+            context.recheck_source_file(source_file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    call_nodes
+                        .iter()
+                        .map(|call| call_publication_state(&context, *call))
+                        .collect::<Vec<_>>(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn array_find_index_rejects_forged_library_signatures_before_call_publication() {
+        for (index, declaration) in [
+            concat!(
+                "findIndex(predicate: (value: T, index: number, obj: T[]) => unknown, ",
+                "thisArg?: any): string;",
+            ),
+            concat!(
+                "findIndex(callback: (value: T, index: number, obj: T[]) => unknown, ",
+                "thisArg?: any): number;",
+            ),
+            concat!(
+                "findIndex(predicate: (value: T, index: number, obj: T[]) => unknown, ",
+                "thisArg: any): number;",
+            ),
+            concat!(
+                "findIndex(predicate: (value: T, index: number, obj: T[]) => boolean, ",
+                "thisArg?: any): number;",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let library = parsed(&format!(
+                "interface Array<T> {{ {declaration} }} interface ReadonlyArray<T> {{}}",
+            ));
+            let source = parsed(concat!(
+                "declare function match(value: number): boolean; ",
+                "declare const values: number[]; values.findIndex(match);",
+            ));
+            let library_file = FileId::new(4_990 + u32::try_from(index * 2).unwrap());
+            let source_file = FileId::new(4_991 + u32::try_from(index * 2).unwrap());
+            let mut context =
+                context_with_default_library(&library, library_file, &source, source_file);
+            let call_nodes = calls(&source, source_file);
+            let [call] = call_nodes.as_slice() else {
+                panic!("the malformed library fixture must retain one findIndex call")
+            };
+            let call = *call;
+
+            assert!(context.check_source_file(source_file).is_err());
+            assert!(context.store().type_node_links(call).is_none());
+            assert!(context.store().signature_links(call).is_none());
+        }
+    }
+
+    #[test]
+    fn array_find_index_rejects_source_owned_global_augmentations() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parsed(concat!(
+            "interface Array<T> { ",
+            "findIndex(predicate: (value: T, index: number, obj: T[]) => unknown, ",
+            "thisArg?: any): number; } ",
+            "declare function match(value: number): boolean; ",
+            "declare const values: number[]; values.findIndex(match);",
+        ));
+        let library_file = FileId::new(4_998);
+        let source_file = FileId::new(4_999);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+        let call_nodes = calls(&source, source_file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("the source-owned augmentation must retain one findIndex call")
+        };
+        let call = *call;
+
+        assert!(context.check_source_file(source_file).is_err());
+        assert!(context.store().type_node_links(call).is_none());
+        assert!(context.store().signature_links(call).is_none());
     }
 
     #[test]

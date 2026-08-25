@@ -165,8 +165,9 @@ use super::{
         SourceCallCalleeForm, SourceCallPlan, check_direct_source_call,
         emit_call_type_argument_grammar_diagnostics, finish_direct_source_call_plan,
         is_immediately_invoked_source_callable, materialize_global_array_callback_method,
-        plan_direct_source_call_syntax, source_call_argument_contextual_type,
-        source_global_array_callback_method_name,
+        materialize_global_array_find_index_method, plan_direct_source_call_syntax,
+        source_call_argument_contextual_type, source_global_array_callback_method_name,
+        source_is_global_array_find_index_method,
     },
     source_elements::{
         CheckedSourceElement, SourceElementError, SourceElementPlan, SourceElementUnsupported,
@@ -22468,6 +22469,7 @@ fn check_expression_type(
                 || source_is_global_array_concat_method(host, property.node)
                 || source_global_array_callback_method_name(host, property.node).is_some()
                 || source_is_global_object_factory_method(host, property.node)
+                || source_is_global_array_find_index_method(host, property.node)
                 || matches!(
                     &property.receiver.unparenthesized().kind,
                     PlannedExpressionKind::Identifier(read)
@@ -22524,6 +22526,17 @@ fn check_expression_type(
                     diagnostics,
                     receiver.result,
                     &name,
+                    property.node,
+                )?;
+            }
+            if source_is_global_array_find_index_method(host, property.node) {
+                materialize_global_array_find_index_method(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                    receiver.result,
                     property.node,
                 )?;
             }
@@ -24002,7 +24015,7 @@ fn check_contextual_direct_call_arrow(
         || target.rest_parameter.is_some()
         || if promise_executor {
             parameters.len() != 1 || target.min_argument_count != 2 || target.parameters.len() != 2
-        } else if array_parameter_type.is_some() {
+        } else if parameters.len() == 1 {
             target.min_argument_count == 0
         } else {
             target.min_argument_count != parameters.len()

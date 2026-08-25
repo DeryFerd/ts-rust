@@ -8058,28 +8058,32 @@ fn valid_direct_call_contextual_target(
     signature.type_parameters().is_empty()
         && !signature.has_rest_parameter()
         && callable.rest_parameter.is_none()
-        && (callable.min_argument_count == parameters.len()
-            && callable.parameters.len() == parameters.len()
-            && callable
-                .parameters
-                .iter()
-                .zip(parameters)
-                .all(|(expected, parameter)| *expected == parameter.type_)
-            || parameters.len() == 1
-                && callable.min_argument_count >= 1
-                && super::source_calls::authenticated_array_callback_contextual_target(
-                    store,
-                    target,
-                    source_parameter,
-                    parameters[0].type_,
-                )
-            || parameters.len() == 1
-                && callable.min_argument_count == 2
+        && if parameters.len() == 1
+            && stored_promise_executor_contextual_target_is_exact(store, signature)
+        {
+            callable.min_argument_count == 2
                 && matches!(
                     callable.parameters.as_slice(),
                     [first, _] if *first == parameters[0].type_
                 )
-                && stored_promise_executor_contextual_target_is_exact(store, signature))
+        } else {
+            callable.min_argument_count == parameters.len()
+                && callable.parameters.len() == parameters.len()
+                && callable
+                    .parameters
+                    .iter()
+                    .zip(parameters)
+                    .all(|(expected, parameter)| *expected == parameter.type_)
+                || parameters.len() == 1
+                    && callable.min_argument_count >= 1
+                    && (source_parameter == parameters[0].type_
+                        || super::source_calls::authenticated_array_callback_contextual_target(
+                            store,
+                            target,
+                            source_parameter,
+                            parameters[0].type_,
+                        ))
+        }
 }
 
 fn stored_promise_executor_contextual_target_is_exact(
@@ -9549,29 +9553,33 @@ pub(super) fn validate_stored_source_callable(
                             && signature.type_parameters().is_empty()
                             && !signature.has_rest_parameter()
                             && callable.rest_parameter.is_none()
-                            && (callable.min_argument_count == types.len()
-                                && callable.parameters.as_slice() == types
-                                || types.len() == 1
-                                    && callable.min_argument_count >= 1
-                                    && callable.parameters.first().copied().is_some_and(
-                                        |source_parameter| {
-                                            super::source_calls::authenticated_array_callback_contextual_target(
-                                                store,
-                                                target,
-                                                source_parameter,
-                                                types[0],
-                                            )
-                                        },
-                                    )
-                                || types.len() == 1
-                                    && callable.min_argument_count == 2
+                            && if types.len() == 1
+                                && stored_promise_executor_contextual_target_is_exact(
+                                    store, signature,
+                                )
+                            {
+                                callable.min_argument_count == 2
                                     && matches!(
                                         callable.parameters.as_slice(),
                                         [first, _] if *first == types[0]
                                     )
-                                    && stored_promise_executor_contextual_target_is_exact(
-                                        store, signature,
-                                    ))
+                            } else {
+                                callable.min_argument_count == types.len()
+                                    && callable.parameters.as_slice() == types
+                                    || types.len() == 1
+                                        && callable.min_argument_count >= 1
+                                        && callable.parameters.first().copied().is_some_and(
+                                            |source_parameter| {
+                                                source_parameter == types[0]
+                                                    || super::source_calls::authenticated_array_callback_contextual_target(
+                                                        store,
+                                                        target,
+                                                        source_parameter,
+                                                        types[0],
+                                                    )
+                                            },
+                                        )
+                            }
                     })
             } else {
                 matches!(
