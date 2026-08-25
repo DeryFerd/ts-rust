@@ -19,7 +19,7 @@
 //! ambient function declarations (including the existing generic callable
 //! closure), initialized identifier-named top-level variables (optionally
 //! exported), object and array binding declarations with authenticated defaults,
-//! rest elements, nested object properties, and omitted array positions,
+//! rest elements, nested object properties, empty patterns, and omitted array positions,
 //! immutable `using` and `await using` resource declarations,
 //! annotated uninitialized non-exported mutable top-level variables,
 //! exact top-level lexical blocks containing a forward read of one numeric const,
@@ -32286,13 +32286,14 @@ fn object_binding_property_type(
     property_node: NodeRef,
     property_name: &str,
 ) -> Result<TypeId, SourceCheckError> {
-    let (any, error, undefined) = store
+    let (any, error, undefined, unknown) = store
         .intrinsic_bootstrap()
         .map(|bootstrap| {
             (
                 bootstrap.any_type,
                 bootstrap.error_type,
                 bootstrap.undefined_or_missing_type,
+                bootstrap.unknown_type,
             )
         })
         .ok_or(SourceCheckError::LiteralCache(
@@ -32302,7 +32303,9 @@ fn object_binding_property_type(
         return Ok(receiver);
     }
 
-    if let Some(property) = store.resolved_own_property(receiver, property_name)? {
+    if receiver != unknown
+        && let Some(property) = store.resolved_own_property(receiver, property_name)?
+    {
         return if property.optional && options.intrinsic.strict_null_checks {
             store
                 .expression_union_type_with_global_types(
@@ -42823,6 +42826,25 @@ pub(super) fn check_source_file(
                     )?
                     .result
                 };
+                if variable.elements.is_empty()
+                    && options.intrinsic.strict_null_checks
+                    && store
+                        .intrinsic_bootstrap()
+                        .is_some_and(|bootstrap| initializer == bootstrap.unknown_type)
+                {
+                    merge_retry_diagnostic(
+                        diagnostics,
+                        CanonicalCheckerDiagnostic {
+                            node: Some(variable.pattern),
+                            range_override: None,
+                            diagnostic: Diagnostic::new(
+                                message_by_code(2571)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(2571))?,
+                            ),
+                            related_information: Vec::new(),
+                        },
+                    );
+                }
                 for element in &variable.elements {
                     let binding = &element.binding;
                     let mut receiver = initializer;
@@ -42944,7 +42966,64 @@ pub(super) fn check_source_file(
                     )?
                     .result
                 };
-                let union_iteration_type = if matches!(
+                let bootstrap =
+                    store
+                        .intrinsic_bootstrap()
+                        .ok_or(SourceCheckError::LiteralCache(
+                            SourceLiteralCacheError::BootstrapUninitialized,
+                        ))?;
+                let (unknown, error) = (bootstrap.unknown_type, bootstrap.error_type);
+                let union_iteration_type = if initializer == unknown {
+                    issue_source_iteration_diagnostic(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        diagnostics,
+                        variable.pattern,
+                        initializer,
+                        2488,
+                    )?;
+                    if variable.elements.is_empty() && options.intrinsic.strict_null_checks {
+                        merge_retry_diagnostic(
+                            diagnostics,
+                            CanonicalCheckerDiagnostic {
+                                node: Some(variable.pattern),
+                                range_override: None,
+                                diagnostic: Diagnostic::new(
+                                    message_by_code(2571)
+                                        .ok_or(SourceCheckError::MissingDiagnostic(2571))?,
+                                ),
+                                related_information: Vec::new(),
+                            },
+                        );
+                    }
+                    Some(error)
+                } else if variable.elements.is_empty() {
+                    if store
+                        .canonical_tuple_shape(initializer)
+                        .map_err(|error| source_contextual_tuple_error(initializer, error))?
+                        .is_some()
+                    {
+                        None
+                    } else {
+                        let (type_, diagnostic) =
+                            source_for_of_iteration_type(store, global_types, initializer)?;
+                        if diagnostic.is_some() {
+                            issue_source_iteration_diagnostic(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                diagnostics,
+                                variable.pattern,
+                                initializer,
+                                2488,
+                            )?;
+                        }
+                        Some(type_)
+                    }
+                } else if matches!(
                     store
                         .type_payload(initializer)
                         .ok_or(RelationUnavailable::Type(initializer))?
@@ -74117,6 +74196,111 @@ class Foo2 {
     }
 
     #[test]
+    fn empty_binding_patterns_preserve_unknown_generic_inference_and_exact_diagnostics() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "declare function read<T>(): T; ",
+            "const {} = read(); ",
+            "const { p1 } = read(); ",
+            "const [] = read(); ",
+            "const [e1, e2] = read();",
+        ));
+
+        for (index, strict_null_checks) in [false, true].into_iter().enumerate() {
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(9_970 + offset);
+            let file = FileId::new(9_971 + offset);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let expected: &[(u32, &str)] = if strict_null_checks {
+                &[
+                    (2571, "{}"),
+                    (2339, "p1"),
+                    (2488, "[]"),
+                    (2571, "[]"),
+                    (2488, "[e1, e2]"),
+                ]
+            } else {
+                &[(2339, "p1"), (2488, "[]"), (2488, "[e1, e2]")]
+            };
+            let diagnostics = context.diagnostics().as_slice();
+            assert_eq!(diagnostics.len(), expected.len(), "{diagnostics:?}");
+            for (diagnostic, (code, text)) in diagnostics.iter().zip(expected) {
+                assert_eq!(diagnostic.diagnostic.code(), *code);
+                assert_eq!(node_text(&source, diagnostic.node.unwrap()), *text);
+                let message = match code {
+                    2571 => "Object is of type 'unknown'.",
+                    2339 => "Property 'p1' does not exist on type 'unknown'.",
+                    2488 => {
+                        "Type 'unknown' must have a '[Symbol.iterator]()' method that returns an iterator."
+                    }
+                    _ => unreachable!("the test only expects unknown-binding diagnostics"),
+                };
+                assert_eq!(diagnostic.diagnostic.render().unwrap(), message);
+                assert!(diagnostic.related_information.is_empty());
+            }
+
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            for name in ["p1", "e1", "e2"] {
+                assert_eq!(
+                    object_binding_value_type(&context, &source, file, name),
+                    bootstrap.error_type,
+                    "{name}",
+                );
+            }
+            for (node, record) in source.arena.iter() {
+                if record.kind == SyntaxKind::CallExpression {
+                    assert_eq!(
+                        resolved_node_type(&context, NodeRef::new(source.arena.id(), file, node),),
+                        bootstrap.unknown_type,
+                    );
+                }
+            }
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn empty_and_omission_only_array_bindings_still_validate_iterable_receivers() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "declare var input: string[]; ",
+            "declare var tuple: [string]; ",
+            "const [] = input; ",
+            "const [, ,] = input; ",
+            "const [] = tuple; ",
+            "const [,] = tuple;",
+        ));
+        let library_file = FileId::new(9_974);
+        let file = FileId::new(9_975);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn imported_object_bindings_reexport_their_binder_owned_local_symbols() {
         let provider = parsed("export const re = { foo: 'ready' };");
         let consumer = parsed(concat!(
@@ -74328,6 +74512,49 @@ class Foo2 {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn omitted_array_bindings_keep_uninitialized_source_diagnostics_at_the_identifier() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "var results: string[]; ",
+            "let [, second, , fourth] = results; ",
+            "const observed = fourth;",
+        ));
+        let library_file = FileId::new(9_976);
+        let file = FileId::new(9_977);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one uninitialized array-source diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2454);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "results");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Variable 'results' is used before being assigned.",
+        );
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for name in ["second", "fourth"] {
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, name),
+                string,
+            );
+        }
+        assert_eq!(
+            variable_value_type(&context, &source, file, "observed"),
+            string,
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]

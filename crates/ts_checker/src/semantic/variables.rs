@@ -893,7 +893,7 @@ fn plan_object_binding_pattern(
     Ok(())
 }
 
-/// Authenticates positional array bindings, omitted elements, defaults, and rest.
+/// Authenticates empty array patterns, positional bindings, omissions, defaults, and rest.
 pub(super) fn plan_top_level_array_binding_elements(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -978,7 +978,6 @@ pub(super) fn plan_top_level_array_binding_elements(
     };
     if pattern_record.kind != SyntaxKind::ArrayBindingPattern
         || pattern_record.flags.0 != 0
-        || pattern_data.elements.nodes.is_empty()
         || pattern_data.elements.range != pattern_record.range
         || pattern_data.facts != 0
     {
@@ -1108,11 +1107,6 @@ pub(super) fn plan_top_level_array_binding_elements(
         });
     }
 
-    if planned.is_empty() {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::BindingPattern(pattern),
-        ));
-    }
     Ok(planned)
 }
 
@@ -2753,16 +2747,50 @@ mod tests {
     }
 
     #[test]
-    fn array_binding_elements_reject_unsupported_shapes_and_poisoned_links() {
-        for (index, source) in [
-            "var [] = source;",
-            "var [,] = source;",
-            "var [,,] = source;",
-            "var [[value]] = source;",
-            "var { value } = source;",
+    fn empty_and_omission_only_array_bindings_retain_authenticated_patterns() {
+        for (index, (source, binding)) in [
+            ("var [] = source;", VariableBindingKind::Var),
+            ("let [,] = source;", VariableBindingKind::Let),
+            ("const [,,] = source;", VariableBindingKind::Const),
         ]
         .into_iter()
         .enumerate()
+        {
+            let fixture = binding_fixture(source, 9_395 + u32::try_from(index).unwrap());
+            let declaration = binding_declaration(&fixture);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                plan_top_level_array_binding_elements(
+                    &fixture.parsed.arena,
+                    &fixture.bound,
+                    &fixture.store,
+                    declaration,
+                    binding,
+                    false,
+                ),
+                Ok(Vec::new()),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn array_binding_elements_reject_unsupported_shapes_and_poisoned_links() {
+        for (index, source) in ["var [[value]] = source;", "var { value } = source;"]
+            .into_iter()
+            .enumerate()
         {
             let fixture = binding_fixture(source, 9_350 + u32::try_from(index).unwrap());
             let declaration = binding_declaration(&fixture);
