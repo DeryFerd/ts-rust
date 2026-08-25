@@ -651,12 +651,27 @@ struct PlannedTypeReference {
     global_array_target: Option<TypeId>,
     direct_generic: bool,
     direct_generic_constraints: Vec<PlannedDirectGenericConstraint>,
+    direct_generic_defaults: Vec<PlannedDirectGenericDefault>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PlannedDirectGenericConstraint {
     parameter: SemanticSymbolId,
     node: NodeRef,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedDirectGenericDefault {
+    parameter: SemanticSymbolId,
+    node: NodeRef,
+    earlier_parameter: Option<SemanticSymbolId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlannedDirectGenericTarget {
+    constraints: Vec<PlannedDirectGenericConstraint>,
+    defaults: Vec<PlannedDirectGenericDefault>,
+    minimum_type_arguments: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9813,6 +9828,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let mut effective_alias_owner = alias_owner;
         let mut direct_generic = false;
         let mut direct_generic_constraints = Vec::new();
+        let mut direct_generic_defaults = Vec::new();
         let arity = if global_array_target.is_some() {
             if type_arguments.len() == 1 {
                 PlannedTypeReferenceArity::Valid
@@ -9861,8 +9877,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         TypeNodeUnavailable::TypeArgumentsUnsupported(node),
                     ));
                 }
-                direct_generic_constraints =
+                let target =
                     self.preflight_direct_generic_reference_target(node, symbol, local_count)?;
+                let minimum_type_arguments = target.minimum_type_arguments;
+                direct_generic_constraints = target.constraints;
+                direct_generic_defaults = target.defaults;
                 let lazy_react_html_factory = type_arguments
                     .get(1)
                     .copied()
@@ -9922,12 +9941,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 for constraint in &direct_generic_constraints {
                     self.plan_type_node_in_context(constraint.node, None, false)?;
                 }
+                for default in &direct_generic_defaults {
+                    self.plan_type_node_in_context(default.node, None, false)?;
+                }
                 direct_generic = true;
-                if type_arguments.len() == local_count {
+                if (minimum_type_arguments..=local_count).contains(&type_arguments.len()) {
                     PlannedTypeReferenceArity::Valid
                 } else {
                     PlannedTypeReferenceArity::InvalidGeneric {
-                        minimum: local_count,
+                        minimum: minimum_type_arguments,
                         maximum: local_count,
                     }
                 }
@@ -10134,6 +10156,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             global_array_target,
             direct_generic,
             direct_generic_constraints,
+            direct_generic_defaults,
         };
         if let Some(existing) = self.plan.references.insert(node, planned.clone()) {
             assert_eq!(existing, planned, "one type-reference node has one plan");
@@ -14110,7 +14133,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         node: NodeRef,
         symbol: SemanticSymbolId,
         local_type_parameter_count: usize,
-    ) -> Result<Vec<PlannedDirectGenericConstraint>, DeclaredTypeError> {
+    ) -> Result<PlannedDirectGenericTarget, DeclaredTypeError> {
         let unsupported = || {
             type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol })
         };
@@ -14134,7 +14157,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 symbol,
                 local_type_parameter_count,
             )?;
-            return Ok(Vec::new());
+            return Ok(PlannedDirectGenericTarget {
+                constraints: Vec::new(),
+                defaults: Vec::new(),
+                minimum_type_arguments: local_type_parameter_count,
+            });
         }
         if declarations.len() > 1
             && local_type_parameter_count == 1
@@ -14162,7 +14189,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             {
                 return Err(unsupported());
             }
-            return Ok(Vec::new());
+            return Ok(PlannedDirectGenericTarget {
+                constraints: Vec::new(),
+                defaults: Vec::new(),
+                minimum_type_arguments: local_type_parameter_count,
+            });
         }
         if declarations.len() != 1 {
             let owner = self.store.symbol(symbol).ok_or_else(&unsupported)?;
@@ -14220,6 +14251,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .parent
             .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
             .ok_or_else(unsupported)?;
+        let source_class = matches!(declaration_node.data, NodeData::ClassDeclaration(_));
         let namespace_owned = match preflight_node(self.store, self.host, parent)?.kind {
             SyntaxKind::SourceFile => false,
             SyntaxKind::ModuleBlock
@@ -14235,7 +14267,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             _ => return Err(unsupported()),
         };
-        let parameter_members = namespace_owned
+        if source_class {
+            self.preflight_source_generic_class_reference_owner(node, symbol, declaration)?;
+        }
+        let parameter_members = (namespace_owned || source_class)
             .then(|| {
                 self.store
                     .symbol(symbol)
@@ -14245,7 +14280,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             })
             .transpose()?;
         let mut constraints = Vec::new();
-        for parameter in &parameters.nodes {
+        let mut defaults = Vec::new();
+        let mut previous_parameters = Vec::new();
+        let mut minimum_type_arguments = 0;
+        let mut previous_parameter_end = parameters.range.start;
+        if source_class && parameters.has_trailing_comma {
+            return Err(unsupported());
+        }
+        for (index, parameter) in parameters.nodes.iter().enumerate() {
             let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
             let parameter_node = preflight_node(self.store, self.host, parameter)?;
             let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_node.data else {
@@ -14253,19 +14295,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             };
             if parameter_node.parent != Some(declaration.node)
                 || parameter_node.flags.0 & NODE_FLAG_JSDOC != 0
-                || parameter_data.default_type.is_some()
+                || parameter_data.default_type.is_some() && !source_class
                 || parameter_data.expression.is_some()
                 || parameter_data.modifiers.is_some()
             {
                 return Err(unsupported());
             }
+            let parameter_symbol = self
+                .host
+                .bound_file(parameter)
+                .and_then(|bound| bound.symbol(parameter))
+                .and_then(|parameter| self.store.get_merged_symbol(parameter))
+                .ok_or_else(&unsupported)?;
             if let Some(members) = parameter_members {
-                let parameter_symbol = self
-                    .host
-                    .bound_file(parameter)
-                    .and_then(|bound| bound.symbol(parameter))
-                    .and_then(|parameter| self.store.get_merged_symbol(parameter))
-                    .ok_or_else(&unsupported)?;
                 let parameter_record = self
                     .store
                     .symbol(parameter_symbol)
@@ -14276,117 +14318,191 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 {
                     return Err(unsupported());
                 }
+                if source_class {
+                    let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+                    let name_record = preflight_node(self.store, self.host, name)?;
+                    let NodeData::Identifier(identifier) = &name_record.data else {
+                        return Err(unsupported());
+                    };
+                    if parameter_node.kind != SyntaxKind::TypeParameter
+                        || parameter_node.flags.0 != 0
+                        || parameter_node.range.start < previous_parameter_end
+                        || parameter_node.range.end > parameters.range.end
+                        || parameter_data.symbol.is_some()
+                        || name_record.kind != SyntaxKind::Identifier
+                        || name_record.flags.0 != 0
+                        || name_record.parent != Some(parameter.node)
+                        || identifier.flow_node.is_some()
+                        || identifier.text.is_empty()
+                        || parameter_record.check_flags() != CheckFlags::NONE
+                        || parameter_record.name().as_utf8() != Some(identifier.text.as_str())
+                        || parameter_record.declarations() != Some(&[parameter])
+                        || parameter_record.value_declaration().is_some()
+                        || parameter_record.members().is_some()
+                        || parameter_record.exports().is_some()
+                        || parameter_record.export_symbol().is_some()
+                        || self.store.get_merged_symbol(parameter_symbol) != Some(parameter_symbol)
+                        || !self
+                            .host
+                            .symbol_matches(self.store, parameter, parameter_symbol)
+                        || members.get_source(&identifier.text) != Some(parameter_symbol)
+                        || previous_parameters.contains(&parameter_symbol)
+                    {
+                        return Err(unsupported());
+                    }
+                    if let Some(parameter_type) = self
+                        .store
+                        .declared_type_links(parameter_symbol)
+                        .and_then(|links| links.declared_type)
+                    {
+                        let Some(TypeData::TypeParameter(cached)) = self
+                            .store
+                            .type_payload(parameter_type)
+                            .map(TypeRecord::data)
+                        else {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::InvalidTypeReference(node),
+                            ));
+                        };
+                        if cached_ordinary_type_parameter_owner(self.store, parameter_type)
+                            != Some(parameter_symbol)
+                            || parameter_data.constraint.is_none() && cached.constraint.is_some()
+                            || parameter_data.default_type.is_none()
+                                && cached.resolved_default_type.is_some()
+                        {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::InvalidTypeReference(node),
+                            ));
+                        }
+                    }
+                    previous_parameter_end = parameter_node.range.end;
+                }
             }
             if let Some(constraint) = parameter_data.constraint {
-                if !matches!(declaration_node.data, NodeData::InterfaceDeclaration(_)) {
-                    return Err(unsupported());
-                }
                 let constraint = NodeRef::new(declaration.arena, declaration.file, constraint);
                 let constraint_record = preflight_node(self.store, self.host, constraint)?;
-                let NodeData::TypeReferenceNode(reference) = &constraint_record.data else {
-                    return Err(unsupported());
-                };
-                let name = NodeRef::new(constraint.arena, constraint.file, reference.type_name);
-                let name_record = preflight_node(self.store, self.host, name)?;
-                if constraint_record.kind != SyntaxKind::TypeReference
-                    || constraint_record.parent != Some(parameter.node)
-                    || constraint_record.flags.0 != 0
-                    || constraint_record.range.end != parameter_node.range.end
-                    || name_record.kind != SyntaxKind::Identifier
-                    || name_record.parent != Some(constraint.node)
-                {
-                    return Err(unsupported());
-                }
-                let argument_count = match reference.type_arguments.as_ref() {
-                    Some(arguments) => {
-                        if arguments.nodes.is_empty()
-                            || arguments.has_trailing_comma
-                            || arguments.range.start < name_record.range.end
-                            || arguments.range.end > constraint_record.range.end
-                            || arguments.nodes.iter().any(|argument| {
-                                let argument =
-                                    NodeRef::new(constraint.arena, constraint.file, *argument);
-                                preflight_node(self.store, self.host, argument).map_or(
-                                    true,
-                                    |record| {
-                                        record.parent != Some(constraint.node)
-                                            || record.range.start < arguments.range.start
-                                            || record.range.end > arguments.range.end
-                                    },
-                                )
-                            })
-                        {
-                            return Err(unsupported());
-                        }
-                        arguments.nodes.len()
+                if source_class {
+                    let NodeData::TypeLiteralNode(empty) = &constraint_record.data else {
+                        return Err(unsupported());
+                    };
+                    if constraint_record.kind != SyntaxKind::TypeLiteral
+                        || constraint_record.parent != Some(parameter.node)
+                        || constraint_record.flags.0 != 0
+                        || constraint_record.range.start < parameter_node.range.start
+                        || constraint_record.range.end > parameter_node.range.end
+                        || !empty.members.nodes.is_empty()
+                        || empty.members.has_trailing_comma
+                        || empty.members.range != constraint_record.range
+                        || empty.symbol.is_some()
+                    {
+                        return Err(unsupported());
                     }
-                    None => 0,
-                };
-                let constraint_symbol = self.resolve_uncached_type_reference_symbol(constraint)?;
-                let constraint_flags = self
-                    .store
-                    .symbol(constraint_symbol)
-                    .map(ts_binder::semantic::Symbol::flags)
-                    .ok_or_else(&unsupported)?;
-                let react_interface_constraint = constraint_flags.without(SymbolFlags::TRANSIENT)
-                    == SymbolFlags::INTERFACE
-                    && self
-                        .store
-                        .get_parent_of_symbol(symbol)
-                        .filter(|namespace| {
-                            self.store.get_parent_of_symbol(constraint_symbol) == Some(*namespace)
-                                && self.is_react_ambient_module_namespace(*namespace, declaration)
-                        })
-                        .and_then(|namespace| self.store.symbol(namespace))
-                        .and_then(ts_binder::semantic::Symbol::exports)
-                        .and_then(|exports| self.store.symbol_table(exports))
-                        .is_some_and(|exports| {
-                            [symbol, constraint_symbol].into_iter().all(|target| {
-                                self.store.symbol(target).is_some_and(|owner| {
-                                    exports
-                                        .get(owner.name())
-                                        .and_then(|export| self.store.get_merged_symbol(export))
-                                        == Some(target)
+                } else {
+                    let NodeData::TypeReferenceNode(reference) = &constraint_record.data else {
+                        return Err(unsupported());
+                    };
+                    let name = NodeRef::new(constraint.arena, constraint.file, reference.type_name);
+                    let name_record = preflight_node(self.store, self.host, name)?;
+                    if constraint_record.kind != SyntaxKind::TypeReference
+                        || constraint_record.parent != Some(parameter.node)
+                        || constraint_record.flags.0 != 0
+                        || constraint_record.range.end != parameter_node.range.end
+                        || name_record.kind != SyntaxKind::Identifier
+                        || name_record.parent != Some(constraint.node)
+                    {
+                        return Err(unsupported());
+                    }
+                    let argument_count = match reference.type_arguments.as_ref() {
+                        Some(arguments) => {
+                            if arguments.nodes.is_empty()
+                                || arguments.has_trailing_comma
+                                || arguments.range.start < name_record.range.end
+                                || arguments.range.end > constraint_record.range.end
+                                || arguments.nodes.iter().any(|argument| {
+                                    let argument =
+                                        NodeRef::new(constraint.arena, constraint.file, *argument);
+                                    preflight_node(self.store, self.host, argument).map_or(
+                                        true,
+                                        |record| {
+                                            record.parent != Some(constraint.node)
+                                                || record.range.start < arguments.range.start
+                                                || record.range.end > arguments.range.end
+                                        },
+                                    )
                                 })
-                            })
-                        });
-                let supported_constraint = constraint_flags == SymbolFlags::INTERFACE
-                    || react_interface_constraint
-                    || self
-                        .is_default_library_dom_interface_argument(constraint, constraint_symbol);
-                if constraint_symbol == symbol
-                    || !supported_constraint
-                    || preflight_class_or_interface_reference(
-                        self.store,
-                        self.host,
-                        constraint_symbol,
-                        constraint_flags,
-                    )? != argument_count
-                {
-                    return Err(unsupported());
-                }
-
-                let parameter_symbol = self
-                    .host
-                    .bound_file(parameter)
-                    .and_then(|bound| bound.symbol(parameter))
-                    .and_then(|parameter| self.store.get_merged_symbol(parameter))
-                    .ok_or_else(&unsupported)?;
-                let parameter_record = self
-                    .store
-                    .symbol(parameter_symbol)
-                    .ok_or_else(&unsupported)?;
-                if parameter_record.flags() != SymbolFlags::TYPE_PARAMETER
-                    || self.store.get_parent_of_symbol(parameter_symbol) != Some(symbol)
-                    || self
+                            {
+                                return Err(unsupported());
+                            }
+                            arguments.nodes.len()
+                        }
+                        None => 0,
+                    };
+                    let constraint_symbol =
+                        self.resolve_uncached_type_reference_symbol(constraint)?;
+                    let constraint_flags = self
                         .store
-                        .symbol(symbol)
-                        .and_then(ts_binder::semantic::Symbol::members)
-                        .and_then(|members| self.store.symbol_table(members))
-                        .and_then(|members| members.get(parameter_record.name()))
-                        != Some(parameter_symbol)
-                {
-                    return Err(unsupported());
+                        .symbol(constraint_symbol)
+                        .map(ts_binder::semantic::Symbol::flags)
+                        .ok_or_else(&unsupported)?;
+                    let react_interface_constraint = constraint_flags
+                        .without(SymbolFlags::TRANSIENT)
+                        == SymbolFlags::INTERFACE
+                        && self
+                            .store
+                            .get_parent_of_symbol(symbol)
+                            .filter(|namespace| {
+                                self.store.get_parent_of_symbol(constraint_symbol)
+                                    == Some(*namespace)
+                                    && self
+                                        .is_react_ambient_module_namespace(*namespace, declaration)
+                            })
+                            .and_then(|namespace| self.store.symbol(namespace))
+                            .and_then(ts_binder::semantic::Symbol::exports)
+                            .and_then(|exports| self.store.symbol_table(exports))
+                            .is_some_and(|exports| {
+                                [symbol, constraint_symbol].into_iter().all(|target| {
+                                    self.store.symbol(target).is_some_and(|owner| {
+                                        exports
+                                            .get(owner.name())
+                                            .and_then(|export| self.store.get_merged_symbol(export))
+                                            == Some(target)
+                                    })
+                                })
+                            });
+                    let supported_constraint = constraint_flags == SymbolFlags::INTERFACE
+                        || react_interface_constraint
+                        || self.is_default_library_dom_interface_argument(
+                            constraint,
+                            constraint_symbol,
+                        );
+                    if constraint_symbol == symbol
+                        || !supported_constraint
+                        || preflight_class_or_interface_reference(
+                            self.store,
+                            self.host,
+                            constraint_symbol,
+                            constraint_flags,
+                        )? != argument_count
+                    {
+                        return Err(unsupported());
+                    }
+
+                    let parameter_record = self
+                        .store
+                        .symbol(parameter_symbol)
+                        .ok_or_else(&unsupported)?;
+                    if parameter_record.flags() != SymbolFlags::TYPE_PARAMETER
+                        || self.store.get_parent_of_symbol(parameter_symbol) != Some(symbol)
+                        || self
+                            .store
+                            .symbol(symbol)
+                            .and_then(ts_binder::semantic::Symbol::members)
+                            .and_then(|members| self.store.symbol_table(members))
+                            .and_then(|members| members.get(parameter_record.name()))
+                            != Some(parameter_symbol)
+                    {
+                        return Err(unsupported());
+                    }
                 }
                 if let Some(parameter_type) = self
                     .store
@@ -14418,8 +14534,201 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     node: constraint,
                 });
             }
+            if let Some(default) = parameter_data.default_type {
+                let default = NodeRef::new(declaration.arena, declaration.file, default);
+                defaults.push(self.preflight_direct_generic_class_default(
+                    node,
+                    symbol,
+                    parameter,
+                    parameter_symbol,
+                    default,
+                    &previous_parameters,
+                )?);
+            } else {
+                minimum_type_arguments = index + 1;
+            }
+            previous_parameters.push(parameter_symbol);
         }
-        Ok(constraints)
+        Ok(PlannedDirectGenericTarget {
+            constraints,
+            defaults,
+            minimum_type_arguments,
+        })
+    }
+
+    fn preflight_source_generic_class_reference_owner(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+        declaration: NodeRef,
+    ) -> Result<(), DeclaredTypeError> {
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol })
+        };
+        let bound = self.host.bound_file(declaration).ok_or_else(&unsupported)?;
+        let facts = bound.source_facts().ok_or_else(&unsupported)?;
+        let owner = self.store.symbol(symbol).ok_or_else(&unsupported)?;
+        let record = preflight_node(self.store, self.host, declaration)?;
+        let NodeData::ClassDeclaration(class) = &record.data else {
+            return Err(unsupported());
+        };
+        let name = class
+            .name
+            .map(|name| NodeRef::new(declaration.arena, declaration.file, name))
+            .ok_or_else(&unsupported)?;
+        let name_record = preflight_node(self.store, self.host, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(unsupported());
+        };
+        if !declaration.is_for(node.arena, node.file)
+            || facts.is_default_library()
+            || facts.is_javascript_file()
+            || record.kind != SyntaxKind::ClassDeclaration
+            || record.flags.0 & (NODE_FLAG_JSDOC | NODE_FLAG_HAS_ERROR) != 0
+            || record.parent != Some(bound.source_file().node)
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || owner.flags() != SymbolFlags::CLASS
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration() != Some(declaration)
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || self.store.get_merged_symbol(symbol) != Some(symbol)
+            || bound.symbol(declaration) != Some(symbol)
+            || !self.host.symbol_matches(self.store, declaration, symbol)
+            || bound
+                .locals(bound.source_file())
+                .and_then(|locals| self.store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&identifier.text))
+                != Some(symbol)
+        {
+            return Err(unsupported());
+        }
+        Ok(())
+    }
+
+    fn preflight_direct_generic_class_default(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+        parameter: NodeRef,
+        parameter_symbol: SemanticSymbolId,
+        default: NodeRef,
+        earlier_parameters: &[SemanticSymbolId],
+    ) -> Result<PlannedDirectGenericDefault, DeclaredTypeError> {
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol })
+        };
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let parameter_record = preflight_node(self.store, self.host, parameter)?;
+        let default_record = preflight_node(self.store, self.host, default)?;
+        if default_record.flags.0 != 0
+            || default_record.parent != Some(parameter.node)
+            || default_record.range.start < parameter_record.range.start
+            || default_record.range.end != parameter_record.range.end
+        {
+            return Err(unsupported());
+        }
+
+        let (earlier_parameter, expected) = match &default_record.data {
+            NodeData::KeywordTypeNode(_) if default_record.kind == SyntaxKind::AnyKeyword => (
+                None,
+                Some(
+                    self.store
+                        .intrinsic_bootstrap()
+                        .ok_or(DeclaredTypeError::Unavailable(
+                            DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                        ))?
+                        .any_type,
+                ),
+            ),
+            NodeData::TypeReferenceNode(reference)
+                if default_record.kind == SyntaxKind::TypeReference
+                    && reference.type_arguments.is_none() =>
+            {
+                let name = NodeRef::new(default.arena, default.file, reference.type_name);
+                let name_record = preflight_node(self.store, self.host, name)?;
+                let NodeData::Identifier(identifier) = &name_record.data else {
+                    return Err(unsupported());
+                };
+                if name_record.kind != SyntaxKind::Identifier
+                    || name_record.flags.0 != 0
+                    || name_record.parent != Some(default.node)
+                    || identifier.flow_node.is_some()
+                    || identifier.text.is_empty()
+                {
+                    return Err(unsupported());
+                }
+                let earlier = self.resolve_uncached_type_reference_symbol(default)?;
+                if !earlier_parameters.contains(&earlier)
+                    || self.store.get_parent_of_symbol(earlier) != Some(symbol)
+                    || self
+                        .store
+                        .symbol(earlier)
+                        .and_then(|parameter| parameter.name().as_utf8())
+                        != Some(identifier.text.as_str())
+                    || self
+                        .store
+                        .symbol(symbol)
+                        .and_then(ts_binder::semantic::Symbol::members)
+                        .and_then(|members| self.store.symbol_table(members))
+                        .and_then(|members| members.get_source(&identifier.text))
+                        != Some(earlier)
+                {
+                    return Err(unsupported());
+                }
+                let expected = self
+                    .store
+                    .declared_type_links(earlier)
+                    .and_then(|links| links.declared_type);
+                if self.store.type_node_links(default).is_some_and(|links| {
+                    links.outer_type_parameters.is_some()
+                        || links
+                            .resolved_type
+                            .is_some_and(|cached| Some(cached) != expected)
+                }) || self
+                    .store
+                    .symbol_node_links(default)
+                    .and_then(|links| links.resolved_symbol)
+                    .is_some_and(|cached| self.store.get_merged_symbol(cached) != Some(earlier))
+                {
+                    return Err(invalid());
+                }
+                (Some(earlier), expected)
+            }
+            _ => return Err(unsupported()),
+        };
+
+        if let Some(parameter_type) = self
+            .store
+            .declared_type_links(parameter_symbol)
+            .and_then(|links| links.declared_type)
+        {
+            let Some(TypeData::TypeParameter(cached)) = self
+                .store
+                .type_payload(parameter_type)
+                .map(TypeRecord::data)
+            else {
+                return Err(invalid());
+            };
+            if cached
+                .resolved_default_type
+                .is_some_and(|actual| Some(actual) != expected)
+            {
+                return Err(invalid());
+            }
+        }
+
+        Ok(PlannedDirectGenericDefault {
+            parameter: parameter_symbol,
+            node: default,
+            earlier_parameter,
+        })
     }
 
     fn preflight_default_library_promise_reference(
@@ -14767,12 +15076,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             };
         }
 
-        let _ = self.preflight_direct_generic_reference_target(
+        let generic = self.preflight_direct_generic_reference_target(
             reference,
             target_symbol,
             local_type_parameter_count,
         )?;
-        if argument_nodes.len() != local_type_parameter_count {
+        if !(generic.minimum_type_arguments..=local_type_parameter_count)
+            .contains(&argument_nodes.len())
+        {
             return if is_error {
                 Ok(())
             } else {
@@ -14793,17 +15104,91 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
             })?;
         if cached_reference.target != target
-            || cached_reference.type_arguments.len() != argument_nodes.len()
+            || cached_reference.type_arguments.len() != local_type_parameter_count
         {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
             ));
         }
-        for (node, cached) in argument_nodes
+        let TypeData::Interface(interface) = self
+            .store
+            .type_payload(target)
+            .map(TypeRecord::data)
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
+            })?
+        else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+            ));
+        };
+        let parameters = interface
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
+            })?;
+        if parameters.len() != local_type_parameter_count {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+            ));
+        }
+
+        let mut expected_arguments = Vec::with_capacity(local_type_parameter_count);
+        for argument in argument_nodes {
+            expected_arguments.push(self.cached_type_node_identity(root_symbol, argument)?);
+        }
+        for parameter in parameters.iter().skip(expected_arguments.len()) {
+            let parameter_symbol = cached_ordinary_type_parameter_owner(self.store, *parameter)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
+                })?;
+            let default = generic
+                .defaults
+                .iter()
+                .find(|default| default.parameter == parameter_symbol)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
+                })?;
+            let Some(TypeData::TypeParameter(parameter_data)) =
+                self.store.type_payload(*parameter).map(TypeRecord::data)
+            else {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                ));
+            };
+            let mut expected = parameter_data.resolved_default_type.ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
+            })?;
+            if let Some(earlier) = default.earlier_parameter {
+                let index = parameters
+                    .iter()
+                    .position(|parameter| {
+                        cached_ordinary_type_parameter_owner(self.store, *parameter)
+                            == Some(earlier)
+                    })
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(
+                            root_symbol,
+                        ))
+                    })?;
+                if parameters[index] != expected {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                    ));
+                }
+                expected = expected_arguments.get(index).copied().ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
+                })?;
+            }
+            expected_arguments.push(expected);
+        }
+        for (expected, cached) in expected_arguments
             .into_iter()
             .zip(cached_reference.type_arguments)
         {
-            if self.cached_type_node_identity(root_symbol, node)? != cached {
+            if expected != cached {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
                 ));
@@ -22507,26 +22892,48 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             match reference.arity {
                 PlannedTypeReferenceArity::Valid => {
                     if reference.direct_generic {
-                        let mut type_arguments = Vec::with_capacity(reference.type_arguments.len());
+                        let mut type_arguments = Vec::with_capacity(
+                            reference.type_arguments.len()
+                                + reference.direct_generic_defaults.len(),
+                        );
                         for argument in &reference.type_arguments {
                             type_arguments.push(self.execute_type_node(*argument, plan, prepared)?);
                         }
-                        if let Some(cached) = cached_resolved_type {
-                            let cached_reference = validate_direct_generic_reference(
-                                self.store, cached,
-                            )
-                            .map_err(|_| {
-                                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(
-                                    node,
-                                ))
-                            })?;
-                            if cached_reference.target != declared_type
-                                || cached_reference.type_arguments != type_arguments
-                            {
-                                return Err(type_node_unavailable(
-                                    TypeNodeUnavailable::InvalidTypeReference(node),
-                                ));
-                            }
+                        let cached_reference = cached_resolved_type
+                            .map(|cached| {
+                                validate_direct_generic_reference(self.store, cached).map_err(
+                                    |_| {
+                                        type_node_unavailable(
+                                            TypeNodeUnavailable::InvalidTypeReference(node),
+                                        )
+                                    },
+                                )
+                            })
+                            .transpose()?;
+                        if cached_reference.as_ref().is_some_and(|cached| {
+                            cached.target != declared_type
+                                || cached.type_arguments.get(..type_arguments.len())
+                                    != Some(type_arguments.as_slice())
+                        }) {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::InvalidTypeReference(node),
+                            ));
+                        }
+                        self.resolve_direct_generic_reference_defaults(
+                            node,
+                            &reference,
+                            declared_type,
+                            &mut type_arguments,
+                            plan,
+                            prepared,
+                        )?;
+                        if cached_reference.is_some_and(|cached| {
+                            cached.target != declared_type
+                                || cached.type_arguments != type_arguments
+                        }) {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::InvalidTypeReference(node),
+                            ));
                         }
                         let constraints = self.resolve_direct_generic_reference_constraints(
                             node,
@@ -22653,6 +23060,108 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         Ok(resolved_type)
+    }
+
+    fn resolve_direct_generic_reference_defaults(
+        &mut self,
+        node: NodeRef,
+        reference: &PlannedTypeReference,
+        declared_type: TypeId,
+        type_arguments: &mut Vec<TypeId>,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<(), DeclaredTypeError> {
+        if reference.direct_generic_defaults.is_empty() {
+            return Ok(());
+        }
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let TypeData::Interface(interface) = self
+            .store
+            .type_payload(declared_type)
+            .map(TypeRecord::data)
+            .ok_or_else(&invalid)?
+        else {
+            return Err(invalid());
+        };
+        let parameters = interface
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .ok_or_else(&invalid)?
+            .to_vec();
+        if type_arguments.len() > parameters.len() {
+            return Err(invalid());
+        }
+
+        for default in &reference.direct_generic_defaults {
+            let index = parameters
+                .iter()
+                .position(|parameter| {
+                    cached_ordinary_type_parameter_owner(self.store, *parameter)
+                        == Some(default.parameter)
+                })
+                .ok_or_else(&invalid)?;
+            let expected = self.execute_type_node(default.node, plan, prepared)?;
+            if default.earlier_parameter.is_some_and(|earlier| {
+                cached_ordinary_type_parameter_owner(self.store, expected) != Some(earlier)
+            }) {
+                return Err(invalid());
+            }
+            let Some(TypeData::TypeParameter(parameter)) = self
+                .store
+                .type_payload(parameters[index])
+                .map(TypeRecord::data)
+            else {
+                return Err(invalid());
+            };
+            let constraint = parameter.constraint;
+            let target = parameter.target;
+            let mapper = parameter.mapper;
+            let current = parameter.resolved_default_type;
+            if current.is_some_and(|current| current != expected)
+                || current.is_none()
+                    && !self.store.set_type_parameter_resolution(
+                        parameters[index],
+                        constraint,
+                        target,
+                        mapper,
+                        Some(expected),
+                    )
+            {
+                return Err(invalid());
+            }
+        }
+
+        for parameter in parameters.iter().skip(type_arguments.len()) {
+            let symbol = cached_ordinary_type_parameter_owner(self.store, *parameter)
+                .ok_or_else(&invalid)?;
+            let default = reference
+                .direct_generic_defaults
+                .iter()
+                .find(|default| default.parameter == symbol)
+                .ok_or_else(&invalid)?;
+            let Some(TypeData::TypeParameter(data)) =
+                self.store.type_payload(*parameter).map(TypeRecord::data)
+            else {
+                return Err(invalid());
+            };
+            let mut argument = data.resolved_default_type.ok_or_else(&invalid)?;
+            if let Some(earlier) = default.earlier_parameter {
+                let index = parameters
+                    .iter()
+                    .position(|parameter| {
+                        cached_ordinary_type_parameter_owner(self.store, *parameter)
+                            == Some(earlier)
+                    })
+                    .ok_or_else(&invalid)?;
+                if parameters[index] != argument {
+                    return Err(invalid());
+                }
+                argument = type_arguments.get(index).copied().ok_or_else(&invalid)?;
+            }
+            type_arguments.push(argument);
+        }
+        Ok(())
     }
 
     fn resolve_direct_generic_reference_constraints(
@@ -34841,6 +35350,341 @@ mod tests {
             assert_eq!(store_state(&fixture.store), before);
             assert!(diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    fn source_generic_class_references_preserve_class_owned_parameters_and_warm_caches() {
+        let mut fixture = fixture(concat!(
+            "class Base<Value> {} ",
+            "class Derived<Value> extends Base<Value> {} ",
+            "class Payload {} ",
+            "let first: Derived<Payload>; ",
+            "let again: Derived<Payload>;",
+        ));
+        let owner = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Derived");
+        let payload = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Payload");
+        let first = variable_type_node(&fixture, "first");
+        let again = variable_type_node(&fixture, "again");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved = query_node(&mut fixture, first, &mut diagnostics).unwrap();
+        assert_eq!(
+            query_node(&mut fixture, again, &mut diagnostics),
+            Ok(resolved),
+        );
+
+        let reference = validate_direct_generic_reference(&fixture.store, resolved).unwrap();
+        let target = fixture
+            .store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let payload_type = fixture
+            .store
+            .declared_type_links(payload)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        assert_eq!(reference.target, target);
+        assert_eq!(reference.type_arguments, [payload_type]);
+        assert!(
+            fixture
+                .store
+                .type_payload(target)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::CLASS),
+        );
+        let parameters = validate_direct_generic_reference(&fixture.store, target)
+            .unwrap()
+            .type_arguments;
+        let [parameter] = parameters.as_slice() else {
+            panic!("the class must retain its one declaration-owned type parameter")
+        };
+        let parameter = cached_ordinary_type_parameter_owner(&fixture.store, *parameter).unwrap();
+        assert_eq!(fixture.store.get_parent_of_symbol(parameter), Some(owner));
+        assert_eq!(
+            fixture
+                .store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| fixture.store.symbol_table(members))
+                .and_then(|members| members.get_source("Value")),
+            Some(parameter),
+        );
+
+        let warm = store_state(&fixture.store);
+        for node in [first, again] {
+            assert_eq!(
+                query_node(&mut fixture, node, &mut diagnostics),
+                Ok(resolved)
+            );
+        }
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn source_generic_class_references_resolve_exact_empty_object_constraints() {
+        let mut fixture = fixture(concat!(
+            "class Box<Value extends {}> {} ",
+            "interface Payload { value: string; } ",
+            "let accepted: Box<Payload>;",
+        ));
+        let owner = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Box");
+        let parameter = named_node(&fixture, SyntaxKind::TypeParameter, "Value");
+        let NodeData::TypeParameterDeclaration(parameter_data) =
+            &fixture.parsed.arena.get(parameter.node).unwrap().data
+        else {
+            panic!("the class must retain its constrained parameter")
+        };
+        let constraint = NodeRef::new(
+            parameter.arena,
+            parameter.file,
+            parameter_data.constraint.unwrap(),
+        );
+        let accepted = variable_type_node(&fixture, "accepted");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved = query_node(&mut fixture, accepted, &mut diagnostics).unwrap();
+        let target = fixture
+            .store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let parameter = validate_direct_generic_reference(&fixture.store, target)
+            .unwrap()
+            .type_arguments[0];
+        let TypeData::TypeParameter(parameter_data) =
+            fixture.store.type_payload(parameter).unwrap().data()
+        else {
+            panic!("the class parameter must preserve its canonical type")
+        };
+        assert_eq!(
+            parameter_data.constraint,
+            fixture
+                .store
+                .type_node_links(constraint)
+                .and_then(|links| links.resolved_type),
+        );
+        assert!(parameter_data.constraint.is_some());
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, accepted, &mut diagnostics),
+            Ok(resolved),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn source_generic_class_defaults_forward_earlier_parameters_and_replay_warm() {
+        let mut fixture = fixture(concat!(
+            "declare class Model<Attrs extends {} = any, Create extends {} = Attrs> {} ",
+            "interface Payload { value: string; } ",
+            "let defaults: Model; ",
+            "let forwarded: Model<Payload>; ",
+            "let explicit: Model<Payload, Payload>; ",
+            "type Wrapped = Model<Payload>;",
+        ));
+        let owner = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Model");
+        let payload = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Payload");
+        let wrapped = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Wrapped");
+        let defaults = variable_type_node(&fixture, "defaults");
+        let forwarded = variable_type_node(&fixture, "forwarded");
+        let explicit = variable_type_node(&fixture, "explicit");
+        let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let defaults_type = query_node(&mut fixture, defaults, &mut diagnostics).unwrap();
+        let forwarded_type = query_node(&mut fixture, forwarded, &mut diagnostics).unwrap();
+        assert_eq!(
+            query_node(&mut fixture, explicit, &mut diagnostics),
+            Ok(forwarded_type),
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                wrapped,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(forwarded_type),
+        );
+
+        let payload_type = fixture
+            .store
+            .declared_type_links(payload)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let target = fixture
+            .store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        assert_eq!(
+            validate_direct_generic_reference(&fixture.store, defaults_type)
+                .unwrap()
+                .type_arguments,
+            [any, any],
+        );
+        assert_eq!(
+            validate_direct_generic_reference(&fixture.store, forwarded_type)
+                .unwrap()
+                .type_arguments,
+            [payload_type, payload_type],
+        );
+        let parameters = validate_direct_generic_reference(&fixture.store, target)
+            .unwrap()
+            .type_arguments;
+        let parameter_default =
+            |parameter| match fixture.store.type_payload(parameter).unwrap().data() {
+                TypeData::TypeParameter(parameter) => parameter.resolved_default_type,
+                _ => panic!("the class must retain its declaration-owned parameters"),
+            };
+        assert_eq!(parameter_default(parameters[0]), Some(any));
+        assert_eq!(parameter_default(parameters[1]), Some(parameters[0]));
+
+        let warm = store_state(&fixture.store);
+        for (node, expected) in [
+            (defaults, defaults_type),
+            (forwarded, forwarded_type),
+            (explicit, forwarded_type),
+        ] {
+            assert_eq!(
+                query_node(&mut fixture, node, &mut diagnostics),
+                Ok(expected)
+            );
+        }
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                wrapped,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(forwarded_type),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+
+        let TypeData::TypeParameter(second) =
+            fixture.store.type_payload(parameters[1]).unwrap().data()
+        else {
+            panic!("the second class parameter must remain canonical")
+        };
+        let constraint = second.constraint;
+        assert!(fixture.store.set_type_parameter_resolution(
+            parameters[1],
+            constraint,
+            None,
+            None,
+            Some(any),
+        ));
+        let poisoned = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, forwarded, &mut diagnostics),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(forwarded),
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert!(fixture.store.set_type_parameter_resolution(
+            parameters[1],
+            constraint,
+            None,
+            None,
+            Some(parameters[0]),
+        ));
+        assert_eq!(
+            query_node(&mut fixture, forwarded, &mut diagnostics),
+            Ok(forwarded_type),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn forged_generic_class_parameter_ownership_fails_before_additional_writes() {
+        let mut fixture = fixture(concat!(
+            "class Model<Value> {} ",
+            "class Other<Foreign> {} ",
+            "let value: Model<string>;",
+        ));
+        let owner = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Model");
+        let parameter = named_symbol(&fixture, SyntaxKind::TypeParameter, "Value");
+        let foreign = named_symbol(&fixture, SyntaxKind::TypeParameter, "Foreign");
+        let value = variable_type_node(&fixture, "value");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let resolved = query_node(&mut fixture, value, &mut diagnostics).unwrap();
+        let relationships = {
+            let record = fixture.store.symbol(parameter).unwrap();
+            (
+                record.members(),
+                record.exports(),
+                record.parent(),
+                record.export_symbol(),
+            )
+        };
+        let member_table = fixture.store.symbol(owner).unwrap().members().unwrap();
+
+        assert!(fixture.store.set_symbol_relationships(
+            parameter,
+            relationships.0,
+            relationships.1,
+            None,
+            relationships.3,
+        ));
+        let poisoned = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, value, &mut diagnostics),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported {
+                    node: value,
+                    symbol: owner,
+                },
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert!(fixture.store.set_symbol_relationships(
+            parameter,
+            relationships.0,
+            relationships.1,
+            relationships.2,
+            relationships.3,
+        ));
+        assert_eq!(
+            query_node(&mut fixture, value, &mut diagnostics),
+            Ok(resolved)
+        );
+
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(member_table, EscapedName::source("Value"), foreign),
+            Some(Some(parameter)),
+        );
+        let poisoned = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, value, &mut diagnostics),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported {
+                    node: value,
+                    symbol: owner,
+                },
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(member_table, EscapedName::source("Value"), parameter),
+            Some(Some(foreign)),
+        );
+        assert_eq!(
+            query_node(&mut fixture, value, &mut diagnostics),
+            Ok(resolved)
+        );
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
