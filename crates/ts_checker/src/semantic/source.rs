@@ -64865,6 +64865,60 @@ class Foo2 {
     }
 
     #[test]
+    fn omitted_switch_default_bindings_preserve_never_diagnostic_spans() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        for (index, pattern) in [
+            "[, missing]",
+            "[, , missing,]",
+            "[, missing, ,]",
+            "[missing,]",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = format!(
+                "type X = {{ kind: 'a'; a: [1] }} | {{ kind: 'b'; a: [] }}; \
+                 function foo(input: X): 1 {{ \
+                 const {{ ['kind']: tag, [`a`]: values }} = input; \
+                 switch (tag) {{ \
+                 case 'a': return values[0]; \
+                 case 'b': return 1; \
+                 default: const {pattern} = values; return values; \
+                 }} }}",
+            );
+            let source = parsed(&text);
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(8_440 + offset);
+            let file = FileId::new(8_441 + offset);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("{pattern}: expected exactly one exhaustive-default diagnostic")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2488, "{pattern}");
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), pattern);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type 'never' must have a '[Symbol.iterator]()' method that returns an iterator.",
+            );
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, "missing"),
+                context.store().intrinsic_bootstrap().unwrap().never_type,
+                "{pattern}",
+            );
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm, "{pattern}");
+        }
+    }
+
+    #[test]
     fn grouped_switch_checks_cases_and_returns_without_admitting_missing_defaults() {
         let source = parsed(concat!(
             "function checked(level: string): string { ",
@@ -69540,6 +69594,91 @@ class Foo2 {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn array_bindings_preserve_omitted_positions_multiple_names_and_trailing_commas() {
+        for (index, (unchecked, expected)) in [(false, "string"), (true, "string | undefined")]
+            .into_iter()
+            .enumerate()
+        {
+            let library = parsed("interface Array<T> { [index: number]: T; }");
+            let source = parsed(concat!(
+                "declare var input: string[]; ",
+                "let [, second, , fourth, ,] = input; ",
+                "const first = second; ",
+                "const last = fourth;",
+            ));
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(8_550 + offset);
+            let file = FileId::new(8_551 + offset);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: unchecked,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    no_unchecked_indexed_access: unchecked,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            for (binding, observed) in [("second", "first"), ("fourth", "last")] {
+                let type_ = object_binding_value_type(&context, &source, file, binding);
+                assert_eq!(
+                    context.type_to_string(type_).unwrap(),
+                    expected,
+                    "{binding}"
+                );
+                assert_eq!(
+                    variable_value_type(&context, &source, file, observed),
+                    type_,
+                    "{binding}",
+                );
+            }
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn omitted_array_bindings_report_their_actual_numeric_positions() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "declare var input: string[]; ",
+            "let [, second, , fourth,] = input;",
+        ));
+        let library_file = FileId::new(8_560);
+        let file = FileId::new(8_561);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        for (diagnostic, (name, position)) in
+            diagnostics.iter().zip([("second", "1"), ("fourth", "3")])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), 2339);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), name);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!("Property '{position}' does not exist on type 'string[]'."),
+            );
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]

@@ -473,7 +473,7 @@ pub(super) struct SourceSwitchObjectBindingSyntax {
     pub(super) elements: Vec<SourceSwitchObjectBindingElementSyntax>,
 }
 
-/// One `const [value] = source` immediately before a switch-clause return.
+/// One named array binding, with optional omissions, before a switch-clause return.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceSwitchArrayBindingSyntax {
     pub(super) statement: NodeRef,
@@ -5223,14 +5223,48 @@ impl SyntaxPlanner<'_> {
             callable,
             SyntaxKind::ArrayBindingPattern,
         )?;
-        let [element] = elements.as_slice() else {
-            return Err(self.unsupported(
+        let mut named = None;
+        for element in elements {
+            let record = self.node(element)?;
+            if matches!(&record.data, NodeData::OmittedExpression(_)) {
+                if record.kind != SyntaxKind::OmittedExpression
+                    || record.flags.0 != 0
+                    || record.range.start != record.range.end
+                    || self.bound.symbol(element).is_some()
+                    || self.bound.local_symbol(element).is_some()
+                {
+                    return Err(self.unsupported(
+                        element,
+                        record.kind,
+                        SourceFunctionStatementsRole::LocalName,
+                    ));
+                }
+                self.validate_parent(
+                    element,
+                    Some(pattern.node),
+                    SourceFunctionStatementsRole::LocalName,
+                )?;
+                self.validate_range(element, pattern)?;
+                self.validate_container(element, callable)?;
+                self.validate_block_scope_container(element, scope)?;
+                continue;
+            }
+            if named.replace(element).is_some() {
+                return Err(self.unsupported(
+                    pattern,
+                    SyntaxKind::ArrayBindingPattern,
+                    SourceFunctionStatementsRole::LocalName,
+                ));
+            }
+        }
+        let element = named.ok_or_else(|| {
+            self.unsupported(
                 pattern,
                 SyntaxKind::ArrayBindingPattern,
                 SourceFunctionStatementsRole::LocalName,
-            ));
-        };
-        let binding = self.plan_switch_binding_element(*element, pattern, scope, callable)?;
+            )
+        })?;
+        let binding = self.plan_switch_binding_element(element, pattern, scope, callable)?;
         Ok(SourceSwitchArrayBindingSyntax {
             statement,
             pattern,
@@ -5350,6 +5384,7 @@ impl SyntaxPlanner<'_> {
             || pattern_record.parent != Some(declaration.node)
             || bindings.elements.nodes.is_empty()
             || bindings.elements.has_trailing_comma
+                && pattern_kind != SyntaxKind::ArrayBindingPattern
             || bindings.elements.range != pattern_record.range
             || bindings.facts != 0
         {
@@ -12074,6 +12109,62 @@ mod joined_tests {
     }
 
     #[test]
+    fn function_switch_authenticates_omitted_default_array_binding_positions() {
+        for (index, (pattern, position)) in [
+            ("[, missing]", 1_usize),
+            ("[, , missing,]", 2),
+            ("[, missing, ,]", 1),
+            ("[missing,]", 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = format!(
+                "function choose(input: any): number {{ \
+                 const {{ kind: tag, values: items }} = input; \
+                 switch (tag) {{ \
+                 case 'first': return items[0]; \
+                 default: const {pattern} = items; return items; \
+                 }} }}",
+            );
+            let fixture =
+                JoinedFixture::new(&source, FileId::new(1_360 + u32::try_from(index).unwrap()));
+            let callable = fixture.callable();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+            );
+
+            let syntax = plan_source_switch_function_statements_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                &callable,
+            )
+            .unwrap_or_else(|error| panic!("{pattern}: {error:?}"));
+
+            let binding = syntax.returns.last().unwrap().binding.unwrap();
+            let NodeData::BindingPattern(elements) =
+                &fixture.parsed.arena.get(binding.pattern.node).unwrap().data
+            else {
+                panic!("expected the authenticated default array pattern")
+            };
+            assert_eq!(elements.elements.nodes[position], binding.element.node);
+            assert_eq!(fixture.bound.symbol(binding.element), Some(binding.symbol));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.mapper_len(),
+                ),
+                before,
+                "{pattern}",
+            );
+        }
+    }
+
+    #[test]
     fn function_switch_rejects_unproven_correlated_binding_shapes() {
         for (index, source) in [
             concat!(
@@ -12090,6 +12181,11 @@ mod joined_tests {
                 "function choose(input: any): number { ",
                 "const { kind, values } = input; ",
                 "switch (kind) { default: const [first, second] = values; return 1; } }",
+            ),
+            concat!(
+                "function choose(input: any): number { ",
+                "const { kind, values } = input; ",
+                "switch (kind) { default: const [,] = values; return 1; } }",
             ),
         ]
         .into_iter()

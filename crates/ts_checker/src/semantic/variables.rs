@@ -978,6 +978,7 @@ pub(super) fn plan_top_level_array_binding_elements(
     };
     if pattern_record.kind != SyntaxKind::ArrayBindingPattern
         || pattern_record.flags.0 != 0
+        || pattern_data.elements.nodes.is_empty()
         || pattern_data.elements.range != pattern_record.range
         || pattern_data.facts != 0
     {
@@ -995,6 +996,7 @@ pub(super) fn plan_top_level_array_binding_elements(
             if !matches!(element_record.data, NodeData::OmittedExpression(_))
                 || element_record.flags.0 != 0
                 || element_record.range.start != element_record.range.end
+                || !bound.contains(element)
                 || bound.symbol(element).is_some()
                 || bound.local_symbol(element).is_some()
             {
@@ -1106,6 +1108,11 @@ pub(super) fn plan_top_level_array_binding_elements(
         });
     }
 
+    if planned.is_empty() {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    }
     Ok(planned)
 }
 
@@ -2494,7 +2501,7 @@ mod tests {
         {
             let mut fixture = binding_fixture(source, 9_340 + u32::try_from(index).unwrap());
             let declaration = binding_declaration(&fixture);
-            let plan = plan_top_level_array_binding_element(
+            let plans = plan_top_level_array_binding_elements(
                 &fixture.parsed.arena,
                 &fixture.bound,
                 &fixture.store,
@@ -2503,6 +2510,10 @@ mod tests {
                 false,
             )
             .unwrap();
+            let [plan] = plans.as_slice() else {
+                panic!("expected exactly one array binding")
+            };
+            let plan = *plan;
 
             assert!(fixture.bound.symbol(declaration).is_none());
             assert_eq!(fixture.bound.symbol(plan.element), Some(plan.symbol));
@@ -2586,7 +2597,7 @@ mod tests {
                 fixture.store.checker_link_allocated_lengths(),
             );
             assert_eq!(
-                plan_top_level_array_binding_element(
+                plan_top_level_array_binding_elements(
                     &fixture.parsed.arena,
                     &fixture.bound,
                     &fixture.store,
@@ -2594,7 +2605,7 @@ mod tests {
                     binding,
                     false,
                 ),
-                Ok(plan)
+                Ok(vec![plan])
             );
             assert_eq!(fixture.store.value_symbol_links(plan.symbol), Some(&links));
             assert_eq!(
@@ -2674,13 +2685,79 @@ mod tests {
     }
 
     #[test]
+    fn array_binding_elements_preserve_omitted_positions_and_trailing_commas() {
+        for (index, (source, binding, names, positions)) in [
+            (
+                "declare var source: string[]; var [, second, , fourth] = source;",
+                VariableBindingKind::Var,
+                ["second", "fourth"].as_slice(),
+                [1_usize, 3].as_slice(),
+            ),
+            (
+                "declare var source: string[]; let [, second, , fourth, ,] = source;",
+                VariableBindingKind::Let,
+                ["second", "fourth"].as_slice(),
+                [1_usize, 3].as_slice(),
+            ),
+            (
+                "declare var source: string[]; const [value,] = source;",
+                VariableBindingKind::Const,
+                ["value"].as_slice(),
+                [0_usize].as_slice(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = binding_fixture(source, 9_370 + u32::try_from(index).unwrap());
+            let declaration = binding_declaration(&fixture);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            let planned = plan_top_level_array_binding_elements(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                declaration,
+                binding,
+                false,
+            )
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+
+            assert_eq!(planned.len(), names.len(), "{source}");
+            for ((element, name), position) in planned.iter().zip(names).zip(positions) {
+                let record = fixture.parsed.arena.get(element.name.node).unwrap();
+                let NodeData::Identifier(identifier) = &record.data else {
+                    panic!("expected an authenticated identifier binding")
+                };
+                assert_eq!(identifier.text, *name);
+                assert_eq!(fixture.bound.symbol(element.element), Some(element.symbol));
+                let NodeData::BindingPattern(pattern) =
+                    &fixture.parsed.arena.get(element.pattern.node).unwrap().data
+                else {
+                    panic!("expected the owning array pattern")
+                };
+                assert_eq!(pattern.elements.nodes[*position], element.element.node);
+            }
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
     fn array_binding_elements_reject_unsupported_shapes_and_poisoned_links() {
         for (index, source) in [
             "var [] = source;",
-            "var [first, second] = source;",
-            "var [value,] = source;",
-            "var [value = 0] = source;",
-            "var [...value] = source;",
+            "var [,] = source;",
+            "var [,,] = source;",
             "var [[value]] = source;",
             "var { value } = source;",
         ]
@@ -2688,6 +2765,35 @@ mod tests {
         .enumerate()
         {
             let fixture = binding_fixture(source, 9_350 + u32::try_from(index).unwrap());
+            let declaration = binding_declaration(&fixture);
+            assert!(
+                matches!(
+                    plan_top_level_array_binding_elements(
+                        &fixture.parsed.arena,
+                        &fixture.bound,
+                        &fixture.store,
+                        declaration,
+                        VariableBindingKind::Var,
+                        false,
+                    ),
+                    Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::BindingPattern(_)
+                    ))
+                ),
+                "{source}"
+            );
+        }
+
+        for (index, source) in [
+            "var [first, second] = source;",
+            "var [value,] = source;",
+            "var [value = 0] = source;",
+            "var [...value] = source;",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = binding_fixture(source, 9_380 + u32::try_from(index).unwrap());
             let declaration = binding_declaration(&fixture);
             assert!(
                 matches!(
@@ -2709,7 +2815,7 @@ mod tests {
 
         let mut fixture = binding_fixture("var [value] = source;", 9_360);
         let declaration = binding_declaration(&fixture);
-        let plan = plan_top_level_array_binding_element(
+        let plans = plan_top_level_array_binding_elements(
             &fixture.parsed.arena,
             &fixture.bound,
             &fixture.store,
@@ -2718,6 +2824,10 @@ mod tests {
             false,
         )
         .unwrap();
+        let [plan] = plans.as_slice() else {
+            panic!("expected exactly one array binding")
+        };
+        let plan = *plan;
         let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
         let links = ValueSymbolLinks {
             resolved_type: Some(bootstrap.error_type),
@@ -2727,7 +2837,7 @@ mod tests {
         assert!(fixture.store.set_value_symbol_links(plan.symbol, links));
         let poisoned = fixture.store.checker_link_allocated_lengths();
         assert_eq!(
-            plan_top_level_array_binding_element(
+            plan_top_level_array_binding_elements(
                 &fixture.parsed.arena,
                 &fixture.bound,
                 &fixture.store,

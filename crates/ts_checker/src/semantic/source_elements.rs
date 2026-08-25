@@ -452,13 +452,34 @@ fn array_binding_name_and_index(
     if positions.next().is_some()
         || pattern_record.kind != SyntaxKind::ArrayBindingPattern
         || pattern_record.flags.0 != 0
-        || data.elements.has_trailing_comma
         || data.elements.range != pattern_record.range
         || data.facts != 0
         || record.range.start < pattern_record.range.start
         || record.range.end > pattern_record.range.end
     {
         return Err(unsupported_access(binding));
+    }
+    for sibling in &data.elements.nodes {
+        let sibling = NodeRef::new(pattern.arena, pattern.file, *sibling);
+        let sibling_record = host.node(sibling).ok_or_else(invalid)?;
+        if sibling_record.parent != Some(pattern.node)
+            || sibling_record.flags.0 != 0
+            || sibling_record.range.start < pattern_record.range.start
+            || sibling_record.range.end > pattern_record.range.end
+            || !store.contains_node_ref(sibling)
+            || !bound.contains(sibling)
+        {
+            return Err(unsupported_access(binding));
+        }
+        match &sibling_record.data {
+            NodeData::BindingElement(_) if sibling_record.kind == SyntaxKind::BindingElement => {}
+            NodeData::OmittedExpression(_)
+                if sibling_record.kind == SyntaxKind::OmittedExpression
+                    && sibling_record.range.start == sibling_record.range.end
+                    && bound.symbol(sibling).is_none()
+                    && bound.local_symbol(sibling).is_none() => {}
+            _ => return Err(unsupported_access(binding)),
+        }
     }
 
     let name = element
