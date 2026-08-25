@@ -2218,15 +2218,21 @@ fn plan_declared_constructor(
         || !object.spreads.is_empty()
         || !object.indexes.is_empty()
         || object.heritage.is_some()
-        || object.call_signatures.iter().any(|signature| {
+        || !object.call_signatures.iter().any(|signature| {
             host.node(signature.declaration)
-                .is_none_or(|record| record.kind != SyntaxKind::ConstructSignature)
+                .is_some_and(|record| record.kind == SyntaxKind::ConstructSignature)
         })
     {
         return Err(reject());
     }
 
     for signature in object.call_signatures {
+        if host
+            .node(signature.declaration)
+            .is_none_or(|record| record.kind != SyntaxKind::ConstructSignature)
+        {
+            continue;
+        }
         let supplied_arguments = usize::from(argument.is_some());
         if signature.parameters.len() > 1
             || supplied_arguments < signature.min_argument_count()
@@ -3985,10 +3991,7 @@ fn resolved_declared_constructor(
     else {
         return Err(invalid());
     };
-    if projection.owner != value_type
-        || !projection.call_signatures.is_empty()
-        || projection.construct_signatures.is_empty()
-    {
+    if projection.owner != value_type || projection.construct_signatures.is_empty() {
         return Err(invalid());
     }
     let Some(signature) = projection
@@ -6507,6 +6510,21 @@ mod tests {
                 true,
             ),
             (
+                "declare const factory: { (): number; new(): string }; const result = new factory();",
+                false,
+                false,
+            ),
+            (
+                concat!(
+                    "declare const factory: { ",
+                    "new(value: number): string; ",
+                    "(value: string): number ",
+                    "}; const result = new factory(1);",
+                ),
+                false,
+                true,
+            ),
+            (
                 concat!(
                     "interface Factory { new(value: string): number; } ",
                     "declare let factory: Factory; ",
@@ -6517,8 +6535,33 @@ mod tests {
             ),
             (
                 concat!(
+                    "interface Factory { ",
+                    "(value: number): string; ",
+                    "new(value: string): number; ",
+                    "} ",
+                    "declare let factory: Factory; ",
+                    "const result = new factory(\"ready\");",
+                ),
+                true,
+                true,
+            ),
+            (
+                concat!(
                     "type Factory = { ",
                     "new(value: number): string; ",
+                    "new(value: string): number ",
+                    "}; ",
+                    "declare var factory: Factory; ",
+                    "const result = new factory(\"ready\");",
+                ),
+                true,
+                true,
+            ),
+            (
+                concat!(
+                    "type Factory = { ",
+                    "new(value: number): string; ",
+                    "(value: number): string; ",
                     "new(value: string): number ",
                     "}; ",
                     "declare var factory: Factory; ",
@@ -6625,6 +6668,17 @@ mod tests {
             (
                 concat!(
                     "interface Factory { new(value?: any): string; } ",
+                    "declare const factory: Factory; ",
+                    "const result = new factory();",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "interface Factory { ",
+                    "(): number; ",
+                    "new(value?: any): string; ",
+                    "} ",
                     "declare const factory: Factory; ",
                     "const result = new factory();",
                 ),
