@@ -2978,6 +2978,49 @@ mod tests {
     }
 
     #[test]
+    fn jsdoc_arrow_body_casts_preserve_the_existing_callable_and_variable_owners() {
+        let fixture = Fixture::javascript(concat!(
+            "/** @param {string} value */\n",
+            "const read = value => /** @type {number} */ (value);",
+        ));
+        let declaration = fixture.declarations()[0];
+        let host = fixture.host();
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let planned = plan_source_arrow(&fixture.store, &host, declaration, None).unwrap();
+        let SourceArrowBodyPlan::ConciseExpression { expression } = planned.body else {
+            panic!("expected the inline JSDoc cast to remain a concise arrow body")
+        };
+        let comments =
+            plan_javascript_source_jsdoc(&fixture.parsed.arena, fixture.bound.source_file())
+                .unwrap();
+        assert_eq!(
+            comments
+                .callable_declaration(&fixture.parsed.arena, planned.callable.declaration)
+                .map(super::super::jsdoc::PlannedJavaScriptDeclaration::node),
+            Some(declaration),
+        );
+        assert_eq!(
+            comments.expression_type(expression).unwrap().type_(),
+            &super::super::jsdoc::JsDocType::Intrinsic(
+                super::super::jsdoc::JsDocIntrinsicType::Number,
+            ),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+    }
+
+    #[test]
     fn jsdoc_callback_arrows_reject_missing_context_and_mismatched_parameters() {
         for source in [
             "/** @type {number} */\nconst f = (name) => {};",

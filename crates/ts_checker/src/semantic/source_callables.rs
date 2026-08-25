@@ -2090,7 +2090,16 @@ fn plan_source_callable_with_owner_shape(
         && view.return_type.is_none()
         && type_parameters.is_empty();
     let eligible_implicit_any_arrow = implicit_any_arrow_shape && view.parameters.nodes.len() == 1;
-    let direct_implicit_any_arrow = eligible_implicit_any_arrow
+    let javascript_documented_multi_arrow = implicit_any_arrow_shape
+        && record.kind == SyntaxKind::ArrowFunction
+        && view.parameters.nodes.len() > 1
+        && bound
+            .source_facts()
+            .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
+        && is_direct_noncontextual_source_arrow(store, host, declaration)?
+        && source_jsdoc_arrow_parameters_are_exact(store, host, declaration, view.parameters)?;
+    let direct_implicit_any_arrow = (eligible_implicit_any_arrow
+        || javascript_documented_multi_arrow)
         && is_direct_noncontextual_source_arrow(store, host, declaration)?;
     let direct_implicit_any_rest_arrow = implicit_any_arrow_shape
         && view.parameters.nodes.iter().any(|parameter| {
@@ -2147,7 +2156,7 @@ fn plan_source_callable_with_owner_shape(
     let untyped_javascript_signature = bound
         .source_facts()
         .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
-        && view.parameters.nodes.len() == 1
+        && (view.parameters.nodes.len() == 1 || javascript_documented_multi_arrow)
         && type_parameters.is_empty()
         && body_mode == SourceCallableBodyMode::Present
         && (view.family == SourceCallableFamily::FunctionDeclaration
@@ -6109,6 +6118,61 @@ fn source_jsdoc_function_parameter_annotation(
         .then(|| (parameter, annotation.clone())))
 }
 
+fn source_jsdoc_arrow_parameters_are_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameters: &NodeList,
+) -> Result<bool, SourceCallableError> {
+    let invalid = || invariant(SourceCallableInvariant::InvalidSyntax(declaration));
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let comments =
+        plan_javascript_source_jsdoc(arena, bound.source_file()).map_err(|_| invalid())?;
+    let Some(jsdoc) = comments.callable_declaration(arena, declaration) else {
+        return Ok(false);
+    };
+    if jsdoc.parameters().len() != parameters.nodes.len()
+        || !jsdoc.template_parameters().is_empty()
+        || jsdoc.type_().is_some()
+        || jsdoc.this_type().is_some()
+        || jsdoc
+            .satisfies()
+            .is_none_or(|satisfies| !matches!(satisfies.type_().type_(), JsDocType::Function(_)))
+    {
+        return Ok(false);
+    }
+
+    let mut names = HashSet::with_capacity(parameters.nodes.len());
+    for (parameter_id, annotation) in parameters.nodes.iter().zip(jsdoc.parameters()) {
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
+        let record = preflight_node(store, host, parameter)?;
+        let NodeData::ParameterDeclaration(syntax) = &record.data else {
+            return Err(invalid());
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, syntax.name);
+        let name_record = preflight_node(store, host, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::Parameter
+            || record.parent != Some(declaration.node)
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.parent != Some(parameter.node)
+            || syntax.type_.is_some()
+            || syntax.initializer.is_some()
+            || syntax.question_token.is_some()
+            || syntax.dot_dot_dot_token.is_some()
+            || annotation.name() != identifier.text.as_str()
+            || annotation.type_().is_none()
+            || annotation.is_optional()
+            || !names.insert(identifier.text.as_str())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn hydrate_warm_jsdoc_function_parameter(
     store: &CanonicalTypeMapperStore,
     plan: &mut SourceCallablePlan,
@@ -7947,9 +8011,17 @@ pub(super) fn validate_stored_source_callable(
     let untyped_javascript = signature_record
         .flags()
         .contains(SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE);
+    let direct_multi_untyped_arrow = family == SourceCallableFamily::ArrowFunction
+        && store.source_node_kind(declaration) == Some(SyntaxKind::ArrowFunction)
+        && signature_record.parameters().len() > 1
+        && matches!(
+            store.source_node_parent(declaration),
+            Some(SourceNodeParent::Parent(variable))
+                if store.source_node_kind(variable) == Some(SyntaxKind::VariableDeclaration)
+        );
     if untyped_javascript
         && (signature_record.flags() != SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
-            || signature_record.parameters().len() != 1
+            || signature_record.parameters().len() != 1 && !direct_multi_untyped_arrow
             || !signature_record.type_parameters().is_empty()
             || signature_record.min_argument_count()
                 != i32::try_from(signature_record.parameters().len()).unwrap_or(-1)
@@ -12769,6 +12841,134 @@ mod tests {
             );
             assert_eq!(publication_state(&fixture.store), warm);
             assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn documented_javascript_satisfies_arrows_accept_multiple_parameters_cold_and_warm() {
+        let source = concat!(
+            "/**\n",
+            " * @satisfies {(first: string, ...rest: number[]) => void}\n",
+            " * @param {string} first\n",
+            " * @param {string | number} second\n",
+            " */\n",
+            "const callback = (first, second) => {};",
+        );
+        let mut fixture = QueryFixture::javascript(source, FileId::new(1_318));
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let cold = publication_state(&fixture.store);
+
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        assert_eq!(plan.parameters.len(), 2);
+        assert_eq!(plan.min_argument_count, 2);
+        assert_eq!(plan.flags, SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE);
+        assert!(
+            plan.parameters
+                .iter()
+                .all(|parameter| parameter.is_implicit_any())
+        );
+        assert_eq!(publication_state(&fixture.store), cold);
+        drop(host);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([any, any].as_slice()),
+        );
+        let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+        publish_inferred_source_callable_return(&mut fixture.store, &plan, signature, void)
+            .unwrap();
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+
+        let warm = publication_state(&fixture.store);
+        assert_eq!(
+            fixture.query_callable(declaration, owner, &mut diagnostics),
+            Ok(callable),
+        );
+        assert_eq!(publication_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn undocumented_javascript_arrows_do_not_admit_multiple_untyped_parameters() {
+        for (index, source) in [
+            "const callback = (first, second) => {};",
+            concat!(
+                "/** @param {string} first */\n",
+                "const callback = (first, second) => {};",
+            ),
+            concat!(
+                "/**\n",
+                " * @satisfies {(first: string, ...rest: number[]) => void}\n",
+                " * @param {string} first\n",
+                " * @param {string} unexpected\n",
+                " */\n",
+                "const callback = (first, second) => {};",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = QueryFixture::javascript(
+                source,
+                FileId::new(1_319 + u32::try_from(index).unwrap()),
+            );
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let cold = publication_state(&fixture.store);
+
+            assert!(matches!(
+                plan_source_callable(&fixture.store, &host, declaration, owner, None),
+                Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::MissingParameterType(_)
+                ))
+            ));
+            assert_eq!(publication_state(&fixture.store), cold);
         }
     }
 

@@ -827,7 +827,17 @@ impl PlannedJavaScriptDeclaration {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedJavaScriptJsDoc {
     declarations: Vec<PlannedJavaScriptDeclaration>,
+    expressions: Vec<PlannedJsDocArrowExpression>,
     diagnostics: Vec<CanonicalCheckerDiagnostic>,
+}
+
+/// One inline `@type` assertion on a source-owned parenthesized arrow body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlannedJsDocArrowExpression {
+    node: NodeRef,
+    callable: NodeRef,
+    declaration: NodeRef,
+    type_: PlannedJsDocType,
 }
 
 impl PlannedJavaScriptJsDoc {
@@ -841,6 +851,28 @@ impl PlannedJavaScriptJsDoc {
         self.declarations
             .iter()
             .find(|declaration| declaration.node == node)
+    }
+
+    /// Finds the inline `@type` assertion owned by one arrow-body expression.
+    #[must_use]
+    pub fn expression_type(&self, node: NodeRef) -> Option<&PlannedJsDocType> {
+        self.expressions
+            .iter()
+            .find(|expression| expression.node == node)
+            .map(|expression| &expression.type_)
+    }
+
+    pub(super) fn expression_annotations(
+        &self,
+    ) -> impl Iterator<Item = (NodeRef, NodeRef, NodeRef, &PlannedJsDocType)> {
+        self.expressions.iter().map(|expression| {
+            (
+                expression.node,
+                expression.callable,
+                expression.declaration,
+                &expression.type_,
+            )
+        })
     }
 
     /// Finds annotations on a callable or its declaring variable.
@@ -1267,6 +1299,7 @@ pub fn plan_javascript_source_jsdoc(
     let mut pending = vec![source.node];
     let mut seen_comments = HashSet::new();
     let mut declarations = Vec::new();
+    let mut expressions = Vec::new();
     let mut diagnostics = Vec::new();
 
     while let Some(node) = pending.pop() {
@@ -1317,17 +1350,81 @@ pub fn plan_javascript_source_jsdoc(
                 declarations.push(planned);
             }
         }
+        if record.kind == SyntaxKind::ParenthesizedExpression
+            && let Some((callable, declaration)) =
+                javascript_jsdoc_arrow_expression_owner(arena, reference)?
+            && let Some(comment) = leading_jsdoc_comment(arena, reference)?
+            && let [tag] = comment.tags()
+            && tag.kind() == JsDocTagKind::Type
+            && let Some(annotation) = tag.type_expression()
+            && seen_comments.insert((comment.range().start.get(), comment.range().end.get()))
+        {
+            for diagnostic in comment.diagnostics() {
+                diagnostics.push(canonical_parser_diagnostic(source, diagnostic)?);
+            }
+            expressions.push(PlannedJsDocArrowExpression {
+                node: reference,
+                callable,
+                declaration,
+                type_: annotation.planned(),
+            });
+        }
         let mut children = Vec::new();
         record.for_each_child(|child| children.push(child));
         pending.extend(children.into_iter().rev());
     }
 
-    attach_local_typedef_resolutions(&mut declarations);
+    attach_local_typedef_resolutions(&mut declarations, &mut expressions);
 
     Ok(PlannedJavaScriptJsDoc {
         declarations,
+        expressions,
         diagnostics,
     })
+}
+
+fn javascript_jsdoc_arrow_expression_owner(
+    arena: &NodeArena,
+    expression: NodeRef,
+) -> Result<Option<(NodeRef, NodeRef)>, JsDocCommentError> {
+    let invalid = || JsDocCommentError::InvalidSourceNode(expression);
+    let mut current = expression;
+    loop {
+        let record = arena.get(current.node).ok_or_else(invalid)?;
+        let Some(parent) = record.parent else {
+            return Ok(None);
+        };
+        let parent = NodeRef::new(expression.arena, expression.file, parent);
+        let parent_record = arena.get(parent.node).ok_or_else(invalid)?;
+        match &parent_record.data {
+            NodeData::ParenthesizedExpression(parenthesized)
+                if parent_record.kind == SyntaxKind::ParenthesizedExpression
+                    && parenthesized.expression == current.node =>
+            {
+                current = parent;
+            }
+            NodeData::ArrowFunction(arrow)
+                if parent_record.kind == SyntaxKind::ArrowFunction
+                    && arrow.body == current.node =>
+            {
+                let Some(declaration) = parent_record.parent else {
+                    return Ok(None);
+                };
+                let declaration = NodeRef::new(expression.arena, expression.file, declaration);
+                let declaration_record = arena.get(declaration.node).ok_or_else(invalid)?;
+                let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+                    return Ok(None);
+                };
+                if declaration_record.kind != SyntaxKind::VariableDeclaration
+                    || variable.initializer != Some(parent.node)
+                {
+                    return Ok(None);
+                }
+                return Ok(Some((parent, declaration)));
+            }
+            _ => return Ok(None),
+        }
+    }
 }
 
 fn authenticate_reparsed_jsdoc_typedef(
@@ -1613,6 +1710,131 @@ pub(super) fn preflight_source_jsdoc_function_type(
     annotation: &PlannedJsDocType,
 ) -> Result<(), JsDocTypeResolutionError> {
     source_jsdoc_function_signature_types(store, global_types, options, annotation).map(|_| ())
+}
+
+/// Validates the structural target of a source-owned `@satisfies` function.
+pub(super) fn preflight_source_jsdoc_satisfies_type(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    annotation: &PlannedJsDocType,
+) -> Result<(), JsDocTypeResolutionError> {
+    let JsDocType::Function(function) = annotation.resolution_type() else {
+        return preflight_planned_jsdoc_type(store, global_types, options, annotation);
+    };
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(JsDocTypeResolutionError::MissingBootstrap)?;
+    if bootstrap.options != options.intrinsic {
+        return Err(JsDocTypeResolutionError::OptionsMismatch {
+            initialized: bootstrap.options,
+            requested: options.intrinsic,
+        });
+    }
+    let invalid = || JsDocTypeResolutionError::UnsupportedType {
+        kind: SyntaxKind::FunctionType,
+        range: annotation.range(),
+    };
+    let mut names = HashSet::with_capacity(function.parameters.len());
+    let mut optional = false;
+    for (index, parameter) in function.parameters.iter().enumerate() {
+        let Some(type_) = parameter.type_.as_ref() else {
+            return Err(invalid());
+        };
+        if parameter.name.is_empty()
+            || !names.insert(parameter.name.as_str())
+            || parameter.rest && (parameter.optional || index + 1 != function.parameters.len())
+            || !parameter.rest && !parameter.optional && optional
+        {
+            return Err(invalid());
+        }
+        if parameter.rest
+            && !matches!(
+                type_,
+                JsDocType::Array(_)
+                    | JsDocType::Variadic(_)
+                    | JsDocType::Intrinsic(JsDocIntrinsicType::Never)
+            )
+        {
+            return Err(invalid());
+        }
+        optional |= parameter.optional;
+        validate_resolvable_type(store, global_types, options, type_, annotation.range())?;
+    }
+    validate_resolvable_type(
+        store,
+        global_types,
+        options,
+        &function.return_type,
+        annotation.range(),
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedJsDocSatisfiesParameter {
+    pub(super) name: String,
+    pub(super) type_: TypeId,
+    pub(super) optional: bool,
+    pub(super) rest: bool,
+    pub(super) array_rest: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedJsDocSatisfiesSignature {
+    pub(super) parameters: Vec<ResolvedJsDocSatisfiesParameter>,
+    pub(super) return_type: TypeId,
+}
+
+/// Resolves a `@satisfies` function without creating a synthetic callable.
+///
+/// Rest parameters retain their element type so contravariant positional
+/// checks do not need to publish an unrelated array or signature identity.
+pub(super) fn resolve_source_jsdoc_satisfies_signature(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    annotation: &PlannedJsDocType,
+) -> Result<ResolvedJsDocSatisfiesSignature, JsDocTypeResolutionError> {
+    preflight_source_jsdoc_satisfies_type(store, global_types, options, annotation)?;
+    let invalid = || JsDocTypeResolutionError::UnsupportedType {
+        kind: SyntaxKind::FunctionType,
+        range: annotation.range(),
+    };
+    let JsDocType::Function(function) = annotation.resolution_type() else {
+        return Err(invalid());
+    };
+    let mut parameters = Vec::with_capacity(function.parameters.len());
+    for parameter in &function.parameters {
+        let type_ = parameter.type_.as_ref().ok_or_else(invalid)?;
+        let array_rest =
+            parameter.rest && matches!(type_, JsDocType::Array(_) | JsDocType::Variadic(_));
+        let type_ = if array_rest {
+            match type_ {
+                JsDocType::Array(element) | JsDocType::Variadic(element) => element.as_ref(),
+                _ => return Err(invalid()),
+            }
+        } else {
+            type_
+        };
+        parameters.push(ResolvedJsDocSatisfiesParameter {
+            name: parameter.name.clone(),
+            type_: resolve_complete_type(store, global_types, options, type_, annotation.range())?,
+            optional: parameter.optional,
+            rest: parameter.rest,
+            array_rest,
+        });
+    }
+    let return_type = resolve_complete_type(
+        store,
+        global_types,
+        options,
+        &function.return_type,
+        annotation.range(),
+    )?;
+    Ok(ResolvedJsDocSatisfiesSignature {
+        parameters,
+        return_type,
+    })
 }
 
 /// Publishes a comment-defined callable on its real JavaScript parameter declaration.
@@ -2321,7 +2543,10 @@ fn bind_jsdoc_function_type(
     })))
 }
 
-fn attach_local_typedef_resolutions(declarations: &mut [PlannedJavaScriptDeclaration]) {
+fn attach_local_typedef_resolutions(
+    declarations: &mut [PlannedJavaScriptDeclaration],
+    expressions: &mut [PlannedJsDocArrowExpression],
+) {
     let mut aliases = HashMap::new();
     let mut duplicates = HashSet::new();
     for declaration in declarations.iter() {
@@ -2384,7 +2609,7 @@ fn attach_local_typedef_resolutions(declarations: &mut [PlannedJavaScriptDeclara
         return;
     }
 
-    for declaration in declarations {
+    for declaration in declarations.iter_mut() {
         let declaration_templates = shadowed_type_parameters(&declaration.template_parameters);
         if let Some(annotation) = &mut declaration.type_ {
             attach_local_typedef_resolution(annotation, &aliases, &declaration_templates);
@@ -2443,6 +2668,15 @@ fn attach_local_typedef_resolutions(declarations: &mut [PlannedJavaScriptDeclara
                 &callback_templates,
             );
         }
+    }
+
+    for expression in expressions {
+        let shadowed = declarations
+            .iter()
+            .find(|declaration| declaration.node == expression.declaration)
+            .map(|declaration| shadowed_type_parameters(&declaration.template_parameters))
+            .unwrap_or_default();
+        attach_local_typedef_resolution(&mut expression.type_, &aliases, &shadowed);
     }
 }
 
@@ -5452,6 +5686,71 @@ mod tests {
     }
 
     #[test]
+    fn nested_arrow_body_type_comments_keep_their_source_and_template_owners() {
+        let source = concat!(
+            "/** @typedef {number} T */\n",
+            "/**\n",
+            " * @template T\n",
+            " * @param {T | undefined} value\n",
+            " * @returns {T}\n",
+            " */\n",
+            "const read = value => /** @type {string} */ ",
+            "(/** @type {T} */ ({ ...value }));",
+        );
+        let javascript = parse_javascript_source_file(source);
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(104),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        let [declaration] = plan.declarations() else {
+            panic!("expected one source-owned generic arrow declaration")
+        };
+        let [outer, inner] = plan.expressions.as_slice() else {
+            panic!("expected both nested arrow-body type comments")
+        };
+        assert_eq!(outer.declaration, declaration.node());
+        assert_eq!(inner.declaration, declaration.node());
+        assert_eq!(outer.callable, inner.callable);
+        assert_eq!(
+            javascript.arena.get(outer.callable.node).unwrap().kind,
+            SyntaxKind::ArrowFunction,
+        );
+        assert_eq!(
+            plan.expression_type(outer.node).unwrap().type_(),
+            &JsDocType::Intrinsic(JsDocIntrinsicType::String),
+        );
+        let generic = plan.expression_type(inner.node).unwrap();
+        assert_eq!(generic.type_(), &JsDocType::Named("T".to_owned()));
+        assert_eq!(generic.resolved_alias_name(), None);
+    }
+
+    #[test]
+    fn arrow_body_type_comments_resolve_unshadowed_local_typedefs() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @typedef {number} Value */\n",
+            "const read = value => /** @type {Value} */ (value);",
+        ));
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(105),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        let [expression] = plan.expressions.as_slice() else {
+            panic!("expected one source-owned arrow-body type comment")
+        };
+        assert_eq!(expression.type_.resolved_alias_name(), Some("Value"));
+    }
+
+    #[test]
     fn callback_signature_tags_do_not_become_host_function_parameters() {
         for declaration in ["function f1() {}", "export function f1() {}"] {
             let source = format!(
@@ -6047,13 +6346,90 @@ mod tests {
     }
 
     #[test]
+    fn arrow_body_template_casts_bind_to_the_same_canonical_signature_type_parameter() {
+        let parsed = parse_source_file("interface Box<T> { value: T; }");
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&parsed, options);
+        let parameter = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeParameter).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    FileId::new(0),
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context
+            .file(FileId::new(0))
+            .unwrap()
+            .1
+            .symbol(parameter)
+            .unwrap();
+        let type_parameter = context.get_declared_type_of_symbol(symbol).unwrap();
+        let javascript = parse_javascript_source_file(concat!(
+            "/**\n",
+            " * @template T\n",
+            " * @param {T|undefined} value value or not\n",
+            " * @returns {T} result value\n",
+            " */\n",
+            "const cloneObjectGood = value => /** @type {T} */({ ...value });",
+        ));
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(107),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        let [declaration] = plan.declarations() else {
+            panic!("expected one generic arrow declaration")
+        };
+        let [expression] = plan.expressions.as_slice() else {
+            panic!("expected one generic arrow-body type assertion")
+        };
+        let globals = context.global_types().clone();
+        let bindings = [JsDocTypeParameterBinding::new("T", type_parameter)];
+        let signature = resolve_planned_jsdoc_signature(
+            context.store_mut_for_test(),
+            &globals,
+            options,
+            declaration,
+            &bindings,
+        )
+        .unwrap();
+        let bound =
+            bind_planned_jsdoc_type_parameters(context.store(), &expression.type_, &bindings)
+                .unwrap();
+        let cast =
+            resolve_planned_jsdoc_type(context.store_mut_for_test(), &globals, options, &bound)
+                .unwrap();
+
+        assert_eq!(signature.return_type(), Some(type_parameter));
+        assert_eq!(cast, type_parameter);
+        assert_eq!(
+            context
+                .type_to_string(signature.parameters()[0].type_().unwrap())
+                .unwrap(),
+            "T | undefined",
+        );
+    }
+
+    #[test]
     fn satisfies_tags_preserve_the_function_shape_and_exact_tag_name_range() {
         let source = concat!(
             "/**\n",
             " * @satisfies {(value: string, ...rest: number[]) => void}\n",
             " * @param {string} value\n",
+            " * @param {string | number} next\n",
             " */\n",
-            "const read = value => {};",
+            "const read = (value, next) => {};",
         );
         let javascript = parse_javascript_source_file(source);
         let root = NodeRef::new(
@@ -6067,12 +6443,83 @@ mod tests {
         };
         assert!(declaration.type_().is_none());
         let satisfies = declaration.satisfies().unwrap();
-        assert!(matches!(satisfies.type_().type_(), JsDocType::Function(_)));
+        let JsDocType::Function(function) = satisfies.type_().type_() else {
+            panic!("expected a complete @satisfies function target")
+        };
+        let [value, rest] = function.parameters() else {
+            panic!("expected the required parameter and number-array rest tail")
+        };
+        assert_eq!(value.name(), "value");
+        assert_eq!(
+            value.type_(),
+            Some(&JsDocType::Intrinsic(JsDocIntrinsicType::String)),
+        );
+        assert_eq!(rest.name(), "rest");
+        assert!(rest.is_rest());
+        assert_eq!(
+            rest.type_(),
+            Some(&JsDocType::Array(Box::new(JsDocType::Intrinsic(
+                JsDocIntrinsicType::Number,
+            )))),
+        );
+        assert_eq!(declaration.parameters().len(), 2);
+        assert_eq!(declaration.parameters()[1].name(), "next");
         let start = source.find("@satisfies").unwrap() + 1;
         assert_eq!(satisfies.range().start.get() as usize, start);
         assert_eq!(
             satisfies.range().end.get() as usize,
             start + "satisfies".len()
         );
+    }
+
+    #[test]
+    fn satisfies_function_rest_parameters_resolve_to_their_canonical_element_type() {
+        let parsed = parse_source_file("const marker = 1;");
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+        for (index, (tail, array_rest)) in [("number[]", true), ("never", false)]
+            .into_iter()
+            .enumerate()
+        {
+            let source = format!(
+                "/**\n * @satisfies {{(value: string, ...rest: {tail}) => void}}\n \
+                 * @param {{string}} value\n * @param {{number}} next\n */\n \
+                 const read = (value, next) => {{}};",
+            );
+            let javascript = parse_javascript_source_file(&source);
+            let root = NodeRef::new(
+                javascript.arena.id(),
+                FileId::new(106 + u32::try_from(index).unwrap()),
+                javascript.source_file,
+            );
+            let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+            let satisfies = plan.declarations()[0].satisfies().unwrap();
+            preflight_source_jsdoc_satisfies_type(
+                context.store(),
+                &globals,
+                options,
+                satisfies.type_(),
+            )
+            .unwrap();
+            let resolved = resolve_source_jsdoc_satisfies_signature(
+                context.store_mut_for_test(),
+                &globals,
+                options,
+                satisfies.type_(),
+            )
+            .unwrap();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let expected = if array_rest {
+                bootstrap.number_type
+            } else {
+                bootstrap.never_type
+            };
+            assert_eq!(resolved.parameters[0].type_, bootstrap.string_type);
+            assert_eq!(resolved.parameters[1].type_, expected);
+            assert!(resolved.parameters[1].rest);
+            assert_eq!(resolved.parameters[1].array_rest, array_rest);
+            assert_eq!(resolved.return_type, bootstrap.void_type);
+        }
     }
 }
