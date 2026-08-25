@@ -1287,6 +1287,7 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
         let name = match self.ast.get(node_id).map(|node| &node.data) {
             Some(NodeData::VariableDeclaration(data)) => Some(data.name),
             Some(NodeData::BindingElement(data)) => data.name,
+            Some(NodeData::OmittedExpression(_)) => return,
             _ => None,
         };
         if let Some(name) = name
