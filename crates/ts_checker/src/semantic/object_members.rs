@@ -12,9 +12,9 @@
 //! optional `any` parameters.
 //! Named interface and type-literal methods retain their own binder symbols,
 //! authenticated method type parameters, annotated required or optional
-//! parameters, and authenticated array, tuple, or inferred rest parameters.
-//! Selected default-library `Math` methods also retain their numeric rest
-//! parameters.
+//! parameters, and authenticated array, tuple, tuple-union, or inferred rest
+//! parameters. Selected default-library `Math` methods also retain their
+//! numeric rest parameters.
 
 use std::collections::{HashMap, HashSet};
 
@@ -1076,7 +1076,12 @@ pub(super) fn declared_signature_parameter_is_rest(
     if found
         && !matches!(
             store.source_node_kind(annotation),
-            Some(SyntaxKind::ArrayType | SyntaxKind::TupleType | SyntaxKind::InferType)
+            Some(
+                SyntaxKind::ArrayType
+                    | SyntaxKind::TupleType
+                    | SyntaxKind::UnionType
+                    | SyntaxKind::InferType
+            )
         )
     {
         return None;
@@ -6884,6 +6889,39 @@ fn valid_declared_rest_parameter_annotation(
             if !numeric_math_rest && record.kind == SyntaxKind::TupleType =>
         {
             tuple.elements.range == record.range
+        }
+        NodeData::UnionTypeNode(union)
+            if !numeric_math_rest && record.kind == SyntaxKind::UnionType =>
+        {
+            if union.types.nodes.len() < 2
+                || union.types.has_trailing_comma
+                || union.types.range != record.range
+            {
+                return false;
+            }
+
+            let mut previous_end = record.range.start;
+            union.types.nodes.iter().all(|constituent| {
+                let constituent = NodeRef::new(node.arena, node.file, *constituent);
+                let Ok(constituent_record) = preflight_node(store, host, constituent) else {
+                    return false;
+                };
+                let NodeData::TupleTypeNode(tuple) = &constituent_record.data else {
+                    return false;
+                };
+                if constituent_record.kind != SyntaxKind::TupleType
+                    || constituent_record.flags.0 != 0
+                    || constituent_record.parent != Some(node.node)
+                    || constituent_record.range.start < previous_end
+                    || constituent_record.range.start < record.range.start
+                    || constituent_record.range.end > record.range.end
+                    || tuple.elements.range != constituent_record.range
+                {
+                    return false;
+                }
+                previous_end = constituent_record.range.end;
+                true
+            })
         }
         NodeData::InferTypeNode(inferred)
             if !numeric_math_rest && record.kind == SyntaxKind::InferType =>
@@ -16992,6 +17030,275 @@ mod generic_publication_tests {
     }
 
     #[test]
+    fn interface_methods_accept_the_exact_class_implementation_tuple_union_rest_shape() {
+        let fixture = interface_fixture(
+            concat!(
+                "declare class MySettable implements Settable { ",
+                "set(option: Record<string, unknown>): void; ",
+                "set(name: string, value: unknown): void; ",
+                "} ",
+                "interface Settable { ",
+                "set(...args: ",
+                "[option: Record<string, unknown>] | ",
+                "[name: string, value: unknown] | ",
+                "[name: string]): void; ",
+                "}",
+            ),
+            3_903,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+
+        let [method] = plan.methods.as_slice() else {
+            panic!("the implemented interface retains one binder-owned set method")
+        };
+        let [rest] = method.parameters.as_slice() else {
+            panic!("the set method retains one union-of-tuples rest parameter")
+        };
+        let NodeData::UnionTypeNode(union) =
+            &fixture.parsed.arena.get(rest.type_node.node).unwrap().data
+        else {
+            panic!("the rest annotation retains its exact union syntax")
+        };
+        assert_eq!(method.flags, SignatureFlags::HAS_REST_PARAMETER);
+        assert_eq!(method.minimum_argument_count, 0);
+        assert_eq!(union.types.nodes.len(), 3);
+        assert_eq!(
+            union
+                .types
+                .nodes
+                .iter()
+                .map(|node| {
+                    let NodeData::TupleTypeNode(tuple) =
+                        &fixture.parsed.arena.get(*node).unwrap().data
+                    else {
+                        panic!("each union constituent must remain a tuple")
+                    };
+                    tuple.elements.nodes.len()
+                })
+                .collect::<Vec<_>>(),
+            [1, 2, 1],
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source proves tuple-union identity, warm replay, and poison.
+    fn tuple_union_method_rest_parameters_publish_authenticated_cold_and_warm() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Settable { ",
+                "set(...args: ",
+                "[option: Options] | ",
+                "[name: string, value: unknown] | ",
+                "[name: string]): void; ",
+                "} ",
+                "interface Options { value: unknown; }",
+            ),
+            3_904,
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let options = fixture
+            .store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source("Options"))
+            .unwrap();
+        fixture.store.merge_global_symbol(globals, options).unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let [method] = plan.methods.as_slice() else {
+            panic!("the tuple-union interface retains one method")
+        };
+        let [parameter] = method.parameters.as_slice() else {
+            panic!("the method retains its one binder-owned rest parameter")
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let owner = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let callable = fixture
+            .store
+            .value_symbol_links(method.symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let crate::semantic::callable_sets::StoredCallableSetValidation::Valid {
+            projection, ..
+        } = crate::semantic::callable_sets::validate_stored_callable_set(&fixture.store, callable)
+        else {
+            panic!("the tuple-union method retains authenticated callable provenance")
+        };
+        let [projected] = projection.call_signatures.as_ref() else {
+            panic!("the tuple-union method publishes exactly one source signature")
+        };
+        let signature = projected.signature;
+        let rest = projected
+            .rest_parameter
+            .expect("the tuple union remains the method rest parameter");
+        assert!(projected.parameters.is_empty());
+        assert_eq!(projected.min_argument_count, 0);
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([rest].as_slice()),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(parameter.type_node)
+                .and_then(|links| links.resolved_type),
+            Some(rest),
+        );
+        assert_eq!(
+            fixture.store.interface_method_linked_type(signature),
+            Some(callable),
+        );
+        let TypeData::Union(union) = fixture.store.type_payload(rest).unwrap().data() else {
+            panic!("the rest parameter must preserve its tuple-union type")
+        };
+        assert_eq!(union.union.types.len(), 3);
+        let mut lengths = union
+            .union
+            .types
+            .iter()
+            .map(|tuple| {
+                let shape = fixture
+                    .store
+                    .canonical_tuple_shape(*tuple)
+                    .unwrap()
+                    .expect("each rest-union constituent retains its canonical tuple identity");
+                assert!(
+                    shape
+                        .element_infos()
+                        .iter()
+                        .all(|element| element.labeled_declaration().is_some())
+                );
+                shape.element_types().len()
+            })
+            .collect::<Vec<_>>();
+        lengths.sort_unstable();
+        assert_eq!(lengths, [1, 1, 2]);
+
+        let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_cache_len(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalCheckerOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_declared_type_of_symbol(fixture.symbol),
+                Ok(owner),
+            );
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalCheckerOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature),
+                Ok(void),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                    fixture
+                        .store
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .union_cache_len(),
+                ),
+                warm,
+            );
+        }
+
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_value_symbol_links(
+            parameter.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(matches!(
+            crate::semantic::callable_sets::validate_stored_callable_set(&fixture.store, callable),
+            crate::semantic::callable_sets::StoredCallableSetValidation::Malformed { .. }
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_cache_len(),
+        );
+        assert!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature)
+            .is_err()
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture
+                    .store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_cache_len(),
+            ),
+            poisoned,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn conditional_type_literal_methods_preserve_authenticated_inferred_rest_parameters() {
         let fixture = interface_fixture(
             concat!(
@@ -17051,32 +17358,37 @@ mod generic_publication_tests {
 
     #[test]
     fn generic_interface_methods_reject_invalid_rest_annotations_before_publication() {
-        let fixture = interface_fixture(
+        for (index, source) in [
             "interface Contract<Value> { spread(...values: string): Value; }",
-            3_899,
-        );
-        let host = host(&fixture.parsed, &fixture.bound);
-        let before = (
-            fixture.store.type_len(),
-            fixture.store.signature_len(),
-            fixture.store.checker_link_allocated_lengths(),
-        );
-
-        assert!(matches!(
-            plan_generic_interface(&fixture.store, &host, fixture.symbol),
-            Err(PropertyObjectError::UnsupportedMember {
-                kind: SyntaxKind::MethodSignature,
-                ..
-            })
-        ));
-        assert_eq!(
-            (
+            "interface Contract<Value> { spread(...values: [value: Value] | string): Value; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = interface_fixture(source, 3_899 + u32::try_from(index).unwrap());
+            let host = host(&fixture.parsed, &fixture.bound);
+            let before = (
                 fixture.store.type_len(),
                 fixture.store.signature_len(),
                 fixture.store.checker_link_allocated_lengths(),
-            ),
-            before,
-        );
+            );
+
+            assert!(matches!(
+                plan_generic_interface(&fixture.store, &host, fixture.symbol),
+                Err(PropertyObjectError::UnsupportedMember {
+                    kind: SyntaxKind::MethodSignature,
+                    ..
+                })
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
     }
 
     #[test]
