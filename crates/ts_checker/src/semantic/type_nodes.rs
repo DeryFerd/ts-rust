@@ -12599,6 +12599,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         }
 
+        if identifier.text == "HTMLWebViewElement" {
+            return self.is_react_webview_interface_argument(node, symbol);
+        }
+
         let Some(declarations) = owner.declarations() else {
             return false;
         };
@@ -12720,6 +12724,81 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .flags()
                 .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
                 == value_declaration.is_some()
+    }
+
+    /// Proves React's same-file WebView declaration retains one cold DOM base.
+    fn is_react_webview_interface_argument(&self, node: NodeRef, symbol: SemanticSymbolId) -> bool {
+        let Some(owner) = self.store.symbol(symbol) else {
+            return false;
+        };
+        let Some([declaration]) = owner.declarations() else {
+            return false;
+        };
+        let declaration = *declaration;
+        let Some(bound) = self.host.bound_file(declaration) else {
+            return false;
+        };
+        let Some(facts) = bound.source_facts() else {
+            return false;
+        };
+        let Ok(record) = preflight_node(self.store, self.host, declaration) else {
+            return false;
+        };
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return false;
+        };
+        let Some(clauses) = interface.heritage_clauses.as_ref() else {
+            return false;
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
+        if declaration.arena != node.arena
+            || declaration.file != node.file
+            || !facts.is_declaration_file()
+            || facts.is_default_library()
+            || facts.is_javascript_file()
+            || facts.is_external_or_common_js_module()
+            || owner.flags() != SymbolFlags::INTERFACE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some("HTMLWebViewElement")
+            || owner.value_declaration().is_some()
+            || owner.members().is_some()
+            || owner.exports().is_some()
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || self.store.get_merged_symbol(symbol) != Some(symbol)
+            || !self.global_symbol_has_name(symbol, "HTMLWebViewElement")
+            || !self.host.symbol_matches(self.store, declaration, symbol)
+            || record.kind != SyntaxKind::InterfaceDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(bound.source_file().node)
+            || interface.type_parameters.is_some()
+            || interface.modifiers.is_some()
+            || interface.flow_node.is_some()
+            || interface.local_symbol.is_some()
+            || interface.symbol.is_some()
+            || !interface.members.nodes.is_empty()
+            || interface.members.has_trailing_comma
+            || !self.react_detailed_html_props_identifier(name, declaration, "HTMLWebViewElement")
+        {
+            return false;
+        }
+
+        let Ok(heritage) = super::interface_heritage::plan_direct_interface_heritage(
+            self.store,
+            self.host,
+            declaration,
+            symbol,
+            clauses,
+        ) else {
+            return false;
+        };
+        matches!(
+            heritage.bases.as_slice(),
+            [base]
+                if base.kind == DirectInterfaceBaseKind::DefaultLibraryInterface
+                    && base.type_arguments.is_empty()
+                    && self.global_symbol_has_name(base.symbol, "HTMLElement")
+        )
     }
 
     /// Authenticates DOM arguments on React's namespace-owned HTML factories.
@@ -35941,6 +36020,173 @@ mod tests {
             context.get_type_from_type_node(audio_annotation),
             Ok(resolved[0].1),
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // WebView source ownership, cold DOM heritage, and forged exports share one proof.
+    fn react_html_factory_webview_arguments_keep_source_and_dom_heritage_lazy() {
+        let library = parse_source_file(concat!(
+            "interface HTMLElement { ",
+            "addEventListener<Value extends string>(type: Value): void; ",
+            "} declare var HTMLElement: unknown;",
+        ));
+        let react = parse_source_file(concat!(
+            "interface HTMLWebViewElement extends HTMLElement {} ",
+            "declare module 'react' { ",
+            "export = React; namespace React { ",
+            "interface HTMLAttributes<Value> {} ",
+            "interface WebViewHTMLAttributes<Value> extends HTMLAttributes<Value> {} ",
+            "interface ClassAttributes<Value> {} ",
+            "type ReactNode = unknown; ",
+            "type DOMFactory<P, T> = ",
+            "(props?: ClassAttributes<T> & P | null, ...children: ReactNode[]) => unknown; ",
+            "interface DetailedHTMLFactory<",
+            "P extends HTMLAttributes<T>, T extends HTMLElement",
+            "> extends DOMFactory<P, T> { ",
+            "(props?: ClassAttributes<T> & P | null, ...children: ReactNode[]): unknown; ",
+            "} ",
+            "interface ReactHTML { ",
+            "webview: DetailedHTMLFactory<",
+            "WebViewHTMLAttributes<HTMLWebViewElement>, HTMLWebViewElement>; ",
+            "} } }",
+        ));
+        let (mut context, library_file, react_file) =
+            default_library_interface_context(&library, &react, true);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let react_bound = context.file(react_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&react.arena, &react_bound),
+            ],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+        let element = context
+            .store()
+            .symbol_table(globals)
+            .and_then(|symbols| symbols.get_source("HTMLElement"))
+            .unwrap();
+        let webview = context
+            .store()
+            .symbol_table(globals)
+            .and_then(|symbols| symbols.get_source("HTMLWebViewElement"))
+            .unwrap();
+        let references = react_dom_type_references(&react, react_file, "HTMLWebViewElement");
+        assert_eq!(references.len(), 2);
+        let aliases = HashMap::new();
+        for reference in &references {
+            assert!(
+                TypeQueryPlanner::new(context.store(), &host, None, None, false, &aliases)
+                    .is_default_library_dom_interface_argument(*reference, webview)
+            );
+        }
+
+        let annotation = react_dom_property_annotation(&react, react_file, "webview");
+        let resolved = context.get_type_from_type_node(annotation).unwrap();
+        let reference = validate_direct_generic_reference(context.store(), resolved).unwrap();
+        let webview_type = context
+            .store()
+            .declared_type_links(webview)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        assert_eq!(reference.type_arguments[1], webview_type);
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), reference.type_arguments[0])
+                .unwrap()
+                .type_arguments,
+            [webview_type],
+        );
+        for symbol in [webview, element] {
+            let target = context
+                .store()
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let TypeData::Interface(interface) =
+                context.store().type_payload(target).unwrap().data()
+            else {
+                panic!("the WebView and DOM base must retain their interface identities")
+            };
+            assert!(!interface.base_types_resolved);
+            assert!(!interface.declared_members_resolved);
+            assert!(interface.resolved_base_types.is_none());
+        }
+        let method = context
+            .store()
+            .symbol(element)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("addEventListener"))
+            .unwrap();
+        assert!(context.store().value_symbol_links(method).is_none());
+
+        let warm = store_state(context.store());
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(resolved));
+        assert_eq!(store_state(context.store()), warm);
+
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            webview,
+            SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+        for reference in &references {
+            assert!(
+                !TypeQueryPlanner::new(context.store(), &host, None, None, false, &aliases)
+                    .is_default_library_dom_interface_argument(*reference, webview)
+            );
+        }
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            webview,
+            SymbolFlags::INTERFACE,
+            CheckFlags::NONE,
+        ));
+
+        let factory = context
+            .store()
+            .symbol_node_links(annotation)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        let namespace = context.store().get_parent_of_symbol(factory).unwrap();
+        let exports = context
+            .store()
+            .symbol(namespace)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let attributes = context
+            .store()
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("WebViewHTMLAttributes"))
+            .unwrap();
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("DetailedHTMLFactory"),
+                attributes,
+            ),
+            Some(Some(factory)),
+        );
+        for reference in &references {
+            assert!(
+                !TypeQueryPlanner::new(context.store(), &host, None, None, false, &aliases)
+                    .is_default_library_dom_interface_argument(*reference, webview)
+            );
+        }
+        let poisoned = store_state(context.store());
+        assert!(context.get_type_from_type_node(annotation).is_err());
+        assert_eq!(store_state(context.store()), poisoned);
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("DetailedHTMLFactory"),
+                factory,
+            ),
+            Some(Some(attributes)),
+        );
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(resolved));
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
