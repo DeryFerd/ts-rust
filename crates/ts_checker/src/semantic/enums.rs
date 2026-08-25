@@ -3724,10 +3724,46 @@ mod tests {
             fixture.store.type_alias_len(),
             fixture.store.checker_link_allocated_lengths(),
         );
+        let replayed = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
         assert_eq!(
-            get_enum_semantics(&mut fixture.store, &host, owner),
-            Ok(result),
+            (
+                replayed.declaration,
+                replayed.symbol,
+                replayed.declared_type,
+                replayed.value_type,
+                replayed.is_const,
+                replayed.is_ambient,
+            ),
+            (
+                result.declaration,
+                result.symbol,
+                result.declared_type,
+                result.value_type,
+                result.is_const,
+                result.is_ambient,
+            ),
         );
+        assert_eq!(replayed.members.len(), result.members.len());
+        for (actual, expected) in replayed.members.iter().zip(&result.members) {
+            assert_eq!(
+                (
+                    actual.declaration,
+                    actual.symbol,
+                    actual.regular_type,
+                    actual.fresh_type,
+                ),
+                (
+                    expected.declaration,
+                    expected.symbol,
+                    expected.regular_type,
+                    expected.fresh_type,
+                ),
+            );
+            assert!(evaluator_result_matches(
+                &evaluator_result(&actual.value),
+                &expected.value,
+            ));
+        }
         assert_eq!(
             (
                 fixture.store.type_len(),
