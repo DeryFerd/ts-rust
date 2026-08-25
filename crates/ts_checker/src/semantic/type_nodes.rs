@@ -34534,6 +34534,32 @@ mod tests {
     }
 
     #[test]
+    fn recursive_generic_function_parameter_templates_fail_as_typed_unsupported() {
+        let mut fixture = fixture(concat!(
+            "type Narrow<Value> = Value extends string ",
+            "? Value : { [Key in keyof Value]: Narrow<Value[Key]> }; ",
+            "declare const parse: <Value>(value: Narrow<Value>) => Value;",
+        ));
+        let function = variable_type_node(&fixture, "parse");
+        let before = function_store_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert!(matches!(
+            query_node(&mut fixture, function, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    kind: SyntaxKind::FunctionType,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(function_store_state(&fixture.store), before);
+        assert!(fixture.store.type_node_links(function).is_none());
+        assert!(fixture.store.signature_links(function).is_none());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn function_type_cold_warm_signature_parameters_and_optionality_are_exact() {
         let mut fixture = fixture_with_intrinsic(
             "type Fn = (required: 1, optional?: (2),) => 3;",

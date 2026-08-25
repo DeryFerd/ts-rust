@@ -586,6 +586,17 @@ pub(super) fn plan_function_type(
             FunctionTypeUnsupported::GenericSignature(node),
         ));
     }
+    if let Some(type_parameter) = type_parameters.first() {
+        for parameter in &parameters {
+            if function_type_parameter_reference_symbol(store, host, parameter.identity_node)?
+                != type_parameter.symbol
+            {
+                return Err(FunctionTypeError::Unsupported(
+                    FunctionTypeUnsupported::GenericSignature(node),
+                ));
+            }
+        }
+    }
     let plan = FunctionTypePlan {
         node,
         symbol,
