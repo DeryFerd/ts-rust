@@ -46,7 +46,7 @@ use super::{
     source::{PlannedExpression, PlannedExpressionKind},
     source_callables::source_promise_constructor_argument_arrow_is_exact,
     source_imports::SourceImportBindingPlan,
-    store::CachedSignatureLookup,
+    store::{CachedSignatureLookup, SourceNodeParent},
     type_nodes::{CanonicalTypeQuery, normalize_numeric_separators},
     type_records::{TypeCacheState, type_list_key},
     types::{ObjectFlags, TypeFlags},
@@ -4482,6 +4482,7 @@ fn resolved_global_date_constructor(
         || store
             .function_signature_return_annotation(signature)
             .is_some_and(|annotation| annotation != (global.return_annotation, false))
+        || authenticated_global_date_constructor_return(store, signature) != Some(instance_type)
     {
         return Err(invariant(SourceNewInvariant::InvalidConstructSignature(
             signature,
@@ -4493,6 +4494,121 @@ fn resolved_global_date_constructor(
         instance_type,
         signature,
     }))
+}
+
+/// Authenticates a published zero-argument Date return without resolving its members.
+#[allow(clippy::too_many_lines)] // Global symbols, source ownership, and signature caches form one proof.
+pub(super) fn authenticated_global_date_constructor_return(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+) -> Option<TypeId> {
+    let record = store.signature(signature)?;
+    let declaration = record.declaration()?;
+    let SourceNodeParent::Parent(owner_declaration) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let globals = store.symbol_table(bootstrap.globals)?;
+    let date = globals
+        .get_source("Date")
+        .and_then(|symbol| store.get_merged_symbol(symbol))?;
+    let owner = globals
+        .get_source("DateConstructor")
+        .and_then(|symbol| store.get_merged_symbol(symbol))?;
+    let date_record = store.symbol(date)?;
+    let owner_record = store.symbol(owner)?;
+    let instance = store.declared_type_links(date)?.declared_type?;
+    let constructor = store.declared_type_links(owner)?.declared_type?;
+    let instance_record = store.type_payload(instance)?;
+    let constructor_record = store.type_payload(constructor)?;
+    let TypeData::Interface(interface) = constructor_record.data() else {
+        return None;
+    };
+    let constructor_symbol = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get(InternalSymbolName::New.as_ref()))?;
+    let symbol_record = store.symbol(constructor_symbol)?;
+    let return_annotation = store.source_direct_type_annotation(declaration)?;
+
+    if date_record.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        || !date_record
+            .flags()
+            .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        || date_record.check_flags() != CheckFlags::NONE
+        || date_record.name().as_utf8() != Some("Date")
+        || store.value_symbol_links(date)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(constructor),
+                ..ValueSymbolLinks::default()
+            })
+        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name().as_utf8() != Some("DateConstructor")
+        || owner_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&owner_declaration))
+        || store.source_node_kind(owner_declaration) != Some(SyntaxKind::InterfaceDeclaration)
+        || symbol_record.flags() != SymbolFlags::SIGNATURE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.parent() != Some(owner)
+        || symbol_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&declaration))
+        || store.source_node_kind(declaration) != Some(SyntaxKind::ConstructSignature)
+        || store.signature_links(declaration)
+            != Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            })
+        || instance_record.flags() != TypeFlags::OBJECT
+        || !instance_record
+            .object_flags()
+            .contains(ObjectFlags::INTERFACE)
+        || instance_record.symbol() != Some(date)
+        || constructor_record.flags() != TypeFlags::OBJECT
+        || !constructor_record
+            .object_flags()
+            .contains(ObjectFlags::INTERFACE)
+        || constructor_record.symbol() != Some(owner)
+        || record.flags() != SignatureFlags::CONSTRUCT
+        || !record.parameters().is_empty()
+        || !record.type_parameters().is_empty()
+        || record.min_argument_count() != 0
+        || record.resolved_min_argument_count() != -1
+        || record.resolved_return_type() != Some(instance)
+        || record.this_parameter().is_some()
+        || record.resolved_type_predicate().is_some()
+        || record.target().is_some()
+        || record.mapper().is_some()
+        || record.isolated_signature_type().is_some()
+        || record.composite().is_some()
+        || store.source_node_kind(return_annotation) != Some(SyntaxKind::TypeReference)
+        || store.type_node_links(return_annotation)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(instance),
+                ..TypeNodeLinks::default()
+            })
+        || store.function_signature_return_annotation(signature) != Some((return_annotation, false))
+        || store
+            .callable_signature_parameter_types(signature)
+            .is_some_and(|parameters| !parameters.is_empty())
+        || interface
+            .reference
+            .object
+            .structured
+            .signatures
+            .as_deref()
+            .is_some_and(|signatures| {
+                signatures
+                    .get(interface.reference.object.structured.call_signature_count..)
+                    .is_none_or(|constructors| !constructors.contains(&signature))
+            })
+    {
+        return None;
+    }
+
+    Some(instance)
 }
 
 fn resolved_global_promise_constructor(
@@ -5166,15 +5282,15 @@ fn validate_selected_default_signature(
 mod tests {
     use ts_ast::FileId;
     use ts_binder::{
-        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName,
+        CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
     };
     use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks, SourceCheckError,
-        UnsupportedSourceSyntax,
+        UnsupportedSourceSyntax, production::GlobalMergeCompletion,
     };
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -6073,6 +6189,10 @@ mod tests {
         assert!(signature_record.parameters().is_empty());
         assert_eq!(signature_record.resolved_return_type(), Some(instance_type));
         assert_eq!(signature_record.min_argument_count(), 0);
+        assert_eq!(
+            authenticated_global_date_constructor_return(store, signature),
+            Some(instance_type),
+        );
         assert_eq!(store.symbol_len(), initial_symbols);
         assert_eq!(
             store.value_symbol_links(date),
@@ -6131,6 +6251,70 @@ mod tests {
             warm,
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn defaulted_constructor_properties_can_preflight_date_initializers_without_publication() {
+        let library = global_date_constructor_library();
+        let source =
+            parse_source_file("class Event { constructor(readonly timestamp = new Date()) {} }");
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(1_840);
+        let source_file = FileId::new(1_841);
+        let context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+        let (_, source_bound) = context.file(source_file).unwrap();
+        let (_, library_bound) = context.file(library_file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, library_bound),
+                (&source.arena, source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let expression = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_direct_default_new(
+            &source.arena,
+            source_bound,
+            context.store(),
+            &host,
+            &HashMap::new(),
+            &HashMap::new(),
+            expression,
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(plan.target, SourceNewTarget::GlobalDate(_)));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(context.store().type_node_links(expression).is_none());
     }
 
     #[test]
@@ -6199,6 +6383,12 @@ mod tests {
                 context.store().signature_len(),
                 context.store().symbol_len(),
                 context.store().checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                authenticated_global_date_constructor_return(context.store(), signature),
+                None,
+                "case {poison}",
             );
 
             assert!(
