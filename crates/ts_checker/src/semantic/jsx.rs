@@ -41,10 +41,11 @@ use super::{
     mapped_types::MappedTypeModifiers,
     production::{CanonicalJsxRuntime, CanonicalJsxRuntimeEvidence},
     reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
-    signatures::SignatureFlags,
+    signatures::{ElementFlags, SignatureFlags},
     source::merge_retry_diagnostic,
     source_calls::resolve_jsx_generic_component_signature,
     spelling::get_spelling_suggestion,
+    tuple_types::CanonicalTupleTypeRequest,
     type_nodes::CanonicalTypeQuery,
     type_records::LiteralValue,
     types::{ObjectFlags, TypeFlags},
@@ -3621,12 +3622,26 @@ fn contextual_jsx_child_element_type(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
     expected: TypeId,
+    index: usize,
 ) -> Result<TypeId, SourceCheckError> {
     let Some(global_types) = global_types else {
         return Ok(expected);
     };
     if let Some(array) = store.canonical_array_reference(global_types, expected)? {
         return Ok(array.element_type);
+    }
+    if let Some(tuple) = store
+        .canonical_tuple_shape(expected)
+        .map_err(|_| RelationUnavailable::InvalidStructuredMembers(expected))?
+    {
+        let element = tuple.element_types().get(index).copied().or_else(|| {
+            tuple
+                .element_infos()
+                .last()
+                .filter(|info| info.flags().contains(ElementFlags::REST))
+                .and_then(|_| tuple.element_types().last().copied())
+        });
+        return Ok(element.unwrap_or(expected));
     }
 
     let Some(super::TypeData::Union(union)) = store
@@ -3637,22 +3652,79 @@ fn contextual_jsx_child_element_type(
     };
     let constituents = union.union.types.clone();
     let mut projected = Vec::with_capacity(constituents.len());
-    let mut has_array = false;
+    let mut has_sequence = false;
     for constituent in constituents {
         if let Some(array) = store.canonical_array_reference(global_types, constituent)? {
             projected.push(array.element_type);
-            has_array = true;
+            has_sequence = true;
+        } else if let Some(tuple) = store
+            .canonical_tuple_shape(constituent)
+            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(constituent))?
+        {
+            has_sequence = true;
+            if let Some(element) = tuple.element_types().get(index).copied().or_else(|| {
+                tuple
+                    .element_infos()
+                    .last()
+                    .filter(|info| info.flags().contains(ElementFlags::REST))
+                    .and_then(|_| tuple.element_types().last().copied())
+            }) {
+                projected.push(element);
+            }
         } else {
             projected.push(constituent);
         }
     }
-    if !has_array {
+    if !has_sequence || projected.is_empty() {
         return Ok(expected);
     }
 
+    store.validate_union_constituent_with_global_types(global_types, expected)?;
     store
         .expression_union_type_with_global_types(global_types, &projected, UnionReduction::None)
         .map_err(Into::into)
+}
+
+fn jsx_children_have_contextual_tuple(
+    store: &CanonicalTypeMapperStore,
+    expected: TypeId,
+    length: usize,
+) -> Result<bool, SourceCheckError> {
+    let candidates = match store
+        .type_payload(expected)
+        .map(super::type_records::TypeRecord::data)
+    {
+        Some(super::TypeData::Union(union)) => union.union.types.as_slice(),
+        Some(_) => std::slice::from_ref(&expected),
+        None => return Err(RelationUnavailable::Type(expected).into()),
+    };
+    for candidate in candidates {
+        if let Some(tuple) = store
+            .canonical_tuple_shape(*candidate)
+            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(*candidate))?
+            && !tuple.combined_flags().intersects(ElementFlags::VARIABLE)
+            && tuple.min_length() <= length
+            && length <= tuple.fixed_length()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn contextual_jsx_children_tuple_type(
+    store: &mut CanonicalTypeMapperStore,
+    children: &[TypeId],
+    expected: TypeId,
+    location: NodeRef,
+) -> Result<TypeId, SourceCheckError> {
+    let required = store
+        .create_tuple_element_info(ElementFlags::REQUIRED, None)
+        .ok_or(SourceCheckError::Property(location))?;
+    let infos = vec![required; children.len()];
+    store
+        .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(children, &infos, false))
+        .map_err(|_| RelationUnavailable::InvalidStructuredMembers(expected).into())
 }
 
 fn jsx_child_is_assignable(
@@ -4050,8 +4122,8 @@ fn check_jsx_implicit_children(
 
     let mut first_node = None;
     let mut child_types = Vec::with_capacity(plan.children.len());
-    let expected_child = if plan.children.len() > 1 {
-        let expected = resolve_expected_jsx_child_type(
+    let expected_children = if plan.children.len() > 1 {
+        resolve_expected_jsx_child_type(
             store,
             source.2,
             expected_attributes,
@@ -4059,15 +4131,12 @@ fn check_jsx_implicit_children(
             plan.opening,
             options,
             diagnostics,
-        )?;
-        expected
-            .map(|expected| contextual_jsx_child_element_type(store, source.3, expected))
-            .transpose()?
+        )?
     } else {
         None
     };
     let mut individual_errors = false;
-    for child in &plan.children {
+    for (index, child) in plan.children.iter().enumerate() {
         let (node, type_) = match child {
             JsxChildPlan::Text { node } => {
                 let string_type = store
@@ -4090,7 +4159,9 @@ fn check_jsx_implicit_children(
             }
         };
         first_node.get_or_insert(node);
-        if let Some(expected) = expected_child
+        if let Some(expected) = expected_children
+            .map(|expected| contextual_jsx_child_element_type(store, source.3, expected, index))
+            .transpose()?
             && !jsx_child_is_assignable(
                 store,
                 type_,
@@ -4112,6 +4183,10 @@ fn check_jsx_implicit_children(
     let node = first_node.expect("a nonempty JSX child plan has a first child");
     let type_ = if let [type_] = child_types.as_slice() {
         *type_
+    } else if let Some(expected) = expected_children
+        && jsx_children_have_contextual_tuple(store, expected, child_types.len())?
+    {
+        contextual_jsx_children_tuple_type(store, &child_types, expected, node)?
     } else {
         let element = if let Some(global_types) = source.3 {
             let mut prepared = store.prepare_type_query_types_with_global_types(
@@ -13091,6 +13166,157 @@ mod runtime_tests {
                     context.diagnostics().as_slice().to_vec(),
                 ),
                 cold,
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Tuple children retain indexed contexts and warm identities.
+    fn function_component_tuple_children_use_their_contextual_position_types() {
+        let source = concat!(
+            "interface Array<T> {}\n",
+            "interface ReadonlyArray<T> {}\n",
+            "declare var React: any;\n",
+            "declare namespace JSX {\n",
+            "  interface Element {}\n",
+            "  interface ElementChildrenAttribute { children: {}; }\n",
+            "  interface IntrinsicElements { span: {}; }\n",
+            "}\n",
+            "interface PairChildren { children: [string, number]; }\n",
+            "interface MixedChildren { children: [string, number] | boolean[]; }\n",
+            "declare function Pair(props: PairChildren): any;\n",
+            "declare function Mixed(props: MixedChildren): any;\n",
+            "const pair = <Pair>ready{123}</Pair>;\n",
+            "const mixed = <Mixed>ready{123}</Mixed>;\n",
+            "const booleans = <Mixed>{true}{false}</Mixed>;\n",
+            "const invalid = <Mixed>{(<span />) as unknown}{\"wrong\"}</Mixed>;\n",
+        );
+
+        for (index, runtime) in [CanonicalJsxRuntime::Classic, CanonicalJsxRuntime::Preserve]
+            .into_iter()
+            .enumerate()
+        {
+            let parsed = parse_jsx_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(8_202 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/jsx-tuple-children.tsx\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = crate::semantic::CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(file, &parsed.arena)],
+                CanonicalCheckerOptions {
+                    jsx_runtime: runtime,
+                    ..CanonicalCheckerOptions::default()
+                },
+            )
+            .unwrap();
+
+            context.check_source_file(file).unwrap();
+
+            let [first, second] = context.diagnostics().as_slice() else {
+                panic!("both invalid tuple positions must fail in {runtime:?} mode")
+            };
+            for (diagnostic, expected_message, expected_source) in [
+                (
+                    first,
+                    "Type 'unknown' is not assignable to type 'string | boolean'.",
+                    "{(<span />) as unknown}",
+                ),
+                (
+                    second,
+                    "Type 'string' is not assignable to type 'number | boolean'.",
+                    "{\"wrong\"}",
+                ),
+            ] {
+                assert_eq!(diagnostic.diagnostic.code(), 2322);
+                assert_eq!(diagnostic.diagnostic.render().unwrap(), expected_message);
+                let range = parsed
+                    .arena
+                    .get(diagnostic.node.unwrap().node)
+                    .unwrap()
+                    .range;
+                assert_eq!(
+                    source.get(range.start.get() as usize..range.end.get() as usize),
+                    Some(expected_source),
+                );
+            }
+
+            let mut contextual_tuples = 0;
+            for (_, record) in parsed.arena.iter() {
+                let NodeData::JsxOpeningElement(opening) = &record.data else {
+                    continue;
+                };
+                let attributes = NodeRef::new(parsed.arena.id(), file, opening.attributes);
+                let attributes_type = context
+                    .store()
+                    .type_node_links(attributes)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                let children = context
+                    .store()
+                    .type_payload(attributes_type)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.members)
+                    .and_then(|members| context.store().symbol_table(members))
+                    .and_then(|members| members.get_source("children"))
+                    .unwrap();
+                let children_type = context
+                    .store()
+                    .value_symbol_links(children)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                let tuple = context
+                    .store()
+                    .canonical_tuple_shape(children_type)
+                    .unwrap()
+                    .expect("matching tuple contexts retain a canonical tuple identity");
+                assert_eq!(tuple.element_types().len(), 2);
+                assert!(
+                    tuple
+                        .element_infos()
+                        .iter()
+                        .all(|info| info.flags() == ElementFlags::REQUIRED)
+                );
+                contextual_tuples += 1;
+            }
+            assert_eq!(contextual_tuples, 4);
+
+            let warm = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().canonical_tuple_target_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            );
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().mapper_len(),
+                    context.store().signature_len(),
+                    context.store().canonical_tuple_target_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().as_slice().to_vec(),
+                ),
+                warm,
             );
         }
     }
