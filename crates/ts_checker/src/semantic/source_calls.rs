@@ -1544,7 +1544,13 @@ pub(super) fn source_call_argument_contextual_type(
         return Ok(None);
     };
     if parameter_types.iter().all(|parameter| *parameter == first) {
-        return Ok(Some(first));
+        return Ok(Some(
+            if matches!(argument.kind, PlannedExpressionKind::Arrow(_)) {
+                nonnullable_contextual_callback_type(store, first)
+            } else {
+                first
+            },
+        ));
     }
     if array_callback {
         return Ok(shared_array_callback_context(store, &parameter_types));
@@ -1599,6 +1605,44 @@ pub(super) fn source_call_argument_contextual_type(
         }
     }
     Ok(None)
+}
+
+/// Optional callback parameters contextualize against their callable member.
+fn nonnullable_contextual_callback_type(
+    store: &CanonicalTypeMapperStore,
+    contextual_type: TypeId,
+) -> TypeId {
+    let Some(undefined) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.undefined_type)
+    else {
+        return contextual_type;
+    };
+    let Some(TypeData::Union(union)) = store.type_payload(contextual_type).map(TypeRecord::data)
+    else {
+        return contextual_type;
+    };
+    if union.union.types.len() != 2 || !union.union.types.contains(&undefined) {
+        return contextual_type;
+    }
+    let Some(callable) = union
+        .union
+        .types
+        .iter()
+        .copied()
+        .find(|candidate| *candidate != undefined)
+    else {
+        return contextual_type;
+    };
+    match validate_stored_callable_set(store, callable) {
+        StoredCallableSetValidation::Valid { projection, .. }
+            if !projection.call_signatures.is_empty()
+                && projection.construct_signatures.is_empty() =>
+        {
+            callable
+        }
+        _ => contextual_type,
+    }
 }
 
 /// Specializes readonly concat calls whose declaration returns mutable arrays.
@@ -2950,6 +2994,9 @@ fn is_supported_arrow_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool 
         }
     }
 
+    let tuple_sort_callback =
+        arrow.parameters.nodes.len() == 2 && is_authenticated_sort_callback_syntax(arena, node);
+
     let mut previous_end = arrow.parameters.range.start;
     for parameter_id in &arrow.parameters.nodes {
         let Some(parameter) = arena.get(*parameter_id) else {
@@ -2972,16 +3019,21 @@ fn is_supported_arrow_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool 
         let Some(name) = arena.get(data.name) else {
             return false;
         };
-        if name.kind != SyntaxKind::Identifier
-            || name.parent != Some(*parameter_id)
+        if name.parent != Some(*parameter_id)
             || name.flags.0 != 0
             || name.range.start < parameter.range.start
             || name.range.end > parameter.range.end
-            || !matches!(
-                &name.data,
-                NodeData::Identifier(identifier)
-                    if identifier.flow_node.is_none() && !identifier.text.is_empty()
-            )
+            || !match (&name.data, name.kind) {
+                (NodeData::Identifier(identifier), SyntaxKind::Identifier) => {
+                    identifier.flow_node.is_none() && !identifier.text.is_empty()
+                }
+                (NodeData::BindingPattern(pattern), SyntaxKind::ArrayBindingPattern)
+                    if tuple_sort_callback =>
+                {
+                    is_authenticated_sort_tuple_binding(arena, data.name, pattern)
+                }
+                _ => false,
+            }
         {
             return false;
         }
@@ -2999,6 +3051,101 @@ fn is_supported_arrow_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool 
         previous_end = parameter.range.end;
     }
     true
+}
+
+pub(super) fn is_authenticated_sort_callback_syntax(arena: &NodeArena, arrow: NodeRef) -> bool {
+    let Some(call_id) = arena.get(arrow.node).and_then(|record| record.parent) else {
+        return false;
+    };
+    let Some(call_record) = arena.get(call_id) else {
+        return false;
+    };
+    let NodeData::CallExpression(call) = &call_record.data else {
+        return false;
+    };
+    if call_record.kind != SyntaxKind::CallExpression
+        || call_record.flags.0 != 0
+        || call.question_dot_token.is_some()
+        || call.symbol.is_some()
+        || call.facts != 0
+        || call.arguments.nodes.as_slice() != [arrow.node]
+    {
+        return false;
+    }
+    let Some(callee_record) = arena.get(call.expression) else {
+        return false;
+    };
+    let NodeData::PropertyAccessExpression(callee) = &callee_record.data else {
+        return false;
+    };
+    let Some(receiver) = arena.get(callee.expression) else {
+        return false;
+    };
+    let Some(name_record) = arena.get(callee.name) else {
+        return false;
+    };
+    matches!(
+        &name_record.data,
+        NodeData::Identifier(name)
+            if callee_record.kind == SyntaxKind::PropertyAccessExpression
+                && callee_record.flags.0 == 0
+                && callee_record.parent == Some(call_id)
+                && callee.flow_node.is_none()
+                && callee.question_dot_token.is_none()
+                && callee.facts == 0
+                && receiver.parent == Some(call.expression)
+                && name_record.kind == SyntaxKind::Identifier
+                && name_record.flags.0 == 0
+                && name_record.parent == Some(call.expression)
+                && name.flow_node.is_none()
+                && name.text == "sort"
+    )
+}
+
+pub(super) fn is_authenticated_sort_tuple_binding(
+    arena: &NodeArena,
+    pattern_id: ts_ast::NodeId,
+    pattern: &ts_ast::BindingPatternData,
+) -> bool {
+    if pattern.facts != 0
+        || pattern.elements.has_trailing_comma
+        || pattern.elements.nodes.len() != 2
+    {
+        return false;
+    }
+    pattern.elements.nodes.iter().all(|element_id| {
+        let Some(element_record) = arena.get(*element_id) else {
+            return false;
+        };
+        let NodeData::BindingElement(element) = &element_record.data else {
+            return false;
+        };
+        let Some(name_id) = element.name else {
+            return false;
+        };
+        let Some(name_record) = arena.get(name_id) else {
+            return false;
+        };
+        matches!(
+            &name_record.data,
+            NodeData::Identifier(name)
+                if element_record.kind == SyntaxKind::BindingElement
+                    && element_record.flags.0 == 0
+                    && element_record.parent == Some(pattern_id)
+                    && element.dot_dot_dot_token.is_none()
+                    && element.flow_node.is_none()
+                    && element.initializer.is_none()
+                    && element.local_symbol.is_none()
+                    && element.property_name.is_none()
+                    && element.symbol.is_none()
+                    && element.facts == 0
+                    && name_record.kind == SyntaxKind::Identifier
+                    && name_record.flags.0 == 0
+                    && name_record.parent == Some(*element_id)
+                    && name.flow_node.is_none()
+                    && !name.text.is_empty()
+        )
+    })
 }
 
 fn is_supported_type_assertion_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
@@ -6040,6 +6187,70 @@ mod tests {
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
         assert_eq!(call_publication_state(&context, *call), cold);
+    }
+
+    #[test]
+    fn array_sort_call_authenticates_two_tuple_binding_callback_parameters() {
+        let parsed = parsed(concat!(
+            "declare const values: [string, any][]; ",
+            "values.sort(([firstKey, firstValue], [secondKey, secondValue]) ",
+            "=> firstValue.name.localeCompare(secondValue.name));",
+        ));
+        let file = FileId::new(4_960);
+        let context = context(&parsed, file);
+        let sort = calls(&parsed, file)
+            .into_iter()
+            .find(|call| {
+                let NodeData::CallExpression(call) = &parsed.arena.get(call.node).unwrap().data
+                else {
+                    return false;
+                };
+                let NodeData::PropertyAccessExpression(property) =
+                    &parsed.arena.get(call.expression).unwrap().data
+                else {
+                    return false;
+                };
+                matches!(
+                    &parsed.arena.get(property.name).unwrap().data,
+                    NodeData::Identifier(name) if name.text == "sort"
+                )
+            })
+            .unwrap();
+
+        let syntax = plan_direct_source_call_syntax(&parsed.arena, context.store(), sort).unwrap();
+
+        assert_eq!(syntax.arguments().len(), 1);
+        assert!(context.store().type_node_links(sort).is_none());
+        assert!(context.store().signature_links(sort).is_none());
+    }
+
+    #[test]
+    fn tuple_binding_callbacks_stay_exclusive_to_authenticated_array_sort_calls() {
+        for (index, source) in [
+            "consume(([first, second], [third, fourth]) => first);",
+            "values.map(([first, second], [third, fourth]) => first);",
+            "values.sort(([first = 0, second], [third, fourth]) => first);",
+            "values.sort(({ first, second }, [third, fourth]) => first);",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parsed(source);
+            let file = FileId::new(4_961 + u32::try_from(index).unwrap());
+            let call_nodes = calls(&parsed, file);
+            let [call] = call_nodes.as_slice() else {
+                panic!("the fixture retains one callback call")
+            };
+            let store = CanonicalTypeMapperStore::new();
+
+            assert!(matches!(
+                plan_direct_source_call_syntax(&parsed.arena, &store, *call),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node)))
+                    if node == *call
+            ));
+            assert!(store.type_node_links(*call).is_none());
+            assert!(store.signature_links(*call).is_none());
+        }
     }
 
     #[test]

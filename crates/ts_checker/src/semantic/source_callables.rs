@@ -2412,6 +2412,9 @@ fn plan_source_callable_with_owner_shape(
         && !direct_implicit_any_arrow
         && !array_implicit_any_arrow
         && source_object_property_arrow_symbol(store, host, declaration)?.is_some();
+    let array_sort_argument_arrow = implicit_any_arrow_shape
+        && view.parameters.nodes.len() == 2
+        && source_array_sort_argument_arrow_is_exact(store, host, declaration);
     let direct_call_argument_arrow = implicit_any_arrow_shape
         && !direct_implicit_any_arrow
         && !array_implicit_any_arrow
@@ -2419,6 +2422,7 @@ fn plan_source_callable_with_owner_shape(
         && (source_direct_call_argument_arrow_is_exact(store, host, declaration)?
             || source_promise_constructor_argument_arrow_is_exact(store, host, declaration)?)
         && (eligible_implicit_any_arrow
+            || array_sort_argument_arrow
             || source_direct_call_arrow_has_zero_parameter_target(store, host, declaration)?);
     let javascript_object_implicit_any_arrow = eligible_implicit_any_arrow
         && object_property_arrow
@@ -2505,13 +2509,25 @@ fn plan_source_callable_with_owner_shape(
         previous_end = parameter_record.range.end;
         let name = NodeRef::new(declaration.arena, declaration.file, data.name);
         let name_record = preflight_node(store, host, name)?;
-        let NodeData::Identifier(identifier) = &name_record.data else {
-            return Err(SourceCallableError::Unsupported(
-                SourceCallableUnsupported::DestructuredParameter(parameter),
-            ));
+        let parameter_name = match (&name_record.data, name_record.kind) {
+            (NodeData::Identifier(identifier), SyntaxKind::Identifier) => identifier.text.clone(),
+            (NodeData::BindingPattern(pattern), SyntaxKind::ArrayBindingPattern)
+                if array_sort_argument_arrow
+                    && host.source(name).is_some_and(|(arena, _)| {
+                        super::source_calls::is_authenticated_sort_tuple_binding(
+                            arena, name.node, pattern,
+                        )
+                    }) =>
+            {
+                format!("__{}", parameters.len())
+            }
+            _ => {
+                return Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::DestructuredParameter(parameter),
+                ));
+            }
         };
-        if name_record.kind != SyntaxKind::Identifier
-            || name_record.parent != Some(parameter.node)
+        if name_record.parent != Some(parameter.node)
             || name_record.range.start < parameter_record.range.start
             || name_record.range.end > parameter_record.range.end
         {
@@ -2540,7 +2556,7 @@ fn plan_source_callable_with_owner_shape(
                 SourceCallableUnsupported::ParameterModifiers(parameter),
             ));
         }
-        if identifier.text == "this"
+        if parameter_name == "this"
             && !(view.family == SourceCallableFamily::FunctionDeclaration
                 && view.parameters.nodes.len() == 1
                 && data.type_.is_none()
@@ -2712,7 +2728,7 @@ fn plan_source_callable_with_owner_shape(
         if symbol == raw_symbol
             && symbol_record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
             && symbol_record.check_flags() == CheckFlags::NONE
-            && symbol_record.name().as_bytes() == identifier.text.as_bytes()
+            && symbol_record.name().as_bytes() == parameter_name.as_bytes()
             && symbol_record.members().is_none()
             && symbol_record.exports().is_none()
             && symbol_record.parent().is_none()
@@ -2740,7 +2756,7 @@ fn plan_source_callable_with_owner_shape(
         if symbol != raw_symbol
             || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
             || symbol_record.check_flags() != CheckFlags::NONE
-            || symbol_record.name().as_bytes() != identifier.text.as_bytes()
+            || symbol_record.name().as_bytes() != parameter_name.as_bytes()
             || symbol_record.declarations() != Some(&[parameter])
             || symbol_record.value_declaration() != Some(parameter)
             || symbol_record.members().is_some()
@@ -3168,7 +3184,7 @@ pub(super) fn source_object_property_arrow_symbol(
     .then_some(planned.symbol))
 }
 
-/// Authenticates one unparenthesized callback in a direct or array method call.
+/// Authenticates one unparenthesized callback in a direct, array, or global sort call.
 #[allow(clippy::too_many_lines)] // Validate the callback, array owner, and top-level container.
 pub(super) fn source_direct_call_argument_arrow_is_exact(
     store: &CanonicalTypeMapperStore,
@@ -3177,6 +3193,9 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
 ) -> Result<bool, SourceCallableError> {
     if store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction) {
         return Ok(false);
+    }
+    if source_array_sort_argument_arrow_is_exact(store, host, declaration) {
+        return Ok(true);
     }
     let Some(SourceNodeParent::Parent(call)) = store.source_node_parent(declaration) else {
         return Ok(false);
@@ -3415,6 +3434,67 @@ pub(super) fn source_promise_constructor_argument_arrow_is_exact(
         }))
 }
 
+fn source_array_sort_argument_arrow_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> bool {
+    let Some((arena, bound)) = host.source(declaration) else {
+        return false;
+    };
+    if !super::source_calls::is_authenticated_sort_callback_syntax(arena, declaration)
+        || bound
+            .source_facts()
+            .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+    {
+        return false;
+    }
+    let Some(owner) = bound.symbol(declaration) else {
+        return false;
+    };
+    let Some(arrow_owner) = store.symbol(owner) else {
+        return false;
+    };
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    let Some(array) = store
+        .symbol_table(bootstrap.globals)
+        .and_then(|globals| globals.get_source("Array"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(target) = store
+        .declared_type_links(array)
+        .and_then(|links| links.declared_type)
+    else {
+        return false;
+    };
+    let Some(method) = store
+        .symbol(array)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source("sort"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+
+    arrow_owner.flags() == SymbolFlags::FUNCTION
+        && arrow_owner.check_flags() == CheckFlags::NONE
+        && arrow_owner.name() == InternalSymbolName::Function.as_ref()
+        && arrow_owner.declarations() == Some(&[declaration])
+        && arrow_owner.value_declaration() == Some(declaration)
+        && arrow_owner.members().is_none()
+        && arrow_owner.exports().is_none()
+        && arrow_owner.parent().is_none()
+        && arrow_owner.export_symbol().is_none()
+        && host.symbol_matches(store, declaration, owner)
+        && store.get_merged_symbol(owner) == Some(owner)
+        && store.authenticated_interface_method_owner(method) == Some((array, target))
+}
+
 /// Authenticates ordinary extra callback parameters against a zero-arity target.
 #[allow(clippy::too_many_lines)] // Keep the arrow, call, callee, and target proof together.
 pub(super) fn source_direct_call_arrow_has_zero_parameter_target(
@@ -3552,6 +3632,9 @@ fn stored_direct_call_argument_arrow_is_exact(
     let Some(SourceNodeParent::Parent(call)) = store.source_node_parent(declaration) else {
         return false;
     };
+    if stored_array_sort_argument_arrow_is_exact(store, declaration, owner_symbol, call) {
+        return true;
+    }
     let Some(SourceNodeParent::Parent(container)) = store.source_node_parent(call) else {
         return false;
     };
@@ -3596,6 +3679,81 @@ fn stored_direct_call_argument_arrow_is_exact(
         && owner.parent().is_none()
         && owner.export_symbol().is_none()
         && store.get_merged_symbol(owner_symbol) == Some(owner_symbol)
+}
+
+fn stored_array_sort_argument_arrow_is_exact(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    call: NodeRef,
+) -> bool {
+    let Some(owner) = store.symbol(owner_symbol) else {
+        return false;
+    };
+    if store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+        || store.source_node_kind(call) != Some(SyntaxKind::CallExpression)
+        || owner.flags() != SymbolFlags::FUNCTION
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name() != InternalSymbolName::Function.as_ref()
+        || owner.declarations() != Some(&[declaration])
+        || owner.value_declaration() != Some(declaration)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+    {
+        return false;
+    }
+
+    let mut property = None;
+    for index in 0..declaration.node.index() {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let candidate = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            ts_ast::NodeId::new(index),
+        );
+        if store.source_node_kind(candidate) == Some(SyntaxKind::PropertyAccessExpression)
+            && store.source_node_parent(candidate) == Some(SourceNodeParent::Parent(call))
+            && property.replace(candidate).is_some()
+        {
+            return false;
+        }
+    }
+    let Some(property) = property else {
+        return false;
+    };
+    let Some(method) = store
+        .symbol_node_links(property)
+        .and_then(|links| links.resolved_symbol)
+    else {
+        return false;
+    };
+    let Some(array) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("Array"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(target) = store
+        .declared_type_links(array)
+        .and_then(|links| links.declared_type)
+    else {
+        return false;
+    };
+    store
+        .symbol(method)
+        .is_some_and(|symbol| symbol.name().as_utf8() == Some("sort"))
+        && store.authenticated_interface_method_owner(method) == Some((array, target))
+        && store
+            .type_node_links(property)
+            .and_then(|links| links.resolved_type)
+            .is_some()
 }
 
 fn is_direct_noncontextual_source_arrow(
@@ -7706,7 +7864,7 @@ fn publish_prepared_contextual_source_callable(
     let target_valid = if direct_call_anchor {
         valid_direct_call_contextual_target(store, prepared.contextual_target, prepared.parameters)
             && prepared.flags == SignatureFlags::NONE
-            && prepared.min_argument_count == 1
+            && usize::try_from(prepared.min_argument_count).ok() == Some(parameter_count)
     } else {
         matches!(
             validate_stored_function_type(store, prepared.contextual_target),
@@ -7883,17 +8041,9 @@ fn valid_direct_call_contextual_target(
     target: TypeId,
     parameters: &[ContextualSourceCallableParameter],
 ) -> bool {
-    let [parameter] = parameters else {
+    if parameters.is_empty() {
         return false;
-    };
-    valid_direct_call_contextual_target_type(store, target, parameter.type_)
-}
-
-fn valid_direct_call_contextual_target_type(
-    store: &CanonicalTypeMapperStore,
-    target: TypeId,
-    expected_parameter: TypeId,
-) -> bool {
+    }
     let StoredSingleCallableValidation::Valid { callable, .. } =
         validate_stored_single_callable(store, target)
     else {
@@ -7908,19 +8058,28 @@ fn valid_direct_call_contextual_target_type(
     signature.type_parameters().is_empty()
         && !signature.has_rest_parameter()
         && callable.rest_parameter.is_none()
-        && if stored_promise_executor_contextual_target_is_exact(store, signature) {
-            callable.min_argument_count == 2
-                && matches!(callable.parameters.as_slice(), [first, _] if *first == expected_parameter)
-        } else {
-            callable.min_argument_count >= 1
-                && (source_parameter == expected_parameter
-                    || super::source_calls::authenticated_array_callback_contextual_target(
-                        store,
-                        target,
-                        source_parameter,
-                        expected_parameter,
-                    ))
-        }
+        && (callable.min_argument_count == parameters.len()
+            && callable.parameters.len() == parameters.len()
+            && callable
+                .parameters
+                .iter()
+                .zip(parameters)
+                .all(|(expected, parameter)| *expected == parameter.type_)
+            || parameters.len() == 1
+                && callable.min_argument_count >= 1
+                && super::source_calls::authenticated_array_callback_contextual_target(
+                    store,
+                    target,
+                    source_parameter,
+                    parameters[0].type_,
+                )
+            || parameters.len() == 1
+                && callable.min_argument_count == 2
+                && matches!(
+                    callable.parameters.as_slice(),
+                    [first, _] if *first == parameters[0].type_
+                )
+                && stored_promise_executor_contextual_target_is_exact(store, signature))
 }
 
 fn stored_promise_executor_contextual_target_is_exact(
@@ -9375,12 +9534,44 @@ pub(super) fn validate_stored_source_callable(
         let target_valid = target != type_
             && if direct_call_anchor {
                 signature_record.flags() == SignatureFlags::NONE
-                    && signature_record.min_argument_count() == 1
-                    && expected_parameter_types.is_some_and(|types| match types {
-                        [parameter] => {
-                            valid_direct_call_contextual_target_type(store, target, *parameter)
-                        }
-                        _ => false,
+                    && usize::try_from(signature_record.min_argument_count()).ok()
+                        == Some(signature_record.parameters().len())
+                    && expected_parameter_types.is_some_and(|types| {
+                        let StoredSingleCallableValidation::Valid { callable, .. } =
+                            validate_stored_single_callable(store, target)
+                        else {
+                            return false;
+                        };
+                        let Some(signature) = store.signature(callable.signature) else {
+                            return false;
+                        };
+                        !types.is_empty()
+                            && signature.type_parameters().is_empty()
+                            && !signature.has_rest_parameter()
+                            && callable.rest_parameter.is_none()
+                            && (callable.min_argument_count == types.len()
+                                && callable.parameters.as_slice() == types
+                                || types.len() == 1
+                                    && callable.min_argument_count >= 1
+                                    && callable.parameters.first().copied().is_some_and(
+                                        |source_parameter| {
+                                            super::source_calls::authenticated_array_callback_contextual_target(
+                                                store,
+                                                target,
+                                                source_parameter,
+                                                types[0],
+                                            )
+                                        },
+                                    )
+                                || types.len() == 1
+                                    && callable.min_argument_count == 2
+                                    && matches!(
+                                        callable.parameters.as_slice(),
+                                        [first, _] if *first == types[0]
+                                    )
+                                    && stored_promise_executor_contextual_target_is_exact(
+                                        store, signature,
+                                    ))
                     })
             } else {
                 matches!(
@@ -13760,6 +13951,68 @@ mod tests {
             StoredSourceCallableValidation::Valid(_)
         ));
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn array_sort_callbacks_retain_bound_tuple_parameter_symbols() {
+        let mut fixture = QueryFixture::new(
+            concat!(
+                "interface Array<T> { sort(compare: (first: T, second: T) => number): this; } ",
+                "declare const values: [string, any][]; ",
+                "values.sort(([firstKey, firstValue], [secondKey, secondValue]) => 0);",
+            ),
+            FileId::new(1_250),
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let array = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("Array"))
+            .unwrap();
+        fixture.store.merge_global_symbol(globals, array).unwrap();
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        fixture
+            .store
+            .get_declared_type_of_symbol(&host, array)
+            .unwrap();
+        let before = publication_state(&fixture.store);
+
+        assert_eq!(
+            source_direct_call_argument_arrow_is_exact(&fixture.store, &host, declaration),
+            Ok(true),
+        );
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        assert_eq!(plan.parameters.len(), 2);
+        assert_eq!(plan.min_argument_count, 2);
+        for (index, parameter) in plan.parameters.iter().enumerate() {
+            assert!(parameter.is_implicit_any());
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol(parameter.symbol)
+                    .and_then(|symbol| symbol.name().as_utf8()),
+                Some(["__0", "__1"][index]),
+            );
+        }
+        assert_eq!(publication_state(&fixture.store), before);
     }
 
     #[test]

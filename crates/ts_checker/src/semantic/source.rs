@@ -7674,6 +7674,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     ) -> Result<Vec<PlannedParameterInitializer>, SourceCheckError> {
         let mut initializers = Vec::new();
         for (entered, parameter) in callable.parameters.iter().enumerate() {
+            let bindings = match self.callable_parameter_binding_symbols(parameter) {
+                Ok(bindings) => bindings,
+                Err(error) => {
+                    self.leave_callable_parameter_prefix_scope(callable, entered)?;
+                    return Err(error);
+                }
+            };
             if let Some(initializer) = parameter.initializer {
                 self.primitive_binary_position_roots.insert(initializer);
                 let expression = match self.plan_expression(initializer) {
@@ -7703,8 +7710,85 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     parameter.declaration,
                 ));
             }
+            for (index, binding) in bindings.iter().copied().enumerate() {
+                let inserted_prior = self.prior_variables.insert(binding);
+                let inserted_readable = self.readable_variables.insert(binding);
+                if !inserted_prior || !inserted_readable {
+                    if inserted_prior {
+                        self.prior_variables.remove(&binding);
+                    }
+                    if inserted_readable {
+                        self.readable_variables.remove(&binding);
+                    }
+                    for binding in &bindings[..index] {
+                        self.prior_variables.remove(binding);
+                        self.readable_variables.remove(binding);
+                    }
+                    self.prior_variables.remove(&parameter.symbol);
+                    self.readable_variables.remove(&parameter.symbol);
+                    self.leave_callable_parameter_prefix_scope(callable, entered)?;
+                    return Err(callable_parameter_execution_error(
+                        callable,
+                        parameter.declaration,
+                    ));
+                }
+            }
         }
         Ok(initializers)
+    }
+
+    fn callable_parameter_binding_symbols(
+        &self,
+        parameter: &SourceCallableParameterPlan,
+    ) -> Result<Vec<SemanticSymbolId>, SourceCheckError> {
+        let record = self.node(parameter.declaration)?;
+        let NodeData::ParameterDeclaration(syntax) = &record.data else {
+            return Err(SourceCheckError::Arrow(parameter.declaration));
+        };
+        let name = self.reference(syntax.name);
+        let name_record = self.node(name)?;
+        let NodeData::BindingPattern(pattern) = &name_record.data else {
+            return Ok(Vec::new());
+        };
+        if name_record.kind != SyntaxKind::ArrayBindingPattern
+            || !super::source_calls::is_authenticated_sort_tuple_binding(
+                self.arena, name.node, pattern,
+            )
+        {
+            return Err(SourceCheckError::Arrow(parameter.declaration));
+        }
+        let Some((store, _)) = self.semantic else {
+            return Err(SourceCheckError::Arrow(parameter.declaration));
+        };
+        let mut bindings = Vec::with_capacity(pattern.elements.nodes.len());
+        for element in &pattern.elements.nodes {
+            let element = self.reference(*element);
+            let Some(symbol) = self
+                .bound
+                .symbol(element)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+            else {
+                return Err(SourceCheckError::Arrow(element));
+            };
+            let Some(binding) = store.symbol(symbol) else {
+                return Err(SourceCheckError::Arrow(element));
+            };
+            if binding.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                || binding.check_flags() != CheckFlags::NONE
+                || binding.declarations() != Some(&[element])
+                || binding.value_declaration() != Some(element)
+                || binding.members().is_some()
+                || binding.exports().is_some()
+                || binding.parent().is_some()
+                || binding.export_symbol().is_some()
+                || symbol == parameter.symbol
+                || bindings.contains(&symbol)
+            {
+                return Err(SourceCheckError::Arrow(element));
+            }
+            bindings.push(symbol);
+        }
+        Ok(bindings)
     }
 
     fn leave_callable_parameter_scope(
@@ -7721,6 +7805,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     ) -> Result<(), SourceCheckError> {
         let mut invalid = None;
         for parameter in callable.parameters.iter().take(entered) {
+            for binding in self.callable_parameter_binding_symbols(parameter)? {
+                let removed_prior = self.prior_variables.remove(&binding);
+                let removed_readable = self.readable_variables.remove(&binding);
+                if (!removed_prior || !removed_readable) && invalid.is_none() {
+                    invalid = Some(parameter.declaration);
+                }
+            }
             let removed_prior = self.prior_variables.remove(&parameter.symbol);
             let removed_readable = self.readable_variables.remove(&parameter.symbol);
             if (!removed_prior || !removed_readable) && invalid.is_none() {
@@ -21831,6 +21922,25 @@ fn source_is_global_array_concat_method(host: &DeclaredTypeHost<'_>, node: NodeR
     )
 }
 
+fn source_is_global_object_factory_method(host: &DeclaredTypeHost<'_>, node: NodeRef) -> bool {
+    let Some(NodeData::PropertyAccessExpression(property)) =
+        host.node(node).map(|record| &record.data)
+    else {
+        return false;
+    };
+    let receiver = NodeRef::new(node.arena, node.file, property.expression);
+    let name = NodeRef::new(node.arena, node.file, property.name);
+    matches!(
+        (
+            host.node(receiver).map(|record| &record.data),
+            host.node(name).map(|record| &record.data),
+        ),
+        (Some(NodeData::Identifier(receiver)), Some(NodeData::Identifier(name)))
+            if receiver.text == "Object"
+                && matches!(name.text.as_str(), "entries" | "keys" | "values")
+    )
+}
+
 fn emit_enum_use_before_declaration_diagnostics(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -22357,6 +22467,7 @@ fn check_expression_type(
             ) || source_global_wrapper_method_name(host, property.node).is_some()
                 || source_is_global_array_concat_method(host, property.node)
                 || source_global_array_callback_method_name(host, property.node).is_some()
+                || source_is_global_object_factory_method(host, property.node)
                 || matches!(
                     &property.receiver.unparenthesized().kind,
                     PlannedExpressionKind::Identifier(read)
@@ -23832,19 +23943,30 @@ fn check_contextual_direct_call_arrow(
     let unsupported = || {
         SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(arrow.callable.declaration))
     };
-    let [parameter] = arrow.callable.parameters.as_slice() else {
+    let parameters = arrow.callable.parameters.as_slice();
+    if parameters.is_empty() {
         return Err(unsupported());
-    };
-    if !parameter.is_implicit_any()
-        || parameter.optional
-        || parameter.rest
-        || parameter.initializer.is_some()
+    }
+    if parameters.iter().any(|parameter| {
+        !parameter.is_implicit_any()
+            || parameter.optional
+            || parameter.rest
+            || parameter.initializer.is_some()
+    }) || parameters.len() > 1
+        && host
+            .source(arrow.callable.declaration)
+            .is_none_or(|(arena, _)| {
+                !super::source_calls::is_authenticated_sort_callback_syntax(
+                    arena,
+                    arrow.callable.declaration,
+                )
+            })
         || !arrow.parameter_initializers.is_empty()
         || arrow.expression_statement.is_some()
         || !arrow.callable.type_parameters.is_empty()
         || !arrow.callable.return_type.is_inferred()
         || arrow.callable.flags != super::signatures::SignatureFlags::NONE
-        || arrow.callable.min_argument_count != 1
+        || usize::try_from(arrow.callable.min_argument_count).ok() != Some(parameters.len())
     {
         return Err(unsupported());
     }
@@ -23860,34 +23982,97 @@ fn check_contextual_direct_call_arrow(
     let promise_executor =
         source_promise_constructor_argument_arrow_is_exact(store, host, arrow.callable.declaration)
             .map_err(SourcePlanner::callable_plan_error)?;
-    let Some(parameter_type) = target.parameters.first().copied() else {
+    let Some(first_parameter_type) = target.parameters.first().copied() else {
         return Err(unsupported());
+    };
+    let array_parameter_type = if !promise_executor && parameters.len() == 1 {
+        super::source_calls::array_callback_contextual_parameter_type(
+            store,
+            host,
+            global_types,
+            arrow.callable.declaration,
+            contextual_type,
+            first_parameter_type,
+        )?
+    } else {
+        None
     };
     if !signature.type_parameters().is_empty()
         || signature.has_rest_parameter()
         || target.rest_parameter.is_some()
-        || target.min_argument_count == 0
-        || promise_executor && (target.parameters.len() != 2 || target.min_argument_count != 2)
+        || if promise_executor {
+            parameters.len() != 1 || target.min_argument_count != 2 || target.parameters.len() != 2
+        } else if array_parameter_type.is_some() {
+            target.min_argument_count == 0
+        } else {
+            target.min_argument_count != parameters.len()
+                || target.parameters.len() != parameters.len()
+        }
     {
         return Err(unsupported());
     }
-    let parameter_type = super::source_calls::array_callback_contextual_parameter_type(
-        store,
-        host,
-        global_types,
-        arrow.callable.declaration,
-        contextual_type,
-        parameter_type,
-    )?
-    .unwrap_or(parameter_type);
     let mut flow_types = current_flow_types.clone();
-    if flow_types
-        .insert(parameter.symbol, parameter_type)
-        .is_some()
+    let mut prepared_parameters = Vec::with_capacity(parameters.len());
+    let mut binding_types = Vec::new();
+    for (index, (parameter, parameter_type)) in
+        parameters.iter().zip(&target.parameters).enumerate()
     {
-        return Err(SourceCheckError::Variable(
-            VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
-        ));
+        let parameter_type = if index == 0 {
+            array_parameter_type.unwrap_or(*parameter_type)
+        } else {
+            *parameter_type
+        };
+        if flow_types
+            .insert(parameter.symbol, parameter_type)
+            .is_some()
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
+            ));
+        }
+        for (binding, type_) in
+            contextual_sort_parameter_binding_types(store, host, parameter, parameter_type)?
+        {
+            if flow_types.insert(binding, type_).is_some() {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::DuplicateCurrentFlowType(binding),
+                ));
+            }
+            let expected = ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            };
+            if store
+                .value_symbol_links(binding)
+                .is_some_and(|links| links != &ValueSymbolLinks::default() && links != &expected)
+            {
+                return Err(SourceCheckError::Arrow(parameter.declaration));
+            }
+            binding_types.push((binding, type_));
+        }
+        prepared_parameters.push(ContextualSourceCallableParameter {
+            declaration: parameter.declaration,
+            symbol: parameter.symbol,
+            type_: parameter_type,
+        });
+    }
+    let missing_binding_links = binding_types
+        .iter()
+        .filter(|(binding, _)| store.value_symbol_links(*binding).is_none())
+        .count();
+    if !store.try_reserve_value_symbol_links(missing_binding_links) {
+        return Err(SourceCheckError::Arrow(arrow.callable.declaration));
+    }
+    for (binding, type_) in binding_types {
+        if !store.set_value_symbol_links(
+            binding,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ) {
+            return Err(SourceCheckError::Arrow(arrow.callable.declaration));
+        }
     }
     let return_type = match &arrow.body {
         PlannedArrowBody::Empty => {
@@ -23924,11 +24109,7 @@ fn check_contextual_direct_call_arrow(
             declaration: arrow.callable.declaration,
             owner_symbol: arrow.callable.owner_symbol,
             contextual_target: contextual_type,
-            parameters: vec![ContextualSourceCallableParameter {
-                declaration: parameter.declaration,
-                symbol: parameter.symbol,
-                type_: parameter_type,
-            }],
+            parameters: prepared_parameters,
             flags: arrow.callable.flags,
             min_argument_count: arrow.callable.min_argument_count,
             return_type,
@@ -23937,6 +24118,61 @@ fn check_contextual_direct_call_arrow(
     .map_err(SourcePlanner::callable_plan_error)?;
     publish_expression_type(store, arrow.callable.declaration, callable)?;
     Ok(CheckedExpressionTypes::leaf(callable, callable))
+}
+
+fn contextual_sort_parameter_binding_types(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    parameter: &SourceCallableParameterPlan,
+    type_: TypeId,
+) -> Result<Vec<(SemanticSymbolId, TypeId)>, SourceCheckError> {
+    let record = host
+        .node(parameter.declaration)
+        .ok_or(SourceCheckError::Arrow(parameter.declaration))?;
+    let NodeData::ParameterDeclaration(syntax) = &record.data else {
+        return Err(SourceCheckError::Arrow(parameter.declaration));
+    };
+    let name = NodeRef::new(
+        parameter.declaration.arena,
+        parameter.declaration.file,
+        syntax.name,
+    );
+    let name_record = host
+        .node(name)
+        .ok_or(SourceCheckError::Arrow(parameter.declaration))?;
+    let NodeData::BindingPattern(pattern) = &name_record.data else {
+        return Ok(Vec::new());
+    };
+    let tuple = store
+        .canonical_tuple_shape(type_)
+        .map_err(|_| SourceCheckError::Arrow(parameter.declaration))?
+        .ok_or(SourceCheckError::Arrow(parameter.declaration))?;
+    if name_record.kind != SyntaxKind::ArrayBindingPattern
+        || pattern.elements.nodes.len() != tuple.element_types().len()
+    {
+        return Err(SourceCheckError::Arrow(parameter.declaration));
+    }
+    let (_, bound) = host
+        .source(parameter.declaration)
+        .ok_or(SourceCheckError::Arrow(parameter.declaration))?;
+    pattern
+        .elements
+        .nodes
+        .iter()
+        .zip(tuple.element_types())
+        .map(|(element, type_)| {
+            let element = NodeRef::new(
+                parameter.declaration.arena,
+                parameter.declaration.file,
+                *element,
+            );
+            let symbol = bound
+                .symbol(element)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .ok_or(SourceCheckError::Arrow(element))?;
+            Ok((symbol, *type_))
+        })
+        .collect()
 }
 
 fn recover_contextual_string_property(
@@ -47011,6 +47247,142 @@ mod tests {
     }
 
     #[test]
+    fn global_object_factory_methods_preserve_declared_array_results_cold_and_warm() {
+        let library = parsed(concat!(
+            "interface IArguments {} ",
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface Object {} ",
+            "interface ObjectConstructor { ",
+            "keys(value: object): string[]; ",
+            "values(value: {}): any[]; ",
+            "entries(value: {}): [string, any][]; ",
+            "} declare var Object: ObjectConstructor; ",
+            "interface Function {} interface String {} interface Number {} ",
+            "interface Boolean {} interface RegExp {} interface ThisType<T> {}",
+        ));
+        let source = parsed(concat!(
+            "const names = Object.keys({ value: 1 }); ",
+            "const values = Object.values({ value: 1 }); ",
+            "const entries = Object.entries({ value: 1 });",
+        ));
+        let library_file = FileId::new(9_490);
+        let source_file = FileId::new(9_491);
+        let mut context = context_with_cross_file_global(
+            library_file,
+            &library,
+            source_file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::Script,
+            true,
+        );
+
+        context.check_source_file(source_file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        for (name, expected) in [
+            ("names", "string[]"),
+            ("values", "any[]"),
+            ("entries", "[string, any][]"),
+        ] {
+            assert_eq!(
+                context
+                    .type_to_string(variable_value_type(&context, &source, source_file, name))
+                    .unwrap(),
+                expected,
+            );
+        }
+        let constructor = context
+            .store()
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| context.store().symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("ObjectConstructor"))
+            .and_then(|symbol| context.store().get_merged_symbol(symbol))
+            .unwrap();
+        for (access_id, access) in source
+            .arena
+            .iter()
+            .filter(|(_, node)| node.kind == SyntaxKind::PropertyAccessExpression)
+        {
+            let NodeData::PropertyAccessExpression(property) = &access.data else {
+                unreachable!("the selected node is a property access")
+            };
+            let NodeData::Identifier(name) = &source.arena.get(property.name).unwrap().data else {
+                unreachable!("Object factory methods have identifier names")
+            };
+            let expected = context
+                .store()
+                .symbol(constructor)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source(&name.text))
+                .unwrap();
+            let access = NodeRef::new(source.arena.id(), source_file, access_id);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(access)
+                    .and_then(|links| links.resolved_symbol),
+                Some(expected),
+            );
+        }
+
+        let warm = observable_state(&context, source_file);
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(observable_state(&context, source_file), warm);
+    }
+
+    #[test]
+    fn global_object_factory_argument_diagnostics_preserve_source_order() {
+        let library = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Object {} ",
+            "interface ObjectConstructor { ",
+            "keys(value: object): string[]; ",
+            "values(value: object): any[]; ",
+            "} declare var Object: ObjectConstructor;",
+        ));
+        let source = parsed("Object.keys(1); Object.values('wrong');");
+        let library_file = FileId::new(9_494);
+        let source_file = FileId::new(9_495);
+        let mut context = context_with_cross_file_global(
+            library_file,
+            &library,
+            source_file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::Script,
+            true,
+        );
+
+        context.check_source_file(source_file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2345, 2345],
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Argument of type 'number' is not assignable to parameter of type 'object'.",
+                "Argument of type 'string' is not assignable to parameter of type 'object'.",
+            ],
+        );
+
+        let warm = observable_state(&context, source_file);
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(observable_state(&context, source_file), warm);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Keep merged Math ownership and intrinsic JSX state together.
     fn merged_math_globals_drive_intrinsic_union_jsx_tags_cold_and_warm() {
         let library = parsed(concat!(
@@ -60112,6 +60484,154 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn optional_contextual_callbacks_drop_undefined_before_parameter_inference() {
+        let source = parsed(concat!(
+            "declare function consume(callback?: (value: number) => number): void; ",
+            "consume(value => value);",
+        ));
+        let file = FileId::new(8_354);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let arrow = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::ArrowFunction(syntax) = &source.arena.get(arrow.node).unwrap().data else {
+            panic!("expected the optional callback arrow")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, syntax.parameters.nodes[0]);
+        let parameter = context.file(file).unwrap().1.symbol(parameter).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(parameter)
+                .and_then(|links| links.resolved_type),
+            Some(context.store().intrinsic_bootstrap().unwrap().number_type),
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn array_sort_contextualizes_binder_owned_tuple_callback_elements() {
+        let library = parsed(concat!(
+            "interface Array<T> { ",
+            "sort(compare: (first: [string, any], second: [string, any]) => number): ",
+            "[string, any][]; ",
+            "} interface ReadonlyArray<T> {}",
+        ));
+        let source = parsed(concat!(
+            "declare const values: [string, any][]; ",
+            "const sorted = values.sort(([firstKey, firstValue], ",
+            "[secondKey, secondValue]) => 0);",
+        ));
+        let library_file = FileId::new(9_492);
+        let source_file = FileId::new(9_493);
+        let mut context = context(
+            &[(library_file, &library), (source_file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let method = library
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodSignature).then_some(NodeRef::new(
+                    library.arena.id(),
+                    library_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::MethodSignatureDeclaration(method_data) =
+            &library.arena.get(method.node).unwrap().data
+        else {
+            panic!("the global array retains its real sort method declaration")
+        };
+        let parameter = method_data.parameters.nodes[0];
+        let NodeData::ParameterDeclaration(parameter_data) =
+            &library.arena.get(parameter).unwrap().data
+        else {
+            panic!("the sort method retains its comparator parameter")
+        };
+        let callback_type = NodeRef::new(
+            library.arena.id(),
+            library_file,
+            parameter_data.type_.unwrap(),
+        );
+        context.get_type_from_type_node(callback_type).unwrap();
+
+        context.check_source_file(library_file).unwrap();
+        context.check_source_file(source_file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(
+                    &context,
+                    &source,
+                    source_file,
+                    "sorted"
+                ))
+                .unwrap(),
+            "[string, any][]",
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (_, bound) = context.file(source_file).unwrap();
+        for (node, record) in source.arena.iter() {
+            let NodeData::BindingElement(binding) = &record.data else {
+                continue;
+            };
+            let name = binding.name.unwrap();
+            let NodeData::Identifier(identifier) = &source.arena.get(name).unwrap().data else {
+                panic!("sort tuple binding elements must retain identifier names")
+            };
+            let element = NodeRef::new(source.arena.id(), source_file, node);
+            let symbol = bound.symbol(element).unwrap();
+            let expected = if identifier.text.ends_with("Key") {
+                bootstrap.string_type
+            } else {
+                bootstrap.any_type
+            };
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+            );
+        }
+
+        let warm = observable_state(&context, source_file);
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(observable_state(&context, source_file), warm);
     }
 
     #[test]

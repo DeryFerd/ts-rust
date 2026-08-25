@@ -654,15 +654,23 @@ pub(super) fn check_direct_source_property(
                     receiver_type,
                 )? {
                     Some(method) => Some(method),
-                    None => match resolve_published_canonical_array_property(
+                    None => match resolve_published_global_object_constructor_method(
                         store,
                         global_types,
                         plan,
                         receiver_type,
                     )? {
-                        Some(CanonicalArrayProperty::Present(property)) => Some(property),
-                        Some(CanonicalArrayProperty::Missing) => None,
-                        None => store.resolved_own_property(receiver_type, &plan.name)?,
+                        Some(method) => Some(method),
+                        None => match resolve_published_canonical_array_property(
+                            store,
+                            global_types,
+                            plan,
+                            receiver_type,
+                        )? {
+                            Some(CanonicalArrayProperty::Present(property)) => Some(property),
+                            Some(CanonicalArrayProperty::Missing) => None,
+                            None => store.resolved_own_property(receiver_type, &plan.name)?,
+                        },
                     },
                 },
             },
@@ -1175,6 +1183,156 @@ fn resolve_published_global_math_random_method(
         || signature.resolved_return_type() != Some(bootstrap.number_type)
     {
         return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+
+    Ok(Some(ResolvedOwnProperty {
+        symbol,
+        type_,
+        optional: false,
+        readonly: false,
+    }))
+}
+
+/// Reads an authenticated, already-published global `Object` factory method.
+fn resolve_published_global_object_constructor_method(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+) -> Result<Option<ResolvedOwnProperty>, SourcePropertyError> {
+    let Some(global_types) = global_types else {
+        return Ok(None);
+    };
+    if !matches!(plan.name.as_str(), "entries" | "keys" | "values")
+        || !matches!(plan.position, SourcePropertyPosition::CallCallee(_))
+    {
+        return Ok(None);
+    }
+    let PlannedExpressionKind::Identifier(receiver) = &plan.receiver.unparenthesized().kind else {
+        return Ok(None);
+    };
+    let invalid = || SourcePropertyError::InvalidCache(plan.node);
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    let globals = store.symbol_table(bootstrap.globals).ok_or_else(invalid)?;
+    let Some(global_object) = globals
+        .get_source("Object")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(None);
+    };
+    if receiver.value_symbol != global_object {
+        return Ok(None);
+    }
+    let Some(owner) = globals
+        .get_source("ObjectConstructor")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(None);
+    };
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    let receiver_record = store.type_payload(receiver_type).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = receiver_record.data() else {
+        return Err(invalid());
+    };
+    let allowed_owner_flags = SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT;
+    if receiver_record.flags() != TypeFlags::OBJECT
+        || !receiver_record
+            .object_flags()
+            .contains(ObjectFlags::INTERFACE)
+        || receiver_record
+            .object_flags()
+            .intersects(ObjectFlags::CLASS)
+        || receiver_record.alias().is_some()
+        || receiver_record.symbol() != Some(owner)
+        || owner_record.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        || owner_record.flags().without(allowed_owner_flags) != SymbolFlags::NONE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name().as_utf8() != Some("ObjectConstructor")
+        || owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(receiver_type)
+        || interface
+            .all_type_parameters
+            .as_ref()
+            .is_some_and(|parameters| !parameters.is_empty())
+    {
+        return Err(invalid());
+    }
+    let members = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(invalid)?;
+    let Some(symbol) = members
+        .get_source(&plan.name)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(None);
+    };
+    let method = store.symbol(symbol).ok_or_else(invalid)?;
+    if method.flags() != SymbolFlags::METHOD
+        || method.check_flags() != CheckFlags::NONE
+        || method.name().as_utf8() != Some(plan.name.as_str())
+        || store.authenticated_interface_method_owner(symbol) != Some((owner, receiver_type))
+    {
+        return Err(invalid());
+    }
+    let links = store
+        .value_symbol_links(symbol)
+        .ok_or(RelationUnavailable::UnresolvedPropertyType(symbol))?;
+    let type_ = links
+        .resolved_type
+        .ok_or(RelationUnavailable::UnresolvedPropertyType(symbol))?;
+    if links
+        != &(ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        })
+    {
+        return Err(invalid());
+    }
+    let StoredCallableSetValidation::Valid { projection, .. } =
+        validate_stored_callable_set(store, type_)
+    else {
+        return Err(invalid());
+    };
+    if projection.owner != type_
+        || !projection.construct_signatures.is_empty()
+        || projection.call_signatures.is_empty()
+    {
+        return Err(invalid());
+    }
+    for signature in &projection.call_signatures {
+        let return_type = signature.return_type.ok_or_else(invalid)?;
+        let array = store
+            .canonical_array_reference(global_types, return_type)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        if signature.owner != type_
+            || signature.parameters.len() != 1
+            || signature.min_argument_count != 1
+            || signature.rest_parameter.is_some()
+            || array.readonly
+            || match plan.name.as_str() {
+                "keys" => array.element_type != bootstrap.string_type,
+                "entries" => store
+                    .canonical_tuple_shape(array.element_type)
+                    .map_err(|_| invalid())?
+                    .is_none_or(|tuple| {
+                        tuple.element_types().len() != 2
+                            || tuple.element_types()[0] != bootstrap.string_type
+                    }),
+                "values" => false,
+                _ => unreachable!("only authenticated Object factory methods are admitted"),
+            }
+        {
+            return Err(invalid());
+        }
     }
 
     Ok(Some(ResolvedOwnProperty {
