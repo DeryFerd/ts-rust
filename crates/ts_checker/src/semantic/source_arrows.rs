@@ -75,6 +75,7 @@ pub(super) struct SourceContextualParameterPlan {
 }
 
 /// The bounded inferred-return shapes admitted by contextual source arrows.
+#[allow(clippy::enum_variant_names)] // Every variant explicitly records inferred provenance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceContextualReturnOrigin {
     InferredEmptyBody {
