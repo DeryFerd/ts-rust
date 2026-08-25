@@ -1154,37 +1154,62 @@ enum ConditionalPrimitiveDomain {
     Symbol,
 }
 
+const MAX_CONDITIONAL_PRIMITIVE_UNION_CONSTITUENTS: usize = 16;
+const MAX_CONDITIONAL_PRIMITIVE_COMPARISONS: usize = 64;
+
 pub(super) fn conditional_operands_have_disjoint_primitive_domains(
     store: &CanonicalTypeMapperStore,
     check_type: TypeId,
     extends_type: TypeId,
 ) -> bool {
-    let Some((check, check_domain)) = conditional_primitive_operand(store, check_type) else {
+    let Some(check) = conditional_primitive_operand_identity(store, check_type) else {
         return false;
     };
-    let Some((extends, extends_domain)) = conditional_primitive_operand(store, extends_type) else {
+    let Some(extends) = conditional_primitive_operand_identity(store, extends_type) else {
         return false;
     };
-    if check_domain != extends_domain {
-        return true;
+    let Some(check_count) = conditional_primitive_operand_count(store, check) else {
+        return false;
+    };
+    let Some(extends_count) = conditional_primitive_operand_count(store, extends) else {
+        return false;
+    };
+    if check_count
+        .checked_mul(extends_count)
+        .is_none_or(|count| count > MAX_CONDITIONAL_PRIMITIVE_COMPARISONS)
+    {
+        return false;
     }
 
-    matches!(
-        (
-            store.type_payload(check).map(TypeRecord::data),
-            store.type_payload(extends).map(TypeRecord::data),
-        ),
-        (Some(TypeData::Literal(check)), Some(TypeData::Literal(extends)))
-            if check.value != extends.value
-    )
+    if check_count == 1 && extends_count == 1 {
+        let Some(check) = conditional_primitive_leaf(store, check) else {
+            return false;
+        };
+        let Some(extends) = conditional_primitive_leaf(store, extends) else {
+            return false;
+        };
+        return conditional_primitive_pair_is_disjoint(store, check, extends);
+    }
+
+    let Some(checks) = conditional_primitive_operands(store, check) else {
+        return false;
+    };
+    let Some(bounds) = conditional_primitive_operands(store, extends) else {
+        return false;
+    };
+    checks.iter().all(|check| {
+        bounds
+            .iter()
+            .all(|bound| conditional_primitive_pair_is_disjoint(store, *check, *bound))
+    })
 }
 
-fn conditional_primitive_operand(
+fn conditional_primitive_operand_identity(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
-) -> Option<(TypeId, ConditionalPrimitiveDomain)> {
+) -> Option<TypeId> {
     let record = store.type_payload(type_)?;
-    let primitive = match record.data() {
+    match record.data() {
         TypeData::TypeParameter(parameter) => {
             cached_ordinary_type_parameter_owner(store, type_)?;
             let constraint = parameter.constraint?;
@@ -1199,22 +1224,95 @@ fn conditional_primitive_operand(
             {
                 return None;
             }
-            constraint
+            Some(constraint)
         }
-        _ => type_,
+        _ => Some(type_),
+    }
+}
+
+fn conditional_primitive_operand_count(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<usize> {
+    let record = store.type_payload(type_)?;
+    match record.data() {
+        TypeData::Union(union)
+            if (2..=MAX_CONDITIONAL_PRIMITIVE_UNION_CONSTITUENTS)
+                .contains(&union.union.types.len()) =>
+        {
+            Some(union.union.types.len())
+        }
+        TypeData::Union(_) => None,
+        _ => conditional_primitive_domain(record.flags()).map(|_| 1),
+    }
+}
+
+fn conditional_primitive_operands(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<Vec<(TypeId, ConditionalPrimitiveDomain)>> {
+    let record = store.type_payload(type_)?;
+    let TypeData::Union(union) = record.data() else {
+        return conditional_primitive_leaf(store, type_).map(|value| vec![value]);
     };
-    let domain = match store.type_payload(primitive)?.flags() {
+    if !(2..=MAX_CONDITIONAL_PRIMITIVE_UNION_CONSTITUENTS).contains(&union.union.types.len())
+        || union.union.types.iter().any(|constituent| {
+            store
+                .type_payload(*constituent)
+                .and_then(|record| conditional_primitive_domain(record.flags()))
+                .is_none()
+        })
+        || store.validate_union_constituent(type_).is_err()
+    {
+        return None;
+    }
+
+    union
+        .union
+        .types
+        .iter()
+        .map(|constituent| conditional_primitive_leaf(store, *constituent))
+        .collect()
+}
+
+fn conditional_primitive_leaf(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<(TypeId, ConditionalPrimitiveDomain)> {
+    let domain = conditional_primitive_domain(store.type_payload(type_)?.flags())?;
+    if store.validate_union_constituent(type_).is_err() {
+        return None;
+    }
+    Some((type_, domain))
+}
+
+fn conditional_primitive_domain(flags: TypeFlags) -> Option<ConditionalPrimitiveDomain> {
+    Some(match flags {
         TypeFlags::STRING | TypeFlags::STRING_LITERAL => ConditionalPrimitiveDomain::String,
         TypeFlags::NUMBER | TypeFlags::NUMBER_LITERAL => ConditionalPrimitiveDomain::Number,
         TypeFlags::BIG_INT | TypeFlags::BIG_INT_LITERAL => ConditionalPrimitiveDomain::BigInt,
         TypeFlags::BOOLEAN | TypeFlags::BOOLEAN_LITERAL => ConditionalPrimitiveDomain::Boolean,
         TypeFlags::ES_SYMBOL | TypeFlags::UNIQUE_ES_SYMBOL => ConditionalPrimitiveDomain::Symbol,
         _ => return None,
-    };
-    if store.validate_union_constituent(primitive).is_err() {
-        return None;
+    })
+}
+
+fn conditional_primitive_pair_is_disjoint(
+    store: &CanonicalTypeMapperStore,
+    (check, check_domain): (TypeId, ConditionalPrimitiveDomain),
+    (extends, extends_domain): (TypeId, ConditionalPrimitiveDomain),
+) -> bool {
+    if check_domain != extends_domain {
+        return true;
     }
-    Some((primitive, domain))
+    matches!(
+        (
+            store.type_payload(check).map(TypeRecord::data),
+            store.type_payload(extends).map(TypeRecord::data),
+        ),
+        (Some(TypeData::Literal(check)), Some(TypeData::Literal(extends)))
+            if check.value != extends.value
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // Tail recursion retains the current root and active mapper.
@@ -3970,6 +4068,309 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Primitive and literal unions share one bounded proof matrix.
+    fn bounded_primitive_union_constraints_reduce_only_disjoint_members() {
+        for (keep_true, use_literals) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let source = if keep_true {
+                concat!(
+                    "type Select<T, U> = T extends U ? T : never; ",
+                    "type Caller<Value, Other> = Value;",
+                )
+            } else {
+                concat!(
+                    "type Select<T, U> = T extends U ? never : T; ",
+                    "type Caller<Value, Other> = Value;",
+                )
+            };
+            let mut fixture = Fixture::new(source);
+            let node = fixture.conditional();
+            let parameter = fixture.type_parameter("T");
+            let bound = fixture.type_parameter("U");
+            let checked = fixture.type_parameter("Value");
+            let other = fixture.type_parameter("Other");
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let (string, number, bigint, symbol, never) = (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.bigint_type,
+                bootstrap.es_symbol_type,
+                bootstrap.never_type,
+            );
+            let (constraint_members, disjoint_members, overlapping_members) = if use_literals {
+                let left = fixture
+                    .store
+                    .regular_string_literal_type("left".to_owned())
+                    .unwrap();
+                let center = fixture
+                    .store
+                    .regular_string_literal_type("center".to_owned())
+                    .unwrap();
+                let right = fixture
+                    .store
+                    .regular_string_literal_type("right".to_owned())
+                    .unwrap();
+                let other = fixture
+                    .store
+                    .regular_string_literal_type("other".to_owned())
+                    .unwrap();
+                ([left, center], [right, other], [center, right])
+            } else {
+                ([string, bigint], [number, symbol], [string, number])
+            };
+            let constraint =
+                canonical_anonymous_union(&mut fixture.store, &constraint_members).unwrap();
+            let disjoint =
+                canonical_anonymous_union(&mut fixture.store, &disjoint_members).unwrap();
+            let overlapping =
+                canonical_anonymous_union(&mut fixture.store, &overlapping_members).unwrap();
+            assert!(fixture.store.set_type_parameter_resolution(
+                checked,
+                Some(constraint),
+                None,
+                None,
+                None,
+            ));
+            assert!(fixture.store.set_type_parameter_resolution(
+                other,
+                Some(disjoint),
+                None,
+                None,
+                None,
+            ));
+            assert!(conditional_operands_have_disjoint_primitive_domains(
+                &fixture.store,
+                checked,
+                disjoint,
+            ));
+            assert!(conditional_operands_have_disjoint_primitive_domains(
+                &fixture.store,
+                checked,
+                other,
+            ));
+            assert!(conditional_operands_have_disjoint_primitive_domains(
+                &fixture.store,
+                constraint,
+                disjoint,
+            ));
+            assert!(!conditional_operands_have_disjoint_primitive_domains(
+                &fixture.store,
+                checked,
+                overlapping,
+            ));
+
+            let branch_types = if keep_true {
+                branches(parameter, never)
+            } else {
+                branches(never, parameter)
+            };
+            let conditional = get_type_from_conditional_type(
+                &mut fixture.store,
+                ConditionalTypeRequest {
+                    node,
+                    check_type: parameter,
+                    extends_type: bound,
+                    branches: branch_types,
+                    infer_type_parameters: &[],
+                    outer_type_parameters: &[parameter, bound],
+                    alias: None,
+                },
+                None,
+            )
+            .unwrap();
+            for actual_bound in [disjoint, other] {
+                assert_eq!(
+                    get_conditional_type_instantiation(
+                        &mut fixture.store,
+                        ConditionalTypeInstantiation {
+                            conditional_type: conditional,
+                            type_arguments: &[checked, actual_bound],
+                            branches: branch_types,
+                            alias: None,
+                            for_constraint: false,
+                        },
+                        None,
+                        None,
+                    ),
+                    Ok(if keep_true { never } else { checked }),
+                );
+            }
+
+            let unresolved = get_conditional_type_instantiation(
+                &mut fixture.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &[checked, overlapping],
+                    branches: branch_types,
+                    alias: None,
+                    for_constraint: false,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(matches!(
+                fixture.store.type_payload(unresolved).map(TypeRecord::data),
+                Some(TypeData::Conditional(_))
+            ));
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.conditional_root_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &[checked, disjoint],
+                        branches: branch_types,
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None,
+                ),
+                Ok(if keep_true { never } else { checked }),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.mapper_len(),
+                    fixture.store.conditional_root_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_union_disjointness_enforces_constituent_and_comparison_limits() {
+        let mut fixture = Fixture::new("type Caller<Value> = Value;");
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let mut strings = Vec::new();
+        for index in 0..=MAX_CONDITIONAL_PRIMITIVE_UNION_CONSTITUENTS {
+            strings.push(
+                fixture
+                    .store
+                    .regular_string_literal_type(format!("value-{index}"))
+                    .unwrap(),
+            );
+        }
+        let bounded = canonical_anonymous_union(
+            &mut fixture.store,
+            &strings[..MAX_CONDITIONAL_PRIMITIVE_UNION_CONSTITUENTS],
+        )
+        .unwrap();
+        let oversized = canonical_anonymous_union(&mut fixture.store, &strings).unwrap();
+        assert!(conditional_operands_have_disjoint_primitive_domains(
+            &fixture.store,
+            bounded,
+            number,
+        ));
+        assert!(!conditional_operands_have_disjoint_primitive_domains(
+            &fixture.store,
+            oversized,
+            number,
+        ));
+
+        let bounded_comparisons =
+            canonical_anonymous_union(&mut fixture.store, &strings[..8]).unwrap();
+        let excessive_comparisons =
+            canonical_anonymous_union(&mut fixture.store, &strings[..9]).unwrap();
+        let mut numbers = Vec::new();
+        for value in 0..8 {
+            numbers.push(
+                fixture
+                    .store
+                    .regular_number_literal_type(ts_jsnum::Number::new(f64::from(value)))
+                    .unwrap(),
+            );
+        }
+        let right = canonical_anonymous_union(&mut fixture.store, &numbers).unwrap();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert!(conditional_operands_have_disjoint_primitive_domains(
+            &fixture.store,
+            bounded_comparisons,
+            right,
+        ));
+        assert!(!conditional_operands_have_disjoint_primitive_domains(
+            &fixture.store,
+            excessive_comparisons,
+            right,
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn primitive_union_disjointness_rejects_forged_union_identities() {
+        let mut fixture = Fixture::new("type Caller<Value> = Value;");
+        let checked = fixture.type_parameter("Value");
+        let left = fixture
+            .store
+            .regular_string_literal_type("left".to_owned())
+            .unwrap();
+        let right = fixture
+            .store
+            .regular_string_literal_type("right".to_owned())
+            .unwrap();
+        let canonical = canonical_anonymous_union(&mut fixture.store, &[left, right]).unwrap();
+        let members = match fixture.store.type_payload(canonical).unwrap().data() {
+            TypeData::Union(union) => union.union.types.clone(),
+            _ => panic!("two distinct string literals must retain a canonical union"),
+        };
+        let forged = fixture
+            .store
+            .alloc_union_type(ObjectFlags::NONE, members)
+            .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_type_parameter_resolution(
+            checked,
+            Some(canonical),
+            None,
+            None,
+            None,
+        ));
+        assert!(conditional_operands_have_disjoint_primitive_domains(
+            &fixture.store,
+            checked,
+            number,
+        ));
+        assert!(!conditional_operands_have_disjoint_primitive_domains(
+            &fixture.store,
+            forged,
+            number,
+        ));
+        assert!(fixture.store.set_type_parameter_resolution(
+            checked,
+            Some(forged),
+            None,
+            None,
+            None,
+        ));
+        assert!(!conditional_operands_have_disjoint_primitive_domains(
+            &fixture.store,
+            checked,
+            number,
+        ));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // One proof covers forged literals, owners, and cycles.
     fn disjoint_primitive_conditional_proofs_reject_forged_caches() {
         let mut fixture = Fixture::new("type Caller<Value, Other> = Value;");
@@ -4466,6 +4867,111 @@ mod tests {
                 .map(TypeRecord::data),
             Some(TypeData::Conditional(_))
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Alias resolution covers primitive and literal union proofs.
+    fn constrained_conditional_alias_type_nodes_reduce_bounded_disjoint_primitive_unions() {
+        for (source, preserves_parameter) in [
+            (
+                concat!(
+                    "type Extract<T, U> = T extends U ? T : never; ",
+                    "type Result<Value extends string | bigint> = ",
+                    "Extract<Value, number | symbol>;",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "type Exclude<T, U> = T extends U ? never : T; ",
+                    "type Result<Value extends string | bigint> = ",
+                    "Exclude<Value, number | symbol>;",
+                ),
+                true,
+            ),
+            (
+                concat!(
+                    "type Extract<T, U> = T extends U ? T : never; ",
+                    "type Result<Value extends 'a' | 'b'> = ",
+                    "Extract<Value, 'c' | 'd'>;",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "type Exclude<T, U> = T extends U ? never : T; ",
+                    "type Result<Value extends 'a' | 'b'> = ",
+                    "Exclude<Value, 'c' | 'd'>;",
+                ),
+                true,
+            ),
+            (
+                concat!(
+                    "type Extract<T, U> = T extends U ? T : never; ",
+                    "type Result<Value extends string | bigint, ",
+                    "Bound extends number | symbol> = Extract<Value, Bound>;",
+                ),
+                false,
+            ),
+        ] {
+            let mut fixture = Fixture::new(source);
+            let checked = fixture.type_parameter("Value");
+            let expected = if preserves_parameter {
+                checked
+            } else {
+                fixture.store.intrinsic_bootstrap().unwrap().never_type
+            };
+            assert_eq!(fixture.declared_alias("Result"), expected);
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.conditional_root_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(fixture.declared_alias("Result"), expected);
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.conditional_root_len(),
+                    fixture.store.mapper_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+
+        let mut uncertain = Fixture::new(concat!(
+            "type Extract<T, U> = T extends U ? T : never; ",
+            "type Result<Value extends string | number> = ",
+            "Extract<Value, number | symbol>;",
+        ));
+        let checked = uncertain.type_parameter("Value");
+        let unresolved = uncertain.declared_alias("Result");
+        let TypeData::Conditional(data) = uncertain.store.type_payload(unresolved).unwrap().data()
+        else {
+            panic!("overlapping primitive unions must retain a deferred conditional")
+        };
+        assert_eq!(data.check_type, checked);
+        assert!(data.resolved_true_type.is_none());
+        assert!(data.resolved_false_type.is_none());
+
+        let warm = (
+            uncertain.store.type_len(),
+            uncertain.store.conditional_root_len(),
+            uncertain.store.mapper_len(),
+            uncertain.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(uncertain.declared_alias("Result"), unresolved);
+        assert_eq!(
+            (
+                uncertain.store.type_len(),
+                uncertain.store.conditional_root_len(),
+                uncertain.store.mapper_len(),
+                uncertain.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
     }
 
     #[test]
