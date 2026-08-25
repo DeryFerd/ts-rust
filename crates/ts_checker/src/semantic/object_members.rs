@@ -1506,6 +1506,13 @@ pub(super) fn plan_interface(
     plan.heritage = heritage;
     if let Some(method) = plan.methods.first()
         && (!value_declarations.is_empty()
+            && !authenticated_global_math_random_interface(
+                store,
+                host,
+                symbol,
+                &value_declarations,
+                &plan,
+            )
             || symbol_record.name().as_utf8() == Some("IntrinsicElements")
                 && store
                     .get_parent_of_symbol(symbol)
@@ -1732,6 +1739,114 @@ pub(super) fn plan_interface(
         });
     }
     Ok(plan)
+}
+
+fn authenticated_global_math_random_interface(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    value_declarations: &[NodeRef],
+    plan: &PropertyObjectPlan,
+) -> bool {
+    let ([declaration], [method]) = (value_declarations, plan.methods.as_slice()) else {
+        return false;
+    };
+    let declaration = *declaration;
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    let allowed =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    let global = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("Math"))
+        .and_then(|global| store.get_merged_symbol(global));
+    let Some(bound) = host.bound_file(declaration) else {
+        return false;
+    };
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let Some(declaration_record) = host.node(declaration) else {
+        return false;
+    };
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return false;
+    };
+    let Some(annotation) = variable
+        .type_
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return false;
+    };
+    let Some(annotation_record) = host.node(annotation) else {
+        return false;
+    };
+    let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+        return false;
+    };
+    let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+    let Some(name_record) = host.node(name) else {
+        return false;
+    };
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return false;
+    };
+    let Some(method_record) = store.symbol(method.symbol) else {
+        return false;
+    };
+    let Some(return_type) = host.node(method.return_type) else {
+        return false;
+    };
+    let method_is_default_library = host
+        .bound_file(method.declaration)
+        .and_then(ts_binder::BoundFile::source_facts)
+        .is_some_and(|facts| facts.is_declaration_file() && facts.is_default_library());
+
+    owner.name().as_utf8() == Some("Math")
+        && owner
+            .flags()
+            .contains(SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        && owner.flags().without(allowed) == SymbolFlags::NONE
+        && owner.parent().is_none()
+        && owner.value_declaration() == Some(declaration)
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && global == Some(symbol)
+        && facts.is_declaration_file()
+        && facts.is_default_library()
+        && !facts.is_javascript_file()
+        && !facts.is_external_or_common_js_module()
+        && declaration_record.kind == SyntaxKind::VariableDeclaration
+        && declaration_record.flags.0 == 0
+        && variable.initializer.is_none()
+        && variable.exclamation_token.is_none()
+        && variable.local_symbol.is_none()
+        && variable.symbol.is_none()
+        && variable.facts == 0
+        && host.symbol_matches(store, declaration, symbol)
+        && annotation_record.kind == SyntaxKind::TypeReference
+        && annotation_record.flags.0 == 0
+        && annotation_record.parent == Some(declaration.node)
+        && reference.type_arguments.is_none()
+        && name_record.kind == SyntaxKind::Identifier
+        && name_record.flags.0 == 0
+        && name_record.parent == Some(annotation.node)
+        && identifier.flow_node.is_none()
+        && identifier.text == "Math"
+        && method_record.name().as_utf8() == Some("random")
+        && method.parameters.is_empty()
+        && method.flags == SignatureFlags::NONE
+        && method.minimum_argument_count == 0
+        && return_type.kind == SyntaxKind::NumberKeyword
+        && return_type.flags.0 == 0
+        && return_type.parent == Some(method.declaration.node)
+        && method_is_default_library
+        && plan.accessors.is_empty()
+        && plan.spreads.is_empty()
+        && plan.indexes.is_empty()
+        && plan.call_signatures.is_empty()
+        && plan.heritage.is_none()
 }
 
 /// Combines reopened interface clauses without duplicating authenticated bases.
@@ -13422,6 +13537,42 @@ mod generic_publication_tests {
             warm,
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn merged_interface_methods_stay_unsupported_outside_default_library_math_random() {
+        for (index, source) in [
+            "interface Shared { random(): number } declare var Shared: Shared;",
+            "interface Math { random(): number } declare var Math: Math;",
+            "interface Math { random(value: number): number } declare var Math: Math;",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = interface_fixture(source, 3_795 + u32::try_from(index).unwrap());
+            let host = host(&fixture.parsed, &fixture.bound);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                plan_interface(&fixture.store, &host, fixture.symbol),
+                Err(PropertyObjectError::UnsupportedMember {
+                    kind: SyntaxKind::MethodSignature,
+                    ..
+                })
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
     }
 
     #[test]
