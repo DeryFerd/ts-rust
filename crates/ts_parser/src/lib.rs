@@ -17559,23 +17559,23 @@ export as namespace GlobalName;
     #[test]
     fn escaped_jsx_identifiers_report_exact_diagnostics_without_false_tag_mismatches() {
         for (source, spelling, decoded) in [
-            (r#"const view = <\u0061></a>;"#, r"\u0061", "a"),
-            (r#"const view = <\u0061-b></a-b>;"#, r"\u0061-b", "a-b"),
-            (r#"const view = <a-\u0063></a-c>;"#, r"a-\u0063", "a-c"),
-            (r#"const view = <Comp\u0061 />;"#, r"Comp\u0061", "Compa"),
+            (r"const view = <\u0061></a>;", r"\u0061", "a"),
+            (r"const view = <\u0061-b></a-b>;", r"\u0061-b", "a-b"),
+            (r"const view = <a-\u0063></a-c>;", r"a-\u0063", "a-c"),
+            (r"const view = <Comp\u0061 />;", r"Comp\u0061", "Compa"),
             (
-                r#"const view = <value.\u0076ideo />;"#,
+                r"const view = <value.\u0076ideo />;",
                 r"\u0076ideo",
                 "video",
             ),
-            (r#"const view = <\u{0061}></a>;"#, r"\u{0061}", "a"),
+            (r"const view = <\u{0061}></a>;", r"\u{0061}", "a"),
             (
-                r#"const view = <video data-\u0076ideo />;"#,
+                r"const view = <video data-\u0076ideo />;",
                 r"data-\u0076ideo",
                 "data-video",
             ),
             (r#"const view = <video \u0073rc="" />;"#, r"\u0073rc", "src"),
-            (r#"const view = <a></\u0061>;"#, r"\u0061", "a"),
+            (r"const view = <a></\u0061>;", r"\u0061", "a"),
         ] {
             let result = parse_jsx_source_file(source);
             let start = u32::try_from(source.find(spelling).unwrap()).unwrap();
@@ -17678,7 +17678,7 @@ export as namespace GlobalName;
 
     #[test]
     fn escaped_jsx_closing_tags_compare_decoded_names_and_keep_real_mismatch_ranges() {
-        let equivalent = parse_jsx_source_file(r#"const view = <\u006es:\u0074hing></ns:thing>;"#);
+        let equivalent = parse_jsx_source_file(r"const view = <\u006es:\u0074hing></ns:thing>;");
         assert_eq!(
             equivalent
                 .diagnostics
@@ -17688,7 +17688,7 @@ export as namespace GlobalName;
             [Some(17021), Some(17021)],
         );
 
-        let source = r#"const view = <\u0061></other>;"#;
+        let source = r"const view = <\u0061></other>;";
         let mismatch = parse_jsx_source_file(source);
         let escaped_start = u32::try_from(source.find(r"\u0061").unwrap()).unwrap();
         let closing_start = u32::try_from(source.find("other").unwrap()).unwrap();
