@@ -34411,8 +34411,7 @@ fn publish_imported_namespace_augmentation_exports(
             let target = store
                 .symbol(resolved.target_symbol)
                 .ok_or(SourceCheckError::Import(binding.declaration))?;
-            if !target.flags().intersects(SymbolFlags::MODULE)
-                || !target.flags().intersects(SymbolFlags::VALUE)
+            if !target.flags().contains(SymbolFlags::VALUE_MODULE)
                 || store.get_merged_symbol(resolved.target_symbol) != Some(resolved.target_symbol)
             {
                 continue;
@@ -59697,7 +59696,64 @@ mod tests {
         .unwrap();
 
         context.check_source_file(library_file).unwrap();
+        let owner = variable_symbol(&context, &library, library_file, "callable");
+        let (_, library_bound) = context.file(library_file).unwrap();
+        let module = library_bound.symbol(library_bound.source_file()).unwrap();
+        let assignment = context
+            .store()
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .and_then(|exports| exports.get(ts_binder::InternalSymbolName::ExportEquals.as_ref()))
+            .unwrap();
+        let import = extension
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NamespaceImport).then_some(NodeRef::new(
+                    extension.arena.id(),
+                    extension_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, extension_bound) = context.file(extension_file).unwrap();
+        let alias = extension_bound.symbol(import).unwrap();
+        let original_exports = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::exports);
+        let original_module_links = context.store().module_symbol_links(owner).cloned();
+
         context.check_source_file(extension_file).unwrap();
+
+        assert_eq!(
+            context.store().symbol(owner).unwrap().flags(),
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::NAMESPACE_MODULE,
+        );
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(alias)
+                .map(|links| (links.immediate_target, links.alias_target)),
+            Some((Some(assignment), AliasTargetState::Resolved(owner))),
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::exports),
+            original_exports,
+        );
+        assert_eq!(
+            context.store().module_symbol_links(owner),
+            original_module_links.as_ref(),
+        );
+        assert!(
+            original_exports
+                .and_then(|exports| context.store().symbol_table(exports))
+                .is_none_or(|exports| exports.get_source("extra").is_none())
+        );
 
         let [diagnostic] = context.diagnostics().as_slice() else {
             panic!("expected one diagnostic for augmenting an exported non-module value")
@@ -59715,6 +59771,31 @@ mod tests {
         let warm = observable_state(&context, extension_file);
         context.recheck_source_file(extension_file).unwrap();
         assert_eq!(observable_state(&context, extension_file), warm);
+
+        let mut forged = context.store().alias_symbol_links(alias).unwrap().clone();
+        forged.immediate_target = Some(owner);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_alias_symbol_links(alias, forged)
+        );
+        let forged_state = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert!(matches!(
+            context.recheck_source_file(extension_file),
+            Err(SourceCheckError::Import(node)) if node == import
+        ));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            forged_state,
+        );
     }
 
     #[test]
