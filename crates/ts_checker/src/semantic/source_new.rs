@@ -38,11 +38,11 @@ use super::{
     functions::plan_function_type,
     jsdoc::leading_jsdoc_comment,
     object_members::{
-        PropertyObjectPlan, object_literal_state, plan_interface, plan_object_literal,
-        plan_type_literal, publish_object_literal,
+        PropertyObjectPlan, PropertyObjectState, object_literal_state, plan_interface,
+        plan_object_literal, plan_type_literal, publish_object_literal,
     },
     reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
-    signatures::SignatureFlags,
+    signatures::{Signature, SignatureFlags},
     source::{PlannedExpression, PlannedExpressionKind},
     source_callables::source_promise_constructor_argument_arrow_is_exact,
     source_imports::SourceImportBindingPlan,
@@ -493,10 +493,7 @@ pub(super) fn promise_executor_missing_argument_is_exact(
     let NodeData::Identifier(identifier) = &callee_record.data else {
         return false;
     };
-    let Some(annotation) = store
-        .signature(signature)
-        .and_then(|record| record.declaration())
-    else {
+    let Some(annotation) = store.signature(signature).and_then(Signature::declaration) else {
         return false;
     };
     let Some(resolve_parameter) = host
@@ -580,7 +577,7 @@ pub(super) fn promise_executor_missing_argument_is_exact(
             == Some(SyntaxKind::ConstructSignature)
         && store
             .symbol(owner)
-            .and_then(|owner| owner.members())
+            .and_then(ts_binder::semantic::Symbol::members)
             .and_then(|members| store.symbol_table(members))
             .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
             .and_then(|constructor| store.symbol(constructor))
@@ -3870,7 +3867,7 @@ pub(super) fn check_direct_default_new(
                             invariant(SourceNewInvariant::InvalidExpressionCache(argument.node))
                         })?
                         .filter(|state| state.is_resolved())
-                        .map(|state| state.type_id())
+                        .map(PropertyObjectState::type_id)
                         .ok_or_else(|| {
                             invariant(SourceNewInvariant::InvalidExpressionCache(argument.node))
                         });
@@ -4712,7 +4709,7 @@ fn cached_argument_type(
                 .map(|state| {
                     state
                         .filter(|state| state.is_resolved())
-                        .map(|state| state.type_id())
+                        .map(PropertyObjectState::type_id)
                 })
                 .map_err(|_| invariant(SourceNewInvariant::InvalidExpressionCache(argument.node)));
         }
