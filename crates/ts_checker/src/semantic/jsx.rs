@@ -14998,7 +14998,7 @@ mod runtime_tests {
             "interface Props<T> { value: T; }\n",
             "declare function Widget<T>(props: Props<T>): any;\n",
             "declare function forward<T>(props: Props<T>): Props<T>;\n",
-            "declare function select<T>(names: readonly string[], props: Props<T>): Props<T>;\n",
+            "declare function select(names: readonly string[], props: Props<number>): Props<number>;\n",
             "declare const numbers: Props<number>;\n",
             "const direct = <Widget {...forward(numbers)} />;\n",
             "const selected = <Widget {...select(['value'], numbers)} />;\n",
