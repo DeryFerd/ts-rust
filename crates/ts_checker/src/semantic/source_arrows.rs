@@ -1258,6 +1258,13 @@ pub(super) fn plan_contextual_source_arrow(
                     host.node(NodeRef::new(parameter.arena, parameter.file, token))
                         .is_none_or(|record| record.range.end > annotation_record.range.start)
                 })
+                || annotation_record.kind.is_keyword_type()
+                    && store.type_node_links(annotation).is_some_and(|links| {
+                        links.outer_type_parameters.is_some()
+                            || links.resolved_type.is_some_and(|cached| {
+                                !store.source_direct_type_annotation_is_exact(annotation, cached)
+                            })
+                    })
             {
                 return Err(contextual_invariant(
                     SourceContextualArrowInvariant::InvalidParameter(annotation),
