@@ -966,7 +966,10 @@ fn plan_jsx_attributes(
         if let NodeData::JsxSpreadAttribute(spread) = &record.data {
             let expression = child_ref(node, spread.expression);
             let expression_record = jsx_node(arena, bound, store, expression)?;
-            return if expression_record.kind == SyntaxKind::Identifier {
+            return if matches!(
+                expression_record.kind,
+                SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
+            ) {
                 plan_jsx_source_spread(arena, bound, store, attributes_node, node)
                     .map(|spread| JsxAttributesPlan::SourceSpread(Box::new(spread)))
             } else {
@@ -1199,10 +1202,15 @@ fn plan_jsx_source_spread(
         node,
         child_ref(node, spread.expression),
     )?;
+    let receiver = match &value {
+        JsxScalarPlan::Identifier { .. } => &value,
+        JsxScalarPlan::Property { receiver, .. } => receiver.as_ref(),
+        _ => return Err(unsupported(node, SyntaxKind::JsxSpreadAttribute)),
+    };
     let JsxScalarPlan::Identifier {
         node: identifier,
         name,
-    } = &value
+    } = receiver
     else {
         return Err(unsupported(node, SyntaxKind::JsxSpreadAttribute));
     };
@@ -6234,8 +6242,9 @@ fn check_jsx_source_spread(
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Vec<CheckedJsxAttribute>, SourceCheckError> {
-    let JsxScalarPlan::Identifier { node, .. } = &spread.value else {
-        return Err(unsupported(spread.node, SyntaxKind::JsxSpreadAttribute));
+    let node = match &spread.value {
+        JsxScalarPlan::Identifier { node, .. } | JsxScalarPlan::Property { node, .. } => node,
+        _ => return Err(unsupported(spread.node, SyntaxKind::JsxSpreadAttribute)),
     };
     let type_ = execute_scalar(
         store,
@@ -13473,6 +13482,147 @@ mod runtime_tests {
                 context.store().checker_link_allocated_lengths(),
             ),
             cold,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Inference, spread ownership, and warm publication share one graph.
+    fn generic_jsx_components_infer_property_access_spreads_and_replay_warm() {
+        let source = concat!(
+            "declare namespace JSX { interface Element {} }\n",
+            "interface Props<T> { value: T; }\n",
+            "interface NumberSource { props: Props<number>; }\n",
+            "interface StringSource { props: Props<string>; }\n",
+            "declare function Widget<T>(props: Props<T>): any;\n",
+            "declare const numbers: NumberSource;\n",
+            "declare const strings: StringSource;\n",
+            "const numeric = <Widget {...numbers.props} />;\n",
+            "const textual = <Widget {...strings.props} />;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_188);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/generic-jsx-property-spread.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let expected = [bootstrap.number_type, bootstrap.string_type];
+        let mut checked = 0;
+        for (node, record) in parsed.arena.iter() {
+            let NodeData::JsxSelfClosingElement(element) = &record.data else {
+                continue;
+            };
+            let opening = NodeRef::new(parsed.arena.id(), file, node);
+            let signature = context
+                .store()
+                .signature_links(opening)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let callable = context.store().signature(signature).unwrap();
+            assert!(callable.type_parameters().is_empty());
+            let [parameter] = callable.parameters() else {
+                panic!("the specialized JSX component must keep its one props parameter")
+            };
+            let props = context
+                .store()
+                .value_symbol_links(*parameter)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let inferred = validate_direct_generic_reference(context.store(), props).unwrap();
+            assert_eq!(inferred.type_arguments.as_slice(), &[expected[checked]]);
+
+            let attributes = child_ref(opening, element.attributes);
+            let NodeData::JsxAttributes(attribute_list) =
+                &parsed.arena.get(attributes.node).unwrap().data
+            else {
+                panic!("the component must retain its JSX attributes")
+            };
+            let [spread] = attribute_list.properties.nodes.as_slice() else {
+                panic!("the component must retain its one source spread")
+            };
+            let spread = child_ref(attributes, *spread);
+            let NodeData::JsxSpreadAttribute(value) = &parsed.arena.get(spread.node).unwrap().data
+            else {
+                panic!("the JSX attribute must remain a spread")
+            };
+            let donor = child_ref(spread, value.expression);
+            assert_eq!(
+                parsed.arena.get(donor.node).unwrap().kind,
+                SyntaxKind::PropertyAccessExpression,
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(donor)
+                    .and_then(|links| links.resolved_type),
+                Some(props),
+            );
+            let object_type = context
+                .store()
+                .type_node_links(attributes)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let member = context
+                .store()
+                .type_payload(object_type)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source("value"))
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(member)
+                    .and_then(|links| links.resolved_type),
+                Some(expected[checked]),
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, expected.len());
+
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
         );
     }
 
