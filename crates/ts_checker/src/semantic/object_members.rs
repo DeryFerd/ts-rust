@@ -1571,6 +1571,13 @@ pub(super) fn plan_interface(
         let mut effective_base_properties =
             Vec::<Vec<PlannedProperty>>::with_capacity(heritage.bases.len());
         for base in &heritage.bases {
+            if !base.type_arguments.is_empty() {
+                plan_generic_interface(store, host, base.symbol)?;
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: base.node,
+                    kind: SyntaxKind::ExpressionWithTypeArguments,
+                });
+            }
             let base_plan = plan_interface(store, host, base.symbol)?;
             if let Some(index) = base_plan.indexes.first() {
                 return Err(PropertyObjectError::UnsupportedMember {

@@ -2230,6 +2230,82 @@ mod tests {
     }
 
     #[test]
+    fn react_portal_generic_base_is_unsupported_without_forging_interface_corruption() {
+        let library = parse_source_file(concat!(
+            "interface Array<Value> { length: number }\n",
+            "declare var Array: any;\n",
+            "interface ReadonlyArray<Value> {}\n",
+        ));
+        let source = parse_source_file(concat!(
+            "declare module 'react' {\n",
+            "  export = React;\n",
+            "  namespace React {\n",
+            "    type Key = string | number;\n",
+            "    interface ComponentClass<Props> {}\n",
+            "    interface SFC<Props> {}\n",
+            "    interface ReactElement<Props> {\n",
+            "      type: string | ComponentClass<Props> | SFC<Props>;\n",
+            "      props: Props;\n",
+            "      key: Key | null;\n",
+            "    }\n",
+            "    interface ReactPortal extends ReactElement<any> {\n",
+            "      key: Key | null;\n",
+            "      children: string;\n",
+            "    }\n",
+            "  }\n",
+            "  type MergePropTypes<Props, Inferred> = Props & Inferred;\n",
+            "}\n",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let (context, library_file, source_file) =
+            default_library_heritage_context(&library, &source, true);
+        let element = interface_symbol(&source, source_file, &context, "ReactElement");
+        let portal = interface_symbol(&source, source_file, &context, "ReactPortal");
+        let planned = heritage_plan(&source, source_file, &context, "ReactPortal").unwrap();
+        let [base] = planned.bases.as_slice() else {
+            panic!("ReactPortal must retain its single ReactElement<any> base")
+        };
+        assert_eq!(base.symbol, element);
+        assert_eq!(base.type_arguments.len(), 1);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(source_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let cold = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            crate::semantic::object_members::plan_interface(context.store(), &host, portal),
+            Err(
+                crate::semantic::object_members::PropertyObjectError::UnsupportedMember {
+                    node: base.node,
+                    kind: SyntaxKind::ExpressionWithTypeArguments,
+                }
+            ),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+    }
+
+    #[test]
     fn react_array_heritage_rejects_non_default_library_lookalikes_without_publication() {
         let library = parse_source_file(concat!(
             "interface Array<Value> { length: number }\n",
