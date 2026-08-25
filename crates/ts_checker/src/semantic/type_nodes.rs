@@ -22297,6 +22297,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
         );
+        let Ok(attribute_element_symbol) =
+            planner.resolve_uncached_type_reference_symbol(nested_element)
+        else {
+            return false;
+        };
+        let Some(attribute_element) = self
+            .store
+            .declared_type_links(attribute_element_symbol)
+            .and_then(|links| links.declared_type)
+        else {
+            return false;
+        };
         if self
             .store
             .symbol(reference.symbol)
@@ -22307,8 +22319,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .symbol(element_constraint_symbol)
                 .and_then(|owner| owner.name().as_utf8())
                 != Some("HTMLElement")
+            || attribute_element != *element && attribute_element != *element_constraint
+            || self
+                .store
+                .type_node_links(nested_element)
+                .and_then(|links| links.resolved_type)
+                != Some(attribute_element)
             || !planner.is_default_library_dom_interface_argument(*element_node, element_symbol)
-            || !planner.is_default_library_dom_interface_argument(nested_element, element_symbol)
+            || !planner
+                .is_default_library_dom_interface_argument(nested_element, attribute_element_symbol)
             || !planner.is_default_library_dom_interface_argument(
                 element_plan.node,
                 element_constraint_symbol,
@@ -22369,7 +22388,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             != Some(attribute_plan.parameter)
             || cached_ordinary_type_parameter_owner(self.store, *element_parameter)
                 != Some(element_plan.parameter)
-            || derived.type_arguments.as_slice() != [*element]
+            || derived.type_arguments.as_slice() != [attribute_element]
             || base.type_arguments.as_slice() != [*element_parameter]
             || self
                 .store
@@ -35297,7 +35316,10 @@ mod tests {
             "interface HTMLHyperlinkElementUtils { href: string; } ",
             "interface HTMLAnchorElement extends HTMLElement, HTMLHyperlinkElementUtils { ",
             "addEventListener<Value extends string>(type: Value): void; ",
-            "} declare var HTMLAnchorElement: unknown;",
+            "} declare var HTMLAnchorElement: unknown; ",
+            "interface HTMLHeadElement extends HTMLElement { ",
+            "addEventListener<Value extends string>(type: Value): void; ",
+            "} declare var HTMLHeadElement: unknown;",
         ));
         let react = parse_source_file(concat!(
             "declare module 'react' { ",
@@ -35316,6 +35338,7 @@ mod tests {
             "} ",
             "interface ReactHTML { ",
             "a: DetailedHTMLFactory<AnchorHTMLAttributes<HTMLAnchorElement>, HTMLAnchorElement>; ",
+            "head: DetailedHTMLFactory<HTMLAttributes<HTMLElement>, HTMLHeadElement>; ",
             "} } }",
         ));
         let (mut context, library_file, react_file) =
@@ -35335,6 +35358,16 @@ mod tests {
             .store()
             .symbol_table(globals)
             .and_then(|symbols| symbols.get_source("HTMLAnchorElement"))
+            .unwrap();
+        let head = context
+            .store()
+            .symbol_table(globals)
+            .and_then(|symbols| symbols.get_source("HTMLHeadElement"))
+            .unwrap();
+        let html_element = context
+            .store()
+            .symbol_table(globals)
+            .and_then(|symbols| symbols.get_source("HTMLElement"))
             .unwrap();
         let references = react_dom_type_references(&react, react_file, "HTMLAnchorElement");
         assert_eq!(references.len(), 2);
@@ -35376,8 +35409,48 @@ mod tests {
             .unwrap();
         assert!(context.store().value_symbol_links(method).is_none());
 
+        let head_annotation = react_dom_property_annotation(&react, react_file, "head");
+        let head_resolved = context.get_type_from_type_node(head_annotation).unwrap();
+        let head_reference =
+            validate_direct_generic_reference(context.store(), head_resolved).unwrap();
+        let head_type = context
+            .store()
+            .declared_type_links(head)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let html_element_type = context
+            .store()
+            .declared_type_links(html_element)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        assert_eq!(head_reference.type_arguments[1], head_type);
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), head_reference.type_arguments[0])
+                .unwrap()
+                .type_arguments,
+            [html_element_type],
+        );
+        let TypeData::Interface(head_interface) =
+            context.store().type_payload(head_type).unwrap().data()
+        else {
+            panic!("the head factory must retain its exact DOM element identity")
+        };
+        assert!(!head_interface.declared_members_resolved);
+        let head_method = context
+            .store()
+            .symbol(head)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("addEventListener"))
+            .unwrap();
+        assert!(context.store().value_symbol_links(head_method).is_none());
+
         let warm = store_state(context.store());
         assert_eq!(context.get_type_from_type_node(annotation), Ok(resolved));
+        assert_eq!(
+            context.get_type_from_type_node(head_annotation),
+            Ok(head_resolved),
+        );
         assert_eq!(store_state(context.store()), warm);
 
         let factory = context
@@ -35451,6 +35524,51 @@ mod tests {
             Some(Some(attributes)),
         );
         assert_eq!(context.get_type_from_type_node(annotation), Ok(resolved));
+
+        let NodeData::TypeReferenceNode(factory_reference) =
+            &react.arena.get(head_annotation.node).unwrap().data
+        else {
+            panic!("the head property must retain its factory reference")
+        };
+        let attributes = NodeRef::new(
+            head_annotation.arena,
+            head_annotation.file,
+            factory_reference.type_arguments.as_ref().unwrap().nodes[0],
+        );
+        let NodeData::TypeReferenceNode(attribute_reference) =
+            &react.arena.get(attributes.node).unwrap().data
+        else {
+            panic!("the head property must retain its nested HTMLAttributes reference")
+        };
+        let nested_element = NodeRef::new(
+            attributes.arena,
+            attributes.file,
+            attribute_reference.type_arguments.as_ref().unwrap().nodes[0],
+        );
+        let original = context
+            .store()
+            .type_node_links(nested_element)
+            .unwrap()
+            .clone();
+        let mut forged = original.clone();
+        forged.resolved_type = Some(head_type);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(nested_element, forged),
+        );
+        let poisoned = store_state(context.store());
+        assert!(context.get_type_from_type_node(head_annotation).is_err());
+        assert_eq!(store_state(context.store()), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(nested_element, original),
+        );
+        assert_eq!(
+            context.get_type_from_type_node(head_annotation),
+            Ok(head_resolved),
+        );
     }
 
     #[test]
