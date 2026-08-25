@@ -1792,7 +1792,6 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             || clause_data.symbol.is_some()
             || clause_data.facts != 0
             || import.kind != SyntaxKind::ImportDeclaration
-            || import.parent != Some(importer.bound.source_file().node)
             || import.flags.0 != 0
             || import_data.import_clause != Some(clause_id)
             || import_data.attributes.is_some()
@@ -1814,6 +1813,99 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             )
         {
             return Err(malformed());
+        }
+
+        if import.parent != Some(importer.bound.source_file().node) {
+            let Some(block_id) = import.parent else {
+                return Err(malformed());
+            };
+            let Some(block) = importer.arena.get(block_id) else {
+                return Err(malformed());
+            };
+            let NodeData::ModuleBlock(block_data) = &block.data else {
+                return Err(malformed());
+            };
+            let Some(module_id) = block.parent else {
+                return Err(malformed());
+            };
+            let Some(ambient) = importer.arena.get(module_id) else {
+                return Err(malformed());
+            };
+            let NodeData::ModuleDeclaration(ambient_data) = &ambient.data else {
+                return Err(malformed());
+            };
+            let Some(ambient_name) = importer.arena.get(ambient_data.name) else {
+                return Err(malformed());
+            };
+            let NodeData::StringLiteral(module_name) = &ambient_name.data else {
+                return Err(malformed());
+            };
+            let ambient_ref = NodeRef::new(declaration.arena, declaration.file, module_id);
+            let Some(ambient_owner) = importer
+                .bound
+                .symbol(ambient_ref)
+                .and_then(|owner| store.get_merged_symbol(owner))
+            else {
+                return Err(malformed());
+            };
+            let Some(ambient_owner_record) = store.symbol(ambient_owner) else {
+                return Err(malformed());
+            };
+            let Some(alias_record) = store.symbol(alias) else {
+                return Err(malformed());
+            };
+            if importer.bound.source_facts().is_none_or(|facts| {
+                !facts.is_declaration_file()
+                    || facts.is_external_or_common_js_module()
+                    || facts.is_javascript_file()
+            }) || block.kind != SyntaxKind::ModuleBlock
+                || block.flags.0 != 0
+                || block_data.flow_node.is_some()
+                || block_data.facts != 0
+                || block_data
+                    .statements
+                    .nodes
+                    .iter()
+                    .filter(|statement| **statement == import_id)
+                    .count()
+                    != 1
+                || ambient.kind != SyntaxKind::ModuleDeclaration
+                || ambient.flags.0 != 0
+                || ambient.parent != Some(importer.bound.source_file().node)
+                || ambient_data.keyword != SyntaxKind::ModuleKeyword
+                || ambient_data.body != Some(block_id)
+                || ambient_name.kind != SyntaxKind::StringLiteral
+                || ambient_name.flags.0 != 0
+                || ambient_name.parent != Some(module_id)
+                || module_name.token_flags.0 != 0
+                || module_name.text.is_empty()
+                || !ambient_owner_record.flags().intersects(SymbolFlags::MODULE)
+                || ambient_owner_record
+                    .declarations()
+                    .is_none_or(|declarations| !declarations.contains(&ambient_ref))
+                || store.get_merged_symbol(ambient_owner) != Some(ambient_owner)
+                || importer.bound.container(declaration) != Some(ambient_ref)
+                || importer
+                    .bound
+                    .locals(ambient_ref)
+                    .and_then(|locals| store.symbol_table(locals))
+                    .and_then(|locals| locals.get_source(&import_name_data.text))
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    != Some(alias)
+                || alias_record.flags() != SymbolFlags::ALIAS
+                || alias_record.check_flags() != CheckFlags::NONE
+                || alias_record.declarations() != Some(&[declaration])
+                || alias_record.value_declaration().is_some()
+                || alias_record.members().is_some()
+                || alias_record.exports().is_some()
+                || alias_record.parent().is_some()
+                || alias_record.export_symbol().is_some()
+                || store.get_merged_symbol(alias) != Some(alias)
+            {
+                return Err(malformed());
+            }
+
+            return Ok(None);
         }
 
         if let Some(cached) = store
@@ -4386,6 +4478,88 @@ mod tests {
                 .unwrap()
                 .target,
             AliasTargetState::Resolved(synthetic),
+        );
+        assert_eq!(
+            (store.symbol_len(), store.symbol_store().symbol_table_len()),
+            allocations,
+        );
+    }
+
+    #[test]
+    fn nested_ambient_namespace_import_preserves_merged_export_equals_target() {
+        let importer = parsed(concat!(
+            "declare module 'mymod' { ",
+            "import * as foo from 'foo'; ",
+            "export { foo }; ",
+            "}",
+        ));
+        let declaration = parsed(concat!(
+            "declare function foo(): void; ",
+            "declare namespace foo { export const items: string[]; } ",
+            "export = foo;",
+        ));
+        let importer_file = FileId::new(5_208);
+        let declaration_file = FileId::new(5_209);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::Script),
+            (
+                declaration_file,
+                &declaration,
+                CanonicalModuleState::External,
+            ),
+        ];
+        let specifier = module_specifiers(&importer)[0];
+        let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+            &files,
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&importer, importer_file, specifier),
+                    esm(declaration_file),
+                ),
+            ]),
+            &[importer_file, declaration_file],
+        );
+        let binding = importer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NamespaceImport).then_some(node_ref(
+                    &importer,
+                    importer_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let import_alias = alias(&bound_files, binding);
+        let target_bound = bound_files.get(&declaration_file).unwrap();
+        let original = store
+            .symbol_table(target_bound.locals(target_bound.source_file()).unwrap())
+            .unwrap()
+            .get_source("foo")
+            .unwrap();
+        let allocations = (store.symbol_len(), store.symbol_store().symbol_table_len());
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(import_alias)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(original),
+        );
+        assert_eq!(
+            (store.symbol_len(), store.symbol_store().symbol_table_len()),
+            allocations,
+        );
+        assert!(store.export_type_links(original).is_none());
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(import_alias)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(original),
         );
         assert_eq!(
             (store.symbol_len(), store.symbol_store().symbol_table_len()),
