@@ -1349,8 +1349,8 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
             &mut Vec::new(),
         )?;
         if !valid_template
-            && !(index < fixed_parameter_count
-                && valid_fixed_generic_source_parameter_type(store, projected))
+            && (index >= fixed_parameter_count
+                || !valid_fixed_generic_source_parameter_type(store, projected))
             && (index < minimum_argument_count
                 || optional_generic_parameter_template(
                     store,
