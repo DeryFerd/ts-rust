@@ -2236,7 +2236,7 @@ fn namespace_generic_annotation_requires_deferral(
     Ok(false)
 }
 
-/// Keeps only React's authenticated `SyntheticEvent.currentTarget: EventTarget & T` cold.
+/// Keeps React's exact synthetic and derived-event `EventTarget & T` properties cold.
 #[allow(clippy::too_many_lines)] // Namespace, defaulted parameter, global DOM targets, and warm caches form one proof.
 fn authenticated_react_synthetic_event_current_target_annotation(
     arena: &NodeArena,
@@ -2256,17 +2256,20 @@ fn authenticated_react_synthetic_event_current_target_annotation(
     let NodeData::Identifier(property_identifier) = &property_name_record.data else {
         return None;
     };
-    if property_identifier.text != "currentTarget" {
-        return None;
-    }
     let interface = child(property, property_record.parent?);
     let interface_symbol = bound
         .symbol(interface)
         .and_then(|symbol| store.get_merged_symbol(symbol))?;
     let interface_owner = store.symbol(interface_symbol)?;
     let namespace_owner = store.symbol(namespace)?;
-    if interface_owner.name().as_utf8() != Some("SyntheticEvent")
-        || namespace_owner.name().as_utf8() != Some("React")
+    let interface_name = interface_owner.name().as_utf8()?;
+    let derived_event = matches!(
+        interface_name,
+        "FocusEvent" | "InvalidEvent" | "ChangeEvent"
+    );
+    if namespace_owner.name().as_utf8() != Some("React")
+        || !(interface_name == "SyntheticEvent" && property_identifier.text == "currentTarget"
+            || derived_event && property_identifier.text == "target")
     {
         return None;
     }
@@ -2372,7 +2375,7 @@ fn authenticated_react_synthetic_event_current_target_annotation(
             && interface_owner.declarations() == Some(&[interface])
             && store.get_parent_of_symbol(interface_symbol) == Some(namespace)
             && exports
-                .get_source("SyntheticEvent")
+                .get_source(interface_name)
                 .and_then(|symbol| store.get_merged_symbol(symbol))
                 == Some(interface_symbol)
             && interface_record.kind == SyntaxKind::InterfaceDeclaration
@@ -2411,14 +2414,14 @@ fn authenticated_react_synthetic_event_current_target_annotation(
             && property_data.initializer.is_none()
             && property_name_record.kind == SyntaxKind::Identifier
             && property_name_record.parent == Some(property.node)
-            && property_owner.name().as_utf8() == Some("currentTarget")
+            && property_owner.name().as_utf8() == Some(property_identifier.text.as_str())
             && property_owner.flags() == SymbolFlags::PROPERTY
             && property_owner.check_flags() == CheckFlags::NONE
             && store.get_parent_of_symbol(property_symbol) == Some(interface_symbol)
             && interface_owner
                 .members()
                 .and_then(|members| store.symbol_table(members))
-                .and_then(|members| members.get_source("currentTarget"))
+                .and_then(|members| members.get_source(&property_identifier.text))
                 == Some(property_symbol)
             && annotation_record.kind == SyntaxKind::IntersectionType
             && annotation_record.flags.0 == 0
@@ -2497,11 +2500,144 @@ fn authenticated_react_synthetic_event_current_target_annotation(
                     links
                         .resolved_type
                         .is_none_or(|cached| Some(cached) == cached_intersection)
-                }))
+                })
+            && (!derived_event
+                || authenticated_react_derived_synthetic_event_heritage(
+                    arena,
+                    bound,
+                    store,
+                    namespace,
+                    interface,
+                    interface_symbol,
+                    parameter_symbol,
+                )))
         .then_some(())
     })()
     .is_some();
     Some(valid)
+}
+
+/// Authenticates only a React event interface's exact `extends SyntheticEvent<T>` edge.
+#[allow(clippy::too_many_arguments)] // Namespace, derived declaration, and forwarded binder parameter remain explicit.
+fn authenticated_react_derived_synthetic_event_heritage(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+    parameter: SemanticSymbolId,
+) -> bool {
+    let Some(record) = arena.get(declaration.node) else {
+        return false;
+    };
+    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+        return false;
+    };
+    let Some(clauses) = interface.heritage_clauses.as_ref() else {
+        return false;
+    };
+    let [clause] = clauses.nodes.as_slice() else {
+        return false;
+    };
+    let clause = child(declaration, *clause);
+    let Some(clause_record) = arena.get(clause.node) else {
+        return false;
+    };
+    let NodeData::HeritageClause(heritage) = &clause_record.data else {
+        return false;
+    };
+    let [base] = heritage.types.nodes.as_slice() else {
+        return false;
+    };
+    let base = child(clause, *base);
+    let Some(base_record) = arena.get(base.node) else {
+        return false;
+    };
+    let NodeData::ExpressionWithTypeArguments(reference) = &base_record.data else {
+        return false;
+    };
+    let Some(arguments) = reference.type_arguments.as_ref() else {
+        return false;
+    };
+    let [argument] = arguments.nodes.as_slice() else {
+        return false;
+    };
+    let name = child(base, reference.expression);
+    let Some(name_record) = arena.get(name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return false;
+    };
+    let argument = child(base, *argument);
+    let Some(argument_record) = arena.get(argument.node) else {
+        return false;
+    };
+    let NodeData::TypeReferenceNode(argument_data) = &argument_record.data else {
+        return false;
+    };
+    let argument_name = child(argument, argument_data.type_name);
+    let Some(argument_name_record) = arena.get(argument_name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(argument_identifier) = &argument_name_record.data else {
+        return false;
+    };
+    let Some(base_symbol) = store
+        .symbol(namespace)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source("SyntheticEvent"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(base_owner) = store.symbol(base_symbol) else {
+        return false;
+    };
+    let Some(parameter_owner) = store.symbol(parameter) else {
+        return false;
+    };
+
+    record.kind == SyntaxKind::InterfaceDeclaration
+        && !clauses.has_trailing_comma
+        && clause_record.kind == SyntaxKind::HeritageClause
+        && clause_record.flags.0 == 0
+        && clause_record.parent == Some(declaration.node)
+        && heritage.token == SyntaxKind::ExtendsKeyword
+        && !heritage.types.has_trailing_comma
+        && base_record.kind == SyntaxKind::ExpressionWithTypeArguments
+        && base_record.flags.0 == 0
+        && base_record.parent == Some(clause.node)
+        && !arguments.has_trailing_comma
+        && name_record.kind == SyntaxKind::Identifier
+        && name_record.parent == Some(base.node)
+        && identifier.flow_node.is_none()
+        && identifier.text == "SyntheticEvent"
+        && base_owner.name().as_utf8() == Some("SyntheticEvent")
+        && base_owner.flags().without(SymbolFlags::TRANSIENT) == SymbolFlags::INTERFACE
+        && base_owner.check_flags() == CheckFlags::NONE
+        && store.get_parent_of_symbol(base_symbol) == Some(namespace)
+        && argument_record.kind == SyntaxKind::TypeReference
+        && argument_record.parent == Some(base.node)
+        && argument_data.type_arguments.is_none()
+        && argument_name_record.kind == SyntaxKind::Identifier
+        && argument_name_record.parent == Some(argument.node)
+        && argument_identifier.flow_node.is_none()
+        && argument_identifier.text == "T"
+        && parameter_owner.name().as_utf8() == Some("T")
+        && parameter_owner.flags() == SymbolFlags::TYPE_PARAMETER
+        && store.get_parent_of_symbol(parameter) == Some(owner)
+        && bound
+            .symbol(declaration)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            == Some(owner)
+        && store.symbol_node_links(argument).is_none_or(|links| {
+            links
+                .resolved_symbol
+                .is_none_or(|cached| store.get_merged_symbol(cached) == Some(parameter))
+        })
 }
 
 /// Keeps only `SyntheticEvent`'s canonical `nativeEvent: Event` and `target: EventTarget` cold.
@@ -16333,6 +16469,234 @@ mod tests {
                 before,
             );
         }
+    }
+
+    #[test]
+    fn react_derived_event_targets_remain_lazy_and_reject_forged_identities() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "interface Element {} declare var Element: unknown; ",
+                "interface EventTarget { addEventListener(type: string): void; } ",
+                "declare var EventTarget: unknown; ",
+                "declare namespace React { ",
+                "interface SyntheticEvent<T = Element> {} ",
+                "interface FocusEvent<T = Element> extends SyntheticEvent<T> { ",
+                "target: EventTarget & T; } ",
+                "interface InvalidEvent<T = Element> extends SyntheticEvent<T> { ",
+                "target: EventTarget & T; } ",
+                "interface ChangeEvent<T = Element> extends SyntheticEvent<T> { ",
+                "target: EventTarget & T; } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 4);
+        let [
+            SourceNamespaceMemberPlan::Interface {
+                symbol: synthetic, ..
+            },
+            SourceNamespaceMemberPlan::Interface {
+                symbol: focus,
+                generic: Some(focus_generic),
+                ..
+            },
+            SourceNamespaceMemberPlan::Interface {
+                generic: Some(invalid_generic),
+                ..
+            },
+            SourceNamespaceMemberPlan::Interface {
+                generic: Some(change_generic),
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("React must retain its synthetic event and three derived event interfaces")
+        };
+        let synthetic = *synthetic;
+        let focus = *focus;
+        let annotations = [
+            focus_generic.properties[0].annotation,
+            invalid_generic.properties[0].annotation,
+            change_generic.properties[0].annotation,
+        ];
+        let globals = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .globals;
+        let event_target = fixture
+            .context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("EventTarget"))
+            .unwrap();
+        let element = fixture
+            .context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("Element"))
+            .unwrap();
+        let exports = fixture
+            .context
+            .store()
+            .symbol(namespace.symbol)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let listener = fixture
+            .context
+            .store()
+            .symbol(event_target)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.context.store().symbol_table(members))
+            .and_then(|members| members.get_source("addEventListener"))
+            .unwrap();
+
+        for (generic, annotation) in [
+            (focus_generic, annotations[0]),
+            (invalid_generic, annotations[1]),
+            (change_generic, annotations[2]),
+        ] {
+            assert!(generic.annotation_is_deferred(annotation));
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .type_node_links(annotation)
+                    .is_none()
+            );
+        }
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(listener)
+                .is_none()
+        );
+        let cold = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(plan(&fixture, 4), namespace);
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("SyntheticEvent"),
+                focus,
+            ),
+            Some(Some(synthetic)),
+        );
+        {
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+            for annotation in annotations {
+                assert_eq!(
+                    authenticated_react_synthetic_event_current_target_annotation(
+                        arena,
+                        bound,
+                        fixture.context.store(),
+                        namespace.symbol,
+                        annotation,
+                    ),
+                    Some(false),
+                );
+            }
+        }
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("SyntheticEvent"),
+                synthetic,
+            ),
+            Some(Some(focus)),
+        );
+
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                globals,
+                EscapedName::source("EventTarget"),
+                element,
+            ),
+            Some(Some(event_target)),
+        );
+        {
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+            assert_eq!(
+                authenticated_react_synthetic_event_current_target_annotation(
+                    arena,
+                    bound,
+                    fixture.context.store(),
+                    namespace.symbol,
+                    annotations[0],
+                ),
+                Some(false),
+            );
+        }
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                globals,
+                EscapedName::source("EventTarget"),
+                event_target,
+            ),
+            Some(Some(element)),
+        );
+
+        let NodeData::IntersectionTypeNode(intersection) =
+            &fixture.parsed.arena.get(annotations[0].node).unwrap().data
+        else {
+            panic!("the FocusEvent target must retain its forwarded intersection")
+        };
+        let forwarded = child(annotations[0], intersection.types.nodes[1]);
+        assert!(fixture.context.store_mut_for_test().set_symbol_node_links(
+            forwarded,
+            SymbolNodeLinks {
+                resolved_symbol: Some(event_target),
+                ..SymbolNodeLinks::default()
+            },
+        ));
+        let poisoned = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        {
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+            assert_eq!(
+                authenticated_react_synthetic_event_current_target_annotation(
+                    arena,
+                    bound,
+                    fixture.context.store(),
+                    namespace.symbol,
+                    annotations[0],
+                ),
+                Some(false),
+            );
+        }
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(listener)
+                .is_none()
+        );
     }
 
     #[test]
