@@ -8114,7 +8114,7 @@ mod runtime_tests {
             .context
             .store()
             .type_payload(reference.target)
-            .and_then(|record| record.symbol())
+            .and_then(super::super::type_records::TypeRecord::symbol)
             .unwrap();
         assert_eq!(
             fixture
@@ -8536,7 +8536,7 @@ mod runtime_tests {
             .context
             .store()
             .type_payload(reference.target)
-            .and_then(|record| record.symbol())
+            .and_then(super::super::type_records::TypeRecord::symbol)
             .unwrap();
         assert_eq!(
             fixture
