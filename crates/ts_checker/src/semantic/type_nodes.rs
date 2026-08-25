@@ -3689,9 +3689,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             let NodeData::InterfaceDeclaration(interface) = &owner_record.data else {
                 return Ok(false);
             };
-            let bound = match self.host.bound_file(parent) {
-                Some(bound) => bound,
-                None => return Ok(false),
+            let Some(bound) = self.host.bound_file(parent) else {
+                return Ok(false);
             };
             let method_symbol = bound
                 .symbol(parent)
