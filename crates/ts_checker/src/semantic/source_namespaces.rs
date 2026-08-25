@@ -808,6 +808,20 @@ fn plan_interface_index_signature(
         ));
     }
 
+    if authenticated_react_component_spec_index_signature(
+        arena,
+        bound,
+        store,
+        owner,
+        declaration,
+        symbol,
+    ) == Some(false)
+    {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ));
+    }
+
     plan_interface_signature_annotations(
         arena,
         bound,
@@ -819,6 +833,260 @@ fn plan_interface_index_signature(
         annotations,
     )?;
     Ok(symbol)
+}
+
+/// Proves React's exact lazy `ComponentSpec` render/index declaration and warm identities.
+#[allow(clippy::too_many_lines)] // Namespace exports, forwarded heritage, method, index, and caches form one proof.
+fn authenticated_react_component_spec_index_signature(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    index: SemanticSymbolId,
+) -> Option<bool> {
+    let owner_record = store.symbol(owner)?;
+    if owner_record.name().as_utf8() != Some("ComponentSpec") {
+        return None;
+    }
+    let namespace = store.get_parent_of_symbol(owner)?;
+    let namespace_record = store.symbol(namespace)?;
+    if namespace_record.name().as_utf8() != Some("React") {
+        return None;
+    }
+    let index_record = arena.get(declaration.node)?;
+    let interface = child(declaration, index_record.parent?);
+    let interface_record = arena.get(interface.node)?;
+    let NodeData::InterfaceDeclaration(interface_data) = &interface_record.data else {
+        return Some(false);
+    };
+    let [render, exact_index] = interface_data.members.nodes.as_slice() else {
+        return None;
+    };
+    if *exact_index != declaration.node {
+        return None;
+    }
+    let render = child(interface, *render);
+    let render_record = arena.get(render.node)?;
+    let NodeData::MethodSignatureDeclaration(render_data) = &render_record.data else {
+        return None;
+    };
+    let render_name = child(render, render_data.name);
+    let render_name_record = arena.get(render_name.node)?;
+    let NodeData::Identifier(render_identifier) = &render_name_record.data else {
+        return None;
+    };
+    let return_type = child(render, render_data.type_?);
+    let return_record = arena.get(return_type.node)?;
+    let NodeData::TypeReferenceNode(return_reference) = &return_record.data else {
+        return None;
+    };
+    let return_name = child(return_type, return_reference.type_name);
+    let return_name_record = arena.get(return_name.node)?;
+    let NodeData::Identifier(return_identifier) = &return_name_record.data else {
+        return None;
+    };
+    if render_identifier.text != "render" || return_identifier.text != "ReactNode" {
+        return None;
+    }
+
+    let authenticated = (|| {
+        let facts = bound.source_facts()?;
+        let exports = namespace_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))?;
+        let members = owner_record
+            .members()
+            .and_then(|members| store.symbol_table(members))?;
+        let react_node = exports
+            .get_source("ReactNode")
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let react_node_owner = store.symbol(react_node)?;
+        let mixin = exports
+            .get_source("Mixin")
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let mixin_owner = store.symbol(mixin)?;
+        let render_symbol = bound
+            .symbol(render)
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let render_owner = store.symbol(render_symbol)?;
+        let index_owner = store.symbol(index)?;
+        let parameters = interface_data.type_parameters.as_ref()?;
+        let [props, state] = parameters.nodes.as_slice() else {
+            return None;
+        };
+        let clauses = interface_data.heritage_clauses.as_ref()?;
+        let [clause] = clauses.nodes.as_slice() else {
+            return None;
+        };
+        let clause = child(interface, *clause);
+        let clause_record = arena.get(clause.node)?;
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return None;
+        };
+        let [base] = heritage.types.nodes.as_slice() else {
+            return None;
+        };
+        let base = child(clause, *base);
+        let base_record = arena.get(base.node)?;
+        let NodeData::ExpressionWithTypeArguments(base_data) = &base_record.data else {
+            return None;
+        };
+        let base_name = child(base, base_data.expression);
+        let base_name_record = arena.get(base_name.node)?;
+        let NodeData::Identifier(base_identifier) = &base_name_record.data else {
+            return None;
+        };
+        let arguments = base_data.type_arguments.as_ref()?;
+        let [first, second] = arguments.nodes.as_slice() else {
+            return None;
+        };
+        let NodeData::IndexSignatureDeclaration(index_data) = &index_record.data else {
+            return None;
+        };
+        let [key_parameter] = index_data.parameters.nodes.as_slice() else {
+            return None;
+        };
+        let key_parameter = child(declaration, *key_parameter);
+        let key_parameter_record = arena.get(key_parameter.node)?;
+        let NodeData::ParameterDeclaration(key_data) = &key_parameter_record.data else {
+            return None;
+        };
+        let key_name = child(key_parameter, key_data.name);
+        let key_name_record = arena.get(key_name.node)?;
+        let NodeData::Identifier(key_identifier) = &key_name_record.data else {
+            return None;
+        };
+        let key_type = child(key_parameter, key_data.type_?);
+        let key_record = arena.get(key_type.node)?;
+        let value_type = child(declaration, index_data.type_);
+        let value_record = arena.get(value_type.node)?;
+        let bootstrap = store.intrinsic_bootstrap()?;
+
+        if !facts.is_declaration_file()
+            || facts.is_default_library()
+            || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+            || namespace_record.check_flags() != CheckFlags::NONE
+            || store.get_merged_symbol(namespace) != Some(namespace)
+            || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || owner_record.check_flags() != CheckFlags::NONE
+            || owner_record.declarations() != Some(&[interface])
+            || exports
+                .get_source("ComponentSpec")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(owner)
+            || interface_record.kind != SyntaxKind::InterfaceDeclaration
+            || interface_record.flags.0 != 0
+            || parameters.has_trailing_comma
+            || clauses.has_trailing_comma
+            || clause_record.kind != SyntaxKind::HeritageClause
+            || clause_record.parent != Some(interface.node)
+            || heritage.token != SyntaxKind::ExtendsKeyword
+            || heritage.types.has_trailing_comma
+            || base_record.kind != SyntaxKind::ExpressionWithTypeArguments
+            || base_record.parent != Some(clause.node)
+            || arguments.has_trailing_comma
+            || base_name_record.kind != SyntaxKind::Identifier
+            || base_name_record.parent != Some(base.node)
+            || base_identifier.text != "Mixin"
+            || mixin_owner.name().as_utf8() != Some("Mixin")
+            || mixin_owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || mixin_owner.check_flags() != CheckFlags::NONE
+            || store.get_parent_of_symbol(mixin) != Some(namespace)
+            || render_record.kind != SyntaxKind::MethodSignature
+            || render_record.flags.0 != 0
+            || render_record.parent != Some(interface.node)
+            || render_data.postfix_token.is_some()
+            || render_data.type_parameters.is_some()
+            || !render_data.parameters.nodes.is_empty()
+            || render_name_record.kind != SyntaxKind::Identifier
+            || render_name_record.parent != Some(render.node)
+            || render_owner.name().as_utf8() != Some("render")
+            || render_owner.flags() != SymbolFlags::METHOD
+            || render_owner.check_flags() != CheckFlags::NONE
+            || store.get_parent_of_symbol(render_symbol) != Some(owner)
+            || members.get_source("render") != Some(render_symbol)
+            || return_record.kind != SyntaxKind::TypeReference
+            || return_record.parent != Some(render.node)
+            || return_reference.type_arguments.is_some()
+            || return_name_record.kind != SyntaxKind::Identifier
+            || return_name_record.parent != Some(return_type.node)
+            || react_node_owner.name().as_utf8() != Some("ReactNode")
+            || react_node_owner.flags() != SymbolFlags::TYPE_ALIAS
+            || react_node_owner.check_flags() != CheckFlags::NONE
+            || store.get_parent_of_symbol(react_node) != Some(namespace)
+            || index_record.kind != SyntaxKind::IndexSignature
+            || index_record.flags.0 != 0
+            || index_record.parent != Some(interface.node)
+            || index_owner.flags() != SymbolFlags::SIGNATURE
+            || index_owner.check_flags() != CheckFlags::NONE
+            || index_owner.name() != InternalSymbolName::Index.as_ref()
+            || index_owner.declarations() != Some(&[declaration])
+            || store.get_parent_of_symbol(index) != Some(owner)
+            || members.get(InternalSymbolName::Index.as_ref()) != Some(index)
+            || store
+                .value_symbol_links(index)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || key_parameter_record.kind != SyntaxKind::Parameter
+            || key_parameter_record.parent != Some(declaration.node)
+            || key_name_record.kind != SyntaxKind::Identifier
+            || key_name_record.parent != Some(key_parameter.node)
+            || key_identifier.text != "propertyName"
+            || key_record.kind != SyntaxKind::StringKeyword
+            || key_record.parent != Some(key_parameter.node)
+            || value_record.kind != SyntaxKind::AnyKeyword
+            || value_record.parent != Some(declaration.node)
+            || store.type_node_links(key_type).is_some_and(|links| {
+                links.outer_type_parameters.is_some()
+                    || links
+                        .resolved_type
+                        .is_some_and(|cached| cached != bootstrap.string_type)
+            })
+            || store.type_node_links(value_type).is_some_and(|links| {
+                links.outer_type_parameters.is_some()
+                    || links
+                        .resolved_type
+                        .is_some_and(|cached| cached != bootstrap.any_type)
+            })
+        {
+            return None;
+        }
+
+        for (parameter, argument, expected) in [(*props, *first, "P"), (*state, *second, "S")] {
+            let parameter = child(interface, parameter);
+            let parameter_symbol = bound
+                .symbol(parameter)
+                .and_then(|symbol| store.get_merged_symbol(symbol))?;
+            let parameter_owner = store.symbol(parameter_symbol)?;
+            let argument = child(base, argument);
+            let argument_record = arena.get(argument.node)?;
+            let NodeData::TypeReferenceNode(argument_data) = &argument_record.data else {
+                return None;
+            };
+            let argument_name = child(argument, argument_data.type_name);
+            let argument_name_record = arena.get(argument_name.node)?;
+            let NodeData::Identifier(argument_identifier) = &argument_name_record.data else {
+                return None;
+            };
+            if parameter_owner.flags() != SymbolFlags::TYPE_PARAMETER
+                || parameter_owner.check_flags() != CheckFlags::NONE
+                || parameter_owner.name().as_utf8() != Some(expected)
+                || store.get_parent_of_symbol(parameter_symbol) != Some(owner)
+                || members.get_source(expected) != Some(parameter_symbol)
+                || argument_record.kind != SyntaxKind::TypeReference
+                || argument_record.parent != Some(base.node)
+                || argument_data.type_arguments.is_some()
+                || argument_name_record.kind != SyntaxKind::Identifier
+                || argument_name_record.parent != Some(argument.node)
+                || argument_identifier.text != expected
+            {
+                return None;
+            }
+        }
+        Some(())
+    })()
+    .is_some();
+    Some(authenticated)
 }
 
 #[allow(clippy::too_many_arguments)] // Signature annotations retain their bound owner and syntax.
@@ -15107,6 +15375,163 @@ mod tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    fn react_component_spec_index_rejects_forged_exports_and_cached_annotations() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "type ReactNode = string; ",
+                "interface Mixin<P, S> {} ",
+                "interface ComponentSpec<P, S> extends Mixin<P, S> { ",
+                "render(): ReactNode; [propertyName: string]: any; ",
+                "} }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::TypeAlias { .. },
+            SourceNamespaceMemberPlan::Interface { symbol: mixin, .. },
+            SourceNamespaceMemberPlan::Interface {
+                symbol: component,
+                generic: Some(generic),
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("React must retain its node alias, Mixin, and indexed ComponentSpec")
+        };
+        let mixin = *mixin;
+        let component = *component;
+        let [index] = generic.index_signatures.as_slice() else {
+            panic!("ComponentSpec must retain its exact index signature")
+        };
+        let index = *index;
+        let [declaration] = fixture
+            .context
+            .store()
+            .symbol(index)
+            .unwrap()
+            .declarations()
+            .unwrap()
+        else {
+            panic!("the index symbol must retain its declaration")
+        };
+        let declaration = *declaration;
+        let NodeData::IndexSignatureDeclaration(index_data) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the binder-owned member must remain an index signature")
+        };
+        let parameter = child(declaration, index_data.parameters.nodes[0]);
+        let NodeData::ParameterDeclaration(parameter_data) =
+            &fixture.parsed.arena.get(parameter.node).unwrap().data
+        else {
+            panic!("the index signature must retain its key parameter")
+        };
+        let key = child(parameter, parameter_data.type_.unwrap());
+        let value = child(declaration, index_data.type_);
+        let exports = fixture
+            .context
+            .store()
+            .symbol(namespace.symbol)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let (number, string) = {
+            let bootstrap = fixture.context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+
+        assert!(generic.annotation_is_deferred(key));
+        assert!(generic.annotation_is_deferred(value));
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert!(
+            fixture
+                .context
+                .store()
+                .signature_links(declaration)
+                .is_none()
+        );
+        assert!(fixture.context.store().type_node_links(key).is_none());
+        assert!(fixture.context.store().type_node_links(value).is_none());
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("Mixin"),
+                component,
+            ),
+            Some(Some(mixin)),
+        );
+        let poisoned = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).is_err());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("Mixin"),
+                mixin,
+            ),
+            Some(Some(component)),
+        );
+
+        for (annotation, forged) in [(key, number), (value, string)] {
+            assert!(fixture.context.store_mut_for_test().set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(forged),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            let poisoned = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            assert!(execute(&mut fixture, &namespace).is_err());
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                ),
+                poisoned,
+            );
+            assert!(
+                fixture
+                    .context
+                    .store_mut_for_test()
+                    .set_type_node_links(annotation, TypeNodeLinks::default())
+            );
+        }
     }
 
     #[test]
