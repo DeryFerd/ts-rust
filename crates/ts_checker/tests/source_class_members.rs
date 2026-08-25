@@ -1254,7 +1254,7 @@ fn unsupported_ambient_class_shapes_leave_class_publication_cold() {
 }
 
 #[test]
-fn exported_class_is_unsupported_before_export_symbol_planning() {
+fn exported_class_publishes_owner_local_alias_and_optional_member_once() {
     let parsed = parse_source_file("export class Exported { value?: string; }");
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(0);
@@ -1262,6 +1262,8 @@ fn exported_class_is_unsupported_before_export_symbol_planning() {
         checker_context_with_module_state(&parsed, file, CanonicalModuleState::External);
     let declaration = class_declaration(&parsed, file, "Exported");
     let bound = context.file(file).unwrap().1;
+    let module = bound.symbol(bound.source_file()).unwrap();
+    let locals = bound.locals(bound.source_file()).unwrap();
     let exported = context
         .store()
         .get_merged_symbol(bound.symbol(declaration).unwrap())
@@ -1270,38 +1272,44 @@ fn exported_class_is_unsupported_before_export_symbol_planning() {
         .store()
         .get_merged_symbol(bound.local_symbol(declaration).unwrap())
         .unwrap();
-    let before = (
-        context.store().type_len(),
-        context.store().signature_len(),
-        context.store().symbol_len(),
-        context.store().symbol_store().symbol_table_len(),
-        context.store().relation_state_snapshot(),
-    );
+    let NodeData::ClassDeclaration(class) = &parsed.arena.get(declaration.node).unwrap().data
+    else {
+        panic!("the exported declaration must remain a class")
+    };
+    let field_declaration = NodeRef::new(parsed.arena.id(), file, class.members.nodes[0]);
+    let field = bound.symbol(field_declaration).unwrap();
+    let annotation = property_type_node(&parsed, file, "value");
 
+    assert_ne!(exported, local);
     assert_eq!(
-        context.check_source_file(file),
-        Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Class(declaration)
-        ))
+        context.store().symbol(exported).unwrap().parent(),
+        Some(module),
     );
     assert_eq!(
-        (
-            context.store().type_len(),
-            context.store().signature_len(),
-            context.store().symbol_len(),
-            context.store().symbol_store().symbol_table_len(),
-            context.store().relation_state_snapshot(),
-        ),
-        before
+        context.store().symbol(local).unwrap().export_symbol(),
+        Some(exported),
+    );
+    assert_eq!(
+        context.store().symbol(local).unwrap().flags(),
+        SymbolFlags::EXPORT_VALUE,
+    );
+    assert_eq!(
+        context
+            .store()
+            .symbol(module)
+            .and_then(|module| module.exports())
+            .and_then(|exports| context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("Exported")),
+        Some(exported),
+    );
+    assert_eq!(
+        context
+            .store()
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source("Exported")),
+        Some(local),
     );
     for symbol in [exported, local] {
-        assert!(
-            context
-                .store()
-                .declared_type_links(symbol)
-                .and_then(|links| links.declared_type)
-                .is_none()
-        );
         assert!(
             context
                 .store()
@@ -1312,11 +1320,113 @@ fn exported_class_is_unsupported_before_export_symbol_planning() {
     }
     assert!(
         context
-            .source_file(file)
-            .and_then(|source| context.store().source_file_links(source))
-            .is_none_or(|links| !links.type_checked)
+            .store()
+            .declared_type_links(exported)
+            .and_then(|links| links.declared_type)
+            .is_none()
     );
+    assert!(!is_type_checked(&context, file));
+
+    context.check_source_file(file).unwrap();
+
+    let members = context.get_nongeneric_class_members(exported).unwrap();
+    let instance = members.shells().instance_type();
+    let value = members.shells().value_type();
+    let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+    let class_value = ValueSymbolLinks {
+        resolved_type: Some(value),
+        ..ValueSymbolLinks::default()
+    };
+    assert_eq!(members.declared_instance_properties(), &[field]);
+    assert!(members.declared_static_properties().is_empty());
+    assert_eq!(
+        context
+            .store()
+            .declared_type_links(exported)
+            .and_then(|links| links.declared_type),
+        Some(instance),
+    );
+    assert!(
+        context
+            .store()
+            .declared_type_links(local)
+            .and_then(|links| links.declared_type)
+            .is_none()
+    );
+    assert_eq!(
+        context.store().value_symbol_links(exported),
+        Some(&class_value)
+    );
+    assert_eq!(
+        context.store().value_symbol_links(local),
+        Some(&class_value)
+    );
+    assert_eq!(
+        context.store().symbol(field).unwrap().flags(),
+        SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL,
+    );
+    assert_eq!(
+        context.store().symbol(field).unwrap().parent(),
+        Some(exported),
+    );
+    assert_eq!(
+        context.store().value_symbol_links(field),
+        Some(&ValueSymbolLinks {
+            resolved_type: Some(string),
+            ..ValueSymbolLinks::default()
+        }),
+    );
+    assert_eq!(
+        context.store().type_node_links(annotation),
+        Some(&TypeNodeLinks {
+            resolved_type: Some(string),
+            ..TypeNodeLinks::default()
+        }),
+    );
+    assert_eq!(
+        context
+            .store()
+            .symbol_table(members.instance_members().unwrap())
+            .and_then(|members| members.get_source("value")),
+        Some(field),
+    );
+    assert!(is_type_checked(&context, file));
     assert!(context.diagnostics().is_empty());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.store().relation_state_snapshot(),
+        context.diagnostics().clone(),
+    );
+    context.check_source_file(file).unwrap();
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        context.get_nongeneric_class_members(exported).unwrap(),
+        members,
+    );
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+    assert_eq!(
+        context.store().value_symbol_links(exported),
+        Some(&class_value)
+    );
+    assert_eq!(
+        context.store().value_symbol_links(local),
+        Some(&class_value)
+    );
+    assert!(is_type_checked(&context, file));
 }
 
 #[test]
