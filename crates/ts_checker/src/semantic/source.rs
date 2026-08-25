@@ -4407,7 +4407,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(unsupported());
         }
 
-        let Some((store, _)) = self.semantic else {
+        let Some((store, host)) = self.semantic else {
             return Err(unsupported());
         };
         let locals = self
@@ -4539,6 +4539,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let NodeData::ObjectLiteralExpression(properties) = &object_record.data else {
                     return Err(unsupported());
                 };
+                let object_plan = super::object_members::plan_object_literal(store, host, object)
+                    .map_err(|error| self.object_plan_error(error))?;
                 if statement_record.kind != SyntaxKind::VariableStatement
                     || statement_record.flags.0 != 0
                     || statement_record.parent != Some(block.node)
@@ -4552,26 +4554,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     || declarations.declarations.range != list_record.range
                     || declarations.declarations.has_trailing_comma
                     || declarations.facts != 0
-                    || declaration_record.kind != SyntaxKind::VariableDeclaration
-                    || declaration_record.flags.0 != 0
-                    || declaration_record.parent != Some(list.node)
-                    || variable.exclamation_token.is_some()
-                    || variable.local_symbol.is_some()
-                    || variable.symbol.is_some()
                     || variable.type_.is_some()
-                    || variable.facts != 0
-                    || name_record.kind != SyntaxKind::Identifier
-                    || name_record.flags.0 != 0
-                    || name_record.parent != Some(declaration.node)
-                    || identifier.flow_node.is_some()
                     || identifier.text.is_empty()
-                    || object_record.kind != SyntaxKind::ObjectLiteralExpression
-                    || object_record.flags.0 != 0
                     || object_record.parent != Some(declaration.node)
                     || properties.properties.has_trailing_comma
-                    || properties.properties.nodes.len() != bindings.len()
-                    || properties.symbol.is_some()
-                    || properties.facts != 0
+                    || object_plan.properties.len() != bindings.len()
+                    || !object_plan.spreads.is_empty()
                     || [statement, list, declaration, name, object]
                         .into_iter()
                         .any(|node| {
@@ -4581,40 +4569,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 {
                     return Err(unsupported());
                 }
-                let mut seen = HashSet::with_capacity(properties.properties.nodes.len());
-                for property in &properties.properties.nodes {
-                    let property = self.reference(*property);
-                    let property_record = self.node(property)?;
-                    let NodeData::ShorthandPropertyAssignment(shorthand) = &property_record.data
-                    else {
-                        return Err(unsupported());
-                    };
-                    let reference = self.reference(shorthand.name);
-                    let reference_record = self.node(reference)?;
-                    let NodeData::Identifier(identifier) = &reference_record.data else {
-                        return Err(unsupported());
-                    };
-                    if property_record.kind != SyntaxKind::ShorthandPropertyAssignment
-                        || property_record.flags.0 != 0
-                        || property_record.parent != Some(object.node)
-                        || shorthand.equals_token.is_some()
-                        || shorthand.object_assignment_initializer.is_some()
-                        || shorthand.postfix_token.is_some()
-                        || shorthand.symbol.is_some()
-                        || shorthand.type_.is_some()
-                        || shorthand.facts != 0
-                        || shorthand.modifiers.is_some()
-                        || reference_record.kind != SyntaxKind::Identifier
-                        || reference_record.flags.0 != 0
-                        || reference_record.parent != Some(property.node)
-                        || identifier.flow_node.is_some()
+                for property in &object_plan.properties {
+                    if self.node(property.declaration)?.kind
+                        != SyntaxKind::ShorthandPropertyAssignment
+                        || property.name_node != property.type_node
                         || !bindings.iter().any(|binding| {
                             self.node(binding.name).is_ok_and(|record| {
                                 matches!(&record.data, NodeData::Identifier(name)
-                                    if name.text == identifier.text)
+                                    if name.text == property.name)
                             })
                         })
-                        || !seen.insert(identifier.text.as_str())
                     {
                         return Err(unsupported());
                     }
