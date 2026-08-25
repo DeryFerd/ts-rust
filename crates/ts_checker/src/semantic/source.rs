@@ -1467,6 +1467,7 @@ struct PlannedArrowExpandoAssignment {
     variable_symbol: SemanticSymbolId,
     owner_symbol: SemanticSymbolId,
     property_symbol: SemanticSymbolId,
+    jsdoc_type: Option<PlannedJsDocType>,
     right: PlannedExpression,
 }
 
@@ -3573,6 +3574,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         self.primitive_binary_position_roots
                             .insert(assignment.right);
                         let right = self.plan_expression(assignment.right)?;
+                        let jsdoc_type = if is_javascript_file {
+                            leading_jsdoc_comment(self.arena, statement)
+                                .map_err(|_| {
+                                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
+                                        statement,
+                                    ))
+                                })?
+                                .and_then(|comment| {
+                                    comment
+                                        .type_tag()
+                                        .and_then(super::jsdoc::JsDocTag::type_expression)
+                                        .map(|annotation| annotation.planned())
+                                })
+                        } else {
+                            None
+                        };
                         statements.push(PlannedStatement::ArrowExpandoAssignment(
                             PlannedArrowExpandoAssignment {
                                 expression: assignment.expression,
@@ -3581,6 +3598,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 variable_symbol: assignment.owner_symbol,
                                 owner_symbol: assignment.owner_symbol,
                                 property_symbol: assignment.property_symbol,
+                                jsdoc_type,
                                 right,
                             },
                         ));
@@ -3613,6 +3631,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 variable_symbol: assignment.variable_symbol,
                                 owner_symbol: assignment.owner_symbol,
                                 property_symbol: assignment.property_symbol,
+                                jsdoc_type: None,
                                 right,
                             },
                         ));
@@ -34028,6 +34047,94 @@ fn planned_commonjs_export_annotations(
     Ok(annotations)
 }
 
+fn cached_javascript_function_expando_object_type(
+    store: &CanonicalTypeMapperStore,
+    assignment: &PlannedArrowExpandoAssignment,
+    annotation: &PlannedJsDocType,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let JsDocType::ObjectLiteral(properties) = annotation.type_() else {
+        return Ok(None);
+    };
+    if properties.is_empty() {
+        return Ok(None);
+    }
+    let Some(cached) = store
+        .value_symbol_links(assignment.property_symbol)
+        .and_then(|links| links.resolved_type)
+    else {
+        return Ok(None);
+    };
+    let invalid = || {
+        SourceCheckError::Variable(VariableInvariant::InvalidValueLinks(
+            assignment.property_symbol,
+        ))
+    };
+    let record = store.type_payload(cached).ok_or_else(invalid)?;
+    let TypeData::Object(object) = record.data() else {
+        return Err(invalid());
+    };
+    let members = object
+        .structured
+        .members
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(invalid)?;
+    let published = object
+        .structured
+        .properties
+        .as_deref()
+        .ok_or_else(invalid)?;
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+        || record.symbol().is_some()
+        || record.alias().is_some()
+        || members.len() != properties.len()
+        || published.len() != properties.len()
+        || object.structured.signatures.is_some()
+        || object.structured.index_infos.is_some()
+        || store
+            .type_node_links(assignment.left)
+            .and_then(|links| links.resolved_type)
+            != Some(cached)
+    {
+        return Err(invalid());
+    }
+
+    for (property, symbol) in properties.iter().zip(published) {
+        let record = store.symbol(*symbol).ok_or_else(invalid)?;
+        let expected_flags = SymbolFlags::PROPERTY
+            | SymbolFlags::TRANSIENT
+            | if property.is_optional() {
+                SymbolFlags::OPTIONAL
+            } else {
+                SymbolFlags::NONE
+            };
+        let expected_checks = if property.is_readonly() {
+            CheckFlags::READONLY
+        } else {
+            CheckFlags::NONE
+        };
+        if members.get_source(property.name()) != Some(*symbol)
+            || record.flags() != expected_flags
+            || record.check_flags() != expected_checks
+            || record.name().as_utf8() != Some(property.name())
+            || record.declarations().is_some()
+            || record.value_declaration().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent().is_some()
+            || record.export_symbol().is_some()
+            || store
+                .value_symbol_links(*symbol)
+                .and_then(|links| links.resolved_type)
+                .is_none_or(|type_| store.type_payload(type_).is_none())
+        {
+            return Err(invalid());
+        }
+    }
+
+    Ok(Some(cached))
+}
+
 fn non_module_value_augmentation_diagnostic(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -36709,6 +36816,17 @@ pub(super) fn check_source_file(
     for annotation in commonjs_export_annotations.values() {
         preflight_planned_jsdoc_type(store, global_types, options, annotation).map_err(|_| {
             SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(source.node_ref()))
+        })?;
+    }
+    for assignment in statements.iter().filter_map(|statement| match statement {
+        PlannedStatement::ArrowExpandoAssignment(assignment) => Some(assignment),
+        _ => None,
+    }) {
+        let Some(annotation) = &assignment.jsdoc_type else {
+            continue;
+        };
+        preflight_planned_jsdoc_type(store, global_types, options, annotation).map_err(|_| {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(assignment.expression))
         })?;
     }
     let deferred_inferred_functions =
@@ -41542,53 +41660,92 @@ pub(super) fn check_source_file(
                     ));
                 }
 
-                let value = check_expression_type(
-                    store,
-                    host,
-                    global_types,
-                    source,
-                    options,
-                    session,
-                    diagnostics,
-                    &current_flow_types,
-                    &preflighted_type_import_value_uses,
-                    &assignment.right,
-                    None,
-                    &mut deferred,
-                )?;
-                let property_type = if matches!(
-                    &assignment.right.kind,
-                    PlannedExpressionKind::Array(elements) if elements.is_empty()
-                ) {
-                    if options.no_implicit_any {
-                        let name = store
-                            .symbol(assignment.property_symbol)
-                            .and_then(|property| property.name().as_utf8())
-                            .ok_or(SourceCheckError::Assignment(
-                                AssignmentInvariant::InvalidSymbolShape(assignment.property_symbol),
-                            ))?
-                            .to_owned();
-                        merge_retry_diagnostic(
-                            diagnostics,
-                            CanonicalCheckerDiagnostic {
-                                node: Some(assignment.left),
-                                range_override: None,
-                                diagnostic: Diagnostic::with_arguments(
-                                    message_by_code(7008)
-                                        .ok_or(SourceCheckError::MissingDiagnostic(7008))?,
-                                    [name, "any[]".to_owned()],
-                                ),
-                                related_information: Vec::new(),
-                            },
-                        );
-                    }
-                    global_types.any_array_type
+                let (property_type, assigned_type) = if let Some(annotation) =
+                    &assignment.jsdoc_type
+                {
+                    let target = match cached_javascript_function_expando_object_type(
+                        store, assignment, annotation,
+                    )? {
+                        Some(cached) => cached,
+                        None => {
+                            resolve_planned_jsdoc_type(store, global_types, options, annotation)
+                                .map_err(|_| {
+                                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
+                                        assignment.expression,
+                                    ))
+                                })?
+                        }
+                    };
+                    let checked = check_assignment_to_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        &mut deferred,
+                        target,
+                        None,
+                        &assignment.right,
+                        assignment.left,
+                        Some(assignment.expression),
+                    )?;
+                    (target, checked.assigned_type)
                 } else {
-                    let widened_literal = widened_fresh_literal_type(store, value.result)?;
-                    store.get_widened_type_with_global_types(widened_literal, global_types)?
+                    let value = check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        &assignment.right,
+                        None,
+                        &mut deferred,
+                    )?;
+                    let property_type = if matches!(
+                        &assignment.right.kind,
+                        PlannedExpressionKind::Array(elements) if elements.is_empty()
+                    ) {
+                        if options.no_implicit_any {
+                            let name = store
+                                .symbol(assignment.property_symbol)
+                                .and_then(|property| property.name().as_utf8())
+                                .ok_or(SourceCheckError::Assignment(
+                                    AssignmentInvariant::InvalidSymbolShape(
+                                        assignment.property_symbol,
+                                    ),
+                                ))?
+                                .to_owned();
+                            merge_retry_diagnostic(
+                                diagnostics,
+                                CanonicalCheckerDiagnostic {
+                                    node: Some(assignment.left),
+                                    range_override: None,
+                                    diagnostic: Diagnostic::with_arguments(
+                                        message_by_code(7008)
+                                            .ok_or(SourceCheckError::MissingDiagnostic(7008))?,
+                                        [name, "any[]".to_owned()],
+                                    ),
+                                    related_information: Vec::new(),
+                                },
+                            );
+                        }
+                        global_types.any_array_type
+                    } else {
+                        let widened_literal = widened_fresh_literal_type(store, value.result)?;
+                        store.get_widened_type_with_global_types(widened_literal, global_types)?
+                    };
+                    (property_type, value.result)
                 };
                 preflight_source_expression_cache(store, assignment.left, property_type)?;
-                preflight_source_expression_cache(store, assignment.expression, value.result)?;
+                preflight_source_expression_cache(store, assignment.expression, assigned_type)?;
                 stage_value_type(
                     store,
                     &mut staged_value_types,
@@ -41620,7 +41777,7 @@ pub(super) fn check_source_file(
                     }
                 }
                 publish_expression_type(store, assignment.left, property_type)?;
-                publish_expression_type(store, assignment.expression, value.result)?;
+                publish_expression_type(store, assignment.expression, assigned_type)?;
             }
             PlannedStatement::ObjectExpandoAssignment(assignment) => {
                 let property = store.symbol(assignment.property_symbol).ok_or(
@@ -69281,6 +69438,124 @@ class Foo2 {
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn javascript_function_expando_jsdoc_annotations_type_properties_and_reads() {
+        for (index, (source_text, object_property, incompatible)) in [
+            (
+                concat!(
+                    "function work() {}\n",
+                    "/** @type {string} */\n",
+                    "work.value = 'ready';\n",
+                    "const copied = work.value;",
+                ),
+                false,
+                false,
+            ),
+            (
+                concat!(
+                    "function work() {}\n",
+                    "/** @type {string} */\n",
+                    "work.value = 1;\n",
+                    "const copied = work.value;",
+                ),
+                false,
+                true,
+            ),
+            (
+                concat!(
+                    "function work() {}\n",
+                    "/** @type {{ ready: boolean }} */\n",
+                    "work.value = { ready: true };\n",
+                    "const copied = work.value.ready;",
+                ),
+                true,
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parse_javascript_source_file(source_text);
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let file = FileId::new(8_465 + u32::try_from(index).unwrap());
+            let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+            context.check_source_file(file).unwrap();
+
+            let owner = function_symbol(&context, &source, file, "work");
+            let property = context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source("value"))
+                .unwrap();
+            let property_type = context
+                .store()
+                .value_symbol_links(property)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let expected = if object_property {
+                context.store().intrinsic_bootstrap().unwrap().boolean_type
+            } else {
+                context.store().intrinsic_bootstrap().unwrap().string_type
+            };
+            if !object_property {
+                assert_eq!(property_type, expected);
+            }
+            assert_eq!(
+                variable_value_type(&context, &source, file, "copied"),
+                expected,
+            );
+
+            if incompatible {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("expected one annotated function-property assignment diagnostic")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2322);
+                assert_eq!(diagnostic.diagnostic.arguments, ["number", "string"]);
+                assert_eq!(node_text(&source, diagnostic.node.unwrap()), "work.value");
+            } else {
+                assert!(context.diagnostics().is_empty());
+            }
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn unsupported_javascript_function_expando_annotations_leave_semantic_state_cold() {
+        let source = parse_javascript_source_file(concat!(
+            "function work() {}\n",
+            "/** @type {Record<string, boolean>} */\n",
+            "work.value = {};",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_468);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+        let owner = function_symbol(&context, &source, file, "work");
+        let cold = observable_state(&context, file);
+
+        for _ in 0..2 {
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::JsDoc(_)
+                ))
+            ));
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(
+                context
+                    .store()
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
+            assert!(context.diagnostics().is_empty());
         }
     }
 

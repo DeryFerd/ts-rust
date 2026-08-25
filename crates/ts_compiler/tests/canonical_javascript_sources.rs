@@ -77,6 +77,47 @@ fn canonical_program_checks_javascript_arrow_expandos() {
 }
 
 #[test]
+fn canonical_program_honors_javascript_function_expando_jsdoc_annotations() {
+    for (value, expected_diagnostic) in [("'ready'", None), ("1", Some(2322))] {
+        let filesystem = MemoryFileSystem::new(true);
+        filesystem
+            .write_file(
+                "/project/input.js",
+                &format!(
+                    "function work() {{}}\n\
+                     /** @type {{string}} */\n\
+                     work.value = {value};\n\
+                     const copied = work.value;\n"
+                ),
+            )
+            .unwrap();
+        let mut options = javascript_options();
+        options.check_js = true;
+
+        let program = Program::try_new_with_canonical_checker(
+            &filesystem,
+            "/project",
+            &["input.js".to_owned()],
+            options,
+        )
+        .unwrap_or_else(|error| panic!("failed to check annotated function property: {error:?}"));
+
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            expected_diagnostic
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>(),
+            "value: {value}",
+        );
+    }
+}
+
+#[test]
 fn unchecked_javascript_es_modules_share_one_bundler_graph() {
     let filesystem = MemoryFileSystem::new(true);
     filesystem
