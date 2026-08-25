@@ -16525,9 +16525,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         enums::get_enum_semantics(self.store, self.host, symbol).map_err(Into::into)
     }
 
-    /// Resolves an exact function-type or declared call-signature return type.
-    /// Function-type return annotations remain lazy after the callable and its
-    /// parameter value types have been published.
+    /// Resolves an exact function, source callable, declared call, or method
+    /// signature return type. Function-type return annotations remain lazy
+    /// after the callable and its parameter value types are published.
     pub(super) fn get_return_type_of_signature(
         &mut self,
         signature: SignatureId,
@@ -16687,6 +16687,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             signature,
                         ))
                     });
+            }
+            SyntaxKind::MethodSignature => {
+                return self.get_return_type_of_declared_method_signature(signature, declaration);
             }
             SyntaxKind::FunctionType => {
                 if let Some(annotation) = self
@@ -16874,6 +16877,80 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             );
             Ok(return_type)
         }
+    }
+
+    fn get_return_type_of_declared_method_signature(
+        &self,
+        signature: SignatureId,
+        declaration: NodeRef,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        self.reject_type_reference_alias_capabilities()?;
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature));
+        let record = preflight_node(self.store, self.host, declaration)?;
+        let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+            return Err(invalid());
+        };
+        let annotation = method
+            .type_
+            .map(|annotation| NodeRef::new(declaration.arena, declaration.file, annotation))
+            .ok_or_else(invalid)?;
+        let bound = self.host.bound_file(declaration).ok_or_else(invalid)?;
+        let method_symbol = bound
+            .symbol(declaration)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        let callable = self
+            .store
+            .value_symbol_links(method_symbol)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+
+        if !self
+            .host
+            .symbol_matches(self.store, declaration, method_symbol)
+            || self
+                .store
+                .authenticated_interface_method_owner(method_symbol)
+                .is_none()
+                && self
+                    .store
+                    .authenticated_type_literal_method_owner(method_symbol)
+                    .is_none()
+            || self
+                .store
+                .signature_links(declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                != Some(signature)
+            || self.store.source_direct_type_annotation(declaration) != Some(annotation)
+        {
+            return Err(invalid());
+        }
+
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(self.store, callable)
+        else {
+            return Err(invalid());
+        };
+        let return_type = projection
+            .call_signatures
+            .iter()
+            .find(|candidate| candidate.signature == signature)
+            .and_then(|candidate| candidate.return_type)
+            .ok_or_else(invalid)?;
+        if self
+            .store
+            .signature(signature)
+            .and_then(Signature::resolved_return_type)
+            != Some(return_type)
+            || !self
+                .store
+                .source_direct_type_annotation_is_exact(annotation, return_type)
+        {
+            return Err(invalid());
+        }
+
+        Ok(return_type)
     }
 
     fn get_return_type_of_source_callable_signature(
@@ -37450,8 +37527,20 @@ mod tests {
                 .callable_signature_parameter_types(signature.signature),
             Some([bootstrap.string_type].as_slice()),
         );
+        let method_signature = signature.signature;
+        let expected_return = bootstrap.number_type;
 
         let warm = (store_state(&fixture.store), fixture.store.signature_len());
+        for _ in 0..2 {
+            assert_eq!(
+                query_signature_return(&mut fixture, method_signature, &mut diagnostics),
+                Ok(expected_return),
+            );
+            assert_eq!(
+                (store_state(&fixture.store), fixture.store.signature_len()),
+                warm,
+            );
+        }
         assert_eq!(
             query_declared(
                 &mut fixture,
@@ -37875,8 +37964,19 @@ mod tests {
         assert_eq!(signature.parameters, [other_type]);
         assert_eq!(signature.return_type, Some(other_type));
         assert!(signature.strict_variance_exempt);
+        let method_signature = signature.signature;
 
         let warm = (store_state(&fixture.store), fixture.store.signature_len());
+        for _ in 0..2 {
+            assert_eq!(
+                query_signature_return(&mut fixture, method_signature, &mut diagnostics),
+                Ok(other_type),
+            );
+            assert_eq!(
+                (store_state(&fixture.store), fixture.store.signature_len()),
+                warm,
+            );
+        }
         assert_eq!(
             query_declared(
                 &mut fixture,
@@ -37890,6 +37990,74 @@ mod tests {
             (store_state(&fixture.store), fixture.store.signature_len()),
             warm,
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn namespaced_generic_interface_methods_return_their_authenticated_type_parameter() {
+        let mut fixture = fixture(concat!(
+            "namespace Shapes { ",
+            "export interface Contract { ",
+            "map<Value extends string = string>(value: Value): Value; ",
+            "} } ",
+            "type Selected = Shapes.Contract;",
+        ));
+        let selected = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Selected");
+        let contract = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Contract");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let contract_type = query_declared(
+            &mut fixture,
+            selected,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let method = fixture
+            .store
+            .symbol(contract)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("map"))
+            .unwrap();
+        let callable = fixture
+            .store
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, callable)
+        else {
+            panic!("a namespaced generic method retains authenticated callable provenance")
+        };
+        let [projected] = projection.call_signatures.as_ref() else {
+            panic!("the namespaced generic method exposes one signature")
+        };
+        let method_signature = projected.signature;
+        let [type_parameter] = fixture
+            .store
+            .signature(method_signature)
+            .unwrap()
+            .type_parameters()
+        else {
+            panic!("the generic method retains its binder-owned type parameter")
+        };
+        let type_parameter = *type_parameter;
+        assert_eq!(projected.parameters, [type_parameter]);
+        assert_eq!(projected.return_type, Some(type_parameter));
+        assert_eq!(
+            fixture.store.authenticated_interface_method_owner(method),
+            Some((contract, contract_type)),
+        );
+
+        let warm = function_store_state(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                query_signature_return(&mut fixture, method_signature, &mut diagnostics),
+                Ok(type_parameter),
+            );
+            assert_eq!(function_store_state(&fixture.store), warm);
+        }
         assert!(diagnostics.is_empty());
     }
 
@@ -38939,8 +39107,8 @@ mod tests {
     }
 
     #[test]
-    fn warm_indexed_methods_reject_forged_parameter_signature_and_owner_caches() {
-        for corruption in 0..3 {
+    fn warm_indexed_methods_reject_forged_parameter_signature_owner_and_return_caches() {
+        for corruption in 0..5 {
             let mut fixture = fixture(concat!(
                 "type Bad = ",
                 "{ bivarianceHack(value: string): void }['bivarianceHack'];",
@@ -38968,7 +39136,18 @@ mod tests {
                 &mut diagnostics,
             )
             .unwrap();
-            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            let signature = fixture
+                .store
+                .signature_links(method.declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let number = bootstrap.number_type;
+            let void = bootstrap.void_type;
+            assert_eq!(
+                query_signature_return(&mut fixture, signature, &mut diagnostics),
+                Ok(void),
+            );
             match corruption {
                 0 => assert!(fixture.store.set_value_symbol_links(
                     method.parameters[0].symbol,
@@ -38989,6 +39168,18 @@ mod tests {
                         ..ValueSymbolLinks::default()
                     },
                 )),
+                3 => assert!(
+                    fixture
+                        .store
+                        .set_signature_resolved_return_type(signature, Some(number))
+                ),
+                4 => assert!(fixture.store.set_type_node_links(
+                    method.return_type,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    },
+                )),
                 _ => unreachable!("corruption cases are bounded"),
             }
             assert!(matches!(
@@ -38997,6 +39188,16 @@ mod tests {
             ));
             let before = (store_state(&fixture.store), fixture.store.signature_len());
             for _ in 0..2 {
+                assert!(matches!(
+                    query_signature_return(&mut fixture, signature, &mut diagnostics),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(cached),
+                    )) if cached == signature
+                ));
+                assert_eq!(
+                    (store_state(&fixture.store), fixture.store.signature_len()),
+                    before,
+                );
                 assert!(
                     query_declared(
                         &mut fixture,
@@ -39358,6 +39559,11 @@ mod tests {
             .expect("interface methods must be published as named members");
         assert_eq!(record.symbol(), Some(symbol));
         assert_eq!(members.len(), 4);
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let void = bootstrap.void_type;
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let mut method_returns = Vec::new();
 
         for (name, expected_signatures) in [("reset", 1), ("convert", 2)] {
             let method = members.get_source(name).unwrap();
@@ -39373,14 +39579,32 @@ mod tests {
                 .and_then(|structured| structured.signatures.as_deref())
                 .expect("a method object must retain its source signatures");
             assert_eq!(signatures.len(), expected_signatures, "{name}");
+            for (index, signature) in signatures.iter().copied().enumerate() {
+                let expected_return = match (name, index) {
+                    ("reset", 0) => void,
+                    ("convert", 0) => number,
+                    ("convert", 1) => string,
+                    _ => unreachable!("the interface has three bounded method signatures"),
+                };
+                method_returns.push((signature, expected_return));
+            }
         }
 
-        let warm = store_state(&fixture.store);
+        let warm = function_store_state(&fixture.store);
+        for _ in 0..2 {
+            for (signature, expected_return) in &method_returns {
+                assert_eq!(
+                    query_signature_return(&mut fixture, *signature, &mut diagnostics),
+                    Ok(*expected_return),
+                );
+            }
+            assert_eq!(function_store_state(&fixture.store), warm);
+        }
         assert_eq!(
             query_node(&mut fixture, reference, &mut diagnostics),
             Ok(declared)
         );
-        assert_eq!(store_state(&fixture.store), warm);
+        assert_eq!(function_store_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
     }
 
