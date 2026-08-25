@@ -2721,6 +2721,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                     return Err(self.interface_plan_error(statement, error));
                                 }
                             };
+                            if let Some(heritage) = plan.heritage.as_ref()
+                                && heritage
+                                    .bases
+                                    .iter()
+                                    .any(|base| base.type_arguments.is_empty())
+                            {
+                                return Err(self.unsupported(
+                                    heritage.clause,
+                                    SyntaxKind::HeritageClause,
+                                    SourceSyntaxRole::InterfaceDeclaration,
+                                ));
+                            }
                             statements.push(PlannedStatement::GenericInterface(plan));
                             continue;
                         }
