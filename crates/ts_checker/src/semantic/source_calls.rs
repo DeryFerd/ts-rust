@@ -5174,6 +5174,26 @@ fn prepare_vector_source_call_diagnostic(
             {
                 return Err(SourceCheckError::Call(plan.node));
             }
+            if expected == 1
+                && actual == 0
+                && !has_effective_rest
+                && promise_executor_missing_argument_is_exact(
+                    store,
+                    host,
+                    plan.node,
+                    plan.callee_diagnostic_node,
+                    projection.generic_signature,
+                )
+            {
+                return Ok(vec![CanonicalCheckerDiagnostic {
+                    node: Some(plan.callee_diagnostic_node),
+                    range_override: None,
+                    diagnostic: Diagnostic::new(
+                        message_by_code(2810).ok_or(SourceCheckError::MissingDiagnostic(2810))?,
+                    ),
+                    related_information: Vec::new(),
+                }]);
+            }
             let (message, expected) = if has_effective_rest {
                 (
                     message_by_code(2555).ok_or(SourceCheckError::MissingDiagnostic(2555))?,
