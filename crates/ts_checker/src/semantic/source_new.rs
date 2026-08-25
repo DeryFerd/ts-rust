@@ -8,9 +8,9 @@
 //! global `Object`, `Array`, `Date`, or `Promise` constructor. Imported ambient
 //! classes retain primitive constructor arguments and canonical generic
 //! instantiations. Global arrays retain their real length and generic-item
-//! overloads. Planning proves syntax, resolver routes, provider provenance, and
-//! cold/warm caches before source execution may publish class or expression
-//! state.
+//! overloads, including authenticated empty object literals. Planning proves
+//! syntax, resolver routes, provider provenance, and cold/warm caches before
+//! source execution may publish class or expression state.
 
 use std::collections::{HashMap, HashSet};
 
@@ -37,7 +37,10 @@ use super::{
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
     functions::plan_function_type,
     jsdoc::leading_jsdoc_comment,
-    object_members::{PropertyObjectPlan, plan_interface, plan_type_literal},
+    object_members::{
+        PropertyObjectPlan, object_literal_state, plan_interface, plan_object_literal,
+        plan_type_literal, publish_object_literal,
+    },
     reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
     signatures::SignatureFlags,
     source::{PlannedExpression, PlannedExpressionKind},
@@ -257,6 +260,7 @@ struct SourceNewTypeArgument {
 enum SourceNewArgumentValue {
     String(String),
     Number(Number),
+    EmptyObject(Box<PropertyObjectPlan>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -665,6 +669,25 @@ pub(super) fn plan_direct_default_new(
                         }
                         SourceNewArgumentValue::Number(value)
                     }
+                    NodeData::ObjectLiteralExpression(object)
+                        if argument_record.kind == SyntaxKind::ObjectLiteralExpression
+                            && object.properties.nodes.is_empty()
+                            && object.symbol.is_none()
+                            && object.facts == 0 =>
+                    {
+                        let planned = plan_object_literal(store, host, argument_node)
+                            .map_err(|_| unsupported(SourceNewUnsupported::Arguments(node)))?;
+                        if !planned.properties.is_empty()
+                            || !planned.methods.is_empty()
+                            || !planned.accessors.is_empty()
+                            || !planned.spreads.is_empty()
+                            || !planned.indexes.is_empty()
+                            || !planned.call_signatures.is_empty()
+                        {
+                            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+                        }
+                        SourceNewArgumentValue::EmptyObject(Box::new(planned))
+                    }
                     _ => return Err(unsupported(SourceNewUnsupported::Arguments(node))),
                 };
                 if argument_record.flags.0 != 0
@@ -787,6 +810,13 @@ pub(super) fn plan_direct_default_new(
             .and_then(|global| store.get_merged_symbol(global))
             == Some(symbol);
     if executor.is_some() && !global_promise {
+        return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+    }
+    if !global_array
+        && arguments
+            .iter()
+            .any(|argument| matches!(&argument.value, SourceNewArgumentValue::EmptyObject(_)))
+    {
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
     if !global_array
@@ -2023,6 +2053,7 @@ fn plan_global_array_constructor(
             let inferred = match &argument.value {
                 SourceNewArgumentValue::String(_) => bootstrap.string_type,
                 SourceNewArgumentValue::Number(_) => bootstrap.number_type,
+                SourceNewArgumentValue::EmptyObject(_) => bootstrap.empty_type_literal_type,
             };
             let element = explicit.unwrap_or(inferred);
             if std::iter::once(argument)
@@ -2031,6 +2062,7 @@ fn plan_global_array_constructor(
                     let actual = match &argument.value {
                         SourceNewArgumentValue::String(_) => bootstrap.string_type,
                         SourceNewArgumentValue::Number(_) => bootstrap.number_type,
+                        SourceNewArgumentValue::EmptyObject(_) => bootstrap.empty_type_literal_type,
                     };
                     element != bootstrap.any_type && element != actual
                 })
@@ -2511,6 +2543,7 @@ fn argument_matches_parameter(
         let argument_type = match &argument.value {
             SourceNewArgumentValue::String(_) => bootstrap.string_type,
             SourceNewArgumentValue::Number(_) => bootstrap.number_type,
+            SourceNewArgumentValue::EmptyObject(_) => bootstrap.empty_type_literal_type,
         };
         parameter.type_ == argument_type
             || parameter.type_ == bootstrap.any_type
@@ -2524,6 +2557,21 @@ pub(super) fn preflight_direct_default_new(
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
 ) -> Result<(), SourceNewError> {
+    for argument in plan.arguments() {
+        if let SourceNewArgumentValue::EmptyObject(object) = &argument.value {
+            let actual = plan_object_literal(store, host, argument.node).map_err(|_| {
+                invariant(SourceNewInvariant::InvalidExpressionCache(argument.node))
+            })?;
+            if &actual != object.as_ref() {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    argument.node,
+                )));
+            }
+            object_literal_state(store, object).map_err(|_| {
+                invariant(SourceNewInvariant::InvalidExpressionCache(argument.node))
+            })?;
+        }
+    }
     match &plan.target {
         SourceNewTarget::Class(class) => {
             preflight_nongeneric_class_member_query(store, host, class)?;
@@ -2656,6 +2704,16 @@ pub(super) fn prepare_direct_default_news(
     }
 
     for plan in plans {
+        for argument in plan.arguments() {
+            if let SourceNewArgumentValue::EmptyObject(object) = &argument.value {
+                publish_object_literal(store, object, &[]).map_err(|_| {
+                    invariant(SourceNewInvariant::InvalidExpressionCache(argument.node))
+                })?;
+            }
+        }
+    }
+
+    for plan in plans {
         match &plan.target {
             SourceNewTarget::GlobalObject(global)
                 if resolved_global_object_constructor(store, plan, global)?.is_none() =>
@@ -2706,6 +2764,7 @@ pub(super) fn prepare_direct_default_news(
         match &argument.value {
             SourceNewArgumentValue::String(value) => strings.push(value.clone()),
             SourceNewArgumentValue::Number(value) => numbers.push(*value),
+            SourceNewArgumentValue::EmptyObject(_) => {}
         }
     }
     if !strings.is_empty() || !numbers.is_empty() {
@@ -3782,6 +3841,17 @@ pub(super) fn check_direct_default_new(
                     store.regular_string_literal_type(value.clone())
                 }
                 SourceNewArgumentValue::Number(value) => store.regular_number_literal_type(*value),
+                SourceNewArgumentValue::EmptyObject(object) => {
+                    return object_literal_state(store, object)
+                        .map_err(|_| {
+                            invariant(SourceNewInvariant::InvalidExpressionCache(argument.node))
+                        })?
+                        .filter(|state| state.is_resolved())
+                        .map(|state| state.type_id())
+                        .ok_or_else(|| {
+                            invariant(SourceNewInvariant::InvalidExpressionCache(argument.node))
+                        });
+                }
             }
             .map_err(|error| literal_cache_error(argument.node, error))?;
             store
@@ -4617,6 +4687,15 @@ fn cached_argument_type(
     let regular = match &argument.value {
         SourceNewArgumentValue::String(value) => bootstrap.cached_string_literal_type(value),
         SourceNewArgumentValue::Number(value) => bootstrap.cached_number_literal_type(*value),
+        SourceNewArgumentValue::EmptyObject(object) => {
+            return object_literal_state(store, object)
+                .map(|state| {
+                    state
+                        .filter(|state| state.is_resolved())
+                        .map(|state| state.type_id())
+                })
+                .map_err(|_| invariant(SourceNewInvariant::InvalidExpressionCache(argument.node)));
+        }
     };
     regular
         .map(|regular| {
@@ -6166,6 +6245,171 @@ mod tests {
             warm,
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn global_array_object_items_preserve_fresh_arguments_and_canonical_empty_elements() {
+        let library = global_array_constructor_library();
+        let source = parse_source_file(concat!(
+            "const first = new Array({}); ",
+            "const second = new Array({}); ",
+            "const explicit = new Array<any>({});",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(1_844);
+        let source_file = FileId::new(1_845);
+        let mut context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+
+        context.check_source_file(source_file).unwrap();
+
+        let (empty, any) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.empty_type_literal_type, bootstrap.any_type)
+        };
+        let mut object_types = Vec::new();
+        for (name, expected_element) in [("first", empty), ("second", empty), ("explicit", any)] {
+            let (construction, _) = variable_new(&source, source_file, name);
+            let instance = context
+                .store()
+                .type_node_links(construction)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .canonical_array_element_type(context.global_types(), instance)
+                    .unwrap(),
+                Some(expected_element),
+            );
+            let NodeData::NewExpression(expression) =
+                &source.arena.get(construction.node).unwrap().data
+            else {
+                panic!("the selected variable must retain its Array construction")
+            };
+            let [object] = expression.arguments.as_ref().unwrap().nodes.as_slice() else {
+                panic!("the Array items overload must retain one empty object argument")
+            };
+            let object = NodeRef::new(source.arena.id(), source_file, *object);
+            let owner = context.file(source_file).unwrap().1.symbol(object).unwrap();
+            let object_type = context
+                .store()
+                .type_node_links(object)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let object_record = context.store().type_payload(object_type).unwrap();
+            assert_eq!(object_record.symbol(), Some(owner));
+            assert_eq!(
+                object_record.object_flags(),
+                ObjectFlags::ANONYMOUS
+                    | ObjectFlags::OBJECT_LITERAL
+                    | ObjectFlags::FRESH_LITERAL
+                    | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL
+                    | ObjectFlags::MEMBERS_RESOLVED,
+            );
+            let TypeData::Object(object_record) = object_record.data() else {
+                panic!("the Array argument must retain a fresh source object")
+            };
+            assert!(
+                context
+                    .store()
+                    .symbol_table(object_record.structured.members.unwrap())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_ne!(object_type, empty);
+            object_types.push(object_type);
+        }
+        assert_ne!(object_types[0], object_types[1]);
+        assert_ne!(object_types[1], object_types[2]);
+        assert!(context.diagnostics().is_empty());
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().cached_signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().cached_signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn global_array_object_items_reject_nonempty_or_forged_object_arguments() {
+        let library = global_array_constructor_library();
+        let nonempty = parse_source_file("const value = new Array({ value: 1 });");
+        let mut context = global_object_constructor_context(
+            &library,
+            &nonempty,
+            FileId::new(1_846),
+            FileId::new(1_847),
+        );
+        let (construction, _) = variable_new(&nonempty, FileId::new(1_847), "value");
+
+        assert!(context.check_source_file(FileId::new(1_847)).is_err());
+        assert!(context.store().type_node_links(construction).is_none());
+        assert!(context.store().signature_links(construction).is_none());
+
+        let source = parse_source_file("const value = new Array({});");
+        let source_file = FileId::new(1_849);
+        let mut context =
+            global_object_constructor_context(&library, &source, FileId::new(1_848), source_file);
+        let (construction, _) = variable_new(&source, source_file, "value");
+        let NodeData::NewExpression(expression) =
+            &source.arena.get(construction.node).unwrap().data
+        else {
+            panic!("the selected variable must retain its Array construction")
+        };
+        let object = NodeRef::new(
+            source.arena.id(),
+            source_file,
+            expression.arguments.as_ref().unwrap().nodes[0],
+        );
+        let owner = context.file(source_file).unwrap().1.symbol(object).unwrap();
+        let parent = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_symbol;
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            owner,
+            None,
+            None,
+            Some(parent),
+            None,
+        ));
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(context.check_source_file(source_file).is_err());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(context.store().type_node_links(object).is_none());
+        assert!(context.store().type_node_links(construction).is_none());
     }
 
     #[test]
