@@ -6485,7 +6485,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Keep the four upstream fixtures and their exact locations together.
     fn legacy_checker_preserves_upstream_strict_arguments_diagnostics() {
-        let cases: [(&str, &str, &[(usize, usize)]); 4] = [
+        type StrictArgumentsCase = (&'static str, &'static str, &'static [(usize, usize)]);
+
+        let cases: [StrictArgumentsCase; 4] = [
             (
                 "alwaysStrictModule.ts",
                 concat!(
@@ -8205,55 +8207,55 @@ mod tests {
         );
     }
 
-    #[test]
-    fn upstream_diagnostic_order_uses_origin_arguments_and_message_chain_shape() {
-        fn diagnostic(
-            code: u32,
-            arguments: &[&str],
-            origin: super::CompilationDiagnosticOrigin,
-            details: &[&str],
-        ) -> CompilationDiagnostic {
-            let structured = ts_diagnostics::Diagnostic::with_arguments(
-                ts_diagnostics::message_by_code(code).unwrap(),
-                arguments.iter().copied(),
-            )
-            .with_details(details.iter().copied());
-            CompilationDiagnostic {
-                file_name: None,
-                source_text: None,
-                range: None,
-                code: Some(code),
-                category: Some(CompilationDiagnosticCategory::Error),
-                message: structured.render().unwrap(),
-                related_information: Some(Vec::new()),
-                ordering: super::CompilationDiagnosticOrdering {
-                    origin,
-                    diagnostic: Some(structured),
-                },
-            }
+    fn ordered_diagnostic(
+        code: u32,
+        arguments: &[&str],
+        origin: super::CompilationDiagnosticOrigin,
+        details: &[&str],
+    ) -> CompilationDiagnostic {
+        let structured = ts_diagnostics::Diagnostic::with_arguments(
+            ts_diagnostics::message_by_code(code).unwrap(),
+            arguments.iter().copied(),
+        )
+        .with_details(details.iter().copied());
+        CompilationDiagnostic {
+            file_name: None,
+            source_text: None,
+            range: None,
+            code: Some(code),
+            category: Some(CompilationDiagnosticCategory::Error),
+            message: structured.render().unwrap(),
+            related_information: Some(Vec::new()),
+            ordering: super::CompilationDiagnosticOrdering {
+                origin,
+                diagnostic: Some(structured),
+            },
         }
+    }
 
+    #[test]
+    fn upstream_diagnostic_order_uses_origin_and_message_arguments() {
         let case = Case::parse("global.ts", "").unwrap();
         let globals = [
-            diagnostic(
+            ordered_diagnostic(
                 2318,
                 &["Object"],
                 super::CompilationDiagnosticOrigin::Checker,
                 &[],
             ),
-            diagnostic(
+            ordered_diagnostic(
                 2318,
                 &["Boolean"],
                 super::CompilationDiagnosticOrigin::Checker,
                 &[],
             ),
-            diagnostic(
+            ordered_diagnostic(
                 5053,
                 &["lib", "noLib"],
                 super::CompilationDiagnosticOrigin::CompilerOption,
                 &[],
             ),
-            diagnostic(
+            ordered_diagnostic(
                 2318,
                 &["Array"],
                 super::CompilationDiagnosticOrigin::Checker,
@@ -8272,13 +8274,13 @@ mod tests {
             ),
         );
 
-        let argument_first = diagnostic(
+        let argument_first = ordered_diagnostic(
             1007,
             &["alpha", "zeta"],
             super::CompilationDiagnosticOrigin::Checker,
             &[],
         );
-        let rendered_first = diagnostic(
+        let rendered_first = ordered_diagnostic(
             1007,
             &["beta", "alpha"],
             super::CompilationDiagnosticOrigin::Checker,
@@ -8289,14 +8291,17 @@ mod tests {
             super::compare_compilation_diagnostics(&argument_first, &rendered_first),
             std::cmp::Ordering::Less,
         );
+    }
 
-        let elaborated = diagnostic(
+    #[test]
+    fn upstream_diagnostic_order_prefers_more_elaborate_message_chains() {
+        let elaborated = ordered_diagnostic(
             2318,
             &["Array"],
             super::CompilationDiagnosticOrigin::Checker,
             &["first detail", "second detail"],
         );
-        let brief = diagnostic(
+        let brief = ordered_diagnostic(
             2318,
             &["Array"],
             super::CompilationDiagnosticOrigin::Checker,
@@ -8307,13 +8312,13 @@ mod tests {
             std::cmp::Ordering::Less,
         );
 
-        let nested = diagnostic(
+        let nested = ordered_diagnostic(
             2318,
             &["Array"],
             super::CompilationDiagnosticOrigin::Checker,
             &["first detail", "  nested detail"],
         );
-        let siblings = diagnostic(
+        let siblings = ordered_diagnostic(
             2318,
             &["Array"],
             super::CompilationDiagnosticOrigin::Checker,
