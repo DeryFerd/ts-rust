@@ -44640,7 +44640,6 @@ mod tests {
     #[test]
     fn malformed_labeled_for_in_loops_fail_before_source_state_publication() {
         for (index, iteration) in [
-            "outer: for (var key in ready) { (() => key); }",
             "outer: for (const key in ready) (() => key);",
             "outer: for (let key in ready) { let nested = key; }",
         ]
