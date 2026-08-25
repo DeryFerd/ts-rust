@@ -31808,15 +31808,15 @@ fn check_planned_array_binding_element(
         });
     }
 
-    let trailing_comma = match host.node(binding.pattern).map(|node| &node.data) {
-        Some(NodeData::BindingPattern(pattern)) => pattern.elements.has_trailing_comma,
-        _ => {
-            return Err(SourceCheckError::Variable(
-                VariableInvariant::InvalidBindingPattern(binding.pattern),
-            ));
-        }
-    };
-    if !binding.rest && binding.initializer.is_none() && !trailing_comma {
+    if !matches!(
+        host.node(binding.pattern).map(|node| &node.data),
+        Some(NodeData::BindingPattern(_))
+    ) {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::InvalidBindingPattern(binding.pattern),
+        ));
+    }
+    if !binding.rest && binding.initializer.is_none() {
         return check_array_binding_element(
             store,
             host,
