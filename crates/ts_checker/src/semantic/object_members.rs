@@ -827,6 +827,24 @@ pub(super) fn validate_stored_declared_call_set(
             };
             *declaration
         };
+        let optional_boolean_call = !construct
+            && signature_record.parameters().len() == 1
+            && signature_record.type_parameters() == parameter_types
+            && minimum == 0
+            && store
+                .intrinsic_bootstrap()
+                .is_some_and(|bootstrap| return_type == bootstrap.boolean_type)
+            && signature_record
+                .parameters()
+                .first()
+                .and_then(|parameter| store.symbol(*parameter))
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .zip(parameter_types.first().copied())
+                .is_some_and(|(parameter, type_)| {
+                    authenticated_global_boolean_constructor_optional_parameter(
+                        store, parameter, type_,
+                    )
+                });
         if !seen_signatures.insert(signature)
             || store.declared_call_set_type_for_signature(signature) != Some(provider)
             || if construct
@@ -861,6 +879,7 @@ pub(super) fn validate_stored_declared_call_set(
             || !construct
                 && minimum != fixed_parameter_count
                 && store.source_node_kind(provider_declaration) != Some(SyntaxKind::TypeLiteral)
+                && !optional_boolean_call
             || !super::callable_sets::valid_declared_method_type_parameters(
                 store,
                 signature_record,
@@ -940,7 +959,8 @@ pub(super) fn validate_stored_declared_call_set(
                         optional
                             != ((construct
                                 || store.source_node_kind(provider_declaration)
-                                    == Some(SyntaxKind::TypeLiteral))
+                                    == Some(SyntaxKind::TypeLiteral)
+                                || optional_boolean_call)
                                 && parameter_index >= minimum
                                 && parameter_index < fixed_parameter_count)
                     })
@@ -1158,11 +1178,104 @@ fn declared_signature_parameter_is_optional(
         && store.source_node_parent(question) == Some(SourceNodeParent::Parent(declaration));
     if optional {
         let any = store.intrinsic_bootstrap()?.any_type;
-        if store.source_node_kind(annotation) != Some(SyntaxKind::AnyKeyword) || type_ != any {
+        if (store.source_node_kind(annotation) != Some(SyntaxKind::AnyKeyword) || type_ != any)
+            && !authenticated_global_boolean_constructor_optional_parameter(
+                store,
+                declaration,
+                type_,
+            )
+        {
             return None;
         }
     }
     Some(optional)
+}
+
+fn authenticated_global_boolean_constructor_optional_parameter(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    type_: TypeId,
+) -> bool {
+    let Some(SourceNodeParent::Parent(signature)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(interface)) = store.source_node_parent(signature) else {
+        return false;
+    };
+    let Some(parameter) = cached_ordinary_type_parameter_owner(store, type_) else {
+        return false;
+    };
+    let Some([parameter_declaration]) = store
+        .symbol(parameter)
+        .and_then(|record| record.declarations())
+    else {
+        return false;
+    };
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    let Some(globals) = store.symbol_table(bootstrap.globals) else {
+        return false;
+    };
+    let Some(owner) = globals
+        .get_source("BooleanConstructor")
+        .and_then(|owner| store.get_merged_symbol(owner))
+    else {
+        return false;
+    };
+    let Some(owner_record) = store.symbol(owner) else {
+        return false;
+    };
+    let Some(boolean) = globals
+        .get_source("Boolean")
+        .and_then(|boolean| store.get_merged_symbol(boolean))
+    else {
+        return false;
+    };
+    let Some(boolean_record) = store.symbol(boolean) else {
+        return false;
+    };
+    let Some(value_declaration) = boolean_record.value_declaration() else {
+        return false;
+    };
+    let Some(annotation) = store.source_direct_type_annotation(declaration) else {
+        return false;
+    };
+    let Some(return_annotation) = store.source_direct_type_annotation(signature) else {
+        return false;
+    };
+
+    store.source_node_kind(signature) == Some(SyntaxKind::CallSignature)
+        && store.source_node_kind(interface) == Some(SyntaxKind::InterfaceDeclaration)
+        && owner_record.flags() == SymbolFlags::INTERFACE
+        && owner_record.name().as_utf8() == Some("BooleanConstructor")
+        && owner_record
+            .declarations()
+            .is_some_and(|declarations| declarations.contains(&interface))
+        && owner_record
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(InternalSymbolName::Call.as_ref()))
+            .and_then(|symbol| store.symbol(symbol))
+            .and_then(|record| record.declarations())
+            .is_some_and(|declarations| declarations.contains(&signature))
+        && boolean_record
+            .flags()
+            .contains(SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        && store.source_node_kind(value_declaration) == Some(SyntaxKind::VariableDeclaration)
+        && store
+            .source_direct_type_annotation(value_declaration)
+            .is_some_and(|annotation| {
+                store.source_node_kind(annotation) == Some(SyntaxKind::TypeReference)
+            })
+        && store.source_node_parent(*parameter_declaration)
+            == Some(SourceNodeParent::Parent(signature))
+        && store.source_node_kind(annotation) == Some(SyntaxKind::TypeReference)
+        && store
+            .type_node_links(annotation)
+            .and_then(|links| links.resolved_type)
+            == Some(type_)
+        && store.source_node_kind(return_annotation) == Some(SyntaxKind::BooleanKeyword)
 }
 
 pub(super) fn declared_signature_parameter_is_rest(
@@ -2574,6 +2687,7 @@ fn authenticated_global_builtin_interface(
         return false;
     };
     let (annotation_name, marker, parameter_count) = match owner_name {
+        "Boolean" => ("BooleanConstructor", "valueOf", 0),
         "Number" => ("NumberConstructor", "toFixed", 1),
         "String" => ("StringConstructor", "toLowerCase", 0),
         "Object" => ("ObjectConstructor", "toString", 0),
@@ -2613,7 +2727,12 @@ fn authenticated_global_builtin_interface(
             }))
         && method.flags == SignatureFlags::NONE
         && method.minimum_argument_count == 0
-        && return_type.kind == SyntaxKind::StringKeyword
+        && return_type.kind
+            == if owner_name == "Boolean" {
+                SyntaxKind::BooleanKeyword
+            } else {
+                SyntaxKind::StringKeyword
+            }
         && return_type.flags.0 == 0
         && return_type.parent == Some(method.declaration.node)
         && plan.methods.iter().all(|method| {
@@ -7284,6 +7403,97 @@ fn plan_interface_method_parameter(
     ))
 }
 
+fn authenticated_global_boolean_constructor_optional_call(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    type_parameters: &[PlannedInterfaceMethodTypeParameter],
+    annotation: NodeRef,
+    return_type: NodeRef,
+) -> bool {
+    let [parameter] = type_parameters else {
+        return false;
+    };
+    let Some(owner_record) = store.symbol(owner) else {
+        return false;
+    };
+    let Some(bound) = host.bound_file(declaration) else {
+        return false;
+    };
+    let Some(globals) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+    else {
+        return false;
+    };
+    let Some(boolean) = globals
+        .get_source("Boolean")
+        .and_then(|boolean| store.get_merged_symbol(boolean))
+    else {
+        return false;
+    };
+    let Some(value_declaration) = store
+        .symbol(boolean)
+        .and_then(|record| record.value_declaration())
+    else {
+        return false;
+    };
+    let Some(annotation_record) = host.node(annotation) else {
+        return false;
+    };
+    let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+        return false;
+    };
+    let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+    let Some(name_record) = host.node(name) else {
+        return false;
+    };
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return false;
+    };
+    let Some(parameter_record) = store.symbol(parameter.symbol) else {
+        return false;
+    };
+
+    owner_record.flags() == SymbolFlags::INTERFACE
+        && owner_record.name().as_utf8() == Some("BooleanConstructor")
+        && globals
+            .get_source("BooleanConstructor")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            == Some(owner)
+        && bound.source_facts().is_some_and(|facts| {
+            facts.is_default_library()
+                && facts.is_declaration_file()
+                && !facts.is_javascript_file()
+                && !facts.is_external_or_common_js_module()
+        })
+        && authenticated_global_builtin_value_declaration(
+            store,
+            host,
+            boolean,
+            value_declaration,
+            "Boolean",
+            "BooleanConstructor",
+        )
+        && parameter.constraint.is_none()
+        && parameter.default_type.is_none()
+        && annotation_record.kind == SyntaxKind::TypeReference
+        && annotation_record.flags.0 == 0
+        && reference.type_arguments.is_none()
+        && name_record.kind == SyntaxKind::Identifier
+        && name_record.flags.0 == 0
+        && name_record.parent == Some(annotation.node)
+        && identifier.flow_node.is_none()
+        && parameter_record.name().as_utf8() == Some(identifier.text.as_str())
+        && bound
+            .locals(declaration)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            == Some(parameter.symbol)
+        && store.source_node_kind(return_type) == Some(SyntaxKind::BooleanKeyword)
+}
+
 fn plan_call_signature(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -7523,7 +7733,19 @@ fn plan_call_signature(
         let optional = if let Some(token) = data.question_token {
             let token = NodeRef::new(parameter.arena, parameter.file, token);
             let token_record = preflight_node(store, host, token).map_err(|_| unsupported())?;
-            if !is_construct && !type_literal_call
+            let boolean_constructor = !is_construct
+                && !type_literal_call
+                && parameter_nodes.nodes.len() == 1
+                && authenticated_global_boolean_constructor_optional_call(
+                    store,
+                    host,
+                    owner_symbol,
+                    declaration,
+                    &type_parameters,
+                    type_node,
+                    return_type,
+                );
+            if !is_construct && !type_literal_call && !boolean_constructor
                 || rest.is_some()
                 || token_record.kind != SyntaxKind::QuestionToken
                 || !matches!(token_record.data, NodeData::Token(_))
@@ -7531,16 +7753,17 @@ fn plan_call_signature(
                 || token_record.parent != Some(parameter.node)
                 || token_record.range.start < name_record.range.end
                 || token_record.range.end > type_start
-                || preflight_node(store, host, type_node)
-                    .map_err(|_| unsupported())?
-                    .kind
-                    != SyntaxKind::AnyKeyword
-                || !matches!(
-                    preflight_node(store, host, type_node)
+                || !boolean_constructor
+                    && (preflight_node(store, host, type_node)
                         .map_err(|_| unsupported())?
-                        .data,
-                    NodeData::KeywordTypeNode(_)
-                )
+                        .kind
+                        != SyntaxKind::AnyKeyword
+                        || !matches!(
+                            preflight_node(store, host, type_node)
+                                .map_err(|_| unsupported())?
+                                .data,
+                            NodeData::KeywordTypeNode(_)
+                        ))
             {
                 return Err(unsupported());
             }

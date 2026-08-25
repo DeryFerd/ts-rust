@@ -8976,6 +8976,106 @@ mod tests {
     }
 
     #[test]
+    fn array_filter_accepts_the_authenticated_generic_boolean_constructor() {
+        let library = parsed(concat!(
+            "interface Array<T> { ",
+            "filter<S extends T>(predicate: ",
+            "(value: T, index: number, array: T[]) => value is S, thisArg?: any): S[]; ",
+            "filter(predicate: ",
+            "(value: T, index: number, array: T[]) => unknown, thisArg?: any): T[]; ",
+            "} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface Boolean { valueOf(): boolean; } ",
+            "interface BooleanConstructor { ",
+            "new(value?: any): Boolean; ",
+            "<T>(value?: T): boolean; ",
+            "readonly prototype: Boolean; ",
+            "} ",
+            "declare var Boolean: BooleanConstructor;",
+        ));
+        let source = parsed(concat!(
+            "declare const values: any[]; ",
+            "const filtered: any[] = values.filter(Boolean);",
+        ));
+        let library_file = FileId::new(4_930);
+        let source_file = FileId::new(4_931);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+
+        context.check_source_file(source_file).unwrap();
+
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let call_nodes = calls(&source, source_file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("the source must retain its Boolean filter call")
+        };
+        let call = *call;
+        let result = context
+            .store()
+            .type_node_links(call)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let array = context
+            .store()
+            .canonical_array_reference(context.global_types(), result)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            array.element_type,
+            context.store().intrinsic_bootstrap().unwrap().any_type
+        );
+        assert!(!array.readonly);
+
+        let boolean = context
+            .store()
+            .symbol_table(context.globals())
+            .and_then(|globals| globals.get_source("Boolean"))
+            .unwrap();
+        let constructor = context
+            .store()
+            .value_symbol_links(boolean)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(context.store(), constructor)
+        else {
+            panic!("Boolean must retain authenticated call and construct signatures")
+        };
+        let [signature] = projection.call_signatures.as_ref() else {
+            panic!("Boolean must retain exactly one generic call signature")
+        };
+        assert_eq!(projection.construct_signatures.len(), 1);
+        let record = context.store().signature(signature.signature).unwrap();
+        assert_eq!(record.type_parameters().len(), 1);
+        assert_eq!(record.min_argument_count(), 0);
+        assert_eq!(
+            record.resolved_return_type(),
+            Some(context.store().intrinsic_bootstrap().unwrap().boolean_type),
+        );
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            call_publication_state(&context, call),
+        );
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                call_publication_state(&context, call),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
     fn array_callback_materialization_rejects_forged_predicate_metadata() {
         let library = array_callback_default_library();
         let source = parsed(concat!(
