@@ -9843,8 +9843,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 preflight_class_or_interface_reference(self.store, self.host, symbol, flags)?;
             if union_constituent
                 && (flags.contains(SymbolFlags::CLASS)
-                    || local_count != 0
-                        && (exact_import.is_some() || type_arguments.len() != local_count))
+                    || local_count != 0 && exact_import.is_some())
             {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::UnsupportedUnionConstituent(node),
@@ -9880,6 +9879,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 let target =
                     self.preflight_direct_generic_reference_target(node, symbol, local_count)?;
                 let minimum_type_arguments = target.minimum_type_arguments;
+                if union_constituent
+                    && !(minimum_type_arguments..=local_count).contains(&type_arguments.len())
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::UnsupportedUnionConstituent(node),
+                    ));
+                }
                 direct_generic_constraints = target.constraints;
                 direct_generic_defaults = target.defaults;
                 let lazy_react_html_factory = type_arguments
@@ -14267,6 +14273,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             _ => return Err(unsupported()),
         };
+        let react_interface_defaults = namespace_owned
+            && matches!(
+                self.store
+                    .symbol(symbol)
+                    .and_then(|owner| owner.name().as_utf8()),
+                Some("ComponentClass" | "StatelessComponent")
+            )
+            && self
+                .store
+                .get_parent_of_symbol(symbol)
+                .is_some_and(|namespace| {
+                    self.is_react_ambient_module_namespace(namespace, declaration)
+                });
         if source_class {
             self.preflight_source_generic_class_reference_owner(node, symbol, declaration)?;
         }
@@ -14284,7 +14303,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let mut previous_parameters = Vec::new();
         let mut minimum_type_arguments = 0;
         let mut previous_parameter_end = parameters.range.start;
-        if source_class && parameters.has_trailing_comma {
+        if (source_class || react_interface_defaults) && parameters.has_trailing_comma {
             return Err(unsupported());
         }
         for (index, parameter) in parameters.nodes.iter().enumerate() {
@@ -14295,7 +14314,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             };
             if parameter_node.parent != Some(declaration.node)
                 || parameter_node.flags.0 & NODE_FLAG_JSDOC != 0
-                || parameter_data.default_type.is_some() && !source_class
+                || parameter_data.default_type.is_some()
+                    && !(source_class || react_interface_defaults)
                 || parameter_data.expression.is_some()
                 || parameter_data.modifiers.is_some()
             {
@@ -14318,7 +14338,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 {
                     return Err(unsupported());
                 }
-                if source_class {
+                if source_class || react_interface_defaults {
                     let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
                     let name_record = preflight_node(self.store, self.host, name)?;
                     let NodeData::Identifier(identifier) = &name_record.data else {
@@ -14536,15 +14556,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             if let Some(default) = parameter_data.default_type {
                 let default = NodeRef::new(declaration.arena, declaration.file, default);
-                defaults.push(self.preflight_direct_generic_class_default(
+                defaults.push(self.preflight_direct_generic_default(
                     node,
                     symbol,
                     parameter,
                     parameter_symbol,
                     default,
                     &previous_parameters,
+                    react_interface_defaults,
                 )?);
             } else {
+                if react_interface_defaults && !defaults.is_empty() {
+                    return Err(unsupported());
+                }
                 minimum_type_arguments = index + 1;
             }
             previous_parameters.push(parameter_symbol);
@@ -14612,7 +14636,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(())
     }
 
-    fn preflight_direct_generic_class_default(
+    #[allow(clippy::too_many_arguments)] // Default syntax retains the authenticated declaration owner.
+    fn preflight_direct_generic_default(
         &self,
         node: NodeRef,
         symbol: SemanticSymbolId,
@@ -14620,6 +14645,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         parameter_symbol: SemanticSymbolId,
         default: NodeRef,
         earlier_parameters: &[SemanticSymbolId],
+        react_interface: bool,
     ) -> Result<PlannedDirectGenericDefault, DeclaredTypeError> {
         let unsupported = || {
             type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol })
@@ -14647,6 +14673,40 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         .any_type,
                 ),
             ),
+            NodeData::TypeLiteralNode(empty)
+                if react_interface
+                    && default_record.kind == SyntaxKind::TypeLiteral
+                    && empty.members.nodes.is_empty()
+                    && !empty.members.has_trailing_comma
+                    && empty.members.range == default_record.range
+                    && empty.symbol.is_none() =>
+            {
+                if self.store.type_node_links(default).is_some_and(|links| {
+                    links.outer_type_parameters.is_some()
+                        || links.resolved_type.is_some_and(|cached| {
+                            self.store
+                                .intrinsic_bootstrap()
+                                .is_none_or(|bootstrap| cached != bootstrap.empty_type_literal_type)
+                        })
+                }) || self
+                    .store
+                    .symbol_node_links(default)
+                    .is_some_and(|links| links != &SymbolNodeLinks::default())
+                {
+                    return Err(invalid());
+                }
+                (
+                    None,
+                    Some(
+                        self.store
+                            .intrinsic_bootstrap()
+                            .ok_or(DeclaredTypeError::Unavailable(
+                                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                            ))?
+                            .empty_type_literal_type,
+                    ),
+                )
+            }
             NodeData::TypeReferenceNode(reference)
                 if default_record.kind == SyntaxKind::TypeReference
                     && reference.type_arguments.is_none() =>
@@ -14665,27 +14725,84 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     return Err(unsupported());
                 }
                 let earlier = self.resolve_uncached_type_reference_symbol(default)?;
-                if !earlier_parameters.contains(&earlier)
-                    || self.store.get_parent_of_symbol(earlier) != Some(symbol)
-                    || self
+                let (earlier_parameter, expected) = if earlier_parameters.contains(&earlier) {
+                    if self.store.get_parent_of_symbol(earlier) != Some(symbol)
+                        || self
+                            .store
+                            .symbol(earlier)
+                            .and_then(|parameter| parameter.name().as_utf8())
+                            != Some(identifier.text.as_str())
+                        || self
+                            .store
+                            .symbol(symbol)
+                            .and_then(ts_binder::semantic::Symbol::members)
+                            .and_then(|members| self.store.symbol_table(members))
+                            .and_then(|members| members.get_source(&identifier.text))
+                            != Some(earlier)
+                    {
+                        return Err(unsupported());
+                    }
+                    (
+                        Some(earlier),
+                        self.store
+                            .declared_type_links(earlier)
+                            .and_then(|links| links.declared_type),
+                    )
+                } else if react_interface && identifier.text == "ComponentState" {
+                    let namespace = self
                         .store
-                        .symbol(earlier)
-                        .and_then(|parameter| parameter.name().as_utf8())
-                        != Some(identifier.text.as_str())
-                    || self
+                        .get_parent_of_symbol(symbol)
+                        .ok_or_else(&unsupported)?;
+                    let alias = self.store.symbol(earlier).ok_or_else(&unsupported)?;
+                    let Some([declaration]) = alias.declarations() else {
+                        return Err(unsupported());
+                    };
+                    let declaration = *declaration;
+                    let declaration_record = preflight_node(self.store, self.host, declaration)?;
+                    let NodeData::TypeAliasDeclaration(alias_data) = &declaration_record.data
+                    else {
+                        return Err(unsupported());
+                    };
+                    let value = NodeRef::new(declaration.arena, declaration.file, alias_data.type_);
+                    let value_record = preflight_node(self.store, self.host, value)?;
+                    let any = self
                         .store
-                        .symbol(symbol)
-                        .and_then(ts_binder::semantic::Symbol::members)
-                        .and_then(|members| self.store.symbol_table(members))
-                        .and_then(|members| members.get_source(&identifier.text))
-                        != Some(earlier)
-                {
+                        .intrinsic_bootstrap()
+                        .ok_or(DeclaredTypeError::Unavailable(
+                            DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                        ))?
+                        .any_type;
+                    if alias.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::TYPE_ALIAS
+                        || alias.check_flags() != CheckFlags::NONE
+                        || alias.name().as_utf8() != Some("ComponentState")
+                        || self.store.get_parent_of_symbol(earlier) != Some(namespace)
+                        || self.store.get_merged_symbol(earlier) != Some(earlier)
+                        || !self.host.symbol_matches(self.store, declaration, earlier)
+                        || declaration_record.kind != SyntaxKind::TypeAliasDeclaration
+                        || alias_data.type_parameters.is_some()
+                        || value_record.kind != SyntaxKind::AnyKeyword
+                        || value_record.flags.0 != 0
+                        || value_record.parent != Some(declaration.node)
+                        || self
+                            .store
+                            .symbol(namespace)
+                            .and_then(ts_binder::semantic::Symbol::exports)
+                            .and_then(|exports| self.store.symbol_table(exports))
+                            .and_then(|exports| exports.get(alias.name()))
+                            .and_then(|export| self.store.get_merged_symbol(export))
+                            != Some(earlier)
+                        || self
+                            .store
+                            .type_alias_links(earlier)
+                            .and_then(|links| links.declared_type)
+                            .is_some_and(|cached| cached != any)
+                    {
+                        return Err(unsupported());
+                    }
+                    (None, Some(any))
+                } else {
                     return Err(unsupported());
-                }
-                let expected = self
-                    .store
-                    .declared_type_links(earlier)
-                    .and_then(|links| links.declared_type);
+                };
                 if self.store.type_node_links(default).is_some_and(|links| {
                     links.outer_type_parameters.is_some()
                         || links
@@ -14699,7 +14816,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 {
                     return Err(invalid());
                 }
-                (Some(earlier), expected)
+                (earlier_parameter, expected)
             }
             _ => return Err(unsupported()),
         };
@@ -35599,6 +35716,186 @@ mod tests {
         assert_eq!(
             query_node(&mut fixture, forwarded, &mut diagnostics),
             Ok(forwarded_type),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One ambient owner proves both React defaults and warm-cache poison.
+    fn react_component_interface_defaults_preserve_argument_identity_and_reject_poison() {
+        let mut fixture = fixture(concat!(
+            "declare module 'react' { export = React; namespace React { ",
+            "type ComponentState = any; ",
+            "interface ComponentClass<Props = {}, State = ComponentState> {} ",
+            "interface StatelessComponent<Props = {}> {} ",
+            "type DefaultClass = ComponentClass; ",
+            "type PartialClass = ComponentClass<string>; ",
+            "type ExplicitClass = ComponentClass<string, any>; ",
+            "type DefaultFunction = StatelessComponent; ",
+            "type ExplicitFunction = StatelessComponent<number>; ",
+            "} }",
+        ));
+        let class = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "ComponentClass");
+        let function = named_symbol(
+            &fixture,
+            SyntaxKind::InterfaceDeclaration,
+            "StatelessComponent",
+        );
+        let default_class =
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "DefaultClass");
+        let partial_class =
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "PartialClass");
+        let explicit_class =
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "ExplicitClass");
+        let default_function = named_symbol(
+            &fixture,
+            SyntaxKind::TypeAliasDeclaration,
+            "DefaultFunction",
+        );
+        let explicit_function = named_symbol(
+            &fixture,
+            SyntaxKind::TypeAliasDeclaration,
+            "ExplicitFunction",
+        );
+        let (empty, any, string, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.empty_type_literal_type,
+                bootstrap.any_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+            )
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let defaulted = query_declared(
+            &mut fixture,
+            default_class,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let partial = query_declared(
+            &mut fixture,
+            partial_class,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                explicit_class,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(partial),
+        );
+        let defaulted_function = query_declared(
+            &mut fixture,
+            default_function,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let provided_function = query_declared(
+            &mut fixture,
+            explicit_function,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        let class_target = fixture
+            .store
+            .declared_type_links(class)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let function_target = fixture
+            .store
+            .declared_type_links(function)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let default_reference =
+            validate_direct_generic_reference(&fixture.store, defaulted).unwrap();
+        let partial_reference = validate_direct_generic_reference(&fixture.store, partial).unwrap();
+        let function_reference =
+            validate_direct_generic_reference(&fixture.store, defaulted_function).unwrap();
+        let explicit_reference =
+            validate_direct_generic_reference(&fixture.store, provided_function).unwrap();
+        assert_eq!(default_reference.target, class_target);
+        assert_eq!(default_reference.type_arguments, [empty, any]);
+        assert_eq!(partial_reference.target, class_target);
+        assert_eq!(partial_reference.type_arguments, [string, any]);
+        assert_eq!(function_reference.target, function_target);
+        assert_eq!(function_reference.type_arguments, [empty]);
+        assert_eq!(explicit_reference.target, function_target);
+        assert_eq!(explicit_reference.type_arguments, [number]);
+
+        let warm = store_state(&fixture.store);
+        for (alias, expected) in [
+            (default_class, defaulted),
+            (partial_class, partial),
+            (explicit_class, partial),
+            (default_function, defaulted_function),
+            (explicit_function, provided_function),
+        ] {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected),
+            );
+        }
+        assert_eq!(store_state(&fixture.store), warm);
+
+        let state = validate_direct_generic_reference(&fixture.store, class_target)
+            .unwrap()
+            .type_arguments[1];
+        let TypeData::TypeParameter(parameter) = fixture.store.type_payload(state).unwrap().data()
+        else {
+            panic!("ComponentClass retains its state type parameter")
+        };
+        let constraint = parameter.constraint;
+        assert!(fixture.store.set_type_parameter_resolution(
+            state,
+            constraint,
+            None,
+            None,
+            Some(number),
+        ));
+        let poisoned = store_state(&fixture.store);
+        assert!(matches!(
+            query_declared(
+                &mut fixture,
+                partial_class,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(_)
+                    | TypeNodeUnavailable::InvalidCachedTypeAlias(_)
+            )),
+        ));
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert!(fixture.store.set_type_parameter_resolution(
+            state,
+            constraint,
+            None,
+            None,
+            Some(any),
+        ));
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                partial_class,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(partial),
         );
         assert!(diagnostics.is_empty());
     }
