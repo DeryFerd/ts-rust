@@ -37,7 +37,7 @@ use super::{
         validate_inference_leaf, validate_inference_leaf_with_array_targets,
     },
     instantiate::{
-        InstantiationError, InstantiationLimits, InstantiationSession,
+        InstantiationError, InstantiationLimits, InstantiationSession, canonical_anonymous_union,
         instantiate_type_with_session, instantiate_type_with_vector_and_session,
     },
     keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type},
@@ -144,6 +144,10 @@ pub(super) enum GenericCallVectorInvariant {
         signature: SignatureId,
         type_: TypeId,
         error: ArrayTypeError,
+    },
+    InvalidUnionParameter {
+        signature: SignatureId,
+        type_: TypeId,
     },
     InvalidInterfaceReference {
         signature: SignatureId,
@@ -345,6 +349,12 @@ struct GenericCallSignatureShape {
     minimum_argument_count: usize,
     return_type: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
+}
+
+#[derive(Clone, Debug)]
+struct GenericUnionInferenceTemplate {
+    parameter: TypeId,
+    fixed: Vec<TypeId>,
 }
 
 #[derive(Debug)]
@@ -1414,6 +1424,18 @@ fn validate_generic_parameter_template(
         return Ok(true);
     }
 
+    if validated_generic_union_inference_template(
+        store,
+        type_,
+        type_parameters,
+        array_targets,
+        signature,
+    )?
+    .is_some()
+    {
+        return Ok(true);
+    }
+
     if let Some(array_targets) = array_targets {
         let reference = store
             .canonical_array_reference_with_targets(array_targets, type_)
@@ -1467,6 +1489,85 @@ fn validate_generic_parameter_template(
     }
     active_types.pop();
     Ok(contains_type_parameter)
+}
+
+/// Authenticates `T | fixed` before inference removes the fixed constituents.
+fn validated_generic_union_inference_template(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    type_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    signature: SignatureId,
+) -> Result<Option<GenericUnionInferenceTemplate>, GenericCallVectorError> {
+    let Some(record) = store.type_payload(type_) else {
+        return Err(GenericCallVectorInvariant::InvalidUnionParameter { signature, type_ }.into());
+    };
+    let TypeData::Union(union) = record.data() else {
+        return Ok(None);
+    };
+    if union
+        .union
+        .types
+        .iter()
+        .filter(|constituent| type_parameters.contains(constituent))
+        .count()
+        != 1
+    {
+        return Ok(None);
+    }
+    let invalid = || GenericCallVectorInvariant::InvalidUnionParameter { signature, type_ };
+    if record.flags() != TypeFlags::UNION
+        || record.alias().is_some()
+        || union.origin.is_some()
+        || union.union.types.len() < 2
+        || store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| bootstrap.cached_union_type(&union.union.types))
+            .is_some_and(|cached| cached != type_)
+    {
+        return Err(invalid().into());
+    }
+
+    let mut parameter = None;
+    let mut fixed = Vec::with_capacity(union.union.types.len() - 1);
+    let mut seen = Vec::with_capacity(union.union.types.len());
+    for constituent in &union.union.types {
+        if seen.contains(constituent) {
+            return Err(invalid().into());
+        }
+        seen.push(*constituent);
+        if type_parameters.contains(constituent) {
+            if parameter.replace(*constituent).is_some() {
+                return Ok(None);
+            }
+            continue;
+        }
+        let Some(record) = store.type_payload(*constituent) else {
+            return Err(invalid().into());
+        };
+        if matches!(record.data(), TypeData::Union(_))
+            || record
+                .flags()
+                .intersects(TypeFlags::ANY_OR_UNKNOWN | TypeFlags::NEVER)
+        {
+            return Err(invalid().into());
+        }
+        if !matches!(
+            record.data(),
+            TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_)
+        ) {
+            return Ok(None);
+        }
+        match array_targets {
+            Some(targets) => {
+                validate_inference_leaf_with_array_targets(store, *constituent, targets)
+            }
+            None => validate_inference_leaf(store, *constituent),
+        }
+        .map_err(|_| invalid())?;
+        fixed.push(*constituent);
+    }
+    Ok(parameter.map(|parameter| GenericUnionInferenceTemplate { parameter, fixed }))
 }
 
 /// Authenticates a direct generic interface without treating classes as wrappers.
@@ -2129,9 +2230,9 @@ fn infer_generic_call_type_arguments(
     Ok(inferred)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep wrapper and variance proofs in one inference walk.
 fn collect_generic_call_inferences(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
     array_targets: Option<CanonicalArrayTargets>,
     source: TypeId,
     target: TypeId,
@@ -2167,6 +2268,63 @@ fn collect_generic_call_inferences(
             bucket.push(source);
         }
         return Ok(());
+    }
+
+    if let Some(template) = validated_generic_union_inference_template(
+        store,
+        target,
+        type_parameters,
+        array_targets,
+        signature,
+    )? {
+        let sources = match store
+            .type_payload(source)
+            .map(super::type_records::TypeRecord::data)
+        {
+            Some(TypeData::Union(union)) => {
+                match array_targets {
+                    Some(targets) => {
+                        validate_inference_leaf_with_array_targets(store, source, targets)
+                    }
+                    None => validate_inference_leaf(store, source),
+                }
+                .map_err(|error| GenericCallVectorError::Inference(error.into()))?;
+                union.union.types.clone()
+            }
+            Some(_) => vec![source],
+            None => {
+                return Err(GenericCallVectorError::Inference(
+                    NakedTypeInferenceError::InvalidCandidate(source).into(),
+                ));
+            }
+        };
+        let unmatched = sources
+            .into_iter()
+            .filter(|source| {
+                !template
+                    .fixed
+                    .iter()
+                    .any(|fixed| generic_union_fixed_constituent_matches(store, *source, *fixed))
+            })
+            .collect::<Vec<_>>();
+        let candidate = match unmatched.as_slice() {
+            [] => source,
+            [candidate] => *candidate,
+            candidates => canonical_anonymous_union(store, candidates)
+                .map_err(|error| GenericCallVectorError::Inference(error.into()))?,
+        };
+        return collect_generic_call_inferences(
+            store,
+            array_targets,
+            candidate,
+            template.parameter,
+            type_parameters,
+            buckets,
+            contravariant_buckets,
+            signature,
+            active_targets,
+            contravariant,
+        );
     }
 
     if let Some(array_targets) = array_targets {
@@ -2249,7 +2407,8 @@ fn collect_generic_call_inferences(
         })?;
     let variances = store
         .variance_links(owner)
-        .and_then(|links| links.variances.as_deref());
+        .and_then(|links| links.variances.as_ref())
+        .cloned();
     active_targets.push(target);
     let result = source_reference
         .type_arguments
@@ -2258,6 +2417,7 @@ fn collect_generic_call_inferences(
         .enumerate()
         .try_for_each(|(index, (source, target))| {
             let argument_contravariant = variances
+                .as_ref()
                 .and_then(|variances| variances.get(index))
                 .is_some_and(|variance| {
                     *variance & VarianceFlags::VARIANCE_MASK == VarianceFlags::CONTRAVARIANT
@@ -2277,6 +2437,29 @@ fn collect_generic_call_inferences(
         });
     active_targets.pop();
     result
+}
+
+fn generic_union_fixed_constituent_matches(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    fixed: TypeId,
+) -> bool {
+    if source == fixed {
+        return true;
+    }
+    let Some(source) = store.type_payload(source) else {
+        return false;
+    };
+    let Some(fixed) = store.type_payload(fixed) else {
+        return false;
+    };
+    source.flags().intersects(TypeFlags::STRING_LITERAL) && fixed.flags() == TypeFlags::STRING
+        || source.flags().intersects(TypeFlags::NUMBER_LITERAL)
+            && fixed.flags() == TypeFlags::NUMBER
+        || source.flags().intersects(TypeFlags::BIG_INT_LITERAL)
+            && fixed.flags() == TypeFlags::BIG_INT
+        || source.flags().intersects(TypeFlags::BOOLEAN_LITERAL)
+            && fixed.flags().intersects(TypeFlags::BOOLEAN)
 }
 
 fn type_maybe_primitive(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
@@ -4671,8 +4854,9 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks,
-        IntrinsicBootstrapOptions, SemanticStore, VarianceLinks, instantiate::InstantiationLimits,
-        mapper::TypeMapper, type_records::TypeRecord, types::ObjectFlags,
+        IntrinsicBootstrapOptions, SemanticStore, VarianceLinks, bootstrap::UnionReduction,
+        instantiate::InstantiationLimits, mapper::TypeMapper, type_records::TypeRecord,
+        types::ObjectFlags,
     };
 
     const EXACT_SOURCE: IdentityTypeParameterCacheProvenance =
@@ -4881,6 +5065,33 @@ mod tests {
             },
             type_parameters,
         )
+    }
+
+    fn union_vector_callable(
+        store: &mut CanonicalTypeMapperStore,
+        fixed: &[TypeId],
+    ) -> (ValidatedSingleCallable, TypeId, TypeId) {
+        let (mut callable, parameters) =
+            vector_callable(store, &["T"], &[None], &[None], &[0], |_, parameters| {
+                parameters[0]
+            });
+        let parameter = parameters[0];
+        let mut constituents = Vec::with_capacity(fixed.len() + 1);
+        constituents.push(parameter);
+        constituents.extend_from_slice(fixed);
+        let union = store
+            .alloc_union_type(ObjectFlags::NONE, constituents)
+            .unwrap();
+        let symbol = store.signature(callable.signature).unwrap().parameters()[0];
+        assert!(store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(union),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        callable.parameters[0] = union;
+        (callable, parameter, union)
     }
 
     fn canonical_array_target(store: &mut CanonicalTypeMapperStore, name: &str) -> TypeId {
@@ -5680,6 +5891,261 @@ mod tests {
     }
 
     #[test]
+    fn generic_union_parameters_infer_unmatched_and_fully_matched_sources() {
+        let mut store = initialized_store();
+        let (string, number, never, auto, unknown) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.never_type,
+                bootstrap.auto_type,
+                bootstrap.unknown_type,
+            )
+        };
+        let literal = fresh_string(&mut store, "value");
+        let (callable, parameter, _) = union_vector_callable(&mut store, &[string]);
+
+        for (source, expected) in [
+            (number, number),
+            (string, string),
+            (literal, literal),
+            (never, never),
+            (auto, unknown),
+        ] {
+            let resolution = project_vector(
+                &mut store,
+                &callable,
+                vector_request(callable.owner, None, &[source]),
+            )
+            .unwrap();
+
+            assert_eq!(
+                resolution.applicability,
+                GenericCallVectorApplicability::Applicable,
+            );
+            assert_eq!(resolution.projection.type_parameters, [parameter]);
+            assert_eq!(
+                resolution.projection.instantiation.type_arguments,
+                [expected]
+            );
+            assert_eq!(
+                demand_vector_return(
+                    &mut store,
+                    &callable,
+                    &resolution,
+                    &resolution.projection.instantiation,
+                ),
+                expected,
+            );
+            let warm = vector_cache_graph_counts(&store);
+            assert_eq!(
+                project_vector(
+                    &mut store,
+                    &callable,
+                    vector_request(callable.owner, None, &[source]),
+                ),
+                Ok(resolution),
+            );
+            assert_eq!(vector_cache_graph_counts(&store), warm);
+        }
+    }
+
+    #[test]
+    fn generic_union_parameters_infer_only_unmatched_source_constituents() {
+        let mut store = initialized_store();
+        let (string, number, bigint) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.bigint_type,
+            )
+        };
+        let (callable, _, _) = union_vector_callable(&mut store, &[string]);
+        let matched = store
+            .expression_union_type(&[string, number], UnionReduction::Literal)
+            .unwrap();
+        let multiple = store
+            .expression_union_type(&[number, bigint], UnionReduction::Literal)
+            .unwrap();
+
+        let selected = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, None, &[matched]),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.applicability,
+            GenericCallVectorApplicability::Applicable,
+        );
+        assert_eq!(selected.projection.instantiation.type_arguments, [number]);
+
+        let combined = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, None, &[multiple]),
+        )
+        .unwrap();
+        assert_eq!(
+            combined.applicability,
+            GenericCallVectorApplicability::Applicable,
+        );
+        let inferred = combined.projection.instantiation.type_arguments[0];
+        let TypeData::Union(union) = store.type_payload(inferred).unwrap().data() else {
+            panic!("multiple unmatched constituents must retain their canonical union")
+        };
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.contains(&number));
+        assert!(union.union.types.contains(&bigint));
+
+        let (multiple_fixed, _, _) = union_vector_callable(&mut store, &[string, number]);
+        let all = store
+            .expression_union_type(&[string, number, bigint], UnionReduction::Literal)
+            .unwrap();
+        let remaining = project_vector(
+            &mut store,
+            &multiple_fixed,
+            vector_request(multiple_fixed.owner, None, &[all]),
+        )
+        .unwrap();
+        assert_eq!(
+            remaining.applicability,
+            GenericCallVectorApplicability::Applicable,
+        );
+        assert_eq!(remaining.projection.instantiation.type_arguments, [bigint]);
+
+        let warm = vector_cache_graph_counts(&store);
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &callable,
+                vector_request(callable.owner, None, &[multiple]),
+            ),
+            Ok(combined),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), warm);
+    }
+
+    #[test]
+    fn contravariant_union_inference_keeps_never_fallback_and_cache_identity() {
+        let mut store = initialized_store();
+        let target = canonical_interface_target(&mut store, "Consumer");
+        let owner = store.type_payload(target).unwrap().symbol().unwrap();
+        assert!(store.set_variance_links(
+            owner,
+            VarianceLinks {
+                variances: Some(vec![VarianceFlags::CONTRAVARIANT]),
+            },
+        ));
+        let (string, number, never) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.never_type,
+            )
+        };
+        let (mut callable, parameters) = vector_callable(
+            &mut store,
+            &["T"],
+            &[None],
+            &[None],
+            &[0, 0],
+            |_, parameters| parameters[0],
+        );
+        let template = store
+            .alloc_union_type(ObjectFlags::NONE, vec![parameters[0], string])
+            .unwrap();
+        let consumer = canonical_interface_reference(&mut store, target, template);
+        let symbol = store.signature(callable.signature).unwrap().parameters()[1];
+        assert!(store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(consumer),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        callable.parameters[1] = consumer;
+        let actual = store
+            .expression_union_type(&[string, number], UnionReduction::Literal)
+            .unwrap();
+        let argument = canonical_interface_reference(&mut store, target, actual);
+
+        let resolution = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, None, &[never, argument]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolution.applicability,
+            GenericCallVectorApplicability::Applicable,
+        );
+        assert_eq!(resolution.projection.instantiation.type_arguments, [number]);
+        let warm = vector_cache_graph_counts(&store);
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &callable,
+                vector_request(callable.owner, None, &[never, argument]),
+            ),
+            Ok(resolution),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), warm);
+    }
+
+    #[test]
+    fn malformed_generic_union_templates_fail_before_signature_publication() {
+        for nested in [false, true] {
+            let mut store = initialized_store();
+            let (string, number) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (bootstrap.string_type, bootstrap.number_type)
+            };
+            let (mut callable, parameter, _) = union_vector_callable(&mut store, &[string]);
+            let constituents = if nested {
+                let inner = store
+                    .alloc_union_type(ObjectFlags::NONE, vec![string, number])
+                    .unwrap();
+                vec![parameter, inner]
+            } else {
+                vec![parameter, string, string]
+            };
+            let forged = store
+                .alloc_union_type(ObjectFlags::NONE, constituents)
+                .unwrap();
+            let symbol = store.signature(callable.signature).unwrap().parameters()[0];
+            assert!(store.set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(forged),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            callable.parameters[0] = forged;
+            let before = vector_cache_graph_counts(&store);
+
+            assert_eq!(
+                project_vector(
+                    &mut store,
+                    &callable,
+                    vector_request(callable.owner, None, &[number]),
+                ),
+                Err(GenericCallVectorError::Invariant(
+                    GenericCallVectorInvariant::InvalidUnionParameter {
+                        signature: callable.signature,
+                        type_: forged,
+                    },
+                )),
+            );
+            assert_eq!(vector_cache_graph_counts(&store), before);
+        }
+    }
+
+    #[test]
     fn generic_interface_inference_reuses_checked_signature_and_return_identity() {
         let mut store = initialized_store();
         let target = canonical_interface_target(&mut store, "Box");
@@ -6078,7 +6544,7 @@ mod tests {
 
         assert_eq!(
             collect_generic_call_inferences(
-                &store,
+                &mut store,
                 None,
                 argument,
                 callable.parameters[0],
