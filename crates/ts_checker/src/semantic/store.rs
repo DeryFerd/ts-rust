@@ -1230,12 +1230,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
                     && target != type_
                     && self.types.get(target).is_some()
-                    && self.source_direct_call_contextual_callable_is_exact(
+                    && (self.source_direct_call_contextual_callable_is_exact(
                         provenance.declaration,
                         provenance.owner_symbol,
                         provenance.signature,
                         target,
-                    )
+                    ) || self.source_prototype_contextual_callable_is_exact(
+                        provenance.declaration,
+                        provenance.owner_symbol,
+                        provenance.signature,
+                        target,
+                    ))
             }
             _ => false,
         };
@@ -1312,6 +1317,307 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.mark_relation_inputs_dirty();
         }
         true
+    }
+
+    fn source_prototype_contextual_callable_is_exact(
+        &self,
+        declaration: NodeRef,
+        owner_symbol: SemanticSymbolId,
+        signature: SignatureId,
+        contextual_target: TypeId,
+    ) -> bool {
+        let Some(owner) = self.symbol(owner_symbol) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(assignment)) = self.source_node_parent(declaration)
+        else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(statement)) = self.source_node_parent(assignment) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(statement) else {
+            return false;
+        };
+        if self.source_node_kind(declaration) != Some(SyntaxKind::FunctionExpression)
+            || self.source_node_kind(assignment) != Some(SyntaxKind::BinaryExpression)
+            || self.source_node_kind(statement) != Some(SyntaxKind::ExpressionStatement)
+            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || owner.flags() != SymbolFlags::FUNCTION
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name() != InternalSymbolName::Function.as_ref()
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration() != Some(declaration)
+            || owner.members().is_some()
+            || owner.exports().is_some()
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || self.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+        {
+            return false;
+        }
+
+        let unique_property_access = |parent: NodeRef| {
+            let mut found = None;
+            for (index, facts) in self
+                .source_node_facts
+                .get(&parent.arena)?
+                .iter()
+                .enumerate()
+            {
+                if facts.is_some_and(|facts| {
+                    facts.kind == SyntaxKind::PropertyAccessExpression
+                        && facts.parent == Some(parent.node)
+                }) {
+                    let candidate = NodeRef::new(
+                        parent.arena,
+                        parent.file,
+                        NodeId::new(u32::try_from(index).ok()?),
+                    );
+                    if found.replace(candidate).is_some() {
+                        return None;
+                    }
+                }
+            }
+            found
+        };
+        let Some(left) = unique_property_access(assignment) else {
+            return false;
+        };
+        let Some(prototype_access) = unique_property_access(left) else {
+            return false;
+        };
+        let Some(method_symbol) = self
+            .links
+            .value_symbol
+            .find_key(|symbol| {
+                self.symbol(*symbol)
+                    .is_some_and(|method| method.flags() == SymbolFlags::METHOD)
+                    && self.value_symbol_links(*symbol)
+                        == Some(&ValueSymbolLinks {
+                            resolved_type: Some(contextual_target),
+                            ..ValueSymbolLinks::default()
+                        })
+            })
+            .copied()
+        else {
+            return false;
+        };
+        let Some(method) = self.symbol(method_symbol) else {
+            return false;
+        };
+        let Some([method_declaration]) = method.declarations() else {
+            return false;
+        };
+        let method_declaration = *method_declaration;
+        let Some(class_symbol) = method.parent() else {
+            return false;
+        };
+        let Some(class) = self.symbol(class_symbol) else {
+            return false;
+        };
+        let Some([class_declaration]) = class.declarations() else {
+            return false;
+        };
+        let class_declaration = *class_declaration;
+        let Some(method_name) = method.name().as_utf8() else {
+            return false;
+        };
+        let Some(class_type) = self
+            .declared_type_links(class_symbol)
+            .and_then(|links| links.declared_type)
+        else {
+            return false;
+        };
+        let Some(prototype_symbol) = class
+            .exports()
+            .and_then(|exports| self.symbol_table(exports))
+            .and_then(|exports| exports.get_source("prototype"))
+        else {
+            return false;
+        };
+        let Some(prototype) = self.symbol(prototype_symbol) else {
+            return false;
+        };
+        if method.check_flags() != CheckFlags::NONE
+            || method.value_declaration() != Some(method_declaration)
+            || method.members().is_some()
+            || method.exports().is_some()
+            || method.export_symbol().is_some()
+            || self.get_merged_symbol(method_symbol) != Some(method_symbol)
+            || self.source_node_kind(method_declaration) != Some(SyntaxKind::MethodDeclaration)
+            || self.source_node_parent(method_declaration)
+                != Some(SourceNodeParent::Parent(class_declaration))
+            || class.flags() != SymbolFlags::CLASS
+            || class.check_flags() != CheckFlags::NONE
+            || class.value_declaration() != Some(class_declaration)
+            || class.parent().is_some()
+            || class.export_symbol().is_some()
+            || self.get_merged_symbol(class_symbol) != Some(class_symbol)
+            || self.source_node_kind(class_declaration) != Some(SyntaxKind::ClassDeclaration)
+            || self.source_node_parent(class_declaration) != Some(SourceNodeParent::Parent(source))
+            || class
+                .members()
+                .and_then(|members| self.symbol_table(members))
+                .and_then(|members| members.get_source(method_name))
+                != Some(method_symbol)
+            || prototype.flags() != SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE
+            || prototype.check_flags() != CheckFlags::NONE
+            || prototype.name().as_utf8() != Some("prototype")
+            || prototype.declarations().is_some()
+            || prototype.value_declaration().is_some()
+            || prototype.members().is_some()
+            || prototype.exports().is_some()
+            || prototype.parent() != Some(class_symbol)
+            || prototype.export_symbol().is_some()
+            || self.get_merged_symbol(prototype_symbol) != Some(prototype_symbol)
+            || self.type_node_links(left)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(contextual_target),
+                    ..TypeNodeLinks::default()
+                })
+            || self.type_node_links(prototype_access)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(class_type),
+                    ..TypeNodeLinks::default()
+                })
+            || self.symbol_node_links(left).is_some_and(|links| {
+                links != &SymbolNodeLinks::default()
+                    && links
+                        != &SymbolNodeLinks {
+                            resolved_symbol: Some(method_symbol),
+                        }
+            })
+            || self
+                .symbol_node_links(prototype_access)
+                .is_some_and(|links| {
+                    links != &SymbolNodeLinks::default()
+                        && links
+                            != &SymbolNodeLinks {
+                                resolved_symbol: Some(prototype_symbol),
+                            }
+                })
+        {
+            return false;
+        }
+
+        let Some(target_signature) = self
+            .signature_links(method_declaration)
+            .and_then(|links| links.resolved_signature.signature())
+        else {
+            return false;
+        };
+        let Some(target_record) = self.signature(target_signature) else {
+            return false;
+        };
+        let Some(record) = self.signature(signature) else {
+            return false;
+        };
+        let parameters = record.parameters();
+        if self.signature_links(method_declaration)
+            != Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(target_signature),
+                ..SignatureLinks::default()
+            })
+            || target_record.declaration() != Some(method_declaration)
+            || record.declaration() != Some(declaration)
+            || target_record.flags() != SignatureFlags::NONE
+            || record.flags() != target_record.flags()
+            || !target_record.type_parameters().is_empty()
+            || !record.type_parameters().is_empty()
+            || target_record.this_parameter().is_some()
+            || record.this_parameter().is_some()
+            || parameters.is_empty()
+            || target_record.parameters().len() != parameters.len()
+            || usize::try_from(target_record.min_argument_count()).ok() != Some(parameters.len())
+            || record.min_argument_count() != target_record.min_argument_count()
+            || target_record.resolved_min_argument_count() != -1
+            || record.resolved_min_argument_count() != -1
+            || target_record
+                .resolved_return_type()
+                .is_none_or(|type_| self.types.get(type_).is_none())
+            || record.resolved_return_type() != target_record.resolved_return_type()
+            || target_record.resolved_type_predicate().is_some()
+            || record.resolved_type_predicate().is_some()
+            || target_record.target().is_some()
+            || record.target().is_some()
+            || target_record.mapper().is_some()
+            || record.mapper().is_some()
+            || target_record.isolated_signature_type().is_some()
+            || record.isolated_signature_type().is_some()
+            || target_record.composite().is_some()
+            || record.composite().is_some()
+        {
+            return false;
+        }
+
+        parameters
+            .iter()
+            .zip(target_record.parameters())
+            .enumerate()
+            .all(|(index, (parameter, target_parameter))| {
+                let Some(parameter_record) = self.symbol(*parameter) else {
+                    return false;
+                };
+                let Some([parameter_declaration]) = parameter_record.declarations() else {
+                    return false;
+                };
+                let parameter_declaration = *parameter_declaration;
+                let Some(target_parameter_record) = self.symbol(*target_parameter) else {
+                    return false;
+                };
+                let Some([target_parameter_declaration]) = target_parameter_record.declarations()
+                else {
+                    return false;
+                };
+                let target_parameter_declaration = *target_parameter_declaration;
+                let Some(expected_type) = self
+                    .value_symbol_links(*target_parameter)
+                    .and_then(|links| links.resolved_type)
+                else {
+                    return false;
+                };
+                !parameters[..index].contains(parameter)
+                    && !target_record.parameters()[..index].contains(target_parameter)
+                    && parameter_record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    && parameter_record.check_flags() == CheckFlags::NONE
+                    && parameter_record.value_declaration() == Some(parameter_declaration)
+                    && parameter_record.members().is_none()
+                    && parameter_record.exports().is_none()
+                    && parameter_record.parent().is_none()
+                    && parameter_record.export_symbol().is_none()
+                    && self.get_merged_symbol(*parameter) == Some(*parameter)
+                    && self.source_node_kind(parameter_declaration) == Some(SyntaxKind::Parameter)
+                    && self.source_node_parent(parameter_declaration)
+                        == Some(SourceNodeParent::Parent(declaration))
+                    && target_parameter_record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    && target_parameter_record.check_flags() == CheckFlags::NONE
+                    && target_parameter_record.value_declaration()
+                        == Some(target_parameter_declaration)
+                    && target_parameter_record.members().is_none()
+                    && target_parameter_record.exports().is_none()
+                    && target_parameter_record.parent().is_none()
+                    && target_parameter_record.export_symbol().is_none()
+                    && self.get_merged_symbol(*target_parameter) == Some(*target_parameter)
+                    && self.source_node_kind(target_parameter_declaration)
+                        == Some(SyntaxKind::Parameter)
+                    && self.source_node_parent(target_parameter_declaration)
+                        == Some(SourceNodeParent::Parent(method_declaration))
+                    && self.types.get(expected_type).is_some()
+                    && self.value_symbol_links(*target_parameter)
+                        == Some(&ValueSymbolLinks {
+                            resolved_type: Some(expected_type),
+                            ..ValueSymbolLinks::default()
+                        })
+                    && self.value_symbol_links(*parameter).is_none_or(|links| {
+                        links == &ValueSymbolLinks::default()
+                            || links
+                                == &ValueSymbolLinks {
+                                    resolved_type: Some(expected_type),
+                                    ..ValueSymbolLinks::default()
+                                }
+                    })
+            })
     }
 
     fn source_direct_call_contextual_callable_is_exact(
