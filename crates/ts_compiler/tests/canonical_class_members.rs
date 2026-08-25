@@ -204,7 +204,7 @@ fn assert_exported_class_program_queries(
         queries.get_symbol_at_location(field_name).unwrap(),
         Some(member)
     );
-    assert_eq!(queries.symbol_to_string(member).unwrap(), "value");
+    assert_eq!(queries.symbol_to_string(member).unwrap(), "Exported.value");
     assert_eq!(queries.get_symbol_declarations(member).unwrap(), &[field]);
     let member_type = queries.get_type_at_location(annotation).unwrap();
     assert_eq!(queries.type_to_string(member_type).unwrap(), "string");
