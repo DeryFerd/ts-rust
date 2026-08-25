@@ -10137,6 +10137,154 @@ mod runtime_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep React declaration checking, intrinsic errors, and warm identity together.
+    fn intrinsic_elements_keep_defaulted_react_component_class_references_lazy() {
+        let source = concat!(
+            "const first = <div<   number> label='ready' />;\n",
+            "const second = <div<\n    number> label='ready' />;\n",
+        );
+        let mut fixture = ReactFragmentFixture::with_library(
+            source,
+            FileId::new(8_204),
+            CanonicalJsxRuntime::Preserve,
+            concat!(
+                "declare namespace React { ",
+                "type ComponentState = any; ",
+                "type Ref<T> = T; ",
+                "type SFC<P = {}> = P; ",
+                "interface Component<P, S> {} ",
+                "interface ComponentClass<P = {}, S = ComponentState> { ",
+                "new(props: P): Component<P, S>; ",
+                "displayName?: string; ",
+                "} ",
+                "interface ReactElement<P> { ",
+                "type: string | ComponentClass<P> | SFC<P>; props: P; key: string; ",
+                "} ",
+                "interface ComponentElement<P, T extends Component<P, ComponentState>> ",
+                "extends ReactElement<P> { type: ComponentClass<P>; ref?: Ref<T>; } ",
+                "} ",
+                "declare namespace JSX { ",
+                "interface Element extends React.ReactElement<any> {} ",
+                "interface IntrinsicElements { div: { label: string }; } ",
+                "}",
+            ),
+        );
+        let library_file = FileId::new(u32::try_from(fixture.file.index()).unwrap() + 1_000);
+
+        fixture.context.check_source_file(library_file).unwrap();
+        assert!(fixture.context.diagnostics().is_empty());
+
+        let globals = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .globals;
+        let namespace = fixture
+            .context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("React"))
+            .unwrap();
+        let exports = fixture
+            .context
+            .store()
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .unwrap();
+        let [component_class, react_element, component_element] =
+            ["ComponentClass", "ReactElement", "ComponentElement"].map(|name| {
+                fixture
+                    .context
+                    .store()
+                    .symbol_table(exports)
+                    .and_then(|exports| exports.get_source(name))
+                    .unwrap()
+            });
+        let properties = [
+            (component_class, "displayName"),
+            (react_element, "type"),
+            (component_element, "type"),
+            (component_element, "ref"),
+        ]
+        .map(|(owner, name)| {
+            fixture
+                .context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| fixture.context.store().symbol_table(members))
+                .and_then(|members| members.get_source(name))
+                .unwrap()
+        });
+        for property in properties {
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .value_symbol_links(property)
+                    .is_none()
+            );
+        }
+
+        fixture.context.check_source_file(fixture.file).unwrap();
+
+        assert_eq!(fixture.context.diagnostics().len(), 2);
+        for diagnostic in fixture.context.diagnostics().as_slice() {
+            assert_eq!(diagnostic.diagnostic.code(), 2558);
+            let range = diagnostic.range_override.unwrap().range();
+            let start = usize::try_from(range.start.get()).unwrap();
+            let end = usize::try_from(range.end.get()).unwrap();
+            assert_eq!(&source[start..end], "number");
+        }
+        for owner in [component_class, react_element, component_element] {
+            let type_ = fixture
+                .context
+                .store()
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let super::super::TypeData::Interface(interface) =
+                fixture.context.store().type_payload(type_).unwrap().data()
+            else {
+                panic!("React component interfaces must preserve their declared identities")
+            };
+            assert!(!interface.declared_members_resolved);
+        }
+        for property in properties {
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .value_symbol_links(property)
+                    .is_none()
+            );
+        }
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().signature_len(),
+            fixture.context.store().index_info_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+            fixture.context.diagnostics().as_slice().to_vec(),
+        );
+        fixture.context.recheck_source_file(library_file).unwrap();
+        fixture.context.recheck_source_file(fixture.file).unwrap();
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().index_info_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+                fixture.context.diagnostics().as_slice().to_vec(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Keep lazy members, warm publication, and TS2558 ranges together.
     fn intrinsic_members_resolve_only_requested_tags_and_keep_type_argument_ranges() {
         let source = concat!(

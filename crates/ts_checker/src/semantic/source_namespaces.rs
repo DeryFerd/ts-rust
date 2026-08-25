@@ -1899,6 +1899,14 @@ fn namespace_generic_annotation_requires_deferral(
                     return Ok(true);
                 }
 
+                if node == annotation
+                    && authenticated_react_defaulted_component_class_reference(
+                        arena, bound, store, namespace, target, node, reference,
+                    )
+                {
+                    return Ok(true);
+                }
+
                 if target_record.flags().contains(SymbolFlags::INTERFACE)
                     && !target_record.flags().contains(SymbolFlags::CLASS)
                     && target_record
@@ -1919,6 +1927,268 @@ fn namespace_generic_annotation_requires_deferral(
         record.for_each_child(|nested| pending.push(child(node, nested)));
     }
     Ok(false)
+}
+
+/// Keeps the legacy React component-class default outside eager declaration checks.
+#[allow(clippy::too_many_lines)] // Source property, target defaults, and namespace ownership are one proof.
+fn authenticated_react_defaulted_component_class_reference(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    target: SemanticSymbolId,
+    reference_node: NodeRef,
+    reference: &ts_ast::TypeReferenceNodeData,
+) -> bool {
+    let Some(namespace_record) = store.symbol(namespace) else {
+        return false;
+    };
+    let Some(target_record) = store.symbol(target) else {
+        return false;
+    };
+    let Some([declaration]) = target_record.declarations() else {
+        return false;
+    };
+    let declaration = *declaration;
+    let Some(declaration_record) = arena.get(declaration.node) else {
+        return false;
+    };
+    let NodeData::InterfaceDeclaration(interface) = &declaration_record.data else {
+        return false;
+    };
+    let Some(parameters) = interface.type_parameters.as_ref() else {
+        return false;
+    };
+    let Some(arguments) = reference.type_arguments.as_ref() else {
+        return false;
+    };
+    let Some(members) = target_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+    else {
+        return false;
+    };
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let name = child(reference_node, reference.type_name);
+    let Some(name_record) = arena.get(name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return false;
+    };
+    let Some(reference_record) = arena.get(reference_node.node) else {
+        return false;
+    };
+    let Some(property_node) = reference_record.parent else {
+        return false;
+    };
+    let property_node = child(reference_node, property_node);
+    let Some(property_record) = arena.get(property_node.node) else {
+        return false;
+    };
+    let (property_name, property_annotation) = match &property_record.data {
+        NodeData::PropertyDeclaration(property)
+            if property_record.kind == SyntaxKind::PropertyDeclaration =>
+        {
+            (property.name, property.type_)
+        }
+        NodeData::PropertySignatureDeclaration(property)
+            if property_record.kind == SyntaxKind::PropertySignature =>
+        {
+            (property.name, Some(property.type_))
+        }
+        _ => return false,
+    };
+    let Some(component_node) = property_record.parent else {
+        return false;
+    };
+    let component_node = child(property_node, component_node);
+    let Some(component_record) = arena.get(component_node.node) else {
+        return false;
+    };
+    let NodeData::InterfaceDeclaration(component_interface) = &component_record.data else {
+        return false;
+    };
+    let Some(component) = bound
+        .symbol(component_node)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(component_owner) = store.symbol(component) else {
+        return false;
+    };
+    let Some(component_members) = component_owner
+        .members()
+        .and_then(|members| store.symbol_table(members))
+    else {
+        return false;
+    };
+    let Some(property) = bound
+        .symbol(property_node)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(property_owner) = store.symbol(property) else {
+        return false;
+    };
+    let property_name = child(property_node, property_name);
+    let Some(property_name_record) = arena.get(property_name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(property_identifier) = &property_name_record.data else {
+        return false;
+    };
+    if !facts.is_declaration_file()
+        || facts.is_default_library()
+        || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+        || namespace_record.check_flags() != CheckFlags::NONE
+        || namespace_record.name().as_utf8() != Some("React")
+        || target_record.flags() != SymbolFlags::INTERFACE
+        || target_record.check_flags() != CheckFlags::NONE
+        || target_record.name().as_utf8() != Some("ComponentClass")
+        || target_record.value_declaration().is_some()
+        || target_record.exports().is_some()
+        || target_record.export_symbol().is_some()
+        || !declaration.is_for(arena.id(), bound.file_id())
+        || declaration_record.kind != SyntaxKind::InterfaceDeclaration
+        || declaration_record.flags.0 != 0
+        || bound
+            .symbol(declaration)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(target)
+        || store.get_parent_of_symbol(target) != Some(namespace)
+        || namespace_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("ComponentClass"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(target)
+        || parameters.has_trailing_comma
+        || parameters.nodes.len() != 2
+        || arguments.has_trailing_comma
+        || arguments.nodes.len() != 1
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(reference_node.node)
+        || identifier.flow_node.is_some()
+        || identifier.text != "ComponentClass"
+        || reference_record.kind != SyntaxKind::TypeReference
+        || reference_record.flags.0 != 0
+        || property_record.flags.0 != 0
+        || property_annotation != Some(reference_node.node)
+        || property_name_record.kind != SyntaxKind::Identifier
+        || property_name_record.flags.0 != 0
+        || property_name_record.parent != Some(property_node.node)
+        || property_identifier.flow_node.is_some()
+        || property_identifier.text != "type"
+        || property_owner.flags() != SymbolFlags::PROPERTY
+        || property_owner.check_flags() != CheckFlags::NONE
+        || property_owner.name().as_utf8() != Some("type")
+        || store.get_parent_of_symbol(property) != Some(component)
+        || component_members.get_source("type") != Some(property)
+        || component_record.kind != SyntaxKind::InterfaceDeclaration
+        || component_record.flags.0 != 0
+        || component_interface
+            .type_parameters
+            .as_ref()
+            .is_none_or(|parameters| parameters.nodes.len() != 2)
+        || component_owner.flags() != SymbolFlags::INTERFACE
+        || component_owner.check_flags() != CheckFlags::NONE
+        || component_owner.name().as_utf8() != Some("ComponentElement")
+        || store.get_parent_of_symbol(component) != Some(namespace)
+        || namespace_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("ComponentElement"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(component)
+    {
+        return false;
+    }
+
+    let argument = child(reference_node, arguments.nodes[0]);
+    let Some(argument_record) = arena.get(argument.node) else {
+        return false;
+    };
+    let NodeData::TypeReferenceNode(argument_reference) = &argument_record.data else {
+        return false;
+    };
+    let argument_name = child(argument, argument_reference.type_name);
+    let Some(argument_name_record) = arena.get(argument_name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(argument_identifier) = &argument_name_record.data else {
+        return false;
+    };
+    let Some(argument_parameter) = component_members.get_source("P") else {
+        return false;
+    };
+    let Some(argument_owner) = store.symbol(argument_parameter) else {
+        return false;
+    };
+    if argument_record.kind != SyntaxKind::TypeReference
+        || argument_record.flags.0 != 0
+        || argument_record.parent != Some(reference_node.node)
+        || argument_reference.type_arguments.is_some()
+        || argument_name_record.kind != SyntaxKind::Identifier
+        || argument_name_record.flags.0 != 0
+        || argument_name_record.parent != Some(argument.node)
+        || argument_identifier.flow_node.is_some()
+        || argument_identifier.text != "P"
+        || argument_owner.flags() != SymbolFlags::TYPE_PARAMETER
+        || argument_owner.check_flags() != CheckFlags::NONE
+        || argument_owner.name().as_utf8() != Some("P")
+        || store.get_parent_of_symbol(argument_parameter) != Some(component)
+    {
+        return false;
+    }
+
+    for (parameter, expected_name) in parameters.nodes.iter().zip(["P", "S"]) {
+        let parameter = child(declaration, *parameter);
+        let Some(parameter_record) = arena.get(parameter.node) else {
+            return false;
+        };
+        let NodeData::TypeParameterDeclaration(data) = &parameter_record.data else {
+            return false;
+        };
+        let Some(default) = data.default_type else {
+            return false;
+        };
+        let default = child(parameter, default);
+        let Some(default_record) = arena.get(default.node) else {
+            return false;
+        };
+        let Some(parameter_symbol) = bound
+            .symbol(parameter)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+        else {
+            return false;
+        };
+        let Some(parameter_owner) = store.symbol(parameter_symbol) else {
+            return false;
+        };
+        if parameter_record.kind != SyntaxKind::TypeParameter
+            || parameter_record.flags.0 != 0
+            || parameter_record.parent != Some(declaration.node)
+            || data.constraint.is_some()
+            || data.expression.is_some()
+            || data.modifiers.is_some()
+            || default_record.parent != Some(parameter.node)
+            || parameter_owner.flags() != SymbolFlags::TYPE_PARAMETER
+            || parameter_owner.check_flags() != CheckFlags::NONE
+            || parameter_owner.name().as_utf8() != Some(expected_name)
+            || store.get_parent_of_symbol(parameter_symbol) != Some(target)
+            || members.get(parameter_owner.name()) != Some(parameter_symbol)
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Proves that a nested, type-only namespace and interface share one binder symbol.
