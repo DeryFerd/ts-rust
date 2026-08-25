@@ -5,6 +5,8 @@
 //! parameters with bounded trailing primitive arguments, concrete generic
 //! instantiations, bounded base chains, and
 //! merged default-library DOM interface/value identities.
+//! React namespace bases also retain bounded nested forwarded interface
+//! arguments and authenticated deferred generic constraints.
 //! Authenticated React node arrays retain their default-library `Array<T>`
 //! heritage without expanding recursive members.
 //! It also authenticates the exact `Record<string, any>` mapped-alias base.
@@ -64,6 +66,7 @@ enum HeritageTypeParameterAnnotations {
 
 const MAX_INTERFACE_HERITAGE_DEPTH: usize = 16;
 const MAX_TRAILING_PRIMITIVE_HERITAGE_ARGUMENTS: usize = 3;
+const MAX_REACT_FORWARDED_INTERFACE_ARGUMENT_DEPTH: usize = 3;
 
 pub(super) fn plan_direct_interface_heritage(
     store: &CanonicalTypeMapperStore,
@@ -459,6 +462,7 @@ fn plan_forwarded_interface_type_arguments(
     if owner_parameters.len() != parameters.nodes.len() {
         return Err(unsupported());
     }
+    let react_namespace = authenticated_react_generic_heritage_namespace(store, owner, base);
 
     let mut shared_base_parameters: Option<Vec<SemanticSymbolId>> = None;
     for &base_declaration in base_declarations {
@@ -503,7 +507,11 @@ fn plan_forwarded_interface_type_arguments(
                 parameter,
                 *symbol,
                 node,
-                HeritageTypeParameterAnnotations::Reject,
+                if react_namespace.is_some() {
+                    HeritageTypeParameterAnnotations::Defer
+                } else {
+                    HeritageTypeParameterAnnotations::Reject
+                },
             )?;
         }
         if shared_base_parameters.is_none() {
@@ -529,6 +537,7 @@ fn plan_forwarded_interface_type_arguments(
     let mut planned = Vec::with_capacity(arguments.nodes.len());
     let mut previous_end = expression_record.range.end;
     let mut previous_parameter = None;
+    let mut forwarded_parameter_seen = false;
     let mut trailing_primitive_count = 0;
     for argument in &arguments.nodes {
         let argument = NodeRef::new(node.arena, node.file, *argument);
@@ -544,7 +553,7 @@ fn plan_forwarded_interface_type_arguments(
             return Err(DirectInterfaceHeritageError::Invalid);
         }
         if matches!(argument_record.data, NodeData::KeywordTypeNode(_)) {
-            if previous_parameter.is_none()
+            if !forwarded_parameter_seen
                 || trailing_primitive_count >= MAX_TRAILING_PRIMITIVE_HERITAGE_ARGUMENTS
             {
                 return Err(unsupported());
@@ -562,7 +571,23 @@ fn plan_forwarded_interface_type_arguments(
             return Err(unsupported());
         }
         if reference.type_arguments.is_some() {
-            return Err(unsupported());
+            let Some(namespace) = react_namespace else {
+                return Err(unsupported());
+            };
+            authenticate_concrete_interface_type_argument(store, host, argument, 0)?;
+            authenticate_react_forwarded_interface_argument(
+                store,
+                host,
+                argument,
+                node,
+                (namespace, owner),
+                &owner_parameters,
+                0,
+            )?;
+            forwarded_parameter_seen = true;
+            previous_end = argument_record.range.end;
+            planned.push(argument);
+            continue;
         }
 
         let name = NodeRef::new(argument.arena, argument.file, reference.type_name);
@@ -596,6 +621,7 @@ fn plan_forwarded_interface_type_arguments(
             return Err(unsupported());
         }
         previous_parameter = Some(position);
+        forwarded_parameter_seen = true;
         let expected = owner_parameters[position];
         let parameter = parameters.nodes[position];
 
@@ -622,6 +648,133 @@ fn plan_forwarded_interface_type_arguments(
         planned.push(argument);
     }
     Ok(planned)
+}
+
+fn authenticated_react_generic_heritage_namespace(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    base: SemanticSymbolId,
+) -> Option<SemanticSymbolId> {
+    let namespace = store.get_parent_of_symbol(owner)?;
+    let namespace_record = store.symbol(namespace)?;
+    let exports = namespace_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))?;
+    if namespace_record.name().as_utf8() != Some("React")
+        || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+        || namespace_record.check_flags() != CheckFlags::NONE
+        || store.get_merged_symbol(namespace) != Some(namespace)
+        || store.get_parent_of_symbol(base) != Some(namespace)
+        || [owner, base].into_iter().any(|symbol| {
+            store.symbol(symbol).is_none_or(|record| {
+                record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+                    || record.check_flags() != CheckFlags::NONE
+                    || exports
+                        .get(record.name())
+                        .and_then(|export| store.get_merged_symbol(export))
+                        != Some(symbol)
+            })
+        })
+    {
+        return None;
+    }
+    Some(namespace)
+}
+
+#[allow(clippy::too_many_arguments)] // Nested arguments retain their exact React namespace and owner.
+fn authenticate_react_forwarded_interface_argument(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    argument: NodeRef,
+    heritage: NodeRef,
+    (namespace, owner): (SemanticSymbolId, SemanticSymbolId),
+    owner_parameters: &[SemanticSymbolId],
+    depth: usize,
+) -> Result<(), DirectInterfaceHeritageError> {
+    let unsupported = || DirectInterfaceHeritageError::Unsupported {
+        node: heritage,
+        kind: SyntaxKind::ExpressionWithTypeArguments,
+    };
+    if depth >= MAX_REACT_FORWARDED_INTERFACE_ARGUMENT_DEPTH {
+        return Err(unsupported());
+    }
+    let record =
+        preflight_node(store, host, argument).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return Err(unsupported());
+    };
+    let name = NodeRef::new(argument.arena, argument.file, reference.type_name);
+    let name_record =
+        preflight_node(store, host, name).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported());
+    };
+    if record.kind != SyntaxKind::TypeReference
+        || record.flags.0 != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(argument.node)
+        || identifier.flow_node.is_some()
+    {
+        return Err(unsupported());
+    }
+    let mut resolver = host
+        .name_resolver_host(store)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let symbol = resolver
+        .resolve_entity_name(name, SymbolFlags::TYPE)
+        .map_err(|_| unsupported())?
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(unsupported)?;
+
+    let Some(arguments) = reference.type_arguments.as_ref() else {
+        return if owner_parameters.contains(&symbol)
+            && store.get_parent_of_symbol(symbol) == Some(owner)
+        {
+            Ok(())
+        } else {
+            Err(unsupported())
+        };
+    };
+    let Some(interface) = store.symbol(symbol) else {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    };
+    let exported = store
+        .symbol(namespace)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get(interface.name()))
+        .and_then(|export| store.get_merged_symbol(export));
+    if symbol == owner
+        || store.get_parent_of_symbol(symbol) != Some(namespace)
+        || interface.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+        || interface.check_flags() != CheckFlags::NONE
+        || exported != Some(symbol)
+        || arguments.nodes.is_empty()
+        || arguments.has_trailing_comma
+    {
+        return Err(unsupported());
+    }
+    for nested in &arguments.nodes {
+        let nested = NodeRef::new(argument.arena, argument.file, *nested);
+        if preflight_node(store, host, nested)
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+            .parent
+            != Some(argument.node)
+        {
+            return Err(DirectInterfaceHeritageError::Invalid);
+        }
+        authenticate_react_forwarded_interface_argument(
+            store,
+            host,
+            nested,
+            heritage,
+            (namespace, owner),
+            owner_parameters,
+            depth + 1,
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // Concrete instantiation retains both canonical owners.
@@ -3299,6 +3452,192 @@ mod tests {
             ),
             cold,
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // React base chains, nested arguments, and export poison share one proof.
+    fn react_generic_heritage_authenticates_nested_forwarded_arguments_and_constraints() {
+        let parsed = parse_source_file(concat!(
+            "interface HTMLElement {}\n",
+            "declare namespace React {\n",
+            "  interface HTMLAttributes<T> {}\n",
+            "  interface AllHTMLAttributes<T> extends HTMLAttributes<T> {}\n",
+            "  interface DOMElement<P extends HTMLAttributes<T>, T extends HTMLElement> {}\n",
+            "  interface DetailedReactHTMLElement<",
+            "P extends HTMLAttributes<T>, T extends HTMLElement> ",
+            "extends DOMElement<P, T> {}\n",
+            "  interface ReactHTMLElement<T extends HTMLElement> ",
+            "extends DetailedReactHTMLElement<AllHTMLAttributes<T>, T> {}\n",
+            "  interface DetailedHTMLFactory<",
+            "P extends HTMLAttributes<T>, T extends HTMLElement> {}\n",
+            "  interface HTMLFactory<T extends HTMLElement> ",
+            "extends DetailedHTMLFactory<AllHTMLAttributes<T>, T> {}\n",
+            "}\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_490);
+        let mut context = checker_context(&parsed, file);
+        let wrapper = interface_symbol(&parsed, file, &context, "AllHTMLAttributes");
+        let element_base = interface_symbol(&parsed, file, &context, "DetailedReactHTMLElement");
+        let factory_base = interface_symbol(&parsed, file, &context, "DetailedHTMLFactory");
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let cold = snapshot(context.store());
+
+        for (name, expected_base) in [
+            ("ReactHTMLElement", element_base),
+            ("HTMLFactory", factory_base),
+        ] {
+            let planned = heritage_plan(&parsed, file, &context, name).unwrap();
+            let [base] = planned.bases.as_slice() else {
+                panic!("{name}: React must retain its one nested generic base")
+            };
+            assert_eq!(base.symbol, expected_base);
+            let [nested, forwarded] = base.type_arguments.as_slice() else {
+                panic!("{name}: React must retain its wrapped and direct owner arguments")
+            };
+            let NodeData::TypeReferenceNode(nested_reference) =
+                &parsed.arena.get(nested.node).unwrap().data
+            else {
+                panic!("{name}: the first base argument must remain a generic interface")
+            };
+            let [nested_parameter] = nested_reference
+                .type_arguments
+                .as_ref()
+                .unwrap()
+                .nodes
+                .as_slice()
+            else {
+                panic!("{name}: the wrapped generic argument must retain one owner parameter")
+            };
+            assert_eq!(
+                parsed.arena.get(*nested_parameter).unwrap().kind,
+                SyntaxKind::TypeReference,
+            );
+            assert_eq!(
+                parsed.arena.get(forwarded.node).unwrap().kind,
+                SyntaxKind::TypeReference,
+            );
+            assert_eq!(heritage_plan(&parsed, file, &context, name), Ok(planned));
+            assert_eq!(snapshot(context.store()), cold);
+        }
+
+        let namespace = context.store().get_parent_of_symbol(wrapper).unwrap();
+        let exports = context
+            .store()
+            .symbol(namespace)
+            .unwrap()
+            .exports()
+            .unwrap();
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("AllHTMLAttributes"),
+                element_base,
+            ),
+            Some(Some(wrapper)),
+        );
+        let poisoned = snapshot(context.store());
+        assert!(matches!(
+            heritage_plan(&parsed, file, &context, "ReactHTMLElement"),
+            Err(DirectInterfaceHeritageError::Unsupported { .. })
+        ));
+        assert_eq!(snapshot(context.store()), poisoned);
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("AllHTMLAttributes"),
+                wrapper,
+            ),
+            Some(Some(element_base)),
+        );
+        assert!(heritage_plan(&parsed, file, &context, "ReactHTMLElement").is_ok());
+    }
+
+    #[test]
+    fn react_nested_generic_heritage_rejects_foreign_and_nonforwarded_arguments() {
+        for (index, (source, owner)) in [
+            (
+                concat!(
+                    "declare namespace Other { ",
+                    "interface Wrapper<T> {} interface Base<P, T> {} ",
+                    "interface Derived<T> extends Base<Wrapper<T>, T> {} ",
+                    "}",
+                ),
+                "Derived",
+            ),
+            (
+                concat!(
+                    "interface Foreign<T> {} ",
+                    "declare namespace React { ",
+                    "interface Base<P, T> {} ",
+                    "interface Derived<T> extends Base<Foreign<T>, T> {} ",
+                    "}",
+                ),
+                "Derived",
+            ),
+            (
+                concat!(
+                    "declare namespace React { ",
+                    "interface Wrapper<T> {} interface Base<P, T> {} ",
+                    "interface Derived<T> extends Base<Wrapper<string>, T> {} ",
+                    "}",
+                ),
+                "Derived",
+            ),
+            (
+                concat!(
+                    "declare namespace React { ",
+                    "interface Wrapper<T> {} interface Base<P, T> {} ",
+                    "interface Derived<T> ",
+                    "extends Base<Wrapper<Wrapper<Wrapper<T>>>, T> {} ",
+                    "}",
+                ),
+                "Derived",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{index}: {:?}",
+                parsed.diagnostics,
+            );
+            let file = FileId::new(8_491 + u32::try_from(index).unwrap());
+            let context = checker_context(&parsed, file);
+            let cold = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                matches!(
+                    heritage_plan(&parsed, file, &context, owner),
+                    Err(DirectInterfaceHeritageError::Unsupported { .. })
+                ),
+                "{index}: {source}",
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                cold,
+                "{index}: rejected nested heritage published checker state",
+            );
+        }
     }
 
     #[test]

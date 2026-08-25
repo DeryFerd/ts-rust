@@ -21529,6 +21529,250 @@ mod generic_publication_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Nested React base arguments, receiver mapping, and poisoned caches are one proof.
+    fn generic_react_elements_specialize_nested_forwarded_interface_base_arguments() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface ReactHTMLElement<T> ",
+                "extends DetailedReactHTMLElement<AllHTMLAttributes<T>, T> ",
+                "{ marker: T; } ",
+                "interface DetailedReactHTMLElement<Props, Element> ",
+                "{ props: Props; element: Element; } ",
+                "interface AllHTMLAttributes<T> { value: T; } ",
+                "}",
+            ),
+            3_916,
+        );
+        let namespace = fixture.store.get_parent_of_symbol(fixture.symbol).unwrap();
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let detailed = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("DetailedReactHTMLElement"))
+            .unwrap();
+        let attributes = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("AllHTMLAttributes"))
+            .unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let [base] = plan.heritage.as_ref().unwrap().bases.as_slice() else {
+            panic!("ReactHTMLElement must preserve its detailed generic base")
+        };
+        assert_eq!(base.symbol, detailed);
+        assert_eq!(base.type_arguments.len(), 2);
+
+        let attributes_plan = plan_generic_interface(&fixture.store, &host, attributes).unwrap();
+        let attributes_flags = fixture.store.symbol(attributes).unwrap().flags();
+        let attributes_target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            attributes,
+            attributes_flags,
+        )
+        .unwrap()
+        .unwrap();
+        let attributes_parameter =
+            validate_direct_generic_reference(&fixture.store, attributes_target)
+                .unwrap()
+                .type_arguments[0];
+        assert!(
+            fixture
+                .store
+                .publish_interface_no_base_resolution(attributes_target)
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &attributes_plan,
+                attributes_target,
+                &[attributes_parameter],
+            ),
+            Ok(attributes_target),
+        );
+
+        let detailed_plan = plan_generic_interface(&fixture.store, &host, detailed).unwrap();
+        let detailed_flags = fixture.store.symbol(detailed).unwrap().flags();
+        let detailed_target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            detailed,
+            detailed_flags,
+        )
+        .unwrap()
+        .unwrap();
+        let detailed_parameters =
+            validate_direct_generic_reference(&fixture.store, detailed_target)
+                .unwrap()
+                .type_arguments;
+        assert!(
+            fixture
+                .store
+                .publish_interface_no_base_resolution(detailed_target)
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &detailed_plan,
+                detailed_target,
+                &detailed_parameters,
+            ),
+            Ok(detailed_target),
+        );
+
+        let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+        let target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let parameter = validate_direct_generic_reference(&fixture.store, target)
+            .unwrap()
+            .type_arguments[0];
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let arguments = base
+            .type_arguments
+            .iter()
+            .map(|annotation| {
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalCheckerOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(*annotation)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let nested = validate_direct_generic_reference(&fixture.store, arguments[0]).unwrap();
+        assert_eq!(nested.target, attributes_target);
+        assert_eq!(nested.type_arguments, [parameter]);
+        assert_eq!(arguments[1], parameter);
+
+        let (string, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let wrong_attributes = fixture
+            .store
+            .create_direct_generic_reference_type(attributes_target, &[string])
+            .unwrap();
+        let forged = fixture
+            .store
+            .create_direct_generic_reference_type(detailed_target, &[wrong_attributes, parameter])
+            .unwrap();
+        assert!(fixture.store.set_interface_base_resolution(
+            target,
+            true,
+            None,
+            Some(vec![forged]),
+        ));
+        let poisoned = state(&fixture.store, &plan, target);
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter],
+            ),
+            Err(PropertyObjectError::InvalidCachedInterface {
+                symbol: fixture.symbol,
+                type_: target,
+            }),
+        );
+        assert_eq!(state(&fixture.store, &plan, target), poisoned);
+
+        let inherited = fixture
+            .store
+            .create_direct_generic_reference_type(detailed_target, &arguments)
+            .unwrap();
+        assert!(fixture.store.set_interface_base_resolution(
+            target,
+            true,
+            None,
+            Some(vec![inherited]),
+        ));
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter],
+            ),
+            Ok(target),
+        );
+        let receiver = fixture
+            .store
+            .create_direct_generic_reference_type(target, &[number])
+            .unwrap();
+        let members = fixture
+            .store
+            .resolve_generic_interface_members(receiver, None)
+            .unwrap();
+        assert_eq!(
+            members
+                .properties()
+                .iter()
+                .map(|property| fixture.store.symbol(*property).unwrap().name().as_utf8())
+                .collect::<Vec<_>>(),
+            [Some("marker"), Some("props"), Some("element")],
+        );
+        let properties = fixture
+            .store
+            .resolve_generic_interface_property(receiver, "props", None)
+            .unwrap()
+            .unwrap()
+            .type_id();
+        let instantiated_attributes =
+            validate_direct_generic_reference(&fixture.store, properties).unwrap();
+        assert_eq!(instantiated_attributes.target, attributes_target);
+        assert_eq!(instantiated_attributes.type_arguments, [number]);
+        for name in ["marker", "element"] {
+            assert_eq!(
+                fixture
+                    .store
+                    .resolve_generic_interface_property(receiver, name, None)
+                    .unwrap()
+                    .unwrap()
+                    .type_id(),
+                number,
+            );
+        }
+
+        let warm = (
+            state(&fixture.store, &plan, target),
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.symbol_len(),
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter],
+            ),
+            Ok(target),
+        );
+        assert_eq!(
+            (
+                state(&fixture.store, &plan, target),
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.symbol_len(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn generic_interface_plans_keep_forwarded_base_arguments_without_publication() {
         let mut fixture = interface_fixture(
             concat!(
