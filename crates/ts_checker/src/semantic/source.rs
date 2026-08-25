@@ -2826,6 +2826,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         if let Err(error) =
                             super::object_members::plan_interface(store, host, symbol)
                         {
+                            if let super::object_members::PropertyObjectError::UnsupportedMember {
+                                node,
+                                kind: SyntaxKind::CallSignature,
+                            } = &error
+                                && self.authenticated_generic_predicate_interface_call(
+                                    statement, symbol, *node,
+                                )?
+                            {
+                                statements.push(PlannedStatement::Interface(symbol));
+                                continue;
+                            }
                             if let Some(owner) = store.symbol(symbol)
                                 && owner.flags() == (SymbolFlags::CLASS | SymbolFlags::INTERFACE)
                                 && let Some([class, interface]) = owner.declarations()
@@ -8098,6 +8109,374 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             missing_name,
             missing_text: missing.text.clone(),
         }))
+    }
+
+    #[allow(clippy::too_many_lines)] // Syntax ownership and both binder-owned signature families form one proof.
+    fn authenticated_generic_predicate_interface_call(
+        &self,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+        signature: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let Some((store, host)) = self.semantic else {
+            return Ok(false);
+        };
+        let declaration_record = self.node(declaration)?;
+        let NodeData::InterfaceDeclaration(interface) = &declaration_record.data else {
+            return Ok(false);
+        };
+        let [constructor, call] = interface.members.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let constructor = self.reference(*constructor);
+        if signature != self.reference(*call)
+            || declaration_record.kind != SyntaxKind::InterfaceDeclaration
+            || declaration_record.flags.0 != 0
+            || declaration_record.parent != Some(self.source.node_ref().node)
+            || interface.flow_node.is_some()
+            || interface.heritage_clauses.is_some()
+            || interface.local_symbol.is_some()
+            || interface.members.has_trailing_comma
+            || interface.modifiers.is_some()
+            || interface.symbol.is_some()
+            || interface.type_parameters.is_some()
+            || self.bound.symbol(declaration) != Some(symbol)
+        {
+            return Ok(false);
+        }
+        let Some(owner) = store.symbol(symbol) else {
+            return Ok(false);
+        };
+        let Some(members) = owner
+            .members()
+            .and_then(|members| store.symbol_table(members))
+        else {
+            return Ok(false);
+        };
+        if owner.flags() != SymbolFlags::INTERFACE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration().is_some()
+            || owner.parent().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || members.len() != 2
+            || store.get_merged_symbol(symbol) != Some(symbol)
+        {
+            return Ok(false);
+        }
+
+        for (member, expected_name) in [
+            (constructor, ts_binder::InternalSymbolName::New),
+            (signature, ts_binder::InternalSymbolName::Call),
+        ] {
+            let Some(member_symbol) = self.bound.symbol(member) else {
+                return Ok(false);
+            };
+            let Some(member_owner) = store.symbol(member_symbol) else {
+                return Ok(false);
+            };
+            if member_owner.flags() != SymbolFlags::SIGNATURE
+                || member_owner.check_flags() != CheckFlags::NONE
+                || member_owner.name() != expected_name.as_ref()
+                || member_owner.declarations() != Some(&[member])
+                || member_owner.value_declaration().is_some()
+                || member_owner.members().is_some()
+                || member_owner.exports().is_some()
+                || member_owner.parent() != Some(symbol)
+                || member_owner.export_symbol().is_some()
+                || members.get(expected_name.as_ref()) != Some(member_symbol)
+                || store.get_merged_symbol(member_symbol) != Some(member_symbol)
+            {
+                return Ok(false);
+            }
+        }
+
+        let constructor_record = self.node(constructor)?;
+        let NodeData::ConstructSignatureDeclaration(construct) = &constructor_record.data else {
+            return Ok(false);
+        };
+        let [constructor_parameter] = construct.parameters.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let Some(constructor_return) = construct.type_.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let constructor_return_record = self.node(constructor_return)?;
+        let NodeData::TypeReferenceNode(constructor_return_type) = &constructor_return_record.data
+        else {
+            return Ok(false);
+        };
+        let constructor_return_name = self.reference(constructor_return_type.type_name);
+        let constructor_return_name_record = self.node(constructor_return_name)?;
+        let NodeData::Identifier(constructor_return_identifier) =
+            &constructor_return_name_record.data
+        else {
+            return Ok(false);
+        };
+        if constructor_record.kind != SyntaxKind::ConstructSignature
+            || constructor_record.flags.0 != 0
+            || constructor_record.parent != Some(declaration.node)
+            || construct.full_signature.is_some()
+            || construct.next_container.is_some()
+            || construct.parameters.has_trailing_comma
+            || construct.symbol.is_some()
+            || construct.type_parameters.is_some()
+            || constructor_return_record.kind != SyntaxKind::TypeReference
+            || constructor_return_record.flags.0 != 0
+            || constructor_return_record.parent != Some(constructor.node)
+            || constructor_return_type.type_arguments.is_some()
+            || constructor_return_name_record.kind != SyntaxKind::Identifier
+            || constructor_return_name_record.flags.0 != 0
+            || constructor_return_name_record.parent != Some(constructor_return.node)
+            || constructor_return_identifier.flow_node.is_some()
+            || constructor_return_identifier.text.is_empty()
+        {
+            return Ok(false);
+        }
+
+        let signature_record = self.node(signature)?;
+        let NodeData::CallSignatureDeclaration(call) = &signature_record.data else {
+            return Ok(false);
+        };
+        let Some(type_parameters) = &call.type_parameters else {
+            return Ok(false);
+        };
+        let [type_parameter] = type_parameters.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let [value_parameter] = call.parameters.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let Some(predicate) = call.type_.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        if signature_record.kind != SyntaxKind::CallSignature
+            || signature_record.flags.0 != 0
+            || signature_record.parent != Some(declaration.node)
+            || call.full_signature.is_some()
+            || call.next_container.is_some()
+            || call.parameters.has_trailing_comma
+            || call.symbol.is_some()
+            || type_parameters.has_trailing_comma
+        {
+            return Ok(false);
+        }
+
+        let type_parameter = self.reference(*type_parameter);
+        let type_parameter_record = self.node(type_parameter)?;
+        let NodeData::TypeParameterDeclaration(type_data) = &type_parameter_record.data else {
+            return Ok(false);
+        };
+        let type_name = self.reference(type_data.name);
+        let type_name_record = self.node(type_name)?;
+        let NodeData::Identifier(type_identifier) = &type_name_record.data else {
+            return Ok(false);
+        };
+        let Some(type_symbol) = self.bound.symbol(type_parameter) else {
+            return Ok(false);
+        };
+        let Some(type_owner) = store.symbol(type_symbol) else {
+            return Ok(false);
+        };
+        let Some(locals) = self
+            .bound
+            .locals(signature)
+            .and_then(|locals| store.symbol_table(locals))
+        else {
+            return Ok(false);
+        };
+        if type_parameter_record.kind != SyntaxKind::TypeParameter
+            || type_parameter_record.flags.0 != 0
+            || type_parameter_record.parent != Some(signature.node)
+            || type_data.constraint.is_some()
+            || type_data.default_type.is_some()
+            || type_data.expression.is_some()
+            || type_data.modifiers.is_some()
+            || type_data.symbol.is_some()
+            || type_name_record.kind != SyntaxKind::Identifier
+            || type_name_record.flags.0 != 0
+            || type_name_record.parent != Some(type_parameter.node)
+            || type_identifier.flow_node.is_some()
+            || type_identifier.text.is_empty()
+            || type_owner.flags() != SymbolFlags::TYPE_PARAMETER
+            || type_owner.check_flags() != CheckFlags::NONE
+            || type_owner.name().as_utf8() != Some(type_identifier.text.as_str())
+            || type_owner.declarations() != Some(&[type_parameter])
+            || type_owner.value_declaration().is_some()
+            || type_owner.members().is_some()
+            || type_owner.exports().is_some()
+            || type_owner.parent().is_some()
+            || type_owner.export_symbol().is_some()
+            || locals.len() != 2
+            || locals.get_source(&type_identifier.text) != Some(type_symbol)
+            || store.get_merged_symbol(type_symbol) != Some(type_symbol)
+        {
+            return Ok(false);
+        }
+
+        let constructor_parameter = self.reference(*constructor_parameter);
+        let value_parameter = self.reference(*value_parameter);
+        let constructor_parameter_record = self.node(constructor_parameter)?;
+        let value_parameter_record = self.node(value_parameter)?;
+        let NodeData::ParameterDeclaration(constructor_data) = &constructor_parameter_record.data
+        else {
+            return Ok(false);
+        };
+        let NodeData::ParameterDeclaration(value_data) = &value_parameter_record.data else {
+            return Ok(false);
+        };
+        let Some(constructor_annotation) = constructor_data
+            .type_
+            .map(|annotation| self.reference(annotation))
+        else {
+            return Ok(false);
+        };
+        let constructor_annotation_record = self.node(constructor_annotation)?;
+        let Some(value_annotation) = value_data
+            .type_
+            .map(|annotation| self.reference(annotation))
+        else {
+            return Ok(false);
+        };
+        if constructor_annotation_record.kind != SyntaxKind::AnyKeyword
+            || constructor_annotation_record.flags.0 != 0
+            || constructor_annotation_record.parent != Some(constructor_parameter.node)
+            || !matches!(
+                constructor_annotation_record.data,
+                NodeData::KeywordTypeNode(_)
+            )
+        {
+            return Ok(false);
+        }
+
+        let mut value_symbol = None;
+        let mut value_name = None;
+        for (parameter, owner, data) in [
+            (constructor_parameter, constructor, constructor_data),
+            (value_parameter, signature, value_data),
+        ] {
+            let parameter_record = self.node(parameter)?;
+            let name = self.reference(data.name);
+            let name_record = self.node(name)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Ok(false);
+            };
+            let Some(question) = data.question_token.map(|token| self.reference(token)) else {
+                return Ok(false);
+            };
+            let question_record = self.node(question)?;
+            let Some(parameter_symbol) = self.bound.symbol(parameter) else {
+                return Ok(false);
+            };
+            let Some(parameter_owner) = store.symbol(parameter_symbol) else {
+                return Ok(false);
+            };
+            let Some(parameter_locals) = self
+                .bound
+                .locals(owner)
+                .and_then(|locals| store.symbol_table(locals))
+            else {
+                return Ok(false);
+            };
+            if parameter_record.kind != SyntaxKind::Parameter
+                || parameter_record.flags.0 != 0
+                || parameter_record.parent != Some(owner.node)
+                || data.dot_dot_dot_token.is_some()
+                || data.initializer.is_some()
+                || data.modifiers.is_some()
+                || data.symbol.is_some()
+                || data.facts != 0
+                || name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(parameter.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+                || question_record.kind != SyntaxKind::QuestionToken
+                || question_record.flags.0 != 0
+                || question_record.parent != Some(parameter.node)
+                || !matches!(question_record.data, NodeData::Token(_))
+                || parameter_owner.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                || parameter_owner.check_flags() != CheckFlags::NONE
+                || parameter_owner.name().as_utf8() != Some(identifier.text.as_str())
+                || parameter_owner.declarations() != Some(&[parameter])
+                || parameter_owner.value_declaration() != Some(parameter)
+                || parameter_owner.members().is_some()
+                || parameter_owner.exports().is_some()
+                || parameter_owner.parent().is_some()
+                || parameter_owner.export_symbol().is_some()
+                || parameter_locals.get_source(&identifier.text) != Some(parameter_symbol)
+                || store.get_merged_symbol(parameter_symbol) != Some(parameter_symbol)
+                || owner == constructor && parameter_locals.len() != 1
+            {
+                return Ok(false);
+            }
+            if owner == signature {
+                value_symbol = Some(parameter_symbol);
+                value_name = Some(identifier.text.as_str());
+            }
+        }
+
+        let predicate_record = self.node(predicate)?;
+        let NodeData::TypePredicateNode(predicate_data) = &predicate_record.data else {
+            return Ok(false);
+        };
+        let Some(narrowed) = predicate_data.type_.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let predicate_name = self.reference(predicate_data.parameter_name);
+        let predicate_name_record = self.node(predicate_name)?;
+        let NodeData::Identifier(predicate_identifier) = &predicate_name_record.data else {
+            return Ok(false);
+        };
+        if predicate_record.kind != SyntaxKind::TypePredicate
+            || predicate_record.flags.0 != 0
+            || predicate_record.parent != Some(signature.node)
+            || predicate_data.asserts_modifier.is_some()
+            || predicate_name_record.kind != SyntaxKind::Identifier
+            || predicate_name_record.flags.0 != 0
+            || predicate_name_record.parent != Some(predicate.node)
+            || predicate_identifier.flow_node.is_some()
+            || Some(predicate_identifier.text.as_str()) != value_name
+        {
+            return Ok(false);
+        }
+
+        for (reference, parent) in [(value_annotation, value_parameter), (narrowed, predicate)] {
+            let record = self.node(reference)?;
+            let NodeData::TypeReferenceNode(type_reference) = &record.data else {
+                return Ok(false);
+            };
+            let name = self.reference(type_reference.type_name);
+            let name_record = self.node(name)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Ok(false);
+            };
+            if record.kind != SyntaxKind::TypeReference
+                || record.flags.0 != 0
+                || record.parent != Some(parent.node)
+                || type_reference.type_arguments.is_some()
+                || name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(reference.node)
+                || identifier.flow_node.is_some()
+                || identifier.text != type_identifier.text
+            {
+                return Ok(false);
+            }
+        }
+
+        let Ok(planned) =
+            super::source_callables::plan_callable_type_predicate(store, host, predicate)
+        else {
+            return Ok(false);
+        };
+        Ok(planned.owner == signature
+            && planned.kind == TypePredicateKind::Identifier
+            && planned.parameter_index == 0
+            && Some(planned.parameter_symbol) == value_symbol
+            && planned.parameter_name == predicate_name
+            && planned.narrowed_type == Some(narrowed))
     }
 
     fn plan_invalid_bigint_index_signature(
@@ -81946,6 +82325,92 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn generic_predicate_interface_calls_preserve_constructor_identity_cold_and_warm() {
+        let source = parsed(concat!(
+            "interface Bullean {} ",
+            "interface BulleanConstructor { ",
+            "new(v1?: any): Bullean; ",
+            "<T>(v2?: T): v2 is T; ",
+            "} ",
+            "declare var Bullean: BulleanConstructor;",
+        ));
+        let file = FileId::new(9_939);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let owner = global_symbol(&context, "BulleanConstructor");
+        let declared = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) = context.store().type_payload(declared).unwrap().data()
+        else {
+            panic!("the predicate constructor must retain its interface identity")
+        };
+        let [call] = interface.declared_call_signatures.as_deref().unwrap() else {
+            panic!("the predicate constructor must retain one generic call")
+        };
+        let [constructor] = interface.declared_construct_signatures.as_deref().unwrap() else {
+            panic!("the predicate constructor must retain its original constructor")
+        };
+        let call = *call;
+        let constructor = *constructor;
+        assert_eq!(
+            interface.reference.object.structured.signatures.as_deref(),
+            Some([call, constructor].as_slice()),
+        );
+        let signature = context.store().signature(call).unwrap();
+        let [type_parameter] = signature.type_parameters() else {
+            panic!("the predicate call must retain its binder-owned type parameter")
+        };
+        let type_parameter = *type_parameter;
+        assert_eq!(signature.min_argument_count(), 0);
+        assert_eq!(
+            signature.resolved_return_type(),
+            Some(context.store().intrinsic_bootstrap().unwrap().boolean_type),
+        );
+        assert_eq!(
+            context.store().callable_signature_parameter_types(call),
+            Some([type_parameter].as_slice()),
+        );
+        let predicate = signature
+            .resolved_type_predicate()
+            .and_then(|predicate| context.store().type_predicate(predicate))
+            .unwrap();
+        assert_eq!(predicate.kind(), TypePredicateKind::Identifier);
+        assert_eq!(predicate.parameter_index(), 0);
+        assert_eq!(predicate.parameter_name(), "v2");
+        assert_eq!(predicate.type_id(), Some(type_parameter));
+        let bullean = global_symbol(&context, "Bullean");
+        assert_eq!(
+            context
+                .store()
+                .signature(constructor)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            context
+                .store()
+                .declared_type_links(bullean)
+                .and_then(|links| links.declared_type),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = (
+            observable_state(&context, file),
+            context.store().type_predicate_len(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                observable_state(&context, file),
+                context.store().type_predicate_len(),
+            ),
+            warm,
+        );
     }
 
     #[test]
