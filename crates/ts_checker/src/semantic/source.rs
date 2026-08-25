@@ -6753,6 +6753,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         {
             return Ok(None);
         }
+
+        let mut literal = condition_node;
+        while let NodeData::ParenthesizedExpression(parenthesized) = &self.node(literal)?.data {
+            let inner = self.reference(parenthesized.expression);
+            if self.node(inner)?.parent != Some(literal.node) {
+                return Ok(None);
+            }
+            literal = inner;
+        }
+        if !matches!(
+            self.node(literal)?.kind,
+            SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+        ) {
+            return Ok(None);
+        }
+
         let condition = self.plan_expression(condition_node)?;
         if !matches!(
             condition.unparenthesized().kind,
