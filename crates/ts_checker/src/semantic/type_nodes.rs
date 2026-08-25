@@ -12763,7 +12763,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 == value_declaration.is_some()
     }
 
-    /// Proves React's same-file WebView declaration retains one cold DOM base.
+    /// Proves React's same-file `WebView` declaration retains one cold DOM base.
     fn is_react_webview_interface_argument(&self, node: NodeRef, symbol: SemanticSymbolId) -> bool {
         let Some(owner) = self.store.symbol(symbol) else {
             return false;
@@ -24450,20 +24450,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 arguments,
             )?);
         }
-        match self.global_types.as_ref() {
-            Some(global_types) => self.store.expression_union_type_with_global_types(
+        if let Some(global_types) = self.global_types.as_ref() {
+            self.store.expression_union_type_with_global_types(
                 global_types,
                 &instantiated,
                 UnionReduction::Literal,
-            ),
-            None => {
-                let mut prepared = self
-                    .store
-                    .prepare_type_query_types(&[], &[], &[], 1, 0)
-                    .map_err(Self::literal_cache_error)?;
-                self.store
-                    .literal_union_type_prepared(&instantiated, None, &mut prepared)
-            }
+            )
+        } else {
+            let mut prepared = self
+                .store
+                .prepare_type_query_types(&[], &[], &[], 1, 0)
+                .map_err(Self::literal_cache_error)?;
+            self.store
+                .literal_union_type_prepared(&instantiated, None, &mut prepared)
         }
         .map_err(Self::literal_cache_error)
     }

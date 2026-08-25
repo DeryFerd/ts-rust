@@ -8683,7 +8683,7 @@ fn validate_resolved_declared_property_object_detailed(
     }
 }
 
-/// Authenticates React's source-owned WebView shell without resolving its DOM base.
+/// Authenticates React's source-owned `WebView` shell without resolving its DOM base.
 #[allow(clippy::too_many_lines)] // Global ownership, the cold shell, and its DOM base form one proof.
 fn valid_unresolved_react_webview_interface(
     store: &CanonicalTypeMapperStore,
