@@ -4,6 +4,8 @@
 //! declarations, authenticated namespace exports, forwarded generic type
 //! parameters, concrete generic instantiations, bounded base chains, and
 //! merged default-library DOM interface/value identities.
+//! Authenticated React node arrays retain their default-library `Array<T>`
+//! heritage without expanding recursive members.
 //! It also authenticates the exact `Record<string, any>` mapped-alias base.
 //! Every base is resolved before publication so member construction retains
 //! its declaration identity and, for mapped bases, its source type arguments.
@@ -18,6 +20,7 @@ use ts_binder::{
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeHost, TypeData,
     declared::{explicit_type_parameter_symbols, preflight_node},
+    global_types::preflight_generic_global_type_target,
     mapped_types::plan_mapped_type_declaration,
     types::ObjectFlags,
 };
@@ -26,6 +29,7 @@ use super::{
 pub(super) enum DirectInterfaceBaseKind {
     Interface,
     DefaultLibraryInterface,
+    DefaultLibraryArray,
     RecordMappedAlias,
 }
 
@@ -224,9 +228,23 @@ fn plan_direct_interface_heritage_inner(
                 kind: expression_record.kind,
             });
         }
-        let type_arguments = match base.type_arguments.as_ref() {
-            None => Vec::new(),
-            Some(arguments) if symbol_record.flags() == SymbolFlags::TYPE_ALIAS => {
+        let react_array_arguments = match (identifier, base.type_arguments.as_ref()) {
+            (Some(identifier), Some(arguments)) if identifier.text == "Array" => {
+                authenticate_react_default_library_array_base(
+                    store,
+                    host,
+                    (declaration, owner),
+                    (symbol, base_declarations),
+                    node,
+                    arguments,
+                )?
+            }
+            _ => None,
+        };
+        let type_arguments = match (base.type_arguments.as_ref(), react_array_arguments.as_ref()) {
+            (Some(_), Some(arguments)) => arguments.clone(),
+            (None, _) => Vec::new(),
+            (Some(arguments), _) if symbol_record.flags() == SymbolFlags::TYPE_ALIAS => {
                 if identifier.is_none_or(|identifier| identifier.text != "Record")
                     || clause_data.types.nodes.len() != 1
                     || !authenticate_record_mapped_alias(store, host, symbol, base_declarations)?
@@ -238,7 +256,7 @@ fn plan_direct_interface_heritage_inner(
                 }
                 plan_record_type_arguments(store, host, node, arguments)?
             }
-            Some(arguments)
+            (Some(arguments), _)
                 if symbol_record.flags().without(SymbolFlags::TRANSIENT)
                     == SymbolFlags::INTERFACE =>
             {
@@ -271,7 +289,7 @@ fn plan_direct_interface_heritage_inner(
                     )?
                 }
             }
-            Some(_) => {
+            (Some(_), _) => {
                 return Err(DirectInterfaceHeritageError::Unsupported {
                     node,
                     kind: SyntaxKind::ExpressionWithTypeArguments,
@@ -290,6 +308,16 @@ fn plan_direct_interface_heritage_inner(
                 expression,
                 symbol,
                 kind: DirectInterfaceBaseKind::RecordMappedAlias,
+                type_arguments,
+            });
+            continue;
+        }
+        if react_array_arguments.is_some() {
+            bases.push(DirectInterfaceBasePlan {
+                node,
+                expression,
+                symbol,
+                kind: DirectInterfaceBaseKind::DefaultLibraryArray,
                 type_arguments,
             });
             continue;
@@ -900,6 +928,322 @@ fn authenticate_heritage_type_parameter(
         }
     }
     Ok(name)
+}
+
+#[allow(clippy::too_many_lines)] // React ownership and the merged global Array are one proof.
+fn authenticate_react_default_library_array_base(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    (declaration, owner): (NodeRef, SemanticSymbolId),
+    (base, base_declarations): (SemanticSymbolId, &[NodeRef]),
+    node: NodeRef,
+    type_argument_list: &NodeList,
+) -> Result<Option<Vec<NodeRef>>, DirectInterfaceHeritageError> {
+    let derived = store
+        .symbol(owner)
+        .ok_or(DirectInterfaceHeritageError::Invalid)?;
+    let Some(namespace) = store.get_parent_of_symbol(owner) else {
+        return Ok(None);
+    };
+    let Some(namespace_owner) = store.symbol(namespace) else {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    };
+    let Some(exports) = namespace_owner
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+    else {
+        return Ok(None);
+    };
+    let Some(bound) = host.bound_file(declaration) else {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    };
+    let Some(facts) = bound.source_facts() else {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    };
+    let derived_record = preflight_node(store, host, declaration)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let NodeData::InterfaceDeclaration(interface) = &derived_record.data else {
+        return Ok(None);
+    };
+    if !facts.is_declaration_file()
+        || facts.is_default_library()
+        || derived_record.kind != SyntaxKind::InterfaceDeclaration
+        || derived_record.flags.0 != 0
+        || interface.type_parameters.is_some()
+        || !interface.members.nodes.is_empty()
+        || !host.symbol_matches(store, declaration, owner)
+        || derived.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+        || derived.check_flags() != CheckFlags::NONE
+        || derived.name().as_utf8() != Some("ReactNodeArray")
+        || derived.declarations() != Some(&[declaration])
+        || !namespace_owner.flags().intersects(SymbolFlags::NAMESPACE)
+        || namespace_owner.name().as_utf8() != Some("React")
+        || exports
+            .get_source("ReactNodeArray")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(owner)
+    {
+        return Ok(None);
+    }
+
+    let Some(block_id) = derived_record.parent else {
+        return Ok(None);
+    };
+    let block = NodeRef::new(declaration.arena, declaration.file, block_id);
+    let block_record =
+        preflight_node(store, host, block).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let NodeData::ModuleBlock(module_block) = &block_record.data else {
+        return Ok(None);
+    };
+    let Some(namespace_id) = block_record.parent else {
+        return Ok(None);
+    };
+    let namespace_declaration = NodeRef::new(block.arena, block.file, namespace_id);
+    let namespace_record = preflight_node(store, host, namespace_declaration)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let NodeData::ModuleDeclaration(namespace_data) = &namespace_record.data else {
+        return Ok(None);
+    };
+    let namespace_name = NodeRef::new(
+        namespace_declaration.arena,
+        namespace_declaration.file,
+        namespace_data.name,
+    );
+    let namespace_name_record = preflight_node(store, host, namespace_name)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    if block_record.kind != SyntaxKind::ModuleBlock
+        || module_block
+            .statements
+            .nodes
+            .iter()
+            .filter(|candidate| **candidate == declaration.node)
+            .count()
+            != 1
+        || namespace_record.kind != SyntaxKind::ModuleDeclaration
+        || namespace_data.keyword != SyntaxKind::NamespaceKeyword
+        || namespace_data.body != Some(block.node)
+        || namespace_name_record.kind != SyntaxKind::Identifier
+        || namespace_name_record.parent != Some(namespace_declaration.node)
+        || !matches!(
+            &namespace_name_record.data,
+            NodeData::Identifier(identifier)
+                if identifier.flow_node.is_none() && identifier.text == "React"
+        )
+        || bound
+            .symbol(namespace_declaration)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(namespace)
+    {
+        return Ok(None);
+    }
+
+    let global = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals));
+    let owner_is_global = global
+        .and_then(|globals| globals.get_source("React"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        == Some(namespace);
+    if !owner_is_global {
+        let Some(module_block_id) = namespace_record.parent else {
+            return Ok(None);
+        };
+        let module_block = NodeRef::new(
+            namespace_declaration.arena,
+            namespace_declaration.file,
+            module_block_id,
+        );
+        let module_block_record = preflight_node(store, host, module_block)
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+        let Some(module_id) = module_block_record.parent else {
+            return Ok(None);
+        };
+        let module = NodeRef::new(module_block.arena, module_block.file, module_id);
+        let module_record = preflight_node(store, host, module)
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+        let NodeData::ModuleDeclaration(module_data) = &module_record.data else {
+            return Ok(None);
+        };
+        let name = NodeRef::new(module.arena, module.file, module_data.name);
+        let name_record =
+            preflight_node(store, host, name).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+        if module_block_record.kind != SyntaxKind::ModuleBlock
+            || module_record.kind != SyntaxKind::ModuleDeclaration
+            || module_record.parent != Some(bound.source_file().node)
+            || module_data.keyword != SyntaxKind::ModuleKeyword
+            || module_data.body != Some(module_block.node)
+            || name_record.kind != SyntaxKind::StringLiteral
+            || name_record.parent != Some(module.node)
+            || !matches!(&name_record.data, NodeData::StringLiteral(name) if name.text == "react")
+            || bound
+                .locals(module)
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source("React"))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(namespace)
+        {
+            return Ok(None);
+        }
+    }
+
+    let array = store
+        .symbol(base)
+        .ok_or(DirectInterfaceHeritageError::Invalid)?;
+    if array.name().as_utf8() != Some("Array")
+        || array.flags().without(SymbolFlags::TRANSIENT)
+            != SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || array.check_flags() != CheckFlags::NONE
+        || array.parent().is_some()
+        || array.exports().is_some()
+        || array.export_symbol().is_some()
+        || store.get_merged_symbol(base) != Some(base)
+        || global
+            .and_then(|globals| globals.get_source("Array"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(base)
+    {
+        return Ok(None);
+    }
+    let Some(target) = store
+        .declared_type_links(base)
+        .and_then(|links| links.declared_type)
+    else {
+        return Ok(None);
+    };
+    if preflight_generic_global_type_target(store, target)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+        .is_some()
+        || store
+            .type_payload(target)
+            .and_then(|record| record.symbol())
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(base)
+    {
+        return Ok(None);
+    }
+
+    let mut interface_declarations = Vec::new();
+    let mut seen = HashSet::with_capacity(base_declarations.len());
+    let mut value = None;
+    for &candidate in base_declarations {
+        let Some(candidate_bound) = host.bound_file(candidate) else {
+            return Err(DirectInterfaceHeritageError::Invalid);
+        };
+        let Some(candidate_facts) = candidate_bound.source_facts() else {
+            return Err(DirectInterfaceHeritageError::Invalid);
+        };
+        let candidate_record = preflight_node(store, host, candidate)
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+        if !seen.insert(candidate)
+            || !candidate_facts.is_default_library()
+            || !candidate_facts.is_declaration_file()
+            || candidate_facts.is_javascript_file()
+            || candidate_facts.is_external_or_common_js_module()
+            || !host.symbol_matches(store, candidate, base)
+        {
+            return Ok(None);
+        }
+        match &candidate_record.data {
+            NodeData::InterfaceDeclaration(interface)
+                if candidate_record.kind == SyntaxKind::InterfaceDeclaration
+                    && candidate_record.flags.0 == 0
+                    && candidate_record.parent == Some(candidate_bound.source_file().node)
+                    && interface
+                        .type_parameters
+                        .as_ref()
+                        .is_some_and(|parameters| {
+                            parameters.nodes.len() == 1 && !parameters.has_trailing_comma
+                        })
+                    && interface.flow_node.is_none()
+                    && interface.local_symbol.is_none()
+                    && interface.symbol.is_none() =>
+            {
+                interface_declarations.push(candidate);
+            }
+            NodeData::VariableDeclaration(variable)
+                if candidate_record.kind == SyntaxKind::VariableDeclaration
+                    && candidate_record.flags.0 == 0
+                    && variable.initializer.is_none()
+                    && variable.exclamation_token.is_none()
+                    && variable.local_symbol.is_none()
+                    && variable.symbol.is_none()
+                    && variable.facts == 0
+                    && value.replace(candidate).is_none() =>
+            {
+                if !authenticated_default_library_value_declaration(
+                    store,
+                    host,
+                    candidate,
+                    candidate_bound.source_file(),
+                )? {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+    if interface_declarations.is_empty() || array.value_declaration() != value {
+        return Ok(None);
+    }
+
+    let planned = plan_concrete_interface_type_arguments(
+        store,
+        host,
+        declaration,
+        owner,
+        node,
+        base,
+        &interface_declarations,
+        type_argument_list,
+    )?;
+    let [argument] = planned.as_slice() else {
+        return Ok(None);
+    };
+    let argument_record = preflight_node(store, host, *argument)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let NodeData::TypeReferenceNode(reference) = &argument_record.data else {
+        return Ok(None);
+    };
+    let name = NodeRef::new(argument.arena, argument.file, reference.type_name);
+    let name_record =
+        preflight_node(store, host, name).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let Some(react_node) = exports
+        .get_source("ReactNode")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(None);
+    };
+    let Some(alias) = store.symbol(react_node) else {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    };
+    let mut resolver = host
+        .name_resolver_host(store)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    if argument_record.kind != SyntaxKind::TypeReference
+        || reference.type_arguments.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(argument.node)
+        || !matches!(
+            &name_record.data,
+            NodeData::Identifier(identifier)
+                if identifier.flow_node.is_none() && identifier.text == "ReactNode"
+        )
+        || !alias.flags().contains(SymbolFlags::TYPE_ALIAS)
+        || alias
+            .flags()
+            .without(SymbolFlags::TYPE_ALIAS | SymbolFlags::TRANSIENT)
+            != SymbolFlags::NONE
+        || alias.check_flags() != CheckFlags::NONE
+        || store.get_parent_of_symbol(react_node) != Some(namespace)
+        || resolver
+            .resolve_entity_name(name, SymbolFlags::TYPE)
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(react_node)
+    {
+        return Ok(None);
+    }
+    Ok(Some(planned))
 }
 
 fn authenticate_default_library_interface_base(
@@ -1521,14 +1865,15 @@ mod tests {
     use ts_ast::FileId;
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName,
+        EscapedName, InternalSymbolName,
     };
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError, TypeData,
-        production::GlobalMergeCompletion,
+        AliasTargetState, CanonicalCheckerContext, CanonicalCheckerDiagnostics,
+        CanonicalCheckerOptions, SourceCheckError, TypeData, production::GlobalMergeCompletion,
+        type_nodes::CanonicalTypeQuery,
     };
 
     fn checker_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -1660,6 +2005,244 @@ mod tests {
         )
         .unwrap();
         (context, library_file, source_file)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep Array, React exports, private aliases, and warm identity together.
+    fn default_library_array_bases_keep_recursive_react_module_nodes_lazy() {
+        let library = parse_source_file(concat!(
+            "interface Array<Value> { length: number }\n",
+            "declare var Array: any;\n",
+            "interface ReadonlyArray<Value> {}\n",
+        ));
+        let source = parse_source_file(concat!(
+            "declare module 'react' {\n",
+            "  export = React;\n",
+            "  namespace React {\n",
+            "    interface ReactElement<Props> { props: Props }\n",
+            "    interface ReactNodeArray extends Array<ReactNode> {}\n",
+            "    type ReactFragment = {} | ReactNodeArray;\n",
+            "    type ReactNode = ReactElement<any> | ReactFragment | ",
+            "string | number | boolean | null | undefined;\n",
+            "  }\n",
+            "  type MergePropTypes<Props, Inferred> = Props & Inferred;\n",
+            "}\n",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let (mut context, library_file, source_file) =
+            default_library_heritage_context(&library, &source, true);
+        let array = interface_symbol(&library, library_file, &context, "Array");
+        let react_array = interface_symbol(&source, source_file, &context, "ReactNodeArray");
+        let namespace = context.store().get_parent_of_symbol(react_array).unwrap();
+        let exports = context
+            .store()
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .unwrap();
+        let react_node = context
+            .store()
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("ReactNode"))
+            .unwrap();
+        let module = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return None;
+                };
+                matches!(
+                    source.arena.get(module.name).map(|name| &name.data),
+                    Some(NodeData::StringLiteral(name)) if name.text == "react"
+                )
+                .then_some(NodeRef::new(source.arena.id(), source_file, node))
+            })
+            .unwrap();
+        let source_bound = context.file(source_file).unwrap().1.clone();
+        let module_symbol = source_bound.symbol(module).unwrap();
+        let module_exports = context
+            .store()
+            .symbol(module_symbol)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .unwrap();
+        let export_assignment = context
+            .store()
+            .symbol_table(module_exports)
+            .and_then(|exports| exports.get(InternalSymbolName::ExportEquals.as_ref()))
+            .unwrap();
+        let private_alias = source_bound
+            .locals(module)
+            .and_then(|locals| context.store().symbol_table(locals))
+            .and_then(|locals| locals.get_source("MergePropTypes"))
+            .unwrap();
+        assert_eq!(
+            context.store().symbol(array).unwrap().flags(),
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+        );
+        assert_eq!(
+            context
+                .store()
+                .declared_type_links(array)
+                .and_then(|links| links.declared_type),
+            Some(context.global_types().array_type),
+        );
+        assert!(
+            context
+                .store()
+                .symbol(private_alias)
+                .unwrap()
+                .parent()
+                .is_none()
+        );
+        assert!(
+            context
+                .store()
+                .symbol_table(module_exports)
+                .and_then(|exports| exports.get_source("MergePropTypes"))
+                .is_none()
+        );
+        let cold = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        let planned = heritage_plan(&source, source_file, &context, "ReactNodeArray").unwrap();
+        let [inherited] = planned.bases.as_slice() else {
+            panic!("ReactNodeArray must retain the one default-library Array base")
+        };
+        assert_eq!(inherited.symbol, array);
+        assert_eq!(inherited.kind, DirectInterfaceBaseKind::DefaultLibraryArray);
+        let [argument] = inherited.type_arguments.as_slice() else {
+            panic!("the Array base must retain its recursive ReactNode argument")
+        };
+        assert_eq!(
+            source.arena.get(argument.node).unwrap().kind,
+            SyntaxKind::TypeReference,
+        );
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let properties =
+            crate::semantic::object_members::plan_interface(context.store(), &host, react_array)
+                .unwrap();
+        assert!(properties.properties.is_empty());
+        assert_eq!(properties.heritage.as_ref(), Some(&planned));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let options = context.options();
+        let resolved = CanonicalTypeQuery::new(
+            context.store_mut_for_test(),
+            &host,
+            options,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(react_node)
+        .unwrap();
+        assert!(context.store().type_payload(resolved).is_some());
+        let array_shell = context
+            .store()
+            .declared_type_links(react_array)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            context.store().type_payload(array_shell).unwrap().data()
+        else {
+            panic!("ReactNodeArray must retain an authenticated interface shell")
+        };
+        assert!(!interface.base_types_resolved);
+        assert!(!interface.declared_members_resolved);
+        assert!(
+            context
+                .store()
+                .alias_symbol_links(export_assignment)
+                .is_none_or(|links| links.alias_target == AliasTargetState::Resolved(namespace))
+        );
+        assert!(context.store().type_alias_links(private_alias).is_none());
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                context.store_mut_for_test(),
+                &host,
+                options,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(react_node),
+            Ok(resolved),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn react_array_heritage_rejects_non_default_library_lookalikes_without_publication() {
+        let library = parse_source_file(concat!(
+            "interface Array<Value> { length: number }\n",
+            "declare var Array: any;\n",
+            "interface ReadonlyArray<Value> {}\n",
+        ));
+        let source = parse_source_file(concat!(
+            "declare namespace React {\n",
+            "  interface ReactNodeArray extends Array<ReactNode> {}\n",
+            "  type ReactNode = string | ReactNodeArray;\n",
+            "}\n",
+        ));
+        let (context, _, source_file) = default_library_heritage_context(&library, &source, false);
+        let cold = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            heritage_plan(&source, source_file, &context, "ReactNodeArray"),
+            Err(DirectInterfaceHeritageError::Unsupported {
+                kind: SyntaxKind::ExpressionWithTypeArguments,
+                ..
+            })
+        ));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
     }
 
     #[test]

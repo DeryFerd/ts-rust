@@ -1518,14 +1518,20 @@ pub(super) fn plan_interface(
         });
     }
     if let Some(heritage) = plan.heritage.as_ref() {
-        if heritage
-            .bases
-            .iter()
-            .any(|base| base.kind == DirectInterfaceBaseKind::DefaultLibraryInterface)
-        {
+        if heritage.bases.iter().any(|base| {
+            matches!(
+                base.kind,
+                DirectInterfaceBaseKind::DefaultLibraryInterface
+                    | DirectInterfaceBaseKind::DefaultLibraryArray
+            )
+        }) {
             if !matches!(
                 heritage.bases.as_slice(),
-                [base] if base.kind == DirectInterfaceBaseKind::DefaultLibraryInterface
+                [base]
+                    if base.kind == DirectInterfaceBaseKind::DefaultLibraryInterface
+                        && base.type_arguments.is_empty()
+                        || base.kind == DirectInterfaceBaseKind::DefaultLibraryArray
+                            && base.type_arguments.len() == 1
             ) || !plan.properties.is_empty()
                 || !plan.spreads.is_empty()
                 || !plan.indexes.is_empty()

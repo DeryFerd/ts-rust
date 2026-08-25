@@ -1354,6 +1354,8 @@ fn has_lazy_default_library_interface_base(plan: &PropertyObjectPlan) -> bool {
         Some([base])
             if base.kind == DirectInterfaceBaseKind::DefaultLibraryInterface
                 && base.type_arguments.is_empty()
+                || base.kind == DirectInterfaceBaseKind::DefaultLibraryArray
+                    && base.type_arguments.len() == 1
     ) && plan.declarations.len() == 1
         && plan.members.is_none()
         && plan.properties.is_empty()
