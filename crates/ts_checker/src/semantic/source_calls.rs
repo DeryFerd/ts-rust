@@ -4822,12 +4822,61 @@ pub(super) fn resolve_jsx_generic_component_signature(
     component: TypeId,
     attributes: TypeId,
 ) -> Result<SignatureId, SourceCheckError> {
+    resolve_jsx_call_signature(
+        store,
+        host,
+        global_types,
+        options,
+        diagnostics,
+        opening,
+        component,
+        &[attributes],
+        SyntaxKind::JsxOpeningElement,
+    )
+}
+
+/// Resolves an authenticated call used as a JSX spread donor.
+#[allow(clippy::too_many_arguments)] // JSX calls retain their source, arguments, and diagnostic owner.
+pub(super) fn resolve_jsx_spread_call_signature(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    call: NodeRef,
+    callee: TypeId,
+    arguments: &[TypeId],
+) -> Result<SignatureId, SourceCheckError> {
+    resolve_jsx_call_signature(
+        store,
+        host,
+        global_types,
+        options,
+        diagnostics,
+        call,
+        callee,
+        arguments,
+        SyntaxKind::CallExpression,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Component openings and spread calls share one inference path.
+fn resolve_jsx_call_signature(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    node: NodeRef,
+    callee: TypeId,
+    arguments: &[TypeId],
+    kind: SyntaxKind,
+) -> Result<SignatureId, SourceCheckError> {
     let existing = store
-        .signature_links(opening)
+        .signature_links(node)
         .and_then(|links| links.resolved_signature.signature());
     let mut session = InstantiationSession::new(InstantiationLimits::default());
     let mut retried_signatures = HashSet::new();
-    let arguments = [attributes];
     let resolution = loop {
         match resolve_source_call_once(
             store,
@@ -4838,8 +4887,8 @@ pub(super) fn resolve_jsx_generic_component_signature(
             &mut session,
             SourceCallResolutionRequest {
                 form: DirectCallForm::Call,
-                callee_type: component,
-                argument_types: &arguments,
+                callee_type: callee,
+                argument_types: arguments,
                 explicit_type_arguments: None,
             },
         ) {
@@ -4865,8 +4914,8 @@ pub(super) fn resolve_jsx_generic_component_signature(
             ) => {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::Syntax {
-                        node: opening,
-                        kind: SyntaxKind::JsxOpeningElement,
+                        node,
+                        kind,
                         role: super::SourceSyntaxRole::VariableInitializer,
                     },
                 ));
@@ -4876,24 +4925,40 @@ pub(super) fn resolve_jsx_generic_component_signature(
 
     match resolution {
         ResolvedSourceCall::Legacy(resolution)
-        | ResolvedSourceCall::NongenericTypeArguments(resolution) => Ok(resolution.signature),
+        | ResolvedSourceCall::NongenericTypeArguments(resolution) => {
+            if kind == SyntaxKind::CallExpression
+                && resolution.applicability != DirectCallApplicability::Applicable
+            {
+                return Err(SourceCheckError::Call(node));
+            }
+            Ok(resolution.signature)
+        }
         ResolvedSourceCall::Identity(resolution) => {
+            if kind == SyntaxKind::CallExpression
+                && resolution.applicability != DirectCallApplicability::Applicable
+            {
+                return Err(SourceCheckError::Call(node));
+            }
             demand_identity_generic_call_return_with_session(store, &resolution, &mut session)
-                .map_err(|_| SourceCheckError::Call(opening))?;
+                .map_err(|_| SourceCheckError::Call(node))?;
             Ok(resolution.projection.signature)
         }
         ResolvedSourceCall::Vector(resolution) => {
-            if !matches!(
+            let applicable = matches!(
                 resolution.applicability(),
                 GenericCallVectorApplicability::Applicable
-                    | GenericCallVectorApplicability::ArgumentNotAssignable { .. }
-            ) {
-                return Err(SourceCheckError::Call(opening));
+            ) || kind == SyntaxKind::JsxOpeningElement
+                && matches!(
+                    resolution.applicability(),
+                    GenericCallVectorApplicability::ArgumentNotAssignable { .. }
+                );
+            if !applicable {
+                return Err(SourceCheckError::Call(node));
             }
             let materialized = materialize_generic_call_vector_source(store, &resolution, existing)
-                .map_err(|_| SourceCheckError::Call(opening))?;
+                .map_err(|_| SourceCheckError::Call(node))?;
             demand_generic_call_vector_return_with_session(store, &resolution, &mut session)
-                .map_err(|_| SourceCheckError::Call(opening))?;
+                .map_err(|_| SourceCheckError::Call(node))?;
             Ok(materialized.call_signature)
         }
     }

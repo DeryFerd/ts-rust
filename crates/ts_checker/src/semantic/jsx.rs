@@ -43,7 +43,7 @@ use super::{
     reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
     signatures::{ElementFlags, SignatureFlags},
     source::merge_retry_diagnostic,
-    source_calls::resolve_jsx_generic_component_signature,
+    source_calls::{resolve_jsx_generic_component_signature, resolve_jsx_spread_call_signature},
     spelling::get_spelling_suggestion,
     tuple_types::CanonicalTupleTypeRequest,
     type_nodes::CanonicalTypeQuery,
@@ -155,6 +155,10 @@ enum JsxScalarPlan {
         name: String,
     },
     GlobalThis(NodeRef),
+    Array {
+        node: NodeRef,
+        elements: Vec<Self>,
+    },
     Property {
         node: NodeRef,
         receiver: Box<Self>,
@@ -164,6 +168,7 @@ enum JsxScalarPlan {
     Call {
         node: NodeRef,
         callee: Box<Self>,
+        arguments: Vec<Self>,
     },
     TypeAssertion {
         node: NodeRef,
@@ -1334,28 +1339,54 @@ fn plan_scalar(
                 name: identifier.text.clone(),
             })
         }
+        NodeData::ArrayLiteralExpression(array)
+            if record.kind == SyntaxKind::ArrayLiteralExpression
+                && array.facts == 0
+                && !array.elements.nodes.is_empty()
+                && !array.elements.has_trailing_comma =>
+        {
+            let mut elements = Vec::with_capacity(array.elements.nodes.len());
+            for element in &array.elements.nodes {
+                let element = child_ref(node, *element);
+                let planned = plan_scalar(arena, bound, store, node, element)?;
+                if !matches!(
+                    planned,
+                    JsxScalarPlan::String { .. }
+                        | JsxScalarPlan::Number { .. }
+                        | JsxScalarPlan::Boolean { .. }
+                        | JsxScalarPlan::Identifier { .. }
+                ) {
+                    return Err(unsupported(element, SyntaxKind::ArrayLiteralExpression));
+                }
+                elements.push(planned);
+            }
+            Ok(JsxScalarPlan::Array { node, elements })
+        }
         NodeData::CallExpression(call)
             if record.kind == SyntaxKind::CallExpression
                 && call.question_dot_token.is_none()
                 && call.symbol.is_none()
                 && call.facts == 0
                 && call.type_arguments.is_none()
-                && call.arguments.nodes.is_empty()
                 && !call.arguments.has_trailing_comma =>
         {
             let syntax = super::source_calls::plan_direct_source_call_syntax(arena, store, node)?;
-            if syntax.callee_form() != super::source_calls::SourceCallCalleeForm::Identifier
-                || !syntax.arguments().is_empty()
-            {
+            if syntax.callee_form() != super::source_calls::SourceCallCalleeForm::Identifier {
                 return Err(unsupported(node, record.kind));
             }
             let callee = plan_scalar(arena, bound, store, node, syntax.callee())?;
             if !matches!(callee, JsxScalarPlan::Identifier { .. }) {
                 return Err(unsupported(node, record.kind));
             }
+            let arguments = syntax
+                .arguments()
+                .iter()
+                .map(|argument| plan_scalar(arena, bound, store, node, *argument))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(JsxScalarPlan::Call {
                 node,
                 callee: Box::new(callee),
+                arguments,
             })
         }
         NodeData::BinaryExpression(_) if record.kind == SyntaxKind::BinaryExpression => {
@@ -2115,11 +2146,21 @@ fn collect_jsx_scalar_intrinsic_names(
         JsxScalarPlan::Element(element) => {
             collect_jsx_plan_intrinsic_names(store, arena, bound, element, names);
         }
-        JsxScalarPlan::Property { receiver, .. }
-        | JsxScalarPlan::Call {
-            callee: receiver, ..
-        } => {
+        JsxScalarPlan::Property { receiver, .. } => {
             collect_jsx_scalar_intrinsic_names(store, arena, bound, receiver, names);
+        }
+        JsxScalarPlan::Call {
+            callee, arguments, ..
+        } => {
+            collect_jsx_scalar_intrinsic_names(store, arena, bound, callee, names);
+            for argument in arguments {
+                collect_jsx_scalar_intrinsic_names(store, arena, bound, argument, names);
+            }
+        }
+        JsxScalarPlan::Array { elements, .. } => {
+            for element in elements {
+                collect_jsx_scalar_intrinsic_names(store, arena, bound, element, names);
+            }
         }
         JsxScalarPlan::TypeAssertion { value, .. } | JsxScalarPlan::Parenthesized { value, .. } => {
             collect_jsx_scalar_intrinsic_names(store, arena, bound, value, names);
@@ -6894,6 +6935,29 @@ fn execute_scalar(
             publish_symbol_links(store, *node, symbol)?;
             (*node, type_)
         }
+        JsxScalarPlan::Array { node, elements } => {
+            let global_types = source
+                .3
+                .ok_or_else(|| unsupported(*node, SyntaxKind::ArrayLiteralExpression))?;
+            let mut types = Vec::with_capacity(elements.len());
+            for element in elements {
+                types.push(execute_scalar(
+                    store,
+                    source,
+                    namespace,
+                    element,
+                    options,
+                    diagnostics,
+                )?);
+            }
+            let element = store.expression_union_type_with_global_types(
+                global_types,
+                &types,
+                UnionReduction::Subtype,
+            )?;
+            let array = store.create_canonical_array_type(global_types, element, false)?;
+            (*node, store.create_array_literal_type(global_types, array)?)
+        }
         JsxScalarPlan::Identifier { node, name } => {
             let Some(symbol) = resolve_scoped_jsx_value_symbol(store, arena, bound, *node, name)
             else {
@@ -6991,9 +7055,46 @@ fn execute_scalar(
                 (*node, namespace.error_type)
             }
         }
-        JsxScalarPlan::Call { node, callee } => {
+        JsxScalarPlan::Call {
+            node,
+            callee,
+            arguments,
+        } => {
             let callee_type =
                 execute_scalar(store, source, namespace, callee, options, diagnostics)?;
+            if !arguments.is_empty() {
+                let global_types = source
+                    .3
+                    .ok_or_else(|| unsupported(*node, SyntaxKind::CallExpression))?;
+                let mut argument_types = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    argument_types.push(execute_scalar(
+                        store,
+                        source,
+                        namespace,
+                        argument,
+                        options,
+                        diagnostics,
+                    )?);
+                }
+                let signature = resolve_jsx_spread_call_signature(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                    *node,
+                    callee_type,
+                    &argument_types,
+                )?;
+                let type_ = store
+                    .signature(signature)
+                    .and_then(super::signatures::Signature::resolved_return_type)
+                    .ok_or(SourceCheckError::Call(*node))?;
+                publish_signature_links(store, *node, signature)?;
+                publish_type_links(store, *node, type_)?;
+                return Ok(type_);
+            }
             let StoredCallableSetValidation::Valid { projection, .. } =
                 validate_stored_callable_set(store, callee_type)
             else {
@@ -14888,8 +14989,119 @@ mod runtime_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Donor arguments, inferred signatures, and warm caches share one graph.
+    fn generic_jsx_components_infer_call_argument_spreads_and_replay_warm() {
+        let source = concat!(
+            "interface Array<T> {}\n",
+            "interface ReadonlyArray<T> {}\n",
+            "declare namespace JSX { interface Element {} }\n",
+            "interface Props<T> { value: T; }\n",
+            "declare function Widget<T>(props: Props<T>): any;\n",
+            "declare function forward<T>(props: Props<T>): Props<T>;\n",
+            "declare function select<T>(names: readonly string[], props: Props<T>): Props<T>;\n",
+            "declare const numbers: Props<number>;\n",
+            "const direct = <Widget {...forward(numbers)} />;\n",
+            "const selected = <Widget {...select(['value'], numbers)} />;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_236);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/generic-jsx-call-arguments.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let mut calls = 0;
+        for (node, record) in parsed.arena.iter() {
+            let NodeData::CallExpression(call) = &record.data else {
+                continue;
+            };
+            let node = NodeRef::new(parsed.arena.id(), file, node);
+            let result = context
+                .store()
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let inferred = validate_direct_generic_reference(context.store(), result).unwrap();
+            assert_eq!(inferred.type_arguments.as_slice(), &[number]);
+            let signature = context
+                .store()
+                .signature_links(node)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .and_then(super::super::signatures::Signature::resolved_return_type),
+                Some(result),
+            );
+            if call.arguments.nodes.len() == 2 {
+                let array = NodeRef::new(parsed.arena.id(), file, call.arguments.nodes[0]);
+                let array_type = context
+                    .store()
+                    .type_node_links(array)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                assert!(
+                    context
+                        .store()
+                        .canonical_array_reference(context.global_types(), array_type)
+                        .unwrap()
+                        .is_some_and(|array| array.array_literal)
+                );
+            }
+            calls += 1;
+        }
+        assert_eq!(calls, 2);
+
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
     fn jsx_call_result_spreads_reject_unsupported_call_shapes_before_publication() {
-        for (index, donor) in ["make(1)", "make<string>()", "make?.()"]
+        for (index, donor) in ["make().value()", "make<string>()", "make?.()"]
             .into_iter()
             .enumerate()
         {

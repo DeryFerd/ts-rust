@@ -8393,11 +8393,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     ..
                 } => self.plan_arrow_return_expression(statement, expression)?,
             };
-            if matches!(body, PlannedArrowBody::ReturnJsx { .. }) {
-                return Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Arrow(arrow.declaration),
-                ));
-            }
             Ok(body)
         })();
         self.prior_variables = prior_variables;
@@ -34185,6 +34180,28 @@ fn materialize_contextual_source_arrow(
                 None => widened_fresh_literal_type(store, checked.result)?,
             };
             store.get_widened_type_with_global_types(widened, global_types)?
+        }
+        (
+            SourceContextualReturnOrigin::InferredConciseExpression { expression }
+            | SourceContextualReturnOrigin::InferredReturnExpression { expression, .. },
+            PlannedArrowBody::ReturnJsx {
+                expression: body,
+                element,
+                ..
+            },
+        ) if body == expression => {
+            let mut jsx_diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = store.check_jsx_element_with_global_types(
+                host,
+                global_types,
+                *element,
+                options,
+                &mut jsx_diagnostics,
+            );
+            merge_retry_diagnostics(diagnostics, jsx_diagnostics);
+            let result = result?;
+            publish_parenthesized_jsx_expression_types(store, host, *body, *element, result)?;
+            store.get_widened_type_with_global_types(result, global_types)?
         }
         _ => return Err(SourceCheckError::Arrow(plan.declaration)),
     };
@@ -72775,6 +72792,64 @@ class Foo2 {
             bootstrap.number_type,
         );
         assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn contextual_arrow_jsx_returns_preserve_element_identity_and_warm_diagnostics() {
+        let source = ts_parser::parse_jsx_source_file(concat!(
+            "declare namespace JSX { ",
+            "interface Element {} ",
+            "interface IntrinsicElements { div: { label: string }; p: {}; } ",
+            "} ",
+            "const direct: () => JSX.Element = () => <div label='ready' />; ",
+            "const nested: () => JSX.Element = () => { return (<p />); }; ",
+            "const invalid: () => JSX.Element = () => <div label={123} />;",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(9_990);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("only the invalid contextual JSX attribute must report a diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'string'.",
+        );
+
+        let (_, bound) = context.file(file).unwrap();
+        for name in ["direct", "nested", "invalid"] {
+            let arrow = variable_initializer(&source, file, name);
+            let owner = bound.symbol(arrow).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let result = context
+                .store()
+                .signature(signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type)
+                .unwrap();
+            let element = context
+                .store()
+                .type_payload(result)
+                .and_then(TypeRecord::symbol)
+                .and_then(|symbol| context.store().symbol(symbol))
+                .and_then(|symbol| symbol.name().as_utf8());
+            assert_eq!(element, Some("Element"));
+        }
 
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
