@@ -11,10 +11,10 @@ use ts_jsnum::{Number, PseudoBigInt};
 use xxhash_rust::xxh3::Xxh3;
 
 use super::{
-    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
-    CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
-    DeclaredTypeUnavailable, SignatureId, TypeId, TypeResolutionTarget, TypeSystemPropertyName,
-    UnsupportedDeclaredTypeKind,
+    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalCheckerRelatedInformation,
+    CanonicalGlobalTypes, CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeError,
+    DeclaredTypeHost, DeclaredTypeUnavailable, SignatureId, TypeId, TypeResolutionTarget,
+    TypeSystemPropertyName, UnsupportedDeclaredTypeKind,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes, UnionReduction},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
@@ -692,6 +692,8 @@ struct TypeQueryPlan {
     references: BTreeMap<NodeRef, PlannedTypeReference>,
     jsdoc_imports: BTreeMap<NodeRef, CanonicalJsDocImportTypeTarget>,
     recovered_missing_references: BTreeMap<NodeRef, NodeRef>,
+    recovered_missing_reference_diagnostics:
+        BTreeMap<NodeRef, PlannedMissingTypeReferenceDiagnostic>,
     type_queries: BTreeMap<NodeRef, PlannedValueTypeQuery>,
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
     unions: BTreeMap<NodeRef, PlannedUnionType>,
@@ -785,6 +787,14 @@ struct PlannedMappedIndexedAccess {
 struct PlannedRecoveredIndexedAccess {
     object: NodeRef,
     index: NodeRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlannedMissingTypeReferenceDiagnostic {
+    node: NodeRef,
+    code: u32,
+    arguments: Vec<String>,
+    related: Option<(NodeRef, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -7710,6 +7720,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !cached_type.is_some_and(|cached| is_instantiated_mapped_type(self.store, cached))
             && !qualified
             && !source_parameter_constraint
+            && !self.is_recovered_source_variable_reference(node, cached_type)?
             && !matches!(name_text, "Array" | "ReadonlyArray" | "NonNullable")
         {
             return Ok(());
@@ -7727,7 +7738,23 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 cached_symbol,
             )?
         } else if qualified {
-            let resolved = self.resolve_qualified_type_reference_symbol(node, name)?;
+            let resolved = match self.resolve_qualified_type_reference_symbol(node, name) {
+                Ok(symbol) => symbol,
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::MissingTypeReference(missing),
+                )) if missing == node
+                    && self.plan_missing_source_variable_reference(
+                        node,
+                        name,
+                        alias_owner,
+                        union_constituent,
+                        &type_arguments,
+                    )? =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             if let Some(cached) = cached_symbol {
                 let canonical = self.store.get_merged_symbol(cached).ok_or_else(|| {
                     type_node_unavailable(TypeNodeUnavailable::InvalidCachedSymbol {
@@ -7829,6 +7856,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 Ok(None) => {
                     if self.plan_missing_source_constraint_reference(
+                        node,
+                        name,
+                        alias_owner,
+                        union_constituent,
+                        &type_arguments,
+                    )? {
+                        return Ok(());
+                    }
+                    if self.plan_missing_source_variable_reference(
                         node,
                         name,
                         alias_owner,
@@ -8344,6 +8380,323 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         if let Some(existing) = self.plan.recovered_missing_references.insert(node, name)
             && existing != name
+        {
+            return Err(invalid());
+        }
+        Ok(true)
+    }
+
+    fn is_recovered_source_variable_reference(
+        &self,
+        node: NodeRef,
+        cached: Option<TypeId>,
+    ) -> Result<bool, DeclaredTypeError> {
+        if cached.is_none()
+            || self
+                .store
+                .symbol_node_links(node)
+                .and_then(|links| links.resolved_symbol)
+                .is_some()
+        {
+            return Ok(false);
+        }
+        let record = preflight_node(self.store, self.host, node)?;
+        let Some(parent) = record.parent else {
+            return Ok(false);
+        };
+        let declaration = NodeRef::new(node.arena, node.file, parent);
+        Ok(matches!(
+            self.host.node(declaration).map(|record| &record.data),
+            Some(NodeData::VariableDeclaration(variable)) if variable.type_ == Some(node.node)
+        ))
+    }
+
+    fn resolve_missing_reference_symbol(
+        &self,
+        node: NodeRef,
+        name: &str,
+        meaning: SymbolFlags,
+        suggestions: bool,
+    ) -> Result<Option<SemanticSymbolId>, DeclaredTypeError> {
+        let (arena, bound) = self.host.source(node).ok_or({
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(node))
+        })?;
+        let mut callback_host = self.host.name_resolver_host(self.store)?;
+        if suggestions {
+            callback_host = callback_host.with_spelling_suggestions();
+        }
+        CanonicalNameResolver::new(arena, bound, self.store.symbol_store(), &mut callback_host)?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(node)),
+                name,
+                meaning,
+                None,
+                false,
+                false,
+            )
+            .map_err(Into::into)
+    }
+
+    fn missing_reference_suggestion(
+        &self,
+        node: NodeRef,
+        name: &str,
+        meaning: SymbolFlags,
+        code: u32,
+    ) -> Result<Option<PlannedMissingTypeReferenceDiagnostic>, DeclaredTypeError> {
+        let Some(suggestion) = self.resolve_missing_reference_symbol(node, name, meaning, true)?
+        else {
+            return Ok(None);
+        };
+        let record = self.store.symbol(suggestion).ok_or({
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(suggestion))
+        })?;
+        let suggested_name = record.name().as_utf8().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+        })?;
+        let related = match record.value_declaration() {
+            Some(declaration) => {
+                let declaration_record = preflight_node(self.store, self.host, declaration)?;
+                if matches!(
+                    &declaration_record.data,
+                    NodeData::ModuleDeclaration(module)
+                        if module.keyword == SyntaxKind::GlobalKeyword
+                ) {
+                    return Ok(None);
+                }
+                Some((declaration, suggested_name.to_owned()))
+            }
+            None => None,
+        };
+        Ok(Some(PlannedMissingTypeReferenceDiagnostic {
+            node,
+            code,
+            arguments: vec![name.to_owned(), suggested_name.to_owned()],
+            related,
+        }))
+    }
+
+    fn plan_missing_source_variable_reference(
+        &mut self,
+        node: NodeRef,
+        name: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
+        union_constituent: bool,
+        type_arguments: &[NodeRef],
+    ) -> Result<bool, DeclaredTypeError> {
+        if alias_owner.is_some() || union_constituent || !type_arguments.is_empty() {
+            return Ok(false);
+        }
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let record = preflight_node(self.store, self.host, node)?;
+        let Some(declaration_id) = record.parent else {
+            return Ok(false);
+        };
+        let declaration = NodeRef::new(node.arena, node.file, declaration_id);
+        let declaration_record = preflight_node(self.store, self.host, declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Ok(false);
+        };
+        if declaration_record.kind != SyntaxKind::VariableDeclaration
+            || variable.type_ != Some(node.node)
+        {
+            return Ok(false);
+        }
+        let Some(list_id) = declaration_record.parent else {
+            return Ok(false);
+        };
+        let list = NodeRef::new(node.arena, node.file, list_id);
+        let list_record = preflight_node(self.store, self.host, list)?;
+        let Some(statement_id) = list_record.parent else {
+            return Ok(false);
+        };
+        let statement = NodeRef::new(node.arena, node.file, statement_id);
+        let statement_record = preflight_node(self.store, self.host, statement)?;
+        let Some(bound) = self.host.bound_file(declaration) else {
+            return Err(invalid());
+        };
+        let symbol = bound
+            .symbol(declaration)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+            .ok_or_else(&invalid)?;
+        if list_record.kind != SyntaxKind::VariableDeclarationList
+            || statement_record.kind != SyntaxKind::VariableStatement
+            || statement_record.parent != Some(bound.source_file().node)
+            || bound
+                .source_facts()
+                .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+            || self
+                .store
+                .symbol(symbol)
+                .is_none_or(|record| !record.flags().intersects(SymbolFlags::VARIABLE))
+        {
+            return Ok(false);
+        }
+
+        let error_type = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ))?
+            .error_type;
+        if self
+            .store
+            .symbol_node_links(node)
+            .is_some_and(|links| links.resolved_symbol.is_some())
+            || self.store.type_node_links(node).is_some_and(|links| {
+                links.outer_type_parameters.is_some()
+                    || links
+                        .resolved_type
+                        .is_some_and(|cached| cached != error_type)
+            })
+        {
+            return Err(invalid());
+        }
+
+        let name_record = preflight_node(self.store, self.host, name)?;
+        let diagnostic = match &name_record.data {
+            NodeData::Identifier(identifier) if name_record.kind == SyntaxKind::Identifier => {
+                let text = identifier.text.as_str();
+                if text.is_empty() || identifier.flow_node.is_some() {
+                    return Err(invalid());
+                }
+                if self
+                    .resolve_missing_reference_symbol(name, text, SymbolFlags::MODULE, false)?
+                    .is_some()
+                {
+                    PlannedMissingTypeReferenceDiagnostic {
+                        node: name,
+                        code: 2709,
+                        arguments: vec![text.to_owned()],
+                        related: None,
+                    }
+                } else if self
+                    .resolve_missing_reference_symbol(
+                        name,
+                        text,
+                        SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+                        false,
+                    )?
+                    .is_some()
+                {
+                    PlannedMissingTypeReferenceDiagnostic {
+                        node: name,
+                        code: 2749,
+                        arguments: vec![text.to_owned()],
+                        related: None,
+                    }
+                } else if let Some(library) = super::source::missing_source_identifier_library(text)
+                {
+                    PlannedMissingTypeReferenceDiagnostic {
+                        node: name,
+                        code: 2583,
+                        arguments: vec![text.to_owned(), library.to_owned()],
+                        related: None,
+                    }
+                } else if let Some(suggestion) =
+                    self.missing_reference_suggestion(name, text, SymbolFlags::TYPE, 2552)?
+                {
+                    suggestion
+                } else {
+                    PlannedMissingTypeReferenceDiagnostic {
+                        node: name,
+                        code: 2304,
+                        arguments: vec![text.to_owned()],
+                        related: None,
+                    }
+                }
+            }
+            NodeData::QualifiedName(qualified) if name_record.kind == SyntaxKind::QualifiedName => {
+                let left = NodeRef::new(name.arena, name.file, qualified.left);
+                let left_record = preflight_node(self.store, self.host, left)?;
+                let NodeData::Identifier(left_name) = &left_record.data else {
+                    return Ok(false);
+                };
+                let right = NodeRef::new(name.arena, name.file, qualified.right);
+                let right_record = preflight_node(self.store, self.host, right)?;
+                let NodeData::Identifier(right_name) = &right_record.data else {
+                    return Err(invalid());
+                };
+                if left_record.kind != SyntaxKind::Identifier
+                    || left_record.parent != Some(name.node)
+                    || left_name.flow_node.is_some()
+                    || left_name.text.is_empty()
+                    || right_record.kind != SyntaxKind::Identifier
+                    || right_record.parent != Some(name.node)
+                    || right_name.flow_node.is_some()
+                    || right_name.text.is_empty()
+                {
+                    return Err(invalid());
+                }
+                if self
+                    .resolve_missing_reference_symbol(
+                        left,
+                        &left_name.text,
+                        SymbolFlags::NAMESPACE,
+                        false,
+                    )?
+                    .is_some()
+                {
+                    PlannedMissingTypeReferenceDiagnostic {
+                        node: right,
+                        code: 2694,
+                        arguments: vec![left_name.text.clone(), right_name.text.clone()],
+                        related: None,
+                    }
+                } else if self
+                    .resolve_missing_reference_symbol(
+                        left,
+                        &left_name.text,
+                        SymbolFlags::TYPE,
+                        false,
+                    )?
+                    .is_some()
+                {
+                    PlannedMissingTypeReferenceDiagnostic {
+                        node: left,
+                        code: 2702,
+                        arguments: vec![left_name.text.clone()],
+                        related: None,
+                    }
+                } else if let Some(suggestion) = self.missing_reference_suggestion(
+                    left,
+                    &left_name.text,
+                    SymbolFlags::NAMESPACE,
+                    2833,
+                )? {
+                    suggestion
+                } else {
+                    PlannedMissingTypeReferenceDiagnostic {
+                        node: left,
+                        code: 2503,
+                        arguments: vec![left_name.text.clone()],
+                        related: None,
+                    }
+                }
+            }
+            _ => return Ok(false),
+        };
+        if self
+            .store
+            .symbol_node_links(diagnostic.node)
+            .is_some_and(|links| links.resolved_symbol.is_some())
+        {
+            return Err(invalid());
+        }
+        if let Some(existing) = self
+            .plan
+            .recovered_missing_references
+            .insert(node, diagnostic.node)
+            && existing != diagnostic.node
+        {
+            return Err(invalid());
+        }
+        if let Some(existing) = self
+            .plan
+            .recovered_missing_reference_diagnostics
+            .insert(node, diagnostic.clone())
+            && existing != diagnostic
         {
             return Err(invalid());
         }
@@ -18141,7 +18494,25 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if !self.store.set_type_node_links(node, links) {
             return Err(invalid());
         }
-        if !identifier.text.is_empty() {
+        if let Some(planned) = plan.recovered_missing_reference_diagnostics.get(&node) {
+            let diagnostic = self.diagnostics.add(
+                Some(planned.node),
+                Diagnostic::with_arguments(
+                    message_by_code(planned.code)
+                        .expect("missing type-name diagnostics are in the catalog"),
+                    planned.arguments.clone(),
+                ),
+            );
+            if let Some((declaration, name)) = &planned.related {
+                diagnostic.append_related(CanonicalCheckerRelatedInformation {
+                    node: Some(*declaration),
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2728).expect("TS2728 is in the diagnostic catalog"),
+                        [name.clone()],
+                    ),
+                });
+            }
+        } else if !identifier.text.is_empty() {
             self.diagnostics.add(
                 Some(name),
                 Diagnostic::with_arguments(
@@ -31575,6 +31946,158 @@ mod tests {
             }
             assert!(diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    fn source_variable_type_references_recover_exact_namespace_and_type_diagnostics() {
+        for (source, code, arguments, diagnostic_name) in [
+            ("let item: Missing;", 2304, ["Missing", ""], "Missing"),
+            (
+                "interface Model {} let item: Mdel;",
+                2552,
+                ["Mdel", "Model"],
+                "Mdel",
+            ),
+            (
+                "namespace Shapes {} let item: Shapes;",
+                2709,
+                ["Shapes", ""],
+                "Shapes",
+            ),
+            (
+                "const ready = 1; let item: ready;",
+                2749,
+                ["ready", ""],
+                "ready",
+            ),
+            (
+                "interface OhNo {} let item: OhNo.hello;",
+                2702,
+                ["OhNo", ""],
+                "OhNo",
+            ),
+            ("let item: Missing.Item;", 2503, ["Missing", ""], "Missing"),
+            (
+                "namespace Models { export class Item {} } let item: Model.Item;",
+                2833,
+                ["Model", "Models"],
+                "Model",
+            ),
+            (
+                "namespace Models { export interface Present {} } let item: Models.Missing;",
+                2694,
+                ["Models", "Missing"],
+                "Missing",
+            ),
+            ("let item: Map;", 2583, ["Map", "es2015"], "Map"),
+        ] {
+            let mut fixture = fixture(source);
+            let reference = variable_type_node(&fixture, "item");
+            let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+            let before = store_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .preflight_type_from_type_node(reference)
+            .unwrap();
+            assert_eq!(store_state(&fixture.store), before, "source: {source}");
+            assert!(diagnostics.is_empty());
+
+            assert_eq!(
+                query_node(&mut fixture, reference, &mut diagnostics),
+                Ok(error_type),
+                "source: {source}",
+            );
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected one missing type diagnostic for {source}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), code, "source: {source}");
+            if arguments[1].is_empty() {
+                assert_eq!(diagnostic.diagnostic.arguments, [arguments[0]]);
+            } else {
+                assert_eq!(diagnostic.diagnostic.arguments, arguments);
+            }
+            let name = fixture
+                .parsed
+                .arena
+                .get(diagnostic.node.unwrap().node)
+                .unwrap();
+            let NodeData::Identifier(identifier) = &name.data else {
+                panic!("the diagnostic must target an identifier")
+            };
+            assert_eq!(identifier.text, diagnostic_name);
+            if code == 2833 {
+                let [related] = diagnostic.related_information.as_slice() else {
+                    panic!("a runtime namespace suggestion must retain its declaration")
+                };
+                assert_eq!(related.diagnostic.code(), 2728);
+                assert_eq!(related.diagnostic.arguments, ["Models"]);
+            }
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(reference)
+                    .and_then(|links| links.resolved_type),
+                Some(error_type),
+            );
+            assert!(fixture.store.symbol_node_links(reference).is_none());
+
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                query_node(&mut fixture, reference, &mut diagnostics),
+                Ok(error_type),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+            assert_eq!(diagnostics.len(), 1);
+        }
+    }
+
+    #[test]
+    fn recovered_source_variable_type_references_reject_poisoned_warm_links() {
+        let mut fixture = fixture("interface Model {} let item: Mdel;");
+        let reference = variable_type_node(&fixture, "item");
+        let (error_type, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.error_type, bootstrap.number_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_node(&mut fixture, reference, &mut diagnostics),
+            Ok(error_type),
+        );
+        let original = fixture.store.type_node_links(reference).unwrap().clone();
+        assert!(fixture.store.set_type_node_links(
+            reference,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..original.clone()
+            },
+        ));
+        let poisoned = store_state(&fixture.store);
+
+        assert!(
+            query_node(&mut fixture, reference, &mut diagnostics).is_err(),
+            "a poisoned recovered reference cannot replay as a valid type",
+        );
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert_eq!(diagnostics.len(), 1);
+
+        assert!(fixture.store.set_type_node_links(reference, original));
+        assert_eq!(
+            query_node(&mut fixture, reference, &mut diagnostics),
+            Ok(error_type),
+        );
+        assert_eq!(diagnostics.len(), 1);
     }
 
     #[test]

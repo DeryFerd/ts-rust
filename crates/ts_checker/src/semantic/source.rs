@@ -1528,6 +1528,7 @@ struct PlannedLocalNamedExport {
 struct PlannedMissingNamedExport {
     name: NodeRef,
     skipped_statement: Option<NodeRef>,
+    type_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -10935,7 +10936,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || statement_record.parent != Some(self.source.node_ref().node)
             || export.attributes.is_some()
             || export.flow_node.is_some()
-            || export.is_type_only
             || export.module_specifier.is_some()
             || export.symbol.is_some()
             || export.facts != 0
@@ -11104,6 +11104,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(resolved.is_none().then_some(PlannedMissingNamedExport {
             name,
             skipped_statement,
+            type_only: export.is_type_only,
         }))
     }
 
@@ -20046,6 +20047,45 @@ fn missing_source_identifier_diagnostic(
         .ok_or(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingNode(expression.node),
         ))?;
+    let mut namespace_host = host.name_resolver_host(store)?;
+    let namespace_symbol =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut namespace_host)
+            .map_err(DeclaredTypeError::from)?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(expression.node)),
+                name,
+                SymbolFlags::NAMESPACE_MODULE,
+                None,
+                false,
+                false,
+            )
+            .map_err(DeclaredTypeError::from)?;
+    if let Some(symbol) = namespace_symbol
+        && store.symbol(symbol).is_some_and(|symbol| {
+            !symbol.flags().intersects(SymbolFlags::VALUE)
+                && !symbol.declarations().is_some_and(|declarations| {
+                    declarations.iter().copied().any(|declaration| {
+                        host.node(declaration).is_some_and(|record| {
+                            matches!(
+                                &record.data,
+                                NodeData::ModuleDeclaration(module)
+                                    if module.keyword == SyntaxKind::GlobalKeyword
+                            )
+                        })
+                    })
+                })
+        })
+    {
+        return Ok(CanonicalCheckerDiagnostic {
+            node: Some(expression.node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2708).ok_or(SourceCheckError::MissingDiagnostic(2708))?,
+                [name],
+            ),
+            related_information: Vec::new(),
+        });
+    }
     let mut type_host = host.name_resolver_host(store)?;
     let type_symbol =
         CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut type_host)
@@ -20185,7 +20225,67 @@ fn missing_source_identifier_diagnostic(
     })
 }
 
-fn missing_source_identifier_library(name: &str) -> Option<&'static str> {
+fn missing_source_type_export_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    name: &str,
+) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
+    let (arena, bound) = host.source(node).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingNode(node),
+    ))?;
+    let mut callback_host = host.name_resolver_host(store)?.with_spelling_suggestions();
+    let suggestion =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(DeclaredTypeError::from)?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(node)),
+                name,
+                SymbolFlags::TYPE,
+                None,
+                false,
+                false,
+            )
+            .map_err(DeclaredTypeError::from)?;
+    let Some(suggestion) = suggestion else {
+        return Ok(CanonicalCheckerDiagnostic {
+            node: Some(node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2304).ok_or(SourceCheckError::MissingDiagnostic(2304))?,
+                [name],
+            ),
+            related_information: Vec::new(),
+        });
+    };
+    let symbol = store.symbol(suggestion).ok_or(SourceCheckError::Variable(
+        VariableInvariant::InvalidSymbolShape(suggestion),
+    ))?;
+    let suggested = symbol.name().as_utf8().ok_or(SourceCheckError::Variable(
+        VariableInvariant::InvalidSymbolShape(suggestion),
+    ))?;
+    let related_information = match symbol.value_declaration() {
+        Some(declaration) => vec![CanonicalCheckerRelatedInformation {
+            node: Some(declaration),
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2728).ok_or(SourceCheckError::MissingDiagnostic(2728))?,
+                [suggested],
+            ),
+        }],
+        None => Vec::new(),
+    };
+    Ok(CanonicalCheckerDiagnostic {
+        node: Some(node),
+        range_override: None,
+        diagnostic: Diagnostic::with_arguments(
+            message_by_code(2552).ok_or(SourceCheckError::MissingDiagnostic(2552))?,
+            [name, suggested],
+        ),
+        related_information,
+    })
+}
+
+pub(super) fn missing_source_identifier_library(name: &str) -> Option<&'static str> {
     match name {
         "Map" | "Set" | "Promise" | "Symbol" | "WeakMap" | "WeakSet" | "Iterator"
         | "AsyncIterator" | "Reflect" => Some("es2015"),
@@ -33492,13 +33592,22 @@ pub(super) fn check_source_file(
                         unknown_symbol,
                     )),
                 );
-                let diagnostic = missing_source_identifier_diagnostic(
-                    store,
-                    host,
-                    options,
-                    &expression,
-                    &identifier.text,
-                )?;
+                let diagnostic = if export.type_only {
+                    missing_source_type_export_diagnostic(
+                        store,
+                        host,
+                        export.name,
+                        &identifier.text,
+                    )?
+                } else {
+                    missing_source_identifier_diagnostic(
+                        store,
+                        host,
+                        options,
+                        &expression,
+                        &identifier.text,
+                    )?
+                };
                 merge_retry_diagnostic(diagnostics, diagnostic);
             }
             PlannedStatement::ExternalModuleMarker
@@ -53909,6 +54018,82 @@ class Foo2 {
     }
 
     #[test]
+    fn missing_type_only_exports_use_type_scope_spelling_without_value_suggestions() {
+        for (index, (text, expected_code, expected_arguments)) in [
+            (
+                concat!("type RoomInterfae = {}; ", "export type { RoomInterface };",),
+                2552,
+                ["RoomInterface", "RoomInterfae"],
+            ),
+            (
+                "const RoomInterfae = 1; export type { RoomInterface };",
+                2304,
+                ["RoomInterface", ""],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_872 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one missing type export diagnostic for {text}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), expected_code);
+            if expected_arguments[1].is_empty() {
+                assert_eq!(diagnostic.diagnostic.arguments, [expected_arguments[0]]);
+            } else {
+                assert_eq!(diagnostic.diagnostic.arguments, expected_arguments);
+            }
+            assert_eq!(
+                node_text(&source, diagnostic.node.unwrap()),
+                "RoomInterface"
+            );
+            assert!(diagnostic.related_information.is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn missing_value_exports_keep_spelling_suggestions_and_related_declarations() {
+        let source = parsed("const available = 1; export { availabl };");
+        let file = FileId::new(9_874);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one missing local-export suggestion")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2552);
+        assert_eq!(diagnostic.diagnostic.arguments, ["availabl", "available"]);
+        assert_eq!(
+            diagnostic.related_information[0].node,
+            Some(variable_declaration(&source, file, "available")),
+        );
+        assert_eq!(diagnostic.related_information[0].diagnostic.code(), 2728);
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn identifier_expression_statements_and_lone_break_report_exact_diagnostics() {
         let source = parsed("const value = 1; value; missing; break;");
         let file = FileId::new(8_295);
@@ -61766,6 +61951,178 @@ class Foo2 {
                 assert_eq!(diagnostic.diagnostic.arguments, arguments);
             }
             assert!(diagnostic.related_information.is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn source_variable_type_annotations_report_exact_missing_namespace_and_type_errors() {
+        for (index, (text, code, arguments, diagnostic_name)) in [
+            ("let item: Missing;", 2304, ["Missing", ""], "Missing"),
+            (
+                "interface Model {} let item: Mdel;",
+                2552,
+                ["Mdel", "Model"],
+                "Mdel",
+            ),
+            (
+                "namespace Shapes {} let item: Shapes;",
+                2709,
+                ["Shapes", ""],
+                "Shapes",
+            ),
+            (
+                "const ready = 1; let item: ready;",
+                2749,
+                ["ready", ""],
+                "ready",
+            ),
+            (
+                "interface OhNo {} declare let item: OhNo.hello;",
+                2702,
+                ["OhNo", ""],
+                "OhNo",
+            ),
+            (
+                "declare let item: Missing.Member;",
+                2503,
+                ["Missing", ""],
+                "Missing",
+            ),
+            (
+                "namespace Models { export interface Present {} } let item: Models.Missing;",
+                2694,
+                ["Models", "Missing"],
+                "Missing",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_860 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let reference = variable_type_node(&source, file, "item");
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one source type-name diagnostic for {text}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), code, "source: {text}");
+            assert_eq!(
+                node_text(&source, diagnostic.node.unwrap()),
+                diagnostic_name
+            );
+            if arguments[1].is_empty() {
+                assert_eq!(diagnostic.diagnostic.arguments, [arguments[0]]);
+            } else {
+                assert_eq!(diagnostic.diagnostic.arguments, arguments);
+            }
+            let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+            assert_eq!(resolved_node_type(&context, reference), error);
+            assert_eq!(variable_value_type(&context, &source, file, "item"), error);
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn missing_namespace_roots_keep_spelling_suggestions_and_declaration_identity() {
+        let source = parsed(concat!(
+            "namespace Models { export var available = 1; } ",
+            "declare let item: Model.Item;",
+        ));
+        let file = FileId::new(9_870);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one namespace spelling suggestion")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2833);
+        assert_eq!(diagnostic.diagnostic.arguments, ["Model", "Models"]);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "Model");
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("the namespace suggestion must retain its declaration")
+        };
+        assert_eq!(related.diagnostic.code(), 2728);
+        assert_eq!(related.diagnostic.arguments, ["Models"]);
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn type_only_namespaces_used_as_values_report_ts2708_before_spelling_suggestions() {
+        let source = parsed("declare namespace Shapes {} const item = Shapes;");
+        let file = FileId::new(9_871);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let expression = variable_initializer(&source, file, "item");
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one namespace-as-value diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2708);
+        assert_eq!(diagnostic.diagnostic.arguments, ["Shapes"]);
+        assert_eq!(diagnostic.node, Some(expression));
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Cannot use namespace 'Shapes' as a value.",
+        );
+        let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+        assert_eq!(resolved_node_type(&context, expression), error);
+        assert_eq!(variable_value_type(&context, &source, file, "item"), error);
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn shorthand_and_literal_computed_properties_keep_exact_missing_name_diagnostics() {
+        for (index, (text, code, arguments)) in [
+            ("const item = { missing };", 18004, ["missing", ""]),
+            (
+                "const available = 1; const item = { availabl };",
+                2552,
+                ["availabl", "available"],
+            ),
+            (
+                "const available = 1; const item = { ['key']: availabl };",
+                2552,
+                ["availabl", "available"],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_875 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one property-name diagnostic for {text}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), code, "source: {text}");
+            if arguments[1].is_empty() {
+                assert_eq!(diagnostic.diagnostic.arguments, [arguments[0]]);
+                assert!(diagnostic.related_information.is_empty());
+            } else {
+                assert_eq!(diagnostic.diagnostic.arguments, arguments);
+                assert_eq!(diagnostic.related_information[0].diagnostic.code(), 2728);
+            }
 
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();
