@@ -10932,7 +10932,32 @@ fn issue_ambient_module_export_collision(
     )?;
     let related = message_by_code(ALSO_DECLARED_HERE)
         .ok_or(SourceCheckError::MissingDiagnostic(ALSO_DECLARED_HERE))?;
-    for (declaration, other) in [(first_name, second_name), (second_name, first_name)] {
+    let first_file = host
+        .bound_file(first_name)
+        .and_then(BoundFile::source_facts)
+        .ok_or(SourceCheckError::Import(first_name))?;
+    let second_file = host
+        .bound_file(second_name)
+        .and_then(BoundFile::source_facts)
+        .ok_or(SourceCheckError::Import(second_name))?;
+    let first_range = host
+        .node(first_name)
+        .ok_or_else(|| missing_node(first_name))?;
+    let second_range = host
+        .node(second_name)
+        .ok_or_else(|| missing_node(second_name))?;
+    let ordered = if (
+        first_file.source_file_symbol_name().as_bytes(),
+        first_range.range.start,
+    ) <= (
+        second_file.source_file_symbol_name().as_bytes(),
+        second_range.range.start,
+    ) {
+        [(first_name, second_name), (second_name, first_name)]
+    } else {
+        [(second_name, first_name), (first_name, second_name)]
+    };
+    for (declaration, other) in ordered {
         super::source::merge_retry_diagnostic(
             diagnostics,
             CanonicalCheckerDiagnostic {
@@ -19138,6 +19163,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Keep alias identity, duplicate anchors, and forgery checks together.
     fn external_merged_namespace_reexports_preserve_exact_ambient_collisions() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
         let provider = parse_source_file(concat!(
             "declare function foo(): void; ",
             "declare namespace foo { export const items: string[]; } ",
@@ -19147,6 +19173,7 @@ mod tests {
             "declare module 'mymod' { import * as foo from 'foo'; export { foo }; }",
         );
         let second = parse_source_file("declare module 'mymod' { export const foo: number; }");
+        let library_file = FileId::new(7_509);
         let provider_file = FileId::new(7_510);
         let first_file = FileId::new(7_511);
         let second_file = FileId::new(7_512);
@@ -19170,6 +19197,7 @@ mod tests {
         ]);
         let mut context = ambient_module_context(
             &[
+                (library_file, &library, CanonicalModuleState::Script),
                 (provider_file, &provider, CanonicalModuleState::External),
                 (first_file, &first, CanonicalModuleState::Script),
                 (second_file, &second, CanonicalModuleState::Script),
@@ -19269,6 +19297,13 @@ mod tests {
             38
         );
 
+        context.check_source_file(provider_file).unwrap();
+        let items_type = context
+            .store()
+            .value_symbol_links(items)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(items_type).unwrap(), "string[]");
         context.check_source_file(first_file).unwrap();
         assert_eq!(
             context
@@ -19284,7 +19319,13 @@ mod tests {
                 .map(|links| (links.immediate_target, links.alias_target)),
             Some((Some(imported), AliasTargetState::Resolved(original))),
         );
-        assert!(context.store().value_symbol_links(items).is_none());
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(items)
+                .and_then(|links| links.resolved_type),
+            Some(items_type),
+        );
 
         context.check_source_file(second_file).unwrap();
         let diagnostics = context.diagnostics().as_slice();
@@ -19350,6 +19391,89 @@ mod tests {
             context
                 .store_mut_for_test()
                 .set_alias_symbol_links(reexported, original_links)
+        );
+    }
+
+    #[test]
+    fn reopened_ambient_module_collisions_keep_source_order_when_checked_backwards() {
+        let first = parse_source_file(concat!(
+            "declare module 'target' { export interface Value {} } ",
+            "declare module 'mymod' { ",
+            "import * as foo from 'target'; export { foo }; ",
+            "}",
+        ));
+        let second = parse_source_file("declare module 'mymod' { export const foo: number; }");
+        let first_file = FileId::new(7_513);
+        let second_file = FileId::new(7_514);
+        let mut context = ambient_module_context(
+            &[
+                (first_file, &first, CanonicalModuleState::Script),
+                (second_file, &second, CanonicalModuleState::Script),
+            ],
+            None,
+        );
+        let first_name = first
+            .arena
+            .iter()
+            .find_map(|(declaration, record)| match &record.data {
+                NodeData::ExportSpecifier(export) if record.kind == SyntaxKind::ExportSpecifier => {
+                    Some(child(
+                        NodeRef::new(first.arena.id(), first_file, declaration),
+                        export.name,
+                    ))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let second_name = second
+            .arena
+            .iter()
+            .find_map(|(declaration, record)| match &record.data {
+                NodeData::VariableDeclaration(variable)
+                    if record.kind == SyntaxKind::VariableDeclaration =>
+                {
+                    Some(child(
+                        NodeRef::new(second.arena.id(), second_file, declaration),
+                        variable.name,
+                    ))
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        context.check_source_file(second_file).unwrap();
+        context.check_source_file(first_file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, (name, related)) in diagnostics
+            .iter()
+            .zip([(first_name, second_name), (second_name, first_name)])
+        {
+            assert_eq!(diagnostic.node, Some(name));
+            assert_eq!(diagnostic.diagnostic.code(), 2451);
+            let [other] = diagnostic.related_information.as_slice() else {
+                panic!("each reversed collision must retain its opposite declaration")
+            };
+            assert_eq!(other.node, Some(related));
+            assert_eq!(other.diagnostic.code(), 6203);
+        }
+
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        context.recheck_source_file(first_file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            warm,
         );
     }
 
