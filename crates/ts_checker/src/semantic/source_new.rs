@@ -7153,6 +7153,20 @@ mod tests {
                 store.signature_len(),
                 store.checker_link_allocated_lengths(),
             );
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Ok(expected),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{source}",
+            );
 
             context.recheck_source_file(file).unwrap();
 
@@ -7184,6 +7198,19 @@ mod tests {
                     "interface Factory { ",
                     "(): number; ",
                     "new(value?: any): string; ",
+                    "} ",
+                    "declare const factory: Factory; ",
+                    "const result = new factory();",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "interface Factory { ",
+                    "new(value?: any): string; ",
+                    "(): any; ",
+                    "(value: any): any; ",
+                    "readonly prototype: string; ",
                     "} ",
                     "declare const factory: Factory; ",
                     "const result = new factory();",

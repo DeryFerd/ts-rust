@@ -19020,7 +19020,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::FunctionDeclaration | SyntaxKind::ArrowFunction => {
                 return self.get_return_type_of_source_callable_signature(signature, declaration);
             }
-            SyntaxKind::CallSignature => {
+            kind @ (SyntaxKind::CallSignature | SyntaxKind::ConstructSignature) => {
                 self.reject_type_reference_alias_capabilities()?;
                 let owner = self
                     .store
@@ -19037,11 +19037,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         TypeNodeUnavailable::InvalidFunctionSignature(signature),
                     ));
                 };
-                if !projection
-                    .call_signatures
-                    .iter()
-                    .any(|callable| callable.signature == signature)
-                {
+                let valid_signature = if kind == SyntaxKind::ConstructSignature {
+                    projection.construct_signatures.contains(&signature)
+                } else {
+                    projection
+                        .call_signatures
+                        .iter()
+                        .any(|callable| callable.signature == signature)
+                };
+                if projection.owner != owner || !valid_signature {
                     return Err(type_node_unavailable(
                         TypeNodeUnavailable::InvalidFunctionSignature(signature),
                     ));
@@ -49127,6 +49131,99 @@ mod tests {
             Ok(string),
         );
         assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn default_library_object_constructor_returns_preserve_mixed_signature_identity() {
+        let mut fixture = default_library_fixture(concat!(
+            "interface Object {} ",
+            "interface ObjectConstructor { ",
+            "new(value?: any): Object; ",
+            "(): any; ",
+            "(value: any): any; ",
+            "readonly prototype: Object; ",
+            "freeze<Value>(value: Value): Value; ",
+            "} ",
+            "declare var Object: ObjectConstructor;",
+        ));
+        let owner = named_symbol(
+            &fixture,
+            SyntaxKind::InterfaceDeclaration,
+            "ObjectConstructor",
+        );
+        let object = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Object");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let constructor = query_declared(
+            &mut fixture,
+            owner,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let object_type = fixture
+            .store
+            .declared_type_links(object)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            fixture.store.type_payload(constructor).unwrap().data()
+        else {
+            panic!("ObjectConstructor must preserve its default-library interface identity")
+        };
+        let [signature] = interface.declared_construct_signatures.as_deref().unwrap() else {
+            panic!("ObjectConstructor must retain its real optional construct signature")
+        };
+        let signature = *signature;
+        assert_eq!(
+            interface.declared_call_signatures.as_ref().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .min_argument_count(),
+            0
+        );
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([fixture.store.intrinsic_bootstrap().unwrap().any_type].as_slice()),
+        );
+
+        let warm = function_store_state(&fixture.store);
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Ok(object_type),
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(string))
+        );
+        let poisoned = function_store_state(&fixture.store);
+        assert!(matches!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(actual)
+            )) if actual == signature
+        ));
+        assert_eq!(function_store_state(&fixture.store), poisoned);
+
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(object_type))
+        );
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Ok(object_type),
+        );
         assert!(diagnostics.is_empty());
     }
 
