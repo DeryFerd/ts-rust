@@ -14,8 +14,8 @@ use super::{
     instantiated_members::{GenericInterfaceMemberError, validate_generic_interface_members},
     links::ValueSymbolLinks,
     object_members::{
-        DeclaredPropertyObjectValidation, resolved_declared_property_types,
-        validate_resolved_declared_property_object,
+        DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
+        resolved_declared_property_types, validate_resolved_declared_property_object,
     },
     reference_types::validate_direct_generic_reference,
     type_records::{StructuredTypeData, TypeData, TypeRecord},
@@ -101,6 +101,7 @@ impl CanonicalTypeMapperStore {
     ) -> Result<(), IntersectionTypeError> {
         let mut constituents = Vec::new();
         self.append_intersection_constituent(type_, &mut constituents)?;
+        self.validate_branded_string_intersection(&constituents)?;
         expected_properties(self, &constituents)?;
         expected_call_signatures(self, &constituents).map(|_| ())
     }
@@ -127,6 +128,7 @@ impl CanonicalTypeMapperStore {
         for type_ in input {
             self.append_intersection_constituent(*type_, &mut types)?;
         }
+        self.validate_branded_string_intersection(&types)?;
         if types.is_empty() {
             return Ok(unknown_type);
         }
@@ -693,6 +695,14 @@ impl CanonicalTypeMapperStore {
             }
             return Ok(());
         }
+        if record.flags() == TypeFlags::STRING_LITERAL {
+            self.validate_union_constituent(type_)
+                .map_err(|_| IntersectionTypeError::MalformedConstituent(type_))?;
+            if !output.contains(&type_) {
+                output.push(type_);
+            }
+            return Ok(());
+        }
         match validate_resolved_declared_property_object(self, type_) {
             DeclaredPropertyObjectValidation::Valid(_) => {
                 if !output.contains(&type_) {
@@ -745,6 +755,43 @@ impl CanonicalTypeMapperStore {
                 Err(IntersectionTypeError::MalformedConstituent(type_))
             }
         }
+    }
+
+    fn validate_branded_string_intersection(
+        &self,
+        constituents: &[TypeId],
+    ) -> Result<(), IntersectionTypeError> {
+        let Some(literal) = constituents.iter().copied().find(|constituent| {
+            self.type_payload(*constituent)
+                .is_some_and(|record| record.flags() == TypeFlags::STRING_LITERAL)
+        }) else {
+            return Ok(());
+        };
+        let [string, brand] = constituents else {
+            return Err(IntersectionTypeError::UnsupportedConstituent(literal));
+        };
+        if *string != literal {
+            return Err(IntersectionTypeError::UnsupportedConstituent(literal));
+        }
+        match validate_resolved_declared_property_object(self, *brand) {
+            DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::TypeLiteral) => {}
+            DeclaredPropertyObjectValidation::Malformed => {
+                return Err(IntersectionTypeError::MalformedConstituent(*brand));
+            }
+            DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
+            | DeclaredPropertyObjectValidation::NotDeclared => {
+                return Err(IntersectionTypeError::UnsupportedConstituent(*brand));
+            }
+        }
+        if self
+            .type_payload(*brand)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .is_none_or(|properties| properties.is_empty())
+        {
+            return Err(IntersectionTypeError::UnsupportedConstituent(*brand));
+        }
+        Ok(())
     }
 
     fn validate_resolved_generic_intersection_constituent(
@@ -863,6 +910,12 @@ impl CanonicalTypeMapperStore {
         };
         if self.intersection_types.get(&key) != Some(&type_)
             || self.intersection_keys_by_type.get(&type_) != Some(&key)
+        {
+            return Err(invalid());
+        }
+        if self
+            .validate_branded_string_intersection(&key.types)
+            .is_err()
         {
             return Err(invalid());
         }
@@ -1058,6 +1111,12 @@ fn expected_properties(
         let record = store
             .type_payload(*type_)
             .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?;
+        if record.flags() == TypeFlags::STRING_LITERAL {
+            store
+                .validate_union_constituent(*type_)
+                .map_err(|_| IntersectionTypeError::MalformedConstituent(*type_))?;
+            continue;
+        }
         let structured = record
             .data()
             .structured()

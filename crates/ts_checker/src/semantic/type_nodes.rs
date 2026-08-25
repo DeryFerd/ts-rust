@@ -4491,6 +4491,25 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 ));
             }
         } else {
+            if let Some(literal) = types.iter().copied().find(|constituent| {
+                matches!(
+                    self.plan.literals.get(constituent),
+                    Some(PlannedLiteralType::String(_))
+                )
+            }) && !matches!(
+                types.as_slice(),
+                [string, brand]
+                    if *string == literal
+                        && self
+                            .plan
+                            .type_literals
+                            .get(brand)
+                            .is_some_and(|plan| !plan.properties.is_empty())
+            ) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedIntersectionConstituent(literal),
+                ));
+            }
             let mut validating = HashSet::new();
             for constituent in &types {
                 self.validate_planned_intersection_constituent(*constituent, &mut validating)?;
@@ -4629,6 +4648,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         type_node_unavailable(TypeNodeUnavailable::InvalidIntersectionType(node))
                     })?;
                     self.validate_intersection_property_plan(planned, validating)
+                }
+                NodeData::LiteralTypeNode(_)
+                    if record.kind == SyntaxKind::LiteralType
+                        && matches!(
+                            self.plan.literals.get(&node),
+                            Some(PlannedLiteralType::String(_))
+                        ) =>
+                {
+                    Ok(())
                 }
                 NodeData::FunctionTypeNode(_) if record.kind == SyntaxKind::FunctionType => {
                     if self.plan.functions.contains_key(&node) {
