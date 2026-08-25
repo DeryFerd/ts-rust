@@ -76209,7 +76209,10 @@ class Foo2 {
                 "{ value: number; }",
                 "arrow {name}",
             );
-            assert_eq!(resolved_node_type(&context, arrow), callable);
+            assert_eq!(
+                variable_value_type(&context, &source, file, name),
+                callable,
+            );
         }
         for (node, record) in source.arena.iter() {
             if record.kind == SyntaxKind::ObjectLiteralExpression {
