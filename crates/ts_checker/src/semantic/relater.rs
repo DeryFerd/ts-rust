@@ -1121,8 +1121,8 @@ impl<'store> RelaterSession<'store> {
     /// The pinned oracle is surface-sensitive: a sole empty `Array<T>` shell
     /// makes `[[1], {}]` infer `number[][]`, while a shell with required
     /// `length` and the default library infer `{}[]`. Array -> regularized
-    /// empty object is always true for structural relations. Strict subtype
-    /// reduction also proves the reverse direction false only when the raw
+    /// empty object is always true for structural relations. Assignability and
+    /// subtype comparisons prove the reverse direction false only when the raw
     /// target has a required own property; otherwise it remains unavailable
     /// rather than guessing that a cold shell is empty.
     fn canonical_array_empty_object_relation(
@@ -1144,7 +1144,12 @@ impl<'store> RelaterSession<'store> {
         let (array, object, result, reverse_requires_property) = match (source_array, target_array)
         {
             (Some(_), None) => (source, target, Ternary::True, false),
-            (None, Some(_)) if self.relation == RelationKind::StrictSubtype => {
+            (None, Some(_))
+                if matches!(
+                    self.relation,
+                    RelationKind::Assignable | RelationKind::Subtype | RelationKind::StrictSubtype
+                ) =>
+            {
                 (target, source, Ternary::False, true)
             }
             _ => return Ok(None),
@@ -14831,16 +14836,22 @@ mod tests {
             );
             assert_eq!(store.relation_state_snapshot(), before);
         }
-        assert_eq!(
-            store.is_type_related_to_with_optional_global_types(
-                empty,
-                array_number,
-                RelationKind::StrictSubtype,
-                Some(global_types),
-            ),
-            Err(RelationUnavailable::UnsupportedStructuredType(array.target))
-        );
-        assert_eq!(store.relation_state_snapshot(), before);
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+        ] {
+            assert_eq!(
+                store.is_type_related_to_with_optional_global_types(
+                    empty,
+                    array_number,
+                    relation,
+                    Some(global_types),
+                ),
+                Err(RelationUnavailable::UnsupportedStructuredType(array.target)),
+            );
+            assert_eq!(store.relation_state_snapshot(), before);
+        }
 
         {
             let bootstrap = store.relation_bootstrap_facts().unwrap();
@@ -14861,16 +14872,22 @@ mod tests {
         assert_eq!(store.relation_state_snapshot(), before);
 
         let length = add_required_array_property(&mut store, array, "length");
-        assert_eq!(
-            store.is_type_related_to_with_optional_global_types(
-                empty,
-                array_number,
-                RelationKind::StrictSubtype,
-                Some(global_types),
-            ),
-            Ok(false)
-        );
-        assert_eq!(store.relation_state_snapshot(), before);
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+        ] {
+            assert_eq!(
+                store.is_type_related_to_with_optional_global_types(
+                    empty,
+                    array_number,
+                    relation,
+                    Some(global_types),
+                ),
+                Ok(false),
+            );
+            assert_eq!(store.relation_state_snapshot(), before);
+        }
 
         let (length_declarations, length_value_declaration) = {
             let record = store.symbol(length).unwrap();
@@ -14884,16 +14901,22 @@ mod tests {
         {
             assert!(store.set_symbol_declarations(length, declarations, value_declaration));
             let poisoned = store.relation_state_snapshot();
-            assert_eq!(
-                store.is_type_related_to_with_optional_global_types(
-                    empty,
-                    array_number,
-                    RelationKind::StrictSubtype,
-                    Some(global_types),
-                ),
-                Err(RelationUnavailable::InvalidStructuredMembers(array.target))
-            );
-            assert_eq!(store.relation_state_snapshot(), poisoned);
+            for relation in [
+                RelationKind::Assignable,
+                RelationKind::Subtype,
+                RelationKind::StrictSubtype,
+            ] {
+                assert_eq!(
+                    store.is_type_related_to_with_optional_global_types(
+                        empty,
+                        array_number,
+                        relation,
+                        Some(global_types),
+                    ),
+                    Err(RelationUnavailable::InvalidStructuredMembers(array.target)),
+                );
+                assert_eq!(store.relation_state_snapshot(), poisoned);
+            }
             {
                 let bootstrap = store.relation_bootstrap_facts().unwrap();
                 let mut session = super::RelaterSession::new_with_global_types(
@@ -15189,6 +15212,48 @@ mod tests {
                 Some(global_types),
             ),
             Ok(true),
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        add_required_array_property(&mut store, array, "length");
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+        ] {
+            for target in [base, literal] {
+                assert_eq!(
+                    store.is_type_related_to_with_optional_global_types(
+                        empty,
+                        target,
+                        relation,
+                        Some(global_types),
+                    ),
+                    Ok(false),
+                );
+                assert_eq!(store.relation_state_snapshot(), before);
+            }
+            assert_eq!(
+                store.is_type_related_to_with_optional_global_types(
+                    empty,
+                    forged,
+                    relation,
+                    Some(global_types),
+                ),
+                Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                    forged
+                )),
+            );
+            assert_eq!(store.relation_state_snapshot(), before);
+        }
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                empty,
+                literal,
+                RelationKind::Comparable,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::UnsupportedStructuredType(literal)),
         );
         assert_eq!(store.relation_state_snapshot(), before);
     }
