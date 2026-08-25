@@ -1,9 +1,9 @@
-use ts_compiler::{CanonicalProgramCheckFailureClass, Program};
+use ts_compiler::Program;
 use ts_options::CompilerOptions;
 use ts_vfs::{FileSystem, MemoryFileSystem};
 
 #[test]
-fn canonical_expando_arrow_is_a_typed_boundary_not_an_invariant() {
+fn canonical_program_checks_authenticated_arrow_expandos() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
         "/project/main.ts",
@@ -11,7 +11,7 @@ fn canonical_expando_arrow_is_a_typed_boundary_not_an_invariant() {
     )
     .unwrap();
 
-    let error = Program::try_new_with_canonical_checker(
+    let program = Program::try_new_with_canonical_checker(
         &fs,
         "/project",
         &["main.ts".to_owned()],
@@ -21,12 +21,19 @@ fn canonical_expando_arrow_is_a_typed_boundary_not_an_invariant() {
             ..CompilerOptions::default()
         },
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert_eq!(
-        error.failure_class(),
-        CanonicalProgramCheckFailureClass::Unsupported {
-            capability_code: "E00.SOURCE_SYNTAX",
-        }
+    assert!(program.diagnostics().is_empty());
+
+    let source = program.source_file("/project/main.ts").unwrap();
+    assert_eq!(source.binding.file_id(), Some(source.id));
+    assert!(
+        source
+            .binding
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("foo")
+            .is_some()
     );
 }
