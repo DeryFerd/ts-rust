@@ -7,9 +7,10 @@
 //! retains the exact split between annotated instance properties
 //! (`symbol.members`) and annotated static properties (`symbol.exports`).
 //!
-//! The member transaction adds direct primitive property annotations,
-//! retained readonly state, final instance/static structured caches, and one
-//! default or explicit zero-argument construct signature. The public query
+//! The member transaction adds direct primitive and previously resolved class
+//! property annotations, retained readonly state, final instance/static
+//! structured caches, and one default or explicit zero-argument construct
+//! signature. The public query
 //! additionally admits one direct local base whose own completed graph is in
 //! the same supported family; plain generic classes can forward their exact
 //! declaration-owned parameters through direct generic heritage.
@@ -8185,6 +8186,104 @@ fn resolved_property_value_type(
     Ok(Some(regular))
 }
 
+fn planned_class_reference_property_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    property: &ClassPropertyPlan,
+) -> Result<TypeId, ClassError> {
+    let reject = || {
+        unsupported(ClassUnsupported::PropertyType {
+            node: property.type_node,
+            kind: SyntaxKind::TypeReference,
+        })
+    };
+    let annotation = preflight_node(store, host, property.type_node)?;
+    let NodeData::TypeReferenceNode(reference) = &annotation.data else {
+        return Err(reject());
+    };
+    let name = NodeRef::new(
+        property.type_node.arena,
+        property.type_node.file,
+        reference.type_name,
+    );
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(reject());
+    };
+    let owner = store
+        .symbol(property.symbol)
+        .and_then(Symbol::parent)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(property.declaration)))?;
+    if annotation.kind != SyntaxKind::TypeReference
+        || annotation.flags.0 != 0
+        || annotation.parent != Some(property.declaration.node)
+        || reference.type_arguments.is_some()
+        || property.initializer_node.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(property.type_node.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(reject());
+    }
+
+    let (arena, bound) = host
+        .source(property.type_node)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidProperty(property.declaration)))?;
+    let mut callback_host = host.name_resolver_host(store)?;
+    let raw = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+        .map_err(|_| invariant(ClassInvariant::InvalidProperty(property.declaration)))?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(property.type_node)),
+            &identifier.text,
+            SymbolFlags::TYPE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|_| reject())?
+        .ok_or_else(reject)?;
+    let symbol = store.get_merged_symbol(raw).ok_or_else(reject)?;
+    let target = store.symbol(symbol).ok_or_else(reject)?;
+    let target_declaration = target.value_declaration().ok_or_else(reject)?;
+    let owner_declaration = store
+        .symbol(owner)
+        .and_then(Symbol::value_declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(property.declaration)))?;
+    let owner_record = preflight_node(store, host, owner_declaration)?;
+    let target_record = preflight_node(store, host, target_declaration)?;
+    let type_ = store
+        .declared_type_links(symbol)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(reject)?;
+    if raw != symbol
+        || symbol == owner
+        || target.flags() != SymbolFlags::CLASS
+        || !target_declaration.is_for(owner_declaration.arena, owner_declaration.file)
+        || target_record.range.end > owner_record.range.start
+        || preflight_class_or_interface_reference(store, host, symbol, SymbolFlags::CLASS)? != 0
+        || validate_class_heritage_members(store, type_) != ClassHeritageMembersValidation::Valid
+    {
+        return Err(reject());
+    }
+    if store
+        .symbol_node_links(property.type_node)
+        .is_some_and(|links| {
+            links != &SymbolNodeLinks::default()
+                && links
+                    != &(SymbolNodeLinks {
+                        resolved_symbol: Some(symbol),
+                    })
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+            property.type_node,
+        )));
+    }
+    Ok(type_)
+}
+
 fn planned_property_type(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -8361,6 +8460,9 @@ fn planned_property_type(
             .intrinsic_bootstrap()
             .map(|bootstrap| bootstrap.number_type)
             .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(property.type_node)));
+    }
+    if matches!(record.data, NodeData::TypeReferenceNode(_)) {
+        return planned_class_reference_property_type(store, host, property);
     }
     if !matches!(record.data, NodeData::KeywordTypeNode(_)) {
         return Err(unsupported(ClassUnsupported::PropertyType {
@@ -9120,6 +9222,19 @@ fn exact_property_type_links(
     } else {
         Some(property_type)
     };
+    if store.source_node_kind(property.type_node) == Some(SyntaxKind::TypeReference)
+        && store
+            .type_payload(property_type)
+            .and_then(TypeRecord::symbol)
+            .is_none_or(|symbol| {
+                store.symbol_node_links(property.type_node)
+                    != Some(&SymbolNodeLinks {
+                        resolved_symbol: Some(symbol),
+                    })
+            })
+    {
+        return false;
+    }
     expected_type_node.is_some_and(|expected| {
         store.type_node_links(property.type_node)
             == Some(&TypeNodeLinks {
@@ -16284,6 +16399,18 @@ fn publish_class_property(
                 ..TypeNodeLinks::default()
             },
         ));
+        if store.source_node_kind(property.type_node) == Some(SyntaxKind::TypeReference) {
+            let symbol = store
+                .type_payload(property_type)
+                .and_then(TypeRecord::symbol)
+                .expect("an authenticated class property reference retains its target symbol");
+            assert!(store.set_symbol_node_links(
+                property.type_node,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(symbol),
+                },
+            ));
+        }
     }
     if let Some(initializer) = property.initializer_node
         && initializer != property.type_node
@@ -16568,6 +16695,18 @@ pub(super) fn execute_nongeneric_class_members(
         })
         .filter(|node| store.symbol_node_links(*node).is_none())
         .count();
+    let missing_property_symbol_links = plan
+        .class
+        .properties
+        .iter()
+        .filter(|property| {
+            store.source_node_kind(property.type_node) == Some(SyntaxKind::TypeReference)
+                && store.symbol_node_links(property.type_node).is_none()
+        })
+        .count();
+    let missing_symbol_links = missing_method_body_symbol_links
+        .checked_add(missing_property_symbol_links)
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let missing_index_type_node_links = plan.class.index.map_or(0, |index| {
         [index.key_type_node, index.value_type_node]
             .into_iter()
@@ -16701,7 +16840,7 @@ pub(super) fn execute_nongeneric_class_members(
             usize::from(prepared_instance_members.is_some()),
         )
         || !store.try_reserve_type_node_links(missing_type_node_links)
-        || !store.try_reserve_symbol_node_links(missing_method_body_symbol_links)
+        || !store.try_reserve_symbol_node_links(missing_symbol_links)
         || !store.try_reserve_value_symbol_links(missing_value_links)
         || !store.try_reserve_signature_links(missing_signature_links)
     {
@@ -17258,9 +17397,20 @@ fn execute_direct_derived_class_members(
         .iter()
         .filter(|argument| store.symbol_node_links(argument.node).is_none())
         .count();
+    let missing_property_symbol_links = plan
+        .class
+        .properties
+        .iter()
+        .chain(&base_plan.class.properties)
+        .filter(|property| {
+            store.source_node_kind(property.type_node) == Some(SyntaxKind::TypeReference)
+                && store.symbol_node_links(property.type_node).is_none()
+        })
+        .count();
     let missing_symbol_links = missing_constructor_property_symbol_links
         .checked_add(missing_method_body_symbol_links)
         .and_then(|count| count.checked_add(missing_generic_base_symbol_links))
+        .and_then(|count| count.checked_add(missing_property_symbol_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let method_count = plan
         .class
@@ -18571,6 +18721,71 @@ fn exact_stored_javascript_constructor_property(
     .then_some(first)
 }
 
+fn exact_stored_class_reference_property(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    type_: TypeId,
+) -> bool {
+    let Some(annotation) = store.source_direct_type_annotation(declaration) else {
+        return false;
+    };
+    let Some(target) = store.type_payload(type_).and_then(TypeRecord::symbol) else {
+        return false;
+    };
+    let Some(target_record) = store.symbol(target) else {
+        return false;
+    };
+    let Some(target_declaration) = target_record.value_declaration() else {
+        return false;
+    };
+    let Some(owner_declaration) = store.symbol(owner).and_then(Symbol::value_declaration) else {
+        return false;
+    };
+    if store.source_node_kind(annotation) != Some(SyntaxKind::TypeReference)
+        || target == owner
+        || target_record.flags() != SymbolFlags::CLASS
+        || !target_declaration.is_for(owner_declaration.arena, owner_declaration.file)
+        || target_declaration.node.index() >= owner_declaration.node.index()
+        || store
+            .declared_type_links(target)
+            .and_then(|links| links.declared_type)
+            != Some(type_)
+        || store.type_node_links(annotation)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(type_),
+                ..TypeNodeLinks::default()
+            })
+        || store.symbol_node_links(annotation)
+            != Some(&SymbolNodeLinks {
+                resolved_symbol: Some(target),
+            })
+        || validate_class_heritage_members(store, type_) != ClassHeritageMembersValidation::Valid
+    {
+        return false;
+    }
+
+    let mut names = 0;
+    for index in 0..annotation.node.index() {
+        let Some(index) = u32::try_from(index).ok() else {
+            return false;
+        };
+        let node = NodeRef::new(
+            annotation.arena,
+            annotation.file,
+            ts_ast::NodeId::new(index),
+        );
+        if store.source_node_parent(node) != Some(SourceNodeParent::Parent(annotation)) {
+            continue;
+        }
+        if store.source_node_kind(node) != Some(SyntaxKind::Identifier) {
+            return false;
+        }
+        names += 1;
+    }
+    names == 1
+}
+
 fn exact_stored_property(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
@@ -18641,6 +18856,8 @@ fn exact_stored_property(
     {
         return None;
     }
+    let class_reference =
+        exact_stored_class_reference_property(store, owner, *declaration, property_type);
     let primitive = [
         bootstrap.any_type,
         bootstrap.unknown_type,
@@ -18898,6 +19115,7 @@ fn exact_stored_property(
             },
             |annotation| store.source_type_node_result_is_exact(annotation, property_type, &[]),
         );
+    let source_type_valid = source_type_valid || class_reference;
     ((flags == SymbolFlags::PROPERTY || flags == (SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL))
         && matches!(check_flags, CheckFlags::NONE | CheckFlags::READONLY)
         && record.value_declaration() == Some(*declaration)
@@ -18915,7 +19133,7 @@ fn exact_stored_property(
                 resolved_type: Some(property_type),
                 ..ValueSymbolLinks::default()
             })
-        && (primitive || readonly_literal || arrow_callable))
+        && (primitive || readonly_literal || arrow_callable || class_reference))
         .then_some(*declaration)
 }
 
@@ -27085,6 +27303,172 @@ mod tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    fn inherited_generic_class_fields_preserve_preceding_class_reference_identity() {
+        let mut fixture = fixture(concat!(
+            "class Class2 {} ",
+            "class Class3<Value> { public memberVariable: Class2; } ",
+            "class Class4<Value> extends Class3<Value> { #secret = 1; }",
+        ));
+        let target_owner = class_symbol(&fixture, "Class2");
+        let base_owner = class_symbol(&fixture, "Class3");
+        let owner = class_symbol(&fixture, "Class4");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let target_plan = plan_nongeneric_class_member_query(&fixture.store, &host, target_owner)
+            .expect("the referenced class retains its complete local declaration plan");
+
+        let target =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &target_plan).unwrap();
+        let base_plan = plan_nongeneric_class_member_query(&fixture.store, &host, base_owner)
+            .expect("the generic class accepts its preceding class-typed property");
+        let ClassMemberQueryPlan::Direct(base_class) = &base_plan else {
+            panic!("the generic member provider retains one direct class plan")
+        };
+        let property = base_class.class.instance_properties[0].clone();
+        assert_eq!(
+            base_class.uninitialized_instance_properties(),
+            &[property.name_node],
+        );
+        let base =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &base_plan).unwrap();
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner)
+            .expect("the derived generic class retains its authenticated forwarded base");
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        assert_eq!(
+            fixture.store.type_node_links(property.type_node),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(target.shells().instance_type()),
+                ..TypeNodeLinks::default()
+            }),
+        );
+        assert_eq!(
+            fixture.store.symbol_node_links(property.type_node),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(target_owner),
+            }),
+        );
+        assert_eq!(
+            fixture.store.value_symbol_links(property.symbol),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(target.shells().instance_type()),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+        assert_eq!(members.instance_properties()[1], property.symbol);
+        assert_eq!(base.instance_properties(), &[property.symbol]);
+        assert_eq!(
+            authenticated_private_class_symbol_name(
+                &fixture.store,
+                owner,
+                members.instance_properties()[0],
+            ),
+            Some("#secret"),
+        );
+        for instance in [
+            target.shells().instance_type(),
+            base.shells().instance_type(),
+            members.shells().instance_type(),
+        ] {
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, instance),
+                ClassHeritageMembersValidation::Valid,
+            );
+        }
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn generic_class_reference_fields_reject_cold_targets_and_poisoned_symbols() {
+        let mut fixture = fixture(concat!(
+            "class Target {} ",
+            "class Other {} ",
+            "class Model<Value> { value: Target; }",
+        ));
+        let target = class_symbol(&fixture, "Target");
+        let other = class_symbol(&fixture, "Other");
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+            Err(ClassError::Unsupported(ClassUnsupported::PropertyType {
+                kind: SyntaxKind::TypeReference,
+                ..
+            })),
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+
+        let target_plan =
+            plan_nongeneric_class_member_query(&fixture.store, &host, target).unwrap();
+        execute_nongeneric_class_member_query(&mut fixture.store, &host, &target_plan).unwrap();
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("the class reference belongs to one direct generic provider")
+        };
+        let annotation = class.class.properties[0].type_node;
+        assert!(fixture.store.set_symbol_node_links(
+            annotation,
+            SymbolNodeLinks {
+                resolved_symbol: Some(other),
+            },
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+            Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                annotation
+            ))),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
     }
 
     #[test]
