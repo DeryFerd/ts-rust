@@ -1564,7 +1564,20 @@ fn validated_method_annotation_type(
     annotation: ts_ast::NodeRef,
 ) -> Option<TypeId> {
     let bootstrap = store.intrinsic_bootstrap()?;
-    let intrinsic = match store.source_node_kind(annotation)? {
+    let kind = store.source_node_kind(annotation)?;
+    let null_literal = if kind == SyntaxKind::LiteralType {
+        let index = annotation.node.index().checked_sub(1)?;
+        let literal = ts_ast::NodeRef::new(
+            annotation.arena,
+            annotation.file,
+            ts_ast::NodeId::new(u32::try_from(index).ok()?),
+        );
+        store.source_node_kind(literal) == Some(SyntaxKind::NullKeyword)
+            && store.source_node_parent(literal) == Some(SourceNodeParent::Parent(annotation))
+    } else {
+        false
+    };
+    let intrinsic = match kind {
         SyntaxKind::AnyKeyword => Some(bootstrap.any_type),
         SyntaxKind::UnknownKeyword => Some(bootstrap.unknown_type),
         SyntaxKind::StringKeyword => Some(bootstrap.string_type),
@@ -1578,6 +1591,7 @@ fn validated_method_annotation_type(
         SyntaxKind::NeverKeyword => Some(bootstrap.never_type),
         SyntaxKind::ObjectKeyword => Some(bootstrap.non_primitive_type),
         SyntaxKind::IntrinsicKeyword => Some(bootstrap.intrinsic_marker_type),
+        SyntaxKind::LiteralType if null_literal => Some(bootstrap.null_type),
         _ => None,
     };
     let Some(links) = store.type_node_links(annotation) else {
@@ -3576,6 +3590,70 @@ mod tests {
             mapped_method_type_parameter(&store, merged, source),
             Some(target)
         );
+    }
+
+    #[test]
+    fn generic_interface_null_overloads_preserve_source_identity_and_optional_arity() {
+        let parsed = parse_source_file(concat!(
+            "interface Thenable<Value> { ",
+            "then(filter: null): Value; ",
+            "then(filter?: null): Value; ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4_486);
+        let mut context =
+            source_callable_context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+
+        context.check_source_file(file).unwrap();
+
+        let store = context.store();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let owner = store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("Thenable"))
+            .unwrap();
+        let method = store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("then"))
+            .unwrap();
+        let callable = store
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let StoredCallableSetValidation::Valid {
+            family, projection, ..
+        } = validate_stored_callable_set(store, callable)
+        else {
+            panic!("null-valued then overloads must retain authenticated method callables")
+        };
+        assert_eq!(family, CallableFamily::DeclaredCallSignatures);
+        let [required, optional] = projection.call_signatures.as_ref() else {
+            panic!("the binder-owned then method must preserve both overload declarations")
+        };
+        let null = store.intrinsic_bootstrap().unwrap().null_type;
+        assert_eq!(required.parameters, vec![null]);
+        assert_eq!(required.min_argument_count, 1);
+        assert_eq!(optional.parameters, vec![null]);
+        assert_eq!(optional.min_argument_count, 0);
+
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

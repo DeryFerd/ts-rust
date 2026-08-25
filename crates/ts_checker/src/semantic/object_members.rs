@@ -8,8 +8,9 @@
 //! signatures can also retain trailing optional `any` parameters.
 //! Named interface and type-literal methods retain their own binder symbols,
 //! authenticated method type parameters, annotated required or optional
-//! parameters, and authenticated array rest parameters when present. Selected
-//! default-library `Math` methods also retain their numeric rest parameters.
+//! parameters, and authenticated array, tuple, or inferred rest parameters.
+//! Selected default-library `Math` methods also retain their numeric rest
+//! parameters.
 
 use std::collections::{HashMap, HashSet};
 
@@ -6300,19 +6301,42 @@ fn plan_interface_method_parameter(
         false
     };
     if rest.is_some() {
-        let NodeData::ArrayTypeNode(array) = &type_record.data else {
-            return Err(unsupported());
-        };
-        let element = NodeRef::new(type_node.arena, type_node.file, array.element_type);
-        let element_record = preflight_node(store, host, element).map_err(|_| unsupported())?;
-        if type_record.kind != SyntaxKind::ArrayType
-            || numeric_math_rest && element_record.kind != SyntaxKind::NumberKeyword
-            || element_record.flags.0 != 0
-            || element_record.parent != Some(type_node.node)
-            || element_record.range.start != type_record.range.start
-            || element_record.range.end > type_record.range.end
-        {
-            return Err(unsupported());
+        match &type_record.data {
+            NodeData::ArrayTypeNode(array) if type_record.kind == SyntaxKind::ArrayType => {
+                let element = NodeRef::new(type_node.arena, type_node.file, array.element_type);
+                let element_record =
+                    preflight_node(store, host, element).map_err(|_| unsupported())?;
+                if numeric_math_rest && element_record.kind != SyntaxKind::NumberKeyword
+                    || element_record.flags.0 != 0
+                    || element_record.parent != Some(type_node.node)
+                    || element_record.range.start != type_record.range.start
+                    || element_record.range.end > type_record.range.end
+                {
+                    return Err(unsupported());
+                }
+            }
+            NodeData::TupleTypeNode(tuple)
+                if !numeric_math_rest && type_record.kind == SyntaxKind::TupleType =>
+            {
+                if tuple.elements.range != type_record.range {
+                    return Err(unsupported());
+                }
+            }
+            NodeData::InferTypeNode(inferred)
+                if !numeric_math_rest && type_record.kind == SyntaxKind::InferType =>
+            {
+                let parameter =
+                    NodeRef::new(type_node.arena, type_node.file, inferred.type_parameter);
+                let parameter_record =
+                    preflight_node(store, host, parameter).map_err(|_| unsupported())?;
+                if parameter_record.kind != SyntaxKind::TypeParameter
+                    || parameter_record.flags.0 != 0
+                    || parameter_record.parent != Some(type_node.node)
+                {
+                    return Err(unsupported());
+                }
+            }
+            _ => return Err(unsupported()),
         }
     }
 
@@ -6336,13 +6360,14 @@ fn plan_interface_method_parameter(
         return Err(unsupported());
     }
 
+    let identity_node = peel_parenthesized_type(store, host, type_node)?;
     Ok((
         PlannedCallParameter {
             symbol,
             type_node,
-            identity_node: type_node,
-            null_literal_identity: false,
-            optional: false,
+            identity_node,
+            null_literal_identity: is_null_literal_type(store, host, identity_node)?,
+            optional,
         },
         rest.is_some(),
         optional,
@@ -10704,7 +10729,13 @@ fn generic_method_signature_types(
         let parameter_types = method
             .parameters
             .iter()
-            .map(|parameter| cached_planned_type_identity(store, parameter.type_node))
+            .map(|parameter| {
+                cached_annotation_identity(
+                    store,
+                    parameter.identity_node,
+                    parameter.null_literal_identity,
+                )
+            })
             .collect::<Option<Vec<_>>>()?;
         signatures.push(ResolvedCallSignatureTypes {
             parameter_types,
@@ -10797,9 +10828,18 @@ fn valid_generic_publication_target(
             let Ok(base_reference) = validate_direct_generic_reference(store, *base) else {
                 return false;
             };
+            let arguments_match = base_reference.type_arguments == reference.type_arguments
+                || planned.type_arguments.len() == base_reference.type_arguments.len()
+                    && planned
+                        .type_arguments
+                        .iter()
+                        .zip(&base_reference.type_arguments)
+                        .all(|(annotation, argument)| {
+                            cached_planned_type_identity(store, *annotation) == Some(*argument)
+                        });
             if planned.kind != DirectInterfaceBaseKind::Interface
                 || planned.type_arguments.is_empty()
-                || base_reference.type_arguments != reference.type_arguments
+                || !arguments_match
                 || store
                     .type_payload(base_reference.target)
                     .and_then(TypeRecord::symbol)
@@ -15263,6 +15303,142 @@ mod generic_publication_tests {
     }
 
     #[test]
+    fn generic_interface_methods_preserve_null_overloads_and_tuple_rest_parameters() {
+        let fixture = interface_fixture(
+            concat!(
+                "interface Contract<Value> { ",
+                "then(filter: null): Value; ",
+                "then(filter?: null): Value; ",
+                "spread(...values: [value: Value]): Value; ",
+                "}",
+            ),
+            3_898,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+
+        let [required, optional, spread] = plan.methods.as_slice() else {
+            panic!("the generic interface must preserve both overloads and its tuple rest method")
+        };
+        assert_eq!(required.symbol, optional.symbol);
+        assert!(required.parameters[0].null_literal_identity);
+        assert!(!required.parameters[0].optional);
+        assert_eq!(required.minimum_argument_count, 1);
+        assert!(optional.parameters[0].null_literal_identity);
+        assert!(optional.parameters[0].optional);
+        assert_eq!(optional.minimum_argument_count, 0);
+        assert_eq!(spread.flags, SignatureFlags::HAS_REST_PARAMETER);
+        assert_eq!(
+            fixture
+                .store
+                .source_node_kind(spread.parameters[0].type_node),
+            Some(SyntaxKind::TupleType),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn conditional_then_methods_preserve_authenticated_inferred_rest_parameters() {
+        let fixture = interface_fixture(
+            concat!(
+                "interface Owner {} ",
+                "type Unwrap<Value> = Value extends { ",
+                "then(value: infer Result, ...args: infer Rest): any; ",
+                "} ? Result : never;",
+            ),
+            3_901,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let literal = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeLiteral).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_type_literal(&fixture.store, &host, literal, None).unwrap();
+
+        let [method] = plan.methods.as_slice() else {
+            panic!("the conditional thenable must retain its binder-owned method")
+        };
+        let [value, rest] = method.parameters.as_slice() else {
+            panic!("the thenable must retain its inferred value and rest parameters")
+        };
+        assert_eq!(method.flags, SignatureFlags::HAS_REST_PARAMETER);
+        assert_eq!(method.minimum_argument_count, 1);
+        assert_eq!(
+            fixture.store.source_node_kind(value.type_node),
+            Some(SyntaxKind::InferType),
+        );
+        assert_eq!(
+            fixture.store.source_node_kind(rest.type_node),
+            Some(SyntaxKind::InferType),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn generic_interface_methods_reject_non_array_rest_annotations_without_publication() {
+        let fixture = interface_fixture(
+            "interface Contract<Value> { spread(...values: string): Value; }",
+            3_899,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            plan_generic_interface(&fixture.store, &host, fixture.symbol),
+            Err(PropertyObjectError::UnsupportedMember {
+                kind: SyntaxKind::MethodSignature,
+                ..
+            })
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
     fn generic_interface_methods_accept_recursive_mapped_array_rest_annotations() {
         let fixture = interface_fixture(
             concat!(
@@ -17777,6 +17953,124 @@ mod generic_publication_tests {
                     .union_cache_len(),
             ),
             warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_interface_heritage_preserves_transformed_base_arguments_and_members() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Base<First, Second> { first: First; second: Second; } ",
+                "interface Derived<Value> extends Base<Value, string> { own: Value; }",
+            ),
+            3_900,
+        );
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let derived = fixture
+            .store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source("Derived"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        fixture.store.merge_global_symbol(globals, derived).unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let base_plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let base_flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+        let base = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            base_flags,
+        )
+        .unwrap()
+        .unwrap();
+        let base_arguments = validate_direct_generic_reference(&fixture.store, base)
+            .unwrap()
+            .type_arguments;
+        assert!(fixture.store.publish_interface_no_base_resolution(base));
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &base_plan,
+                base,
+                &base_arguments,
+            ),
+            Ok(base),
+        );
+
+        let plan = plan_generic_interface(&fixture.store, &host, derived).unwrap();
+        let flags = fixture.store.symbol(derived).unwrap().flags();
+        let target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            derived,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let value = validate_direct_generic_reference(&fixture.store, target)
+            .unwrap()
+            .type_arguments[0];
+        let heritage = plan.heritage.as_ref().unwrap();
+        let [base_plan] = heritage.bases.as_slice() else {
+            panic!("the derived interface must retain one transformed generic base")
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let arguments = base_plan
+            .type_arguments
+            .iter()
+            .map(|annotation| {
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalCheckerOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(*annotation)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(arguments, [value, string]);
+        let inherited = fixture
+            .store
+            .create_direct_generic_reference_type(base, &arguments)
+            .unwrap();
+        assert!(fixture.store.set_interface_base_resolution(
+            target,
+            true,
+            None,
+            Some(vec![inherited]),
+        ));
+
+        assert_eq!(
+            publish_generic_interface_declared_members(&mut fixture.store, &plan, target, &[value],),
+            Ok(target),
+        );
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let receiver = fixture
+            .store
+            .create_direct_generic_reference_type(target, &[number])
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .resolve_generic_interface_property(receiver, "first", None)
+                .unwrap()
+                .unwrap()
+                .type_id(),
+            number,
+        );
+        assert_eq!(
+            fixture
+                .store
+                .resolve_generic_interface_property(receiver, "second", None)
+                .unwrap()
+                .unwrap()
+                .type_id(),
+            string,
         );
         assert!(diagnostics.is_empty());
     }

@@ -11645,12 +11645,36 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     || constraint_record.parent != Some(parameter.node)
                     || constraint_record.flags.0 != 0
                     || constraint_record.range.end != parameter_node.range.end
-                    || reference.type_arguments.is_some()
                     || name_record.kind != SyntaxKind::Identifier
                     || name_record.parent != Some(constraint.node)
                 {
                     return Err(unsupported());
                 }
+                let argument_count = match reference.type_arguments.as_ref() {
+                    Some(arguments) => {
+                        if arguments.nodes.is_empty()
+                            || arguments.has_trailing_comma
+                            || arguments.range.start < name_record.range.end
+                            || arguments.range.end > constraint_record.range.end
+                            || arguments.nodes.iter().any(|argument| {
+                                let argument =
+                                    NodeRef::new(constraint.arena, constraint.file, *argument);
+                                preflight_node(self.store, self.host, argument).map_or(
+                                    true,
+                                    |record| {
+                                        record.parent != Some(constraint.node)
+                                            || record.range.start < arguments.range.start
+                                            || record.range.end > arguments.range.end
+                                    },
+                                )
+                            })
+                        {
+                            return Err(unsupported());
+                        }
+                        arguments.nodes.len()
+                    }
+                    None => 0,
+                };
                 let constraint_symbol = self.resolve_uncached_type_reference_symbol(constraint)?;
                 let constraint_flags = self
                     .store
@@ -11664,7 +11688,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         self.host,
                         constraint_symbol,
                         constraint_flags,
-                    )? != 0
+                    )? != argument_count
                 {
                     return Err(unsupported());
                 }
@@ -29785,6 +29809,48 @@ mod tests {
             query_global_node(&mut fixture, &global_types, accepted, &mut diagnostics),
             Ok(expected),
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_interface_constraints_accept_authenticated_generic_interface_bounds() {
+        let mut fixture = fixture(concat!(
+            "interface Constraint<Value> {} ",
+            "interface Box<Value extends Constraint<any>> { value: Value; } ",
+            "let accepted: Box<Constraint<any>>;",
+        ));
+        let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Box");
+        let accepted = variable_type_node(&fixture, "accepted");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved = query_node(&mut fixture, accepted, &mut diagnostics).unwrap();
+
+        let reference = validate_direct_generic_reference(&fixture.store, resolved).unwrap();
+        let [argument] = reference.type_arguments.as_slice() else {
+            panic!("the constrained generic interface must retain its one type argument")
+        };
+        let target = fixture
+            .store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let parameter = validate_direct_generic_reference(&fixture.store, target)
+            .unwrap()
+            .type_arguments[0];
+        let TypeData::TypeParameter(parameter_data) =
+            fixture.store.type_payload(parameter).unwrap().data()
+        else {
+            panic!("the interface owner must preserve its canonical type parameter")
+        };
+        assert_eq!(parameter_data.constraint, Some(*argument));
+        assert!(diagnostics.is_empty());
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, accepted, &mut diagnostics),
+            Ok(resolved)
+        );
+        assert_eq!(store_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
     }
 
