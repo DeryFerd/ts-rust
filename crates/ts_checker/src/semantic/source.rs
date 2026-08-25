@@ -37,7 +37,8 @@
 //! authenticated shorthand object-assignment defaults inside bounded function bodies
 //! and variable initializer expressions,
 //! strict top-level call expression statements, exhaustive grouped literal
-//! switch returns, inferred-void string switches with exact unreachable ranges,
+//! switch returns with correlated destructuring and exhaustive clause narrowing,
+//! inferred-void string switches with exact unreachable ranges,
 //! atomic primitive/literal scalar binary and comma operators, bounded
 //! string-key object membership expressions, flattened long top-level literal
 //! addition chains, direct top-level and function-local
@@ -239,7 +240,8 @@ use super::{
         SourceLinearFunctionStatementSyntax, SourceLinearFunctionStatementsSyntax,
         SourceLocalDeclarationSyntax, SourceLoopFunctionStatementSyntax,
         SourceLoopFunctionStatementsSyntax, SourceReturnBranchSyntax,
-        SourceSwitchFunctionStatementsSyntax, SourceTypeofConditionSyntax,
+        SourceSwitchArrayBindingSyntax, SourceSwitchFunctionStatementsSyntax,
+        SourceSwitchObjectBindingSyntax, SourceTypeofConditionSyntax,
         SourceTypeofSwitchFunctionStatementsSyntax, SourceUnusedIterationDeclarationKind,
         SourceUnusedIterationStatementSyntax, SourceVoidSwitchCallSyntax,
         SourceVoidSwitchFunctionStatementsSyntax,
@@ -1216,10 +1218,34 @@ struct PlannedLinearParameterAssignment {
 
 #[derive(Clone, Debug)]
 struct PlannedSwitchFunctionStatements {
+    leading: Option<PlannedSwitchObjectBinding>,
     discriminant: PlannedExpression,
     cases: Vec<PlannedExpression>,
     returns: Vec<PlannedSwitchReturn>,
     exhaustive_constraint: Option<NodeRef>,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedSwitchObjectBinding {
+    initializer: PlannedExpression,
+    elements: Vec<PlannedSwitchObjectBindingElement>,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedSwitchObjectBindingElement {
+    symbol: SemanticSymbolId,
+    property_name: String,
+}
+
+#[derive(Clone, Debug)]
+struct CheckedSwitchObjectBinding {
+    properties: Vec<CheckedSwitchObjectBindingProperty>,
+}
+
+#[derive(Clone, Debug)]
+struct CheckedSwitchObjectBindingProperty {
+    symbol: SemanticSymbolId,
+    constituent_types: Vec<TypeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1277,8 +1303,21 @@ struct PlannedConditionalEnumFunctionStatements {
 
 #[derive(Clone, Debug)]
 struct PlannedSwitchReturn {
+    case_start: usize,
+    case_end: usize,
+    includes_default: bool,
     statement: NodeRef,
     expression: PlannedExpression,
+    binding: Option<PlannedSwitchArrayBinding>,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedSwitchArrayBinding {
+    pattern: NodeRef,
+    element: NodeRef,
+    name: NodeRef,
+    symbol: SemanticSymbolId,
+    initializer: PlannedExpression,
 }
 
 #[derive(Clone, Debug)]
@@ -9664,6 +9703,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
 
+        let leading = syntax
+            .leading
+            .map(|binding| self.finish_switch_object_binding(binding))
+            .transpose()?;
         let discriminant = self.plan_expression(syntax.switch.expression)?;
         if !matches!(
             &discriminant.kind,
@@ -9676,20 +9719,52 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
 
         let mut cases = Vec::with_capacity(syntax.switch.clauses.len());
+        let mut groups = HashMap::with_capacity(syntax.returns.len());
+        let mut group_start = 0;
         for clause in syntax.switch.clauses {
             if let Some(expression) = clause.expression {
                 cases.push(self.plan_expression(expression)?);
+            }
+            if !clause.statements.is_empty() {
+                if groups
+                    .insert(
+                        clause.clause,
+                        (group_start, cases.len(), clause.expression.is_none()),
+                    )
+                    .is_some()
+                {
+                    return Err(Self::unsupported_function_body(callable));
+                }
+                group_start = cases.len();
             }
         }
 
         let mut returns = Vec::with_capacity(syntax.returns.len());
         for value in syntax.returns {
-            returns.push(PlannedSwitchReturn {
-                statement: value.statement,
-                expression: self.plan_expression(value.expression)?,
-            });
+            let (case_start, case_end, includes_default) = groups
+                .remove(&value.clause)
+                .ok_or_else(|| Self::unsupported_function_body(callable))?;
+            let prior = self.prior_variables.clone();
+            let readable = self.readable_variables.clone();
+            let planned = (|| -> Result<PlannedSwitchReturn, SourceCheckError> {
+                let binding = value
+                    .binding
+                    .map(|binding| self.finish_switch_array_binding(binding))
+                    .transpose()?;
+                Ok(PlannedSwitchReturn {
+                    case_start,
+                    case_end,
+                    includes_default,
+                    statement: value.statement,
+                    expression: self.plan_expression(value.expression)?,
+                    binding,
+                })
+            })();
+            self.prior_variables = prior;
+            self.readable_variables = readable;
+            returns.push(planned?);
         }
-        if returns.is_empty() {
+        if returns.is_empty() || !groups.is_empty() {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(callable.body),
             ));
@@ -9708,10 +9783,64 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         };
 
         Ok(PlannedSwitchFunctionStatements {
+            leading,
             discriminant,
             cases,
             returns,
             exhaustive_constraint,
+        })
+    }
+
+    fn finish_switch_object_binding(
+        &mut self,
+        syntax: SourceSwitchObjectBindingSyntax,
+    ) -> Result<PlannedSwitchObjectBinding, SourceCheckError> {
+        let initializer = self.plan_expression(syntax.initializer)?;
+        let mut elements = Vec::with_capacity(syntax.elements.len());
+        for element in syntax.elements {
+            let record = self.node(element.name)?;
+            let NodeData::Identifier(identifier) = &record.data else {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidBindingPattern(element.name),
+                ));
+            };
+            let property_name = identifier.text.clone();
+            if !self.prior_variables.insert(element.symbol)
+                || !self.readable_variables.insert(element.symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(element.symbol),
+                ));
+            }
+            elements.push(PlannedSwitchObjectBindingElement {
+                symbol: element.symbol,
+                property_name,
+            });
+        }
+        Ok(PlannedSwitchObjectBinding {
+            initializer,
+            elements,
+        })
+    }
+
+    fn finish_switch_array_binding(
+        &mut self,
+        syntax: SourceSwitchArrayBindingSyntax,
+    ) -> Result<PlannedSwitchArrayBinding, SourceCheckError> {
+        let initializer = self.plan_expression(syntax.initializer)?;
+        if !self.prior_variables.insert(syntax.symbol)
+            || !self.readable_variables.insert(syntax.symbol)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(syntax.symbol),
+            ));
+        }
+        Ok(PlannedSwitchArrayBinding {
+            pattern: syntax.pattern,
+            element: syntax.element,
+            name: syntax.name,
+            symbol: syntax.symbol,
+            initializer,
         })
     }
 
@@ -20342,21 +20471,53 @@ fn preflight_inferred_function_return_dependencies(
                 )
             }
             PlannedFunctionBody::Switch(statements) => {
-                expression_is_closed(
-                    &statements.discriminant,
-                    &function.callable.parameters,
-                    &locals,
-                    functions,
-                ) && statements.cases.iter().all(|case| {
-                    expression_is_closed(case, &function.callable.parameters, &locals, functions)
-                }) && statements.returns.iter().all(|value| {
-                    expression_is_closed(
-                        &value.expression,
+                let leading_closed = statements.leading.as_ref().is_none_or(|binding| {
+                    if !expression_is_closed(
+                        &binding.initializer,
+                        &function.callable.parameters,
+                        &locals,
+                        functions,
+                    ) {
+                        return false;
+                    }
+                    locals.extend(binding.elements.iter().map(|element| element.symbol));
+                    true
+                });
+                leading_closed
+                    && expression_is_closed(
+                        &statements.discriminant,
                         &function.callable.parameters,
                         &locals,
                         functions,
                     )
-                })
+                    && statements.cases.iter().all(|case| {
+                        expression_is_closed(
+                            case,
+                            &function.callable.parameters,
+                            &locals,
+                            functions,
+                        )
+                    })
+                    && statements.returns.iter().all(|value| {
+                        let mut clause_locals = locals.clone();
+                        if let Some(binding) = &value.binding {
+                            if !expression_is_closed(
+                                &binding.initializer,
+                                &function.callable.parameters,
+                                &clause_locals,
+                                functions,
+                            ) {
+                                return false;
+                            }
+                            clause_locals.insert(binding.symbol);
+                        }
+                        expression_is_closed(
+                            &value.expression,
+                            &function.callable.parameters,
+                            &clause_locals,
+                            functions,
+                        )
+                    })
             }
             PlannedFunctionBody::VoidSwitch(statements) => {
                 expression_is_closed(
@@ -26963,7 +27124,67 @@ fn check_planned_switch_function_statements(
     deferred: &mut Vec<DeferredAssertion>,
     return_type: Option<NodeRef>,
     statements: &PlannedSwitchFunctionStatements,
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
 ) -> Result<Vec<TypeId>, SourceCheckError> {
+    let mut switch_flow_types = flow_types.clone();
+    let object_binding = if let Some(binding) = &statements.leading {
+        let initializer = check_expression_type(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            &switch_flow_types,
+            preflighted_type_import_value_uses,
+            &binding.initializer,
+            None,
+            deferred,
+        )?;
+        let record = store
+            .type_payload(initializer.result)
+            .ok_or(RelationUnavailable::Type(initializer.result))?;
+        let constituents = match record.data() {
+            TypeData::Union(union) => union.union.types.clone(),
+            _ => vec![initializer.result],
+        };
+        let mut properties = Vec::with_capacity(binding.elements.len());
+        for element in &binding.elements {
+            let mut types = Vec::with_capacity(constituents.len());
+            for constituent in &constituents {
+                let property = store
+                    .resolved_own_property(*constituent, &element.property_name)?
+                    .filter(|property| !property.optional)
+                    .ok_or(SourceCheckError::Function(
+                        SourceFunctionInvariant::Callable(binding.initializer.node),
+                    ))?;
+                types.push(property.type_);
+            }
+            let type_ = switch_union_type(store, global_types, &types)?;
+            stage_value_type(
+                store,
+                staged_value_types,
+                value_order,
+                element.symbol,
+                type_,
+            )?;
+            if switch_flow_types.insert(element.symbol, type_).is_some() {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::DuplicateCurrentFlowType(element.symbol),
+                ));
+            }
+            properties.push(CheckedSwitchObjectBindingProperty {
+                symbol: element.symbol,
+                constituent_types: types,
+            });
+        }
+        Some(CheckedSwitchObjectBinding { properties })
+    } else {
+        None
+    };
+
     let exhaustive_constraint = if let Some(constraint) = statements.exhaustive_constraint {
         session.reset_query();
         let mut constraint_diagnostics = CanonicalCheckerDiagnostics::default();
@@ -27056,7 +27277,7 @@ fn check_planned_switch_function_statements(
         options,
         session,
         diagnostics,
-        flow_types,
+        &switch_flow_types,
         preflighted_type_import_value_uses,
         &statements.discriminant,
         None,
@@ -27100,6 +27321,7 @@ fn check_planned_switch_function_statements(
     } else {
         discriminant.result
     };
+    let mut checked_cases = Vec::with_capacity(statements.cases.len());
     for case in &statements.cases {
         let checked = check_expression_type(
             store,
@@ -27109,7 +27331,7 @@ fn check_planned_switch_function_statements(
             options,
             session,
             diagnostics,
-            flow_types,
+            &switch_flow_types,
             preflighted_type_import_value_uses,
             case,
             None,
@@ -27146,11 +27368,99 @@ fn check_planned_switch_function_statements(
                 },
             );
         }
+        checked_cases.push(checked.result);
     }
 
+    let PlannedExpressionKind::Identifier(discriminant_read) = &statements.discriminant.kind else {
+        return Err(SourceCheckError::Function(
+            SourceFunctionInvariant::Callable(statements.discriminant.node),
+        ));
+    };
     let mut return_types = Vec::with_capacity(statements.returns.len());
     for value in &statements.returns {
         session.reset_query();
+        let mut clause_flow = switch_flow_types.clone();
+        narrow_switch_clause_flow(
+            store,
+            global_types,
+            &mut clause_flow,
+            discriminant_read.value_symbol,
+            object_binding.as_ref(),
+            &checked_cases,
+            value,
+        )?;
+        if let Some(binding) = &value.binding {
+            let initializer = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                &clause_flow,
+                preflighted_type_import_value_uses,
+                &binding.initializer,
+                None,
+                deferred,
+            )?;
+            let never = store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?
+                .never_type;
+            let type_ = if initializer.result == never {
+                merge_retry_diagnostic(
+                    diagnostics,
+                    CanonicalCheckerDiagnostic {
+                        node: Some(binding.pattern),
+                        range_override: None,
+                        diagnostic: Diagnostic::with_arguments(
+                            message_by_code(2488)
+                                .ok_or(SourceCheckError::MissingDiagnostic(2488))?,
+                            ["never"],
+                        ),
+                        related_information: Vec::new(),
+                    },
+                );
+                never
+            } else {
+                let checked = check_array_binding_element(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    binding.element,
+                    initializer.result,
+                )
+                .map_err(|error| SourcePlanner::element_plan_error(binding.element, error))?;
+                if let Some(diagnostic) = checked.diagnostic {
+                    merge_retry_diagnostic(diagnostics, diagnostic);
+                }
+                checked.type_
+            };
+            stage_value_type(
+                store,
+                staged_value_types,
+                value_order,
+                binding.symbol,
+                type_,
+            )?;
+            if clause_flow.insert(binding.symbol, type_).is_some() {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::DuplicateCurrentFlowType(binding.symbol),
+                ));
+            }
+            if host
+                .node(binding.name)
+                .is_none_or(|record| record.kind != SyntaxKind::Identifier)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidBindingPattern(binding.name),
+                ));
+            }
+        }
         let checked = if let Some(return_type) = return_type {
             check_planned_assignment(
                 store,
@@ -27160,7 +27470,7 @@ fn check_planned_switch_function_statements(
                 options,
                 session,
                 diagnostics,
-                flow_types,
+                &clause_flow,
                 preflighted_type_import_value_uses,
                 deferred,
                 return_type,
@@ -27179,7 +27489,7 @@ fn check_planned_switch_function_statements(
                 options,
                 session,
                 diagnostics,
-                flow_types,
+                &clause_flow,
                 preflighted_type_import_value_uses,
                 &value.expression,
                 None,
@@ -27191,6 +27501,170 @@ fn check_planned_switch_function_statements(
         return_types.push(checked);
     }
     Ok(return_types)
+}
+
+fn switch_union_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    types: &[TypeId],
+) -> Result<TypeId, SourceCheckError> {
+    match types {
+        [] => store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.never_type)
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            )),
+        [only] => Ok(*only),
+        _ => store
+            .expression_union_type_with_global_types(global_types, types, UnionReduction::Literal)
+            .map_err(Into::into),
+    }
+}
+
+fn switch_case_matches(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    candidate: TypeId,
+    case: TypeId,
+) -> Result<bool, SourceCheckError> {
+    let candidate = match store
+        .type_payload(candidate)
+        .ok_or(RelationUnavailable::Type(candidate))?
+        .data()
+    {
+        TypeData::Literal(literal) => literal.regular_type,
+        _ => candidate,
+    };
+    let case = match store
+        .type_payload(case)
+        .ok_or(RelationUnavailable::Type(case))?
+        .data()
+    {
+        TypeData::Literal(literal) => literal.regular_type,
+        _ => case,
+    };
+    if candidate == case {
+        return Ok(true);
+    }
+    store
+        .is_type_identical_to_with_global_types(candidate, case, global_types)
+        .map_err(Into::into)
+}
+
+fn switch_case_is_selected(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    candidate: TypeId,
+    selected: &[TypeId],
+    all_cases: &[TypeId],
+    includes_default: bool,
+) -> Result<bool, SourceCheckError> {
+    for case in selected {
+        if switch_case_matches(store, global_types, candidate, *case)? {
+            return Ok(true);
+        }
+    }
+    if !includes_default {
+        return Ok(false);
+    }
+    for case in all_cases {
+        if switch_case_matches(store, global_types, candidate, *case)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)] // Keep switch groups and correlated bindings together.
+fn narrow_switch_clause_flow(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    flow_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    discriminant: SemanticSymbolId,
+    object_binding: Option<&CheckedSwitchObjectBinding>,
+    cases: &[TypeId],
+    clause: &PlannedSwitchReturn,
+) -> Result<(), SourceCheckError> {
+    let selected =
+        cases
+            .get(clause.case_start..clause.case_end)
+            .ok_or(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(clause.statement),
+            ))?;
+    if let Some(binding) = object_binding {
+        let discriminant_property = binding
+            .properties
+            .iter()
+            .find(|property| property.symbol == discriminant)
+            .ok_or(SourceCheckError::Variable(
+                VariableInvariant::MissingCurrentFlowType(discriminant),
+            ))?;
+        let mut selected_indices = Vec::new();
+        for (index, candidate) in discriminant_property
+            .constituent_types
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            if switch_case_is_selected(
+                store,
+                global_types,
+                candidate,
+                selected,
+                cases,
+                clause.includes_default,
+            )? {
+                selected_indices.push(index);
+            }
+        }
+        for property in &binding.properties {
+            let mut retained = Vec::with_capacity(selected_indices.len());
+            for index in &selected_indices {
+                retained.push(*property.constituent_types.get(*index).ok_or(
+                    SourceCheckError::Function(SourceFunctionInvariant::Callable(clause.statement)),
+                )?);
+            }
+            let narrowed = switch_union_type(store, global_types, &retained)?;
+            if flow_types.insert(property.symbol, narrowed).is_none() {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::MissingCurrentFlowType(property.symbol),
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    let current = flow_types
+        .get(&discriminant)
+        .copied()
+        .ok_or(SourceCheckError::Variable(
+            VariableInvariant::MissingCurrentFlowType(discriminant),
+        ))?;
+    let record = store
+        .type_payload(current)
+        .ok_or(RelationUnavailable::Type(current))?;
+    let candidates = match record.data() {
+        TypeData::Union(union) => union.union.types.clone(),
+        TypeData::Literal(_) => vec![current],
+        _ => return Ok(()),
+    };
+    let mut retained = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if switch_case_is_selected(
+            store,
+            global_types,
+            candidate,
+            selected,
+            cases,
+            clause.includes_default,
+        )? {
+            retained.push(candidate);
+        }
+    }
+    let narrowed = switch_union_type(store, global_types, &retained)?;
+    flow_types.insert(discriminant, narrowed);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // Keeps switch narrowing inside the source transaction.
@@ -36317,6 +36791,8 @@ pub(super) fn check_source_file(
                     &mut deferred,
                     None,
                     statements,
+                    &mut staged_value_types,
+                    &mut value_order,
                 )?;
                 if return_types.is_empty() {
                     return Err(SourceCheckError::Function(
@@ -37640,6 +38116,8 @@ pub(super) fn check_source_file(
                             &mut deferred,
                             Some(return_type),
                             statements,
+                            &mut staged_value_types,
+                            &mut value_order,
                         )?;
                     }
                     PlannedFunctionBody::Statements(statements) => {
@@ -62504,6 +62982,144 @@ class Foo2 {
         let warm = observable_state(&context, file);
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn switch_clauses_narrow_grouped_literals_and_exhaustive_defaults() {
+        let source = parsed(concat!(
+            "function exact(value: 'first' | 'second'): 'first' { ",
+            "switch (value) { ",
+            "case 'first': return value; ",
+            "case 'second': return 'first'; ",
+            "default: return value; } } ",
+            "function grouped(value: 'first' | 'second' | 'third'): 'first' | 'second' { ",
+            "switch (value) { ",
+            "case 'first': case 'second': return value; ",
+            "default: return 'first'; } }",
+        ));
+        let file = FileId::new(8_425);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let mut returned = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::Identifier(identifier) = &record.data else {
+                    return None;
+                };
+                (identifier.text == "value"
+                    && record
+                        .parent
+                        .and_then(|parent| source.arena.get(parent))
+                        .is_some_and(|parent| parent.kind == SyntaxKind::ReturnStatement))
+                .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .collect::<Vec<_>>();
+        returned.sort_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        let [first, exhausted, grouped] = returned.as_slice() else {
+            panic!("expected one narrowed case, one exhaustive default, and one grouped case")
+        };
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, *first))
+                .unwrap(),
+            "\"first\"",
+        );
+        assert_eq!(
+            resolved_node_type(&context, *exhausted),
+            context.store().intrinsic_bootstrap().unwrap().never_type,
+        );
+        let TypeData::Union(group) = context
+            .store()
+            .type_payload(resolved_node_type(&context, *grouped))
+            .unwrap()
+            .data()
+        else {
+            panic!("grouped cases must preserve their literal union")
+        };
+        assert_eq!(group.union.types.len(), 2);
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn destructured_switch_defaults_report_never_iteration_at_the_array_pattern() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "type X = { kind: 'a'; a: [1] } | { kind: 'b'; a: [] }; ",
+            "function foo(x: X): 1 { ",
+            "const { kind, a } = x; ",
+            "switch (kind) { ",
+            "case 'a': return a[0]; ",
+            "case 'b': return 1; ",
+            "default: const [n] = a; return a; ",
+            "} }",
+        ));
+        let library_file = FileId::new(8_426);
+        let file = FileId::new(8_427);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected exactly one unreachable array-destructuring diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2488);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "[n]");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type 'never' must have a '[Symbol.iterator]()' method that returns an iterator.",
+        );
+
+        let never = context.store().intrinsic_bootstrap().unwrap().never_type;
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "n"),
+            never
+        );
+        let values = object_binding_value_type(&context, &source, file, "a");
+        let TypeData::Union(union) = context.store().type_payload(values).unwrap().data() else {
+            panic!("the declared tuple binding must preserve both union constituents")
+        };
+        assert_eq!(union.union.types.len(), 2);
+
+        for (node, record) in source.arena.iter() {
+            let NodeData::Identifier(identifier) = &record.data else {
+                continue;
+            };
+            if identifier.text != "a" {
+                continue;
+            }
+            let node = NodeRef::new(source.arena.id(), file, node);
+            let Some(parent) = record.parent.and_then(|parent| source.arena.get(parent)) else {
+                continue;
+            };
+            match parent.kind {
+                SyntaxKind::ElementAccessExpression => {
+                    let tuple = context
+                        .store()
+                        .canonical_tuple_shape(resolved_node_type(&context, node))
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(tuple.min_length(), 1);
+                }
+                SyntaxKind::VariableDeclaration | SyntaxKind::ReturnStatement => {
+                    assert_eq!(resolved_node_type(&context, node), never);
+                }
+                _ => {}
+            }
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
     }
 

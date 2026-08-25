@@ -408,18 +408,47 @@ pub(super) struct SourceLoopFunctionStatementsSyntax {
     pub(super) statements: Vec<SourceLoopFunctionStatementSyntax>,
 }
 
+/// One binder-owned shorthand property in a leading switch discriminant binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceSwitchObjectBindingElementSyntax {
+    pub(super) element: NodeRef,
+    pub(super) name: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+}
+
+/// One `const { kind, value } = source` immediately before its switch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceSwitchObjectBindingSyntax {
+    pub(super) statement: NodeRef,
+    pub(super) initializer: NodeRef,
+    pub(super) elements: Vec<SourceSwitchObjectBindingElementSyntax>,
+}
+
+/// One `const [value] = source` immediately before a switch-clause return.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceSwitchArrayBindingSyntax {
+    pub(super) statement: NodeRef,
+    pub(super) pattern: NodeRef,
+    pub(super) element: NodeRef,
+    pub(super) name: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) initializer: NodeRef,
+}
+
 /// One value return owned directly by a grouped switch clause.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceSwitchReturnSyntax {
     pub(super) clause: NodeRef,
     pub(super) statement: NodeRef,
     pub(super) expression: NodeRef,
+    pub(super) binding: Option<SourceSwitchArrayBindingSyntax>,
 }
 
-/// One function-body switch with literal cases and exhaustive value returns.
+/// One function-body switch with optional correlated bindings and exhaustive returns.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceSwitchFunctionStatementsSyntax {
     pub(super) body: NodeRef,
+    pub(super) leading: Option<SourceSwitchObjectBindingSyntax>,
     pub(super) switch: SourceControlSwitchSyntax,
     pub(super) returns: Vec<SourceSwitchReturnSyntax>,
     /// A no-default edge that still requires canonical constraint coverage proof.
@@ -3788,21 +3817,32 @@ impl SyntaxPlanner<'_> {
         let body = self.callable.body;
         self.validate_range(body, declaration)?;
         let statements = self.plan_body(body, declaration)?;
-        let [switch_id] = statements.as_slice() else {
-            let statement = statements
-                .first()
-                .copied()
-                .map_or(body, |node| self.reference(node));
-            return Err(self.unsupported(
-                statement,
-                self.node(statement)?.kind,
-                SourceFunctionStatementsRole::BodyStatement,
-            ));
+        let (leading, switch_id) = match statements.as_slice() {
+            [switch] => (None, *switch),
+            [binding, switch] => (
+                Some(self.plan_switch_object_binding(
+                    self.reference(*binding),
+                    body,
+                    declaration,
+                )?),
+                *switch,
+            ),
+            _ => {
+                let statement = statements
+                    .first()
+                    .copied()
+                    .map_or(body, |node| self.reference(node));
+                return Err(self.unsupported(
+                    statement,
+                    self.node(statement)?.kind,
+                    SourceFunctionStatementsRole::BodyStatement,
+                ));
+            }
         };
         let switch = plan_source_control_switch_syntax(
             self.arena,
             self.bound,
-            self.reference(*switch_id),
+            self.reference(switch_id),
             body,
         )?;
         self.validate_block_scope_container(switch.statement, declaration)?;
@@ -3828,6 +3868,19 @@ impl SyntaxPlanner<'_> {
                 SourceFunctionStatementsRole::Condition,
             ));
         }
+        if let Some(binding) = &leading
+            && !binding.elements.iter().any(|element| {
+                self.node(element.name).is_ok_and(|record| {
+                    matches!(&record.data, NodeData::Identifier(name) if name.text == identifier.text)
+                })
+            })
+        {
+            return Err(self.unsupported(
+                switch.expression,
+                discriminant.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
 
         let has_default = switch
             .clauses
@@ -3837,10 +3890,12 @@ impl SyntaxPlanner<'_> {
         if !has_default {
             self.validate_no_default_switch(&switch)?;
         }
-        let no_match_flow = self.validate_switch_flow(&switch, &returns, has_default)?;
+        let no_match_flow =
+            self.validate_switch_flow(&switch, &returns, has_default, leading.as_ref())?;
 
         Ok(SourceSwitchFunctionStatementsSyntax {
             body,
+            leading,
             switch,
             returns,
             no_match_flow,
@@ -3852,6 +3907,7 @@ impl SyntaxPlanner<'_> {
         switch: &SourceControlSwitchSyntax,
         returns: &[SourceSwitchReturnSyntax],
         has_default: bool,
+        leading: Option<&SourceSwitchObjectBindingSyntax>,
     ) -> Result<Option<FlowRef>, SourceFunctionStatementsError> {
         let declaration = self.callable.declaration;
         let flow = self.bound.flow_graph();
@@ -3885,6 +3941,27 @@ impl SyntaxPlanner<'_> {
         if self.switch_flow_at(switch.expression, declaration)? != switch_flow {
             return Err(Self::incomplete_switch_flow(switch.expression));
         }
+        if let Some(binding) = leading {
+            let mut current = switch_flow;
+            for element in binding.elements.iter().rev() {
+                let assignment = flow
+                    .nodes()
+                    .get(current)
+                    .ok_or_else(|| Self::incomplete_switch_flow(element.element))?;
+                if joined_semantic_flow_flags(assignment.flags) != FlowFlags::ASSIGNMENT.bits()
+                    || assignment.payload != Some(FlowNodePayload::Ast(element.element))
+                    || !assignment.antecedents.is_empty()
+                {
+                    return Err(Self::incomplete_switch_flow(element.element));
+                }
+                current = assignment
+                    .antecedent
+                    .ok_or_else(|| Self::incomplete_switch_flow(element.element))?;
+            }
+            if current != start {
+                return Err(Self::incomplete_switch_flow(binding.statement));
+            }
+        }
 
         let mut returned_clauses = returns.iter();
         let mut group_start = 0;
@@ -3902,7 +3979,25 @@ impl SyntaxPlanner<'_> {
             if value.clause != clause.clause {
                 return Err(Self::incomplete_switch_flow(value.statement));
             }
-            let return_flow = self.switch_flow_at(value.statement, declaration)?;
+            let mut return_flow = self.switch_flow_at(value.statement, declaration)?;
+            if let Some(binding) = value.binding {
+                let assignment = flow
+                    .nodes()
+                    .get(return_flow)
+                    .ok_or_else(|| Self::incomplete_switch_flow(binding.statement))?;
+                if joined_semantic_flow_flags(assignment.flags) != FlowFlags::ASSIGNMENT.bits()
+                    || assignment.payload != Some(FlowNodePayload::Ast(binding.element))
+                    || !assignment.antecedents.is_empty()
+                {
+                    return Err(Self::incomplete_switch_flow(binding.statement));
+                }
+                return_flow = assignment
+                    .antecedent
+                    .ok_or_else(|| Self::incomplete_switch_flow(binding.statement))?;
+                if self.switch_flow_at(binding.statement, declaration)? != return_flow {
+                    return Err(Self::incomplete_switch_flow(binding.statement));
+                }
+            }
             let return_node = flow
                 .nodes()
                 .get(return_flow)
@@ -4190,6 +4285,342 @@ impl SyntaxPlanner<'_> {
         )
     }
 
+    fn plan_switch_object_binding(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        callable: NodeRef,
+    ) -> Result<SourceSwitchObjectBindingSyntax, SourceFunctionStatementsError> {
+        let (pattern, elements, initializer) = self.plan_switch_binding_declaration(
+            statement,
+            parent,
+            callable,
+            callable,
+            SyntaxKind::ObjectBindingPattern,
+        )?;
+        if elements.len() < 2 {
+            return Err(self.unsupported(
+                pattern,
+                SyntaxKind::ObjectBindingPattern,
+                SourceFunctionStatementsRole::LocalName,
+            ));
+        }
+        let mut names = HashSet::with_capacity(elements.len());
+        let mut bindings = Vec::with_capacity(elements.len());
+        for element in elements {
+            let binding = self.plan_switch_binding_element(element, pattern, callable, callable)?;
+            if !names.insert(binding.symbol) {
+                return Err(self.unsupported(
+                    element,
+                    SyntaxKind::BindingElement,
+                    SourceFunctionStatementsRole::LocalName,
+                ));
+            }
+            bindings.push(binding);
+        }
+        Ok(SourceSwitchObjectBindingSyntax {
+            statement,
+            initializer,
+            elements: bindings,
+        })
+    }
+
+    fn plan_switch_array_binding(
+        &self,
+        statement: NodeRef,
+        clause: NodeRef,
+        scope: NodeRef,
+        callable: NodeRef,
+    ) -> Result<SourceSwitchArrayBindingSyntax, SourceFunctionStatementsError> {
+        let (pattern, elements, initializer) = self.plan_switch_binding_declaration(
+            statement,
+            clause,
+            scope,
+            callable,
+            SyntaxKind::ArrayBindingPattern,
+        )?;
+        let [element] = elements.as_slice() else {
+            return Err(self.unsupported(
+                pattern,
+                SyntaxKind::ArrayBindingPattern,
+                SourceFunctionStatementsRole::LocalName,
+            ));
+        };
+        let binding = self.plan_switch_binding_element(*element, pattern, scope, callable)?;
+        Ok(SourceSwitchArrayBindingSyntax {
+            statement,
+            pattern,
+            element: binding.element,
+            name: binding.name,
+            symbol: binding.symbol,
+            initializer,
+        })
+    }
+
+    fn plan_switch_binding_declaration(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        scope: NodeRef,
+        callable: NodeRef,
+        pattern_kind: SyntaxKind,
+    ) -> Result<(NodeRef, Vec<NodeRef>, NodeRef), SourceFunctionStatementsError> {
+        let record = self.node(statement)?;
+        let NodeData::VariableStatement(variable_statement) = &record.data else {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::LocalStatement,
+            ));
+        };
+        if record.kind != SyntaxKind::VariableStatement
+            || record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || variable_statement.modifiers.is_some()
+            || variable_statement.flow_node.is_some()
+            || variable_statement.facts != 0
+        {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::LocalStatement,
+            ));
+        }
+        self.validate_range(statement, parent)?;
+        self.validate_container(statement, callable)?;
+        self.validate_block_scope_container(statement, scope)?;
+
+        let list = self.reference(variable_statement.declaration_list);
+        let list_record = self.node(list)?;
+        let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+            return Err(self.unsupported(
+                list,
+                list_record.kind,
+                SourceFunctionStatementsRole::LocalDeclarationList,
+            ));
+        };
+        let [declaration] = declarations.declarations.nodes.as_slice() else {
+            return Err(self.unsupported(
+                list,
+                list_record.kind,
+                SourceFunctionStatementsRole::LocalDeclarationList,
+            ));
+        };
+        if list_record.kind != SyntaxKind::VariableDeclarationList
+            || list_record.flags.0 != NODE_FLAG_CONST
+            || list_record.parent != Some(statement.node)
+            || declarations.declarations.range != list_record.range
+            || declarations.declarations.has_trailing_comma
+            || declarations.facts != 0
+        {
+            return Err(self.unsupported(
+                list,
+                list_record.kind,
+                SourceFunctionStatementsRole::LocalDeclarationList,
+            ));
+        }
+        self.validate_range(list, statement)?;
+        self.validate_container(list, callable)?;
+        self.validate_block_scope_container(list, scope)?;
+
+        let declaration = self.reference(*declaration);
+        let declaration_record = self.node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Err(self.unsupported(
+                declaration,
+                declaration_record.kind,
+                SourceFunctionStatementsRole::LocalDeclaration,
+            ));
+        };
+        if declaration_record.kind != SyntaxKind::VariableDeclaration
+            || declaration_record.flags.0 != 0
+            || declaration_record.parent != Some(list.node)
+            || variable.exclamation_token.is_some()
+            || variable.local_symbol.is_some()
+            || variable.symbol.is_some()
+            || variable.type_.is_some()
+            || variable.facts != 0
+            || self.bound.symbol(declaration).is_some()
+        {
+            return Err(self.unsupported(
+                declaration,
+                declaration_record.kind,
+                SourceFunctionStatementsRole::LocalDeclaration,
+            ));
+        }
+        self.validate_range(declaration, list)?;
+        self.validate_container(declaration, callable)?;
+        self.validate_block_scope_container(declaration, scope)?;
+
+        let pattern = self.reference(variable.name);
+        let pattern_record = self.node(pattern)?;
+        let NodeData::BindingPattern(bindings) = &pattern_record.data else {
+            return Err(self.unsupported(
+                pattern,
+                pattern_record.kind,
+                SourceFunctionStatementsRole::LocalName,
+            ));
+        };
+        if pattern_record.kind != pattern_kind
+            || pattern_record.flags.0 != 0
+            || pattern_record.parent != Some(declaration.node)
+            || bindings.elements.nodes.is_empty()
+            || bindings.elements.has_trailing_comma
+            || bindings.elements.range != pattern_record.range
+            || bindings.facts != 0
+        {
+            return Err(self.unsupported(
+                pattern,
+                pattern_record.kind,
+                SourceFunctionStatementsRole::LocalName,
+            ));
+        }
+        self.validate_range(pattern, declaration)?;
+        self.validate_container(pattern, callable)?;
+        self.validate_block_scope_container(pattern, scope)?;
+
+        let initializer = variable
+            .initializer
+            .map(|node| self.reference(node))
+            .ok_or(SourceFunctionStatementsError::Unsupported(
+                SourceFunctionStatementsUnsupported::MissingInitializer(declaration),
+            ))?;
+        let initializer_record = self.node(initializer)?;
+        let NodeData::Identifier(identifier) = &initializer_record.data else {
+            return Err(self.unsupported(
+                initializer,
+                initializer_record.kind,
+                SourceFunctionStatementsRole::LocalInitializer,
+            ));
+        };
+        if initializer_record.kind != SyntaxKind::Identifier
+            || initializer_record.flags.0 != 0
+            || initializer_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(self.unsupported(
+                initializer,
+                initializer_record.kind,
+                SourceFunctionStatementsRole::LocalInitializer,
+            ));
+        }
+        self.validate_range(initializer, declaration)?;
+        self.validate_order(pattern, initializer)?;
+        self.validate_container(initializer, callable)?;
+        self.validate_block_scope_container(initializer, scope)?;
+
+        Ok((
+            pattern,
+            bindings
+                .elements
+                .nodes
+                .iter()
+                .map(|node| self.reference(*node))
+                .collect(),
+            initializer,
+        ))
+    }
+
+    fn plan_switch_binding_element(
+        &self,
+        element: NodeRef,
+        pattern: NodeRef,
+        scope: NodeRef,
+        callable: NodeRef,
+    ) -> Result<SourceSwitchObjectBindingElementSyntax, SourceFunctionStatementsError> {
+        let record = self.node(element)?;
+        let NodeData::BindingElement(binding) = &record.data else {
+            return Err(self.unsupported(
+                element,
+                record.kind,
+                SourceFunctionStatementsRole::LocalName,
+            ));
+        };
+        if record.kind != SyntaxKind::BindingElement
+            || record.flags.0 != 0
+            || record.parent != Some(pattern.node)
+            || binding.dot_dot_dot_token.is_some()
+            || binding.flow_node.is_some()
+            || binding.initializer.is_some()
+            || binding.local_symbol.is_some()
+            || binding.property_name.is_some()
+            || binding.symbol.is_some()
+            || binding.facts != 0
+        {
+            return Err(self.unsupported(
+                element,
+                record.kind,
+                SourceFunctionStatementsRole::LocalName,
+            ));
+        }
+        self.validate_range(element, pattern)?;
+        self.validate_container(element, callable)?;
+        self.validate_block_scope_container(element, scope)?;
+
+        let name = binding.name.map(|node| self.reference(node)).ok_or(
+            SourceFunctionStatementsError::Unsupported(
+                SourceFunctionStatementsUnsupported::Syntax {
+                    node: element,
+                    kind: record.kind,
+                    role: SourceFunctionStatementsRole::LocalName,
+                },
+            ),
+        )?;
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(self.unsupported(
+                name,
+                name_record.kind,
+                SourceFunctionStatementsRole::LocalName,
+            ));
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(element.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(self.unsupported(
+                name,
+                name_record.kind,
+                SourceFunctionStatementsRole::LocalName,
+            ));
+        }
+        self.validate_range(name, element)?;
+        self.validate_container(name, callable)?;
+        self.validate_block_scope_container(name, scope)?;
+
+        let symbol = plan_top_level_variable(
+            self.bound,
+            self.store,
+            element,
+            name,
+            &identifier.text,
+            VariableBindingKind::Const,
+            false,
+        )?;
+        let actual = self
+            .bound
+            .locals(scope)
+            .and_then(|locals| self.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text));
+        if actual != Some(symbol) {
+            return Err(SourceFunctionStatementsInvariant::LocalTableMismatch {
+                declaration: element,
+                scope,
+                expected: symbol,
+                actual,
+            }
+            .into());
+        }
+        Ok(SourceSwitchObjectBindingElementSyntax {
+            element,
+            name,
+            symbol,
+        })
+    }
+
     fn plan_switch_returns(
         &self,
         switch: &SourceControlSwitchSyntax,
@@ -4227,6 +4658,22 @@ impl SyntaxPlanner<'_> {
                     switch.case_block,
                     declaration,
                 )?),
+                [binding, statement] if clause.expression.is_none() => {
+                    let binding = self.plan_switch_array_binding(
+                        *binding,
+                        clause.clause,
+                        switch.case_block,
+                        declaration,
+                    )?;
+                    let mut value = self.plan_switch_return(
+                        clause.clause,
+                        *statement,
+                        switch.case_block,
+                        declaration,
+                    )?;
+                    value.binding = Some(binding);
+                    returns.push(value);
+                }
                 [] => {
                     return Err(SourceFunctionStatementsError::Unsupported(
                         SourceFunctionStatementsUnsupported::MissingReturn(clause.clause),
@@ -4299,12 +4746,95 @@ impl SyntaxPlanner<'_> {
         self.validate_range(expression, statement)?;
         self.validate_container(expression, callable)?;
         self.validate_block_scope_container(expression, scope)?;
-        self.validate_switch_literal(expression, SourceFunctionStatementsRole::ReturnExpression)?;
+        self.validate_switch_return_expression(expression, callable, scope)?;
         Ok(SourceSwitchReturnSyntax {
             clause,
             statement,
             expression,
+            binding: None,
         })
+    }
+
+    fn validate_switch_return_expression(
+        &self,
+        expression: NodeRef,
+        callable: NodeRef,
+        scope: NodeRef,
+    ) -> Result<(), SourceFunctionStatementsError> {
+        let record = self.node(expression)?;
+        match &record.data {
+            NodeData::Identifier(identifier)
+                if record.kind == SyntaxKind::Identifier
+                    && record.flags.0 == 0
+                    && identifier.flow_node.is_none()
+                    && !identifier.text.is_empty() =>
+            {
+                Ok(())
+            }
+            NodeData::ElementAccessExpression(access)
+                if record.kind == SyntaxKind::ElementAccessExpression
+                    && record.flags.0 == 0
+                    && access.question_dot_token.is_none()
+                    && access.flow_node.is_none()
+                    && access.facts == 0 =>
+            {
+                let receiver = self.reference(access.expression);
+                let index = self.reference(access.argument_expression);
+                for child in [receiver, index] {
+                    self.validate_parent(
+                        child,
+                        Some(expression.node),
+                        SourceFunctionStatementsRole::ReturnExpression,
+                    )?;
+                    self.validate_range(child, expression)?;
+                    self.validate_container(child, callable)?;
+                    self.validate_block_scope_container(child, scope)?;
+                }
+                self.validate_order(receiver, index)?;
+                let receiver_record = self.node(receiver)?;
+                let NodeData::Identifier(identifier) = &receiver_record.data else {
+                    return Err(self.unsupported(
+                        receiver,
+                        receiver_record.kind,
+                        SourceFunctionStatementsRole::ReturnExpression,
+                    ));
+                };
+                if receiver_record.kind != SyntaxKind::Identifier
+                    || receiver_record.flags.0 != 0
+                    || identifier.flow_node.is_some()
+                    || identifier.text.is_empty()
+                {
+                    return Err(self.unsupported(
+                        receiver,
+                        receiver_record.kind,
+                        SourceFunctionStatementsRole::ReturnExpression,
+                    ));
+                }
+                let index_record = self.node(index)?;
+                let NodeData::NumericLiteral(literal) = &index_record.data else {
+                    return Err(self.unsupported(
+                        index,
+                        index_record.kind,
+                        SourceFunctionStatementsRole::ReturnExpression,
+                    ));
+                };
+                if index_record.kind != SyntaxKind::NumericLiteral
+                    || index_record.flags.0 != 0
+                    || literal.token_flags.0 != 0
+                {
+                    return Err(self.unsupported(
+                        index,
+                        index_record.kind,
+                        SourceFunctionStatementsRole::ReturnExpression,
+                    ));
+                }
+                Ok(())
+            }
+            _ => self.validate_switch_literal(
+                expression,
+                SourceFunctionStatementsRole::ReturnExpression,
+            ),
+        }
     }
 
     fn validate_switch_literal(
@@ -10129,6 +10659,112 @@ mod joined_tests {
     }
 
     #[test]
+    fn function_switch_authenticates_correlated_bindings_and_default_array_destructuring() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function choose(input: any): number { ",
+                "const { kind, values } = input; ",
+                "switch (kind) { ",
+                "case 'first': return values[0]; ",
+                "case 'second': return 1; ",
+                "default: const [missing] = values; return values; ",
+                "} }",
+            ),
+            FileId::new(1_340),
+        );
+        let callable = fixture.callable();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.mapper_len(),
+        );
+
+        let syntax = plan_source_switch_function_statements_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            &callable,
+        )
+        .unwrap();
+
+        let leading = syntax.leading.as_ref().unwrap();
+        assert_eq!(leading.elements.len(), 2);
+        for element in &leading.elements {
+            assert_eq!(fixture.bound.symbol(element.element), Some(element.symbol));
+            assert_eq!(
+                fixture.bound.block_scope_container(element.element),
+                Some(callable.declaration),
+            );
+        }
+        assert_eq!(syntax.returns.len(), 3);
+        assert!(
+            syntax.returns[..2]
+                .iter()
+                .all(|value| value.binding.is_none())
+        );
+        let default = syntax.returns[2].binding.unwrap();
+        assert_eq!(fixture.bound.symbol(default.element), Some(default.symbol));
+        assert_eq!(
+            fixture.bound.block_scope_container(default.element),
+            Some(syntax.switch.case_block),
+        );
+        assert_eq!(
+            plan_source_switch_function_statements_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                &callable,
+            ),
+            Ok(syntax),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn function_switch_rejects_unproven_correlated_binding_shapes() {
+        for (index, source) in [
+            concat!(
+                "function choose(input: any): number { ",
+                "const { kind: tag, values } = input; ",
+                "switch (tag) { default: return 1; } }",
+            ),
+            concat!(
+                "function choose(input: any): number { ",
+                "let { kind, values } = input; ",
+                "switch (kind) { default: return 1; } }",
+            ),
+            concat!(
+                "function choose(input: any): number { ",
+                "const { kind, values } = input; ",
+                "switch (kind) { default: const [first, second] = values; return 1; } }",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_341 + u32::try_from(index).unwrap()));
+            let callable = fixture.callable();
+            assert!(matches!(
+                plan_source_switch_function_statements_syntax(
+                    &fixture.parsed.arena,
+                    &fixture.bound,
+                    &fixture.store,
+                    &callable,
+                ),
+                Err(SourceFunctionStatementsError::Unsupported(_)),
+            ));
+        }
+    }
+
+    #[test]
     fn function_switch_accepts_boolean_cases_and_returns() {
         let fixture = JoinedFixture::new(
             concat!(
@@ -10431,7 +11067,7 @@ mod joined_tests {
             "function f(level) { switch (level) { case 0: return \"value\"; } }",
             "function f(level) { switch (level) { default: return; } }",
             "function f(level) { switch (level) { case level: return \"value\"; default: return \"fallback\"; } }",
-            "function f(level) { switch (level) { default: return level; } }",
+            "function f(level) { switch (level) { default: return level + 1; } }",
             "function f(level) { switch (level) { default: return \"first\"; return \"second\"; } }",
             "function f(level) { switch (level) { default: return \"first\"; case 0: return \"second\"; } }",
             "function f(level) { switch (level + 1) { default: return \"value\"; } }",
