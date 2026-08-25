@@ -9267,7 +9267,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Err(unsupported());
         }
         let declaration_record = preflight_node(self.store, self.host, declaration)?;
-        if declaration_record.range.end > record.range.start {
+        let self_reference = declaration_record.range.end > record.range.start;
+        if self_reference
+            && (record.range.start < declaration_record.range.start
+                || record.range.end > declaration_record.range.end)
+        {
             return Err(unsupported());
         }
 
@@ -9342,6 +9346,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     return Err(unsupported());
                 }
                 if list_record.flags.0 == NODE_FLAG_LET {
+                    if self_reference {
+                        return Err(unsupported());
+                    }
                     let annotation = variable
                         .type_
                         .map(|annotation| NodeRef::new(node.arena, node.file, annotation))
@@ -9432,11 +9439,33 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     {
                         return Err(invalid());
                     }
-                    let type_ = value_type.or(initializer_type).ok_or_else(unsupported)?;
-                    if !matches!(
-                        self.store.type_payload(type_).map(TypeRecord::data),
-                        Some(TypeData::Intrinsic(_) | TypeData::Literal(_))
-                    ) {
+                    let recursive_callable = if self_reference {
+                        Some(
+                            self.authenticated_recursive_arrow_type_query(
+                                node,
+                                declaration,
+                                initializer,
+                            )?
+                            .ok_or_else(unsupported)?,
+                        )
+                    } else {
+                        None
+                    };
+                    let type_ = recursive_callable
+                        .or(value_type)
+                        .or(initializer_type)
+                        .ok_or_else(unsupported)?;
+                    if value_type.is_some_and(|value| value != type_)
+                        || initializer_type.is_some_and(|initializer| initializer != type_)
+                    {
+                        return Err(invalid());
+                    }
+                    if recursive_callable.is_none()
+                        && !matches!(
+                            self.store.type_payload(type_).map(TypeRecord::data),
+                            Some(TypeData::Intrinsic(_) | TypeData::Literal(_))
+                        )
+                    {
                         return Err(unsupported());
                     }
                     (Some(initializer), Some(type_))
@@ -9444,7 +9473,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             (NodeData::FunctionDeclaration(_), SymbolFlags::FUNCTION)
                 if declaration_record.kind == SyntaxKind::FunctionDeclaration
-                    && declaration_record.parent == Some(bound.source_file().node) =>
+                    && declaration_record.parent == Some(bound.source_file().node)
+                    && !self_reference =>
             {
                 let type_ = value_type.ok_or_else(unsupported)?;
                 if self.store.source_callable_type_for_owner(symbol) != Some(type_)
@@ -9505,6 +9535,79 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Err(invalid());
         }
         Ok(())
+    }
+
+    /// Reuses an exact pending arrow shell for `() => value satisfies typeof own`.
+    fn authenticated_recursive_arrow_type_query(
+        &self,
+        node: NodeRef,
+        declaration: NodeRef,
+        initializer: NodeRef,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let arrow_record = preflight_node(self.store, self.host, initializer)?;
+        let NodeData::ArrowFunction(arrow) = &arrow_record.data else {
+            return Ok(None);
+        };
+        let satisfaction = NodeRef::new(initializer.arena, initializer.file, arrow.body);
+        let satisfaction_record = preflight_node(self.store, self.host, satisfaction)?;
+        let NodeData::SatisfiesExpression(expression) = &satisfaction_record.data else {
+            return Ok(None);
+        };
+        let operand = NodeRef::new(satisfaction.arena, satisfaction.file, expression.expression);
+        let operand_record = preflight_node(self.store, self.host, operand)?;
+        if arrow_record.kind != SyntaxKind::ArrowFunction
+            || arrow_record.flags.0 != 0
+            || arrow_record.parent != Some(declaration.node)
+            || arrow.type_.is_some()
+            || arrow.type_parameters.is_some()
+            || !arrow.parameters.nodes.is_empty()
+            || satisfaction_record.kind != SyntaxKind::SatisfiesExpression
+            || satisfaction_record.flags.0 != 0
+            || satisfaction_record.parent != Some(initializer.node)
+            || expression.type_ != node.node
+            || operand_record.parent != Some(satisfaction.node)
+            || preflight_node(self.store, self.host, node)?.parent != Some(satisfaction.node)
+        {
+            return Ok(None);
+        }
+
+        let bound = self.host.bound_file(initializer).ok_or_else(invalid)?;
+        let owner = bound
+            .symbol(initializer)
+            .and_then(|owner| self.store.get_merged_symbol(owner))
+            .ok_or_else(invalid)?;
+        let Some(type_) = self.store.source_callable_type_for_owner(owner) else {
+            return Ok(None);
+        };
+        let callable = source_callables::plan_source_callable(
+            self.store,
+            self.host,
+            initializer,
+            owner,
+            self.array_targets,
+        )
+        .map_err(|error| source_callable_error(error, SourceCallableFamily::ArrowFunction))?;
+        if callable.family != SourceCallableFamily::ArrowFunction
+            || !callable.return_type.is_inferred()
+            || !callable.parameters.is_empty()
+            || !callable.type_parameters.is_empty()
+            || self.store.source_callable_type_for_declaration(initializer) != Some(type_)
+        {
+            return Err(invalid());
+        }
+        match source_callables::source_callable_state(self.store, &callable, false)
+            .map_err(|error| source_callable_error(error, SourceCallableFamily::ArrowFunction))?
+        {
+            source_callables::SourceCallableState::AwaitingInferredReturn {
+                type_: existing,
+                ..
+            }
+            | source_callables::SourceCallableState::Resolved {
+                type_: existing, ..
+            } if existing == type_ => Ok(Some(type_)),
+            _ => Err(invalid()),
+        }
     }
 
     /// Plans `typeof Namespace.value` only for a proven ambient namespace import.
@@ -23259,6 +23362,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     Some(type_) => Some(type_),
                     None if query.type_.is_none() => {
                         Some(self.execute_type_node(source_node, plan, prepared)?)
+                    }
+                    None if self.store.source_node_kind(source_node)
+                        == Some(SyntaxKind::ArrowFunction)
+                        && self.store.source_callable_type_for_declaration(source_node)
+                            == query.type_ =>
+                    {
+                        query.type_
                     }
                     None => None,
                 }
@@ -42334,6 +42444,133 @@ mod tests {
         );
         assert_eq!(store_state(&fixture.store), warm);
         assert!(fixture.store.value_symbol_links(symbol).is_none());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn recursive_arrow_value_type_query_reuses_pending_callable_without_value_publication() {
+        let mut fixture = fixture("const value = () => 42 satisfies typeof value;");
+        let variable = fixture
+            .store
+            .get_merged_symbol(named_symbol(
+                &fixture,
+                SyntaxKind::VariableDeclaration,
+                "value",
+            ))
+            .unwrap();
+        let arrow = variable_initializer_node(&fixture, "value");
+        let owner = node_symbol(&fixture, arrow);
+        let query = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeQuery).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let name = type_query_name(&fixture, query);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let cold = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node: query,
+                    kind: SyntaxKind::TypeQuery,
+                },
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), cold);
+
+        let expected = query_source_callable(&mut fixture, arrow, owner, &mut diagnostics).unwrap();
+        let signature = function_signature(&fixture.store, arrow);
+        assert_ne!(variable, owner);
+        assert_eq!(
+            validate_stored_source_callable(&fixture.store, expected),
+            StoredSourceCallableValidation::Pending,
+        );
+        assert!(fixture.store.value_symbol_links(variable).is_none());
+        assert!(
+            fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type()
+                .is_none()
+        );
+
+        let before = store_state(&fixture.store);
+        {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .preflight_type_from_type_node(query)
+            .unwrap();
+        }
+        assert_eq!(store_state(&fixture.store), before);
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Ok(expected)
+        );
+        assert_eq!(
+            fixture.store.type_node_links(query),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(expected),
+                ..TypeNodeLinks::default()
+            }),
+        );
+        assert_eq!(
+            fixture.store.symbol_node_links(name),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(variable),
+            }),
+        );
+        assert!(fixture.store.value_symbol_links(variable).is_none());
+        assert!(
+            fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type()
+                .is_none()
+        );
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Ok(expected)
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_value_symbol_links(
+            variable,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(query),
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), poisoned);
         assert!(diagnostics.is_empty());
     }
 
