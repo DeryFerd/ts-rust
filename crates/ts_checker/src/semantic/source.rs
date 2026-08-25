@@ -39614,7 +39614,7 @@ mod tests {
 
     #[test]
     fn unused_imports_distinguish_single_bindings_from_entire_declarations() {
-        let provider = parsed("export const first = 1; export const second = 2;");
+        let provider = parsed("export const first: number = 1; export const second: number = 2;");
         let provider_file = FileId::new(8_607);
         for (index, text, expected_code, expected_span) in [
             (
