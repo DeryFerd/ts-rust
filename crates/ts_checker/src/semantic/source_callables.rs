@@ -2416,7 +2416,8 @@ fn plan_source_callable_with_owner_shape(
         && !direct_implicit_any_arrow
         && !array_implicit_any_arrow
         && !object_property_arrow
-        && source_direct_call_argument_arrow_is_exact(store, host, declaration)?
+        && (source_direct_call_argument_arrow_is_exact(store, host, declaration)?
+            || source_promise_constructor_argument_arrow_is_exact(store, host, declaration)?)
         && (eligible_implicit_any_arrow
             || source_direct_call_arrow_has_zero_parameter_target(store, host, declaration)?);
     let javascript_object_implicit_any_arrow = eligible_implicit_any_arrow
@@ -3324,6 +3325,96 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
         && callee_valid)
 }
 
+/// Authenticates the one-parameter executor of a top-level global Promise construction.
+pub(super) fn source_promise_constructor_argument_arrow_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> Result<bool, SourceCallableError> {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction) {
+        return Ok(false);
+    }
+    let Some(SourceNodeParent::Parent(construction)) = store.source_node_parent(declaration) else {
+        return Ok(false);
+    };
+    let record = preflight_node(store, host, construction)?;
+    let NodeData::NewExpression(expression) = &record.data else {
+        return Ok(false);
+    };
+    let Some(arguments) = expression.arguments.as_ref() else {
+        return Ok(false);
+    };
+    if record.kind != SyntaxKind::NewExpression
+        || record.flags.0 != 0
+        || expression.facts != 0
+        || expression.type_arguments.is_some()
+        || arguments.has_trailing_comma
+        || arguments.nodes.as_slice() != [declaration.node]
+    {
+        return Ok(false);
+    }
+    let constructor = NodeRef::new(construction.arena, construction.file, expression.expression);
+    let constructor_record = preflight_node(store, host, constructor)?;
+    let NodeData::Identifier(identifier) = &constructor_record.data else {
+        return Ok(false);
+    };
+    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(construction) else {
+        return Ok(false);
+    };
+    let statement_record = preflight_node(store, host, statement)?;
+    let NodeData::ExpressionStatement(statement_data) = &statement_record.data else {
+        return Ok(false);
+    };
+    let Some(bound) = host.bound_file(declaration) else {
+        return Ok(false);
+    };
+    let Some(owner) = bound.symbol(declaration) else {
+        return Ok(false);
+    };
+    let Some(promise) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("Promise"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(false);
+    };
+    Ok(constructor_record.kind == SyntaxKind::Identifier
+        && constructor_record.parent == Some(construction.node)
+        && constructor_record.flags.0 == 0
+        && identifier.flow_node.is_none()
+        && identifier.text == "Promise"
+        && statement_record.kind == SyntaxKind::ExpressionStatement
+        && statement_record.flags.0 == 0
+        && statement_data.expression == construction.node
+        && statement_data.flow_node.is_none()
+        && store.source_node_parent(statement)
+            == Some(SourceNodeParent::Parent(bound.source_file()))
+        && bound
+            .source_facts()
+            .is_some_and(|facts| !facts.is_declaration_file())
+        && store.symbol(promise).is_some_and(|symbol| {
+            symbol.flags().contains(SymbolFlags::INTERFACE)
+                && symbol
+                    .flags()
+                    .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                && symbol.check_flags() == CheckFlags::NONE
+                && symbol.name().as_utf8() == Some("Promise")
+                && symbol.parent().is_none()
+        })
+        && host.symbol_matches(store, declaration, owner)
+        && store.symbol(owner).is_some_and(|symbol| {
+            symbol.flags() == SymbolFlags::FUNCTION
+                && symbol.check_flags() == CheckFlags::NONE
+                && symbol.declarations() == Some(&[declaration])
+                && symbol.value_declaration() == Some(declaration)
+                && symbol.members().is_none()
+                && symbol.exports().is_none()
+                && symbol.parent().is_none()
+                && symbol.export_symbol().is_none()
+        }))
+}
+
 /// Authenticates ordinary extra callback parameters against a zero-arity target.
 #[allow(clippy::too_many_lines)] // Keep the arrow, call, callee, and target proof together.
 pub(super) fn source_direct_call_arrow_has_zero_parameter_target(
@@ -3491,7 +3582,9 @@ fn stored_direct_call_argument_arrow_is_exact(
         _ => return false,
     };
     store.source_node_kind(declaration) == Some(SyntaxKind::ArrowFunction)
-        && store.source_node_kind(call) == Some(SyntaxKind::CallExpression)
+        && (store.source_node_kind(call) == Some(SyntaxKind::CallExpression)
+            || store.source_node_kind(call) == Some(SyntaxKind::NewExpression)
+                && store.source_node_kind(container) == Some(SyntaxKind::ExpressionStatement))
         && store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
         && owner.flags() == SymbolFlags::FUNCTION
         && owner.check_flags() == CheckFlags::NONE
@@ -7815,14 +7908,53 @@ fn valid_direct_call_contextual_target_type(
     signature.type_parameters().is_empty()
         && !signature.has_rest_parameter()
         && callable.rest_parameter.is_none()
-        && callable.min_argument_count >= 1
-        && (source_parameter == expected_parameter
-            || super::source_calls::authenticated_array_callback_contextual_target(
-                store,
-                target,
-                source_parameter,
-                expected_parameter,
-            ))
+        && if stored_promise_executor_contextual_target_is_exact(store, signature) {
+            callable.min_argument_count == 2
+                && matches!(callable.parameters.as_slice(), [first, _] if *first == expected_parameter)
+        } else {
+            callable.min_argument_count >= 1
+                && (source_parameter == expected_parameter
+                    || super::source_calls::authenticated_array_callback_contextual_target(
+                        store,
+                        target,
+                        source_parameter,
+                        expected_parameter,
+                    ))
+        }
+}
+
+fn stored_promise_executor_contextual_target_is_exact(
+    store: &CanonicalTypeMapperStore,
+    signature: &Signature,
+) -> bool {
+    let Some(annotation) = signature.declaration() else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(parameter)) = store.source_node_parent(annotation) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(construction)) = store.source_node_parent(parameter) else {
+        return false;
+    };
+    let Some(owner) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("PromiseConstructor"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    store.source_node_kind(annotation) == Some(SyntaxKind::FunctionType)
+        && store.source_node_kind(parameter) == Some(SyntaxKind::Parameter)
+        && store.source_node_kind(construction) == Some(SyntaxKind::ConstructSignature)
+        && store
+            .symbol(owner)
+            .and_then(|owner| owner.members())
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+            .and_then(|constructor| store.symbol(constructor))
+            .and_then(|constructor| constructor.declarations())
+            .is_some_and(|declarations| declarations.contains(&construction))
 }
 
 /// Publishes the recursive owner cache and structured empty-member barrier.

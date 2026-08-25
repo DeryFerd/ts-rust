@@ -5,11 +5,12 @@
 //! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`.
 //! An admitted constructor belongs to one preceding local class, an imported
 //! exported ambient class, an earlier ambient variable, or an authenticated
-//! global `Object`, `Array`, or `Date` constructor. Imported ambient classes
-//! retain primitive constructor arguments and canonical generic instantiations.
-//! Global arrays retain their real length and generic-item overloads. Planning
-//! proves syntax, resolver routes, provider provenance, and cold/warm caches
-//! before source execution may publish class or expression state.
+//! global `Object`, `Array`, `Date`, or `Promise` constructor. Imported ambient
+//! classes retain primitive constructor arguments and canonical generic
+//! instantiations. Global arrays retain their real length and generic-item
+//! overloads. Planning proves syntax, resolver routes, provider provenance, and
+//! cold/warm caches before source execution may publish class or expression
+//! state.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,9 +22,10 @@ use ts_binder::{
 use ts_jsnum::Number;
 
 use super::{
-    AliasTargetState, CanonicalGlobalTypes, CanonicalTypeMapperStore, ClassError,
-    DeclaredTypeError, DeclaredTypeHost, ResolvedSignatureState, SignatureId, SignatureLinks,
-    SymbolNodeLinks, TypeData, TypeId, TypeNodeLinks, ValueSymbolLinks,
+    AliasTargetState, CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
+    CanonicalTypeMapperStore, ClassError, DeclaredTypeError, DeclaredTypeHost,
+    ResolvedSignatureState, SignatureId, SignatureLinks, SymbolNodeLinks, TypeData, TypeId,
+    TypeNodeLinks, ValueSymbolLinks,
     bootstrap::LiteralTypeCacheError,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::CallableFamily,
@@ -33,12 +35,16 @@ use super::{
         preflight_nongeneric_class_member_query,
     },
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
+    functions::plan_function_type,
     jsdoc::leading_jsdoc_comment,
     object_members::{PropertyObjectPlan, plan_interface, plan_type_literal},
+    reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
     signatures::SignatureFlags,
+    source::{PlannedExpression, PlannedExpressionKind},
+    source_callables::source_promise_constructor_argument_arrow_is_exact,
     source_imports::SourceImportBindingPlan,
     store::CachedSignatureLookup,
-    type_nodes::normalize_numeric_separators,
+    type_nodes::{CanonicalTypeQuery, normalize_numeric_separators},
     type_records::{TypeCacheState, type_list_key},
     types::{ObjectFlags, TypeFlags},
 };
@@ -155,6 +161,7 @@ pub(super) struct SourceDefaultNewPlan {
     argument: Option<SourceNewArgument>,
     additional_arguments: Vec<SourceNewArgument>,
     parameter: Option<SourceNewParameter>,
+    executor: Option<Box<PlannedExpression>>,
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +172,7 @@ enum SourceNewTarget {
     GlobalObject(SourceGlobalObjectConstructorPlan),
     GlobalArray(SourceGlobalArrayConstructorPlan),
     GlobalDate(SourceGlobalDateConstructorPlan),
+    GlobalPromise(SourceGlobalPromiseConstructorPlan),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,6 +200,18 @@ struct SourceGlobalDateConstructorPlan {
     owner: SemanticSymbolId,
     declaration: NodeRef,
     return_annotation: NodeRef,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceGlobalPromiseConstructorPlan {
+    annotation: NodeRef,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    type_parameter: SemanticSymbolId,
+    parameter: SemanticSymbolId,
+    parameter_annotation: NodeRef,
+    return_annotation: NodeRef,
+    executor: NodeRef,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +284,50 @@ impl SourceDefaultNewPlan {
 
     pub(super) fn is_imported_class(&self) -> bool {
         matches!(&self.target, SourceNewTarget::ImportedClass(_))
+    }
+
+    pub(super) fn promise_executor_node(&self) -> Option<NodeRef> {
+        match &self.target {
+            SourceNewTarget::GlobalPromise(global) => Some(global.executor),
+            _ => None,
+        }
+    }
+
+    pub(super) fn set_promise_executor(
+        &mut self,
+        executor: PlannedExpression,
+    ) -> Result<(), SourceNewError> {
+        let Some(node) = self.promise_executor_node() else {
+            return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                self.constructor,
+            )));
+        };
+        if executor.node != node
+            || !matches!(&executor.kind, PlannedExpressionKind::Arrow(_))
+            || self.executor.is_some()
+        {
+            return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                self.constructor,
+            )));
+        }
+        self.executor = Some(Box::new(executor));
+        Ok(())
+    }
+
+    pub(super) fn promise_executor(&self) -> Option<&PlannedExpression> {
+        self.executor.as_deref()
+    }
+
+    pub(super) fn promise_executor_contextual_type(
+        &self,
+        store: &CanonicalTypeMapperStore,
+    ) -> Option<TypeId> {
+        let SourceNewTarget::GlobalPromise(global) = &self.target else {
+            return None;
+        };
+        store
+            .type_node_links(global.parameter_annotation)
+            .and_then(|links| links.resolved_type)
     }
 
     fn arguments(&self) -> impl Iterator<Item = &SourceNewArgument> {
@@ -380,6 +444,129 @@ impl SourceDefaultNewPlan {
     }
 }
 
+/// Recognizes the JavaScript Promise executor call that owns diagnostic TS2810.
+pub(super) fn promise_executor_missing_argument_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    call: NodeRef,
+    callee: NodeRef,
+    signature: SignatureId,
+) -> bool {
+    let Some(call_record) = host.node(call) else {
+        return false;
+    };
+    let NodeData::CallExpression(expression) = &call_record.data else {
+        return false;
+    };
+    let Some(arrow) = call_record
+        .parent
+        .map(|node| NodeRef::new(call.arena, call.file, node))
+    else {
+        return false;
+    };
+    let Some(arrow_record) = host.node(arrow) else {
+        return false;
+    };
+    let NodeData::ArrowFunction(executor) = &arrow_record.data else {
+        return false;
+    };
+    let [parameter] = executor.parameters.nodes.as_slice() else {
+        return false;
+    };
+    let parameter = NodeRef::new(arrow.arena, arrow.file, *parameter);
+    let Some(bound) = host.bound_file(arrow) else {
+        return false;
+    };
+    let Some(parameter_symbol) = bound
+        .symbol(parameter)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(callee_record) = host.node(callee) else {
+        return false;
+    };
+    let NodeData::Identifier(identifier) = &callee_record.data else {
+        return false;
+    };
+    let Some(annotation) = store
+        .signature(signature)
+        .and_then(|record| record.declaration())
+    else {
+        return false;
+    };
+    let Some(resolve_parameter) = host
+        .node(annotation)
+        .and_then(|record| record.parent)
+        .map(|node| NodeRef::new(annotation.arena, annotation.file, node))
+    else {
+        return false;
+    };
+    let Some(executor_annotation) = host
+        .node(resolve_parameter)
+        .and_then(|record| record.parent)
+        .map(|node| NodeRef::new(annotation.arena, annotation.file, node))
+    else {
+        return false;
+    };
+    let Some(constructor_parameter) = host
+        .node(executor_annotation)
+        .and_then(|record| record.parent)
+        .map(|node| NodeRef::new(annotation.arena, annotation.file, node))
+    else {
+        return false;
+    };
+    let Some(constructor_declaration) = host
+        .node(constructor_parameter)
+        .and_then(|record| record.parent)
+        .map(|node| NodeRef::new(annotation.arena, annotation.file, node))
+    else {
+        return false;
+    };
+    let Some(owner) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("PromiseConstructor"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+
+    call_record.kind == SyntaxKind::CallExpression
+        && call_record.flags.0 == 0
+        && expression.expression == callee.node
+        && expression.arguments.nodes.is_empty()
+        && arrow_record.kind == SyntaxKind::ArrowFunction
+        && executor.body == call.node
+        && bound
+            .source_facts()
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
+        && source_promise_constructor_argument_arrow_is_exact(store, host, arrow)
+            .is_ok_and(|valid| valid)
+        && callee_record.kind == SyntaxKind::Identifier
+        && callee_record.parent == Some(call.node)
+        && identifier.text == "resolve"
+        && store
+            .symbol_node_links(callee)
+            .and_then(|links| links.resolved_symbol)
+            == Some(parameter_symbol)
+        && host.node(annotation).map(|record| record.kind) == Some(SyntaxKind::FunctionType)
+        && host.node(resolve_parameter).map(|record| record.kind) == Some(SyntaxKind::Parameter)
+        && host.node(executor_annotation).map(|record| record.kind)
+            == Some(SyntaxKind::FunctionType)
+        && host.node(constructor_parameter).map(|record| record.kind) == Some(SyntaxKind::Parameter)
+        && host.node(constructor_declaration).map(|record| record.kind)
+            == Some(SyntaxKind::ConstructSignature)
+        && store
+            .symbol(owner)
+            .and_then(|owner| owner.members())
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+            .and_then(|constructor| store.symbol(constructor))
+            .and_then(|constructor| constructor.declarations())
+            .is_some_and(|declarations| declarations.contains(&constructor_declaration))
+}
+
 /// Exact selected signature and result of one default construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CheckedSourceDefaultNew {
@@ -411,6 +598,7 @@ pub(super) fn plan_direct_default_new(
         return Err(unsupported(SourceNewUnsupported::Expression(node)));
     }
     let mut arguments = Vec::new();
+    let mut executor = None;
     let argument_start = match new_expression.arguments.as_ref() {
         Some(argument_nodes) => {
             if argument_nodes.has_trailing_comma
@@ -433,6 +621,21 @@ pub(super) fn plan_direct_default_new(
                 let argument_record = arena
                     .get(argument_node.node)
                     .ok_or_else(|| invariant(SourceNewInvariant::MissingNode(argument_node)))?;
+                if matches!(&argument_record.data, NodeData::ArrowFunction(_))
+                    && argument_record.kind == SyntaxKind::ArrowFunction
+                {
+                    if argument_nodes.nodes.len() != 1
+                        || executor.replace(argument_node).is_some()
+                        || argument_record.flags.0 != 0
+                        || argument_record.parent != Some(node.node)
+                        || argument_record.range.start <= argument_nodes.range.start
+                        || argument_record.range.end >= argument_nodes.range.end
+                        || !bound.contains(argument_node)
+                    {
+                        return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+                    }
+                    continue;
+                }
                 let value = match &argument_record.data {
                     NodeData::StringLiteral(literal)
                         if argument_record.kind == SyntaxKind::StringLiteral
@@ -576,6 +779,16 @@ pub(super) fn plan_direct_default_new(
             .and_then(|global| store.get_merged_symbol(global))
             == Some(symbol);
     let imported_class = import_bindings.contains_key(&resolved_symbol);
+    let global_promise = identifier.text == "Promise"
+        && store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Promise"))
+            .and_then(|global| store.get_merged_symbol(global))
+            == Some(symbol);
+    if executor.is_some() && !global_promise {
+        return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+    }
     if !global_array
         && (arguments.len() > 1 || new_expression.type_arguments.is_some() && !imported_class)
     {
@@ -644,6 +857,18 @@ pub(super) fn plan_direct_default_new(
         }
         let global = plan_global_date_constructor(store, host, constructor, symbol)?;
         (SourceNewTarget::GlobalDate(global), None)
+    } else if global_promise {
+        let Some(executor) = executor else {
+            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+        };
+        if argument.is_some()
+            || !source_promise_constructor_argument_arrow_is_exact(store, host, executor)
+                .map_err(|_| unsupported(SourceNewUnsupported::Arguments(node)))?
+        {
+            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+        }
+        let global = plan_global_promise_constructor(store, host, constructor, symbol, executor)?;
+        (SourceNewTarget::GlobalPromise(global), None)
     } else if symbol_record.flags() == SymbolFlags::CLASS {
         let class = if let Some(class) = prior_classes.get(&symbol) {
             ClassMemberQueryPlan::Direct(class.clone())
@@ -736,6 +961,7 @@ pub(super) fn plan_direct_default_new(
         argument,
         additional_arguments,
         parameter,
+        executor: None,
     };
     preflight_default_new_cache(store, host, &plan)?;
     Ok(plan)
@@ -1187,6 +1413,309 @@ fn plan_global_date_constructor(
             owner,
             declaration: signature_declaration,
             return_annotation,
+        });
+    }
+
+    Err(reject())
+}
+
+#[allow(clippy::too_many_lines)] // Preserve the global, generic signature, and executor proof.
+fn plan_global_promise_constructor(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    constructor: NodeRef,
+    symbol: SemanticSymbolId,
+    executor: NodeRef,
+) -> Result<SourceGlobalPromiseConstructorPlan, SourceNewError> {
+    let reject = || {
+        unsupported(SourceNewUnsupported::ConstructorClass {
+            node: constructor,
+            symbol,
+        })
+    };
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(reject)?;
+    let globals = store.symbol_table(bootstrap.globals).ok_or_else(reject)?;
+    let promise = store.symbol(symbol).ok_or_else(reject)?;
+    let allowed_flags =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    let variable_declaration = promise.value_declaration().ok_or_else(reject)?;
+    let (arena, bound) = host.source(variable_declaration).ok_or_else(reject)?;
+    let variable_record = arena.get(variable_declaration.node).ok_or_else(reject)?;
+    let NodeData::VariableDeclaration(variable) = &variable_record.data else {
+        return Err(reject());
+    };
+    let annotation = variable
+        .type_
+        .map(|node| NodeRef::new(variable_declaration.arena, variable_declaration.file, node))
+        .ok_or_else(reject)?;
+    let annotation_record = host.node(annotation).ok_or_else(reject)?;
+    let NodeData::TypeReferenceNode(annotation_reference) = &annotation_record.data else {
+        return Err(reject());
+    };
+    let annotation_name = NodeRef::new(
+        annotation.arena,
+        annotation.file,
+        annotation_reference.type_name,
+    );
+    let annotation_name_record = host.node(annotation_name).ok_or_else(reject)?;
+    let NodeData::Identifier(annotation_identifier) = &annotation_name_record.data else {
+        return Err(reject());
+    };
+    let owner = globals
+        .get_source("PromiseConstructor")
+        .and_then(|owner| store.get_merged_symbol(owner))
+        .ok_or_else(reject)?;
+    let owner_record = store.symbol(owner).ok_or_else(reject)?;
+    let owner_declarations = owner_record.declarations().ok_or_else(reject)?;
+    let constructor_symbol = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+        .and_then(|signature| store.get_merged_symbol(signature))
+        .ok_or_else(reject)?;
+    let constructor_record = store.symbol(constructor_symbol).ok_or_else(reject)?;
+    let declarations = constructor_record.declarations().ok_or_else(reject)?;
+    if promise.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        || !promise
+            .flags()
+            .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        || promise.flags().without(allowed_flags) != SymbolFlags::NONE
+        || promise.check_flags() != CheckFlags::NONE
+        || promise.name().as_utf8() != Some("Promise")
+        || promise.parent().is_some()
+        || promise.exports().is_some()
+        || promise.export_symbol().is_some()
+        || globals
+            .get_source("Promise")
+            .and_then(|global| store.get_merged_symbol(global))
+            != Some(symbol)
+        || variable_record.kind != SyntaxKind::VariableDeclaration
+        || variable.initializer.is_some()
+        || bound
+            .symbol(variable_declaration)
+            .and_then(|declared| store.get_merged_symbol(declared))
+            != Some(symbol)
+        || annotation_record.kind != SyntaxKind::TypeReference
+        || annotation_record.parent != Some(variable_declaration.node)
+        || annotation_reference.type_arguments.is_some()
+        || annotation_name_record.kind != SyntaxKind::Identifier
+        || annotation_name_record.parent != Some(annotation.node)
+        || annotation_identifier.text != "PromiseConstructor"
+        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name().as_utf8() != Some("PromiseConstructor")
+        || owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || owner_declarations.is_empty()
+        || constructor_record.flags() != SymbolFlags::SIGNATURE
+        || constructor_record.check_flags() != CheckFlags::NONE
+        || constructor_record
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(owner)
+        || declarations.is_empty()
+    {
+        return Err(reject());
+    }
+
+    for &declaration in declarations {
+        let Some(record) = host.node(declaration) else {
+            continue;
+        };
+        let NodeData::ConstructSignatureDeclaration(signature) = &record.data else {
+            continue;
+        };
+        let Some(type_parameters) = signature.type_parameters.as_ref() else {
+            continue;
+        };
+        let [type_parameter] = type_parameters.nodes.as_slice() else {
+            continue;
+        };
+        let [parameter] = signature.parameters.nodes.as_slice() else {
+            continue;
+        };
+        let type_parameter = NodeRef::new(declaration.arena, declaration.file, *type_parameter);
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+        let Some(type_parameter_record) = host.node(type_parameter) else {
+            continue;
+        };
+        let NodeData::TypeParameterDeclaration(type_parameter_data) = &type_parameter_record.data
+        else {
+            continue;
+        };
+        let Some(parameter_record) = host.node(parameter) else {
+            continue;
+        };
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            continue;
+        };
+        let Some(parameter_annotation) = parameter_data.type_ else {
+            continue;
+        };
+        let parameter_annotation =
+            NodeRef::new(declaration.arena, declaration.file, parameter_annotation);
+        let Some(parameter_annotation_record) = host.node(parameter_annotation) else {
+            continue;
+        };
+        let Some(return_annotation) = signature.type_ else {
+            continue;
+        };
+        let return_annotation =
+            NodeRef::new(declaration.arena, declaration.file, return_annotation);
+        let Some(return_record) = host.node(return_annotation) else {
+            continue;
+        };
+        let NodeData::TypeReferenceNode(return_reference) = &return_record.data else {
+            continue;
+        };
+        let return_name = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            return_reference.type_name,
+        );
+        let Some(return_name_record) = host.node(return_name) else {
+            continue;
+        };
+        let NodeData::Identifier(return_identifier) = &return_name_record.data else {
+            continue;
+        };
+        let Some(return_arguments) = return_reference.type_arguments.as_ref() else {
+            continue;
+        };
+        let [return_argument] = return_arguments.nodes.as_slice() else {
+            continue;
+        };
+        let return_argument = NodeRef::new(declaration.arena, declaration.file, *return_argument);
+        let Some(return_argument_record) = host.node(return_argument) else {
+            continue;
+        };
+        let NodeData::TypeReferenceNode(return_parameter) = &return_argument_record.data else {
+            continue;
+        };
+        let return_parameter_name = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            return_parameter.type_name,
+        );
+        let Some(return_parameter_record) = host.node(return_parameter_name) else {
+            continue;
+        };
+        let NodeData::Identifier(return_parameter_identifier) = &return_parameter_record.data
+        else {
+            continue;
+        };
+        let type_parameter_name = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            type_parameter_data.name,
+        );
+        let Some(type_parameter_name_record) = host.node(type_parameter_name) else {
+            continue;
+        };
+        let NodeData::Identifier(type_parameter_identifier) = &type_parameter_name_record.data
+        else {
+            continue;
+        };
+        let Some(type_parameter_symbol) = host
+            .bound_file(type_parameter)
+            .and_then(|bound| bound.symbol(type_parameter))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+        else {
+            continue;
+        };
+        let Some(parameter_symbol) = host
+            .bound_file(parameter)
+            .and_then(|bound| bound.symbol(parameter))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+        else {
+            continue;
+        };
+        let Ok(executor_plan) =
+            plan_function_type(store, host, parameter_annotation, None, false, None)
+        else {
+            continue;
+        };
+        let [resolve, reject_parameter] = executor_plan.parameters.as_slice() else {
+            continue;
+        };
+        let Ok(resolve_plan) =
+            plan_function_type(store, host, resolve.type_node, None, false, None)
+        else {
+            continue;
+        };
+        let Ok(reject_plan) =
+            plan_function_type(store, host, reject_parameter.type_node, None, false, None)
+        else {
+            continue;
+        };
+        if record.kind != SyntaxKind::ConstructSignature
+            || !owner_declarations.iter().any(|owner_declaration| {
+                record.parent == Some(owner_declaration.node)
+                    && declaration.arena == owner_declaration.arena
+                    && declaration.file == owner_declaration.file
+            })
+            || type_parameters.has_trailing_comma
+            || type_parameter_record.kind != SyntaxKind::TypeParameter
+            || type_parameter_record.parent != Some(declaration.node)
+            || type_parameter_data.constraint.is_some()
+            || type_parameter_data.default_type.is_some()
+            || type_parameter_name_record.parent != Some(type_parameter.node)
+            || type_parameter_name_record.kind != SyntaxKind::Identifier
+            || parameter_record.kind != SyntaxKind::Parameter
+            || parameter_record.parent != Some(declaration.node)
+            || parameter_data.initializer.is_some()
+            || parameter_data.question_token.is_some()
+            || parameter_data.dot_dot_dot_token.is_some()
+            || parameter_annotation_record.kind != SyntaxKind::FunctionType
+            || parameter_annotation_record.parent != Some(parameter.node)
+            || executor_plan.min_argument_count != 2
+            || executor_plan.flags != SignatureFlags::NONE
+            || host.node(executor_plan.return_type).map(|node| node.kind)
+                != Some(SyntaxKind::VoidKeyword)
+            || resolve_plan.parameters.len() != 1
+            || resolve_plan.min_argument_count != 1
+            || host.node(resolve_plan.return_type).map(|node| node.kind)
+                != Some(SyntaxKind::VoidKeyword)
+            || reject_plan.parameters.len() != 1
+            || reject_plan.min_argument_count != 0
+            || host.node(reject_plan.return_type).map(|node| node.kind)
+                != Some(SyntaxKind::VoidKeyword)
+            || return_record.kind != SyntaxKind::TypeReference
+            || return_record.parent != Some(declaration.node)
+            || return_name_record.kind != SyntaxKind::Identifier
+            || return_name_record.parent != Some(return_annotation.node)
+            || return_identifier.text != "Promise"
+            || return_arguments.has_trailing_comma
+            || return_argument_record.kind != SyntaxKind::TypeReference
+            || return_argument_record.parent != Some(return_annotation.node)
+            || return_parameter.type_arguments.is_some()
+            || return_parameter_record.kind != SyntaxKind::Identifier
+            || return_parameter_record.parent != Some(return_argument.node)
+            || return_parameter_identifier.text != type_parameter_identifier.text
+            || store.symbol(type_parameter_symbol).is_none_or(|symbol| {
+                symbol.flags() != SymbolFlags::TYPE_PARAMETER
+                    || symbol.check_flags() != CheckFlags::NONE
+                    || symbol.declarations() != Some(&[type_parameter])
+            })
+            || store.symbol(parameter_symbol).is_none_or(|symbol| {
+                symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    || symbol.check_flags() != CheckFlags::NONE
+                    || symbol.declarations() != Some(&[parameter])
+                    || symbol.value_declaration() != Some(parameter)
+            })
+        {
+            continue;
+        }
+        return Ok(SourceGlobalPromiseConstructorPlan {
+            annotation,
+            owner,
+            declaration,
+            type_parameter: type_parameter_symbol,
+            parameter: parameter_symbol,
+            parameter_annotation,
+            return_annotation,
+            executor,
         });
     }
 
@@ -2078,6 +2607,27 @@ pub(super) fn preflight_direct_default_new(
                 )));
             }
         }
+        SourceNewTarget::GlobalPromise(expected) => {
+            let actual = plan_global_promise_constructor(
+                store,
+                host,
+                plan.constructor,
+                plan.resolved_symbol,
+                expected.executor,
+            )?;
+            if actual != *expected
+                || plan.argument.is_some()
+                || plan.parameter.is_some()
+                || plan.executor.as_ref().is_none_or(|executor| {
+                    executor.node != expected.executor
+                        || !matches!(&executor.kind, PlannedExpressionKind::Arrow(_))
+                })
+            {
+                return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                )));
+            }
+        }
     }
     preflight_default_new_cache(store, host, plan)
 }
@@ -2089,6 +2639,7 @@ pub(super) fn prepare_direct_default_news(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
     plans: &[SourceDefaultNewPlan],
 ) -> Result<(), SourceNewError> {
     let Some(capacity_node) = plans.first().map(|plan| plan.node) else {
@@ -2126,6 +2677,18 @@ pub(super) fn prepare_direct_default_news(
                 if !imported_constructor_type_arguments(store, host, plan, &class)?.is_empty() {
                     materialize_imported_generic_constructor(store, host, plan, &class)?;
                 }
+            }
+            SourceNewTarget::GlobalPromise(global)
+                if resolved_global_promise_constructor(store, plan, global)?.is_none() =>
+            {
+                materialize_global_promise_constructor(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    plan,
+                    global,
+                )?;
             }
             _ => {}
         }
@@ -2696,6 +3259,221 @@ fn materialize_global_date_constructor(
     Ok(())
 }
 
+/// Materializes the real generic Promise constructor and its lazy executor types.
+#[allow(clippy::too_many_arguments)] // Preserve the constructor's production query options.
+fn materialize_global_promise_constructor(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+    global: &SourceGlobalPromiseConstructorPlan,
+) -> Result<(), SourceNewError> {
+    if resolved_global_promise_constructor(store, plan, global)?.is_some() {
+        return Ok(());
+    }
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    let owner_flags = store.symbol(global.owner).ok_or_else(invalid)?.flags();
+    let promise_flags = store
+        .symbol(plan.resolved_symbol)
+        .ok_or_else(invalid)?
+        .flags();
+    if preflight_class_or_interface_reference(store, host, global.owner, owner_flags)? != 0
+        || preflight_class_or_interface_reference(store, host, plan.resolved_symbol, promise_flags)?
+            != 1
+    {
+        return Err(invalid());
+    }
+    let declared_owner = store
+        .declared_type_links(global.owner)
+        .and_then(|links| links.declared_type);
+    if exact_type_cache(store, global.annotation)
+        .map_err(|()| invalid())?
+        .is_some_and(|cached| Some(cached) != declared_owner)
+        || exact_class_value_type(store, plan.resolved_symbol)?
+            .is_some_and(|cached| Some(cached) != declared_owner)
+    {
+        return Err(invalid());
+    }
+
+    let promise_target = store.get_declared_type_of_symbol(host, plan.resolved_symbol)?;
+    let reference =
+        validate_direct_generic_reference(store, promise_target).map_err(|_| invalid())?;
+    if reference.target != promise_target || reference.type_arguments.len() != 1 {
+        return Err(invalid());
+    }
+    let value_type = store.get_declared_type_of_symbol(host, global.owner)?;
+    if declared_owner.is_some_and(|declared| declared != value_type) {
+        return Err(invalid());
+    }
+    let value = store.type_payload(value_type).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = value.data() else {
+        return Err(invalid());
+    };
+    if value.flags() != TypeFlags::OBJECT
+        || !value.object_flags().contains(ObjectFlags::INTERFACE)
+        || value.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
+        || value.symbol() != Some(global.owner)
+        || value.alias().is_some()
+        || interface.declared_members_resolved
+        || interface.reference.object.structured.signatures.is_some()
+        || interface.declared_construct_signatures.is_some()
+    {
+        return Err(invalid());
+    }
+
+    let generic = execute_type_parameter(store, global.type_parameter);
+    let mut query_diagnostics = CanonicalCheckerDiagnostics::default();
+    let (executor_type, return_type) = {
+        let mut query = CanonicalTypeQuery::new_with_global_types(
+            store,
+            host,
+            global_types,
+            options,
+            &mut query_diagnostics,
+        )?;
+        (
+            query.get_type_from_type_node(global.parameter_annotation)?,
+            query.get_type_from_type_node(global.return_annotation)?,
+        )
+    };
+    if !query_diagnostics.is_empty() {
+        return Err(invalid());
+    }
+    let expected_return =
+        create_direct_generic_reference(store, promise_target, &[generic], ObjectFlags::NONE)
+            .map_err(|_| invalid())?;
+    if return_type != expected_return {
+        return Err(invalid());
+    }
+    let unknown = store
+        .intrinsic_bootstrap()
+        .ok_or_else(invalid)?
+        .unknown_type;
+    let instance_type =
+        create_direct_generic_reference(store, promise_target, &[unknown], ObjectFlags::NONE)
+            .map_err(|_| invalid())?;
+
+    let base = if let Some(signature) =
+        exact_signature_cache(store, global.declaration).map_err(|()| invalid())?
+    {
+        let record = store.signature(signature).ok_or_else(invalid)?;
+        if record.declaration() != Some(global.declaration)
+            || record.flags() != SignatureFlags::CONSTRUCT
+            || record.type_parameters() != [generic]
+            || record.parameters() != [global.parameter]
+            || record.min_argument_count() != 1
+            || record.resolved_return_type() != Some(return_type)
+        {
+            return Err(invalid());
+        }
+        signature
+    } else {
+        if exact_class_value_type(store, global.parameter)?
+            .is_some_and(|cached| cached != executor_type)
+            || !store.try_reserve_signatures(1)
+            || !store.try_reserve_signature_links(usize::from(
+                store.signature_links(global.declaration).is_none(),
+            ))
+            || !store.try_reserve_type_node_links(usize::from(
+                store.type_node_links(global.annotation).is_none(),
+            ))
+            || !store.try_reserve_value_symbol_links(
+                usize::from(store.value_symbol_links(plan.resolved_symbol).is_none())
+                    + usize::from(store.value_symbol_links(global.parameter).is_none()),
+            )
+            || !store.try_reserve_function_signature_return_annotations(1)
+        {
+            return Err(invalid());
+        }
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::CONSTRUCT,
+                Some(global.declaration),
+                vec![generic],
+                None,
+                vec![global.parameter],
+                Some(return_type),
+                None,
+                1,
+            )
+            .ok_or_else(invalid)?;
+        assert!(store.set_type_node_links(
+            global.annotation,
+            TypeNodeLinks {
+                resolved_type: Some(value_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            plan.resolved_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(value_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            global.parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(executor_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_signature_links(
+            global.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(store.set_function_signature_return_annotation(
+            signature,
+            global.return_annotation,
+            false,
+        ));
+        signature
+    };
+
+    let key = type_list_key(&[unknown]);
+    match store.cached_signature(base, key, &[unknown]) {
+        CachedSignatureLookup::Hit(signature) => {
+            if store
+                .signature(signature)
+                .and_then(super::signatures::Signature::resolved_return_type)
+                != Some(instance_type)
+            {
+                return Err(invalid());
+            }
+        }
+        CachedSignatureLookup::Missing => {
+            let mapper = store
+                .new_simple_type_mapper(generic, unknown)
+                .ok_or_else(invalid)?;
+            let signature = store
+                .instantiate_signature_ex(base, mapper, true)
+                .map_err(|_| invalid())?;
+            if !store.try_reserve_cached_signatures(1)
+                || !store.set_signature_resolved_return_type(signature, Some(instance_type))
+                || !store.set_cached_signature(base, key, Box::new([unknown]), signature)
+            {
+                return Err(invalid());
+            }
+        }
+        CachedSignatureLookup::HashCollision(_) | CachedSignatureLookup::Invalid => {
+            return Err(invalid());
+        }
+    }
+
+    if resolved_global_promise_constructor(store, plan, global)?.is_none() {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// Publishes only the selected real `ArrayConstructor` declaration and instance.
 fn materialize_global_array_constructor(
     store: &mut CanonicalTypeMapperStore,
@@ -2978,6 +3756,13 @@ pub(super) fn check_direct_default_new(
         }
         SourceNewTarget::GlobalDate(global) => {
             resolved_global_date_constructor(store, plan, global)?.ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?
+        }
+        SourceNewTarget::GlobalPromise(global) => {
+            resolved_global_promise_constructor(store, plan, global)?.ok_or_else(|| {
                 invariant(SourceNewInvariant::InvalidConstructorCache(
                     plan.constructor,
                 ))
@@ -3365,6 +4150,113 @@ fn resolved_global_date_constructor(
     }))
 }
 
+fn resolved_global_promise_constructor(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceDefaultNewPlan,
+    global: &SourceGlobalPromiseConstructorPlan,
+) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    let Some(value_type) = store
+        .declared_type_links(global.owner)
+        .and_then(|links| links.declared_type)
+    else {
+        return Ok(None);
+    };
+    if exact_type_cache(store, global.annotation)
+        .map_err(|()| invalid())?
+        .is_some_and(|cached| cached != value_type)
+        || exact_class_value_type(store, plan.resolved_symbol)?
+            .is_some_and(|cached| cached != value_type)
+    {
+        return Err(invalid());
+    }
+    let Some(promise_target) = store
+        .declared_type_links(plan.resolved_symbol)
+        .and_then(|links| links.declared_type)
+    else {
+        return Ok(None);
+    };
+    let Some(base) = exact_signature_cache(store, global.declaration).map_err(|()| invalid())?
+    else {
+        return Ok(None);
+    };
+    let generic = store
+        .declared_type_links(global.type_parameter)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(invalid)?;
+    let executor = exact_type_cache(store, global.parameter_annotation)
+        .map_err(|()| invalid())?
+        .ok_or_else(invalid)?;
+    let return_type = exact_type_cache(store, global.return_annotation)
+        .map_err(|()| invalid())?
+        .ok_or_else(invalid)?;
+    let record = store.signature(base).ok_or_else(invalid)?;
+    let value = store.type_payload(value_type).ok_or_else(invalid)?;
+    if value.flags() != TypeFlags::OBJECT
+        || !value.object_flags().contains(ObjectFlags::INTERFACE)
+        || value.symbol() != Some(global.owner)
+        || value.alias().is_some()
+        || record.flags() != SignatureFlags::CONSTRUCT
+        || record.declaration() != Some(global.declaration)
+        || record.type_parameters() != [generic]
+        || record.parameters() != [global.parameter]
+        || record.min_argument_count() != 1
+        || record.resolved_min_argument_count() != -1
+        || record.resolved_return_type() != Some(return_type)
+        || record.this_parameter().is_some()
+        || record.resolved_type_predicate().is_some()
+        || record.target().is_some()
+        || record.mapper().is_some()
+        || record.isolated_signature_type().is_some()
+        || record.composite().is_some()
+        || exact_class_value_type(store, global.parameter)? != Some(executor)
+        || store.function_signature_return_annotation(base)
+            != Some((global.return_annotation, false))
+    {
+        return Err(invariant(SourceNewInvariant::InvalidConstructSignature(
+            base,
+        )));
+    }
+    let unknown = store
+        .intrinsic_bootstrap()
+        .ok_or_else(invalid)?
+        .unknown_type;
+    let selected = match store.cached_signature(base, type_list_key(&[unknown]), &[unknown]) {
+        CachedSignatureLookup::Hit(signature) => signature,
+        CachedSignatureLookup::Missing => return Ok(None),
+        CachedSignatureLookup::HashCollision(_) | CachedSignatureLookup::Invalid => {
+            return Err(invalid());
+        }
+    };
+    let signature = store.signature(selected).ok_or_else(invalid)?;
+    let instance_type = signature.resolved_return_type().ok_or_else(invalid)?;
+    let instance =
+        validate_direct_generic_reference(store, instance_type).map_err(|_| invalid())?;
+    if instance.target != promise_target
+        || instance.type_arguments.as_slice() != [unknown]
+        || signature.flags() != SignatureFlags::CONSTRUCT
+        || signature.declaration() != Some(global.declaration)
+        || !signature.type_parameters().is_empty()
+        || signature.min_argument_count() != 1
+        || signature.target() != Some(base)
+        || signature.mapper().is_none()
+    {
+        return Err(invariant(SourceNewInvariant::InvalidConstructSignature(
+            selected,
+        )));
+    }
+
+    Ok(Some(CheckedSourceDefaultNew {
+        value_type,
+        instance_type,
+        signature: selected,
+    }))
+}
+
 fn resolved_global_array_constructor(
     store: &CanonicalTypeMapperStore,
     plan: &SourceDefaultNewPlan,
@@ -3632,6 +4524,20 @@ fn preflight_default_new_cache(
         }
         SourceNewTarget::GlobalDate(global) => {
             let resolved = resolved_global_date_constructor(store, plan, global)?;
+            if constructor_type.is_some_and(|constructor| {
+                resolved.is_none_or(|resolved| constructor != resolved.value_type)
+            }) || result_type.is_some_and(|result| {
+                resolved.is_none_or(|resolved| result != resolved.instance_type)
+            }) || signature.is_some_and(|signature| {
+                resolved.is_none_or(|resolved| signature != resolved.signature)
+            }) {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+        }
+        SourceNewTarget::GlobalPromise(global) => {
+            let resolved = resolved_global_promise_constructor(store, plan, global)?;
             if constructor_type.is_some_and(|constructor| {
                 resolved.is_none_or(|resolved| constructor != resolved.value_type)
             }) || result_type.is_some_and(|result| {
@@ -4102,6 +5008,65 @@ mod tests {
         .unwrap()
     }
 
+    fn global_promise_constructor_context<'arena>(
+        base: &'arena ParseResult,
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+        base_file: FileId,
+        library_file: FileId,
+        source_file: FileId,
+    ) -> CanonicalCheckerContext<'arena> {
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, path) in [
+            (base, base_file, "\"/lib/es5.d.ts\""),
+            (library, library_file, "\"/lib/es2015.promise.d.ts\""),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        true,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                source_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/promise.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&source.arena, source_file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (base_file, &base.arena),
+                (library_file, &library.arena),
+                (source_file, &source.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
     fn global_array_constructor_library() -> ParseResult {
         parse_source_file(concat!(
             "interface Array<T> {} ",
@@ -4128,6 +5093,22 @@ mod tests {
             "readonly prototype: Date; ",
             "} ",
             "declare var Date: DateConstructor;",
+        ))
+    }
+
+    fn global_promise_base_library() -> ParseResult {
+        parse_source_file("interface PromiseLike<T> {} interface Promise<T> {}")
+    }
+
+    fn global_promise_constructor_library() -> ParseResult {
+        parse_source_file(concat!(
+            "interface PromiseConstructor { ",
+            "readonly prototype: Promise<any>; ",
+            "new<T>(executor: ",
+            "(resolve: (value: T | PromiseLike<T>) => void, ",
+            "reject: (reason?: any) => void) => void): Promise<T>; ",
+            "} ",
+            "declare var Promise: PromiseConstructor;",
         ))
     }
 
@@ -4797,6 +5778,256 @@ mod tests {
                     );
                 }
                 _ => unreachable!("global Date poison cases are bounded"),
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                context.recheck_source_file(source_file).is_err(),
+                "case {poison}",
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+                "case {poison}",
+            );
+        }
+    }
+
+    #[test]
+    fn global_promise_executor_preserves_generic_identity_and_reports_jsdoc_hint() {
+        let base = global_promise_base_library();
+        let library = global_promise_constructor_library();
+        let source = parse_javascript_source_file("new Promise((resolve) => resolve());");
+        assert!(base.diagnostics.is_empty(), "{:?}", base.diagnostics);
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let base_file = FileId::new(1_850);
+        let library_file = FileId::new(1_851);
+        let source_file = FileId::new(1_852);
+        let mut context = global_promise_constructor_context(
+            &base,
+            &library,
+            &source,
+            base_file,
+            library_file,
+            source_file,
+        );
+        let (promise, owner, declaration) = {
+            let store = context.store();
+            let globals = store
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                .unwrap();
+            let promise = globals
+                .get_source("Promise")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let owner = globals
+                .get_source("PromiseConstructor")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let declaration = store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+                .and_then(|signature| store.symbol(signature))
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .and_then(|declarations| declarations.first())
+                .copied()
+                .unwrap();
+            assert!(store.declared_type_links(promise).is_none());
+            assert!(store.declared_type_links(owner).is_none());
+            assert!(store.signature_links(declaration).is_none());
+            (promise, owner, declaration)
+        };
+        let construction = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let executor = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        context.check_source_file(source_file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected the missing Promise JSDoc hint")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2810);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            concat!(
+                "Expected 1 argument, but got 0. 'new Promise()' needs a JSDoc ",
+                "hint to produce a 'resolve' that can be called without arguments.",
+            ),
+        );
+        let store = context.store();
+        let promise_target = store
+            .declared_type_links(promise)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let instance = store
+            .type_node_links(construction)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let unknown = store.intrinsic_bootstrap().unwrap().unknown_type;
+        let reference = validate_direct_generic_reference(store, instance).unwrap();
+        assert_eq!(reference.target, promise_target);
+        assert_eq!(reference.type_arguments, vec![unknown]);
+        let value = store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .and_then(|type_| store.type_payload(type_))
+            .unwrap();
+        assert!(!value.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED));
+        let base = store
+            .signature_links(declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let selected = store
+            .signature_links(construction)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        assert_ne!(base, selected);
+        assert_eq!(store.signature(selected).unwrap().target(), Some(base));
+        let executor_type = store
+            .type_node_links(executor)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let provenance = store.source_callable_provenance(executor_type).unwrap();
+        assert!(provenance.contextual_target.is_some());
+        assert!(provenance.contextual_variable.is_none());
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.cached_signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        context.recheck_source_file(source_file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().cached_signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert_eq!(context.diagnostics().as_slice().len(), 1);
+    }
+
+    #[test]
+    fn global_promise_constructor_rejects_forged_global_and_signature_caches() {
+        for poison in 0..3 {
+            let base_library = global_promise_base_library();
+            let library = global_promise_constructor_library();
+            let source = parse_javascript_source_file("new Promise((resolve) => resolve());");
+            let base_file = FileId::new(1_860 + poison * 3);
+            let library_file = FileId::new(1_861 + poison * 3);
+            let source_file = FileId::new(1_862 + poison * 3);
+            let mut context = global_promise_constructor_context(
+                &base_library,
+                &library,
+                &source,
+                base_file,
+                library_file,
+                source_file,
+            );
+
+            context.check_source_file(source_file).unwrap();
+
+            let (promise, owner, globals, base, selected) = {
+                let store = context.store();
+                let globals = store.intrinsic_bootstrap().unwrap().globals;
+                let symbols = store.symbol_table(globals).unwrap();
+                let promise = symbols
+                    .get_source("Promise")
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap();
+                let owner = symbols
+                    .get_source("PromiseConstructor")
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap();
+                let declaration = store
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+                    .and_then(|signature| store.symbol(signature))
+                    .and_then(ts_binder::semantic::Symbol::declarations)
+                    .and_then(|declarations| declarations.first())
+                    .copied()
+                    .unwrap();
+                let base = store
+                    .signature_links(declaration)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .unwrap();
+                let unknown = store.intrinsic_bootstrap().unwrap().unknown_type;
+                let selected =
+                    match store.cached_signature(base, type_list_key(&[unknown]), &[unknown]) {
+                        CachedSignatureLookup::Hit(signature) => signature,
+                        _ => panic!("expected the selected Promise signature"),
+                    };
+                (promise, owner, globals, base, selected)
+            };
+            match poison {
+                0 => {
+                    assert!(context.store_mut_for_test().set_signature_flags(
+                        base,
+                        SignatureFlags::CONSTRUCT | SignatureFlags::ABSTRACT,
+                    ));
+                }
+                1 => {
+                    let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_resolved_return_type(selected, Some(string))
+                    );
+                }
+                2 => {
+                    assert_eq!(
+                        context.store_mut_for_test().insert_symbol(
+                            globals,
+                            EscapedName::source("Promise"),
+                            owner,
+                        ),
+                        Some(Some(promise)),
+                    );
+                }
+                _ => unreachable!("global Promise poison cases are bounded"),
             }
             let before = (
                 context.store().type_len(),

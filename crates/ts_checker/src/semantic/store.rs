@@ -1361,7 +1361,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             _ => return false,
         };
         if self.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
-            || self.source_node_kind(call) != Some(SyntaxKind::CallExpression)
+            || !matches!(
+                (
+                    self.source_node_kind(call),
+                    self.source_node_kind(container)
+                ),
+                (Some(SyntaxKind::CallExpression), _)
+                    | (
+                        Some(SyntaxKind::NewExpression),
+                        Some(SyntaxKind::ExpressionStatement)
+                    )
+            )
             || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
             || owner.flags() != SymbolFlags::FUNCTION
             || owner.check_flags() != CheckFlags::NONE

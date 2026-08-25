@@ -63,6 +63,7 @@ use super::{
         valid_stored_callable_type_predicate, validate_stored_source_callable,
     },
     source_imports::synthetic_source_import_origin,
+    source_new::promise_executor_missing_argument_is_exact,
     store::SourceNodeParent,
     type_nodes::CanonicalTypeQuery,
     type_records::{TypeData, TypeRecord},
@@ -4223,6 +4224,26 @@ fn prepare_legacy_source_call_diagnostic(
                 || actual != argument_types.len()
             {
                 return Err(SourceCheckError::Call(plan.node));
+            }
+            if expected_at_least == 1
+                && actual == 0
+                && !resolution.has_effective_rest
+                && promise_executor_missing_argument_is_exact(
+                    store,
+                    host,
+                    plan.node,
+                    plan.callee_diagnostic_node,
+                    resolution.signature,
+                )
+            {
+                return Ok(vec![CanonicalCheckerDiagnostic {
+                    node: Some(plan.callee_diagnostic_node),
+                    range_override: None,
+                    diagnostic: Diagnostic::new(
+                        message_by_code(2810).ok_or(SourceCheckError::MissingDiagnostic(2810))?,
+                    ),
+                    related_information: Vec::new(),
+                }]);
             }
             let (message, expected) = if resolution.has_effective_rest {
                 (

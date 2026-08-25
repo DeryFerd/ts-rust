@@ -158,7 +158,8 @@ use super::{
         publish_contextual_direct_call_source_callable, publish_contextual_source_callable,
         publish_inferred_source_callable_return, publish_jsdoc_contextual_source_callable,
         publish_jsdoc_parameterized_source_callable, source_direct_call_argument_arrow_is_exact,
-        source_object_property_arrow_symbol, validate_stored_source_callable,
+        source_object_property_arrow_symbol, source_promise_constructor_argument_arrow_is_exact,
+        validate_stored_source_callable,
     },
     source_calls::{
         SourceCallCalleeForm, SourceCallPlan, check_direct_source_call,
@@ -14845,6 +14846,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                     break;
                 }
+                NodeData::NewExpression(construction)
+                    if record.kind == SyntaxKind::NewExpression
+                        && construction.arguments.as_ref().is_some_and(|arguments| {
+                            arguments.nodes.as_slice() == [argument.node]
+                        }) =>
+                {
+                    if argument != declaration
+                        || !source_promise_constructor_argument_arrow_is_exact(
+                            store,
+                            host,
+                            declaration,
+                        )
+                        .map_err(Self::callable_plan_error)?
+                    {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ));
+                    }
+                    break;
+                }
                 NodeData::PropertyAssignment(property)
                     if record.kind == SyntaxKind::PropertyAssignment
                         && property.initializer == argument.node =>
@@ -14996,6 +15017,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && self.is_contextual_object_property_expression(store, declaration)?;
         let contextual_direct_call_arrow = !is_javascript
             && source_direct_call_argument_arrow_is_exact(store, host, declaration)
+                .map_err(Self::callable_plan_error)?
+            || source_promise_constructor_argument_arrow_is_exact(store, host, declaration)
                 .map_err(Self::callable_plan_error)?;
         if callable
             .parameters
@@ -16141,7 +16164,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     )));
                 };
                 let function_return = self.is_direct_top_level_function_return(expression)?;
-                let construction = plan_direct_default_new(
+                let mut construction = plan_direct_default_new(
                     self.arena,
                     self.bound,
                     store,
@@ -16171,6 +16194,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     )
                     .map_err(|error| Self::import_plan_error(constructor, &error))?;
                     self.import_reads.push(import_read);
+                }
+                if let Some(executor) = construction.promise_executor_node() {
+                    let executor = self.plan_expression(executor)?;
+                    construction
+                        .set_promise_executor(executor)
+                        .map_err(|error| Self::new_plan_error(expression, error))?;
                 }
                 self.default_news.push(construction.clone());
                 Ok(PlannedExpression::new(
@@ -22826,6 +22855,25 @@ fn check_expression_type(
         PlannedExpressionKind::New(construction) => {
             preflight_direct_default_new(store, host, construction)
                 .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+            if let Some(executor) = construction.promise_executor() {
+                let contextual = construction
+                    .promise_executor_contextual_type(store)
+                    .ok_or(SourceCheckError::Call(construction.node()))?;
+                check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    current_flow_types,
+                    preflighted_type_import_value_uses,
+                    executor,
+                    Some(contextual),
+                    deferred,
+                )?;
+            }
             let checked = check_direct_default_new(store, host, construction)
                 .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
             if store
@@ -23446,8 +23494,10 @@ fn check_planned_arrow_argument(
         .parameters
         .iter()
         .any(|parameter| parameter.is_implicit_any())
-        && source_direct_call_argument_arrow_is_exact(store, host, expression)
+        && (source_direct_call_argument_arrow_is_exact(store, host, expression)
             .map_err(SourcePlanner::callable_plan_error)?
+            || source_promise_constructor_argument_arrow_is_exact(store, host, expression)
+                .map_err(SourcePlanner::callable_plan_error)?)
     {
         let contextual_type = contextual_type.ok_or(SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::Arrow(expression),
@@ -23807,6 +23857,9 @@ fn check_contextual_direct_call_arrow(
     let Some(signature) = store.signature(target.signature) else {
         return Err(unsupported());
     };
+    let promise_executor =
+        source_promise_constructor_argument_arrow_is_exact(store, host, arrow.callable.declaration)
+            .map_err(SourcePlanner::callable_plan_error)?;
     let Some(parameter_type) = target.parameters.first().copied() else {
         return Err(unsupported());
     };
@@ -23814,6 +23867,7 @@ fn check_contextual_direct_call_arrow(
         || signature.has_rest_parameter()
         || target.rest_parameter.is_some()
         || target.min_argument_count == 0
+        || promise_executor && (target.parameters.len() != 2 || target.min_argument_count != 2)
     {
         return Err(unsupported());
     }
@@ -34064,8 +34118,16 @@ pub(super) fn check_source_file(
                         .map_err(SourcePlanner::callable_plan_error)?
                         == Some(anchor)
                 }
-                None => source_direct_call_argument_arrow_is_exact(store, host, arrow.declaration)
-                    .map_err(SourcePlanner::callable_plan_error)?,
+                None => {
+                    source_direct_call_argument_arrow_is_exact(store, host, arrow.declaration)
+                        .map_err(SourcePlanner::callable_plan_error)?
+                        || source_promise_constructor_argument_arrow_is_exact(
+                            store,
+                            host,
+                            arrow.declaration,
+                        )
+                        .map_err(SourcePlanner::callable_plan_error)?
+                }
             };
             if !valid_anchor
                 || !matches!(
@@ -34480,7 +34542,7 @@ pub(super) fn check_source_file(
         .filter(|construction| construction.requires_early_preparation())
         .cloned()
         .collect::<Vec<_>>();
-    prepare_direct_default_news(store, host, global_types, &early_default_news)
+    prepare_direct_default_news(store, host, global_types, options, &early_default_news)
         .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
 
     let materialized_overloads = materialize_source_overloads(
@@ -35090,7 +35152,7 @@ pub(super) fn check_source_file(
         inferred_function_diagnostics[index] = Some(function_diagnostics);
     }
 
-    prepare_direct_default_news(store, host, global_types, &default_news)
+    prepare_direct_default_news(store, host, global_types, options, &default_news)
         .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
     for statement in statements {
         session.reset_query();

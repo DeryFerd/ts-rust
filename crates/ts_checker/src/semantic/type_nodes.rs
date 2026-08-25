@@ -4397,6 +4397,93 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(false)
     }
 
+    fn is_authenticated_promise_constructor_union_type_parameter(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(parameter) = self.store.symbol(symbol) else {
+            return Ok(false);
+        };
+        let Some([declaration]) = parameter.declarations() else {
+            return Ok(false);
+        };
+        let declaration = *declaration;
+        let declaration_record = preflight_node(self.store, self.host, declaration)?;
+        let Some(construction) = declaration_record
+            .parent
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+        else {
+            return Ok(false);
+        };
+        let construction_record = preflight_node(self.store, self.host, construction)?;
+        let NodeData::ConstructSignatureDeclaration(signature) = &construction_record.data else {
+            return Ok(false);
+        };
+        let Some(owner) = construction_record
+            .parent
+            .map(|parent| NodeRef::new(construction.arena, construction.file, parent))
+        else {
+            return Ok(false);
+        };
+        let owner_record = preflight_node(self.store, self.host, owner)?;
+        let Some(bound) = self.host.bound_file(construction) else {
+            return Ok(false);
+        };
+        let Some(owner_symbol) = bound
+            .symbol(owner)
+            .and_then(|owner| self.store.get_merged_symbol(owner))
+        else {
+            return Ok(false);
+        };
+        if declaration_record.kind != SyntaxKind::TypeParameter
+            || construction_record.kind != SyntaxKind::ConstructSignature
+            || owner_record.kind != SyntaxKind::InterfaceDeclaration
+            || parameter.flags() != SymbolFlags::TYPE_PARAMETER
+            || parameter.check_flags() != CheckFlags::NONE
+            || parameter.value_declaration().is_some()
+            || parameter.members().is_some()
+            || parameter.exports().is_some()
+            || parameter.parent().is_some()
+            || parameter.export_symbol().is_some()
+            || self.store.get_merged_symbol(symbol) != Some(symbol)
+            || !self.host.symbol_matches(self.store, declaration, symbol)
+            || !signature
+                .type_parameters
+                .as_ref()
+                .is_some_and(|parameters| parameters.nodes.as_slice() == [declaration.node])
+            || !bound
+                .source_facts()
+                .is_some_and(|facts| facts.is_default_library() && facts.is_declaration_file())
+            || !self.global_symbol_has_name(owner_symbol, "PromiseConstructor")
+            || self
+                .store
+                .symbol(owner_symbol)
+                .and_then(|owner| owner.members())
+                .and_then(|members| self.store.symbol_table(members))
+                .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+                .and_then(|constructor| self.store.symbol(constructor))
+                .and_then(|constructor| constructor.declarations())
+                .is_none_or(|declarations| !declarations.contains(&construction))
+        {
+            return Ok(false);
+        }
+
+        let mut current = node;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            let Some(parent) = preflight_node(self.store, self.host, current)?.parent else {
+                return Ok(false);
+            };
+            let parent = NodeRef::new(current.arena, current.file, parent);
+            if parent == construction {
+                return Ok(true);
+            }
+            current = parent;
+        }
+        Ok(false)
+    }
+
     fn is_authenticated_bivariant_generic_union_alias(
         &self,
         node: NodeRef,
@@ -8307,7 +8394,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     && !self.is_authenticated_jsdoc_arrow_union_type_parameter(node, symbol)?
                     && !self
                         .is_authenticated_react_ref_object_union_type_parameter(node, symbol)?
-                    && !self.is_authenticated_readonly_array_union_type_parameter(node, symbol)?)
+                    && !self.is_authenticated_readonly_array_union_type_parameter(node, symbol)?
+                    && !self
+                        .is_authenticated_promise_constructor_union_type_parameter(node, symbol)?)
         {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedUnionConstituent(node),
@@ -12327,7 +12416,22 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     .host
                     .bound_file(declaration)
                     .and_then(ts_binder::BoundFile::source_facts)
-                    .is_some_and(ts_binder::CanonicalSourceFileFacts::is_default_library))
+                    .is_some_and(ts_binder::CanonicalSourceFileFacts::is_default_library)
+                || self.global_symbol_has_name(symbol, "PromiseLike")
+                    && self
+                        .host
+                        .bound_file(declaration)
+                        .and_then(ts_binder::BoundFile::source_facts)
+                        .is_some_and(|facts| {
+                            facts.is_default_library() && facts.is_declaration_file()
+                        })
+                    && self
+                        .host
+                        .bound_file(node)
+                        .and_then(ts_binder::BoundFile::source_facts)
+                        .is_some_and(|facts| {
+                            facts.is_default_library() && facts.is_declaration_file()
+                        }))
         {
             return Err(unsupported());
         }
