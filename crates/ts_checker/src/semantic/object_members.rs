@@ -8,7 +8,8 @@
 //! signatures can also retain trailing optional `any` parameters.
 //! Named interface and type-literal methods retain their own binder symbols,
 //! authenticated method type parameters, annotated required or optional
-//! parameters, and authenticated array rest parameters when present.
+//! parameters, and authenticated array rest parameters when present. Selected
+//! default-library `Math` methods also retain their numeric rest parameters.
 
 use std::collections::{HashMap, HashSet};
 
@@ -1776,10 +1777,50 @@ fn authenticated_global_math_random_interface(
     value_declarations: &[NodeRef],
     plan: &PropertyObjectPlan,
 ) -> bool {
-    let ([declaration], [method]) = (value_declarations, plan.methods.as_slice()) else {
+    let [declaration] = value_declarations else {
         return false;
     };
-    let declaration = *declaration;
+    let mut random_methods = plan.methods.iter().filter(|method| {
+        store
+            .symbol(method.symbol)
+            .is_some_and(|method| method.name().as_utf8() == Some("random"))
+    });
+    let Some(method) = random_methods.next() else {
+        return false;
+    };
+    if random_methods.next().is_some()
+        || !authenticated_global_math_value_declaration(store, host, symbol, *declaration)
+    {
+        return false;
+    }
+    let Some(return_type) = host.node(method.return_type) else {
+        return false;
+    };
+    let method_is_default_library = host
+        .bound_file(method.declaration)
+        .and_then(ts_binder::BoundFile::source_facts)
+        .is_some_and(|facts| facts.is_declaration_file() && facts.is_default_library());
+
+    method.parameters.is_empty()
+        && method.flags == SignatureFlags::NONE
+        && method.minimum_argument_count == 0
+        && return_type.kind == SyntaxKind::NumberKeyword
+        && return_type.flags.0 == 0
+        && return_type.parent == Some(method.declaration.node)
+        && method_is_default_library
+        && plan.accessors.is_empty()
+        && plan.spreads.is_empty()
+        && plan.indexes.is_empty()
+        && plan.call_signatures.is_empty()
+        && plan.heritage.is_none()
+}
+
+fn authenticated_global_math_value_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
     let Some(owner) = store.symbol(symbol) else {
         return false;
     };
@@ -1821,16 +1862,6 @@ fn authenticated_global_math_random_interface(
     let NodeData::Identifier(identifier) = &name_record.data else {
         return false;
     };
-    let Some(method_record) = store.symbol(method.symbol) else {
-        return false;
-    };
-    let Some(return_type) = host.node(method.return_type) else {
-        return false;
-    };
-    let method_is_default_library = host
-        .bound_file(method.declaration)
-        .and_then(ts_binder::BoundFile::source_facts)
-        .is_some_and(|facts| facts.is_declaration_file() && facts.is_default_library());
 
     owner.name().as_utf8() == Some("Math")
         && owner
@@ -1862,19 +1893,123 @@ fn authenticated_global_math_random_interface(
         && name_record.parent == Some(annotation.node)
         && identifier.flow_node.is_none()
         && identifier.text == "Math"
-        && method_record.name().as_utf8() == Some("random")
-        && method.parameters.is_empty()
-        && method.flags == SignatureFlags::NONE
-        && method.minimum_argument_count == 0
-        && return_type.kind == SyntaxKind::NumberKeyword
-        && return_type.flags.0 == 0
-        && return_type.parent == Some(method.declaration.node)
-        && method_is_default_library
-        && plan.accessors.is_empty()
-        && plan.spreads.is_empty()
-        && plan.indexes.is_empty()
-        && plan.call_signatures.is_empty()
-        && plan.heritage.is_none()
+}
+
+fn authenticated_default_library_math_symbol_tag(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
+    let Ok(record) = preflight_node(store, host, declaration) else {
+        return false;
+    };
+    let NodeData::PropertySignatureDeclaration(property) = &record.data else {
+        return false;
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, property.name);
+    let Ok(name_record) = preflight_node(store, host, name) else {
+        return false;
+    };
+    let NodeData::ComputedPropertyName(computed) = &name_record.data else {
+        return false;
+    };
+    let expression = NodeRef::new(name.arena, name.file, computed.expression);
+    let Ok(expression_record) = preflight_node(store, host, expression) else {
+        return false;
+    };
+    let NodeData::PropertyAccessExpression(access) = &expression_record.data else {
+        return false;
+    };
+    let object = NodeRef::new(expression.arena, expression.file, access.expression);
+    let property_name = NodeRef::new(expression.arena, expression.file, access.name);
+    let (Ok(object_record), Ok(property_name_record)) = (
+        preflight_node(store, host, object),
+        preflight_node(store, host, property_name),
+    ) else {
+        return false;
+    };
+    let (NodeData::Identifier(object_identifier), NodeData::Identifier(property_identifier)) =
+        (&object_record.data, &property_name_record.data)
+    else {
+        return false;
+    };
+    let type_node = NodeRef::new(declaration.arena, declaration.file, property.type_);
+    let Ok(type_record) = preflight_node(store, host, type_node) else {
+        return false;
+    };
+    let Some(bound) = host.bound_file(declaration) else {
+        return false;
+    };
+    let Some(symbol) = bound
+        .symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(symbol_record) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(value_declaration) = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
+    else {
+        return false;
+    };
+
+    bound.source_facts().is_some_and(|facts| {
+        facts.is_declaration_file()
+            && facts.is_default_library()
+            && !facts.is_javascript_file()
+            && !facts.is_external_or_common_js_module()
+    }) && authenticated_global_math_value_declaration(store, host, owner, value_declaration)
+        && record.kind == SyntaxKind::PropertySignature
+        && record.flags.0 == 0
+        && property.postfix_token.is_none()
+        && property.symbol.is_none()
+        && missing_signature_initializer(store, host, declaration, property.initializer)
+        && preflight_readonly_modifier(store, host, declaration, property.modifiers.as_ref())
+            == Some(true)
+        && name_record.kind == SyntaxKind::ComputedPropertyName
+        && name_record.flags.0 == 0
+        && name_record.parent == Some(declaration.node)
+        && computed.facts == 0
+        && expression_record.kind == SyntaxKind::PropertyAccessExpression
+        && expression_record.flags.0 == 0
+        && expression_record.parent == Some(name.node)
+        && access.flow_node.is_none()
+        && access.question_dot_token.is_none()
+        && access.facts == 0
+        && object_record.kind == SyntaxKind::Identifier
+        && object_record.flags.0 == 0
+        && object_record.parent == Some(expression.node)
+        && object_identifier.flow_node.is_none()
+        && object_identifier.text == "Symbol"
+        && property_name_record.kind == SyntaxKind::Identifier
+        && property_name_record.flags.0 == 0
+        && property_name_record.parent == Some(expression.node)
+        && property_identifier.flow_node.is_none()
+        && property_identifier.text == "toStringTag"
+        && type_record.kind == SyntaxKind::StringKeyword
+        && type_record.flags.0 == 0
+        && type_record.parent == Some(declaration.node)
+        && symbol_record.flags() == SymbolFlags::PROPERTY
+        && symbol_record.check_flags() == CheckFlags::NONE
+        && symbol_record.name() == InternalSymbolName::Computed.as_ref()
+        && symbol_record.declarations() == Some(&[declaration])
+        && symbol_record.value_declaration() == Some(declaration)
+        && symbol_record.members().is_none()
+        && symbol_record.exports().is_none()
+        && symbol_record.export_symbol().is_none()
+        && symbol_record
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            == Some(owner)
+        && store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .is_some_and(|members| members.iter().all(|(_, member)| member != symbol))
 }
 
 /// Combines reopened interface clauses without duplicating authenticated bases.
@@ -4504,6 +4639,12 @@ fn plan_members(
     for (member_owner, member) in member_entries {
         let member_record =
             preflight_node(store, host, member).map_err(|_| invalid_plan(&provisional))?;
+        if kind == PropertyObjectKind::Interface
+            && member_record.kind == SyntaxKind::PropertySignature
+            && authenticated_default_library_math_symbol_tag(store, host, symbol, member)
+        {
+            continue;
+        }
         let admitted_kind = match kind {
             PropertyObjectKind::ObjectLiteral => matches!(
                 member_record.kind,
@@ -5577,6 +5718,19 @@ fn plan_interface_method(
     let mut previous_end = method.parameters.range.start;
     let mut minimum_argument_count = 0usize;
     let mut optional_parameter_seen = false;
+    let numeric_math_rest = matches!(identifier.text.as_str(), "max" | "min" | "hypot")
+        && bound.source_facts().is_some_and(|facts| {
+            facts.is_declaration_file()
+                && facts.is_default_library()
+                && !facts.is_javascript_file()
+                && !facts.is_external_or_common_js_module()
+        })
+        && store
+            .symbol(owner_symbol)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .is_some_and(|declaration| {
+                authenticated_global_math_value_declaration(store, host, owner_symbol, declaration)
+            });
     for (index, parameter) in method.parameters.nodes.iter().copied().enumerate() {
         let parameter = NodeRef::new(declaration.arena, declaration.file, parameter);
         let parameter_record = preflight_node(store, host, parameter).map_err(|_| unsupported())?;
@@ -5590,6 +5744,7 @@ fn plan_interface_method(
             declaration,
             parameter,
             &method.parameters,
+            numeric_math_rest,
         )?;
         if rest && (optional || index + 1 != method.parameters.nodes.len())
             || !rest && !optional && optional_parameter_seen
@@ -5815,6 +5970,7 @@ fn plan_interface_method_parameter(
     method: NodeRef,
     declaration: NodeRef,
     parameter_nodes: &NodeList,
+    numeric_math_rest: bool,
 ) -> Result<(PlannedCallParameter, bool, bool), PropertyObjectError> {
     let unsupported = || PropertyObjectError::UnsupportedMember {
         node: method,
@@ -5906,6 +6062,7 @@ fn plan_interface_method_parameter(
         let element = NodeRef::new(type_node.arena, type_node.file, array.element_type);
         let element_record = preflight_node(store, host, element).map_err(|_| unsupported())?;
         if type_record.kind != SyntaxKind::ArrayType
+            || numeric_math_rest && element_record.kind != SyntaxKind::NumberKeyword
             || element_record.flags.0 != 0
             || element_record.parent != Some(type_node.node)
             || element_record.range.start != type_record.range.start
@@ -14533,8 +14690,17 @@ mod generic_publication_tests {
     fn merged_interface_methods_stay_unsupported_outside_default_library_math_random() {
         for (index, source) in [
             "interface Shared { random(): number } declare var Shared: Shared;",
+            "interface Shared { max(...values: number[]): number } declare var Shared: Shared;",
             "interface Math { random(): number } declare var Math: Math;",
             "interface Math { random(value: number): number } declare var Math: Math;",
+            concat!(
+                "interface Math { max(...values: number[]): number; random(): number } ",
+                "declare var Math: Math;",
+            ),
+            concat!(
+                "interface Math { hypot(...values: number[]): number; random(): number } ",
+                "declare var Math: Math;",
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -14558,6 +14724,46 @@ mod generic_publication_tests {
                 (
                     fixture.store.type_len(),
                     fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn computed_symbol_tags_stay_unsupported_outside_default_library_math() {
+        for (index, source) in [
+            "interface Shared { value: string; readonly [Symbol.toStringTag]: string }",
+            concat!(
+                "interface Math { random(): number; readonly [Symbol.toStringTag]: string } ",
+                "declare var Math: Math;",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = interface_fixture(source, 3_803 + u32::try_from(index).unwrap());
+            let host = host(&fixture.parsed, &fixture.bound);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                plan_interface(&fixture.store, &host, fixture.symbol),
+                Err(PropertyObjectError::UnsupportedMember {
+                    kind: SyntaxKind::ComputedPropertyName,
+                    ..
+                })
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.symbol_len(),
                     fixture.store.checker_link_allocated_lengths(),
                 ),
                 before,

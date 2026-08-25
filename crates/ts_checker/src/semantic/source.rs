@@ -36327,7 +36327,18 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Keep merged Math ownership and intrinsic JSX state together.
     fn merged_math_globals_drive_intrinsic_union_jsx_tags_cold_and_warm() {
-        let library = parsed("interface Math { random(): number; } declare var Math: Math;");
+        let library = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Math { ",
+            "readonly PI: number; ",
+            "abs(value: number): number; ",
+            "max(...values: number[]): number; ",
+            "min(...values: number[]): number; ",
+            "random(): number; ",
+            "} declare var Math: Math; ",
+            "interface Math { hypot(...values: number[]): number; } ",
+            "interface Math { readonly [Symbol.toStringTag]: string; }",
+        ));
         let augmentation = parsed(concat!(
             "interface Math {} ",
             "declare namespace JSX { ",
@@ -36412,6 +36423,76 @@ mod tests {
             "{:?}",
             context.diagnostics()
         );
+        let math_type = context
+            .store()
+            .value_symbol_links(math)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let math_members = context
+            .store()
+            .symbol(math)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .unwrap();
+        assert_eq!(math_members.len(), 6);
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for (name, rest) in [
+            ("abs", false),
+            ("max", true),
+            ("min", true),
+            ("random", false),
+            ("hypot", true),
+        ] {
+            let method = math_members.get_source(name).unwrap();
+            assert_eq!(
+                context.store().authenticated_interface_method_owner(method),
+                Some((math, math_type)),
+            );
+            let callable = context
+                .store()
+                .value_symbol_links(method)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let [signature] = context
+                .store()
+                .type_payload(callable)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.signatures.as_deref())
+                .unwrap()
+            else {
+                panic!("Math.{name} must retain one published source signature")
+            };
+            let signature = context.store().signature(*signature).unwrap();
+            assert_eq!(
+                signature.flags(),
+                if rest {
+                    SignatureFlags::HAS_REST_PARAMETER
+                } else {
+                    SignatureFlags::NONE
+                },
+            );
+            assert_eq!(signature.resolved_return_type(), Some(number));
+            if rest {
+                assert_eq!(signature.min_argument_count(), 0);
+                let [parameter] = signature.parameters() else {
+                    panic!("Math.{name} must retain one numeric rest parameter")
+                };
+                let parameter_type = context
+                    .store()
+                    .value_symbol_links(*parameter)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                assert_eq!(
+                    context
+                        .store()
+                        .canonical_array_reference(context.global_types(), parameter_type)
+                        .unwrap()
+                        .unwrap()
+                        .element_type,
+                    number,
+                );
+            }
+        }
         let reads = identifier_expressions(&source, file, "Math");
         let [read] = reads.as_slice() else {
             panic!("the upstream-shaped condition contains one Math value read")
@@ -36444,7 +36525,7 @@ mod tests {
                 .store()
                 .type_node_links(call)
                 .and_then(|links| links.resolved_type),
-            Some(context.store().intrinsic_bootstrap().unwrap().number_type),
+            Some(number),
         );
 
         let warm = observable_state(&context, file);
