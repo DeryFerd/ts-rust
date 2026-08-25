@@ -907,6 +907,10 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
     }
 
     fn bind_binary_expression(&mut self, node_id: NodeId) {
+        if self.bind_literal_addition_chain(node_id) {
+            return;
+        }
+
         let (left, operator_token, right, type_) =
             match self.ast.get(node_id).map(|node| &node.data) {
                 Some(NodeData::BinaryExpression(data)) => {
@@ -967,6 +971,75 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
                 }
             }
         }
+    }
+
+    /// Walks long literal additions without recursively entering their left spine.
+    fn bind_literal_addition_chain(&mut self, root: NodeId) -> bool {
+        let mut current = root;
+        let mut chain = Vec::new();
+        let mut expected_family = None;
+
+        let first = loop {
+            let Some(NodeData::BinaryExpression(binary)) =
+                self.ast.get(current).map(|node| &node.data)
+            else {
+                return false;
+            };
+            if binary.type_.is_some()
+                || self.node_kind(binary.operator_token) != Some(SyntaxKind::PlusToken)
+            {
+                return false;
+            }
+
+            let family = match self.node_kind(binary.right) {
+                Some(SyntaxKind::NumericLiteral) => false,
+                Some(SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral) => true,
+                _ => return false,
+            };
+            if expected_family.is_some_and(|expected| expected != family) {
+                return false;
+            }
+            expected_family = Some(family);
+            chain.push((current, binary.operator_token, binary.right));
+
+            if self.node_kind(binary.left) != Some(SyntaxKind::BinaryExpression) {
+                let first_family = match self.node_kind(binary.left) {
+                    Some(SyntaxKind::NumericLiteral) => false,
+                    Some(SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral) => {
+                        true
+                    }
+                    _ => return false,
+                };
+                if first_family != family || chain.len() < 32 {
+                    return false;
+                }
+                break binary.left;
+            }
+            current = binary.left;
+        };
+
+        if chain
+            .iter()
+            .skip(1)
+            .any(|(node, _, _)| self.visited[node.index()])
+        {
+            return false;
+        }
+
+        for (node, _, _) in chain.iter().skip(1) {
+            self.visited[node.index()] = true;
+            self.hooks.enter_node(*node);
+        }
+
+        self.bind_node(first);
+        for (node, operator, right) in chain.into_iter().rev() {
+            self.bind_node(operator);
+            self.bind_node(right);
+            if node != root {
+                self.hooks.exit_node(node);
+            }
+        }
+        true
     }
 
     fn bind_logical_expression(&mut self, node_id: NodeId) {
