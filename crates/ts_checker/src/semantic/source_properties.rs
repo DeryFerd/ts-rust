@@ -2,9 +2,10 @@
 //!
 //! The recursively planned receiver must already have a canonical `any` type,
 //! a published enum value, a validated class constructor, an imported
-//! namespace, an authenticated published scalar-wrapper method, an exact global
-//! array reference with a published member, or belong to the validated
-//! own-property object domain in `relater`. Enum values reuse their published
+//! namespace, an authenticated published scalar-wrapper or `Math.random`
+//! method, an exact global array reference with a published member, or belong
+//! to the validated own-property object domain in `relater`. Enum values reuse
+//! their published
 //! member identities. Class
 //! constructors read their validated static member tables without treating
 //! construct signatures as property-only objects. Namespace reexports retain
@@ -550,15 +551,23 @@ pub(super) fn check_direct_source_property(
                 receiver_type,
             )? {
                 Some(method) => Some(method),
-                None => match resolve_published_canonical_array_property(
+                None => match resolve_published_global_math_random_method(
                     store,
                     global_types,
                     plan,
                     receiver_type,
                 )? {
-                    Some(CanonicalArrayProperty::Present(property)) => Some(property),
-                    Some(CanonicalArrayProperty::Missing) => None,
-                    None => store.resolved_own_property(receiver_type, &plan.name)?,
+                    Some(method) => Some(method),
+                    None => match resolve_published_canonical_array_property(
+                        store,
+                        global_types,
+                        plan,
+                        receiver_type,
+                    )? {
+                        Some(CanonicalArrayProperty::Present(property)) => Some(property),
+                        Some(CanonicalArrayProperty::Missing) => None,
+                        None => store.resolved_own_property(receiver_type, &plan.name)?,
+                    },
                 },
             },
         },
@@ -747,6 +756,153 @@ fn resolve_published_scalar_wrapper_method(
             .signature(callable.signature)
             .and_then(super::signatures::Signature::declaration)
             != Some(declaration)
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+
+    Ok(Some(ResolvedOwnProperty {
+        symbol,
+        type_,
+        optional: false,
+        readonly: false,
+    }))
+}
+
+fn resolve_published_global_math_random_method(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+) -> Result<Option<ResolvedOwnProperty>, SourcePropertyError> {
+    if global_types.is_none()
+        || plan.name != "random"
+        || !matches!(plan.position, SourcePropertyPosition::CallCallee(_))
+    {
+        return Ok(None);
+    }
+    let receiver = store
+        .type_payload(receiver_type)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let TypeData::Interface(interface) = receiver.data() else {
+        return Ok(None);
+    };
+    let Some(owner) = receiver
+        .symbol()
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(None);
+    };
+    let Some(owner_record) = store.symbol(owner) else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    if owner_record.name().as_utf8() != Some("Math") {
+        return Ok(None);
+    }
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return Err(RelationUnavailable::MissingBootstrap.into());
+    };
+    let global = store
+        .symbol_table(bootstrap.globals)
+        .and_then(|globals| globals.get_source("Math"))
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    let allowed =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    let Some(members) = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+    else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let Some(symbol) = members
+        .get_source("random")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let Some(method) = store.symbol(symbol) else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let Some([declaration]) = method.declarations() else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let declaration = *declaration;
+    if receiver.flags() != TypeFlags::OBJECT
+        || receiver.object_flags() != ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+        || receiver.alias().is_some()
+        || !owner_record
+            .flags()
+            .contains(SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        || owner_record.flags().without(allowed) != SymbolFlags::NONE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || global != Some(owner)
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(receiver_type)
+        || !interface.base_types_resolved
+        || !interface.declared_members_resolved
+        || interface.declared_members != owner_record.members()
+        || interface.reference.object.structured.members != owner_record.members()
+        || interface
+            .reference
+            .object
+            .structured
+            .properties
+            .as_deref()
+            .is_none_or(|properties| !properties.contains(&symbol))
+        || method.flags() != SymbolFlags::METHOD
+        || method.check_flags() != CheckFlags::NONE
+        || method.name().as_utf8() != Some("random")
+        || method.value_declaration() != Some(declaration)
+        || store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature)
+        || store.authenticated_interface_method_owner(symbol) != Some((owner, receiver_type))
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+
+    let Some(links) = store.value_symbol_links(symbol) else {
+        return Err(RelationUnavailable::UnresolvedPropertyType(symbol).into());
+    };
+    let Some(type_) = links.resolved_type else {
+        return if links == &ValueSymbolLinks::default() {
+            Err(RelationUnavailable::UnresolvedPropertyType(symbol).into())
+        } else {
+            Err(SourcePropertyError::InvalidCache(plan.node))
+        };
+    };
+    if links
+        != &(ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        })
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    let StoredCallableSetValidation::Valid { projection, .. } =
+        validate_stored_callable_set(store, type_)
+    else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let [callable] = projection.call_signatures.as_ref() else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let Some(signature) = store.signature(callable.signature) else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    if projection.owner != type_
+        || !projection.construct_signatures.is_empty()
+        || callable.owner != type_
+        || !callable.parameters.is_empty()
+        || callable.min_argument_count != 0
+        || callable.return_type != Some(bootstrap.number_type)
+        || !signature.type_parameters().is_empty()
+        || signature.this_parameter().is_some()
+        || signature.has_rest_parameter()
+        || signature.declaration() != Some(declaration)
+        || signature.resolved_return_type() != Some(bootstrap.number_type)
     {
         return Err(SourcePropertyError::InvalidCache(plan.node));
     }
