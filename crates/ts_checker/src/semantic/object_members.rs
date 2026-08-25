@@ -5,7 +5,8 @@
 //! and executes property, index, and signature annotations so one query
 //! retains a single dependency graph and resolution stack. Call and construct
 //! signatures retain authenticated generic parameters, overload order, and
-//! supported rest parameters. Type-literal calls may retain an implicit `any`
+//! supported rest parameters. Nongeneric interface call signatures can appear
+//! beside ordinary properties. Type-literal calls may retain an implicit `any`
 //! return and trailing implicit `any[]` rest parameter. Construct signatures
 //! can also retain trailing optional `any` parameters.
 //! Named interface and type-literal methods retain their own binder symbols,
@@ -669,7 +670,6 @@ pub(super) fn validate_stored_declared_call_set(
         || structured.constrained != ConstrainedTypeData::default()
         || inherited_base.is_none() && structured.members != members
         || inherited_base.is_some() && structured.members == members
-        || structured.properties.is_some()
         || structured.index_infos.is_some()
         || structured
             .object_type_without_abstract_construct_signatures
@@ -685,14 +685,24 @@ pub(super) fn validate_stored_declared_call_set(
     } else {
         call_signature_count
     };
-    if own_call_signature_count > call_signature_count || own_signature_count > signatures.len() {
+    let properties = structured.properties.as_deref().unwrap_or_default();
+    if own_call_signature_count > call_signature_count
+        || own_signature_count > signatures.len()
+        || structured.properties.as_ref().is_some_and(Vec::is_empty)
+        || !properties.is_empty()
+            && (call_signature_count != signatures.len()
+                || inherited_base.is_some()
+                || !matches!(record.data(), TypeData::Interface(_)))
+    {
         return StoredDeclaredCallSetValidation::Malformed;
     }
     let own_calls = &signatures[..own_call_signature_count];
     let own_constructs = &signatures[call_signature_count..];
     if own_signature_count != own_calls.len() + own_constructs.len()
         || members.len()
-            != usize::from(!own_calls.is_empty()) + usize::from(!own_constructs.is_empty())
+            != properties.len()
+                + usize::from(!own_calls.is_empty())
+                + usize::from(!own_constructs.is_empty())
     {
         return StoredDeclaredCallSetValidation::Malformed;
     }
@@ -745,6 +755,58 @@ pub(super) fn validate_stored_declared_call_set(
         {
             return StoredDeclaredCallSetValidation::Malformed;
         }
+    }
+
+    let mut seen_properties = HashSet::with_capacity(properties.len());
+    let mut property_types = Vec::with_capacity(properties.len());
+    for &property in properties {
+        let Some(property_record) = store.symbol(property) else {
+            return StoredDeclaredCallSetValidation::Malformed;
+        };
+        let Some(declarations) = property_record
+            .declarations()
+            .filter(|declarations| !declarations.is_empty())
+        else {
+            return StoredDeclaredCallSetValidation::Malformed;
+        };
+        let Some(links) = store.value_symbol_links(property) else {
+            return StoredDeclaredCallSetValidation::Malformed;
+        };
+        let Some(type_) = links.resolved_type else {
+            return StoredDeclaredCallSetValidation::Malformed;
+        };
+        if !seen_properties.insert(property)
+            || !property_record.flags().contains(SymbolFlags::PROPERTY)
+            || property_record
+                .flags()
+                .without(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+                != SymbolFlags::NONE
+            || property_record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
+            || property_record.name().as_utf8().is_none()
+            || property_record.value_declaration() != declarations.first().copied()
+            || property_record.members().is_some()
+            || property_record.exports().is_some()
+            || property_record.parent() != Some(owner)
+            || property_record.export_symbol().is_some()
+            || store.get_merged_symbol(property) != Some(property)
+            || members.get(property_record.name()) != Some(property)
+            || store.type_payload(type_).is_none()
+            || links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+            || declarations.iter().any(|declaration| {
+                !matches!(
+                    store.source_node_kind(*declaration),
+                    Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                ) || store.source_node_parent(*declaration)
+                    != Some(SourceNodeParent::Parent(owner_declaration))
+            })
+        {
+            return StoredDeclaredCallSetValidation::Malformed;
+        }
+        property_types.push(type_);
     }
 
     let mut edges = Vec::new();
@@ -934,6 +996,7 @@ pub(super) fn validate_stored_declared_call_set(
         }
         edges.push(return_type);
     }
+    edges.extend(property_types);
     StoredDeclaredCallSetValidation::Valid(edges)
 }
 
@@ -1755,6 +1818,15 @@ pub(super) fn plan_interface(
         TypeLiteralMemberPolicy::General,
     )?;
     plan.heritage = heritage;
+    if let Some(call) = plan.call_signatures.first()
+        && !plan.properties.is_empty()
+        && (!value_declarations.is_empty() || !namespace_declarations.is_empty())
+    {
+        return Err(PropertyObjectError::UnsupportedMember {
+            node: call.declaration,
+            kind: call.syntax_kind(),
+        });
+    }
     if let Some(method) = plan.methods.first()
         && (!value_declarations.is_empty()
             && !authenticated_global_math_random_interface(
@@ -6102,7 +6174,18 @@ fn plan_members(
             kind: SyntaxKind::IndexSignature,
         });
     }
-    if !call_signatures.is_empty() && (!properties.is_empty() || !indexes.is_empty()) {
+    if !call_signatures.is_empty()
+        && (!indexes.is_empty()
+            || !properties.is_empty()
+                && (kind != PropertyObjectKind::Interface
+                    || policy == TypeLiteralMemberPolicy::GenericInterface
+                    || !additional_members.is_empty()
+                    || !methods.is_empty()
+                    || !accessors.is_empty()
+                    || call_signatures
+                        .iter()
+                        .any(PlannedCallSignature::is_construct)))
+    {
         return Err(PropertyObjectError::UnsupportedMember {
             node: call_signatures[0].declaration,
             kind: call_signatures[0].syntax_kind(),
@@ -10162,7 +10245,24 @@ fn valid_planned_call_signature_set(
             .iter()
             .any(PlannedCallSignature::is_construct),
     );
-    members.len() == family_count
+    members.len() == plan.properties.len().saturating_add(family_count)
+        && (plan.properties.is_empty()
+            || plan.kind == PropertyObjectKind::Interface
+                && plan.methods.is_empty()
+                && plan.accessors.is_empty()
+                && plan.indexes.is_empty()
+                && !plan
+                    .call_signatures
+                    .iter()
+                    .any(PlannedCallSignature::is_construct))
+        && plan.properties.iter().all(|property| {
+            members.get_source(&property.name) == Some(property.symbol)
+                && store.symbol(property.symbol).is_some_and(|record| {
+                    record.name().as_utf8() == Some(property.name.as_str())
+                        && store.get_parent_of_symbol(property.symbol) == Some(plan.symbol)
+                        && store.get_merged_symbol(property.symbol) == Some(property.symbol)
+                })
+        })
         && [false, true].into_iter().all(|construct| {
             let name = if construct {
                 InternalSymbolName::New
@@ -15930,6 +16030,184 @@ mod generic_publication_tests {
             warm,
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn interface_call_overloads_and_properties_preserve_identity_cold_and_warm() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Callable { ",
+                "(value: string): void; ",
+                "readonly field: boolean; ",
+                "(value: number): void; ",
+                "}",
+            ),
+            3_796,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let [first, second] = plan.call_signatures.as_slice() else {
+            panic!("the interface must retain both call overloads")
+        };
+        let [property] = plan.properties.as_slice() else {
+            panic!("the interface must retain its ordinary property")
+        };
+        assert!(property.readonly);
+        assert_eq!(first.symbol, second.symbol);
+        assert_eq!(
+            fixture
+                .store
+                .symbol(first.symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations),
+            Some([first.declaration, second.declaration].as_slice()),
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(type_).unwrap().data()
+        else {
+            panic!("mixed call overloads must retain their interface identity")
+        };
+        let signatures = interface.declared_call_signatures.as_deref().unwrap();
+        assert_eq!(signatures.len(), 2);
+        for (signature, planned) in signatures.iter().zip(&plan.call_signatures) {
+            assert_eq!(
+                fixture.store.signature(*signature).unwrap().declaration(),
+                Some(planned.declaration),
+            );
+        }
+        assert_eq!(
+            interface.reference.object.structured.properties.as_deref(),
+            Some([property.symbol].as_slice()),
+        );
+        assert_eq!(
+            fixture.store.symbol(property.symbol).unwrap().check_flags(),
+            CheckFlags::READONLY,
+        );
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Valid(vec![
+                bootstrap.string_type,
+                bootstrap.void_type,
+                bootstrap.number_type,
+                bootstrap.void_type,
+                bootstrap.boolean_type,
+            ]),
+        );
+
+        let state = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let warm = state(&fixture.store);
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(fixture.symbol),
+            Ok(type_),
+        );
+        assert_eq!(state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn mixed_interface_call_sets_reject_poisoned_property_links() {
+        let mut fixture = interface_fixture(
+            "interface Callable { (value: string): void; field: boolean; }",
+            3_797,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let property = plan.properties[0].symbol;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let original = fixture.store.value_symbol_links(property).cloned().unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                write_type: Some(number),
+                ..original.clone()
+            },
+        ));
+
+        assert_eq!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Malformed,
+        );
+
+        assert!(fixture.store.set_value_symbol_links(property, original));
+        assert!(matches!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn mixed_constructor_method_and_index_interfaces_remain_unsupported() {
+        for (source, file) in [
+            (
+                "interface Invalid { new(value: number): string; field: boolean; }",
+                3_798,
+            ),
+            (
+                "interface Invalid { (value: number): string; method(): void; }",
+                3_799,
+            ),
+            (
+                "interface Invalid { (value: number): string; [key: string]: boolean; }",
+                3_800,
+            ),
+        ] {
+            let fixture = interface_fixture(source, file);
+            let host = host(&fixture.parsed, &fixture.bound);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                plan_interface(&fixture.store, &host, fixture.symbol),
+                Err(PropertyObjectError::UnsupportedMember {
+                    kind: SyntaxKind::CallSignature | SyntaxKind::ConstructSignature,
+                    ..
+                })
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
     }
 
     #[test]
