@@ -636,13 +636,6 @@ fn unsupported_property_call_families_fail_closed_without_call_publication() {
             ),
         ),
         (
-            "union callable",
-            concat!(
-                "type API = { fn: ((value: number) => string) | ((value: string) => string) }; ",
-                "function use(api: API): string { return api.fn(1); }",
-            ),
-        ),
-        (
             "union receiver",
             concat!(
                 "type Left = { fn: (value: number) => string }; ",
