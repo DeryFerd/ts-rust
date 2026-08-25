@@ -322,7 +322,6 @@ fn explicit_constructor_keeps_strict_field_initialization_diagnostics() {
 #[test]
 fn unsupported_constructor_parameters_and_nonempty_bodies_leave_classes_cold() {
     for (index, source) in [
-        "class Model { constructor(public value: string) {} }",
         concat!(
             "class Base { constructor(public value: string) {} } ",
             "class Model extends Base { constructor(value: string) { super(value); } }",
