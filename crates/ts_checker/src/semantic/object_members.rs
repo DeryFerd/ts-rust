@@ -9823,6 +9823,78 @@ fn valid_generic_property_types(
         })
 }
 
+fn valid_generic_structured_property(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    interface: &InterfaceTypeData,
+    planned: &PlannedProperty,
+    actual: SemanticSymbolId,
+) -> bool {
+    if actual == planned.symbol {
+        return true;
+    }
+    let Some(declared) = store.symbol(planned.symbol) else {
+        return false;
+    };
+    let Some(property) = store.symbol(actual) else {
+        return false;
+    };
+    let Some(links) = store.value_symbol_links(actual) else {
+        return false;
+    };
+    let Some(mapper) = links.mapper else {
+        return false;
+    };
+    let Some(parameters) = interface.reference.resolved_type_arguments.as_deref() else {
+        return false;
+    };
+    let Some(this_type) = interface.this_type else {
+        return false;
+    };
+    let mapper_sources = parameters
+        .iter()
+        .copied()
+        .chain(std::iter::once(this_type))
+        .collect::<Vec<_>>();
+    let mapper_targets = parameters
+        .iter()
+        .copied()
+        .chain(std::iter::once(target))
+        .collect::<Vec<_>>();
+    let checks = CheckFlags::INSTANTIATED
+        | (declared.check_flags()
+            & (CheckFlags::READONLY
+                | CheckFlags::LATE
+                | CheckFlags::OPTIONAL_PARAMETER
+                | CheckFlags::REST_PARAMETER));
+
+    property.flags() == declared.flags() | SymbolFlags::TRANSIENT
+        && property.check_flags() == checks
+        && property.name() == declared.name()
+        && property.declarations() == declared.declarations()
+        && property.value_declaration() == declared.value_declaration()
+        && property.parent() == declared.parent()
+        && property.members().is_none()
+        && property.exports().is_none()
+        && property.export_symbol().is_none()
+        && store.get_merged_symbol(actual) == Some(actual)
+        && store.type_mapper_has_exact_endpoints(mapper, &mapper_sources, &mapper_targets)
+            == Some(true)
+        && links
+            == &(ValueSymbolLinks {
+                resolved_type: links.resolved_type,
+                target: Some(planned.symbol),
+                mapper: Some(mapper),
+                name_type: store
+                    .value_symbol_links(planned.symbol)
+                    .and_then(|declared| declared.name_type),
+                ..ValueSymbolLinks::default()
+            })
+        && links
+            .resolved_type
+            .is_none_or(|type_| store.type_payload(type_).is_some())
+}
+
 fn valid_generic_structured_members(
     store: &CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
@@ -9847,11 +9919,16 @@ fn valid_generic_structured_members(
         return false;
     }
     let properties = structured.properties.as_deref().unwrap_or_default();
-    let mut expected = plan
-        .properties
-        .iter()
-        .map(|property| property.symbol)
-        .collect::<Vec<_>>();
+    if properties.len() < plan.properties.len() {
+        return false;
+    }
+    let mut expected = Vec::with_capacity(properties.len());
+    for (actual, planned) in properties.iter().zip(&plan.properties) {
+        if !valid_generic_structured_property(store, target, interface, planned, *actual) {
+            return false;
+        }
+        expected.push(*actual);
+    }
     let mut names = plan
         .properties
         .iter()
@@ -14863,6 +14940,14 @@ mod generic_publication_tests {
                 .map(|property| fixture.store.symbol(*property).unwrap().name().as_utf8())
                 .collect::<Vec<_>>(),
             [Some("own"), Some("extra"), Some("inherited")],
+        );
+        assert_ne!(members.properties()[0], derived_plan.properties[0].symbol);
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(members.properties()[0])
+                .and_then(|links| links.target),
+            Some(derived_plan.properties[0].symbol),
         );
         let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
         let concrete = fixture
