@@ -1115,8 +1115,8 @@ impl<'store> RelaterSession<'store> {
         Ok(true)
     }
 
-    /// The only mixed Array/property-object relation that is independent of
-    /// instantiating generic Array members.
+    /// Mixed Array/property-object relations that do not require instantiated
+    /// generic Array members.
     ///
     /// The pinned oracle is surface-sensitive: a sole empty `Array<T>` shell
     /// makes `[[1], {}]` infer `number[][]`, while a shell with required
@@ -1124,8 +1124,9 @@ impl<'store> RelaterSession<'store> {
     /// empty object is always true for structural relations. Assignability and
     /// subtype comparisons prove the reverse direction false only when the raw
     /// target has a required own property; otherwise it remains unavailable
-    /// rather than guessing that a cold shell is empty.
-    fn canonical_array_empty_object_relation(
+    /// rather than guessing that a cold shell is empty. An exact `length`
+    /// property can also be compared through its authenticated raw annotation.
+    fn canonical_array_property_object_relation(
         &mut self,
         source: TypeId,
         target: TypeId,
@@ -1168,6 +1169,12 @@ impl<'store> RelaterSession<'store> {
             });
         }
         if !members.properties.is_empty() {
+            if !reverse_requires_property
+                && let Some(related) =
+                    self.canonical_array_length_property_relation(array_target, &members)?
+            {
+                return Ok(Some(related));
+            }
             return Err(RelationUnavailable::StructuralRelation {
                 source,
                 target,
@@ -1180,6 +1187,88 @@ impl<'store> RelaterSession<'store> {
             return Err(RelationUnavailable::UnsupportedStructuredType(array_target));
         }
         Ok(Some(result))
+    }
+
+    fn canonical_array_length_property_relation(
+        &mut self,
+        array_target: TypeId,
+        target_members: &ResolvedObjectMembers,
+    ) -> Result<Option<Ternary>, RelationUnavailable> {
+        let [target_property] = target_members.properties.as_slice() else {
+            return Ok(None);
+        };
+        if !target_members.property_origin.is_declared() || !target_members.index_infos.is_empty() {
+            return Ok(None);
+        }
+        let (target_optional, target_readonly) = {
+            let property =
+                self.property_symbol(*target_property, target_members.property_origin)?;
+            if property.name().as_utf8() != Some("length") {
+                return Ok(None);
+            }
+            (
+                property.flags().contains(SymbolFlags::OPTIONAL),
+                property.check_flags().contains(CheckFlags::READONLY),
+            )
+        };
+        let target_type = self.property_type(*target_property)?;
+        if !self.canonical_array_target_has_required_own_property(array_target)? {
+            return Ok(None);
+        }
+
+        let invalid = || RelationUnavailable::InvalidStructuredMembers(array_target);
+        let owner = self
+            .store
+            .type_payload(array_target)
+            .and_then(TypeRecord::symbol)
+            .ok_or_else(invalid)?;
+        let Some(source_property) = self
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| self.store.symbol_table(members))
+            .and_then(|members| members.get_source("length"))
+        else {
+            return Ok(None);
+        };
+        let source = self.store.symbol(source_property).ok_or_else(invalid)?;
+        let Some([declaration]) = source.declarations() else {
+            return Err(invalid());
+        };
+        let annotation = self
+            .store
+            .source_direct_type_annotation(*declaration)
+            .ok_or_else(invalid)?;
+        if source.flags() != SymbolFlags::PROPERTY
+            || self.store.source_node_kind(annotation) != Some(SyntaxKind::NumberKeyword)
+            || !self
+                .store
+                .source_direct_type_annotation_is_exact(annotation, self.bootstrap.number_type)
+            || self
+                .store
+                .value_symbol_links(source_property)
+                .is_some_and(|links| {
+                    links != &ValueSymbolLinks::default()
+                        && links
+                            != &(ValueSymbolLinks {
+                                resolved_type: Some(self.bootstrap.number_type),
+                                ..ValueSymbolLinks::default()
+                            })
+                })
+        {
+            return Err(invalid());
+        }
+        if self.relation == RelationKind::StrictSubtype
+            && source.check_flags().contains(CheckFlags::READONLY)
+            && !target_readonly
+        {
+            return Ok(Some(Ternary::False));
+        }
+
+        let target_types = self.effective_property_types(target_type, target_optional)?;
+        let number = self.bootstrap.number_type;
+        self.property_types_related(&[number], &target_types)
+            .map(Some)
     }
 
     fn canonical_array_target_has_required_own_property(
@@ -1774,7 +1863,8 @@ impl<'store> RelaterSession<'store> {
             }
             if source_flags.intersects(TypeFlags::OBJECT)
                 && target_flags.intersects(TypeFlags::OBJECT)
-                && let Some(related) = self.canonical_array_empty_object_relation(source, target)?
+                && let Some(related) =
+                    self.canonical_array_property_object_relation(source, target)?
             {
                 return Ok(related);
             }
@@ -15507,6 +15597,221 @@ mod tests {
             Err(RelationUnavailable::UnsupportedStructuredType(literal)),
         );
         assert_eq!(store.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn canonical_arrays_compare_authenticated_length_property_objects() {
+        let mut store = initialized(true);
+        let (number, string, empty_object) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.empty_object_type,
+            )
+        };
+        let array = alloc_canonical_array_target(&mut store, "Array");
+        let global_types = RelationGlobalTypes {
+            array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
+        };
+        let base = canonical_array_reference(&mut store, array.target, number);
+        let literal = alloc_array_literal_clone(&mut store, array, number);
+        let length = alloc_typed_property(&mut store, "length", number, false);
+        let matching = alloc_property_object(&mut store, vec![length]);
+        let wrong_length = alloc_typed_property(&mut store, "length", string, false);
+        let incompatible = alloc_property_object(&mut store, vec![wrong_length]);
+        let optional_length = alloc_typed_property(&mut store, "length", number, true);
+        let optional = alloc_property_object(&mut store, vec![optional_length]);
+        let unrelated_property = alloc_typed_property(&mut store, "other", number, false);
+        let unrelated = alloc_property_object(&mut store, vec![unrelated_property]);
+        let fresh_length = alloc_typed_property(&mut store, "length", number, false);
+        let fresh = alloc_fresh_property_object(&mut store, vec![fresh_length]);
+
+        let before = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                base,
+                matching,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::StructuralRelation {
+                source: base,
+                target: matching,
+                relation: RelationKind::Assignable,
+            }),
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        add_required_array_property(&mut store, array, "length");
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+            RelationKind::Comparable,
+        ] {
+            for source in [base, literal] {
+                for (target, expected) in
+                    [(matching, true), (incompatible, false), (optional, true)]
+                {
+                    assert_eq!(
+                        store.is_type_related_to_with_optional_global_types(
+                            source,
+                            target,
+                            relation,
+                            Some(global_types),
+                        ),
+                        Ok(expected),
+                    );
+                    assert_eq!(store.relation_state_snapshot(), before);
+                }
+                for target in [unrelated, fresh] {
+                    assert_eq!(
+                        store.is_type_related_to_with_optional_global_types(
+                            source,
+                            target,
+                            relation,
+                            Some(global_types),
+                        ),
+                        Err(RelationUnavailable::StructuralRelation {
+                            source,
+                            target,
+                            relation,
+                        }),
+                    );
+                    assert_eq!(store.relation_state_snapshot(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn poisoned_array_length_proofs_and_forged_literals_fail_without_cache_writes() {
+        let mut store = initialized(true);
+        let (number, string, empty_object) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.empty_object_type,
+            )
+        };
+        let array = alloc_canonical_array_target(&mut store, "Array");
+        let global_types = RelationGlobalTypes {
+            array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
+        };
+        let base = canonical_array_reference(&mut store, array.target, number);
+        let literal = alloc_array_literal_clone(&mut store, array, number);
+        let source_length = add_required_array_property(&mut store, array, "length");
+        let target_length = alloc_typed_property(&mut store, "length", number, false);
+        let target = alloc_property_object(&mut store, vec![target_length]);
+        let declaration = store
+            .symbol(source_length)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .unwrap();
+        let annotation = store.source_direct_type_annotation(declaration).unwrap();
+
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                literal,
+                target,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Ok(true),
+        );
+        let key = store
+            .relation_key_if_available(
+                literal,
+                target,
+                super::IntersectionState::NONE,
+                false,
+                false,
+            )
+            .unwrap()
+            .key();
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE,
+        );
+        let warm = store.relation_state_snapshot();
+
+        assert!(store.set_value_symbol_links(
+            source_length,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                literal,
+                target,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::InvalidStructuredMembers(array.target)),
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned);
+        assert!(store.set_value_symbol_links(source_length, ValueSymbolLinks::default()));
+
+        assert!(store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                base,
+                target,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::InvalidStructuredMembers(array.target)),
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned);
+        assert!(store.set_type_node_links(annotation, TypeNodeLinks::default()));
+
+        let forged = store
+            .alloc_type_reference(
+                store.type_payload(literal).unwrap().object_flags(),
+                Some(array.symbol),
+            )
+            .unwrap();
+        assert!(store.set_object_target_and_mapper(forged, Some(array.target), None));
+        assert!(store.set_type_reference_resolution(forged, None, Some(vec![number])));
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                forged,
+                target,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                forged
+            )),
+        );
+        assert_eq!(store.relation_state_snapshot(), warm);
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                literal,
+                target,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Ok(true),
+        );
+        assert_eq!(store.relation_state_snapshot(), warm);
     }
 
     #[test]
