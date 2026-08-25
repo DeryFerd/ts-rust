@@ -3603,6 +3603,7 @@ fn check_react_jsx_fragment_children(
     let Some(expected) = resolve_expected_jsx_child_type(
         store,
         host,
+        source.3,
         attributes,
         &property_name,
         plan.opening,
@@ -3660,9 +3661,11 @@ fn check_react_jsx_fragment_children(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)] // React child aliases retain authenticated global array types.
 fn resolve_expected_jsx_child_type(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     expected: TypeId,
     name: &str,
     location: NodeRef,
@@ -3708,7 +3711,12 @@ fn resolve_expected_jsx_child_type(
     {
         return Err(SourceCheckError::Property(location));
     }
-    CanonicalTypeQuery::new(store, host, options, diagnostics)?
+    let mut query = if let Some(global_types) = global_types {
+        CanonicalTypeQuery::new_with_global_types(store, host, global_types, options, diagnostics)?
+    } else {
+        CanonicalTypeQuery::new(store, host, options, diagnostics)?
+    };
+    query
         .get_declared_type_of_symbol(react_node)
         .map(Some)
         .map_err(Into::into)
@@ -4246,6 +4254,7 @@ fn check_jsx_implicit_children(
         resolve_expected_jsx_child_type(
             store,
             source.2,
+            source.3,
             expected_attributes,
             &property_name,
             plan.opening,
@@ -7497,6 +7506,7 @@ fn check_attribute_assignability(
             && let Some(expected_type) = resolve_expected_jsx_child_type(
                 store,
                 host,
+                global_types,
                 expected,
                 name,
                 opening,
@@ -12122,6 +12132,122 @@ mod runtime_tests {
                 context.diagnostics().as_slice().to_vec(),
             ),
             cold,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Dynamic React tags retain lazy props, array child aliases, and warm state.
+    fn intrinsic_union_components_preserve_global_react_child_array_capabilities() {
+        let mut fixture = ReactFragmentFixture::with_library(
+            concat!(
+                "const Heading = true ? 'h1' : 'h2'; ",
+                "const valid = <Heading className='ok' key='key'>{'Title'}</Heading>; ",
+                "const invalid = <Heading className={1} key='key'>{'Title'}</Heading>;",
+            ),
+            FileId::new(8_244),
+            CanonicalJsxRuntime::Preserve,
+            concat!(
+                "interface Array<T> {} ",
+                "interface ReadonlyArray<T> {} ",
+                "interface HTMLHeadingElement {} ",
+                "declare namespace React { ",
+                "interface ReactElement { marker: string; } ",
+                "type ReactNode = string | number[]; ",
+                "interface Attributes { key?: string; } ",
+                "interface ClassAttributes<T> extends Attributes {} ",
+                "interface DOMAttributes<T> {} ",
+                "interface HTMLAttributes<T> extends DOMAttributes<T> { className?: string; } ",
+                "type DetailedHTMLProps<E extends HTMLAttributes<T>, T> = ClassAttributes<T> & E; ",
+                "} ",
+                "declare namespace JSX { ",
+                "interface Element extends React.ReactElement {} ",
+                "interface ElementChildrenAttribute { children: {}; } ",
+                "interface IntrinsicElements { ",
+                "h1: React.DetailedHTMLProps<React.HTMLAttributes<HTMLHeadingElement>, HTMLHeadingElement>; ",
+                "h2: React.DetailedHTMLProps<React.HTMLAttributes<HTMLHeadingElement>, HTMLHeadingElement>; ",
+                "} }",
+            ),
+        );
+
+        fixture.context.check_source_file(fixture.file).unwrap();
+
+        let [diagnostic] = fixture.context.diagnostics().as_slice() else {
+            panic!("only the numeric className must produce a diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'string'.",
+        );
+        assert_eq!(fixture.text(diagnostic.node.unwrap()), "className");
+
+        let store = fixture.context.store();
+        let react = store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("React"))
+            .and_then(|namespace| store.get_merged_symbol(namespace))
+            .unwrap();
+        let exports = store
+            .symbol(react)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .unwrap();
+        let react_node = exports
+            .get_source("ReactNode")
+            .and_then(|alias| store.get_merged_symbol(alias))
+            .unwrap();
+        let children = store
+            .type_alias_links(react_node)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let super::super::TypeData::Union(union) = store.type_payload(children).unwrap().data()
+        else {
+            panic!("ReactNode must retain its string and canonical array constituents")
+        };
+        assert!(union.union.types.iter().any(|type_| {
+            store
+                .canonical_array_reference(fixture.context.global_types(), *type_)
+                .unwrap()
+                .is_some()
+        }));
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        for (owner, name) in [("Attributes", "key"), ("HTMLAttributes", "className")] {
+            let symbol = exports
+                .get_source(owner)
+                .and_then(|owner| store.get_merged_symbol(owner))
+                .and_then(|owner| store.symbol(owner))
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source(name))
+                .unwrap();
+            assert_eq!(
+                store
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(string),
+            );
+        }
+
+        let warm = (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+            fixture.context.diagnostics().as_slice().to_vec(),
+        );
+        fixture.context.recheck_source_file(fixture.file).unwrap();
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().mapper_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+                fixture.context.diagnostics().as_slice().to_vec(),
+            ),
+            warm,
         );
     }
 
