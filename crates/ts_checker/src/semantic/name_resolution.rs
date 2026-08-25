@@ -6,7 +6,10 @@
 //! links can supply their target meaning, while unresolved aliases remain
 //! explicit capability errors.
 
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashSet},
+};
 
 use ts_ast::{
     FileId, Node, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeRef, SyntaxKind,
@@ -20,6 +23,7 @@ use ts_binder::{
 
 use super::{
     AliasTargetState, CanonicalTypeMapperStore, alias_provider::ProductionAliasSourceRegistry,
+    spelling::get_spelling_suggestion,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +84,7 @@ pub struct ProductionNameResolverHost<'store, 'arena> {
     store: &'store CanonicalTypeMapperStore,
     sources: ProductionNameResolverSources<'arena>,
     options: CanonicalNameResolverOptions,
+    spelling_suggestions: bool,
 }
 
 /// Why a source set cannot back production name resolution.
@@ -244,6 +249,7 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
             store,
             sources: ProductionNameResolverSources::Retained(retained),
             options,
+            spelling_suggestions: false,
         })
     }
 
@@ -269,7 +275,14 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
             store,
             sources: ProductionNameResolverSources::Registry(sources),
             options,
+            spelling_suggestions: false,
         })
+    }
+
+    /// Enables upstream spelling lookup without changing ordinary resolution.
+    pub(super) const fn with_spelling_suggestions(mut self) -> Self {
+        self.spelling_suggestions = true;
+        self
     }
 
     /// Pinned checker `getSymbolOfDeclaration`: read the binder-owned node
@@ -332,6 +345,73 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
             return Ok(target_flags.intersects(meaning).then_some(symbol));
         }
         Ok(None)
+    }
+
+    fn spelling_candidate_name(
+        &self,
+        symbol: SemanticSymbolId,
+        meaning: SymbolFlags,
+    ) -> Option<&str> {
+        let symbol = self.store.get_merged_symbol(symbol)?;
+        let record = self.store.symbol(symbol)?;
+        let name = record.name();
+        let text = name.as_utf8()?;
+        if name.is_internal() || text.starts_with('"') {
+            return None;
+        }
+        if record.flags().intersects(meaning) {
+            return Some(text);
+        }
+        if !record.flags().contains(SymbolFlags::ALIAS) {
+            return None;
+        }
+        let target = self.resolved_alias_target(symbol).ok().flatten()?;
+        self.store
+            .symbol(target)
+            .is_some_and(|target| target.flags().intersects(meaning))
+            .then_some(text)
+    }
+
+    fn compare_spelling_candidates(
+        &self,
+        left: SemanticSymbolId,
+        right: SemanticSymbolId,
+    ) -> Ordering {
+        if left == right {
+            return Ordering::Equal;
+        }
+        let Some(left_record) = self.store.symbol(left) else {
+            return Ordering::Greater;
+        };
+        let Some(right_record) = self.store.symbol(right) else {
+            return Ordering::Less;
+        };
+        let left_declaration = left_record
+            .declarations()
+            .and_then(|declarations| declarations.first())
+            .copied();
+        let right_declaration = right_record
+            .declarations()
+            .and_then(|declarations| declarations.first())
+            .copied();
+        let declaration_order = match (left_declaration, right_declaration) {
+            (Some(left), Some(right)) => left.file.cmp(&right.file).then_with(|| {
+                self.node(left)
+                    .map(|record| record.range.start)
+                    .cmp(&self.node(right).map(|record| record.range.start))
+            }),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        declaration_order
+            .then_with(|| {
+                left_record
+                    .name()
+                    .as_bytes()
+                    .cmp(right_record.name().as_bytes())
+            })
+            .then_with(|| left.cmp(&right))
     }
 
     /// Resolves one identifier, qualified name, or property-access entity.
@@ -621,7 +701,30 @@ impl CanonicalNameResolverHost for ProductionNameResolverHost<'_, '_> {
         if store.id() != self.store.id() {
             return Err(CanonicalNameResolutionError::InvalidHostTable(symbols));
         }
-        self.lookup_name(symbols, name, meaning)
+        let resolved = self.lookup_name(symbols, name, meaning)?;
+        if resolved.is_some() || !self.spelling_suggestions {
+            return Ok(resolved);
+        }
+        let Some(requested) = name.as_utf8() else {
+            return Ok(None);
+        };
+        let table = self
+            .store
+            .symbol_table(symbols)
+            .ok_or(CanonicalNameResolutionError::InvalidHostTable(symbols))?;
+        let suggestion = get_spelling_suggestion(
+            requested,
+            table.iter().map(|(_, symbol)| symbol),
+            |symbol| self.spelling_candidate_name(*symbol, meaning),
+            |left, right| self.compare_spelling_candidates(*left, *right),
+        );
+        suggestion
+            .map(|symbol| {
+                self.store
+                    .get_merged_symbol(symbol)
+                    .ok_or(CanonicalNameResolutionError::InvalidHostSymbol(symbol))
+            })
+            .transpose()
     }
 
     fn globals(&self) -> Option<SymbolTableId> {
@@ -850,6 +953,101 @@ mod tests {
             merged = fixture.store.merge_global_symbol(globals, *symbol).unwrap();
         }
         merged
+    }
+
+    #[test]
+    fn spelling_lookup_is_opt_in_and_uses_source_declaration_order() {
+        for (index, (source, expected)) in [
+            ("const valueA = 1; const valueB = 2;", "valueA"),
+            ("const valueB = 1; const valueA = 2;", "valueB"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = FileId::new(8_920 + u32::try_from(index).unwrap());
+            let fixture = fixture(&[(file, source, CanonicalModuleState::Script)]);
+            let bound = &fixture.files[&file];
+            let locals = bound.locals(bound.source_file()).unwrap();
+            let expected = fixture
+                .store
+                .symbol_table(locals)
+                .and_then(|locals| locals.get_source(expected))
+                .unwrap();
+
+            let mut ordinary = production_host(&fixture);
+            assert_eq!(
+                ordinary.lookup(
+                    fixture.store.symbol_store(),
+                    locals,
+                    EscapedNameRef::source("valueC"),
+                    SymbolFlags::VALUE,
+                ),
+                Ok(None),
+            );
+
+            let mut suggestions = production_host(&fixture).with_spelling_suggestions();
+            assert_eq!(
+                suggestions.lookup(
+                    fixture.store.symbol_store(),
+                    locals,
+                    EscapedNameRef::source("valueC"),
+                    SymbolFlags::VALUE,
+                ),
+                Ok(Some(expected)),
+            );
+        }
+    }
+
+    #[test]
+    fn spelling_resolution_prefers_the_innermost_visible_scope() {
+        let file = FileId::new(8_922);
+        let fixture = fixture(&[(
+            file,
+            "const valueA = 1; function read(valueB: number): number { return valueC; }",
+            CanonicalModuleState::Script,
+        )]);
+        let parsed = &fixture.parsed[&file];
+        let bound = &fixture.files[&file];
+        let reference = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(&record.data, NodeData::Identifier(identifier) if identifier.text == "valueC")
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let parameter = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::Parameter).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let expected = bound.symbol(parameter).unwrap();
+        let mut suggestions = production_host(&fixture).with_spelling_suggestions();
+
+        assert_eq!(
+            CanonicalNameResolver::new(
+                &parsed.arena,
+                bound,
+                fixture.store.symbol_store(),
+                &mut suggestions,
+            )
+            .unwrap()
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(reference)),
+                "valueC",
+                SymbolFlags::VALUE,
+                None,
+                false,
+                false,
+            ),
+            Ok(Some(expected)),
+        );
     }
 
     #[test]

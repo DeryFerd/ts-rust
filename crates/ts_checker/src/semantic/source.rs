@@ -1475,6 +1475,7 @@ enum PlannedStatement {
     ExternalModuleMarker,
     LocalNamedExport,
     RecoveredBigIntNamedExport(NodeRef),
+    MissingNamedExport(PlannedMissingNamedExport),
     NamedReexport,
     DefaultAlias(Box<PlannedDefaultAliasExport>),
     DefaultObject(Box<PlannedDefaultObjectExport>),
@@ -1521,6 +1522,12 @@ struct PlannedLocalNamedExport {
     clause: NodeRef,
     local_symbol: SemanticSymbolId,
     binding: SourceNamedReexportBindingPlan,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlannedMissingNamedExport {
+    name: NodeRef,
+    skipped_statement: Option<NodeRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -2063,10 +2070,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let mut functions = Vec::with_capacity(preplanned_functions.len());
         let mut arrows = Vec::new();
         let mut contextual_arrows = Vec::new();
-        let mut recovered_bigint_export_statements = HashSet::new();
-        for statement in source_statements {
+        let mut recovered_export_statements = HashSet::new();
+        for (statement_index, &statement) in source_statements.iter().enumerate() {
             let statement = self.reference(statement);
-            if recovered_bigint_export_statements.remove(&statement) {
+            if recovered_export_statements.remove(&statement) {
                 continue;
             }
             match self.node(statement)?.kind {
@@ -2876,14 +2883,65 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         if let Some((name, recovered_statement)) =
                             self.plan_recovered_bigint_named_export(statement)?
                         {
-                            if !recovered_bigint_export_statements.insert(recovered_statement) {
+                            if !recovered_export_statements.insert(recovered_statement) {
                                 return Err(SourceCheckError::Import(statement));
                             }
                             statements.push(PlannedStatement::RecoveredBigIntNamedExport(name));
                             continue;
                         }
-                        let exports = self.plan_external_module_marker(statement)?;
+                        let exports = match self.plan_external_module_marker(statement) {
+                            Ok(exports) => exports,
+                            Err(error)
+                                if matches!(
+                                    error,
+                                    SourceCheckError::Unsupported(
+                                        UnsupportedSourceSyntax::Syntax {
+                                            kind: SyntaxKind::NamedExports,
+                                            role: SourceSyntaxRole::ExportClause,
+                                            ..
+                                        }
+                                    )
+                                ) =>
+                            {
+                                let next = source_statements
+                                    .get(statement_index + 1)
+                                    .copied()
+                                    .map(|next| self.reference(next));
+                                let Some(recovered) =
+                                    self.plan_missing_named_export(statement, next)?
+                                else {
+                                    return Err(error);
+                                };
+                                if let Some(skipped) = recovered.skipped_statement
+                                    && !recovered_export_statements.insert(skipped)
+                                {
+                                    return Err(SourceCheckError::Provenance(
+                                        SourceCheckProvenanceError::RepeatedNode(skipped),
+                                    ));
+                                }
+                                statements.push(PlannedStatement::MissingNamedExport(recovered));
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         if exports.is_empty() {
+                            let next = source_statements
+                                .get(statement_index + 1)
+                                .copied()
+                                .map(|next| self.reference(next));
+                            if let Some(recovered) =
+                                self.plan_missing_named_export(statement, next)?
+                            {
+                                if let Some(skipped) = recovered.skipped_statement
+                                    && !recovered_export_statements.insert(skipped)
+                                {
+                                    return Err(SourceCheckError::Provenance(
+                                        SourceCheckProvenanceError::RepeatedNode(skipped),
+                                    ));
+                                }
+                                statements.push(PlannedStatement::MissingNamedExport(recovered));
+                                continue;
+                            }
                             statements.push(PlannedStatement::ExternalModuleMarker);
                         } else {
                             local_named_exports.extend(exports);
@@ -10851,6 +10909,202 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
 
         Ok(planned)
+    }
+
+    fn plan_missing_named_export(
+        &self,
+        statement: NodeRef,
+        following: Option<NodeRef>,
+    ) -> Result<Option<PlannedMissingNamedExport>, SourceCheckError> {
+        let Some((store, host)) = self.semantic else {
+            return Ok(None);
+        };
+        let statement_record = self.node(statement)?;
+        let NodeData::ExportDeclaration(export) = &statement_record.data else {
+            return Ok(None);
+        };
+        let Some(clause) = export.export_clause.map(|clause| self.reference(clause)) else {
+            return Ok(None);
+        };
+        let clause_record = self.node(clause)?;
+        let NodeData::NamedExports(exports) = &clause_record.data else {
+            return Ok(None);
+        };
+        if statement_record.kind != SyntaxKind::ExportDeclaration
+            || statement_record.flags.0 & !NODE_FLAG_PARSER_RECOVERY != 0
+            || statement_record.parent != Some(self.source.node_ref().node)
+            || export.attributes.is_some()
+            || export.flow_node.is_some()
+            || export.is_type_only
+            || export.module_specifier.is_some()
+            || export.symbol.is_some()
+            || export.facts != 0
+            || export.modifiers.is_some()
+            || clause_record.kind != SyntaxKind::NamedExports
+            || clause_record.flags.0 & !NODE_FLAG_PARSER_RECOVERY != 0
+            || clause_record.parent != Some(statement.node)
+            || exports.elements.has_trailing_comma
+            || exports.facts != 0
+        {
+            return Ok(None);
+        }
+
+        let (name, skipped_statement) = match exports.elements.nodes.as_slice() {
+            [binding] => {
+                let binding = self.reference(*binding);
+                let binding_record = self.node(binding)?;
+                let NodeData::ExportSpecifier(specifier) = &binding_record.data else {
+                    return Ok(None);
+                };
+                let local = self.reference(specifier.property_name.unwrap_or(specifier.name));
+                let local_record = self.node(local)?;
+                let NodeData::Identifier(identifier) = &local_record.data else {
+                    return Ok(None);
+                };
+                let exported = self.reference(specifier.name);
+                let exported_record = self.node(exported)?;
+                if binding_record.kind != SyntaxKind::ExportSpecifier
+                    || binding_record.flags.0 & !NODE_FLAG_PARSER_RECOVERY != 0
+                    || binding_record.parent != Some(clause.node)
+                    || specifier.is_type_only
+                    || specifier.local_symbol.is_some()
+                    || specifier.symbol.is_some()
+                    || specifier.facts != 0
+                    || local_record.kind != SyntaxKind::Identifier
+                    || local_record.flags.0 != 0
+                    || local_record.parent != Some(binding.node)
+                    || identifier.flow_node.is_some()
+                    || identifier.text.is_empty()
+                {
+                    return Ok(None);
+                }
+                let skipped = match &exported_record.data {
+                    NodeData::Identifier(exported_identifier)
+                        if exported_record.kind == SyntaxKind::Identifier
+                            && exported_record.parent == Some(binding.node)
+                            && exported_identifier.text.is_empty()
+                            && exported_record.flags.0 == NODE_FLAG_HAS_ERROR
+                            && exported_record.range.start == exported_record.range.end =>
+                    {
+                        let Some(following) = following else {
+                            return Ok(None);
+                        };
+                        let following_record = self.node(following)?;
+                        let NodeData::ExpressionStatement(expression) = &following_record.data
+                        else {
+                            return Ok(None);
+                        };
+                        let bigint = self.reference(expression.expression);
+                        let bigint_record = self.node(bigint)?;
+                        if following_record.kind != SyntaxKind::ExpressionStatement
+                            || following_record.parent != Some(self.source.node_ref().node)
+                            || expression.flow_node.is_some()
+                            || bigint_record.kind != SyntaxKind::BigIntLiteral
+                            || bigint_record.parent != Some(following.node)
+                            || self.plan_bigint_literal(bigint).is_err()
+                        {
+                            return Ok(None);
+                        }
+                        Some(following)
+                    }
+                    NodeData::Identifier(exported_identifier)
+                        if exported_record.kind == SyntaxKind::Identifier
+                            && exported_record.flags.0 == 0
+                            && exported_record.parent == Some(binding.node)
+                            && !exported_identifier.text.is_empty() =>
+                    {
+                        None
+                    }
+                    NodeData::StringLiteral(exported_literal)
+                        if exported_record.kind == SyntaxKind::StringLiteral
+                            && exported_record.flags.0 == 0
+                            && exported_record.parent == Some(binding.node)
+                            && exported_literal.token_flags.0 == 0 =>
+                    {
+                        None
+                    }
+                    _ => return Ok(None),
+                };
+                (local, skipped)
+            }
+            [] => {
+                if clause_record.range.start != clause_record.range.end
+                    || exports.elements.range.start != exports.elements.range.end
+                {
+                    return Ok(None);
+                }
+                let Some(following) = following else {
+                    return Ok(None);
+                };
+                let following_record = self.node(following)?;
+                let NodeData::ExpressionStatement(expression) = &following_record.data else {
+                    return Ok(None);
+                };
+                let assertion = self.reference(expression.expression);
+                let assertion_record = self.node(assertion)?;
+                let NodeData::AsExpression(assertion_data) = &assertion_record.data else {
+                    return Ok(None);
+                };
+                let bigint = self.reference(assertion_data.expression);
+                let bigint_record = self.node(bigint)?;
+                let reference = self.reference(assertion_data.type_);
+                let reference_record = self.node(reference)?;
+                let NodeData::TypeReferenceNode(type_reference) = &reference_record.data else {
+                    return Ok(None);
+                };
+                let name = self.reference(type_reference.type_name);
+                let name_record = self.node(name)?;
+                let NodeData::Identifier(identifier) = &name_record.data else {
+                    return Ok(None);
+                };
+                if following_record.kind != SyntaxKind::ExpressionStatement
+                    || following_record.parent != Some(self.source.node_ref().node)
+                    || expression.flow_node.is_some()
+                    || assertion_record.kind != SyntaxKind::AsExpression
+                    || assertion_record.parent != Some(following.node)
+                    || bigint_record.kind != SyntaxKind::BigIntLiteral
+                    || bigint_record.parent != Some(assertion.node)
+                    || self.plan_bigint_literal(bigint).is_err()
+                    || reference_record.kind != SyntaxKind::TypeReference
+                    || reference_record.parent != Some(assertion.node)
+                    || type_reference.type_arguments.is_some()
+                    || name_record.kind != SyntaxKind::Identifier
+                    || name_record.flags.0 != 0
+                    || name_record.parent != Some(reference.node)
+                    || identifier.flow_node.is_some()
+                    || identifier.text.is_empty()
+                {
+                    return Ok(None);
+                }
+                (name, Some(following))
+            }
+            _ => return Ok(None),
+        };
+
+        let NodeData::Identifier(identifier) = &self.node(name)?.data else {
+            return Ok(None);
+        };
+        let mut callback_host = host.name_resolver_host(store)?;
+        let resolved = CanonicalNameResolver::new(
+            self.arena,
+            self.bound,
+            store.symbol_store(),
+            &mut callback_host,
+        )
+        .map_err(DeclaredTypeError::from)?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(name)),
+            &identifier.text,
+            SymbolFlags::VALUE | SymbolFlags::TYPE | SymbolFlags::NAMESPACE | SymbolFlags::ALIAS,
+            None,
+            false,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?;
+        Ok(resolved.is_none().then_some(PlannedMissingNamedExport {
+            name,
+            skipped_statement,
+        }))
     }
 
     fn plan_default_alias_export(
@@ -19755,7 +20009,6 @@ fn check_unresolved_identifier(
     };
     let name = identifier.text.clone();
     preflight_source_expression_cache(store, expression.node, error_type)?;
-    publish_expression_type(store, expression.node, error_type)?;
     if name.is_empty()
         && record.flags.0 == NODE_FLAG_HAS_ERROR
         && record.range.start == record.range.end
@@ -19772,22 +20025,177 @@ fn check_unresolved_identifier(
                 )
             })
     {
+        publish_expression_type(store, expression.node, error_type)?;
         return Ok(CheckedExpressionTypes::leaf(error_type, error_type));
     }
-    let code = missing_name_diagnostic_code(&name, options.uses_wildcard_types);
-    merge_retry_diagnostic(
-        diagnostics,
-        CanonicalCheckerDiagnostic {
+    let diagnostic = missing_source_identifier_diagnostic(store, host, options, expression, &name)?;
+    publish_expression_type(store, expression.node, error_type)?;
+    merge_retry_diagnostic(diagnostics, diagnostic);
+    Ok(CheckedExpressionTypes::leaf(error_type, error_type))
+}
+
+fn missing_source_identifier_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    options: CanonicalCheckerOptions,
+    expression: &PlannedExpression,
+    name: &str,
+) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
+    let (arena, bound) = host
+        .source(expression.node)
+        .ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingNode(expression.node),
+        ))?;
+    let mut type_host = host.name_resolver_host(store)?;
+    let type_symbol =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut type_host)
+            .map_err(DeclaredTypeError::from)?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(expression.node)),
+                name,
+                SymbolFlags::TYPE,
+                None,
+                false,
+                false,
+            )
+            .map_err(DeclaredTypeError::from)?;
+    if let Some(symbol) = type_symbol {
+        let record = store.symbol(symbol).ok_or(SourceCheckError::Variable(
+            VariableInvariant::InvalidSymbolShape(symbol),
+        ))?;
+        if !record.flags().intersects(SymbolFlags::VALUE) {
+            let code = if matches!(
+                name,
+                "Promise" | "Symbol" | "Map" | "WeakMap" | "Set" | "WeakSet"
+            ) {
+                2585
+            } else {
+                2693
+            };
+            return Ok(CanonicalCheckerDiagnostic {
+                node: Some(expression.node),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
+                    [name],
+                ),
+                related_information: Vec::new(),
+            });
+        }
+    }
+
+    if let Some(library) = missing_source_identifier_library(name) {
+        return Ok(CanonicalCheckerDiagnostic {
             node: Some(expression.node),
             range_override: None,
             diagnostic: Diagnostic::with_arguments(
-                message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
-                [name],
+                message_by_code(2583).ok_or(SourceCheckError::MissingDiagnostic(2583))?,
+                [name, library],
             ),
             related_information: Vec::new(),
-        },
-    );
-    Ok(CheckedExpressionTypes::leaf(error_type, error_type))
+        });
+    }
+
+    let mut suggestion_host = host.name_resolver_host(store)?.with_spelling_suggestions();
+    let suggestion =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut suggestion_host)
+            .map_err(DeclaredTypeError::from)?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(expression.node)),
+                name,
+                SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+                None,
+                false,
+                false,
+            )
+            .map_err(DeclaredTypeError::from)?;
+    if let Some(suggestion) = suggestion {
+        let symbol = store.symbol(suggestion).ok_or(SourceCheckError::Variable(
+            VariableInvariant::InvalidSymbolShape(suggestion),
+        ))?;
+        let declaration = symbol.value_declaration();
+        let is_global_augmentation = declaration
+            .and_then(|declaration| host.node(declaration))
+            .is_some_and(|record| {
+                matches!(
+                    &record.data,
+                    NodeData::ModuleDeclaration(module)
+                        if module.keyword == SyntaxKind::GlobalKeyword
+                )
+            });
+        if !is_global_augmentation {
+            let suggested_name = symbol.name().as_utf8().ok_or(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(suggestion),
+            ))?;
+            let related_information = match declaration {
+                Some(declaration) => {
+                    if host.node(declaration).is_none() {
+                        return Err(SourceCheckError::Provenance(
+                            SourceCheckProvenanceError::MissingNode(declaration),
+                        ));
+                    }
+                    vec![CanonicalCheckerRelatedInformation {
+                        node: Some(declaration),
+                        diagnostic: Diagnostic::with_arguments(
+                            message_by_code(2728)
+                                .ok_or(SourceCheckError::MissingDiagnostic(2728))?,
+                            [suggested_name],
+                        ),
+                    }]
+                }
+                None => Vec::new(),
+            };
+            return Ok(CanonicalCheckerDiagnostic {
+                node: Some(expression.node),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2552).ok_or(SourceCheckError::MissingDiagnostic(2552))?,
+                    [name, suggested_name],
+                ),
+                related_information,
+            });
+        }
+    }
+
+    let parent = host
+        .node(expression.node)
+        .and_then(|record| record.parent)
+        .map(|parent| NodeRef::new(expression.node.arena, expression.node.file, parent))
+        .and_then(|parent| host.node(parent));
+    let code = match parent.map(|record| (&record.data, record.kind)) {
+        Some((
+            NodeData::ShorthandPropertyAssignment(property),
+            SyntaxKind::ShorthandPropertyAssignment,
+        )) if property.name == expression.node.node => 18004,
+        Some((NodeData::CallExpression(call), SyntaxKind::CallExpression))
+            if name == "await" && call.expression == expression.node.node =>
+        {
+            2311
+        }
+        _ => missing_name_diagnostic_code(name, options.uses_wildcard_types),
+    };
+    Ok(CanonicalCheckerDiagnostic {
+        node: Some(expression.node),
+        range_override: None,
+        diagnostic: Diagnostic::with_arguments(
+            message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
+            [name],
+        ),
+        related_information: Vec::new(),
+    })
+}
+
+fn missing_source_identifier_library(name: &str) -> Option<&'static str> {
+    match name {
+        "Map" | "Set" | "Promise" | "Symbol" | "WeakMap" | "WeakSet" | "Iterator"
+        | "AsyncIterator" | "Reflect" => Some("es2015"),
+        "SharedArrayBuffer" | "Atomics" => Some("es2017"),
+        "AsyncIterable" | "AsyncIterableIterator" | "AsyncGenerator" | "AsyncGeneratorFunction" => {
+            Some("es2018")
+        }
+        "BigInt" | "BigInt64Array" | "BigUint64Array" => Some("es2020"),
+        _ => None,
+    }
 }
 
 fn emit_uninitialized_variable_read_diagnostics(
@@ -33064,6 +33472,34 @@ pub(super) fn check_source_file(
                 {
                     return Err(SourceCheckError::Enum(enumeration.declaration));
                 }
+            }
+            PlannedStatement::MissingNamedExport(export) => {
+                let record = host.node(export.name).ok_or(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingNode(export.name),
+                ))?;
+                let NodeData::Identifier(identifier) = &record.data else {
+                    return Err(SourceCheckError::Import(export.name));
+                };
+                let unknown_symbol = store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.unknown_symbol)
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?;
+                let expression = PlannedExpression::new(
+                    export.name,
+                    PlannedExpressionKind::Identifier(PlannedIdentifierRead::unresolved(
+                        unknown_symbol,
+                    )),
+                );
+                let diagnostic = missing_source_identifier_diagnostic(
+                    store,
+                    host,
+                    options,
+                    &expression,
+                    &identifier.text,
+                )?;
+                merge_retry_diagnostic(diagnostics, diagnostic);
             }
             PlannedStatement::ExternalModuleMarker
             | PlannedStatement::LocalNamedExport
@@ -53429,22 +53865,26 @@ class Foo2 {
     }
 
     #[test]
-    fn recovered_bigint_export_names_report_the_missing_local_binding() {
-        for (index, text) in ["export { foo as 0n };", "export { 0n as foo };"]
-            .into_iter()
-            .enumerate()
+    fn missing_local_exports_report_ts2304_without_publishing_invalid_aliases() {
+        for (index, (text, parser_codes)) in [
+            ("export { missing };", [].as_slice()),
+            ("export { foo as 0n };", [1003, 1128].as_slice()),
+            ("export { 0n as foo };", [1003, 1128].as_slice()),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let source = parse_source_file(text);
             assert_eq!(
                 source
                     .diagnostics
                     .iter()
-                    .map(|diagnostic| diagnostic.code)
+                    .map(|diagnostic| diagnostic.code.unwrap())
                     .collect::<Vec<_>>(),
-                [Some(1003), Some(1128)],
-                "{text}",
+                parser_codes,
+                "source: {text}",
             );
-            let file = FileId::new(9_832 + u32::try_from(index).unwrap());
+            let file = FileId::new(9_830 + u32::try_from(index).unwrap());
             let mut context = context_with_module_state(
                 &[(file, &source)],
                 CanonicalModuleState::External,
@@ -53454,11 +53894,13 @@ class Foo2 {
             context.check_source_file(file).unwrap();
 
             let [diagnostic] = context.diagnostics().as_slice() else {
-                panic!("the recovered bigint export must report its missing binding: {text}")
+                panic!("expected one missing exported name for {text}")
             };
+            let expected = if index == 0 { "missing" } else { "foo" };
             assert_eq!(diagnostic.diagnostic.code(), 2304);
-            assert_eq!(node_text(&source, diagnostic.node.unwrap()), "foo");
-            assert_eq!(diagnostic.diagnostic.arguments, ["foo"]);
+            assert_eq!(diagnostic.diagnostic.arguments, [expected]);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), expected);
+            assert!(diagnostic.related_information.is_empty());
 
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();
@@ -61081,6 +61523,252 @@ class Foo2 {
             let warm = observable_state(&context, file);
             mark_source_unchecked(&mut context, file);
             context.check_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn source_identifier_spelling_reports_ts2552_with_the_upstream_related_declaration() {
+        let source = parsed("const global = { x: true }; globals.x;");
+        let file = FileId::new(9_810);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let read = identifier_expressions(&source, file, "globals")[0];
+        let declaration = variable_declaration(&source, file, "global");
+        let (error_type, unknown_symbol) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.error_type, bootstrap.unknown_symbol)
+        };
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one upstream spelling-suggestion diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(read));
+        assert_eq!(diagnostic.diagnostic.code(), 2552);
+        assert_eq!(diagnostic.diagnostic.arguments, ["globals", "global"]);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Cannot find name 'globals'. Did you mean 'global'?",
+        );
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("the spelling suggestion must retain its declaration")
+        };
+        assert_eq!(related.node, Some(declaration));
+        assert_eq!(related.diagnostic.code(), 2728);
+        assert_eq!(related.diagnostic.arguments, ["global"]);
+        assert_eq!(resolved_node_type(&context, read), error_type);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(read)
+                .and_then(|links| links.resolved_symbol),
+            Some(unknown_symbol),
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn source_identifier_suggestions_preserve_lexical_scope_and_declaration_order() {
+        for (index, (text, expected)) in [
+            (
+                "const valueA = 1; const valueB = 2; const result = valueC;",
+                "valueA",
+            ),
+            (
+                "const valueB = 1; const valueA = 2; const result = valueC;",
+                "valueB",
+            ),
+            (
+                concat!(
+                    "const valueA = 1; ",
+                    "function read(valueB: number): number { return valueC; }",
+                ),
+                "valueB",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_811 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one lexical suggestion for {text}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2552, "source: {text}");
+            assert_eq!(diagnostic.diagnostic.arguments, ["valueC", expected]);
+            let [related] = diagnostic.related_information.as_slice() else {
+                panic!("expected one declaration for {text}")
+            };
+            assert_eq!(related.diagnostic.code(), 2728);
+            assert_eq!(related.diagnostic.arguments, [expected]);
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn source_identifier_suggestions_respect_cross_file_global_and_module_visibility() {
+        let global = parsed("declare const availableValue: number;");
+        let source = parsed("const result = availableValu;");
+        let global_file = FileId::new(9_815);
+        let source_file = FileId::new(9_816);
+        let mut context = context_with_cross_file_global(
+            global_file,
+            &global,
+            source_file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::Script,
+            false,
+        );
+
+        context.check_source_file(source_file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected a suggestion for the visible cross-file global")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2552);
+        assert_eq!(
+            diagnostic.diagnostic.arguments,
+            ["availableValu", "availableValue"],
+        );
+        assert_eq!(
+            diagnostic.related_information[0].node,
+            Some(variable_declaration(&global, global_file, "availableValue")),
+        );
+
+        let module = parsed("export declare const hiddenValue: number;");
+        let consumer = parsed("const result = hiddenValu;");
+        let module_file = FileId::new(9_817);
+        let consumer_file = FileId::new(9_818);
+        let mut context = context_with_cross_file_global(
+            module_file,
+            &module,
+            consumer_file,
+            &consumer,
+            CanonicalModuleState::External,
+            CanonicalModuleState::Script,
+            false,
+        );
+
+        context.check_source_file(consumer_file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("a module-only export must not become a global suggestion")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2304);
+        assert_eq!(diagnostic.diagnostic.arguments, ["hiddenValu"]);
+        assert!(diagnostic.related_information.is_empty());
+    }
+
+    #[test]
+    fn source_identifier_suggestions_accept_value_imports_and_ignore_type_only_aliases() {
+        let importer = parsed(concat!(
+            "import { offeredValue as availableValue } from './target'; ",
+            "import type { OfferedType as visibleType } from './target'; ",
+            "const first = availableValu; ",
+            "const second = visibleTyp;",
+        ));
+        let target = parsed(concat!(
+            "export const offeredValue: number = 1; ",
+            "export interface OfferedType {}",
+        ));
+        let importer_file = FileId::new(9_819);
+        let target_file = FileId::new(9_820);
+        let files = [(importer_file, &importer), (target_file, &target)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[
+                SourceImportRoute {
+                    source: 0,
+                    specifier: 0,
+                    target: 1,
+                },
+                SourceImportRoute {
+                    source: 0,
+                    specifier: 1,
+                    target: 1,
+                },
+            ],
+        );
+
+        context.check_source_file(importer_file).unwrap();
+
+        let [value, type_only] = context.diagnostics().as_slice() else {
+            panic!("expected separate value-import suggestion and type-only miss")
+        };
+        assert_eq!(value.diagnostic.code(), 2552);
+        assert_eq!(
+            value.diagnostic.arguments,
+            ["availableValu", "availableValue"]
+        );
+        assert_eq!(type_only.diagnostic.code(), 2304);
+        assert_eq!(type_only.diagnostic.arguments, ["visibleTyp"]);
+        let alias =
+            source_import_alias_symbol(&context, &importer, importer_file, "availableValue");
+        assert!(context.store().value_symbol_links(alias).is_none());
+
+        let warm = observable_state(&context, importer_file);
+        context.recheck_source_file(importer_file).unwrap();
+        assert_eq!(observable_state(&context, importer_file), warm);
+    }
+
+    #[test]
+    fn missing_source_identifiers_preserve_type_library_and_shorthand_diagnostics() {
+        for (index, (text, code, arguments)) in [
+            (
+                "interface Shape {} const value = Shape;",
+                2693,
+                ["Shape", ""],
+            ),
+            (
+                "interface Promise {} const value = Promise;",
+                2585,
+                ["Promise", ""],
+            ),
+            ("const value = Map;", 2583, ["Map", "es2015"]),
+            ("const value = Atomics;", 2583, ["Atomics", "es2017"]),
+            (
+                "const value = AsyncIterable;",
+                2583,
+                ["AsyncIterable", "es2018"],
+            ),
+            ("const value = BigInt;", 2583, ["BigInt", "es2020"]),
+            ("const value = { missing };", 18004, ["missing", ""]),
+            ("const value = document;", 2584, ["document", ""]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_821 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one missing-name diagnostic for {text}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), code, "source: {text}");
+            if arguments[1].is_empty() {
+                assert_eq!(diagnostic.diagnostic.arguments, [arguments[0]]);
+            } else {
+                assert_eq!(diagnostic.diagnostic.arguments, arguments);
+            }
+            assert!(diagnostic.related_information.is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
     }
