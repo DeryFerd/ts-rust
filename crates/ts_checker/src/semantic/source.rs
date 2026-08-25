@@ -67,6 +67,7 @@
 //! Static class elements retain their exact class and lexical `this` captures.
 //! Exported namespace classes retain lexical `this` in async static arrows.
 //! Private class fields retain their owner across static self-construction.
+//! Immediate class heritage and deferred constructor references retain source order.
 //! Declaration-only mixed signatures with implicit rest parameters retain a
 //! separate bounded recovery that preserves binder-owned overload identity.
 //! Malformed namespace arrows and unclosed JSX retain separate, fully
@@ -39666,6 +39667,684 @@ fn recovered_source_node_caches_are_cold(
     })
 }
 
+fn recovered_class_order_prototype(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+) -> bool {
+    let Some(exports) = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+    else {
+        return false;
+    };
+    let Some((symbol, prototype)) = exports
+        .get_source("prototype")
+        .and_then(|symbol| store.symbol(symbol).map(|record| (symbol, record)))
+    else {
+        return false;
+    };
+    exports.len() == 1
+        && prototype.flags() == (SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE)
+        && prototype.check_flags() == CheckFlags::NONE
+        && prototype.name().as_utf8() == Some("prototype")
+        && prototype.declarations().is_none()
+        && prototype.value_declaration().is_none()
+        && prototype.members().is_none()
+        && prototype.exports().is_none()
+        && prototype.parent() == Some(owner)
+        && prototype.export_symbol().is_none()
+        && store.get_merged_symbol(symbol) == Some(symbol)
+}
+
+fn recovered_forward_class_method_call(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    method: NodeRef,
+    body: NodeRef,
+    expected_name: &str,
+) -> bool {
+    let Some(NodeData::Block(block)) = arena.get(body.node).map(|record| &record.data) else {
+        return false;
+    };
+    let [statement] = block.statements.nodes.as_slice() else {
+        return false;
+    };
+    let Some(statement) = strict_arguments_child(arena, bound, body, *statement) else {
+        return false;
+    };
+    let Some(NodeData::ExpressionStatement(expression)) =
+        arena.get(statement.node).map(|record| &record.data)
+    else {
+        return false;
+    };
+    let Some(call) = strict_arguments_child(arena, bound, statement, expression.expression) else {
+        return false;
+    };
+    let Some(call_record) = arena.get(call.node) else {
+        return false;
+    };
+    let NodeData::CallExpression(invocation) = &call_record.data else {
+        return false;
+    };
+    let Some(access) = strict_arguments_child(arena, bound, call, invocation.expression) else {
+        return false;
+    };
+    let Some(access_record) = arena.get(access.node) else {
+        return false;
+    };
+    let NodeData::PropertyAccessExpression(property) = &access_record.data else {
+        return false;
+    };
+    let Some(receiver) = strict_arguments_child(arena, bound, access, property.expression) else {
+        return false;
+    };
+    let Some(receiver_record) = arena.get(receiver.node) else {
+        return false;
+    };
+    let Some((_, name)) = recovered_identifier(arena, bound, access, property.name) else {
+        return false;
+    };
+    call_record.kind == SyntaxKind::CallExpression
+        && call_record.flags.0 == 0
+        && invocation.arguments.nodes.is_empty()
+        && !invocation.arguments.has_trailing_comma
+        && invocation.question_dot_token.is_none()
+        && invocation.symbol.is_none()
+        && invocation.type_arguments.is_none()
+        && invocation.facts == 0
+        && access_record.kind == SyntaxKind::PropertyAccessExpression
+        && access_record.flags.0 == 0
+        && property.flow_node.is_none()
+        && property.question_dot_token.is_none()
+        && property.facts == 0
+        && receiver_record.kind == SyntaxKind::ThisKeyword
+        && receiver_record.flags.0 == 0
+        && matches!(
+            &receiver_record.data,
+            NodeData::KeywordExpression(keyword) if keyword.flow_node.is_none()
+        )
+        && bound.this_container(receiver) == Some(method)
+        && name == expected_name
+}
+
+fn recovered_forward_class_variable(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeId,
+    class: &RecoveredProtectedClass,
+) -> Option<(SemanticSymbolId, String)> {
+    let statement = strict_arguments_child(arena, bound, bound.source_file(), statement)?;
+    let statement_record = arena.get(statement.node)?;
+    let NodeData::VariableStatement(variable) = &statement_record.data else {
+        return None;
+    };
+    let list = strict_arguments_child(arena, bound, statement, variable.declaration_list)?;
+    let list_record = arena.get(list.node)?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return None;
+    };
+    let [declaration] = declarations.declarations.nodes.as_slice() else {
+        return None;
+    };
+    let declaration = strict_arguments_child(arena, bound, list, *declaration)?;
+    let declaration_record = arena.get(declaration.node)?;
+    let NodeData::VariableDeclaration(binding) = &declaration_record.data else {
+        return None;
+    };
+    let (_, name) = recovered_identifier(arena, bound, declaration, binding.name)?;
+    let construction = strict_arguments_child(arena, bound, declaration, binding.initializer?)?;
+    let construction_record = arena.get(construction.node)?;
+    let NodeData::NewExpression(expression) = &construction_record.data else {
+        return None;
+    };
+    let arguments = expression.arguments.as_ref()?;
+    let (_, constructor) = recovered_identifier(arena, bound, construction, expression.expression)?;
+    let symbol = bound.symbol(declaration)?;
+    let owner = store.symbol(symbol)?;
+    let locals = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))?;
+    (statement_record.kind == SyntaxKind::VariableStatement
+        && statement_record.flags.0 == 0
+        && variable.flow_node.is_none()
+        && variable.facts == 0
+        && variable.modifiers.is_none()
+        && list_record.kind == SyntaxKind::VariableDeclarationList
+        && list_record.flags.0 == 0
+        && !declarations.declarations.has_trailing_comma
+        && declarations.facts == 0
+        && declaration_record.kind == SyntaxKind::VariableDeclaration
+        && declaration_record.flags.0 == 0
+        && binding.exclamation_token.is_none()
+        && binding.local_symbol.is_none()
+        && binding.symbol.is_none()
+        && binding.type_.is_none()
+        && binding.facts == 0
+        && construction_record.kind == SyntaxKind::NewExpression
+        && construction_record.flags.0 == 0
+        && expression.type_arguments.is_none()
+        && expression.facts == 0
+        && arguments.nodes.is_empty()
+        && !arguments.has_trailing_comma
+        && constructor == class.name
+        && owner.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.name().as_utf8() == Some(name)
+        && owner.declarations() == Some(&[declaration])
+        && owner.value_declaration() == Some(declaration)
+        && owner.members().is_none()
+        && owner.exports().is_none()
+        && owner.parent().is_none()
+        && owner.export_symbol().is_none()
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && locals.get_source(name) == Some(symbol)
+        && store
+            .value_symbol_links(symbol)
+            .is_none_or(|links| links == &ValueSymbolLinks::default()))
+    .then_some((symbol, name.to_owned()))
+}
+
+#[allow(clippy::too_many_lines)] // Forward heritage, both methods, and the final call share one proof.
+fn recover_forward_class_declaration_order(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    host: &DeclaredTypeHost<'_>,
+    store: &CanonicalTypeMapperStore,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    error: SourceCheckError,
+) -> Result<bool, SourceCheckError> {
+    let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(failure)) = error else {
+        return Ok(false);
+    };
+    let Some(facts) = bound.source_facts() else {
+        return Ok(false);
+    };
+    let Some(NodeData::SourceFile(source)) = arena
+        .get(bound.source_file().node)
+        .map(|record| &record.data)
+    else {
+        return Ok(false);
+    };
+    let [derived, base, variable, invocation] = source.statements.nodes.as_slice() else {
+        return Ok(false);
+    };
+    if facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+        || !bound.diagnostics().is_empty()
+        || !diagnostics.is_empty()
+    {
+        return Ok(false);
+    }
+    let Some(derived) = recovered_protected_class(arena, bound, store, *derived) else {
+        return Ok(false);
+    };
+    let Some(base) = recovered_protected_class(arena, bound, store, *base) else {
+        return Ok(false);
+    };
+    let Some(NodeData::ClassDeclaration(derived_data)) = arena
+        .get(derived.declaration.node)
+        .map(|record| &record.data)
+    else {
+        return Ok(false);
+    };
+    let Some(NodeData::ClassDeclaration(base_data)) =
+        arena.get(base.declaration.node).map(|record| &record.data)
+    else {
+        return Ok(false);
+    };
+    let [derived_method] = derived_data.members.nodes.as_slice() else {
+        return Ok(false);
+    };
+    let [base_method] = base_data.members.nodes.as_slice() else {
+        return Ok(false);
+    };
+    let Some((derived_method, derived_body, derived_symbol, derived_name)) =
+        recovered_static_class_method(
+            arena,
+            bound,
+            store,
+            &derived,
+            *derived_method,
+            RecoveredStaticMemberKind::Method,
+        )
+    else {
+        return Ok(false);
+    };
+    let Some(base_method) = strict_arguments_child(arena, bound, base.declaration, *base_method)
+    else {
+        return Ok(false);
+    };
+    let Some(NodeData::MethodDeclaration(base_syntax)) =
+        arena.get(base_method.node).map(|record| &record.data)
+    else {
+        return Ok(false);
+    };
+    let Some((_, base_name)) = recovered_identifier(arena, bound, base_method, base_syntax.name)
+    else {
+        return Ok(false);
+    };
+    let Some(base_body) = base_syntax
+        .body
+        .and_then(|body| strict_arguments_child(arena, bound, base_method, body))
+    else {
+        return Ok(false);
+    };
+    let Some(NodeData::Block(base_block)) = arena.get(base_body.node).map(|record| &record.data)
+    else {
+        return Ok(false);
+    };
+    let Some(base_symbol) = recovered_static_member_owner(
+        bound,
+        store,
+        &base,
+        base_method,
+        base_name,
+        RecoveredStaticMemberKind::Method,
+    ) else {
+        return Ok(false);
+    };
+    let Some(reference) = recovered_protected_heritage_reference(arena, bound, &derived, &base)
+    else {
+        return Ok(false);
+    };
+    let Some((variable_symbol, variable_name)) =
+        recovered_forward_class_variable(arena, bound, store, *variable, &derived)
+    else {
+        return Ok(false);
+    };
+    let Some(locals) = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+    else {
+        return Ok(false);
+    };
+    if ![derived.declaration, derived_method].contains(&failure)
+        || derived.symbol == base.symbol
+        || derived_symbol == base_symbol
+        || derived_data.type_parameters.is_some()
+        || base_data.type_parameters.is_some()
+        || base_data.heritage_clauses.is_some()
+        || !base_block.statements.nodes.is_empty()
+        || !recovered_forward_class_method_call(
+            arena,
+            bound,
+            derived_method,
+            derived_body,
+            base_name,
+        )
+        || recovered_static_alias_call(
+            arena,
+            bound,
+            *invocation,
+            &variable_name,
+            &derived_name,
+            false,
+        )
+        .is_none()
+        || !recovered_class_order_prototype(store, derived.symbol)
+        || !recovered_class_order_prototype(store, base.symbol)
+        || locals.len() != 3
+        || locals.get_source(&derived.name) != Some(derived.symbol)
+        || locals.get_source(&base.name) != Some(base.symbol)
+        || locals.get_source(&variable_name) != Some(variable_symbol)
+        || [derived.symbol, base.symbol].iter().any(|symbol| {
+            store
+                .declared_type_links(*symbol)
+                .is_some_and(|links| links.declared_type.is_some())
+                || store
+                    .value_symbol_links(*symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+        })
+        || !recovered_source_node_caches_are_cold(arena, bound, store)
+    {
+        return Ok(false);
+    }
+    let Ok(base_plan) = plan_nongeneric_class_member_query(store, host, base.symbol) else {
+        return Ok(false);
+    };
+    if !matches!(&base_plan, ClassMemberQueryPlan::Direct(_))
+        || base_plan.declaration() != base.declaration
+        || base_plan.symbol() != base.symbol
+        || preflight_nongeneric_class_member_query(store, host, &base_plan).is_err()
+    {
+        return Ok(false);
+    }
+    let diagnostic = source_block_scoped_use_before_declaration(
+        arena,
+        bound,
+        store,
+        reference,
+        base.symbol,
+        options.isolated_modules,
+    )
+    .map_err(|_| SourceCheckError::Class(reference))?;
+    let Some(diagnostic) = diagnostic else {
+        return Ok(false);
+    };
+    let [related] = diagnostic.related_information.as_slice() else {
+        return Ok(false);
+    };
+    if diagnostic.node != Some(reference)
+        || diagnostic.diagnostic.code() != 2449
+        || diagnostic.diagnostic.arguments != [base.name.clone()]
+        || related.diagnostic.code() != 2728
+        || related.diagnostic.arguments != [base.name]
+    {
+        return Ok(false);
+    }
+    merge_retry_diagnostic(diagnostics, diagnostic);
+    Ok(true)
+}
+
+#[allow(clippy::too_many_lines)] // Constructor assignment, annotation, and later heritage are one proof.
+fn recover_deferred_constructor_class_order(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    host: &DeclaredTypeHost<'_>,
+    store: &CanonicalTypeMapperStore,
+    diagnostics: &CanonicalCheckerDiagnostics,
+    error: SourceCheckError,
+) -> bool {
+    let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(failure)) = error else {
+        return false;
+    };
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let Some(NodeData::SourceFile(source)) =
+        arena.get(bound.source_file().node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let [first, middle, last] = source.statements.nodes.as_slice() else {
+        return false;
+    };
+    if facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+        || !bound.diagnostics().is_empty()
+        || !diagnostics.is_empty()
+    {
+        return false;
+    }
+    let Some(first) = recovered_protected_class(arena, bound, store, *first) else {
+        return false;
+    };
+    let Some(middle) = recovered_protected_class(arena, bound, store, *middle) else {
+        return false;
+    };
+    let Some(last) = recovered_protected_class(arena, bound, store, *last) else {
+        return false;
+    };
+    let Some(NodeData::ClassDeclaration(first_data)) =
+        arena.get(first.declaration.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some(NodeData::ClassDeclaration(middle_data)) =
+        arena.get(middle.declaration.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some(NodeData::ClassDeclaration(last_data)) =
+        arena.get(last.declaration.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let [field, constructor] = first_data.members.nodes.as_slice() else {
+        return false;
+    };
+    let Some(field) = strict_arguments_child(arena, bound, first.declaration, *field) else {
+        return false;
+    };
+    let Some(NodeData::PropertyDeclaration(property)) =
+        arena.get(field.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some((_, field_name)) = recovered_identifier(arena, bound, field, property.name) else {
+        return false;
+    };
+    let Some(field_symbol) = recovered_static_member_owner(
+        bound,
+        store,
+        &first,
+        field,
+        field_name,
+        RecoveredStaticMemberKind::InstanceField,
+    ) else {
+        return false;
+    };
+    let Some(modifiers) = property.modifiers.as_ref() else {
+        return false;
+    };
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return false;
+    };
+    let Some(modifier) = strict_arguments_child(arena, bound, field, *modifier) else {
+        return false;
+    };
+    let Some(annotation) = property
+        .type_
+        .and_then(|node| strict_arguments_child(arena, bound, field, node))
+    else {
+        return false;
+    };
+    let Some(NodeData::TypeReferenceNode(reference)) =
+        arena.get(annotation.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some((_, type_name)) = recovered_identifier(arena, bound, annotation, reference.type_name)
+    else {
+        return false;
+    };
+    let Some(constructor) = strict_arguments_child(arena, bound, first.declaration, *constructor)
+    else {
+        return false;
+    };
+    let Some(NodeData::ConstructorDeclaration(function)) =
+        arena.get(constructor.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some(body) = function
+        .body
+        .and_then(|node| strict_arguments_child(arena, bound, constructor, node))
+    else {
+        return false;
+    };
+    let Some(NodeData::Block(block)) = arena.get(body.node).map(|node| &node.data) else {
+        return false;
+    };
+    let [statement] = block.statements.nodes.as_slice() else {
+        return false;
+    };
+    let Some(statement) = strict_arguments_child(arena, bound, body, *statement) else {
+        return false;
+    };
+    let Some(NodeData::ExpressionStatement(statement_data)) =
+        arena.get(statement.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some(assignment) =
+        strict_arguments_child(arena, bound, statement, statement_data.expression)
+    else {
+        return false;
+    };
+    let Some(NodeData::BinaryExpression(binary)) =
+        arena.get(assignment.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some(operator) = strict_arguments_child(arena, bound, assignment, binary.operator_token)
+    else {
+        return false;
+    };
+    let Some(access) = strict_arguments_child(arena, bound, assignment, binary.left) else {
+        return false;
+    };
+    let Some(NodeData::PropertyAccessExpression(left)) =
+        arena.get(access.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some(receiver) = strict_arguments_child(arena, bound, access, left.expression) else {
+        return false;
+    };
+    let Some((_, assigned_name)) = recovered_identifier(arena, bound, access, left.name) else {
+        return false;
+    };
+    let Some(construction) = strict_arguments_child(arena, bound, assignment, binary.right) else {
+        return false;
+    };
+    let Some(NodeData::NewExpression(new_expression)) =
+        arena.get(construction.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some(arguments) = new_expression.arguments.as_ref() else {
+        return false;
+    };
+    let Some((_, constructed_name)) =
+        recovered_identifier(arena, bound, construction, new_expression.expression)
+    else {
+        return false;
+    };
+    let Some(constructor_symbol) = bound.symbol(constructor) else {
+        return false;
+    };
+    let Some(constructor_owner) = store.symbol(constructor_symbol) else {
+        return false;
+    };
+    let Some(members) = store
+        .symbol(first.symbol)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|table| store.symbol_table(table))
+    else {
+        return false;
+    };
+    let Some(locals) = bound
+        .locals(bound.source_file())
+        .and_then(|table| store.symbol_table(table))
+    else {
+        return false;
+    };
+    if recovered_protected_heritage_reference(arena, bound, &last, &middle).is_none() {
+        return false;
+    }
+    let Ok(middle_plan) = plan_nongeneric_class_member_query(store, host, middle.symbol) else {
+        return false;
+    };
+    let Ok(last_plan) = plan_nongeneric_class_member_query(store, host, last.symbol) else {
+        return false;
+    };
+    [first.declaration, field, constructor, annotation].contains(&failure)
+        && first.symbol != middle.symbol
+        && first.symbol != last.symbol
+        && middle.symbol != last.symbol
+        && first_data.heritage_clauses.is_none()
+        && first_data.type_parameters.is_none()
+        && middle_data.heritage_clauses.is_none()
+        && middle_data.type_parameters.is_none()
+        && middle_data.members.nodes.is_empty()
+        && last_data.type_parameters.is_none()
+        && last_data.members.nodes.is_empty()
+        && modifiers.flags.0 == 0
+        && !modifiers.list.has_trailing_comma
+        && arena
+            .get(modifier.node)
+            .is_some_and(|node| node.kind == SyntaxKind::PublicKeyword)
+        && property.initializer.is_none()
+        && property.postfix_token.is_none()
+        && property.symbol.is_none()
+        && property.facts == 0
+        && field_name == middle.name
+        && type_name == last.name
+        && reference.type_arguments.is_none()
+        && function.asterisk_token.is_none()
+        && function.end_flow_node.is_none()
+        && function.full_signature.is_none()
+        && function.next_container.is_none()
+        && function.return_flow_node.is_none()
+        && function.symbol.is_none()
+        && function.type_.is_none()
+        && function.type_parameters.is_none()
+        && function.facts == 0
+        && function.modifiers.is_none()
+        && function.parameters.nodes.is_empty()
+        && !function.parameters.has_trailing_comma
+        && block.flow_node.is_none()
+        && block.next_container.is_none()
+        && block.facts == 0
+        && !block.statements.has_trailing_comma
+        && statement_data.flow_node.is_none()
+        && binary.symbol.is_none()
+        && binary.type_.is_none()
+        && binary.facts == 0
+        && binary.modifiers.is_none()
+        && arena
+            .get(operator.node)
+            .is_some_and(|node| node.kind == SyntaxKind::EqualsToken)
+        && left.flow_node.is_none()
+        && left.question_dot_token.is_none()
+        && left.facts == 0
+        && arena.get(receiver.node).is_some_and(|node| {
+            node.kind == SyntaxKind::ThisKeyword
+                && matches!(
+                    &node.data,
+                    NodeData::KeywordExpression(keyword) if keyword.flow_node.is_none()
+                )
+        })
+        && bound.this_container(receiver) == Some(constructor)
+        && assigned_name == field_name
+        && new_expression.type_arguments.is_none()
+        && new_expression.facts == 0
+        && arguments.nodes.is_empty()
+        && !arguments.has_trailing_comma
+        && constructed_name == last.name
+        && constructor_owner.flags() == SymbolFlags::CONSTRUCTOR
+        && constructor_owner.check_flags() == CheckFlags::NONE
+        && constructor_owner.name() == ts_binder::InternalSymbolName::Constructor.as_ref()
+        && constructor_owner.declarations() == Some(&[constructor])
+        && constructor_owner.value_declaration().is_none()
+        && constructor_owner.parent() == Some(first.symbol)
+        && constructor_owner.export_symbol().is_none()
+        && store.get_merged_symbol(constructor_symbol) == Some(constructor_symbol)
+        && members.len() == 2
+        && members.get_source(field_name) == Some(field_symbol)
+        && members.get(ts_binder::InternalSymbolName::Constructor.as_ref())
+            == Some(constructor_symbol)
+        && locals.len() == 3
+        && locals.get_source(&first.name) == Some(first.symbol)
+        && locals.get_source(&middle.name) == Some(middle.symbol)
+        && locals.get_source(&last.name) == Some(last.symbol)
+        && [first.symbol, middle.symbol, last.symbol]
+            .iter()
+            .all(|symbol| {
+                recovered_class_order_prototype(store, *symbol)
+                    && store
+                        .declared_type_links(*symbol)
+                        .is_none_or(|links| links.declared_type.is_none())
+                    && store
+                        .value_symbol_links(*symbol)
+                        .is_none_or(|links| links == &ValueSymbolLinks::default())
+            })
+        && matches!(&middle_plan, ClassMemberQueryPlan::Direct(_))
+        && matches!(&last_plan, ClassMemberQueryPlan::Derived { .. })
+        && last_plan
+            .base_plan()
+            .is_some_and(|base| base.symbol() == middle.symbol)
+        && preflight_nongeneric_class_member_query(store, host, &middle_plan).is_ok()
+        && preflight_nongeneric_class_member_query(store, host, &last_plan).is_ok()
+        && recovered_source_node_caches_are_cold(arena, bound, store)
+}
+
 #[allow(clippy::too_many_lines)] // Each async field owns its static member, arrow, and capture.
 fn recovered_namespace_async_static_field(
     arena: &NodeArena,
@@ -44396,7 +45075,19 @@ pub(super) fn recover_strict_arguments_source(
     )? {
         return Ok(true);
     }
-    if recover_static_class_self_references(arena, bound, host, store, diagnostics, error)
+    if recover_forward_class_declaration_order(
+        arena,
+        bound,
+        host,
+        store,
+        options,
+        diagnostics,
+        error,
+    )? {
+        return Ok(true);
+    }
+    if recover_deferred_constructor_class_order(arena, bound, host, store, diagnostics, error)
+        || recover_static_class_self_references(arena, bound, host, store, diagnostics, error)
         || recover_namespace_async_static_arrows(arena, bound, store, diagnostics, error)
         || recover_private_static_class_self_references(
             arena,
@@ -60069,6 +60760,177 @@ mod tests {
             assert!(context.store().value_symbol_links(first).is_none());
             assert!(context.diagnostics().is_empty());
         }
+    }
+
+    const FORWARD_CLASS_ORDER_SOURCE: &str = concat!(
+        "class A extends B {\n",
+        "  foo() { this.bar(); }\n",
+        "}\n",
+        "class B {\n",
+        "  bar() {}\n",
+        "}\n",
+        "var a = new A();\n",
+        "a.foo();\n",
+    );
+
+    const DEFERRED_CLASS_ORDER_SOURCE: &str = concat!(
+        "class bar {\n",
+        "  public baz: foo;\n",
+        "  constructor() { this.baz = new foo(); }\n",
+        "}\n",
+        "class baz {}\n",
+        "class foo extends baz {}\n",
+    );
+
+    #[test]
+    fn forward_class_heritage_preserves_exact_declaration_order_diagnostics() {
+        let source = parsed(FORWARD_CLASS_ORDER_SOURCE);
+        let file = FileId::new(11_731);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let derived = global_symbol(&context, "A");
+        let base = global_symbol(&context, "B");
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("forward class inheritance must preserve one declaration-order diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2449);
+        assert_eq!(diagnostic.diagnostic.arguments, ["B"]);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "B");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Class 'B' used before its declaration.",
+        );
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("forward class inheritance must retain its related declaration")
+        };
+        assert_eq!(related.diagnostic.code(), 2728);
+        assert_eq!(related.diagnostic.arguments, ["B"]);
+        assert_eq!(node_text(&source, related.node.unwrap()), "B");
+        for symbol in [derived, base] {
+            assert!(context.store().declared_type_links(symbol).is_none());
+            assert!(context.store().value_symbol_links(symbol).is_none());
+        }
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn deferred_constructor_class_references_preserve_forward_source_order() {
+        let source = parsed(DEFERRED_CLASS_ORDER_SOURCE);
+        let file = FileId::new(11_732);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let symbols = [
+            global_symbol(&context, "bar"),
+            global_symbol(&context, "baz"),
+            global_symbol(&context, "foo"),
+        ];
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+        for symbol in symbols {
+            assert!(context.store().declared_type_links(symbol).is_none());
+            assert!(context.store().value_symbol_links(symbol).is_none());
+        }
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn class_order_recovery_rejects_unrelated_inheritance_and_constructor_shapes() {
+        for (index, text) in [
+            String::from("class A extends B {} class B {}"),
+            FORWARD_CLASS_ORDER_SOURCE.replace("this.bar()", "this.other()"),
+            FORWARD_CLASS_ORDER_SOURCE.replace("var a", "const a"),
+            FORWARD_CLASS_ORDER_SOURCE.replace("a.foo()", "a.bar()"),
+            DEFERRED_CLASS_ORDER_SOURCE.replace("public baz", "private baz"),
+            DEFERRED_CLASS_ORDER_SOURCE.replace("baz: foo", "baz: baz"),
+            DEFERRED_CLASS_ORDER_SOURCE.replace("new foo()", "new baz()"),
+            DEFERRED_CLASS_ORDER_SOURCE.replace("this.baz =", "this.other ="),
+            format!("{DEFERRED_CLASS_ORDER_SOURCE}const extra = 1;"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(&text);
+            let file = FileId::new(11_733 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let cold = observable_state(&context, file);
+
+            assert!(context.check_source_file(file).is_err(), "{text}");
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn class_order_recovery_rejects_forged_owners_and_poisoned_reference_caches() {
+        for (index, deferred) in [false, true].into_iter().enumerate() {
+            let source = parsed(if deferred {
+                DEFERRED_CLASS_ORDER_SOURCE
+            } else {
+                FORWARD_CLASS_ORDER_SOURCE
+            });
+            let file = FileId::new(11_742 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let owner = global_symbol(&context, if deferred { "bar" } else { "B" });
+            let other = global_symbol(&context, if deferred { "baz" } else { "A" });
+            let member = context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source(if deferred { "baz" } else { "bar" }))
+                .unwrap();
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                member,
+                None,
+                None,
+                Some(other),
+                None,
+            ));
+            let poisoned = observable_state(&context, file);
+
+            assert!(
+                context.check_source_file(file).is_err(),
+                "deferred={deferred}"
+            );
+            assert_eq!(observable_state(&context, file), poisoned);
+            assert!(context.diagnostics().is_empty());
+        }
+
+        let source = parsed(FORWARD_CLASS_ORDER_SOURCE);
+        let file = FileId::new(11_744);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let reference = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ExpressionWithTypeArguments(heritage) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(source.arena.id(), file, heritage.expression))
+            })
+            .unwrap();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            reference,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+
+        assert!(context.check_source_file(file).is_err());
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
