@@ -33192,6 +33192,7 @@ fn recover_protected_generic_constructor_access(
     if resolved_default != any || !default_diagnostics.is_empty() {
         return Err(SourceCheckError::Class(default));
     }
+    publish_expression_type(store, default, resolved_default)?;
     for (reference, symbol, _) in references {
         if !store.set_symbol_node_links(
             reference,
