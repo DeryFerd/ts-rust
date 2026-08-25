@@ -8566,6 +8566,7 @@ fn validate_resolved_declared_property_object_detailed(
             if valid_unresolved_jsx_element_interface(store, type_, record, interface)
                 || valid_unresolved_react_node_array_interface(store, type_, record, interface)
                 || valid_unresolved_react_portal_interface(store, type_, record, interface)
+                || valid_unresolved_react_webview_interface(store, type_, record, interface)
             {
                 return TraversableBoundary(DeclaredPropertyObjectProof::Interface);
             }
@@ -8680,6 +8681,174 @@ fn validate_resolved_declared_property_object_detailed(
         }
         _ => NotDeclared,
     }
+}
+
+/// Authenticates React's source-owned WebView shell without resolving its DOM base.
+#[allow(clippy::too_many_lines)] // Global ownership, the cold shell, and its DOM base form one proof.
+fn valid_unresolved_react_webview_interface(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    record: &TypeRecord,
+    interface: &InterfaceTypeData,
+) -> bool {
+    let Some(owner) = record.symbol() else {
+        return false;
+    };
+    let Some(owner_record) = store.symbol(owner) else {
+        return false;
+    };
+    let Some([declaration]) = owner_record.declarations() else {
+        return false;
+    };
+    let declaration = *declaration;
+    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(globals) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+    else {
+        return false;
+    };
+    let Some(base) = globals
+        .get_source("HTMLElement")
+        .and_then(|base| store.get_merged_symbol(base))
+    else {
+        return false;
+    };
+    let Some(base_record) = store.symbol(base) else {
+        return false;
+    };
+    let Some(base_declarations) = base_record.declarations() else {
+        return false;
+    };
+
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::INTERFACE | ObjectFlags::REFERENCE
+        || record.alias().is_some()
+        || validate_nongeneric_interface_argument_origin(store, type_).is_err()
+        || interface.reference.object.structured != StructuredTypeData::default()
+        || interface.base_types_resolved
+        || interface.resolved_base_constructor_type.is_some()
+        || interface.resolved_base_types.is_some()
+        || interface.declared_members_resolved
+        || interface.declared_members.is_some()
+        || interface.declared_call_signatures.is_some()
+        || interface.declared_construct_signatures.is_some()
+        || interface.declared_index_infos.is_some()
+        || store.direct_interface_heritage_provenance(type_).is_some()
+        || owner_record.flags() != SymbolFlags::INTERFACE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name().as_utf8() != Some("HTMLWebViewElement")
+        || owner_record.value_declaration().is_some()
+        || owner_record.members().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.parent().is_some()
+        || owner_record.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || globals
+            .get_source("HTMLWebViewElement")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(owner)
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(type_)
+        || store.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration)
+        || store.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+        || store.source_node_is_exported(declaration) != Some(false)
+        || base_record.flags().without(SymbolFlags::TRANSIENT)
+            != SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || base_record.check_flags() != CheckFlags::NONE
+        || base_record.name().as_utf8() != Some("HTMLElement")
+        || base_record.value_declaration().is_none()
+        || base_record.parent().is_some()
+        || base_record.exports().is_some()
+        || base_record.export_symbol().is_some()
+        || base_declarations.iter().any(|candidate| {
+            candidate.arena == declaration.arena || candidate.file == declaration.file
+        })
+    {
+        return false;
+    }
+
+    let mut heritage = None;
+    let mut name_index = None;
+    for index in (0..declaration.node.index()).rev() {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let candidate = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            ts_ast::NodeId::new(index),
+        );
+        if store.source_node_parent(candidate) != Some(SourceNodeParent::Parent(declaration)) {
+            continue;
+        }
+        match store.source_node_kind(candidate) {
+            Some(SyntaxKind::HeritageClause) if heritage.replace(candidate).is_none() => {}
+            Some(SyntaxKind::Identifier)
+                if name_index.replace(candidate.node.index()).is_none() =>
+            {
+                break;
+            }
+            _ => return false,
+        }
+    }
+    let Some(heritage) = heritage else {
+        return false;
+    };
+    let Some(name_index) = name_index else {
+        return false;
+    };
+    let mut expression = None;
+    for index in (name_index.saturating_add(1)..heritage.node.index()).rev() {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let candidate = NodeRef::new(heritage.arena, heritage.file, ts_ast::NodeId::new(index));
+        if store.source_node_parent(candidate) != Some(SourceNodeParent::Parent(heritage)) {
+            continue;
+        }
+        if store.source_node_kind(candidate) != Some(SyntaxKind::ExpressionWithTypeArguments)
+            || expression.replace(candidate).is_some()
+        {
+            return false;
+        }
+    }
+    let Some(expression) = expression else {
+        return false;
+    };
+    let mut base_name = None;
+    for index in (name_index.saturating_add(1)..expression.node.index()).rev() {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let candidate = NodeRef::new(
+            expression.arena,
+            expression.file,
+            ts_ast::NodeId::new(index),
+        );
+        if store.source_node_parent(candidate) != Some(SourceNodeParent::Parent(expression)) {
+            continue;
+        }
+        if store.source_node_kind(candidate) != Some(SyntaxKind::Identifier)
+            || base_name.replace(candidate).is_some()
+        {
+            return false;
+        }
+    }
+    let Some(base_name) = base_name else {
+        return false;
+    };
+    [expression, base_name].into_iter().all(|reference| {
+        store.symbol_node_links(reference).is_none_or(|links| {
+            links
+                .resolved_symbol
+                .is_none_or(|symbol| store.get_merged_symbol(symbol) == Some(base))
+        })
+    })
 }
 
 fn valid_unresolved_jsx_element_interface(
