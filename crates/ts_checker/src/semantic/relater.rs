@@ -8213,7 +8213,7 @@ mod tests {
         global_types::create_type_from_generic_global_type,
         production::GlobalMergeCompletion,
         reference_types::validate_direct_generic_reference,
-        signatures::{ElementFlags, SignatureFlags, Ternary},
+        signatures::{ElementFlags, Signature, SignatureFlags, Ternary},
         tuple_types::CanonicalTupleTypeRequest,
         type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions},
         type_records::{LiteralValue, RegularLiteralLink, TypeCacheState, TypeData, TypeRecord},
@@ -8679,7 +8679,7 @@ mod tests {
         let return_type = fixture
             .store
             .signature(signature)
-            .and_then(|record| record.resolved_return_type())
+            .and_then(Signature::resolved_return_type)
             .expect("the generic function retains its conditional return");
         assert!(matches!(
             fixture
@@ -10400,7 +10400,8 @@ mod tests {
             fixture
                 .store
                 .authenticated_branded_conditional_operand(forged_template),
-            Err(RelationUnavailable::MalformedStructuredType(type_)) if type_ == forged_template
+            Err(RelationUnavailable::MalformedStructuredType(malformed))
+                if malformed == forged_template
         ));
 
         let key = fixture
@@ -10485,7 +10486,8 @@ mod tests {
             fixture
                 .store
                 .authenticated_branded_conditional_operand(forged_mapping),
-            Err(RelationUnavailable::MalformedStructuredType(type_)) if type_ == forged_mapping
+            Err(RelationUnavailable::MalformedStructuredType(malformed))
+                if malformed == forged_mapping
         ));
 
         assert_eq!(
