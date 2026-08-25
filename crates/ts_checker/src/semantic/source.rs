@@ -18817,7 +18817,20 @@ fn check_expression_type(
                 property.receiver.unparenthesized().kind,
                 PlannedExpressionKind::Call(_) | PlannedExpressionKind::New(_)
             ) || source_global_wrapper_method_name(host, property.node).is_some()
-                || source_is_global_array_concat_method(host, property.node) =>
+                || source_is_global_array_concat_method(host, property.node)
+                || matches!(
+                    &property.receiver.unparenthesized().kind,
+                    PlannedExpressionKind::Identifier(read)
+                        if read.kind == PlannedIdentifierReadKind::Import
+                            && store
+                                .alias_symbol_links(read.value_symbol)
+                                .and_then(|links| links.alias_target.symbol())
+                                .and_then(|symbol| store.symbol(symbol))
+                                .is_some_and(|target| {
+                                    target.flags().intersects(SymbolFlags::MODULE)
+                                        && !target.flags().intersects(SymbolFlags::VALUE)
+                                })
+                ) =>
         {
             let receiver = check_expression_type(
                 store,
