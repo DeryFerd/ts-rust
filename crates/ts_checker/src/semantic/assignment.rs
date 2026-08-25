@@ -67,6 +67,19 @@ pub(super) struct ArrowExpandoAssignmentPlan {
     pub(super) property_symbol: SemanticSymbolId,
 }
 
+/// One imported namespace property owned by a matching module augmentation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ImportedNamespaceAssignmentPlan {
+    pub(super) expression: NodeRef,
+    pub(super) left: NodeRef,
+    pub(super) right: NodeRef,
+    pub(super) receiver: NodeRef,
+    pub(super) alias_symbol: SemanticSymbolId,
+    pub(super) namespace_symbol: SemanticSymbolId,
+    pub(super) property_symbol: SemanticSymbolId,
+    pub(super) property_type_node: NodeRef,
+}
+
 /// One binder-authenticated static property assignment on a source function.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct FunctionExpandoAssignmentPlan {
@@ -379,6 +392,21 @@ pub(super) fn plan_javascript_object_expando_assignment(
     .plan_object_expando(statement)
 }
 
+/// Authenticates an imported property against its ambient module declaration.
+pub(super) fn plan_imported_namespace_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<Option<ImportedNamespaceAssignmentPlan>, AssignmentPlanError> {
+    CommonJsAssignmentPlanner {
+        arena,
+        bound,
+        store,
+    }
+    .plan_imported_namespace(statement)
+}
+
 /// Plans one assignment with source-minted capabilities for exact mutable
 /// ambient declarations. Membership is not sufficient by itself: the target
 /// must still prove the direct `declare var`/`declare let` AST and binder shape.
@@ -451,6 +479,374 @@ pub(super) fn plan_simple_assignment_with_all_source_targets(
 }
 
 impl CommonJsAssignmentPlanner<'_> {
+    #[allow(clippy::too_many_lines)] // Proves the assignment, import, and ambient member together.
+    fn plan_imported_namespace(
+        &self,
+        statement: NodeRef,
+    ) -> Result<Option<ImportedNamespaceAssignmentPlan>, AssignmentPlanError> {
+        self.preflight_program()?;
+        if self.bound.source_facts().is_none_or(|facts| {
+            facts.is_javascript_file() || facts.is_declaration_file() || !facts.is_external_module()
+        }) {
+            return Ok(None);
+        }
+
+        let statement_record = self.node(statement)?;
+        let NodeData::ExpressionStatement(statement_data) = &statement_record.data else {
+            return Ok(None);
+        };
+        if statement_record.parent != Some(self.bound.source_file().node)
+            || statement_record.flags.0 != 0
+            || statement_data.flow_node.is_some()
+        {
+            return Err(AssignmentInvariant::InvalidStatementShape(statement).into());
+        }
+        let expression = self.reference(statement_data.expression);
+        self.require_parent(expression, Some(statement.node))?;
+        let expression_record = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &expression_record.data else {
+            return Ok(None);
+        };
+        if expression_record.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.facts != 0
+            || binary.modifiers.is_some()
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryAssignment(expression),
+            ));
+        }
+        let operator = self.reference(binary.operator_token);
+        self.require_parent(operator, Some(expression.node))?;
+        let operator_record = self.node(operator)?;
+        if !matches!(operator_record.data, NodeData::Token(_)) || operator_record.flags.0 != 0 {
+            return Err(AssignmentInvariant::InvalidOperatorToken(operator).into());
+        }
+        if operator_record.kind != SyntaxKind::EqualsToken
+            || self.bound.symbol(expression).is_some()
+        {
+            return Ok(None);
+        }
+
+        let left = self.reference(binary.left);
+        let right = self.reference(binary.right);
+        self.require_parent(left, Some(expression.node))?;
+        self.require_parent(right, Some(expression.node))?;
+        let left_record = self.node(left)?;
+        let NodeData::PropertyAccessExpression(access) = &left_record.data else {
+            return Ok(None);
+        };
+        if left_record.kind != SyntaxKind::PropertyAccessExpression
+            || left_record.flags.0 != 0
+            || access.flow_node.is_some()
+            || access.question_dot_token.is_some()
+            || access.facts != 0
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::Syntax {
+                    node: left,
+                    kind: left_record.kind,
+                    role: AssignmentSyntaxRole::LeftHandSide,
+                },
+            ));
+        }
+        let receiver = self.reference(access.expression);
+        let name = self.reference(access.name);
+        self.require_parent(receiver, Some(left.node))?;
+        self.require_parent(name, Some(left.node))?;
+        let receiver_record = self.node(receiver)?;
+        let NodeData::Identifier(receiver_name) = &receiver_record.data else {
+            return Ok(None);
+        };
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(property_name) = &name_record.data else {
+            return Ok(None);
+        };
+        if receiver_record.flags.0 != 0
+            || receiver_name.flow_node.is_some()
+            || receiver_name.text.is_empty()
+            || name_record.flags.0 != 0
+            || property_name.flow_node.is_some()
+            || property_name.text.is_empty()
+        {
+            return Err(AssignmentInvariant::InvalidIdentifierShape(receiver).into());
+        }
+
+        let Some(alias_symbol) = self
+            .bound
+            .locals(self.bound.source_file())
+            .and_then(|locals| self.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&receiver_name.text))
+        else {
+            return Ok(None);
+        };
+        let alias = self
+            .store
+            .symbol(alias_symbol)
+            .ok_or(AssignmentInvariant::InvalidSymbol(alias_symbol))?;
+        if alias.flags() != SymbolFlags::ALIAS {
+            return Ok(None);
+        }
+        let Some([import]) = alias.declarations() else {
+            return Err(AssignmentInvariant::InvalidSymbolShape(alias_symbol).into());
+        };
+        let import = *import;
+        if alias.check_flags() != CheckFlags::NONE
+            || alias.name().as_bytes() != receiver_name.text.as_bytes()
+            || alias.value_declaration().is_some()
+            || alias.members().is_some()
+            || alias.exports().is_some()
+            || alias.export_symbol().is_some()
+            || self.store.get_merged_symbol(alias_symbol) != Some(alias_symbol)
+            || self.bound.symbol(import) != Some(alias_symbol)
+        {
+            return Err(AssignmentInvariant::InvalidSymbolShape(alias_symbol).into());
+        }
+        if let Some(cached) = self
+            .store
+            .symbol_node_links(receiver)
+            .and_then(|links| links.resolved_symbol)
+            && cached != alias_symbol
+        {
+            return Err(AssignmentInvariant::ResolvedSymbolMismatch {
+                node: receiver,
+                expected: alias_symbol,
+                actual: cached,
+            }
+            .into());
+        }
+
+        let import_record = self.node(import)?;
+        let (import_statement, specifier) = match &import_record.data {
+            NodeData::ImportEqualsDeclaration(import_data)
+                if import_record.kind == SyntaxKind::ImportEqualsDeclaration
+                    && !import_data.is_type_only =>
+            {
+                let reference = self.reference(import_data.module_reference);
+                self.require_parent(reference, Some(import.node))?;
+                let reference_record = self.node(reference)?;
+                let NodeData::ExternalModuleReference(external) = &reference_record.data else {
+                    return Ok(None);
+                };
+                (import, self.reference(external.expression))
+            }
+            NodeData::NamespaceImport(namespace)
+                if import_record.kind == SyntaxKind::NamespaceImport
+                    && namespace.local_symbol.is_none()
+                    && namespace.symbol.is_none() =>
+            {
+                let Some(clause) = import_record.parent.map(|parent| self.reference(parent)) else {
+                    return Err(AssignmentInvariant::InvalidSymbolShape(alias_symbol).into());
+                };
+                let clause_record = self.node(clause)?;
+                let NodeData::ImportClause(clause_data) = &clause_record.data else {
+                    return Err(AssignmentInvariant::InvalidSymbolShape(alias_symbol).into());
+                };
+                let Some(import_statement) =
+                    clause_record.parent.map(|parent| self.reference(parent))
+                else {
+                    return Err(AssignmentInvariant::InvalidSymbolShape(alias_symbol).into());
+                };
+                let statement_record = self.node(import_statement)?;
+                let NodeData::ImportDeclaration(import_data) = &statement_record.data else {
+                    return Err(AssignmentInvariant::InvalidSymbolShape(alias_symbol).into());
+                };
+                if clause_data.named_bindings != Some(import.node)
+                    || import_data.import_clause != Some(clause.node)
+                {
+                    return Err(AssignmentInvariant::InvalidSymbolShape(alias_symbol).into());
+                }
+                (
+                    import_statement,
+                    self.reference(import_data.module_specifier),
+                )
+            }
+            _ => return Ok(None),
+        };
+        let import_statement_record = self.node(import_statement)?;
+        if import_statement_record.parent != Some(self.bound.source_file().node)
+            || import_statement_record.range.end > statement_record.range.start
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::TargetNotPrior {
+                    node: receiver,
+                    symbol: alias_symbol,
+                },
+            ));
+        }
+        let specifier_record = self.node(specifier)?;
+        let NodeData::StringLiteral(module_name) = &specifier_record.data else {
+            return Ok(None);
+        };
+        if specifier_record.kind != SyntaxKind::StringLiteral
+            || specifier_record.flags.0 != 0
+            || module_name.token_flags.0 != 0
+            || module_name.text.is_empty()
+        {
+            return Err(AssignmentInvariant::InvalidSymbolShape(alias_symbol).into());
+        }
+
+        let source_record = self.node(self.bound.source_file())?;
+        let NodeData::SourceFile(source_data) = &source_record.data else {
+            return Err(AssignmentInvariant::StoreSourceMismatch(self.bound.source_file()).into());
+        };
+        let mut matched = None;
+        for candidate in &source_data.statements.nodes {
+            let namespace_declaration = self.reference(*candidate);
+            let namespace_record = self.node(namespace_declaration)?;
+            let NodeData::ModuleDeclaration(namespace_data) = &namespace_record.data else {
+                continue;
+            };
+            let namespace_name = self.reference(namespace_data.name);
+            let namespace_name_record = self.node(namespace_name)?;
+            let NodeData::StringLiteral(augmentation_name) = &namespace_name_record.data else {
+                continue;
+            };
+            if augmentation_name.text != module_name.text
+                || !self
+                    .bound
+                    .module_augmentations()
+                    .iter()
+                    .any(|augmentation| augmentation.name() == namespace_name)
+            {
+                continue;
+            }
+            let raw_namespace = self.bound.symbol(namespace_declaration).ok_or(
+                AssignmentInvariant::MissingDeclarationSymbol(namespace_declaration),
+            )?;
+            let namespace_symbol = self
+                .store
+                .get_merged_symbol(raw_namespace)
+                .ok_or(AssignmentInvariant::InvalidMergedSymbol(raw_namespace))?;
+            let namespace = self
+                .store
+                .symbol(namespace_symbol)
+                .ok_or(AssignmentInvariant::InvalidSymbol(namespace_symbol))?;
+            let Some(property_symbol) = namespace
+                .exports()
+                .and_then(|exports| self.store.symbol_table(exports))
+                .and_then(|exports| exports.get_source(&property_name.text))
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+            else {
+                continue;
+            };
+            let property = self
+                .store
+                .symbol(property_symbol)
+                .ok_or(AssignmentInvariant::InvalidSymbol(property_symbol))?;
+            let Some([property_declaration]) = property.declarations() else {
+                return Err(AssignmentInvariant::InvalidSymbolShape(property_symbol).into());
+            };
+            let property_declaration = *property_declaration;
+            let declaration_record = self.node(property_declaration)?;
+            let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+                return Err(AssignmentInvariant::InvalidSymbolShape(property_symbol).into());
+            };
+            let Some(annotation) = variable.type_.map(|annotation| self.reference(annotation))
+            else {
+                return Err(AssignmentPlanError::Unsupported(
+                    AssignmentUnsupported::MissingTargetType(property_declaration),
+                ));
+            };
+            self.require_parent(annotation, Some(property_declaration.node))?;
+            let list = declaration_record
+                .parent
+                .map(|node| self.reference(node))
+                .ok_or(AssignmentInvariant::InvalidDeclarationList(
+                    property_declaration,
+                ))?;
+            let list_record = self.node(list)?;
+            let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
+                return Err(AssignmentInvariant::InvalidDeclarationList(list).into());
+            };
+            let member_statement = list_record
+                .parent
+                .map(|node| self.reference(node))
+                .ok_or(AssignmentInvariant::InvalidVariableStatement(list))?;
+            let member_statement_record = self.node(member_statement)?;
+            let NodeData::VariableStatement(member_statement_data) = &member_statement_record.data
+            else {
+                return Err(AssignmentInvariant::InvalidVariableStatement(member_statement).into());
+            };
+            let Some(body) = namespace_data.body.map(|body| self.reference(body)) else {
+                return Err(AssignmentInvariant::InvalidSymbolShape(namespace_symbol).into());
+            };
+            let body_record = self.node(body)?;
+            let NodeData::ModuleBlock(module_block) = &body_record.data else {
+                return Err(AssignmentInvariant::InvalidSymbolShape(namespace_symbol).into());
+            };
+            if !matches!(
+                property.flags(),
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE
+            ) || property.check_flags() != CheckFlags::NONE
+                || property.name().as_bytes() != property_name.text.as_bytes()
+                || property.value_declaration() != Some(property_declaration)
+                || property.members().is_some()
+                || property.exports().is_some()
+                || property.export_symbol().is_some()
+                || self.store.get_parent_of_symbol(property_symbol) != Some(namespace_symbol)
+                || self
+                    .bound
+                    .symbol(property_declaration)
+                    .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                    != Some(property_symbol)
+                || variable.initializer.is_some()
+                || variable.symbol.is_some()
+                || variable.local_symbol.is_some()
+                || variable.facts != 0
+                || declaration_record.parent != Some(list.node)
+                || list_record.kind != SyntaxKind::VariableDeclarationList
+                || list_data.facts != 0
+                || list_data
+                    .declarations
+                    .nodes
+                    .iter()
+                    .filter(|candidate| **candidate == property_declaration.node)
+                    .count()
+                    != 1
+                || member_statement_record.kind != SyntaxKind::VariableStatement
+                || member_statement_record.parent != Some(body.node)
+                || member_statement_data.declaration_list != list.node
+                || member_statement_data.flow_node.is_some()
+                || member_statement_data.facts != 0
+                || body_record.kind != SyntaxKind::ModuleBlock
+                || body_record.parent != Some(namespace_declaration.node)
+                || module_block.flow_node.is_some()
+                || module_block.facts != 0
+                || module_block
+                    .statements
+                    .nodes
+                    .iter()
+                    .filter(|candidate| **candidate == member_statement.node)
+                    .count()
+                    != 1
+            {
+                return Err(AssignmentInvariant::InvalidSymbolShape(property_symbol).into());
+            }
+            let plan = ImportedNamespaceAssignmentPlan {
+                expression,
+                left,
+                right,
+                receiver,
+                alias_symbol,
+                namespace_symbol,
+                property_symbol,
+                property_type_node: annotation,
+            };
+            if matched.replace(plan).is_some() {
+                return Err(AssignmentPlanError::Unsupported(
+                    AssignmentUnsupported::NonUniqueTarget {
+                        node: left,
+                        symbol: property_symbol,
+                        declaration_count: 2,
+                    },
+                ));
+            }
+        }
+        Ok(matched)
+    }
+
     #[allow(clippy::too_many_lines)] // Proves the assignment and its complete function owner.
     fn plan_function_expando(
         &self,
@@ -3471,6 +3867,18 @@ mod tests {
                 self.expression_statement(index),
             )
         }
+
+        fn imported_namespace_plan(
+            &self,
+            index: usize,
+        ) -> Result<Option<ImportedNamespaceAssignmentPlan>, AssignmentPlanError> {
+            plan_imported_namespace_assignment(
+                &self.parsed.arena,
+                &self.bound,
+                &self.store,
+                self.expression_statement(index),
+            )
+        }
     }
 
     fn source_facts(file: FileId) -> CanonicalSourceFileFacts {
@@ -3673,6 +4081,101 @@ mod tests {
             );
             assert_eq!(observable_state(&fixture.store), before, "{source}");
         }
+    }
+
+    #[test]
+    fn imported_namespace_assignments_use_the_ambient_member_without_semantic_writes() {
+        let fixture = Fixture::new(concat!(
+            "import selected = require('./target'); ",
+            "selected.value = 1; ",
+            "declare module './target' { let value: number; }",
+        ));
+        let statement = fixture.expression_statement(0);
+        let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+        let NodeData::PropertyAccessExpression(access) =
+            &fixture.parsed.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected selected.value property access")
+        };
+        let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, access.expression);
+        let alias_symbol = fixture.source_local("selected");
+        let namespace = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ModuleDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let namespace_symbol = fixture.bound.symbol(namespace).unwrap();
+        let declaration = fixture.variable_declaration("value");
+        let property_symbol = fixture.bound.symbol(declaration).unwrap();
+        let before = observable_state(&fixture.store);
+
+        assert_eq!(
+            fixture.imported_namespace_plan(0),
+            Ok(Some(ImportedNamespaceAssignmentPlan {
+                expression,
+                left,
+                right,
+                receiver,
+                alias_symbol,
+                namespace_symbol,
+                property_symbol,
+                property_type_node: variable_type(&fixture.parsed, declaration),
+            })),
+        );
+        assert!(fixture.bound.symbol(expression).is_none());
+        assert_eq!(observable_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn imported_namespace_assignments_reject_poisoned_receiver_and_foreign_module() {
+        let mut fixture = Fixture::new(concat!(
+            "import selected = require('./target'); ",
+            "selected.value = 1; ",
+            "declare module './target' { let value: number; }",
+        ));
+        let statement = fixture.expression_statement(0);
+        let (_, left, _) = assignment_parts(&fixture.parsed, statement);
+        let NodeData::PropertyAccessExpression(access) =
+            &fixture.parsed.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected selected.value property access")
+        };
+        let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, access.expression);
+        let alias = fixture.source_local("selected");
+        let property = fixture
+            .bound
+            .symbol(fixture.variable_declaration("value"))
+            .unwrap();
+        assert!(fixture.store.set_symbol_node_links(
+            receiver,
+            SymbolNodeLinks {
+                resolved_symbol: Some(property),
+            },
+        ));
+        assert_eq!(
+            fixture.imported_namespace_plan(0),
+            Err(AssignmentPlanError::Invariant(
+                AssignmentInvariant::ResolvedSymbolMismatch {
+                    node: receiver,
+                    expected: alias,
+                    actual: property,
+                },
+            )),
+        );
+
+        let unrelated = Fixture::new(concat!(
+            "import selected = require('./target'); ",
+            "selected.value = 1; ",
+            "declare module './different' { let value: number; }",
+        ));
+        assert_eq!(unrelated.imported_namespace_plan(0), Ok(None));
     }
 
     #[test]

@@ -1484,6 +1484,18 @@ struct PlannedObjectExpandoAssignment {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedImportedNamespaceAssignment {
+    expression: NodeRef,
+    left: NodeRef,
+    receiver: PlannedExpression,
+    alias_symbol: SemanticSymbolId,
+    namespace_symbol: SemanticSymbolId,
+    property_symbol: SemanticSymbolId,
+    property_type_node: NodeRef,
+    right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 struct PlannedNamespaceAssignment {
     expression: NodeRef,
     left: NodeRef,
@@ -1674,6 +1686,7 @@ enum PlannedStatement {
     CommonJsAssignment(PlannedCommonJsAssignment),
     ArrowExpandoAssignment(PlannedArrowExpandoAssignment),
     ObjectExpandoAssignment(PlannedObjectExpandoAssignment),
+    ImportedNamespaceAssignment(PlannedImportedNamespaceAssignment),
     NamespaceAssignment(PlannedNamespaceAssignment),
     ControlIf(Box<PlannedTopLevelIf>),
     ControlLoop(Box<PlannedTopLevelLoop>),
@@ -3632,6 +3645,40 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 owner_symbol: assignment.owner_symbol,
                                 property_symbol: assignment.property_symbol,
                                 jsdoc_type: None,
+                                right,
+                            },
+                        ));
+                        continue;
+                    }
+                    if let Some(assignment) = super::assignment::plan_imported_namespace_assignment(
+                        self.arena, self.bound, store, statement,
+                    )
+                    .map_err(Self::assignment_plan_error)?
+                    {
+                        let receiver = self.plan_expression(assignment.receiver)?;
+                        if !matches!(
+                            &receiver.kind,
+                            PlannedExpressionKind::Identifier(read)
+                                if read.value_symbol == assignment.alias_symbol
+                        ) {
+                            return Err(SourceCheckError::Assignment(
+                                AssignmentInvariant::InvalidSymbolShape(assignment.alias_symbol),
+                            ));
+                        }
+                        self.primitive_binary_position_roots
+                            .insert(assignment.right);
+                        let right = self.plan_expression(assignment.right)?;
+                        self.identifier_reads
+                            .push((assignment.left, assignment.property_symbol));
+                        statements.push(PlannedStatement::ImportedNamespaceAssignment(
+                            PlannedImportedNamespaceAssignment {
+                                expression: assignment.expression,
+                                left: assignment.left,
+                                receiver,
+                                alias_symbol: assignment.alias_symbol,
+                                namespace_symbol: assignment.namespace_symbol,
+                                property_symbol: assignment.property_symbol,
+                                property_type_node: assignment.property_type_node,
                                 right,
                             },
                         ));
@@ -34233,6 +34280,112 @@ fn non_module_value_augmentation_diagnostic(
     Ok(None)
 }
 
+#[allow(clippy::too_many_lines)] // Keep import, module, and augmentation ownership checks together.
+fn publish_imported_namespace_augmentation_exports(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &mut CanonicalTypeMapperStore,
+    namespace: &SourceNamespacePlan,
+    imports: &[SourceImportPlan],
+    resolved_imports: &HashMap<SemanticSymbolId, ResolvedSourceImportBinding>,
+) -> Result<(), SourceCheckError> {
+    let name = arena
+        .get(namespace.name.node)
+        .ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingNode(namespace.name),
+        ))?;
+    let NodeData::StringLiteral(module_name) = &name.data else {
+        return Ok(());
+    };
+    if !bound
+        .module_augmentations()
+        .iter()
+        .any(|augmentation| augmentation.name() == namespace.name)
+    {
+        return Ok(());
+    }
+    let augmentation_exports = store
+        .symbol(namespace.symbol)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .ok_or(SourceCheckError::Import(namespace.declaration))?;
+
+    for import in imports {
+        let specifier =
+            arena
+                .get(import.module_specifier.node)
+                .ok_or(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingNode(import.module_specifier),
+                ))?;
+        let NodeData::StringLiteral(import_name) = &specifier.data else {
+            continue;
+        };
+        if import_name.text != module_name.text {
+            continue;
+        }
+        for binding in &import.bindings {
+            if binding.imported_text != "*" {
+                continue;
+            }
+            let Some(resolved) = resolved_imports.get(&binding.alias_symbol) else {
+                continue;
+            };
+            let target = store
+                .symbol(resolved.target_symbol)
+                .ok_or(SourceCheckError::Import(binding.declaration))?;
+            if !target.flags().intersects(SymbolFlags::MODULE)
+                || !target.flags().intersects(SymbolFlags::VALUE)
+                || store.get_merged_symbol(resolved.target_symbol) != Some(resolved.target_symbol)
+            {
+                continue;
+            }
+            let own_exports = target
+                .exports()
+                .ok_or(SourceCheckError::Import(binding.declaration))?;
+            let current_exports = store
+                .module_symbol_links(resolved.target_symbol)
+                .and_then(|links| links.resolved_exports)
+                .unwrap_or(own_exports);
+            let current = store
+                .symbol_table(current_exports)
+                .ok_or(SourceCheckError::Import(binding.declaration))?;
+            let augmentation = store
+                .symbol_table(augmentation_exports)
+                .ok_or(SourceCheckError::Import(namespace.declaration))?;
+            let mut additions = Vec::new();
+            for (name, symbol) in augmentation.iter() {
+                let symbol = store
+                    .get_merged_symbol(symbol)
+                    .ok_or(SourceCheckError::Import(namespace.declaration))?;
+                match current.get(name) {
+                    Some(existing) if store.get_merged_symbol(existing) == Some(symbol) => {}
+                    Some(_) => return Err(SourceCheckError::Import(namespace.declaration)),
+                    None => additions.push((name.to_owned(), symbol)),
+                }
+            }
+            if additions.is_empty() {
+                continue;
+            }
+            let combined = store
+                .clone_symbol_table(current_exports)
+                .ok_or(SourceCheckError::Import(binding.declaration))?;
+            for (name, symbol) in additions {
+                if store.insert_symbol(combined, name, symbol) != Some(None) {
+                    return Err(SourceCheckError::Import(binding.declaration));
+                }
+            }
+            let mut links = store
+                .module_symbol_links(resolved.target_symbol)
+                .cloned()
+                .unwrap_or_default();
+            links.resolved_exports = Some(combined);
+            if !store.set_module_symbol_links(resolved.target_symbol, links) {
+                return Err(SourceCheckError::Import(binding.declaration));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Authenticates one ordinary variable or object binding used by a named export.
 fn authenticated_named_export_variable(
     arena: &NodeArena,
@@ -38672,6 +38825,14 @@ pub(super) fn check_source_file(
                     &namespace,
                 )?;
                 merge_source_ambient_module_exports(store, host, diagnostics, &namespace)?;
+                publish_imported_namespace_augmentation_exports(
+                    arena,
+                    bound,
+                    store,
+                    &namespace,
+                    &value_imports,
+                    &resolved_imports,
+                )?;
                 for read in ambient_namespace_reads
                     .iter()
                     .filter(|read| read.same_file && read.namespace == namespace.symbol)
@@ -41898,6 +42059,111 @@ pub(super) fn check_source_file(
                 )?;
                 publish_expression_type(store, assignment.left, property_type)?;
                 publish_expression_type(store, assignment.expression, value.result)?;
+            }
+            PlannedStatement::ImportedNamespaceAssignment(assignment) => {
+                let resolved = resolved_imports
+                    .get(&assignment.alias_symbol)
+                    .ok_or(SourceCheckError::Import(assignment.receiver.node))?;
+                let owner =
+                    store
+                        .symbol(resolved.target_symbol)
+                        .ok_or(SourceCheckError::Assignment(
+                            AssignmentInvariant::InvalidSymbol(resolved.target_symbol),
+                        ))?;
+                let property = store.symbol(assignment.property_symbol).ok_or(
+                    SourceCheckError::Assignment(AssignmentInvariant::InvalidSymbol(
+                        assignment.property_symbol,
+                    )),
+                )?;
+                if !owner.flags().intersects(SymbolFlags::MODULE)
+                    || !owner.flags().intersects(SymbolFlags::VALUE)
+                    || store.get_merged_symbol(resolved.target_symbol)
+                        != Some(resolved.target_symbol)
+                    || store.get_parent_of_symbol(assignment.property_symbol)
+                        != Some(assignment.namespace_symbol)
+                    || !matches!(
+                        property.flags(),
+                        SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    )
+                    || store
+                        .symbol(assignment.namespace_symbol)
+                        .and_then(ts_binder::semantic::Symbol::exports)
+                        .and_then(|exports| store.symbol_table(exports))
+                        .and_then(|exports| exports.get(property.name()))
+                        .and_then(|symbol| store.get_merged_symbol(symbol))
+                        != Some(assignment.property_symbol)
+                {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.property_symbol),
+                    ));
+                }
+
+                let receiver = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &assignment.receiver,
+                    None,
+                    &mut deferred,
+                )?;
+                if current_flow_types.get(&assignment.alias_symbol) != Some(&receiver.result)
+                    || store
+                        .value_symbol_links(resolved.target_symbol)
+                        .and_then(|links| links.resolved_type)
+                        != Some(receiver.result)
+                {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(resolved.target_symbol),
+                    ));
+                }
+                let property_type = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                )?
+                .get_type_from_type_node(assignment.property_type_node)?;
+                if store
+                    .value_symbol_links(assignment.property_symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|cached| cached != property_type)
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::CachedValueTypeMismatch {
+                            symbol: assignment.property_symbol,
+                            cached: store
+                                .value_symbol_links(assignment.property_symbol)
+                                .and_then(|links| links.resolved_type)
+                                .expect("the conflicting property cache was checked"),
+                            expected: property_type,
+                        },
+                    ));
+                }
+                check_assignment_to_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &mut deferred,
+                    property_type,
+                    None,
+                    &assignment.right,
+                    assignment.left,
+                    Some(assignment.expression),
+                )?;
             }
             PlannedStatement::NamespaceAssignment(assignment) => {
                 if store
@@ -59148,6 +59414,149 @@ mod tests {
         let warm = observable_state(&context, extension_file);
         context.recheck_source_file(extension_file).unwrap();
         assert_eq!(observable_state(&context, extension_file), warm);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Verify the imported assignment, consumer, and warm replay.
+    fn export_equals_function_namespace_augmentations_preserve_imported_property_identity() {
+        let library = parsed(concat!(
+            "function foo() {} ",
+            "namespace foo { export var v = 1; } ",
+            "export = foo;",
+        ));
+        let extension = parsed(concat!(
+            "import x = require('./library'); ",
+            "x.b = 1; ",
+            "declare module './library' { interface A { a } let b: number; }",
+        ));
+        let consumer = parsed(concat!(
+            "import * as x from './library'; ",
+            "import './extension'; ",
+            "let a: x.A; ",
+            "let b = x.b;",
+        ));
+        let library_file = FileId::new(8_358);
+        let extension_file = FileId::new(8_359);
+        let consumer_file = FileId::new(8_360);
+        let files = [
+            (library_file, &library),
+            (extension_file, &extension),
+            (consumer_file, &consumer),
+        ];
+        let extension_specifier = extension
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ImportEqualsDeclaration(import) = &record.data else {
+                    return None;
+                };
+                let NodeData::ExternalModuleReference(reference) =
+                    &extension.arena.get(import.module_reference)?.data
+                else {
+                    return None;
+                };
+                Some(reference.expression)
+            })
+            .unwrap();
+        let consumer_specifiers = source_module_specifiers(&consumer);
+        let [library_specifier, extension_import] = consumer_specifiers.as_slice() else {
+            panic!("the consumer must import the library and its augmentation")
+        };
+        let manifest = CanonicalModuleResolutionManifestInput::new([
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(extension.arena.id(), extension_file, extension_specifier),
+                CanonicalResolvedModuleInput::new(
+                    library_file,
+                    CanonicalModuleResolutionMode::CommonJs,
+                    CanonicalModuleResolutionMode::CommonJs,
+                ),
+            ),
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(consumer.arena.id(), consumer_file, *library_specifier),
+                CanonicalResolvedModuleInput::new(
+                    library_file,
+                    CanonicalModuleResolutionMode::CommonJs,
+                    CanonicalModuleResolutionMode::CommonJs,
+                ),
+            ),
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(consumer.arena.id(), consumer_file, *extension_import),
+                CanonicalResolvedModuleInput::new(
+                    extension_file,
+                    CanonicalModuleResolutionMode::CommonJs,
+                    CanonicalModuleResolutionMode::CommonJs,
+                ),
+            ),
+        ]);
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            completed_bindings_with_module_state(&files, CanonicalModuleState::External),
+            files
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions {
+                emit_common_js: true,
+                ..CanonicalCheckerOptions::default()
+            },
+            manifest,
+        )
+        .unwrap();
+
+        context.check_source_file(library_file).unwrap();
+        context.check_source_file(extension_file).unwrap();
+        context.check_source_file(consumer_file).unwrap();
+
+        let owner = function_symbol(&context, &library, library_file, "foo");
+        let declaration = variable_declaration(&extension, extension_file, "b");
+        let (_, extension_bound) = context.file(extension_file).unwrap();
+        let property = extension_bound.symbol(declaration).unwrap();
+        let (left, right) = assignment_parts(&extension, extension_file, 0);
+        let expression = NodeRef::new(
+            extension.arena.id(),
+            extension_file,
+            extension.arena.get(left.node).unwrap().parent.unwrap(),
+        );
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+
+        assert_eq!(resolved_node_type(&context, left), number);
+        assert_eq!(
+            resolved_node_type(&context, expression),
+            resolved_node_type(&context, right),
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(left)
+                .and_then(|links| links.resolved_symbol),
+            Some(property),
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(property)
+                .and_then(|links| links.resolved_type),
+            Some(number),
+        );
+        let exports = context
+            .store()
+            .module_symbol_links(owner)
+            .and_then(|links| links.resolved_exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .unwrap();
+        assert_eq!(exports.get_source("b"), Some(property));
+        assert!(exports.get_source("A").is_some());
+        assert_eq!(
+            variable_value_type(&context, &consumer, consumer_file, "b"),
+            number,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let extension_warm = observable_state(&context, extension_file);
+        context.recheck_source_file(extension_file).unwrap();
+        assert_eq!(observable_state(&context, extension_file), extension_warm);
+        let consumer_warm = observable_state(&context, consumer_file);
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(observable_state(&context, consumer_file), consumer_warm);
     }
 
     #[test]
