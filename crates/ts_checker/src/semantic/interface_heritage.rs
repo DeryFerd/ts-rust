@@ -465,6 +465,7 @@ fn plan_forwarded_interface_type_arguments(
     let react_namespace = authenticated_react_generic_heritage_namespace(store, owner, base);
 
     let mut shared_base_parameters: Option<Vec<SemanticSymbolId>> = None;
+    let mut react_lifecycle_default = None;
     for &base_declaration in base_declarations {
         let record = preflight_node(store, host, base_declaration)
             .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
@@ -474,11 +475,47 @@ fn plan_forwarded_interface_type_arguments(
         let Some(base_parameters) = interface.type_parameters.as_ref() else {
             return Err(unsupported());
         };
+        let omitted_react_lifecycle_default = (react_namespace.is_some()
+            && owner_symbol.name().as_utf8() == Some("Mixin")
+            && store.symbol(base).and_then(|base| base.name().as_utf8())
+                == Some("ComponentLifecycle")
+            && parameters.nodes.len() == 2
+            && arguments.nodes.len() == 2
+            && base_parameters.nodes.len() == 3)
+            .then(|| {
+                let parameter = NodeRef::new(
+                    base_declaration.arena,
+                    base_declaration.file,
+                    base_parameters.nodes[2],
+                );
+                let parameter_record = preflight_node(store, host, parameter).ok()?;
+                let NodeData::TypeParameterDeclaration(data) = &parameter_record.data else {
+                    return None;
+                };
+                let name = NodeRef::new(parameter.arena, parameter.file, data.name);
+                let name_record = preflight_node(store, host, name).ok()?;
+                let NodeData::Identifier(identifier) = &name_record.data else {
+                    return None;
+                };
+                let default = NodeRef::new(parameter.arena, parameter.file, data.default_type?);
+                let default_record = preflight_node(store, host, default).ok()?;
+                (parameter_record.kind == SyntaxKind::TypeParameter
+                    && parameter_record.parent == Some(base_declaration.node)
+                    && identifier.text == "SS"
+                    && name_record.kind == SyntaxKind::Identifier
+                    && name_record.parent == Some(parameter.node)
+                    && default_record.kind == SyntaxKind::AnyKeyword
+                    && default_record.flags.0 == 0
+                    && default_record.parent == Some(parameter.node))
+                .then_some(default)
+            })
+            .flatten();
         if record.kind != SyntaxKind::InterfaceDeclaration
             || record.flags.0 != 0
             || !host.symbol_matches(store, base_declaration, base)
             || base_parameters.has_trailing_comma
             || base_parameters.nodes.len() != arguments.nodes.len()
+                && omitted_react_lifecycle_default.is_none()
         {
             return Err(unsupported());
         }
@@ -490,7 +527,7 @@ fn plan_forwarded_interface_type_arguments(
             &mut checked_parameters,
         )
         .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
-        if symbols.len() != arguments.nodes.len()
+        if symbols.len() != base_parameters.nodes.len()
             || shared_base_parameters
                 .as_ref()
                 .is_some_and(|expected| expected != &symbols)
@@ -517,6 +554,12 @@ fn plan_forwarded_interface_type_arguments(
         if shared_base_parameters.is_none() {
             shared_base_parameters = Some(symbols);
         }
+        if let Some(default) = omitted_react_lifecycle_default {
+            if react_lifecycle_default.is_some_and(|previous| previous != default) {
+                return Err(unsupported());
+            }
+            react_lifecycle_default = Some(default);
+        }
     }
 
     let record =
@@ -534,7 +577,8 @@ fn plan_forwarded_interface_type_arguments(
         return Err(DirectInterfaceHeritageError::Invalid);
     }
 
-    let mut planned = Vec::with_capacity(arguments.nodes.len());
+    let mut planned =
+        Vec::with_capacity(arguments.nodes.len() + usize::from(react_lifecycle_default.is_some()));
     let mut previous_end = expression_record.range.end;
     let mut previous_parameter = None;
     let mut forwarded_parameter_seen = false;
@@ -646,6 +690,9 @@ fn plan_forwarded_interface_type_arguments(
         }
         previous_end = argument_record.range.end;
         planned.push(argument);
+    }
+    if let Some(default) = react_lifecycle_default {
+        planned.push(default);
     }
     Ok(planned)
 }
@@ -3565,6 +3612,47 @@ mod tests {
             Some(Some(element_base)),
         );
         assert!(heritage_plan(&parsed, file, &context, "ReactHTMLElement").is_ok());
+    }
+
+    #[test]
+    fn react_mixin_heritage_appends_only_its_authenticated_lifecycle_default() {
+        let parsed = parse_source_file(concat!(
+            "declare namespace React { ",
+            "interface ComponentLifecycle<P, S, SS = any> {} ",
+            "interface Mixin<P, S> extends ComponentLifecycle<P, S> {} ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_491);
+        let context = checker_context(&parsed, file);
+        let lifecycle = interface_symbol(&parsed, file, &context, "ComponentLifecycle");
+        let cold = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        let planned = heritage_plan(&parsed, file, &context, "Mixin").unwrap();
+        let [base] = planned.bases.as_slice() else {
+            panic!("Mixin must retain its single lifecycle base")
+        };
+        assert_eq!(base.symbol, lifecycle);
+        assert_eq!(base.type_arguments.len(), 3);
+        assert_eq!(
+            parsed.arena.get(base.type_arguments[2].node).unwrap().kind,
+            SyntaxKind::AnyKeyword,
+        );
+        assert_eq!(heritage_plan(&parsed, file, &context, "Mixin"), Ok(planned));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
     }
 
     #[test]
