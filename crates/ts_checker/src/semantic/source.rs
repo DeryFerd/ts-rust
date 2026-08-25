@@ -44,6 +44,8 @@
 //! synthesize `any`. Canonical memo caches are not rolled back after a later
 //! semantic failure; diagnostics coupled to those caches remain in private
 //! source staging until a retry completes and publishes them atomically.
+//! Strict `arguments` collisions retain a bounded binder-authenticated recovery
+//! that preserves the real `IArguments` assignment diagnostic.
 
 use std::collections::{HashMap, HashSet};
 
@@ -231,8 +233,8 @@ use super::{
     },
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_nodes::{
-        CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, normalize_bigint_literal,
-        normalize_numeric_separators,
+        CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, TypeNodeUnavailable,
+        normalize_bigint_literal, normalize_numeric_separators,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -26199,6 +26201,701 @@ fn execute_exported_empty_class(
     }
 
     Ok(value_type)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StrictArgumentsVariable {
+    name: NodeRef,
+    type_node: Option<NodeRef>,
+    initializer: Option<NodeRef>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrictArgumentsFailure {
+    FunctionAssignment {
+        target: NodeRef,
+        symbol: SemanticSymbolId,
+        flags: SymbolFlags,
+    },
+    Arrow(NodeRef),
+    Signature(NodeRef),
+}
+
+fn strict_arguments_child(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    parent: NodeRef,
+    node: NodeId,
+) -> Option<NodeRef> {
+    let child = NodeRef::new(parent.arena, parent.file, node);
+    let record = arena.get(node)?;
+    let owner = arena.get(parent.node)?;
+    (bound.contains(child)
+        && record.parent == Some(parent.node)
+        && record.range.start >= owner.range.start
+        && record.range.end <= owner.range.end)
+        .then_some(child)
+}
+
+fn strict_arguments_variable_statement(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    parent: NodeRef,
+    statement: NodeId,
+) -> Option<StrictArgumentsVariable> {
+    let statement = strict_arguments_child(arena, bound, parent, statement)?;
+    let record = arena.get(statement.node)?;
+    let NodeData::VariableStatement(syntax) = &record.data else {
+        return None;
+    };
+    if record.kind != SyntaxKind::VariableStatement
+        || record.flags.0 != 0
+        || syntax.flow_node.is_some()
+        || syntax.facts != 0
+        || syntax.modifiers.is_some()
+    {
+        return None;
+    }
+
+    let list = strict_arguments_child(arena, bound, statement, syntax.declaration_list)?;
+    let list_record = arena.get(list.node)?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return None;
+    };
+    let [declaration] = declarations.declarations.nodes.as_slice() else {
+        return None;
+    };
+    if list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != 0
+        || declarations.declarations.has_trailing_comma
+        || declarations.facts != 0
+    {
+        return None;
+    }
+
+    let declaration = strict_arguments_child(arena, bound, list, *declaration)?;
+    let declaration_record = arena.get(declaration.node)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return None;
+    };
+    if declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+    {
+        return None;
+    }
+    let name = strict_arguments_child(arena, bound, declaration, variable.name)?;
+    let NodeData::Identifier(identifier) = &arena.get(name.node)?.data else {
+        return None;
+    };
+    let symbol = bound.symbol(declaration)?;
+    let symbol_record = store.symbol(symbol)?;
+    if identifier.text.is_empty()
+        || identifier.flow_node.is_some()
+        || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&declaration))
+    {
+        return None;
+    }
+
+    Some(StrictArgumentsVariable {
+        name,
+        type_node: match variable.type_ {
+            Some(node) => Some(strict_arguments_child(arena, bound, declaration, node)?),
+            None => None,
+        },
+        initializer: match variable.initializer {
+            Some(node) => Some(strict_arguments_child(arena, bound, declaration, node)?),
+            None => None,
+        },
+    })
+}
+
+fn strict_arguments_failure(error: SourceCheckError) -> Option<StrictArgumentsFailure> {
+    match error {
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Variable(
+            VariableUnsupported::NonVariableSymbol {
+                node,
+                symbol,
+                flags,
+            },
+        )) => Some(StrictArgumentsFailure::FunctionAssignment {
+            target: node,
+            symbol,
+            flags,
+        }),
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(node)) => {
+            Some(StrictArgumentsFailure::Arrow(node))
+        }
+        SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+            TypeNodeUnavailable::UnsupportedSyntax { node, kind },
+        )) if matches!(
+            kind,
+            SyntaxKind::CallSignature
+                | SyntaxKind::ConstructSignature
+                | SyntaxKind::MethodSignature
+        ) =>
+        {
+            Some(StrictArgumentsFailure::Signature(node))
+        }
+        _ => None,
+    }
+}
+
+fn strict_arguments_diagnostic_nodes(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    options: CanonicalCheckerOptions,
+) -> Option<HashSet<NodeRef>> {
+    let facts = bound.source_facts()?;
+    if !facts.is_always_strict()
+        || facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_module()
+        || options.no_implicit_any
+        || bound.diagnostics().is_empty()
+    {
+        return None;
+    }
+
+    let mut result = HashSet::with_capacity(bound.diagnostics().len());
+    for diagnostic in bound.diagnostics() {
+        let record = arena.get(diagnostic.node.node)?;
+        let NodeData::Identifier(identifier) = &record.data else {
+            return None;
+        };
+        if diagnostic.diagnostic.code() != 1100
+            || !bound.contains(diagnostic.node)
+            || record.kind != SyntaxKind::Identifier
+            || identifier.text != "arguments"
+            || diagnostic.diagnostic.arguments != ["arguments"]
+            || !result.insert(diagnostic.node)
+        {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+fn strict_argument_node_contains_diagnostic(
+    arena: &NodeArena,
+    node: NodeRef,
+    diagnostics: &HashSet<NodeRef>,
+) -> bool {
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    diagnostics.iter().any(|diagnostic| {
+        arena.get(diagnostic.node).is_some_and(|name| {
+            name.range.start >= record.range.start && name.range.end <= record.range.end
+        })
+    })
+}
+
+fn strict_arguments_function_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statements: &[NodeId],
+    diagnostics: &HashSet<NodeRef>,
+    target: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Option<NodeRef> {
+    let [global, function] = statements else {
+        return None;
+    };
+    let bootstrap = store.intrinsic_bootstrap()?;
+    if symbol != bootstrap.arguments_symbol
+        || diagnostics.len() != 2
+        || !diagnostics.contains(&target)
+    {
+        return None;
+    }
+    let global =
+        strict_arguments_variable_statement(arena, bound, store, bound.source_file(), *global)?;
+    let NodeData::Identifier(global_name) = &arena.get(global.name.node)?.data else {
+        return None;
+    };
+    if global_name.text != "arguments"
+        || !diagnostics.contains(&global.name)
+        || global.type_node.is_some()
+        || global
+            .initializer
+            .and_then(|node| arena.get(node.node))
+            .is_none_or(|node| node.kind != SyntaxKind::NumericLiteral)
+    {
+        return None;
+    }
+
+    let function = strict_arguments_child(arena, bound, bound.source_file(), *function)?;
+    let record = arena.get(function.node)?;
+    let NodeData::FunctionDeclaration(declaration) = &record.data else {
+        return None;
+    };
+    let [parameter] = declaration.parameters.nodes.as_slice() else {
+        return None;
+    };
+    let parameter = strict_arguments_child(arena, bound, function, *parameter)?;
+    let NodeData::ParameterDeclaration(parameter) = &arena.get(parameter.node)?.data else {
+        return None;
+    };
+    if record.kind != SyntaxKind::FunctionDeclaration
+        || record.flags.0 != 0
+        || declaration.modifiers.is_some()
+        || declaration.type_.is_some()
+        || declaration.type_parameters.is_some()
+        || parameter.type_.is_some()
+        || parameter.initializer.is_some()
+        || parameter.dot_dot_dot_token.is_some()
+        || parameter.question_token.is_some()
+    {
+        return None;
+    }
+    let body = strict_arguments_child(arena, bound, function, declaration.body?)?;
+    let NodeData::Block(block) = &arena.get(body.node)?.data else {
+        return None;
+    };
+    let [statement] = block.statements.nodes.as_slice() else {
+        return None;
+    };
+    let statement = strict_arguments_child(arena, bound, body, *statement)?;
+    let NodeData::ExpressionStatement(syntax) = &arena.get(statement.node)?.data else {
+        return None;
+    };
+    let expression = strict_arguments_child(arena, bound, statement, syntax.expression)?;
+    let NodeData::BinaryExpression(binary) = &arena.get(expression.node)?.data else {
+        return None;
+    };
+    let operator = strict_arguments_child(arena, bound, expression, binary.operator_token)?;
+    let right = strict_arguments_child(arena, bound, expression, binary.right)?;
+    if binary.left != target.node
+        || arena.get(target.node)?.parent != Some(expression.node)
+        || arena.get(operator.node)?.kind != SyntaxKind::EqualsToken
+        || arena.get(right.node)?.kind != SyntaxKind::NumericLiteral
+    {
+        return None;
+    }
+    Some(right)
+}
+
+fn strict_arguments_arrow_parameters(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    arrow: NodeRef,
+    parameters: &[NodeId],
+    diagnostics: &HashSet<NodeRef>,
+    observed: &mut HashSet<NodeRef>,
+) -> bool {
+    parameters.iter().all(|parameter| {
+        let Some(parameter) = strict_arguments_child(arena, bound, arrow, *parameter) else {
+            return false;
+        };
+        let Some(NodeData::ParameterDeclaration(syntax)) =
+            arena.get(parameter.node).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(name) = strict_arguments_child(arena, bound, parameter, syntax.name) else {
+            return false;
+        };
+        let Some(NodeData::Identifier(identifier)) = arena.get(name.node).map(|node| &node.data)
+        else {
+            return false;
+        };
+        if syntax.initializer.is_some()
+            || syntax.question_token.is_some()
+            || syntax.modifiers.is_some()
+            || syntax.type_.is_some_and(|annotation| {
+                strict_arguments_child(arena, bound, parameter, annotation)
+                    .and_then(|annotation| arena.get(annotation.node))
+                    .is_none_or(|annotation| annotation.kind != SyntaxKind::NumberKeyword)
+            })
+        {
+            return false;
+        }
+        identifier.text != "arguments" || diagnostics.contains(&name) && observed.insert(name)
+    })
+}
+
+fn strict_arguments_arrow_local(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    body: NodeRef,
+    diagnostics: &HashSet<NodeRef>,
+    observed: &mut HashSet<NodeRef>,
+) -> bool {
+    let Some(NodeData::Block(block)) = arena.get(body.node).map(|node| &node.data) else {
+        return false;
+    };
+    let [statement] = block.statements.nodes.as_slice() else {
+        return false;
+    };
+    let Some(variable) = strict_arguments_variable_statement(arena, bound, store, body, *statement)
+    else {
+        return false;
+    };
+    let Some(NodeData::Identifier(identifier)) =
+        arena.get(variable.name.node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    if identifier.text != "arguments"
+        || !diagnostics.contains(&variable.name)
+        || !observed.insert(variable.name)
+    {
+        return false;
+    }
+    match (variable.initializer, variable.type_node) {
+        (Some(initializer), None) => arena
+            .get(initializer.node)
+            .is_some_and(|node| node.kind == SyntaxKind::NumericLiteral),
+        (None, Some(annotation)) => {
+            let Some(NodeData::ArrayTypeNode(array)) =
+                arena.get(annotation.node).map(|node| &node.data)
+            else {
+                return false;
+            };
+            strict_arguments_child(arena, bound, annotation, array.element_type)
+                .and_then(|element| arena.get(element.node))
+                .is_some_and(|element| element.kind == SyntaxKind::AnyKeyword)
+        }
+        _ => false,
+    }
+}
+
+fn strict_arguments_arrow_collisions(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statements: &[NodeId],
+    diagnostics: &HashSet<NodeRef>,
+    failure: NodeRef,
+) -> bool {
+    let mut observed = HashSet::with_capacity(diagnostics.len());
+    let mut includes_failure = false;
+    for statement in statements {
+        let Some(variable) = strict_arguments_variable_statement(
+            arena,
+            bound,
+            store,
+            bound.source_file(),
+            *statement,
+        ) else {
+            return false;
+        };
+        let Some(arrow) = variable.initializer else {
+            return false;
+        };
+        let Some(NodeData::ArrowFunction(function)) = arena.get(arrow.node).map(|node| &node.data)
+        else {
+            return false;
+        };
+        if variable.type_node.is_some()
+            || function.type_.is_some()
+            || function.type_parameters.is_some()
+            || function.modifiers.is_some()
+            || !strict_arguments_arrow_parameters(
+                arena,
+                bound,
+                arrow,
+                &function.parameters.nodes,
+                diagnostics,
+                &mut observed,
+            )
+        {
+            return false;
+        }
+        let Some(body) = strict_arguments_child(arena, bound, arrow, function.body) else {
+            return false;
+        };
+        if !strict_arguments_arrow_local(arena, bound, store, body, diagnostics, &mut observed) {
+            return false;
+        }
+        let Some(arrow_record) = arena.get(arrow.node) else {
+            return false;
+        };
+        let Some(failure_record) = arena.get(failure.node) else {
+            return false;
+        };
+        includes_failure |= failure_record.range.start <= arrow_record.range.start
+            && failure_record.range.end >= arrow_record.range.end
+            || arrow_record.range.start <= failure_record.range.start
+                && arrow_record.range.end >= failure_record.range.end;
+    }
+    includes_failure && observed == *diagnostics
+}
+
+fn strict_arguments_signature_annotation(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    root: NodeRef,
+    diagnostics: &HashSet<NodeRef>,
+    observed: &mut HashSet<NodeRef>,
+) -> bool {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        let Some(record) = arena.get(node.node) else {
+            return false;
+        };
+        if record.flags.0 != 0 || !bound.contains(node) {
+            return false;
+        }
+        let supported = match &record.data {
+            NodeData::FunctionTypeNode(function) => {
+                record.kind == SyntaxKind::FunctionType
+                    && function.type_.is_some()
+                    && function.type_parameters.is_none()
+                    && function.modifiers.is_none()
+            }
+            NodeData::TypeLiteralNode(_) => record.kind == SyntaxKind::TypeLiteral,
+            NodeData::CallSignatureDeclaration(signature) => {
+                record.kind == SyntaxKind::CallSignature && signature.type_parameters.is_none()
+            }
+            NodeData::ConstructSignatureDeclaration(signature) => {
+                record.kind == SyntaxKind::ConstructSignature && signature.type_parameters.is_none()
+            }
+            NodeData::MethodSignatureDeclaration(signature) => {
+                record.kind == SyntaxKind::MethodSignature
+                    && signature.type_parameters.is_none()
+                    && signature.modifiers.is_none()
+            }
+            NodeData::PropertySignatureDeclaration(property) => {
+                record.kind == SyntaxKind::PropertySignature && property.modifiers.is_none()
+            }
+            NodeData::ParameterDeclaration(parameter) => {
+                record.kind == SyntaxKind::Parameter
+                    && parameter.initializer.is_none()
+                    && parameter.question_token.is_none()
+                    && parameter.modifiers.is_none()
+            }
+            NodeData::Identifier(identifier) => {
+                record.kind == SyntaxKind::Identifier
+                    && (identifier.text != "arguments"
+                        || diagnostics.contains(&node) && observed.insert(node))
+            }
+            NodeData::KeywordTypeNode(_) => {
+                matches!(
+                    record.kind,
+                    SyntaxKind::NumberKeyword | SyntaxKind::VoidKeyword
+                )
+            }
+            NodeData::Token(_) => record.kind == SyntaxKind::DotDotDotToken,
+            _ => false,
+        };
+        if !supported {
+            return false;
+        }
+        let mut children = Vec::new();
+        record.for_each_child(|child| children.push(child));
+        for child in children {
+            let Some(child) = strict_arguments_child(arena, bound, node, child) else {
+                return false;
+            };
+            pending.push(child);
+        }
+    }
+    true
+}
+
+fn strict_arguments_signature_collisions(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statements: &[NodeId],
+    diagnostics: &HashSet<NodeRef>,
+    failure: NodeRef,
+) -> bool {
+    let mut observed = HashSet::with_capacity(diagnostics.len());
+    let mut includes_failure = false;
+    for statement in statements {
+        let Some(variable) = strict_arguments_variable_statement(
+            arena,
+            bound,
+            store,
+            bound.source_file(),
+            *statement,
+        ) else {
+            return false;
+        };
+        let Some(annotation) = variable.type_node else {
+            return false;
+        };
+        if variable.initializer.is_some()
+            || !strict_arguments_signature_annotation(
+                arena,
+                bound,
+                annotation,
+                diagnostics,
+                &mut observed,
+            )
+        {
+            return false;
+        }
+        includes_failure |= strict_argument_node_contains_diagnostic(arena, failure, &observed);
+    }
+    includes_failure && observed == *diagnostics
+}
+
+#[allow(clippy::too_many_arguments)] // Reuses the authoritative relation and diagnostic context.
+fn issue_strict_arguments_assignment_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    target: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let number = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?
+        .number_type;
+    let arguments = global_types.arguments_type;
+    session.reset_query();
+    if source_type_is_assignable_to(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        number,
+        arguments,
+    )? {
+        return Ok(());
+    }
+
+    let mut format_flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    if options.no_error_truncation {
+        format_flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+    }
+    let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        number,
+        arguments,
+        format_flags,
+    )?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(target),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+                [display.source, display.target],
+            ),
+            related_information: Vec::new(),
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // Preserve the canonical source-check execution context.
+pub(super) fn recover_strict_arguments_source(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    store: &mut CanonicalTypeMapperStore,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    error: SourceCheckError,
+) -> Result<bool, SourceCheckError> {
+    let Some(failure) = strict_arguments_failure(error) else {
+        return Ok(false);
+    };
+    let Some(strict_diagnostics) = strict_arguments_diagnostic_nodes(arena, bound, options) else {
+        return Ok(false);
+    };
+    let failure_node = match failure {
+        StrictArgumentsFailure::FunctionAssignment { target, .. } => target,
+        StrictArgumentsFailure::Arrow(node) | StrictArgumentsFailure::Signature(node) => node,
+    };
+    if !bound.contains(failure_node)
+        || !strict_argument_node_contains_diagnostic(arena, failure_node, &strict_diagnostics)
+    {
+        return Ok(false);
+    }
+    let Some(NodeData::SourceFile(source)) =
+        arena.get(bound.source_file().node).map(|node| &node.data)
+    else {
+        return Ok(false);
+    };
+    if source.statements.nodes.is_empty()
+        || source.statements.nodes.iter().any(|statement| {
+            !strict_argument_node_contains_diagnostic(
+                arena,
+                NodeRef::new(bound.source_file().arena, bound.file_id(), *statement),
+                &strict_diagnostics,
+            )
+        })
+    {
+        return Ok(false);
+    }
+
+    match failure {
+        StrictArgumentsFailure::Arrow(node) => Ok(strict_arguments_arrow_collisions(
+            arena,
+            bound,
+            store,
+            &source.statements.nodes,
+            &strict_diagnostics,
+            node,
+        )),
+        StrictArgumentsFailure::Signature(node) => Ok(strict_arguments_signature_collisions(
+            arena,
+            bound,
+            store,
+            &source.statements.nodes,
+            &strict_diagnostics,
+            node,
+        )),
+        StrictArgumentsFailure::FunctionAssignment {
+            target,
+            symbol,
+            flags,
+        } => {
+            if flags != (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT) {
+                return Ok(false);
+            }
+            if strict_arguments_function_assignment(
+                arena,
+                bound,
+                store,
+                &source.statements.nodes,
+                &strict_diagnostics,
+                target,
+                symbol,
+            )
+            .is_none()
+            {
+                return Ok(false);
+            }
+            issue_strict_arguments_assignment_diagnostic(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                target,
+            )?;
+            Ok(true)
+        }
+    }
 }
 
 /// Checks one already-retained source into context-owned private staging.

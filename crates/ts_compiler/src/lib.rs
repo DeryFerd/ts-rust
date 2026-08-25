@@ -10540,6 +10540,223 @@ mod tests {
     }
 
     #[test]
+    fn canonical_program_recovers_authenticated_strict_arguments_collisions() {
+        type StrictCollisionCase = (&'static str, &'static str, &'static [(u32, u32)]);
+        let cases: [StrictCollisionCase; 3] = [
+            (
+                "function.ts",
+                concat!(
+                    "var arguments = 10;\n",
+                    "function foo(a) {\n",
+                    "    arguments = 10;\n",
+                    "}\n",
+                ),
+                &[(1100, 4), (1100, 42), (2322, 42)],
+            ),
+            (
+                "arrows.ts",
+                concat!(
+                    "var first = (arguments: number) => { var arguments = 1; };\n",
+                    "var second = (...rest) => { var arguments: any[]; };\n",
+                ),
+                &[(1100, 13), (1100, 41), (1100, 91)],
+            ),
+            (
+                "types.ts",
+                concat!(
+                    "var first: (arguments: number) => void;\n",
+                    "var second: { (arguments: number); new (value: number, ...arguments); };\n",
+                ),
+                &[(1100, 12), (1100, 55), (1100, 98)],
+            ),
+        ];
+
+        for (file_name, source, expected) in cases {
+            let fs = MemoryFileSystem::new(true);
+            let path = format!("/project/{file_name}");
+            fs.write_file(&path, source).unwrap();
+            let program = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &[file_name.to_owned()],
+                CompilerOptions {
+                    always_strict: true,
+                    strict: false,
+                    strict_specified: true,
+                    no_implicit_any: false,
+                    no_implicit_any_specified: true,
+                    lib: Some(vec!["es5".to_owned()]),
+                    target: ScriptTarget::Es2015,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("{file_name}: {error:?}"));
+
+            let actual = program
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| {
+                    assert_eq!(diagnostic.file_name.as_deref(), Some(path.as_str()));
+                    let range = diagnostic.range.unwrap();
+                    assert_eq!(
+                        &source[range.start.get() as usize..range.end.get() as usize],
+                        "arguments"
+                    );
+                    if diagnostic.code == Some(2322) {
+                        assert_eq!(
+                            diagnostic.message,
+                            "Type 'number' is not assignable to type 'IArguments'."
+                        );
+                    }
+                    (diagnostic.code.unwrap(), range.start.get())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual.as_slice(), expected, "{file_name}");
+        }
+    }
+
+    #[test]
+    fn strict_arguments_recovery_does_not_hide_unrelated_unsupported_source() {
+        let sources = [
+            concat!(
+                "var first = (arguments: number) => {\n",
+                "    var arguments = 1;\n",
+                "    const unrelated: number = 'wrong';\n",
+                "};\n",
+            ),
+            concat!(
+                "var first: (arguments: number) => void;\n",
+                "var second: { (arguments: number): Missing; };\n",
+            ),
+        ];
+
+        for source in sources {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/input.ts", source).unwrap();
+            let error = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &["input.ts".to_owned()],
+                CompilerOptions {
+                    always_strict: true,
+                    strict: false,
+                    strict_specified: true,
+                    no_implicit_any: false,
+                    no_implicit_any_specified: true,
+                    lib: Some(vec!["es5".to_owned()]),
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap_err();
+            assert!(error.is_unsupported_boundary(), "{source}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn strict_arguments_recovery_preserves_isolated_declaration_diagnostics() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/collisions.ts",
+            "var first = (arguments: number) => { var arguments = 1; };\n",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/exported.ts",
+            "export function isString(value: unknown) { return typeof value === 'string'; }\n",
+        )
+        .unwrap();
+
+        let program = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["collisions.ts".to_owned(), "exported.ts".to_owned()],
+            CompilerOptions {
+                always_strict: true,
+                strict: false,
+                strict_specified: true,
+                no_implicit_any: false,
+                no_implicit_any_specified: true,
+                declaration: true,
+                isolated_declarations: true,
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| (diagnostic.file_name.as_deref(), diagnostic.code))
+                .collect::<Vec<_>>(),
+            [
+                (Some("/project/collisions.ts"), Some(1100)),
+                (Some("/project/collisions.ts"), Some(1100)),
+                (Some("/project/exported.ts"), Some(9007)),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovered_strict_argument_arrows_recheck_without_changing_checker_state() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/input.ts",
+            "var first = (arguments: number) => { var arguments = 1; };\n",
+        )
+        .unwrap();
+
+        let (program, state) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["input.ts".to_owned()],
+            CompilerOptions {
+                always_strict: true,
+                strict: false,
+                strict_specified: true,
+                no_implicit_any: false,
+                no_implicit_any_specified: true,
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                let file = program.source_file("/project/input.ts").unwrap().id;
+                let before = (
+                    queries.context.store().type_len(),
+                    queries.context.store().symbol_len(),
+                    queries.context.store().signature_len(),
+                    queries.context.store().mapper_len(),
+                    queries.context.store().type_resolution_len(),
+                    queries.context.diagnostics().len(),
+                );
+                queries.context.recheck_source_file(file).unwrap();
+                let after = (
+                    queries.context.store().type_len(),
+                    queries.context.store().symbol_len(),
+                    queries.context.store().signature_len(),
+                    queries.context.store().mapper_len(),
+                    queries.context.store().type_resolution_len(),
+                    queries.context.diagnostics().len(),
+                );
+                (before, after)
+            },
+        )
+        .unwrap();
+
+        let (before, after) = state.unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Some(1100))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn canonical_program_checks_multi_file_primitive_assignments_atomically() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/project/first.ts", r#"const first: number = "wrong";"#)

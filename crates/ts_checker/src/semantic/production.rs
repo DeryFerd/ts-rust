@@ -1008,6 +1008,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// repaired and retried without exposing a partial source result. Safe
     /// canonical memo caches may survive a rejected attempt; diagnostics tied
     /// to those caches stay in context-private retry staging until success.
+    /// Already-diagnosed strict `arguments` collisions use bounded recovery.
     ///
     /// # Errors
     ///
@@ -1056,6 +1057,24 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             instantiation_session,
             &mut staged,
         );
+        let result = match result {
+            Err(error) => match source::recover_strict_arguments_source(
+                arena,
+                bound,
+                &host,
+                global_types,
+                store,
+                *options,
+                instantiation_session,
+                &mut staged,
+                error,
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(error),
+                Err(recovery_error) => Err(recovery_error),
+            },
+            result => result,
+        };
         let owners = match diagnostic_owners(files, source_file, &staged) {
             Ok(owners) => owners,
             Err(error) => {

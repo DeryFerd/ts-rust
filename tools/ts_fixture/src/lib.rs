@@ -6626,6 +6626,53 @@ mod tests {
                 "{file_name}: {:?}",
                 compilation.diagnostics
             );
+            let mut canonical =
+                compile_case_matrix_with_checker(&case, FixtureChecker::Canonical).unwrap();
+            assert_eq!(canonical.len(), 1);
+            let (variant, canonical) = canonical.remove(0);
+            assert!(
+                variant.unsupported_details.is_empty(),
+                "{file_name}: {:?}",
+                variant.unsupported_details
+            );
+            let canonical_positions = canonical
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Some(1100))
+                .map(|diagnostic| {
+                    assert_eq!(
+                        diagnostic.file_name.as_deref(),
+                        Some(expected_path.as_str())
+                    );
+                    let source = diagnostic.source_text.as_ref().unwrap().as_scannable_str();
+                    let range = diagnostic.range.unwrap();
+                    assert_eq!(
+                        &source[range.start.get() as usize..range.end.get() as usize],
+                        "arguments"
+                    );
+                    super::line_and_utf16_column(source, range.start.get() as usize)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                canonical_positions.as_slice(),
+                expected_positions,
+                "{file_name}: {:?}",
+                canonical.diagnostics
+            );
+            let expected_count = expected_positions.len()
+                + usize::from(file_name == "argumentsBindsToFunctionScopeArgumentList.ts");
+            assert_eq!(canonical.diagnostics.len(), expected_count, "{file_name}");
+            if file_name == "argumentsBindsToFunctionScopeArgumentList.ts" {
+                let assignment = canonical
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.code == Some(2322))
+                    .unwrap();
+                assert_eq!(
+                    assignment.message,
+                    "Type 'number' is not assignable to type 'IArguments'."
+                );
+            }
             if file_name == "alwaysStrictModule.ts" {
                 assert_eq!(
                     compilation.diagnostic_text,
@@ -6638,15 +6685,6 @@ mod tests {
                     artifact.unsupported_details
                 );
 
-                let mut canonical =
-                    compile_case_matrix_with_checker(&case, FixtureChecker::Canonical).unwrap();
-                assert_eq!(canonical.len(), 1);
-                let (variant, canonical) = canonical.remove(0);
-                assert!(
-                    variant.unsupported_details.is_empty(),
-                    "{:?}",
-                    variant.unsupported_details
-                );
                 assert_eq!(canonical.diagnostic_text, compilation.diagnostic_text);
                 let [diagnostic] = canonical.diagnostics.as_slice() else {
                     panic!(
