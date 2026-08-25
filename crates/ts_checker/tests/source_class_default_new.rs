@@ -4,9 +4,11 @@ use ts_binder::{
     EscapedName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, ResolvedSignatureState, SignatureLinks,
-    SourceCheckError, SymbolNodeLinks, TypeData, TypeNodeLinks, UnsupportedSourceSyntax,
-    ValueSymbolLinks,
+    AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions,
+    CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+    CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, ResolvedSignatureState,
+    SignatureLinks, SourceCheckError, SymbolNodeLinks, TypeData, TypeNodeLinks,
+    UnsupportedSourceSyntax, ValueSymbolLinks,
     signatures::SignatureFlags,
     types::{ObjectFlags, TypeFlags},
 };
@@ -139,6 +141,259 @@ fn first_new_expression(parsed: &ParseResult, file: FileId) -> NodeRef {
             ))
         })
         .expect("fixture contains a new expression")
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // The exact multi-file fixture proves alias and class identity.
+fn imported_ambient_default_new_preserves_private_fields_and_inferred_returns() {
+    let declaration = parse_source_file("export declare class C {\n  private p;\n}\n");
+    let importer = parse_source_file(concat!(
+        "import { C } from \"pkg\";\n",
+        "\n",
+        "export function makeC() {\n",
+        "  return new C();\n",
+        "}\n",
+    ));
+    assert!(
+        declaration.diagnostics.is_empty(),
+        "{:?}",
+        declaration.diagnostics
+    );
+    assert!(
+        importer.diagnostics.is_empty(),
+        "{:?}",
+        importer.diagnostics
+    );
+
+    let declaration_file = FileId::new(1_820);
+    let importer_file = FileId::new(1_821);
+    let (module_specifier, binding) = importer
+        .arena
+        .iter()
+        .find_map(|(_, record)| {
+            let NodeData::ImportDeclaration(import) = &record.data else {
+                return None;
+            };
+            let clause = importer.arena.get(import.import_clause?)?;
+            let NodeData::ImportClause(clause) = &clause.data else {
+                return None;
+            };
+            let named = importer.arena.get(clause.named_bindings?)?;
+            let NodeData::NamedImports(named) = &named.data else {
+                return None;
+            };
+            Some((
+                NodeRef::new(importer.arena.id(), importer_file, import.module_specifier),
+                NodeRef::new(
+                    importer.arena.id(),
+                    importer_file,
+                    *named.elements.nodes.first()?,
+                ),
+            ))
+        })
+        .expect("fixture has one named package import");
+
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &importer.arena,
+            importer.source_file,
+            importer_file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/makeC.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                false,
+                CanonicalModuleState::External,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_source_file_with_facts(
+            &declaration.arena,
+            declaration.source_file,
+            declaration_file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/node_modules/pkg/index.d.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                true,
+                CanonicalModuleState::External,
+            ),
+        )
+        .unwrap();
+    for (file, parsed) in [(importer_file, &importer), (declaration_file, &declaration)] {
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+    }
+    let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+        binder.finish(),
+        [
+            (importer_file, &importer.arena),
+            (declaration_file, &declaration.arena),
+        ]
+        .into_iter()
+        .collect(),
+        CanonicalCheckerOptions::default(),
+        CanonicalModuleResolutionManifestInput::new([CanonicalModuleResolutionEntry::resolved(
+            module_specifier,
+            CanonicalResolvedModuleInput::new(
+                declaration_file,
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::Esm,
+            ),
+        )]),
+    )
+    .unwrap();
+
+    let target = class_symbol(&declaration, declaration_file, &context, "C");
+    let alias = context
+        .file(importer_file)
+        .unwrap()
+        .1
+        .symbol(binding)
+        .unwrap();
+    assert_ne!(alias, target);
+    let construction = first_new_expression(&importer, importer_file);
+    let constructor = constructor(&importer, construction);
+    let function = importer
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            matches!(record.data, NodeData::FunctionDeclaration(_)).then_some(NodeRef::new(
+                importer.arena.id(),
+                importer_file,
+                node,
+            ))
+        })
+        .expect("fixture has one exported function");
+    let target_source = context.source_file(declaration_file).unwrap();
+
+    context.check_source_file(importer_file).unwrap();
+
+    let members = context.get_nongeneric_class_members(target).unwrap();
+    let shells = members.shells();
+    let alias_links = context.store().alias_symbol_links(alias).unwrap();
+    assert_eq!(alias_links.immediate_target, Some(target));
+    assert_eq!(alias_links.alias_target, AliasTargetState::Resolved(target));
+    assert!(alias_links.type_only_declaration.is_none());
+    assert_eq!(
+        context.store().symbol_node_links(constructor),
+        Some(&SymbolNodeLinks {
+            resolved_symbol: Some(alias),
+        }),
+    );
+    assert_eq!(
+        context.store().type_node_links(constructor),
+        Some(&TypeNodeLinks {
+            resolved_type: Some(shells.value_type()),
+            ..TypeNodeLinks::default()
+        }),
+    );
+    assert_eq!(
+        context.store().signature_links(construction),
+        Some(&SignatureLinks {
+            resolved_signature: ResolvedSignatureState::Resolved(
+                members.default_construct_signature(),
+            ),
+            ..SignatureLinks::default()
+        }),
+    );
+    assert_eq!(
+        context.store().type_node_links(construction),
+        Some(&TypeNodeLinks {
+            resolved_type: Some(shells.instance_type()),
+            ..TypeNodeLinks::default()
+        }),
+    );
+    for symbol in [target, alias] {
+        assert_eq!(
+            context.store().value_symbol_links(symbol),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(shells.value_type()),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+    }
+    let function_signature = context
+        .store()
+        .signature_links(function)
+        .and_then(|links| links.resolved_signature.signature())
+        .expect("the exported function has an inferred signature");
+    assert_eq!(
+        context
+            .store()
+            .signature(function_signature)
+            .unwrap()
+            .resolved_return_type(),
+        Some(shells.instance_type()),
+    );
+
+    let &[private_field] = members.declared_instance_properties() else {
+        panic!("the imported class retains exactly one private field")
+    };
+    assert_eq!(
+        context
+            .store()
+            .symbol(private_field)
+            .unwrap()
+            .name()
+            .as_utf8(),
+        Some("p"),
+    );
+    assert_eq!(
+        context.store().value_symbol_links(private_field),
+        Some(&ValueSymbolLinks {
+            resolved_type: Some(context.store().intrinsic_bootstrap().unwrap().any_type),
+            ..ValueSymbolLinks::default()
+        }),
+    );
+    assert!(context.diagnostics().is_empty());
+    assert!(
+        !context
+            .store()
+            .source_file_links(target_source)
+            .is_some_and(|links| links.type_checked),
+        "imported declaration files remain unchecked",
+    );
+
+    let warm = (
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+        ),
+        context.store().alias_symbol_links(alias).cloned(),
+        context.store().symbol_node_links(constructor).cloned(),
+        context.store().type_node_links(constructor).cloned(),
+        context.store().signature_links(construction).cloned(),
+        context.store().type_node_links(construction).cloned(),
+        context.store().value_symbol_links(alias).cloned(),
+        context.store().value_symbol_links(private_field).cloned(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(importer_file).unwrap();
+    assert_eq!(
+        (
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            context.store().alias_symbol_links(alias).cloned(),
+            context.store().symbol_node_links(constructor).cloned(),
+            context.store().type_node_links(constructor).cloned(),
+            context.store().signature_links(construction).cloned(),
+            context.store().type_node_links(construction).cloned(),
+            context.store().value_symbol_links(alias).cloned(),
+            context.store().value_symbol_links(private_field).cloned(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
 }
 
 #[test]

@@ -3,12 +3,12 @@
 //! This is the dependency-closed `new Model()`, `new Model`, and single-literal
 //! constructor branch of pinned TypeScript-Go `checkCallExpression`,
 //! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`.
-//! An admitted constructor belongs to one preceding local class, an earlier
-//! ambient variable, or an authenticated global `Object`, `Array`, or `Date`
-//! constructor. Global arrays retain their real length and generic-item
-//! overloads. Planning proves syntax, resolver routes, provider provenance, and
-//! cold/warm caches before source execution may publish class or expression
-//! state.
+//! An admitted constructor belongs to one preceding local class, an imported
+//! exported ambient class, an earlier ambient variable, or an authenticated
+//! global `Object`, `Array`, or `Date` constructor. Global arrays retain their
+//! real length and generic-item overloads. Planning proves syntax, resolver
+//! routes, provider provenance, and cold/warm caches before source execution
+//! may publish class or expression state.
 
 use std::collections::{HashMap, HashSet};
 
@@ -20,9 +20,9 @@ use ts_binder::{
 use ts_jsnum::Number;
 
 use super::{
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, ClassError, DeclaredTypeError,
-    DeclaredTypeHost, ResolvedSignatureState, SignatureId, SignatureLinks, SymbolNodeLinks,
-    TypeData, TypeId, TypeNodeLinks, ValueSymbolLinks,
+    AliasTargetState, CanonicalGlobalTypes, CanonicalTypeMapperStore, ClassError,
+    DeclaredTypeError, DeclaredTypeHost, ResolvedSignatureState, SignatureId, SignatureLinks,
+    SymbolNodeLinks, TypeData, TypeId, TypeNodeLinks, ValueSymbolLinks,
     bootstrap::LiteralTypeCacheError,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::CallableFamily,
@@ -35,6 +35,7 @@ use super::{
     jsdoc::leading_jsdoc_comment,
     object_members::{PropertyObjectPlan, plan_interface, plan_type_literal},
     signatures::SignatureFlags,
+    source_imports::SourceImportBindingPlan,
     store::CachedSignatureLookup,
     type_nodes::normalize_numeric_separators,
     type_records::type_list_key,
@@ -148,6 +149,7 @@ pub(super) struct SourceDefaultNewPlan {
     constructor: NodeRef,
     resolved_symbol: SemanticSymbolId,
     target: SourceNewTarget,
+    function_return: bool,
     argument: Option<SourceNewArgument>,
     additional_arguments: Vec<SourceNewArgument>,
     parameter: Option<SourceNewParameter>,
@@ -156,6 +158,7 @@ pub(super) struct SourceDefaultNewPlan {
 #[derive(Clone, Debug)]
 enum SourceNewTarget {
     Class(Box<ClassMemberQueryPlan>),
+    ImportedClass(Box<SourceImportBindingPlan>),
     Declared(SourceDeclaredConstructorPlan),
     GlobalObject(SourceGlobalObjectConstructorPlan),
     GlobalArray(SourceGlobalArrayConstructorPlan),
@@ -247,6 +250,14 @@ impl SourceDefaultNewPlan {
         self.resolved_symbol
     }
 
+    pub(super) const fn requires_early_preparation(&self) -> bool {
+        self.function_return
+    }
+
+    pub(super) fn is_imported_class(&self) -> bool {
+        matches!(&self.target, SourceNewTarget::ImportedClass(_))
+    }
+
     fn arguments(&self) -> impl Iterator<Item = &SourceNewArgument> {
         self.argument.iter().chain(&self.additional_arguments)
     }
@@ -257,9 +268,16 @@ impl SourceDefaultNewPlan {
         arena: &NodeArena,
         bound: &BoundFile,
         store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
     ) -> Result<Option<(u32, String)>, SourceNewError> {
-        let SourceNewTarget::Class(class) = &self.target else {
-            return Ok(None);
+        let imported_class;
+        let class = match &self.target {
+            SourceNewTarget::Class(class) => class.as_ref(),
+            SourceNewTarget::ImportedClass(binding) => {
+                imported_class = imported_constructor_class(store, host, self, binding)?;
+                &imported_class
+            }
+            _ => return Ok(None),
         };
         let code = match class.constructor_visibility() {
             ClassConstructorVisibility::Private => Some(2673),
@@ -323,10 +341,10 @@ impl SourceDefaultNewPlan {
             return Ok(None);
         };
         let name = store
-            .symbol(self.resolved_symbol)
+            .symbol(class.symbol())
             .and_then(|symbol| symbol.name().as_utf8())
             .filter(|name| !name.is_empty())
-            .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(self.resolved_symbol)))?;
+            .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(class.symbol())))?;
         Ok(Some((code, name.to_owned())))
     }
 }
@@ -347,7 +365,9 @@ pub(super) fn plan_direct_default_new(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     prior_classes: &HashMap<SemanticSymbolId, ClassMemberPlan>,
+    import_bindings: &HashMap<SemanticSymbolId, SourceImportBindingPlan>,
     node: NodeRef,
+    function_return: bool,
 ) -> Result<SourceDefaultNewPlan, SourceNewError> {
     let record = arena
         .get(node.node)
@@ -470,6 +490,11 @@ pub(super) fn plan_direct_default_new(
         false,
     ) {
         Ok(Some(symbol)) => symbol,
+        Err(CanonicalNameResolutionError::AliasResolutionUnavailable(symbol))
+            if import_bindings.contains_key(&symbol) =>
+        {
+            symbol
+        }
         Ok(None) | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => {
             return Err(unsupported(SourceNewUnsupported::Constructor(constructor)));
         }
@@ -528,7 +553,22 @@ pub(super) fn plan_direct_default_new(
     }
     let argument = arguments.first().cloned();
     let additional_arguments = arguments.into_iter().skip(1).collect::<Vec<_>>();
-    let (target, parameter) = if global_object {
+    let (target, parameter) = if let Some(binding) = import_bindings.get(&resolved_symbol) {
+        if symbol_record.flags() != SymbolFlags::ALIAS
+            || binding.alias_symbol != resolved_symbol
+            || binding.local_text != identifier.text
+            || binding.declaration.file != node.file
+        {
+            return Err(unsupported(SourceNewUnsupported::Constructor(constructor)));
+        }
+        if argument.is_some() {
+            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+        }
+        (
+            SourceNewTarget::ImportedClass(Box::new(binding.clone())),
+            None,
+        )
+    } else if global_object {
         let global = plan_global_object_constructor(store, host, constructor, symbol)?;
         (
             SourceNewTarget::GlobalObject(global),
@@ -654,11 +694,12 @@ pub(super) fn plan_direct_default_new(
         constructor,
         resolved_symbol,
         target,
+        function_return,
         argument,
         additional_arguments,
         parameter,
     };
-    preflight_default_new_cache(store, &plan)?;
+    preflight_default_new_cache(store, host, &plan)?;
     Ok(plan)
 }
 
@@ -1714,6 +1755,68 @@ fn constructor_parameter(
     Ok(Some(SourceNewParameter { symbol, type_ }))
 }
 
+/// Resolves an imported constructor only after its normal alias binding exists.
+fn imported_constructor_class(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    binding: &SourceImportBindingPlan,
+) -> Result<ClassMemberQueryPlan, SourceNewError> {
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    let alias = store.symbol(binding.alias_symbol).ok_or_else(invalid)?;
+    let links = store
+        .alias_symbol_links(binding.alias_symbol)
+        .ok_or_else(invalid)?;
+    let AliasTargetState::Resolved(target) = links.alias_target else {
+        return Err(invalid());
+    };
+    let target_record = store.symbol(target).ok_or_else(invalid)?;
+    let Some([declaration]) = target_record.declarations() else {
+        return Err(unsupported(SourceNewUnsupported::ConstructorClass {
+            node: plan.constructor,
+            symbol: target,
+        }));
+    };
+    let declaration = *declaration;
+    let (_, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let facts = bound.source_facts().ok_or_else(invalid)?;
+    if binding.alias_symbol != plan.resolved_symbol
+        || binding.declaration.file != plan.node.file
+        || alias.flags() != SymbolFlags::ALIAS
+        || alias.check_flags() != CheckFlags::NONE
+        || alias.name().as_utf8() != Some(binding.local_text.as_str())
+        || store.get_merged_symbol(binding.alias_symbol) != Some(binding.alias_symbol)
+        || links.immediate_target.is_none()
+        || links.type_only_declaration.is_some()
+        || target_record.flags() != SymbolFlags::CLASS
+        || target_record.check_flags() != CheckFlags::NONE
+        || target_record.value_declaration() != Some(declaration)
+        || store.get_merged_symbol(target) != Some(target)
+        || declaration.file == plan.node.file
+        || !facts.is_declaration_file()
+        || !facts.is_external_module()
+        || facts.is_common_js_module()
+        || facts.is_javascript_file()
+    {
+        return Err(unsupported(SourceNewUnsupported::ConstructorClass {
+            node: plan.constructor,
+            symbol: target,
+        }));
+    }
+    let class = plan_nongeneric_class_member_query(store, host, target)?;
+    if class.symbol() != target
+        || class.declaration() != declaration
+        || class.export_local().is_none()
+    {
+        return Err(invariant(SourceNewInvariant::InvalidClassPlan(declaration)));
+    }
+    Ok(class)
+}
+
 fn argument_matches_parameter(
     store: &CanonicalTypeMapperStore,
     argument: &SourceNewArgument,
@@ -1743,6 +1846,15 @@ pub(super) fn preflight_direct_default_new(
                 return Err(invariant(SourceNewInvariant::InvalidClassPlan(
                     class.declaration(),
                 )));
+            }
+        }
+        SourceNewTarget::ImportedClass(binding) => {
+            let class = imported_constructor_class(store, host, plan, binding)?;
+            preflight_nongeneric_class_member_query(store, host, &class)?;
+            if class.constructor_interface_annotation().is_some()
+                || constructor_parameter(store, host, &class)? != plan.parameter
+            {
+                return Err(unsupported(SourceNewUnsupported::Arguments(plan.node)));
             }
         }
         SourceNewTarget::Declared(expected) => {
@@ -1814,12 +1926,12 @@ pub(super) fn preflight_direct_default_new(
             }
         }
     }
-    preflight_default_new_cache(store, plan)
+    preflight_default_new_cache(store, host, plan)
 }
 
 /// Revalidates every retained construction before reserving any sparse link
-/// capacity, then installs only empty default slots. No class execution may
-/// begin until this whole-file phase succeeds for every plan.
+/// capacity, then installs only empty default slots. No construction may
+/// execute until its complete preparation batch succeeds.
 pub(super) fn prepare_direct_default_news(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2485,7 +2597,7 @@ pub(super) fn check_direct_default_new(
     plan: &SourceDefaultNewPlan,
 ) -> Result<CheckedSourceDefaultNew, SourceNewError> {
     preflight_direct_default_new(store, host, plan)?;
-    preflight_prepared_default_new_cache(store, plan)?;
+    preflight_prepared_default_new_cache(store, host, plan)?;
     let selected = match &plan.target {
         SourceNewTarget::Class(class) => {
             let members = execute_nongeneric_class_member_query(store, host, class)?;
@@ -2498,6 +2610,24 @@ pub(super) fn check_direct_default_new(
                 store,
                 plan,
                 class,
+                selected.value_type,
+                selected.instance_type,
+                selected.signature,
+            )?;
+            selected
+        }
+        SourceNewTarget::ImportedClass(binding) => {
+            let class = imported_constructor_class(store, host, plan, binding)?;
+            let members = execute_nongeneric_class_member_query(store, host, &class)?;
+            let selected = CheckedSourceDefaultNew {
+                value_type: members.shells().value_type(),
+                instance_type: members.shells().instance_type(),
+                signature: members.default_construct_signature(),
+            };
+            validate_selected_default_signature(
+                store,
+                plan,
+                &class,
                 selected.value_type,
                 selected.instance_type,
                 selected.signature,
@@ -2555,6 +2685,7 @@ pub(super) fn check_direct_default_new(
         .collect::<Result<Vec<_>, _>>()?;
     preflight_publication_cache(
         store,
+        host,
         plan,
         value_type,
         instance_type,
@@ -2599,6 +2730,7 @@ pub(super) fn check_direct_default_new(
 
 fn preflight_prepared_default_new_cache(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
 ) -> Result<(), SourceNewError> {
     if store.symbol_node_links(plan.constructor).is_none()
@@ -2613,7 +2745,7 @@ fn preflight_prepared_default_new_cache(
             plan.node,
         )));
     }
-    preflight_default_new_cache(store, plan)
+    preflight_default_new_cache(store, host, plan)
 }
 
 fn resolved_declared_constructor(
@@ -3020,6 +3152,7 @@ fn resolved_global_array_constructor(
 
 fn preflight_default_new_cache(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
 ) -> Result<(), SourceNewError> {
     let constructor_symbol = exact_symbol_cache(store, plan.constructor).map_err(|()| {
@@ -3073,6 +3206,41 @@ fn preflight_default_new_cache(
             if let (Some(value), Some(instance), Some(signature)) = (value, instance, signature) {
                 validate_selected_default_signature(
                     store, plan, class, value, instance, signature,
+                )?;
+            } else if signature.is_some() {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+        }
+        SourceNewTarget::ImportedClass(binding) => {
+            if store
+                .alias_symbol_links(binding.alias_symbol)
+                .and_then(|links| links.alias_target.symbol())
+                .is_none()
+            {
+                if constructor_type.is_some() || result_type.is_some() || signature.is_some() {
+                    return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                        plan.node,
+                    )));
+                }
+                return Ok(());
+            }
+            let class = imported_constructor_class(store, host, plan, binding)?;
+            let instance = store
+                .declared_type_links(class.symbol())
+                .and_then(|links| links.declared_type);
+            let value = exact_class_value_type(store, class.symbol())?;
+            if constructor_type.is_some_and(|constructor| Some(constructor) != value)
+                || result_type.is_some_and(|result| Some(result) != instance)
+            {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+            if let (Some(value), Some(instance), Some(signature)) = (value, instance, signature) {
+                validate_selected_default_signature(
+                    store, plan, &class, value, instance, signature,
                 )?;
             } else if signature.is_some() {
                 return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
@@ -3142,13 +3310,14 @@ fn preflight_default_new_cache(
 
 fn preflight_publication_cache(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
     value_type: TypeId,
     instance_type: TypeId,
     signature: SignatureId,
     argument_types: &[TypeId],
 ) -> Result<(), SourceNewError> {
-    preflight_prepared_default_new_cache(store, plan)?;
+    preflight_prepared_default_new_cache(store, host, plan)?;
     let constructor_symbol = exact_symbol_cache(store, plan.constructor).map_err(|()| {
         invariant(SourceNewInvariant::InvalidConstructorCache(
             plan.constructor,

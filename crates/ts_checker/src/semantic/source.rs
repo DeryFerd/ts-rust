@@ -4,8 +4,9 @@
 //! interfaces, top-level nongeneric classes with primitive annotated fields
 //! and at most one exact direct preceding local nongeneric base, empty exported
 //! classes,
-//! exact construction of preceding admitted classes and declared constructors
-//! inside top-level values, assignments, property receivers, and statements,
+//! exact construction of preceding admitted classes, imported ambient classes,
+//! and declared constructors inside top-level values, assignments, property
+//! receivers, statements, and direct top-level function returns,
 //! top-level literal enums, empty external-module markers, exact
 //! named ESM reexports,
 //! leading direct named ESM value imports, clause-level type-only named ESM
@@ -5088,6 +5089,54 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && statement_record.parent == Some(self.source.node_ref().node))
     }
 
+    fn is_direct_top_level_function_return(
+        &self,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let Some(statement) = self
+            .node(expression)?
+            .parent
+            .map(|node| self.reference(node))
+        else {
+            return Ok(false);
+        };
+        let statement_record = self.node(statement)?;
+        let NodeData::ReturnStatement(return_statement) = &statement_record.data else {
+            return Ok(false);
+        };
+        if statement_record.kind != SyntaxKind::ReturnStatement
+            || statement_record.flags.0 != 0
+            || return_statement.expression != Some(expression.node)
+            || return_statement.flow_node.is_some()
+            || return_statement.facts != 0
+        {
+            return Ok(false);
+        }
+        let Some(body) = statement_record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let body_record = self.node(body)?;
+        let NodeData::Block(block) = &body_record.data else {
+            return Ok(false);
+        };
+        if body_record.kind != SyntaxKind::Block
+            || body_record.flags.0 != 0
+            || block.statements.nodes.as_slice() != [statement.node]
+        {
+            return Ok(false);
+        }
+        let Some(function) = body_record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let function_record = self.node(function)?;
+        let NodeData::FunctionDeclaration(declaration) = &function_record.data else {
+            return Ok(false);
+        };
+        Ok(function_record.kind == SyntaxKind::FunctionDeclaration
+            && function_record.parent == Some(self.source.node_ref().node)
+            && declaration.body == Some(body.node))
+    }
+
     /// Proves that constructor evaluation remains inside an admitted top-level expression.
     fn is_top_level_constructor_expression(
         &self,
@@ -5149,6 +5198,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 (NodeData::ExpressionStatement(statement), SyntaxKind::ExpressionStatement) => {
                     return Ok(statement.expression == current.node
                         && record.parent == Some(self.source.node_ref().node));
+                }
+                (NodeData::ReturnStatement(statement), SyntaxKind::ReturnStatement)
+                    if current == expression && statement.expression == Some(current.node) =>
+                {
+                    return self.is_direct_top_level_function_return(current);
                 }
                 _ => return Ok(false),
             }
@@ -13007,15 +13061,38 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         expression,
                     )));
                 };
+                let function_return = self.is_direct_top_level_function_return(expression)?;
                 let construction = plan_direct_default_new(
                     self.arena,
                     self.bound,
                     store,
                     host,
                     &self.prior_classes,
+                    &self.value_import_bindings,
                     expression,
+                    function_return,
                 )
                 .map_err(|error| Self::new_plan_error(expression, error))?;
+                if let Some(binding) = self
+                    .value_import_bindings
+                    .get(&construction.resolved_symbol())
+                {
+                    let constructor = construction.constructor();
+                    let NodeData::Identifier(identifier) = &self.node(constructor)?.data else {
+                        return Err(SourceCheckError::Import(constructor));
+                    };
+                    let import_read = plan_source_import_identifier_read(
+                        self.arena,
+                        self.bound,
+                        store,
+                        binding,
+                        constructor,
+                        &identifier.text,
+                        construction.resolved_symbol(),
+                    )
+                    .map_err(|error| Self::import_plan_error(constructor, &error))?;
+                    self.import_reads.push(import_read);
+                }
                 self.default_news.push(construction.clone());
                 Ok(PlannedExpression::new(
                     expression,
@@ -15598,7 +15675,8 @@ fn preflight_inferred_function_return_dependencies(
                             && !parameter.rest
                     })
             }
-            PlannedExpressionKind::TypeImportValueUse(_) | PlannedExpressionKind::New(_) => false,
+            PlannedExpressionKind::TypeImportValueUse(_) => false,
+            PlannedExpressionKind::New(construction) => construction.requires_early_preparation(),
             PlannedExpressionKind::Parenthesized(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => {
                 expression_is_closed(inner, parameters, locals, functions)
@@ -18102,7 +18180,7 @@ fn check_expression_type(
                 ))
             })?;
             if let Some((code, name)) = construction
-                .constructor_accessibility_diagnostic(arena, bound, store)
+                .constructor_accessibility_diagnostic(arena, bound, store, host)
                 .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?
             {
                 merge_retry_diagnostic(
@@ -25561,6 +25639,14 @@ pub(super) fn check_source_file(
         }
     }
 
+    for construction in default_news
+        .iter()
+        .filter(|construction| construction.is_imported_class())
+    {
+        preflight_direct_default_new(store, host, construction)
+            .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+    }
+
     let mut imported_javascript_typedef_annotations = HashMap::new();
     if let Some(jsdoc) = &javascript_jsdoc {
         for declaration in jsdoc.declarations() {
@@ -26337,6 +26423,14 @@ pub(super) fn check_source_file(
         }
         prepared_imports.push(prepared);
     }
+
+    let early_default_news = default_news
+        .iter()
+        .filter(|construction| construction.requires_early_preparation())
+        .cloned()
+        .collect::<Vec<_>>();
+    prepare_direct_default_news(store, host, global_types, &early_default_news)
+        .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
 
     let materialized_overloads = materialize_source_overloads(
         store,

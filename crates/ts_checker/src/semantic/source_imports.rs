@@ -10,21 +10,22 @@
 //! JavaScript `JSDoc` typedef targets retain their exact parser-owned reparsed
 //! flag. Comment-only typedef imports authenticate promoted `CommonJS` type
 //! exports through their exact module-specifier nodes. Value preparation
-//! supports initialized annotated `const` declarations, authenticated
-//! `CommonJS` variables and named assignments, explicit and implicit ambient
+//! supports initialized annotated `const` declarations, exported ambient
+//! classes from declaration files, authenticated `CommonJS` variables and named
+//! assignments, explicit and implicit ambient
 //! `export const` declarations in retained declaration files, annotated
 //! `FunctionDeclaration`s, already-published inferred object constants, and
 //! narrowly authenticated cold async-arrow object constants with canonical
-//! fresh-to-widened provenance. Declaration-file
-//! bodies are never source checked by this leaf; only the final imported
-//! annotation is queried.
+//! fresh-to-widened provenance. Declaration-file bodies are never source
+//! checked by this leaf; imported annotations and authenticated ambient class
+//! members are queried lazily.
 //!
 //! Source integration separates declaration checking from value use. Every
 //! binding is resolved through [`resolve_source_import_binding`], including
 //! unused imports, while [`prepare_source_import_value`] queries the target's
-//! annotation or callable graph only for a proven later value read. Preparation
-//! returns eventual target/alias value-link payloads without publishing the
-//! import alias. After the whole source has checked,
+//! annotation, callable graph, or class members only for a proven later value
+//! read. Preparation returns eventual target/alias value-link payloads without
+//! publishing the import alias. After the whole source has checked,
 //! [`preflight_prepared_source_import_publications`] validates and exposes
 //! those payloads for the source checker's one combined atomic publication
 //! batch. Importer-first Program order never recursively checks the target
@@ -46,13 +47,17 @@ use ts_binder::{
 
 use super::{
     AliasTargetState, CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, ProductionAliasTargetHost,
-    SignatureId, TypeId, TypeNodeLinks, ValueSymbolLinks,
+    CanonicalTypeMapperStore, ClassError, DeclaredTypeError, DeclaredTypeHost,
+    ProductionAliasTargetHost, SignatureId, TypeId, TypeNodeLinks, ValueSymbolLinks,
     alias::{
         CanonicalAliasResolutionError, CanonicalAliasResolutionEvent, CanonicalAliasResolver,
         CanonicalAliasTargetHost, CanonicalImmediateAliasTarget,
     },
     array_types::CanonicalArrayTargets,
+    classes::{
+        ClassMemberQueryPlan, execute_nongeneric_class_member_query,
+        plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
+    },
     derived_types::DerivedObjectLiteralValidation,
     enums,
     instantiate::InstantiationSession,
@@ -235,6 +240,10 @@ enum PreparedSourceImportTarget {
     AnnotatedFunction {
         signature: SignatureId,
     },
+    AmbientClass {
+        instance_type: TypeId,
+        signature: SignatureId,
+    },
     ConstEnum {
         declared_type: TypeId,
     },
@@ -289,6 +298,7 @@ enum PlannedSourceImportValueTarget {
         value: bool,
     },
     AnnotatedFunction(Box<SourceCallablePlan>),
+    AmbientClass(Box<ClassMemberQueryPlan>),
     ConstEnum {
         declaration: NodeRef,
     },
@@ -2667,6 +2677,7 @@ pub(super) fn prepare_source_import_value(
         | PlannedSourceImportValueTarget::CommonJsNamedExport { declaration, .. }
         | PlannedSourceImportValueTarget::ModuleNamespace { declaration, .. } => *declaration,
         PlannedSourceImportValueTarget::AnnotatedFunction(callable) => callable.declaration,
+        PlannedSourceImportValueTarget::AmbientClass(class) => class.declaration(),
     };
     if target_declaration.file == binding.declaration.file {
         return Err(unsupported(SourceImportUnsupported::SameSourceTarget {
@@ -2760,6 +2771,19 @@ pub(super) fn prepare_source_import_value(
                 type_,
                 PreparedSourceImportTarget::AnnotatedFunction {
                     signature: provenance.signature,
+                },
+            )
+        }
+        PlannedSourceImportValueTarget::AmbientClass(class) => {
+            let members = execute_nongeneric_class_member_query(store, declared_host, &class)
+                .map_err(|error| {
+                    imported_ambient_class_error(target, class.declaration(), error)
+                })?;
+            (
+                members.shells().value_type(),
+                PreparedSourceImportTarget::AmbientClass {
+                    instance_type: members.shells().instance_type(),
+                    signature: members.default_construct_signature(),
                 },
             )
         }
@@ -3701,6 +3725,9 @@ fn plan_direct_import_value_target(
         .map(Box::new)
         .map(PlannedSourceImportValueTarget::AnnotatedFunction);
     }
+    if flags == SymbolFlags::CLASS {
+        return plan_direct_ambient_class_target(store, host, alias, target);
+    }
     if flags == SymbolFlags::CONST_ENUM {
         return plan_direct_const_enum_target(store, host, alias, target);
     }
@@ -3724,6 +3751,98 @@ fn plan_direct_import_value_target(
         target,
         flags,
     }))
+}
+
+fn plan_direct_ambient_class_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    alias: SemanticSymbolId,
+    target: SemanticSymbolId,
+) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
+    let record = store
+        .symbol(target)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target)))?;
+    let Some([declaration]) = record.declarations() else {
+        return Err(unsupported(SourceImportUnsupported::TargetSymbol {
+            alias,
+            target,
+            flags: record.flags(),
+        }));
+    };
+    let declaration = *declaration;
+    let (arena, bound) = host
+        .source(declaration)
+        .ok_or_else(|| unsupported(SourceImportUnsupported::TargetDeclaration(declaration)))?;
+    let facts = bound.source_facts().ok_or_else(|| {
+        invariant(SourceImportInvariant::MissingSourceFacts(
+            bound.source_file(),
+        ))
+    })?;
+    let declaration_record = checked_node(arena, bound, store, declaration)?;
+    let NodeData::ClassDeclaration(class) = &declaration_record.data else {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    };
+    let Some(module) = bound.symbol(bound.source_file()) else {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    };
+    if record.flags() != SymbolFlags::CLASS
+        || record.check_flags() != CheckFlags::NONE
+        || record.value_declaration() != Some(declaration)
+        || record.parent() != Some(module)
+        || declaration_record.kind != SyntaxKind::ClassDeclaration
+        || declaration_record.parent != Some(bound.source_file().node)
+        || !facts.is_declaration_file()
+        || !facts.is_external_module()
+        || facts.is_common_js_module()
+        || facts.is_javascript_file()
+        || bound.symbol(declaration) != Some(target)
+        || store.get_merged_symbol(target) != Some(target)
+        || store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(record.name()))
+            != Some(target)
+        || !has_exact_export_declare_modifiers(
+            arena,
+            bound,
+            store,
+            declaration,
+            class.modifiers.as_ref(),
+        )?
+    {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    }
+    let class = plan_nongeneric_class_member_query(store, host, target)
+        .map_err(|error| imported_ambient_class_error(target, declaration, error))?;
+    if class.declaration() != declaration || class.export_local().is_none() {
+        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(target)));
+    }
+    preflight_nongeneric_class_member_query(store, host, &class)
+        .map_err(|error| imported_ambient_class_error(target, declaration, error))?;
+    Ok(PlannedSourceImportValueTarget::AmbientClass(Box::new(
+        class,
+    )))
+}
+
+fn imported_ambient_class_error(
+    target: SemanticSymbolId,
+    declaration: NodeRef,
+    error: ClassError,
+) -> SourceImportError {
+    match error {
+        ClassError::Unsupported(_) => unsupported(SourceImportUnsupported::TargetDeclaration(
+            error.node().unwrap_or(declaration),
+        )),
+        ClassError::Invariant(_) => invariant(SourceImportInvariant::InvalidTargetLinks(target)),
+        ClassError::DeclaredType(error) => SourceImportError::DeclaredType(error),
+    }
 }
 
 fn plan_direct_const_enum_target(
@@ -5259,6 +5378,18 @@ fn materialize_imported_module_namespace(
                 .get_return_type_of_signature(signature)?;
                 (type_, None)
             }
+            PlannedSourceImportValueTarget::AmbientClass(class) => {
+                let members = execute_nongeneric_class_member_query(store, host, &class).map_err(
+                    |error| {
+                        imported_ambient_class_error(
+                            member.value_symbol,
+                            class.declaration(),
+                            error,
+                        )
+                    },
+                )?;
+                (members.shells().value_type(), None)
+            }
             PlannedSourceImportValueTarget::ConstEnum { .. } => (
                 enums::get_enum_semantics(store, host, member.value_symbol)
                     .map_err(DeclaredTypeError::from)?
@@ -5423,6 +5554,11 @@ fn preflight_imported_module_namespace_members(
                     diagnostics,
                 )?
                 .preflight_type_of_source_callable(callable.declaration, callable.owner_symbol)?;
+            }
+            PlannedSourceImportValueTarget::AmbientClass(class) => {
+                preflight_nongeneric_class_member_query(store, host, class).map_err(|error| {
+                    imported_ambient_class_error(member.value_symbol, class.declaration(), error)
+                })?;
             }
             PlannedSourceImportValueTarget::DeclarationNumericConst { .. }
             | PlannedSourceImportValueTarget::DeclarationBooleanConst { .. }
@@ -6659,6 +6795,7 @@ fn prepare_value_links(
             && record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
             && record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
             && record.flags() != SymbolFlags::FUNCTION
+            && record.flags() != SymbolFlags::CLASS
             && record.flags() != SymbolFlags::CONST_ENUM
             && record.flags() != SymbolFlags::PROPERTY
             && !record.flags().intersects(SymbolFlags::MODULE))
@@ -6782,6 +6919,32 @@ fn validate_prepared_import_value(
                     validate_stored_source_callable(store, prepared.type_),
                     StoredSourceCallableValidation::Valid(_)
                 )
+        }
+        PreparedSourceImportTarget::AmbientClass {
+            instance_type,
+            signature,
+        } => {
+            store.symbol(prepared.target_symbol).is_some_and(|target| {
+                target.flags() == SymbolFlags::CLASS
+                    && target.value_declaration() == Some(prepared.target_declaration)
+            }) && store.source_node_kind(prepared.target_declaration)
+                == Some(SyntaxKind::ClassDeclaration)
+                && store
+                    .declared_type_links(prepared.target_symbol)
+                    .and_then(|links| links.declared_type)
+                    == Some(*instance_type)
+                && store
+                    .value_symbol_links(prepared.target_symbol)
+                    .and_then(|links| links.resolved_type)
+                    == Some(prepared.type_)
+                && store.signature(*signature).is_some_and(|signature| {
+                    signature.resolved_return_type() == Some(*instance_type)
+                })
+                && store
+                    .type_payload(prepared.type_)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.signatures.as_deref())
+                    == Some(&[*signature][..])
         }
         PreparedSourceImportTarget::ConstEnum { declared_type } => {
             store.symbol(prepared.target_symbol).is_some_and(|target| {
