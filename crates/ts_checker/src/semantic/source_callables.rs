@@ -8201,7 +8201,7 @@ fn authenticated_contextual_declared_call_target(
                 || declared_record.parent() != Some(target_owner)
                 || declared_record.value_declaration() != Some(*property_declaration)
                 || store.source_node_kind(*property_declaration)
-                    != Some(SyntaxKind::PropertySignature)
+                    != Some(SyntaxKind::PropertyDeclaration)
                 || store.source_node_parent(*property_declaration)
                     != Some(SourceNodeParent::Parent(*target_declaration))
                 || store

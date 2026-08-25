@@ -2152,10 +2152,12 @@ impl CommonJsAssignmentPlanner<'_> {
         let Some(property_record) = self.arena.get(property_declaration.node) else {
             return false;
         };
-        let NodeData::PropertySignatureDeclaration(property_data) = &property_record.data else {
+        let NodeData::PropertyDeclaration(property_data) = &property_record.data else {
             return false;
         };
-        let array_type = self.reference(property_data.type_);
+        let Some(array_type) = property_data.type_.map(|node| self.reference(node)) else {
+            return false;
+        };
         let Some(array_record) = self.arena.get(array_type.node) else {
             return false;
         };
@@ -2215,11 +2217,13 @@ impl CommonJsAssignmentPlanner<'_> {
             && property.parent() == Some(owner_symbol)
             && property.export_symbol().is_none()
             && self.store.get_merged_symbol(property_symbol) == Some(property_symbol)
-            && property_record.kind == SyntaxKind::PropertySignature
+            && property_record.kind == SyntaxKind::PropertyDeclaration
             && property_record.parent == Some(annotation.node)
             && property_record.flags.0 == 0
+            && property_data.initializer.is_none()
             && property_data.symbol.is_none()
             && property_data.modifiers.is_none()
+            && property_data.facts == 0
             && array_record.kind == SyntaxKind::ArrayType
             && array_record.parent == Some(property_declaration.node)
             && array_record.flags.0 == 0

@@ -2262,7 +2262,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     && target_owner.flags() == SymbolFlags::TYPE_LITERAL
                     && target_owner.declarations() == Some(&[annotation])
                     && self.source_node_kind(*property_declaration)
-                        == Some(SyntaxKind::PropertySignature)
+                        == Some(SyntaxKind::PropertyDeclaration)
                     && self.source_node_parent(*property_declaration)
                         == Some(SourceNodeParent::Parent(annotation))
                     && self

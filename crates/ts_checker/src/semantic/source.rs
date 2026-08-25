@@ -37058,7 +37058,7 @@ fn declared_callable_expando_property_type(
         || declared_record.exports().is_some()
         || declared_record.export_symbol().is_some()
         || store.get_merged_symbol(declared) != Some(declared)
-        || store.source_node_kind(*declared_declaration) != Some(SyntaxKind::PropertySignature)
+        || store.source_node_kind(*declared_declaration) != Some(SyntaxKind::PropertyDeclaration)
         || store.source_node_parent(*declared_declaration)
             != Some(super::store::SourceNodeParent::Parent(annotation))
         || links
