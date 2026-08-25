@@ -29614,7 +29614,41 @@ mod tests {
             assert!(interface.reference.object.structured.properties.is_none());
             resolved.push(type_);
         }
-        assert!(context.store().declared_type_links(base).is_none());
+        let base_type = context
+            .store()
+            .declared_type_links(base)
+            .and_then(|links| links.declared_type)
+            .expect("recursive native-event planning retains the Event interface identity");
+        let base_record = context.store().type_payload(base_type).unwrap();
+        let TypeData::Interface(base_interface) = base_record.data() else {
+            panic!("Event must retain its canonical interface identity")
+        };
+        assert_eq!(base_record.symbol(), Some(base));
+        assert!(!base_interface.base_types_resolved);
+        assert!(!base_interface.declared_members_resolved);
+        assert!(base_interface.resolved_base_types.is_none());
+        assert!(
+            base_interface
+                .reference
+                .object
+                .structured
+                .properties
+                .is_none()
+        );
+        assert!(
+            base_interface
+                .reference
+                .object
+                .structured
+                .signatures
+                .is_none()
+        );
+        assert!(
+            context
+                .store()
+                .direct_interface_heritage_provenance(base_type)
+                .is_none()
+        );
         assert!(context.store().value_symbol_links(method).is_none());
         let warm = (
             store_state(context.store()),
@@ -29625,6 +29659,14 @@ mod tests {
             assert_eq!(context.get_declared_type_of_symbol(alias), Ok(expected));
             assert_eq!(context.get_type_from_type_node(reference), Ok(expected));
         }
+        assert_eq!(
+            context
+                .store()
+                .declared_type_links(base)
+                .and_then(|links| links.declared_type),
+            Some(base_type),
+        );
+        assert!(context.store().value_symbol_links(method).is_none());
         assert_eq!(
             (
                 store_state(context.store()),
