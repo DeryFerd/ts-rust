@@ -4049,8 +4049,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 == Some(property_symbol))
     }
 
-    #[allow(clippy::too_many_lines)] // Method, interface, and parameter ownership form one proof.
-    fn is_authenticated_method_union_type_parameter(
+    #[allow(clippy::too_many_lines)] // Signature, owner, and parameter ownership form one proof.
+    fn is_authenticated_declared_signature_union_type_parameter(
         &self,
         node: NodeRef,
         symbol: SemanticSymbolId,
@@ -4096,9 +4096,34 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             };
             let parent = NodeRef::new(current.arena, current.file, parent);
             let record = preflight_node(self.store, self.host, parent)?;
-            let NodeData::MethodSignatureDeclaration(method) = &record.data else {
-                current = parent;
-                continue;
+            let (signature_type_parameters, signature_flags, internal_name) = match &record.data {
+                NodeData::MethodSignatureDeclaration(method)
+                    if record.kind == SyntaxKind::MethodSignature =>
+                {
+                    (method.type_parameters.as_ref(), SymbolFlags::METHOD, None)
+                }
+                NodeData::CallSignatureDeclaration(call)
+                    if record.kind == SyntaxKind::CallSignature =>
+                {
+                    (
+                        call.type_parameters.as_ref(),
+                        SymbolFlags::SIGNATURE,
+                        Some(InternalSymbolName::Call),
+                    )
+                }
+                NodeData::ConstructSignatureDeclaration(construct)
+                    if record.kind == SyntaxKind::ConstructSignature =>
+                {
+                    (
+                        construct.type_parameters.as_ref(),
+                        SymbolFlags::SIGNATURE,
+                        Some(InternalSymbolName::New),
+                    )
+                }
+                _ => {
+                    current = parent;
+                    continue;
+                }
             };
             let Some(owner) = record
                 .parent
@@ -4107,45 +4132,65 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 return Ok(false);
             };
             let owner_record = preflight_node(self.store, self.host, owner)?;
-            let NodeData::InterfaceDeclaration(interface) = &owner_record.data else {
-                return Ok(false);
+            let interface = match &owner_record.data {
+                NodeData::InterfaceDeclaration(interface)
+                    if owner_record.kind == SyntaxKind::InterfaceDeclaration =>
+                {
+                    Some(interface)
+                }
+                NodeData::TypeLiteralNode(_) if owner_record.kind == SyntaxKind::TypeLiteral => {
+                    None
+                }
+                _ => return Ok(false),
             };
             let Some(bound) = self.host.bound_file(parent) else {
                 return Ok(false);
             };
-            let method_symbol = bound
+            let signature_symbol = bound
                 .symbol(parent)
-                .and_then(|method| self.store.get_merged_symbol(method));
+                .and_then(|signature| self.store.get_merged_symbol(signature));
             let owner_symbol = bound
                 .symbol(owner)
                 .and_then(|owner| self.store.get_merged_symbol(owner));
-            let (Some(method_symbol), Some(owner_symbol)) = (method_symbol, owner_symbol) else {
+            let (Some(signature_symbol), Some(owner_symbol)) = (signature_symbol, owner_symbol)
+            else {
                 return Ok(false);
             };
-            let Some(method_record) = self.store.symbol(method_symbol) else {
+            let Some(signature_record) = self.store.symbol(signature_symbol) else {
                 return Ok(false);
             };
             let Some(owner_symbol_record) = self.store.symbol(owner_symbol) else {
                 return Ok(false);
             };
-            if record.kind != SyntaxKind::MethodSignature
-                || owner_record.kind != SyntaxKind::InterfaceDeclaration
-                || !self.host.symbol_matches(self.store, parent, method_symbol)
+            if !self
+                .host
+                .symbol_matches(self.store, parent, signature_symbol)
                 || !self.host.symbol_matches(self.store, owner, owner_symbol)
-                || self.store.get_parent_of_symbol(method_symbol) != Some(owner_symbol)
-                || method_record.flags() != SymbolFlags::METHOD
-                || method_record.check_flags() != CheckFlags::NONE
-                || method_record
+                || self.store.get_parent_of_symbol(signature_symbol) != Some(owner_symbol)
+                || signature_record.flags() != signature_flags
+                || internal_name
+                    .as_ref()
+                    .is_some_and(|name| signature_record.name() != name.as_ref())
+                || signature_record.check_flags() != CheckFlags::NONE
+                || signature_record
                     .declarations()
                     .is_none_or(|declarations| !declarations.contains(&parent))
-                || method_record.value_declaration()
-                    != method_record
-                        .declarations()
-                        .and_then(|declarations| declarations.first().copied())
-                || method_record.members().is_some()
-                || method_record.exports().is_some()
-                || method_record.export_symbol().is_some()
-                || !owner_symbol_record.flags().contains(SymbolFlags::INTERFACE)
+                || signature_record.value_declaration()
+                    != if signature_flags == SymbolFlags::METHOD {
+                        signature_record
+                            .declarations()
+                            .and_then(|declarations| declarations.first().copied())
+                    } else {
+                        None
+                    }
+                || signature_record.members().is_some()
+                || signature_record.exports().is_some()
+                || signature_record.export_symbol().is_some()
+                || if interface.is_some() {
+                    !owner_symbol_record.flags().contains(SymbolFlags::INTERFACE)
+                } else {
+                    owner_symbol_record.flags() != SymbolFlags::TYPE_LITERAL
+                }
                 || owner_symbol_record.check_flags() != CheckFlags::NONE
                 || owner_symbol_record
                     .declarations()
@@ -4153,9 +4198,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 || owner_symbol_record
                     .members()
                     .and_then(|members| self.store.symbol_table(members))
-                    .and_then(|members| members.get(method_record.name()))
-                    .and_then(|method| self.store.get_merged_symbol(method))
-                    != Some(method_symbol)
+                    .and_then(|members| members.get(signature_record.name()))
+                    .and_then(|signature| self.store.get_merged_symbol(signature))
+                    != Some(signature_symbol)
             {
                 return Ok(false);
             }
@@ -4163,9 +4208,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             if parameter_owner == parent {
                 return Ok(ordinary
                     && declarations.len() == 1
-                    && method
-                        .type_parameters
-                        .as_ref()
+                    && signature_type_parameters
                         .is_some_and(|parameters| parameters.nodes.contains(&declaration.node))
                     && parameter.parent().is_none()
                     && bound
@@ -4174,7 +4217,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         .and_then(|locals| locals.get(parameter.name()))
                         == Some(symbol));
             }
-            let Some(owner_declarations) = owner_symbol_record.declarations() else {
+            let (Some(interface), Some(owner_declarations)) =
+                (interface, owner_symbol_record.declarations())
+            else {
                 return Ok(false);
             };
             let mut seen = HashSet::with_capacity(declarations.len());
@@ -7955,7 +8000,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
             && (!flags.contains(SymbolFlags::TYPE_PARAMETER)
                 || !self.is_authenticated_bivariant_alias_type_parameter(node, symbol)?
-                    && !self.is_authenticated_method_union_type_parameter(node, symbol)?
+                    && !self
+                        .is_authenticated_declared_signature_union_type_parameter(node, symbol)?
                     && !self.is_authenticated_jsdoc_arrow_union_type_parameter(node, symbol)?
                     && !self
                         .is_authenticated_react_ref_object_union_type_parameter(node, symbol)?)
@@ -14380,7 +14426,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .is_some_and(|target| target.local_symbol == *alias && target.import_type == node)
         });
         let result = (|| {
-            self.execute_interface_method_type_parameters(&methods, &plan, &mut prepared)?;
+            self.execute_interface_method_type_parameters(&methods, &[], &plan, &mut prepared)?;
             for method in &methods {
                 for parameter in &method.parameters {
                     self.execute_type_node(parameter.type_node, &plan, &mut prepared)?;
@@ -14400,23 +14446,30 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     fn execute_interface_method_type_parameters(
         &mut self,
         methods: &[object_members::PlannedInterfaceMethod],
+        signatures: &[object_members::PlannedCallSignature],
         plan: &TypeQueryPlan,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<(), DeclaredTypeError> {
-        if methods.is_empty() {
+        if methods.is_empty() && signatures.is_empty() {
             return Ok(());
         }
         let mut missing = HashSet::new();
-        for method in methods {
-            for parameter in &method.type_parameters {
-                if self
-                    .store
-                    .declared_type_links(parameter.symbol)
-                    .and_then(|links| links.declared_type)
-                    .is_none()
-                {
-                    missing.insert(parameter.symbol);
-                }
+        for parameter in methods
+            .iter()
+            .flat_map(|method| &method.type_parameters)
+            .chain(
+                signatures
+                    .iter()
+                    .flat_map(|signature| &signature.type_parameters),
+            )
+        {
+            if self
+                .store
+                .declared_type_links(parameter.symbol)
+                .and_then(|links| links.declared_type)
+                .is_none()
+            {
+                missing.insert(parameter.symbol);
             }
         }
         if !self.store.try_reserve_types(missing.len())
@@ -14424,64 +14477,76 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             return Err(Self::literal_cache_error(LiteralTypeCacheError::Capacity));
         }
-        for method in methods {
-            for parameter in &method.type_parameters {
-                execute_type_parameter(self.store, parameter.symbol);
-            }
+        for parameter in methods
+            .iter()
+            .flat_map(|method| &method.type_parameters)
+            .chain(
+                signatures
+                    .iter()
+                    .flat_map(|signature| &signature.type_parameters),
+            )
+        {
+            execute_type_parameter(self.store, parameter.symbol);
         }
 
-        for method in methods {
-            for parameter in &method.type_parameters {
-                let type_ = self
-                    .store
-                    .declared_type_links(parameter.symbol)
-                    .and_then(|links| links.declared_type)
-                    .ok_or_else(|| {
-                        type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(
-                            parameter.declaration,
-                        ))
-                    })?;
-                let constraint = parameter
+        for parameter in methods
+            .iter()
+            .flat_map(|method| &method.type_parameters)
+            .chain(
+                signatures
+                    .iter()
+                    .flat_map(|signature| &signature.type_parameters),
+            )
+        {
+            let type_ = self
+                .store
+                .declared_type_links(parameter.symbol)
+                .and_then(|links| links.declared_type)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(
+                        parameter.declaration,
+                    ))
+                })?;
+            let constraint = parameter
+                .constraint
+                .map(|node| self.execute_type_node(node, plan, prepared))
+                .transpose()?;
+            let default_type = parameter
+                .default_type
+                .map(|node| self.execute_type_node(node, plan, prepared))
+                .transpose()?;
+            let Some(TypeData::TypeParameter(data)) =
+                self.store.type_payload(type_).map(TypeRecord::data)
+            else {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
+                ));
+            };
+            if data.target.is_some()
+                || data.mapper.is_some()
+                || data
                     .constraint
-                    .map(|node| self.execute_type_node(node, plan, prepared))
-                    .transpose()?;
-                let default_type = parameter
-                    .default_type
-                    .map(|node| self.execute_type_node(node, plan, prepared))
-                    .transpose()?;
-                let Some(TypeData::TypeParameter(data)) =
-                    self.store.type_payload(type_).map(TypeRecord::data)
-                else {
-                    return Err(type_node_unavailable(
-                        TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
-                    ));
-                };
-                if data.target.is_some()
-                    || data.mapper.is_some()
-                    || data
-                        .constraint
-                        .is_some_and(|actual| Some(actual) != constraint)
-                    || data
-                        .resolved_default_type
-                        .is_some_and(|actual| Some(actual) != default_type)
-                {
-                    return Err(type_node_unavailable(
-                        TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
-                    ));
-                }
-                if (data.constraint != constraint || data.resolved_default_type != default_type)
-                    && !self.store.set_type_parameter_resolution(
-                        type_,
-                        constraint,
-                        None,
-                        None,
-                        default_type,
-                    )
-                {
-                    return Err(type_node_unavailable(
-                        TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
-                    ));
-                }
+                    .is_some_and(|actual| Some(actual) != constraint)
+                || data
+                    .resolved_default_type
+                    .is_some_and(|actual| Some(actual) != default_type)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
+                ));
+            }
+            if (data.constraint != constraint || data.resolved_default_type != default_type)
+                && !self.store.set_type_parameter_resolution(
+                    type_,
+                    constraint,
+                    None,
+                    None,
+                    default_type,
+                )
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
+                ));
             }
         }
         Ok(())
@@ -16051,7 +16116,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             unreachable!("the active-interface check and insertion are adjacent")
         }
         let result = (|| {
-            self.execute_interface_method_type_parameters(&interface.methods, plan, prepared)?;
+            self.execute_interface_method_type_parameters(
+                &interface.methods,
+                &interface.call_signatures,
+                plan,
+                prepared,
+            )?;
             let mut types = Vec::with_capacity(interface.properties.len());
             for property in interface.property_type_nodes() {
                 types.push(self.execute_type_node(property, plan, prepared)?);
@@ -16875,11 +16945,31 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 ));
             }
         }
-        if plan
-            .functions
+        let signature_annotation = plan.functions.values().any(|function| {
+            function.return_type == node
+                || function
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.type_node == node)
+        }) || plan
+            .interfaces
             .values()
-            .any(|function| function.return_type == node)
-        {
+            .chain(plan.generic_interfaces.values())
+            .chain(plan.type_literals.values())
+            .any(|object| {
+                object.call_signatures.iter().any(|signature| {
+                    signature
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.type_node == node)
+                }) || object.methods.iter().any(|method| {
+                    method
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.type_node == node)
+                })
+            });
+        if signature_annotation {
             let mut links = self
                 .store
                 .type_node_links(node)
@@ -18150,7 +18240,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if matches!(state, PropertyObjectState::EmptyBootstrap(_)) {
             return Ok(state.type_id());
         }
-        self.execute_interface_method_type_parameters(&literal.methods, plan, prepared)?;
+        self.execute_interface_method_type_parameters(
+            &literal.methods,
+            &literal.call_signatures,
+            plan,
+            prepared,
+        )?;
         let mut types = Vec::with_capacity(literal.properties.len());
         for property in literal.property_type_nodes() {
             types.push(self.execute_type_node(property, plan, prepared)?);
@@ -40298,7 +40393,7 @@ mod tests {
         for source in [
             "type Fn<T> = (value: string) => number;",
             "type Fn = (this: object, value: string) => number;",
-            "type Fn = (...value: string[]) => number;",
+            "type Fn = (...value: string) => number;",
             "type Fn = ([value]: [string]) => number;",
             "type Fn = (value: string = \"\") => number;",
         ] {

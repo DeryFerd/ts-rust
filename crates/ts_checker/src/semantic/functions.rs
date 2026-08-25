@@ -1,8 +1,8 @@
 //! Exact function-type signatures for the dependency-closed type-node cut.
 //!
-//! This module owns nongeneric function types, authenticated explicit and
-//! implicit `any[]` rest parameters, identifier and assertion predicates, and
-//! generic function types with outer lexical constraints.
+//! This module owns nongeneric function types, authenticated implicit, explicit
+//! `any[]`, and other typed rest parameters, identifier and assertion
+//! predicates, and generic function types with outer lexical constraints.
 //! The type-node planner/executor only supplies recursive annotation callbacks;
 //! binder proof, cache validation, shell publication, signatures, parameter
 //! value types, and lazy return-type validation stay here.
@@ -53,6 +53,7 @@ pub(super) struct FunctionParameterPlan {
     pub(super) optional: bool,
     rest_tuple_element: Option<FunctionRestTupleElementPlan>,
     implicit_any_rest: bool,
+    typed_rest: bool,
 }
 
 /// One required labeled tuple element expanded into a fixed signature parameter.
@@ -495,6 +496,12 @@ pub(super) fn plan_function_type(
                 type_node,
                 array_targets,
             )?;
+        let typed_rest = data.dot_dot_dot_token.is_some()
+            && !implicit_any_rest
+            && matches!(
+                preflight_node(store, host, type_node)?.kind,
+                SyntaxKind::ArrayType | SyntaxKind::InferType
+            );
         let rest_tuple_element = match data.dot_dot_dot_token {
             Some(token) if implicit_any_rest || explicit_any_rest => {
                 let token = NodeRef::new(node.arena, node.file, token);
@@ -507,6 +514,55 @@ pub(super) fn plan_function_type(
                     return Err(invariant(FunctionTypeInvariant::InvalidParameter(
                         parameter,
                     )));
+                }
+                flags |= SignatureFlags::HAS_REST_PARAMETER;
+                None
+            }
+            Some(token) if typed_rest => {
+                let token = NodeRef::new(node.arena, node.file, token);
+                let token_record = preflight_node(store, host, token)?;
+                let type_record = preflight_node(store, host, type_node)?;
+                if token_record.kind != SyntaxKind::DotDotDotToken
+                    || token_record.flags.0 != 0
+                    || token_record.parent != Some(parameter.node)
+                    || token_record.range.start < parameter_record.range.start
+                    || token_record.range.end > name_record.range.start
+                    || !matches!(token_record.data, NodeData::Token(_))
+                    || parameters.len() + 1 != function.parameters.nodes.len()
+                    || optional
+                    || match &type_record.data {
+                        NodeData::ArrayTypeNode(array)
+                            if type_record.kind == SyntaxKind::ArrayType =>
+                        {
+                            let element =
+                                NodeRef::new(type_node.arena, type_node.file, array.element_type);
+                            preflight_node(store, host, element).map_or(true, |element| {
+                                element.flags.0 != 0
+                                    || element.parent != Some(type_node.node)
+                                    || element.range.start != type_record.range.start
+                                    || element.range.end > type_record.range.end
+                            })
+                        }
+                        NodeData::InferTypeNode(inferred)
+                            if type_record.kind == SyntaxKind::InferType =>
+                        {
+                            let parameter = NodeRef::new(
+                                type_node.arena,
+                                type_node.file,
+                                inferred.type_parameter,
+                            );
+                            preflight_node(store, host, parameter).map_or(true, |parameter| {
+                                parameter.kind != SyntaxKind::TypeParameter
+                                    || parameter.flags.0 != 0
+                                    || parameter.parent != Some(type_node.node)
+                            })
+                        }
+                        _ => true,
+                    }
+                {
+                    return Err(FunctionTypeError::Unsupported(
+                        FunctionTypeUnsupported::RestParameter(parameter),
+                    ));
                 }
                 flags |= SignatureFlags::HAS_REST_PARAMETER;
                 None
@@ -635,8 +691,9 @@ pub(super) fn plan_function_type(
             optional,
             rest_tuple_element,
             implicit_any_rest,
+            typed_rest,
         });
-        if !optional && !implicit_any_rest && !explicit_any_rest {
+        if !optional && !implicit_any_rest && !explicit_any_rest && !typed_rest {
             min_argument_count = parameters.len();
         }
     }
@@ -2221,8 +2278,39 @@ pub(super) fn validate_stored_function_type(
         || !signature_record.parameters().is_empty()
             && usize::try_from(signature_record.min_argument_count())
                 .is_ok_and(|minimum| minimum < signature_record.parameters().len())
-            && expected_parameter_types
-                .is_none_or(|types| types.last().copied() == implicit_any_array_type(store));
+            && expected_parameter_types.is_none_or(|types| {
+                let Some(expected) = types.last().copied() else {
+                    return false;
+                };
+                let Some(parameter) = signature_record.parameters().last().copied() else {
+                    return false;
+                };
+                let Some(declaration) = store
+                    .symbol(parameter)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                else {
+                    return false;
+                };
+                match store.source_direct_type_annotation(declaration) {
+                    None => implicit_any_array_type(store) == Some(expected),
+                    Some(annotation)
+                        if matches!(
+                            store.source_node_kind(annotation),
+                            Some(SyntaxKind::ArrayType | SyntaxKind::InferType)
+                        ) =>
+                    {
+                        super::object_members::declared_signature_parameter_is_rest(
+                            store,
+                            declaration,
+                        ) == Some(true)
+                            && store
+                                .type_node_links(annotation)
+                                .and_then(|links| links.resolved_type)
+                                == Some(expected)
+                    }
+                    Some(_) => false,
+                }
+            });
     let alias_state = stored_alias_state(store, type_, record, declaration);
     if record.flags() != TypeFlags::OBJECT
         || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
@@ -2784,6 +2872,13 @@ fn function_parameter_base_type(
 ) -> Option<TypeId> {
     if parameter.implicit_any_rest {
         implicit_any_array_type(store)
+    } else if parameter.typed_rest
+        && !matches!(
+            store.source_node_kind(parameter.type_node),
+            Some(SyntaxKind::ArrayType | SyntaxKind::InferType)
+        )
+    {
+        None
     } else {
         cached_annotation_identity(
             store,
@@ -3923,6 +4018,349 @@ mod tests {
     }
 
     #[test]
+    fn typed_array_rest_function_signatures_preserve_identity_and_replay_warm() {
+        let mut fixture = fixture(
+            concat!(
+                "interface IArguments {} interface Array<T> {} interface Object {} ",
+                "interface Function {} interface String {} interface Number {} ",
+                "interface Boolean {} interface RegExp {} interface ReadonlyArray<T> {} ",
+                "interface ThisType<T> {} ",
+                "declare let value: (first: string, ...rest: number[]) => string;",
+            ),
+            FileId::new(95_044),
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let symbols = fixture
+            .store
+            .symbol_table(locals)
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in symbols {
+            fixture.store.merge_global_symbol(globals, symbol).unwrap();
+        }
+        let global_types = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            initialize_global_library_types(&mut fixture.store, &host, globals, false).unwrap()
+        };
+        let function = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let plan = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            plan_function_type(
+                &fixture.store,
+                &host,
+                function,
+                None,
+                false,
+                Some(CanonicalArrayTargets::from_global_types(&global_types)),
+            )
+            .unwrap()
+        };
+        let [first, rest] = plan.parameters.as_slice() else {
+            panic!("the typed rest callback must preserve both source parameters")
+        };
+        assert_eq!(plan.flags, SignatureFlags::HAS_REST_PARAMETER);
+        assert_eq!(plan.min_argument_count, 1);
+        assert!(!first.typed_rest);
+        assert!(rest.typed_rest);
+        assert!(!rest.implicit_any_rest);
+        assert!(rest.rest_tuple_element.is_none());
+        assert_eq!(fixture.bound.symbol(first.declaration), Some(first.symbol));
+        assert_eq!(fixture.bound.symbol(rest.declaration), Some(rest.symbol));
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let function_type = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new_with_global_types(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap()
+        };
+        let FunctionTypeState::Resolved { signature, .. } =
+            function_type_state(&fixture.store, &plan, false).unwrap()
+        else {
+            panic!("the typed rest callback must publish one resolved signature")
+        };
+        let record = fixture.store.signature(signature).unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let rest_type = fixture
+            .store
+            .type_node_links(rest.type_node)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert!(record.has_rest_parameter());
+        assert_eq!(record.min_argument_count(), 1);
+        assert_eq!(record.parameters(), [first.symbol, rest.symbol].as_slice());
+        assert_eq!(record.resolved_return_type(), Some(string));
+        assert_eq!(
+            fixture
+                .store
+                .canonical_array_element_type(&global_types, rest_type),
+            Ok(Some(number)),
+        );
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([string, rest_type].as_slice()),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(rest.symbol)
+                .and_then(|links| links.resolved_type),
+            Some(rest_type),
+        );
+        assert!(matches!(
+            validate_stored_function_type(&fixture.store, function_type),
+            StoredFunctionTypeValidation::Valid(_)
+        ));
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let replay = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new_with_global_types(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap()
+        };
+        assert_eq!(replay, function_type);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn conditional_inferred_rest_callbacks_preserve_parameter_identity_and_replay_warm() {
+        let mut fixture = fixture(
+            concat!(
+                "type Extract<Input> = Input extends ",
+                "((value: infer Value, ...rest: infer Rest) => any) ",
+                "? Value : never;",
+            ),
+            FileId::new(95_045),
+        );
+        let function = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let alias = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .and_then(|declaration| fixture.bound.symbol(declaration))
+            .unwrap();
+        let plan = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            plan_function_type(&fixture.store, &host, function, None, false, None).unwrap()
+        };
+        let [value, rest] = plan.parameters.as_slice() else {
+            panic!("the conditional callback must preserve both inferred parameters")
+        };
+        assert_eq!(plan.flags, SignatureFlags::HAS_REST_PARAMETER);
+        assert_eq!(plan.min_argument_count, 1);
+        assert!(!value.typed_rest);
+        assert!(rest.typed_rest);
+        assert_eq!(fixture.bound.symbol(value.declaration), Some(value.symbol));
+        assert_eq!(fixture.bound.symbol(rest.declaration), Some(rest.symbol));
+        assert_eq!(
+            fixture.store.source_node_kind(rest.type_node),
+            Some(SyntaxKind::InferType),
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let conditional = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(alias)
+            .unwrap()
+        };
+        let function_type = fixture
+            .store
+            .type_node_links(function)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let FunctionTypeState::Resolved { signature, .. } =
+            function_type_state(&fixture.store, &plan, false).unwrap()
+        else {
+            panic!("the inferred callback must retain one resolved source signature")
+        };
+        let record = fixture.store.signature(signature).unwrap();
+        let inferred_types = [value, rest].map(|parameter| {
+            let type_ = fixture
+                .store
+                .type_node_links(parameter.type_node)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let NodeData::InferTypeNode(inferred) = &fixture
+                .parsed
+                .arena
+                .get(parameter.type_node.node)
+                .unwrap()
+                .data
+            else {
+                panic!("the callback parameter must retain its inferred annotation")
+            };
+            let declaration = NodeRef::new(
+                parameter.type_node.arena,
+                parameter.type_node.file,
+                inferred.type_parameter,
+            );
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(&fixture.store, type_),
+                fixture.bound.symbol(declaration),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(parameter.symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(type_),
+            );
+            type_
+        });
+        assert!(record.has_rest_parameter());
+        assert_eq!(record.min_argument_count(), 1);
+        assert_eq!(record.parameters(), [value.symbol, rest.symbol].as_slice());
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some(inferred_types.as_slice()),
+        );
+        assert!(matches!(
+            validate_stored_function_type(&fixture.store, function_type),
+            StoredFunctionTypeValidation::Valid(_)
+        ));
+        let TypeData::Conditional(data) = fixture.store.type_payload(conditional).unwrap().data()
+        else {
+            panic!("the extraction alias must retain its conditional root")
+        };
+        let parameters = fixture
+            .store
+            .conditional_root(data.root)
+            .and_then(|root| root.infer_type_parameters())
+            .unwrap();
+        assert_eq!(parameters.len(), inferred_types.len());
+        assert!(
+            inferred_types
+                .iter()
+                .all(|type_| parameters.contains(type_))
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture.store.conditional_root_len(),
+        );
+        let replay = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(alias)
+            .unwrap()
+        };
+        assert_eq!(replay, conditional);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.conditional_root_len(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn implicit_any_rest_function_signatures_preserve_arity_and_replay_warm() {
         for (index, (signature_text, expected_minimum)) in [
             ("(...values) => void", 0),
@@ -4156,7 +4594,7 @@ mod tests {
             "(...args: [number]) => void",
             "(...args: [x?: number]) => void",
             "(...args: [x: number, y: string]) => void",
-            "(...args: number[]) => void",
+            "(...args: string) => void",
             "(prefix: string, ...args: [x: number]) => void",
             "(...args: [...number[]]) => void",
         ]

@@ -3,9 +3,10 @@
 //! This module owns the exact syntax-to-member-table boundary.  It deliberately
 //! does not recurse through property annotations: [`super::type_nodes`] plans
 //! and executes property, index, and signature annotations so one query
-//! retains a single dependency graph and resolution stack. Declared signature
-//! sets are limited to pure nongeneric call or construct members. Construct
-//! signatures can also retain trailing optional `any` parameters.
+//! retains a single dependency graph and resolution stack. Pure call and
+//! construct signatures retain authenticated generic parameters,
+//! overload order, and supported rest parameters. Construct signatures can
+//! also retain trailing optional `any` parameters.
 //! Named interface and type-literal methods retain their own binder symbols,
 //! authenticated method type parameters, annotated required or optional
 //! parameters, and authenticated array, tuple, or inferred rest parameters.
@@ -169,7 +170,7 @@ pub(super) struct PlannedCallParameter {
     optional: bool,
 }
 
-/// One binder-owned type parameter declared directly on a method signature.
+/// One binder-owned type parameter declared directly on a source signature.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PlannedInterfaceMethodTypeParameter {
     pub declaration: NodeRef,
@@ -203,11 +204,12 @@ pub(super) struct PlannedInterfaceAccessor {
     pub parameter: Option<PlannedCallParameter>,
 }
 
-/// One nongeneric call or construct signature in source order.
+/// One authenticated call or construct signature in source order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PlannedCallSignature {
     pub declaration: NodeRef,
     pub symbol: SemanticSymbolId,
+    pub type_parameters: Vec<PlannedInterfaceMethodTypeParameter>,
     pub parameters: Vec<PlannedCallParameter>,
     pub return_type: NodeRef,
     return_identity_node: NodeRef,
@@ -237,10 +239,14 @@ impl PlannedCallSignature {
     }
 
     pub(super) fn min_argument_count(&self) -> usize {
+        let fixed = self.parameters.len().saturating_sub(usize::from(
+            self.flags.contains(SignatureFlags::HAS_REST_PARAMETER),
+        ));
         self.parameters
             .iter()
+            .take(fixed)
             .position(|parameter| parameter.optional)
-            .unwrap_or(self.parameters.len())
+            .unwrap_or(fixed)
     }
 }
 
@@ -350,9 +356,16 @@ impl PropertyObjectPlan {
             .iter()
             .flat_map(|signature| {
                 signature
-                    .parameters
+                    .type_parameters
                     .iter()
-                    .map(|parameter| parameter.type_node)
+                    .flat_map(|parameter| [parameter.constraint, parameter.default_type])
+                    .flatten()
+                    .chain(
+                        signature
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.type_node),
+                    )
                     .chain(std::iter::once(signature.return_type))
             })
             .chain(self.methods.iter().flat_map(|method| {
@@ -700,6 +713,16 @@ pub(super) fn validate_stored_declared_call_set(
         let Ok(minimum) = usize::try_from(signature_record.min_argument_count()) else {
             return StoredDeclaredCallSetValidation::Malformed;
         };
+        let has_rest = signature_record
+            .flags()
+            .contains(SignatureFlags::HAS_REST_PARAMETER);
+        let Some(fixed_parameter_count) = signature_record
+            .parameters()
+            .len()
+            .checked_sub(usize::from(has_rest))
+        else {
+            return StoredDeclaredCallSetValidation::Malformed;
+        };
         let provider = if index < own_signature_count {
             type_
         } else {
@@ -738,12 +761,19 @@ pub(super) fn validate_stored_declared_call_set(
                 })
             || signature_record.flags().contains(SignatureFlags::CONSTRUCT) != constructs
             || signature_record.flags().bits()
-                & !(SignatureFlags::HAS_LITERAL_TYPES | SignatureFlags::CONSTRUCT).bits()
+                & !(SignatureFlags::HAS_LITERAL_TYPES
+                    | SignatureFlags::HAS_REST_PARAMETER
+                    | SignatureFlags::CONSTRUCT)
+                    .bits()
                 != 0
             || signature_record.resolved_min_argument_count() != -1
-            || minimum > signature_record.parameters().len()
-            || !constructs && minimum != signature_record.parameters().len()
-            || !signature_record.type_parameters().is_empty()
+            || minimum > fixed_parameter_count
+            || !constructs && minimum != fixed_parameter_count
+            || !super::callable_sets::valid_declared_method_type_parameters(
+                store,
+                signature_record,
+                declaration,
+            )
             || signature_record.this_parameter().is_some()
             || signature_record.resolved_type_predicate().is_some()
             || signature_record.target().is_some()
@@ -793,11 +823,29 @@ pub(super) fn validate_stored_declared_call_set(
                         ..ValueSymbolLinks::default()
                     })
                 || declared_signature_parameter_is_optional(store, *parameter_declaration, *type_)
-                    .is_none_or(|optional| optional != (constructs && parameter_index >= minimum))
+                    .is_none_or(|optional| {
+                        optional
+                            != (constructs
+                                && parameter_index >= minimum
+                                && parameter_index < fixed_parameter_count)
+                    })
+                || declared_signature_parameter_is_rest(store, *parameter_declaration).is_none_or(
+                    |rest| rest != (has_rest && parameter_index == fixed_parameter_count),
+                )
             {
                 return StoredDeclaredCallSetValidation::Malformed;
             }
             edges.push(*type_);
+        }
+        for parameter in signature_record.type_parameters() {
+            let Some(TypeData::TypeParameter(data)) =
+                store.type_payload(*parameter).map(TypeRecord::data)
+            else {
+                return StoredDeclaredCallSetValidation::Malformed;
+            };
+            edges.push(*parameter);
+            edges.extend(data.constraint);
+            edges.extend(data.resolved_default_type);
         }
         edges.push(return_type);
     }
@@ -825,6 +873,48 @@ fn declared_signature_parameter_is_optional(
         }
     }
     Some(optional)
+}
+
+pub(super) fn declared_signature_parameter_is_rest(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> Option<bool> {
+    let annotation = store.source_direct_type_annotation(declaration)?;
+    let name = (0..annotation.node.index()).rev().find_map(|index| {
+        let node = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            ts_ast::NodeId::new(u32::try_from(index).ok()?),
+        );
+        (store.source_node_kind(node) == Some(SyntaxKind::Identifier)
+            && store.source_node_parent(node) == Some(SourceNodeParent::Parent(declaration)))
+        .then_some(node)
+    })?;
+    let found = name
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+        .map(|index| {
+            NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                ts_ast::NodeId::new(index),
+            )
+        })
+        .is_some_and(|token| {
+            store.source_node_kind(token) == Some(SyntaxKind::DotDotDotToken)
+                && store.source_node_parent(token) == Some(SourceNodeParent::Parent(declaration))
+        });
+    if found
+        && !matches!(
+            store.source_node_kind(annotation),
+            Some(SyntaxKind::ArrayType | SyntaxKind::TupleType | SyntaxKind::InferType)
+        )
+    {
+        return None;
+    }
+    Some(found)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5940,13 +6030,14 @@ fn plan_interface_method(
     let locals = bound
         .locals(declaration)
         .and_then(|locals| store.symbol_table(locals));
-    let type_parameters = plan_interface_method_type_parameters(
+    let type_parameters = plan_declared_signature_type_parameters(
         store,
         host,
         declaration,
         method.type_parameters.as_ref(),
         &method.parameters,
         locals,
+        SyntaxKind::MethodSignature,
     )?;
     if method.parameters.nodes.is_empty() && type_parameters.is_empty() {
         if locals.is_some_and(|locals| !locals.is_empty()) {
@@ -6031,17 +6122,18 @@ fn plan_interface_method(
 }
 
 #[allow(clippy::too_many_lines)] // Binder, syntax, constraints, and defaults share one proof.
-fn plan_interface_method_type_parameters(
+fn plan_declared_signature_type_parameters(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
     parameters: Option<&NodeList>,
     value_parameters: &NodeList,
     locals: Option<&ts_binder::semantic::SymbolTable>,
+    kind: SyntaxKind,
 ) -> Result<Vec<PlannedInterfaceMethodTypeParameter>, PropertyObjectError> {
     let unsupported = || PropertyObjectError::UnsupportedMember {
         node: declaration,
-        kind: SyntaxKind::MethodSignature,
+        kind,
     };
     let Some(parameters) = parameters else {
         return Ok(Vec::new());
@@ -6209,6 +6301,45 @@ pub(super) fn plan_enclosing_generic_interface_methods(
         .collect())
 }
 
+fn valid_declared_rest_parameter_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    numeric_math_rest: bool,
+) -> bool {
+    let Ok(record) = preflight_node(store, host, node) else {
+        return false;
+    };
+    match &record.data {
+        NodeData::ArrayTypeNode(array) if record.kind == SyntaxKind::ArrayType => {
+            let element = NodeRef::new(node.arena, node.file, array.element_type);
+            preflight_node(store, host, element).is_ok_and(|element| {
+                (!numeric_math_rest || element.kind == SyntaxKind::NumberKeyword)
+                    && element.flags.0 == 0
+                    && element.parent == Some(node.node)
+                    && element.range.start == record.range.start
+                    && element.range.end <= record.range.end
+            })
+        }
+        NodeData::TupleTypeNode(tuple)
+            if !numeric_math_rest && record.kind == SyntaxKind::TupleType =>
+        {
+            tuple.elements.range == record.range
+        }
+        NodeData::InferTypeNode(inferred)
+            if !numeric_math_rest && record.kind == SyntaxKind::InferType =>
+        {
+            let parameter = NodeRef::new(node.arena, node.file, inferred.type_parameter);
+            preflight_node(store, host, parameter).is_ok_and(|parameter| {
+                parameter.kind == SyntaxKind::TypeParameter
+                    && parameter.flags.0 == 0
+                    && parameter.parent == Some(node.node)
+            })
+        }
+        _ => false,
+    }
+}
+
 fn plan_interface_method_parameter(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -6300,44 +6431,10 @@ fn plan_interface_method_parameter(
     } else {
         false
     };
-    if rest.is_some() {
-        match &type_record.data {
-            NodeData::ArrayTypeNode(array) if type_record.kind == SyntaxKind::ArrayType => {
-                let element = NodeRef::new(type_node.arena, type_node.file, array.element_type);
-                let element_record =
-                    preflight_node(store, host, element).map_err(|_| unsupported())?;
-                if numeric_math_rest && element_record.kind != SyntaxKind::NumberKeyword
-                    || element_record.flags.0 != 0
-                    || element_record.parent != Some(type_node.node)
-                    || element_record.range.start != type_record.range.start
-                    || element_record.range.end > type_record.range.end
-                {
-                    return Err(unsupported());
-                }
-            }
-            NodeData::TupleTypeNode(tuple)
-                if !numeric_math_rest && type_record.kind == SyntaxKind::TupleType =>
-            {
-                if tuple.elements.range != type_record.range {
-                    return Err(unsupported());
-                }
-            }
-            NodeData::InferTypeNode(inferred)
-                if !numeric_math_rest && type_record.kind == SyntaxKind::InferType =>
-            {
-                let parameter =
-                    NodeRef::new(type_node.arena, type_node.file, inferred.type_parameter);
-                let parameter_record =
-                    preflight_node(store, host, parameter).map_err(|_| unsupported())?;
-                if parameter_record.kind != SyntaxKind::TypeParameter
-                    || parameter_record.flags.0 != 0
-                    || parameter_record.parent != Some(type_node.node)
-                {
-                    return Err(unsupported());
-                }
-            }
-            _ => return Err(unsupported()),
-        }
+    if rest.is_some()
+        && !valid_declared_rest_parameter_annotation(store, host, type_node, numeric_math_rest)
+    {
+        return Err(unsupported());
     }
 
     let bound = host.bound_file(declaration).ok_or_else(unsupported)?;
@@ -6389,41 +6486,42 @@ fn plan_call_signature(
         kind: syntax_kind,
     };
     let record = preflight_node(store, host, declaration).map_err(|_| unsupported())?;
-    let (full_signature, next_container, signature_symbol, type_parameters, parameter_nodes, type_) =
-        match &record.data {
-            NodeData::CallSignatureDeclaration(call)
-                if record.kind == SyntaxKind::CallSignature =>
-            {
-                (
-                    call.full_signature,
-                    call.next_container,
-                    call.symbol,
-                    call.type_parameters.as_ref(),
-                    &call.parameters,
-                    call.type_,
-                )
-            }
-            NodeData::ConstructSignatureDeclaration(construct)
-                if record.kind == SyntaxKind::ConstructSignature =>
-            {
-                (
-                    construct.full_signature,
-                    construct.next_container,
-                    construct.symbol,
-                    construct.type_parameters.as_ref(),
-                    &construct.parameters,
-                    construct.type_,
-                )
-            }
-            _ => return Err(unsupported()),
-        };
+    let (
+        full_signature,
+        next_container,
+        signature_symbol,
+        declared_type_parameters,
+        parameter_nodes,
+        type_,
+    ) = match &record.data {
+        NodeData::CallSignatureDeclaration(call) if record.kind == SyntaxKind::CallSignature => (
+            call.full_signature,
+            call.next_container,
+            call.symbol,
+            call.type_parameters.as_ref(),
+            &call.parameters,
+            call.type_,
+        ),
+        NodeData::ConstructSignatureDeclaration(construct)
+            if record.kind == SyntaxKind::ConstructSignature =>
+        {
+            (
+                construct.full_signature,
+                construct.next_container,
+                construct.symbol,
+                construct.type_parameters.as_ref(),
+                &construct.parameters,
+                construct.type_,
+            )
+        }
+        _ => return Err(unsupported()),
+    };
     let is_construct = record.kind == SyntaxKind::ConstructSignature;
     if record.parent != Some(owner.node)
         || record.flags.0 != 0
         || full_signature.is_some()
         || next_container.is_some()
         || signature_symbol.is_some()
-        || type_parameters.is_some()
         || parameter_nodes.has_trailing_comma
         || parameter_nodes.range.start < record.range.start
         || parameter_nodes.range.end > record.range.end
@@ -6473,7 +6571,16 @@ fn plan_call_signature(
     let locals = bound
         .locals(declaration)
         .and_then(|locals| store.symbol_table(locals));
-    if parameter_nodes.nodes.is_empty() {
+    let type_parameters = plan_declared_signature_type_parameters(
+        store,
+        host,
+        declaration,
+        declared_type_parameters,
+        parameter_nodes,
+        locals,
+        syntax_kind,
+    )?;
+    if parameter_nodes.nodes.is_empty() && type_parameters.is_empty() {
         if locals.is_some_and(|locals| !locals.is_empty()) {
             return Err(unsupported());
         }
@@ -6489,7 +6596,7 @@ fn plan_call_signature(
         SignatureFlags::NONE
     };
     let mut optional_seen = false;
-    for parameter_id in &parameter_nodes.nodes {
+    for (index, parameter_id) in parameter_nodes.nodes.iter().enumerate() {
         let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
         let parameter_record = preflight_node(store, host, parameter).map_err(|_| unsupported())?;
         let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
@@ -6501,7 +6608,6 @@ fn plan_call_signature(
             || parameter_record.range.start < previous_end
             || parameter_record.range.start < parameter_nodes.range.start
             || parameter_record.range.end > parameter_nodes.range.end
-            || data.dot_dot_dot_token.is_some()
             || data.initializer.is_some()
             || data.symbol.is_some()
             || data.facts != 0
@@ -6510,6 +6616,23 @@ fn plan_call_signature(
             return Err(unsupported());
         }
         previous_end = parameter_record.range.end;
+        let rest = data
+            .dot_dot_dot_token
+            .map(|token| NodeRef::new(parameter.arena, parameter.file, token));
+        let rest_end = if let Some(rest) = rest {
+            let rest_record = preflight_node(store, host, rest).map_err(|_| unsupported())?;
+            if rest_record.kind != SyntaxKind::DotDotDotToken
+                || rest_record.flags.0 != 0
+                || rest_record.parent != Some(parameter.node)
+                || rest_record.range.start < parameter_record.range.start
+                || !matches!(rest_record.data, NodeData::Token(_))
+            {
+                return Err(unsupported());
+            }
+            rest_record.range.end
+        } else {
+            parameter_record.range.start
+        };
         let name = NodeRef::new(parameter.arena, parameter.file, data.name);
         let name_record = preflight_node(store, host, name).map_err(|_| unsupported())?;
         let NodeData::Identifier(identifier) = &name_record.data else {
@@ -6517,7 +6640,7 @@ fn plan_call_signature(
         };
         if name_record.kind != SyntaxKind::Identifier
             || name_record.parent != Some(parameter.node)
-            || name_record.range.start < parameter_record.range.start
+            || name_record.range.start < rest_end
             || name_record.range.end > parameter_record.range.end
             || identifier.text.is_empty()
             || identifier.text == "this"
@@ -6539,6 +6662,7 @@ fn plan_call_signature(
             let token = NodeRef::new(parameter.arena, parameter.file, token);
             let token_record = preflight_node(store, host, token).map_err(|_| unsupported())?;
             if !is_construct
+                || rest.is_some()
                 || token_record.kind != SyntaxKind::QuestionToken
                 || !matches!(token_record.data, NodeData::Token(_))
                 || token_record.flags.0 != 0
@@ -6554,7 +6678,15 @@ fn plan_call_signature(
         } else {
             false
         };
-        if optional_seen && !optional {
+        if rest.is_some() {
+            if index + 1 != parameter_nodes.nodes.len()
+                || !valid_declared_rest_parameter_annotation(store, host, type_node, false)
+            {
+                return Err(unsupported());
+            }
+            flags |= SignatureFlags::HAS_REST_PARAMETER;
+        }
+        if optional_seen && !optional && rest.is_none() {
             return Err(unsupported());
         }
         optional_seen |= optional;
@@ -6594,7 +6726,7 @@ fn plan_call_signature(
             optional,
         });
     }
-    if locals.is_some_and(|locals| locals.len() != parameters.len()) {
+    if locals.is_some_and(|locals| locals.len() != parameters.len() + type_parameters.len()) {
         return Err(unsupported());
     }
     if i32::try_from(parameters.len()).is_err() {
@@ -6604,6 +6736,7 @@ fn plan_call_signature(
     Ok(PlannedCallSignature {
         declaration,
         symbol: call_symbol,
+        type_parameters,
         parameters,
         return_type,
         return_identity_node,
@@ -9512,12 +9645,17 @@ fn validate_resolved_call_signature(
         .collect::<Vec<_>>();
     let parameter_types = store.callable_signature_parameter_types(signature)?;
     let return_type = record.resolved_return_type()?;
+    let type_parameters = resolved_declared_signature_type_parameters(
+        store,
+        planned.declaration,
+        &planned.type_parameters,
+    )?;
     let minimum = i32::try_from(planned.min_argument_count()).ok()?;
     if record.flags() != planned.flags
         || record.min_argument_count() != minimum
         || record.resolved_min_argument_count() != -1
         || record.declaration() != Some(planned.declaration)
-        || !record.type_parameters().is_empty()
+        || record.type_parameters() != type_parameters.as_slice()
         || record.this_parameter().is_some()
         || record.parameters() != parameter_symbols.as_slice()
         || record.resolved_type_predicate().is_some()
@@ -9541,7 +9679,11 @@ fn validate_resolved_call_signature(
     {
         return None;
     }
-    for (parameter, type_) in planned.parameters.iter().zip(parameter_types) {
+    let rest_index = planned
+        .flags
+        .contains(SignatureFlags::HAS_REST_PARAMETER)
+        .then(|| planned.parameters.len().saturating_sub(1));
+    for (index, (parameter, type_)) in planned.parameters.iter().zip(parameter_types).enumerate() {
         let declaration = store.symbol(parameter.symbol)?.value_declaration()?;
         if cached_annotation_identity(
             store,
@@ -9550,6 +9692,8 @@ fn validate_resolved_call_signature(
         ) != Some(*type_)
             || declared_signature_parameter_is_optional(store, declaration, *type_)
                 != Some(parameter.optional)
+            || declared_signature_parameter_is_rest(store, declaration)
+                != Some(rest_index == Some(index))
             || store.value_symbol_links(parameter.symbol)
                 != Some(&ValueSymbolLinks {
                     resolved_type: Some(*type_),
@@ -9684,9 +9828,17 @@ fn resolved_interface_method_type_parameters(
     store: &CanonicalTypeMapperStore,
     method: &PlannedInterfaceMethod,
 ) -> Option<Vec<TypeId>> {
-    let mut resolved = Vec::with_capacity(method.type_parameters.len());
-    let mut symbols = HashSet::with_capacity(method.type_parameters.len());
-    for parameter in &method.type_parameters {
+    resolved_declared_signature_type_parameters(store, method.declaration, &method.type_parameters)
+}
+
+fn resolved_declared_signature_type_parameters(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    parameters: &[PlannedInterfaceMethodTypeParameter],
+) -> Option<Vec<TypeId>> {
+    let mut resolved = Vec::with_capacity(parameters.len());
+    let mut symbols = HashSet::with_capacity(parameters.len());
+    for parameter in parameters {
         let type_ = store.declared_type_links(parameter.symbol)?.declared_type?;
         let record = store.type_payload(type_)?;
         let TypeData::TypeParameter(data) = record.data() else {
@@ -9704,7 +9856,7 @@ fn resolved_interface_method_type_parameters(
             || cached_ordinary_type_parameter_owner(store, type_) != Some(parameter.symbol)
             || store.source_node_kind(parameter.declaration) != Some(SyntaxKind::TypeParameter)
             || store.source_node_parent(parameter.declaration)
-                != Some(SourceNodeParent::Parent(method.declaration))
+                != Some(SourceNodeParent::Parent(declaration))
             || data.is_this_type
             || data.target.is_some()
             || data.mapper.is_some()
@@ -10263,6 +10415,18 @@ pub(super) fn publish_declared_members(
     if !valid_indexes {
         return Err(invalid_cache(plan, type_));
     }
+    let call_type_parameters = plan
+        .call_signatures
+        .iter()
+        .map(|signature| {
+            resolved_declared_signature_type_parameters(
+                store,
+                signature.declaration,
+                &signature.type_parameters,
+            )
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| invalid_cache(plan, type_))?;
     let missing_accessor_links = plan
         .accessors
         .iter()
@@ -10333,12 +10497,13 @@ pub(super) fn publish_declared_members(
         .call_signatures
         .iter()
         .zip(call_types)
-        .map(|(planned, resolved)| {
+        .zip(call_type_parameters)
+        .map(|((planned, resolved), type_parameters)| {
             store
                 .alloc_signature(
                     planned.flags,
                     Some(planned.declaration),
-                    Vec::new(),
+                    type_parameters,
                     None,
                     planned
                         .parameters
@@ -14406,6 +14571,352 @@ mod generic_publication_tests {
             ),
             warm,
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_interface_call_overloads_publish_authenticated_signature_parameters() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Callable { ",
+                "<Value extends string = string>(value: Value): Value; ",
+                "<Other>(value: Other): Other; ",
+                "}",
+            ),
+            3_910,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let [first, second] = plan.call_signatures.as_slice() else {
+            panic!("the callable interface must preserve both generic declaration overloads")
+        };
+        assert_eq!(first.symbol, second.symbol);
+        assert_eq!(first.type_parameters.len(), 1);
+        assert_eq!(second.type_parameters.len(), 1);
+        assert!(first.type_parameters[0].constraint.is_some());
+        assert!(first.type_parameters[0].default_type.is_some());
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+
+        let TypeData::Interface(interface) = fixture.store.type_payload(type_).unwrap().data()
+        else {
+            panic!("generic call overloads must retain their interface owner")
+        };
+        let signatures = interface.declared_call_signatures.as_deref().unwrap();
+        assert_eq!(signatures.len(), 2);
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        for (signature, planned) in signatures.iter().zip(&plan.call_signatures) {
+            let record = fixture.store.signature(*signature).unwrap();
+            let [parameter] = record.type_parameters() else {
+                panic!("each source overload must retain one distinct binder-owned type parameter")
+            };
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(&fixture.store, *parameter),
+                Some(planned.type_parameters[0].symbol),
+            );
+            assert_eq!(
+                record.parameters(),
+                [planned.parameters[0].symbol].as_slice()
+            );
+            assert_eq!(record.resolved_return_type(), Some(*parameter));
+            assert_eq!(
+                fixture.store.callable_signature_parameter_types(*signature),
+                Some([*parameter].as_slice()),
+            );
+        }
+        let TypeData::TypeParameter(defaulted) = fixture
+            .store
+            .type_payload(
+                fixture
+                    .store
+                    .signature(signatures[0])
+                    .unwrap()
+                    .type_parameters()[0],
+            )
+            .unwrap()
+            .data()
+        else {
+            panic!("the first overload must retain its constrained default")
+        };
+        assert_eq!(defaulted.constraint, Some(string));
+        assert_eq!(defaulted.resolved_default_type, Some(string));
+        assert!(matches!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Valid(_)
+        ));
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(fixture.symbol),
+            Ok(type_),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_construct_signatures_publish_original_type_parameter_identity() {
+        let mut fixture = interface_fixture(
+            "interface Constructor { new<Value>(value: Value): Value; }",
+            3_911,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let [planned] = plan.call_signatures.as_slice() else {
+            panic!("the constructor interface must retain one generic declaration")
+        };
+        assert!(planned.is_construct());
+        assert_eq!(planned.type_parameters.len(), 1);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+
+        let TypeData::Interface(interface) = fixture.store.type_payload(type_).unwrap().data()
+        else {
+            panic!("the constructor must retain its interface owner")
+        };
+        let [signature] = interface.declared_construct_signatures.as_deref().unwrap() else {
+            panic!("the constructor owner must publish exactly one signature")
+        };
+        let record = fixture.store.signature(*signature).unwrap();
+        let [parameter] = record.type_parameters() else {
+            panic!("the construct signature must retain its source type parameter")
+        };
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&fixture.store, *parameter),
+            Some(planned.type_parameters[0].symbol),
+        );
+        assert_eq!(record.resolved_return_type(), Some(*parameter));
+        assert!(matches!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Valid(_)
+        ));
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_type_literal_call_signatures_preserve_union_identity_and_replay_warm() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Owner {} ",
+                "type Callback = { <Value>(value: Value | string): Value | string };",
+            ),
+            3_913,
+        );
+        let literal = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeLiteral).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let alias = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .and_then(|declaration| fixture.bound.symbol(declaration))
+            .unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_type_literal(&fixture.store, &host, literal, Some(alias)).unwrap();
+        let [planned] = plan.call_signatures.as_slice() else {
+            panic!("the callback literal must retain one generic call signature")
+        };
+        assert_eq!(planned.type_parameters.len(), 1);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(alias)
+        .unwrap();
+        let TypeData::Object(object) = fixture.store.type_payload(type_).unwrap().data() else {
+            panic!("the callback alias must retain its anonymous type literal")
+        };
+        assert_eq!(object.structured.call_signature_count, 1);
+        let [signature] = object.structured.signatures.as_deref().unwrap() else {
+            panic!("the callback literal must publish exactly one source signature")
+        };
+        let signature = *signature;
+        let record = fixture.store.signature(signature).unwrap();
+        let [parameter] = record.type_parameters() else {
+            panic!("the callback signature must retain its binder-owned type parameter")
+        };
+        let parameter = *parameter;
+        let union = record.resolved_return_type().unwrap();
+        let TypeData::Union(data) = fixture.store.type_payload(union).unwrap().data() else {
+            panic!("the callback signature must retain its generic union")
+        };
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(data.union.types.len(), 2);
+        assert!(data.union.types.contains(&parameter));
+        assert!(data.union.types.contains(&string));
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&fixture.store, parameter),
+            Some(planned.type_parameters[0].symbol),
+        );
+        assert_eq!(
+            record.parameters(),
+            [planned.parameters[0].symbol].as_slice()
+        );
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([union].as_slice()),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(planned.parameters[0].type_node)
+                .and_then(|links| links.resolved_type),
+            Some(union),
+        );
+        assert!(matches!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Valid(_)
+        ));
+        assert!(matches!(
+            crate::semantic::callable_sets::validate_stored_callable_set(&fixture.store, type_),
+            crate::semantic::callable_sets::StoredCallableSetValidation::Valid { .. }
+        ));
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_cache_len(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(alias),
+            Ok(type_),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture
+                    .store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_cache_len(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn declared_call_signature_rest_tuples_preserve_source_arity_and_callable_identity() {
+        let mut fixture = interface_fixture(
+            "interface Callable { (value: string, ...rest: [extra: number]): void; }",
+            3_912,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let [planned] = plan.call_signatures.as_slice() else {
+            panic!("the callable interface must retain its rest declaration")
+        };
+        assert_eq!(planned.flags, SignatureFlags::HAS_REST_PARAMETER);
+        assert_eq!(planned.min_argument_count(), 1);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+
+        let TypeData::Interface(interface) = fixture.store.type_payload(type_).unwrap().data()
+        else {
+            panic!("the rest callable must retain its interface owner")
+        };
+        let [signature] = interface.declared_call_signatures.as_deref().unwrap() else {
+            panic!("the rest callable must publish exactly one signature")
+        };
+        let record = fixture.store.signature(*signature).unwrap();
+        assert!(record.flags().contains(SignatureFlags::HAS_REST_PARAMETER));
+        assert_eq!(record.min_argument_count(), 1);
+        assert!(matches!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Valid(_)
+        ));
+        let crate::semantic::callable_sets::StoredCallableSetValidation::Valid {
+            projection, ..
+        } = crate::semantic::callable_sets::validate_stored_callable_set(&fixture.store, type_)
+        else {
+            panic!("the rest signature must remain authenticated as a callable set")
+        };
+        let [callable] = projection.call_signatures.as_ref() else {
+            panic!("the callable projection must retain one source signature")
+        };
+        assert_eq!(callable.parameters.len(), 1);
+        assert!(callable.rest_parameter.is_some());
+        assert_eq!(callable.min_argument_count, 1);
         assert!(diagnostics.is_empty());
     }
 
