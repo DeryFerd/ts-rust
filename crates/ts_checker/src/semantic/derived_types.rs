@@ -851,9 +851,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     .type_payload(property.type_)
                     .ok_or(DerivedTypeError::Type(property.type_))?;
                 if property_record.flags().intersects(TypeFlags::OBJECT)
-                    || property_record
+                    && !property_record
                         .object_flags()
-                        .intersects(ObjectFlags::REQUIRES_WIDENING)
+                        .contains(ObjectFlags::OBJECT_LITERAL)
+                    || !property_record.flags().intersects(TypeFlags::OBJECT)
+                        && property_record
+                            .object_flags()
+                            .intersects(ObjectFlags::REQUIRES_WIDENING)
                         && !property_record
                             .flags()
                             .intersects(TypeFlags::ANY | TypeFlags::NULLABLE)
@@ -913,20 +917,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 let property_record = self
                     .type_payload(property.type_)
                     .ok_or(DerivedTypeError::Type(property.type_))?;
-                let transformed = if property_record
+                let transform = if property_record.flags().intersects(TypeFlags::OBJECT) {
+                    self.plan_widened_type(property.type_, global_types, plans, visiting, planned)?
+                } else if property_record
                     .object_flags()
                     .intersects(ObjectFlags::REQUIRES_WIDENING)
                 {
-                    self.intrinsic_bootstrap()
-                        .ok_or(DerivedTypeError::BootstrapUninitialized)?
-                        .any_type
+                    WidenTransform::Identity(
+                        self.intrinsic_bootstrap()
+                            .ok_or(DerivedTypeError::BootstrapUninitialized)?
+                            .any_type,
+                    )
                 } else {
-                    property.type_
+                    WidenTransform::Identity(property.type_)
                 };
                 properties.push(WidenPropertyPlan {
                     source: property.symbol,
                     name: property.name.clone(),
-                    transform: WidenTransform::Identity(transformed),
+                    transform,
                 });
             }
 
@@ -1516,9 +1524,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             for property in shape.properties {
                 let record = self.type_payload(property.type_)?;
                 if record.flags().intersects(TypeFlags::OBJECT)
-                    || record
-                        .object_flags()
-                        .intersects(ObjectFlags::REQUIRES_WIDENING)
+                    && !record.object_flags().contains(ObjectFlags::OBJECT_LITERAL)
+                    || !record.flags().intersects(TypeFlags::OBJECT)
+                        && record
+                            .object_flags()
+                            .intersects(ObjectFlags::REQUIRES_WIDENING)
                         && !record
                             .flags()
                             .intersects(TypeFlags::ANY | TypeFlags::NULLABLE)
@@ -2100,7 +2110,41 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             let Some(property_record) = self.type_payload(source_property.type_) else {
                 return false;
             };
-            let expected_type = if property_record
+            let expected_type = if property_record.flags().intersects(TypeFlags::OBJECT) {
+                if !property_record
+                    .object_flags()
+                    .contains(ObjectFlags::OBJECT_LITERAL)
+                {
+                    return false;
+                }
+                if property_record
+                    .object_flags()
+                    .intersects(ObjectFlags::REQUIRES_WIDENING)
+                {
+                    let Some(widened) = self
+                        .derived_types
+                        .widened_types
+                        .get(&source_property.type_)
+                        .copied()
+                    else {
+                        return false;
+                    };
+                    let mut widened_visiting = HashSet::new();
+                    let mut nested_regular_visiting = HashSet::new();
+                    if !self.widened_cache_entry_is_valid(
+                        source_property.type_,
+                        widened,
+                        &mut widened_visiting,
+                        &mut nested_regular_visiting,
+                        array_targets,
+                    ) {
+                        return false;
+                    }
+                    widened
+                } else {
+                    source_property.type_
+                }
+            } else if property_record
                 .object_flags()
                 .intersects(ObjectFlags::REQUIRES_WIDENING)
             {
@@ -3030,7 +3074,7 @@ mod tests {
     }
 
     #[test]
-    fn contextual_object_unions_reject_nested_objects_before_publication() {
+    fn contextual_object_unions_recursively_widen_nested_objects_and_validate_caches() {
         let library = parsed("interface Array<T> {}");
         let source = parsed("var value: any = [{ nested: { id: 1 } }, {}];");
         let library_file = FileId::new(82);
@@ -3066,7 +3110,69 @@ mod tests {
                 .unwrap(),
             _ => panic!("nested and empty object literals must form an expression union"),
         };
-        let before = (
+        let widened = context
+            .store_mut_for_test()
+            .get_widened_type_with_global_types(value, &global_types)
+            .unwrap();
+        let widened_nested = context
+            .store()
+            .derived_types
+            .widened_types
+            .get(&nested)
+            .copied()
+            .unwrap();
+        assert_ne!(nested, widened_nested);
+        let nested_shape = context
+            .store()
+            .resolved_object_shape(widened_nested)
+            .unwrap();
+        assert_eq!(
+            property(&nested_shape, "id").type_,
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+
+        let widened_union = context
+            .store()
+            .canonical_array_element_type(&global_types, widened)
+            .unwrap()
+            .unwrap();
+        let TypeData::Union(widened_members) =
+            context.store().type_payload(widened_union).unwrap().data()
+        else {
+            panic!("nested and empty object literals must retain both contextual shapes")
+        };
+        assert_eq!(widened_members.union.types.len(), 2);
+        let mut required = None;
+        let mut optional = None;
+        for member in &widened_members.union.types {
+            let shape = context.store().resolved_object_shape(*member).unwrap();
+            let nested_property = property(&shape, "nested");
+            let symbol = context.store().symbol(nested_property.symbol).unwrap();
+            if symbol.flags().contains(SymbolFlags::OPTIONAL) {
+                assert!(
+                    context.store().validate_contextual_widened_object_property(
+                        *member,
+                        nested_property.symbol,
+                    )
+                );
+                optional = Some(nested_property.type_);
+            } else {
+                required = Some(nested_property.type_);
+            }
+        }
+        assert_eq!(required, Some(widened_nested));
+        assert_eq!(
+            optional,
+            Some(
+                context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .undefined_or_missing_type,
+            ),
+        );
+
+        let warm = (
             observable_state(context.store()),
             context.store().derived_types.contextual_widened_types.len(),
             context.store().derived_types.undefined_properties.len(),
@@ -3075,7 +3181,7 @@ mod tests {
             context
                 .store_mut_for_test()
                 .get_widened_type_with_global_types(value, &global_types),
-            Err(DerivedTypeError::UnsupportedWideningType(nested)),
+            Ok(widened),
         );
         assert_eq!(
             (
@@ -3083,7 +3189,53 @@ mod tests {
                 context.store().derived_types.contextual_widened_types.len(),
                 context.store().derived_types.undefined_properties.len(),
             ),
-            before,
+            warm,
+        );
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .widened_types
+                .insert(nested, number),
+            Some(widened_nested),
+        );
+        let poisoned = (
+            observable_state(context.store()),
+            context.store().derived_types.contextual_widened_types.len(),
+            context.store().derived_types.undefined_properties.len(),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(value, &global_types),
+            Err(DerivedTypeError::InvalidWidenedTypeCache {
+                source: value,
+                cached: widened,
+            }),
+        );
+        assert_eq!(
+            (
+                observable_state(context.store()),
+                context.store().derived_types.contextual_widened_types.len(),
+                context.store().derived_types.undefined_properties.len(),
+            ),
+            poisoned,
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .widened_types
+                .insert(nested, widened_nested),
+            Some(number),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(value, &global_types),
+            Ok(widened),
         );
     }
 
