@@ -19,10 +19,10 @@ use super::{
     AliasTargetState, CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics,
     CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable,
-    ProductionAliasTargetHost, SourceAssertionError, SourceCheckError, SourceCheckProvenanceError,
-    SourceFunctionInvariant, SourceLiteralCacheError, SourceObjectLiteralError, SourceSyntaxRole,
-    SymbolNodeLinks, TypeData, TypeId, TypeMapper, TypeNodeLinks, UnsupportedSourceSyntax,
-    ValueSymbolLinks, VariableInvariant,
+    ProductionAliasTargetHost, ResolvedSignatureState, SignatureLinks, SourceAssertionError,
+    SourceCheckError, SourceCheckProvenanceError, SourceFunctionInvariant, SourceLiteralCacheError,
+    SourceObjectLiteralError, SourceSyntaxRole, SymbolNodeLinks, TypeData, TypeId, TypeMapper,
+    TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks, VariableInvariant,
     alias::{
         CanonicalAliasResolutionError, CanonicalAliasResolutionEvent, CanonicalAliasResolver,
         CanonicalAliasTargetHost, CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
@@ -2122,6 +2122,248 @@ fn global_augmentation_array_interface_members_are_exact(
                         == Some(method)
             })
     })
+}
+
+fn published_global_array_augmentation_method(
+    store: &CanonicalTypeMapperStore,
+    method: SemanticSymbolId,
+    declaration: NodeRef,
+    return_type: TypeId,
+) -> Option<TypeId> {
+    let type_ = store.value_symbol_links(method)?.resolved_type?;
+    let record = store.type_payload(type_)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    let [signature] = object.structured.signatures.as_deref()? else {
+        return None;
+    };
+    let signature = *signature;
+    let callable = store.signature(signature)?;
+    (store.value_symbol_links(method)
+        == Some(&ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        })
+        && record.flags() == TypeFlags::OBJECT
+        && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        && record.symbol() == Some(method)
+        && record.alias().is_none()
+        && object.target.is_none()
+        && object.mapper.is_none()
+        && object.structured.members.is_none()
+        && object.structured.properties.is_none()
+        && object.structured.call_signature_count == 1
+        && object.structured.index_infos.is_none()
+        && callable.flags() == SignatureFlags::NONE
+        && callable.declaration() == Some(declaration)
+        && callable.type_parameters().is_empty()
+        && callable.this_parameter().is_none()
+        && callable.parameters().is_empty()
+        && callable.min_argument_count() == 0
+        && callable.resolved_return_type() == Some(return_type)
+        && store.signature_links(declaration)
+            == Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            })
+        && store.interface_method_linked_type(signature) == Some(type_)
+        && store
+            .callable_signature_parameter_types(signature)
+            .is_some_and(<[TypeId]>::is_empty))
+    .then_some(type_)
+}
+
+/// Publishes exact `Array<T>` augmentation methods without resolving library members.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Syntax, caches, and publication share one transaction.
+fn publish_global_array_augmentation_methods(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    interface: NodeRef,
+    owner: SemanticSymbolId,
+    generic: &SourceNamespaceGenericInterfacePlan,
+) -> Result<(), SourceCheckError> {
+    let invalid = || invalid_generic_namespace_interface(interface);
+    let (arena, bound) = host.source(interface).ok_or_else(invalid)?;
+    let reference =
+        validate_direct_generic_reference(store, global_types.array_type).map_err(|_| invalid())?;
+    let [element] = reference.type_arguments.as_slice() else {
+        return Err(invalid());
+    };
+    let element = *element;
+    let mut methods = Vec::with_capacity(generic.methods.len());
+    let mut unique = HashSet::with_capacity(generic.methods.len());
+    let mut cold = 0usize;
+
+    for &symbol in &generic.methods {
+        let method = store.symbol(symbol).ok_or_else(invalid)?;
+        let Some([declaration]) = method.declarations() else {
+            return Err(invalid());
+        };
+        let declaration = *declaration;
+        let record = owned_node(arena, bound, store, declaration).map_err(|_| invalid())?;
+        let NodeData::MethodSignatureDeclaration(signature) = &record.data else {
+            return Err(invalid());
+        };
+        let return_node = signature
+            .type_
+            .map(|node| child(declaration, node))
+            .ok_or_else(invalid)?;
+        let annotation = owned_node(arena, bound, store, return_node).map_err(|_| invalid())?;
+        let NodeData::TypeReferenceNode(reference) = &annotation.data else {
+            return Err(invalid());
+        };
+        let name = child(return_node, reference.type_name);
+        let name_record = owned_node(arena, bound, store, name).map_err(|_| invalid())?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(invalid());
+        };
+
+        if record.kind != SyntaxKind::MethodSignature
+            || record.flags.0 != 0
+            || record.parent != Some(interface.node)
+            || signature.full_signature.is_some()
+            || signature.next_container.is_some()
+            || signature.symbol.is_some()
+            || signature.type_parameters.is_some()
+            || !signature.parameters.nodes.is_empty()
+            || signature.parameters.has_trailing_comma
+            || signature.postfix_token.is_some()
+            || signature.modifiers.is_some()
+            || method.flags() != SymbolFlags::METHOD
+            || method.value_declaration() != Some(declaration)
+            || store.authenticated_interface_method_owner(symbol)
+                != Some((owner, global_types.array_type))
+            || annotation.kind != SyntaxKind::TypeReference
+            || annotation.flags.0 != 0
+            || annotation.parent != Some(declaration.node)
+            || reference.type_arguments.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(return_node.node)
+            || identifier.flow_node.is_some()
+            || identifier.text != "T"
+            || !unique.insert(symbol)
+            || store.type_node_links(return_node).is_some_and(|links| {
+                links.outer_type_parameters.is_some()
+                    || links
+                        .resolved_type
+                        .is_some_and(|resolved| resolved != element)
+            })
+        {
+            return Err(invalid());
+        }
+
+        let existing = store.value_symbol_links(symbol);
+        let is_cold = existing.is_none_or(|links| links == &ValueSymbolLinks::default());
+        if is_cold {
+            if store
+                .signature_links(declaration)
+                .is_some_and(|links| links != &SignatureLinks::default())
+            {
+                return Err(invalid());
+            }
+            cold += 1;
+        } else if published_global_array_augmentation_method(store, symbol, declaration, element)
+            .is_none()
+        {
+            return Err(invalid());
+        }
+        methods.push((symbol, declaration, return_node, is_cold));
+    }
+
+    for &(_, _, return_node, _) in &methods {
+        session.reset_query();
+        if CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_type_from_type_node(return_node)?
+            != element
+        {
+            return Err(invalid());
+        }
+    }
+    if cold == 0 {
+        return Ok(());
+    }
+
+    let missing_values = methods
+        .iter()
+        .filter(|(symbol, _, _, is_cold)| *is_cold && store.value_symbol_links(*symbol).is_none())
+        .count();
+    let missing_signatures = methods
+        .iter()
+        .filter(|(_, declaration, _, is_cold)| {
+            *is_cold && store.signature_links(*declaration).is_none()
+        })
+        .count();
+    if !store.try_reserve_types(cold)
+        || !store.try_reserve_signatures(cold)
+        || !store.try_reserve_signature_links(missing_signatures)
+        || !store.try_reserve_value_symbol_links(missing_values)
+        || !store.try_reserve_callable_signature_parameter_types(cold)
+    {
+        return Err(invalid());
+    }
+
+    let mut signatures = Vec::with_capacity(cold);
+    for (symbol, declaration, _, is_cold) in methods {
+        if !is_cold {
+            continue;
+        }
+        let callable = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(symbol))
+            .ok_or_else(invalid)?;
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(declaration),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(element),
+                None,
+                0,
+            )
+            .ok_or_else(invalid)?;
+        if !store.set_signature_links(
+            declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ) || !store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(callable),
+                ..ValueSymbolLinks::default()
+            },
+        ) || !store.set_structured_type_members(
+            callable,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ) {
+            return Err(invalid());
+        }
+        signatures.push((signature, Vec::new()));
+    }
+
+    store
+        .set_callable_signature_parameter_types_batch(signatures)
+        .then_some(())
+        .ok_or_else(invalid)
 }
 
 fn namespace_generic_annotation_requires_deferral(
@@ -12033,6 +12275,30 @@ pub(super) fn execute_source_namespace(
                     .get_declared_type_of_symbol(*symbol)?
                 };
                 if let Some(generic) = generic {
+                    if target == global_types.array_type
+                        && global_augmentation_array_interface_members_are_exact(
+                            arena,
+                            bound,
+                            store,
+                            *declaration,
+                            plan.symbol,
+                            *symbol,
+                            generic,
+                        )
+                    {
+                        publish_global_array_augmentation_methods(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            diagnostics,
+                            *declaration,
+                            *symbol,
+                            generic,
+                        )?;
+                        continue;
+                    }
                     if !generic.call_signatures.is_empty()
                         || !generic.construct_signatures.is_empty()
                         || !generic.index_signatures.is_empty()
@@ -19535,7 +19801,7 @@ mod tests {
             .and_then(ts_binder::semantic::Symbol::members)
             .and_then(|members| context.store().symbol_table(members))
             .unwrap();
-        assert!(members.get_source("length").is_some());
+        let length = members.get_source("length").unwrap();
         assert_eq!(
             members
                 .get_source("customMethod")
@@ -19565,8 +19831,36 @@ mod tests {
 
         context.check_source_file(augmentation_file).unwrap();
         assert!(context.diagnostics().is_empty());
+        let array_type = context.global_types().array_type;
+        let element = validate_direct_generic_reference(context.store(), array_type)
+            .unwrap()
+            .type_arguments[0];
+        let callable = context
+            .store()
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let signatures = context
+            .store()
+            .type_payload(callable)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .unwrap();
+        let [signature] = signatures else {
+            panic!("the global Array contribution must publish one callable signature")
+        };
+        assert_eq!(
+            context
+                .store()
+                .signature(*signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            Some(element),
+        );
+        assert!(context.store().value_symbol_links(length).is_none());
         let warm = (
             context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
             context.store().symbol_len(),
             context.store().checker_link_allocated_lengths(),
             context.diagnostics().as_slice().to_vec(),
@@ -19575,11 +19869,48 @@ mod tests {
         assert_eq!(
             (
                 context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
                 context.store().symbol_len(),
                 context.store().checker_link_allocated_lengths(),
                 context.diagnostics().as_slice().to_vec(),
             ),
             warm,
+        );
+
+        let original = context.store().value_symbol_links(method).unwrap().clone();
+        let mut poisoned = original.clone();
+        poisoned.write_type = Some(element);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(method, poisoned)
+        );
+        let poisoned_state = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert!(matches!(
+            context.recheck_source_file(augmentation_file),
+            Err(SourceCheckError::Unsupported(_))
+        ));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            poisoned_state,
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(method, original)
         );
 
         assert_ne!(namespace.symbol, array);
