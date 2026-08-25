@@ -691,7 +691,7 @@ fn configuration_created_program_retains_path_without_changing_legacy_emission()
 }
 
 #[test]
-fn configured_programs_preserve_nested_output_paths_without_root_dir() {
+fn configured_programs_preserve_nested_output_paths_and_report_missing_root_dir() {
     let filesystem = MemoryFileSystem::new(true);
     filesystem
         .write_file(
@@ -707,10 +707,16 @@ fn configured_programs_preserve_nested_output_paths_without_root_dir() {
         .unwrap();
 
     let program = Program::from_config(&filesystem, "/project/tsconfig.json");
-    assert!(
-        program.diagnostics().is_empty(),
-        "{:?}",
-        program.diagnostics()
+    let [diagnostic] = program.diagnostics() else {
+        panic!(
+            "expected one missing rootDir diagnostic: {:?}",
+            program.diagnostics()
+        );
+    };
+    assert_eq!(diagnostic.code, Some(5011));
+    assert_eq!(
+        diagnostic.file_name.as_deref(),
+        Some("/project/tsconfig.json")
     );
     let emitted = program.emit();
     assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
