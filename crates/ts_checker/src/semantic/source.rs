@@ -50797,7 +50797,7 @@ mod tests {
         assert_eq!(record.name().as_utf8(), Some("a"));
         assert_eq!(
             record.flags(),
-            SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+            SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT | SymbolFlags::REPLACEABLE_BY_METHOD
         );
         assert_eq!(record.declarations().unwrap().len(), 2);
         assert_eq!(

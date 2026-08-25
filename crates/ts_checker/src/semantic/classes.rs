@@ -1857,7 +1857,8 @@ fn plan_javascript_constructor_boolean_property(
         )));
     };
     if bound.symbol(second.expression) != Some(property)
-        || record.flags() != SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+        || record.flags()
+            != SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT | SymbolFlags::REPLACEABLE_BY_METHOD
         || record.check_flags() != CheckFlags::NONE
         || record.name().as_utf8() != Some(first_name.text.as_str())
         || record.declarations() != Some(&[first.expression, second.expression])
@@ -17269,7 +17270,8 @@ fn exact_stored_javascript_constructor_property(
     let first = *first;
     let second = *second;
     let bootstrap = store.intrinsic_bootstrap()?;
-    if record.flags() != SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+    if record.flags()
+        != SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT | SymbolFlags::REPLACEABLE_BY_METHOD
         || record.check_flags() != CheckFlags::NONE
         || record.value_declaration() != Some(first)
         || record.members().is_some()
@@ -17354,7 +17356,9 @@ fn exact_stored_property(
     if record.flags().intersects(SymbolFlags::ACCESSOR) {
         return exact_stored_merged_auto_accessor(store, owner, owner_declaration, property);
     }
-    if record.flags() == SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT {
+    if record.flags()
+        == SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT | SymbolFlags::REPLACEABLE_BY_METHOD
+    {
         return exact_stored_javascript_constructor_property(
             store,
             owner,
