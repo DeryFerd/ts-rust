@@ -9215,9 +9215,27 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 direct_generic_constraints =
                     self.preflight_direct_generic_reference_target(node, symbol, local_count)?;
+                let lazy_react_html_factory = type_arguments
+                    .get(1)
+                    .copied()
+                    .filter(|_| type_arguments.len() == 2)
+                    .is_some_and(|argument| {
+                        self.store
+                            .symbol(symbol)
+                            .and_then(|owner| owner.name().as_utf8())
+                            == Some("DetailedHTMLFactory")
+                            && self
+                                .resolve_uncached_type_reference_symbol(argument)
+                                .is_ok_and(|element| {
+                                    self.is_default_library_dom_interface_argument(
+                                        argument, element,
+                                    )
+                                })
+                    });
                 if flags.contains(SymbolFlags::INTERFACE)
                     && !flags.contains(SymbolFlags::CLASS)
                     && type_arguments.len() == local_count
+                    && !lazy_react_html_factory
                     && self.has_generic_interface_heritage(symbol)?
                 {
                     self.plan_generic_interface_heritage(symbol)?;
@@ -13516,8 +13534,34 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     .symbol(constraint_symbol)
                     .map(ts_binder::semantic::Symbol::flags)
                     .ok_or_else(&unsupported)?;
+                let react_interface_constraint = constraint_flags.without(SymbolFlags::TRANSIENT)
+                    == SymbolFlags::INTERFACE
+                    && self
+                        .store
+                        .get_parent_of_symbol(symbol)
+                        .filter(|namespace| {
+                            self.store.get_parent_of_symbol(constraint_symbol) == Some(*namespace)
+                                && self.is_react_ambient_module_namespace(*namespace, declaration)
+                        })
+                        .and_then(|namespace| self.store.symbol(namespace))
+                        .and_then(ts_binder::semantic::Symbol::exports)
+                        .and_then(|exports| self.store.symbol_table(exports))
+                        .is_some_and(|exports| {
+                            [symbol, constraint_symbol].into_iter().all(|target| {
+                                self.store.symbol(target).is_some_and(|owner| {
+                                    exports
+                                        .get(owner.name())
+                                        .and_then(|export| self.store.get_merged_symbol(export))
+                                        == Some(target)
+                                })
+                            })
+                        });
+                let supported_constraint = constraint_flags == SymbolFlags::INTERFACE
+                    || react_interface_constraint
+                    || self
+                        .is_default_library_dom_interface_argument(constraint, constraint_symbol);
                 if constraint_symbol == symbol
-                    || constraint_flags != SymbolFlags::INTERFACE
+                    || !supported_constraint
                     || preflight_class_or_interface_reference(
                         self.store,
                         self.host,
@@ -34611,8 +34655,17 @@ mod tests {
         let react = parse_source_file(concat!(
             "declare module 'react' { ",
             "export = React; namespace React { ",
-            "interface AnchorHTMLAttributes<Value> {} ",
-            "interface DetailedHTMLFactory<Props, Target> {} ",
+            "interface HTMLAttributes<Value> {} ",
+            "interface HTMLAttributes<Value> {} ",
+            "interface AnchorHTMLAttributes<Value> extends HTMLAttributes<Value> {} ",
+            "interface ClassAttributes<Value> {} ",
+            "type ReactNode = unknown; ",
+            "type DOMFactory<Props, Target> = {}; ",
+            "interface DetailedHTMLFactory<",
+            "Props extends HTMLAttributes<Target>, Target extends HTMLElement",
+            "> extends DOMFactory<Props, Target> { ",
+            "(props?: ClassAttributes<Target> & Props | null, ...children: ReactNode[]): unknown; ",
+            "} ",
             "interface ReactHTML { ",
             "a: DetailedHTMLFactory<AnchorHTMLAttributes<HTMLAnchorElement>, HTMLAnchorElement>; ",
             "} } }",
