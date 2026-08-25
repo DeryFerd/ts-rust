@@ -24,7 +24,9 @@ use super::{
     ResolvedSignatureState, SignatureId, SignatureLinks, TypeId, TypeNodeLinks, ValueSymbolLinks,
     bootstrap::UnionReduction,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
-    callables::{StoredSingleCallableValidation, validate_stored_single_callable},
+    callables::{
+        StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
+    },
     calls::{
         DirectCallApplicability, DirectCallError, DirectCallForm, DirectCallRequest,
         DirectCallUnsupported, resolve_direct_call,
@@ -2397,7 +2399,7 @@ fn shared_array_callback_context(
 /// Array and object arguments can retain a shared indexed context when
 /// overload parameter identities differ. Generic signatures provide context
 /// for authenticated fixed parameters, array callbacks, and constrained templates.
-/// Unary overloaded callbacks retain a shared parameter and prefer informative returns.
+/// Unary callbacks ignore incompatible overloads and prefer informative returns.
 pub(super) fn source_call_argument_contextual_type(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -2423,8 +2425,6 @@ pub(super) fn source_call_argument_contextual_type(
     let array_callback = matches!(argument.kind, PlannedExpressionKind::Arrow(_))
         && authenticated_array_callback_callee(store, global_types, plan, callee_type)?;
 
-    let parameter_index = argument_index + usize::from(plan.form == DirectCallForm::TaggedTemplate);
-
     let StoredCallableSetValidation::Valid { projection, .. } =
         validate_stored_callable_set(store, callee_type)
     else {
@@ -2434,14 +2434,15 @@ pub(super) fn source_call_argument_contextual_type(
         return Ok(None);
     }
 
-    let mut parameter_types = Vec::with_capacity(projection.call_signatures.len());
-    for callable in &projection.call_signatures {
+    if matches!(argument.kind, PlannedExpressionKind::Template(_))
+        && let [callable] = projection.call_signatures.as_slice()
+    {
         let Some(signature) = store.signature(callable.signature) else {
             return Err(SourceCheckError::Call(plan.node));
         };
+        let parameter_index =
+            argument_index + usize::from(plan.form == DirectCallForm::TaggedTemplate);
         if !signature.type_parameters().is_empty()
-            && projection.call_signatures.len() == 1
-            && matches!(argument.kind, PlannedExpressionKind::Template(_))
             && let Some(parameter) = callable.parameters.get(parameter_index).copied()
             && signature.type_parameters().contains(&parameter)
             && let Some(TypeData::TypeParameter(data)) =
@@ -2456,25 +2457,20 @@ pub(super) fn source_call_argument_contextual_type(
         {
             return Ok(Some(parameter));
         }
-        let parameter_type = match callable.parameters.get(parameter_index).copied() {
-            Some(parameter) => Some(parameter),
-            None => callable
-                .rest_parameter
-                .map(|rest| store.canonical_array_element_type(global_types, rest))
-                .transpose()?
-                .flatten(),
-        };
-        let Some(parameter_type) = parameter_type else {
-            return Ok(None);
-        };
-        if !signature.type_parameters().is_empty()
-            && !array_callback
-            && !valid_fixed_generic_source_parameter_type(store, parameter_type)
-        {
-            return Ok(None);
-        }
-        parameter_types.push(parameter_type);
     }
+
+    let Some(parameter_types) = contextual_overload_parameter_types(
+        store,
+        global_types,
+        plan,
+        &projection.call_signatures,
+        argument_index,
+        matches!(argument.kind, PlannedExpressionKind::Arrow(_)),
+        array_callback,
+    )?
+    else {
+        return Ok(None);
+    };
 
     let Some(first) = parameter_types.first().copied() else {
         return Ok(None);
@@ -2582,6 +2578,92 @@ fn nonnullable_contextual_callback_type(
         }
         _ => contextual_type,
     }
+}
+
+fn contextual_overload_parameter_types(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    plan: &SourceCallPlan,
+    callables: &[ValidatedSingleCallable],
+    argument_index: usize,
+    callback: bool,
+    array_callback: bool,
+) -> Result<Option<Vec<TypeId>>, SourceCheckError> {
+    let implicit_arguments = usize::from(plan.form == DirectCallForm::TaggedTemplate);
+    let parameter_index = argument_index + implicit_arguments;
+    let mut parameter_types = Vec::with_capacity(callables.len());
+    for callable in callables {
+        if callback
+            && !overload_can_contextualize_callback(
+                store,
+                plan,
+                callable,
+                argument_index,
+                implicit_arguments,
+            )
+        {
+            continue;
+        }
+        let Some(signature) = store.signature(callable.signature) else {
+            return Err(SourceCheckError::Call(plan.node));
+        };
+        let parameter_type = match callable.parameters.get(parameter_index).copied() {
+            Some(parameter) => Some(parameter),
+            None => callable
+                .rest_parameter
+                .map(|rest| store.canonical_array_element_type(global_types, rest))
+                .transpose()?
+                .flatten(),
+        };
+        let Some(parameter_type) = parameter_type else {
+            return Ok(None);
+        };
+        if !signature.type_parameters().is_empty()
+            && !array_callback
+            && !valid_fixed_generic_source_parameter_type(store, parameter_type)
+        {
+            return Ok(None);
+        }
+        parameter_types.push(parameter_type);
+    }
+    Ok(Some(parameter_types))
+}
+
+/// Uses only authenticated arity and already-checked literal argument identities.
+fn overload_can_contextualize_callback(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceCallPlan,
+    callable: &ValidatedSingleCallable,
+    argument_index: usize,
+    implicit_arguments: usize,
+) -> bool {
+    if plan.arguments.len() + implicit_arguments > callable.parameters.len()
+        && callable.rest_parameter.is_none()
+    {
+        return false;
+    }
+
+    for (index, argument) in plan.arguments.iter().take(argument_index).enumerate() {
+        let Some(parameter_type) = callable.parameters.get(index + implicit_arguments) else {
+            continue;
+        };
+        let Some(argument_type) = store
+            .type_node_links(argument.node)
+            .and_then(|links| links.resolved_type)
+        else {
+            continue;
+        };
+        let (Some(TypeData::Literal(argument)), Some(TypeData::Literal(parameter))) = (
+            store.type_payload(argument_type).map(TypeRecord::data),
+            store.type_payload(*parameter_type).map(TypeRecord::data),
+        ) else {
+            continue;
+        };
+        if argument.regular_type != parameter.regular_type {
+            return false;
+        }
+    }
+    true
 }
 
 /// Reuses a real unary callback whose input is shared by every overload.
@@ -9425,6 +9507,145 @@ mod tests {
 
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            call_nodes
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold,
+        );
+        assert_eq!(context.store().checker_link_allocated_lengths(), cold_links);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One graph proves arity, literal order, and warm identity.
+    fn overloaded_callbacks_ignore_wrong_arity_and_earlier_literal_discriminants() {
+        let parsed = parsed(concat!(
+            "declare function byArity(label: string): void; ",
+            "declare function byArity(label: string, callback: (value: 'edge') => 'edge'): void; ",
+            "byArity('label', value => value); ",
+            "declare function tagged(kind: 'left', callback: (value: 'left') => 'left'): void; ",
+            "declare function tagged(kind: 'right', callback: (value: 'edge') => 'edge'): void; ",
+            "tagged('right', value => value); ",
+            "declare function reverse(kind: 'right', callback: (value: 'edge') => 'edge'): void; ",
+            "declare function reverse(kind: 'left', callback: (value: 'left') => 'left'): void; ",
+            "reverse('right', value => value);",
+        ));
+        let file = FileId::new(4_915);
+        let mut context = context_with_options(
+            &parsed,
+            file,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let nodes_of_kind = |kind| {
+            let mut nodes = parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == kind).then_some((
+                        record.range.start,
+                        NodeRef::new(parsed.arena.id(), file, node),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            nodes.sort_by_key(|(start, _)| *start);
+            nodes.into_iter().map(|(_, node)| node).collect::<Vec<_>>()
+        };
+        let callback_targets = nodes_of_kind(SyntaxKind::FunctionType)
+            .into_iter()
+            .map(|node| {
+                context
+                    .store()
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type)
+                    .expect("overload callback targets must retain their declared types")
+            })
+            .collect::<Vec<_>>();
+        let declarations = nodes_of_kind(SyntaxKind::FunctionDeclaration);
+        let arrows = nodes_of_kind(SyntaxKind::ArrowFunction);
+        let mut call_nodes = calls(&parsed, file);
+        call_nodes.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        assert_eq!(arrows.len(), 3);
+        assert_eq!(call_nodes.len(), 3);
+        let literal = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .cached_string_literal_type("edge")
+            .expect("the selected callback parameter must preserve its literal type");
+        let (_, bound) = context.file(file).unwrap();
+
+        for (((arrow, call), expected_target), expected_declaration) in arrows
+            .iter()
+            .zip(&call_nodes)
+            .zip([
+                callback_targets[0],
+                callback_targets[2],
+                callback_targets[3],
+            ])
+            .zip([declarations[1], declarations[3], declarations[4]])
+        {
+            let NodeData::ArrowFunction(callback) = &parsed.arena.get(arrow.node).unwrap().data
+            else {
+                panic!("each overload must retain its callback arrow")
+            };
+            let parameter = NodeRef::new(parsed.arena.id(), file, callback.parameters.nodes[0]);
+            let parameter = bound.symbol(parameter).unwrap();
+            let owner = bound.symbol(*arrow).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let provenance = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap();
+
+            assert_eq!(provenance.contextual_target, Some(expected_target));
+            assert!(provenance.contextual_variable.is_none());
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(parameter)
+                    .and_then(|links| links.resolved_type),
+                Some(literal),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .signature_links(*call)
+                    .and_then(|links| links.resolved_signature.signature()),
+                context
+                    .store()
+                    .signature_links(expected_declaration)
+                    .and_then(|links| links.resolved_signature.signature()),
+            );
+        }
+        let cold = call_nodes
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        let cold_links = context.store().checker_link_allocated_lengths();
+
+        context.recheck_source_file(file).unwrap();
 
         assert!(context.diagnostics().is_empty());
         assert_eq!(
