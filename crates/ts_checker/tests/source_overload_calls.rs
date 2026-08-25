@@ -224,3 +224,98 @@ fn multi_overload_failure_recovery_remains_an_atomic_boundary() {
     assert!(context.store().type_node_links(*recovery_call).is_none());
     assert!(context.store().signature_links(*recovery_call).is_none());
 }
+
+#[test]
+fn one_matching_overload_preserves_its_shared_return_and_argument_diagnostic() {
+    let parsed = parse_source_file(concat!(
+        "interface Recovery { ",
+        "(value: number, other: number): string; ",
+        "(value: string): string; ",
+        "} ",
+        "function good(value: Recovery): string { return value(1, 2); } ",
+        "function recovery(value: Recovery): string { return value(true); }",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2);
+    let mut calls = parsed
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            (record.kind == SyntaxKind::CallExpression).then_some((
+                record.range.start,
+                NodeRef::new(parsed.arena.id(), file, node),
+            ))
+        })
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|(start, _)| *start);
+    let [(_, good_call), (_, recovery_call)] = calls.as_slice() else {
+        panic!("fixture contains one successful and one recovered call")
+    };
+    let mut declarations = parsed
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            (record.kind == SyntaxKind::CallSignature).then_some((
+                record.range.start,
+                NodeRef::new(parsed.arena.id(), file, node),
+            ))
+        })
+        .collect::<Vec<_>>();
+    declarations.sort_by_key(|(start, _)| *start);
+    let [(_, _), (_, recovery_declaration)] = declarations.as_slice() else {
+        panic!("fixture contains two overload declarations")
+    };
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("only the matching-arity overload should produce a diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2345);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Argument of type 'boolean' is not assignable to parameter of type 'string'."
+    );
+    let declaration_signature = context
+        .store()
+        .signature_links(*recovery_declaration)
+        .and_then(|links| links.resolved_signature.signature());
+    assert_eq!(
+        context
+            .store()
+            .signature_links(*recovery_call)
+            .and_then(|links| links.resolved_signature.signature()),
+        declaration_signature
+    );
+    for call in [*good_call, *recovery_call] {
+        let return_type = context
+            .store()
+            .type_node_links(call)
+            .and_then(|links| links.resolved_type)
+            .expect("both overload calls must preserve their shared return type");
+        assert_eq!(context.type_to_string(return_type).unwrap(), "string");
+    }
+    let cold = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+        context.store().type_node_links(*recovery_call).cloned(),
+        context.store().signature_links(*recovery_call).cloned(),
+        context.diagnostics().clone(),
+    );
+
+    context.recheck_source_file(file).unwrap();
+
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().type_node_links(*recovery_call).cloned(),
+            context.store().signature_links(*recovery_call).cloned(),
+            context.diagnostics().clone(),
+        ),
+        cold
+    );
+}

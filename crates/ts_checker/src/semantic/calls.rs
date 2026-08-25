@@ -285,6 +285,16 @@ pub(super) fn resolve_direct_call(
     })? {
         return Ok(candidate);
     }
+
+    if let Some(candidate) = recover_direct_call_overload(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        &candidates,
+    )? {
+        return Ok(candidate);
+    }
     Err(DirectCallUnsupported::OverloadFailureRecovery(request.callee).into())
 }
 
@@ -364,6 +374,69 @@ fn choose_applicable_overload(
         }
     }
     Ok(None)
+}
+
+/// Class implementations can add diagnostic notes that this recovery cannot reproduce.
+fn recover_direct_call_overload(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: DirectCallRequest<'_>,
+    candidates: &[DirectCallResolution],
+) -> Result<Option<DirectCallResolution>, DirectCallError> {
+    let class_method = store
+        .type_payload(request.callee)
+        .and_then(TypeRecord::symbol)
+        .and_then(|symbol| store.symbol(symbol))
+        .is_some_and(|method| {
+            method.flags().contains(SymbolFlags::METHOD)
+                && method
+                    .parent()
+                    .and_then(|owner| store.symbol(owner))
+                    .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+        });
+    if request.form != DirectCallForm::Call || class_method {
+        return Ok(None);
+    }
+    recover_single_overload_argument_error(candidates, |source, target| {
+        store.is_type_assignable_to_with_global_types_and_strict_function_types(
+            source,
+            target,
+            global_types,
+            strict_function_types,
+        )
+    })
+}
+
+/// Recovers TS2345 only when overload synthesis cannot change the return type.
+fn recover_single_overload_argument_error(
+    candidates: &[DirectCallResolution],
+    mut is_assignable: impl FnMut(TypeId, TypeId) -> Result<bool, RelationUnavailable>,
+) -> Result<Option<DirectCallResolution>, DirectCallError> {
+    let mut eligible = candidates
+        .iter()
+        .filter(|candidate| candidate.applicability == DirectCallApplicability::Applicable);
+    let Some(candidate) = eligible.next() else {
+        return Ok(None);
+    };
+    if eligible.next().is_some()
+        || candidates
+            .iter()
+            .any(|other| other.projection.return_type != candidate.projection.return_type)
+    {
+        return Ok(None);
+    }
+
+    let applicability = check_argument_applicability(&candidate.projection, &mut is_assignable)?;
+    if !matches!(
+        applicability,
+        DirectCallApplicability::ArgumentNotAssignable { .. }
+    ) {
+        return Ok(None);
+    }
+    let mut selected = candidate.clone();
+    selected.applicability = applicability;
+    Ok(Some(selected))
 }
 
 fn validate_direct_call_form(request: DirectCallRequest<'_>) -> Result<(), DirectCallError> {
