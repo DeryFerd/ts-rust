@@ -5569,8 +5569,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         Some(NodeRef::new(declaration.arena, declaration.file, node))
     }
 
-    /// Primitive annotations may resolve directly without allocating node links.
-    /// Composite annotations must retain their exact published type identity.
+    /// Primitive annotations and null literals may resolve without node links.
+    /// Other composite annotations must retain their exact published identity.
     pub(super) fn source_direct_type_annotation_is_exact(
         &self,
         annotation: NodeRef,
@@ -5590,6 +5590,23 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             Some(SyntaxKind::VoidKeyword) => Some(bootstrap.void_type),
             Some(SyntaxKind::UndefinedKeyword) => Some(bootstrap.undefined_type),
             Some(SyntaxKind::NullKeyword) => Some(bootstrap.null_type),
+            Some(SyntaxKind::LiteralType)
+                if annotation
+                    .node
+                    .index()
+                    .checked_sub(1)
+                    .and_then(|index| u32::try_from(index).ok())
+                    .map(|index| {
+                        NodeRef::new(annotation.arena, annotation.file, NodeId::new(index))
+                    })
+                    .is_some_and(|literal| {
+                        self.source_node_kind(literal) == Some(SyntaxKind::NullKeyword)
+                            && self.source_node_parent(literal)
+                                == Some(SourceNodeParent::Parent(annotation))
+                    }) =>
+            {
+                Some(bootstrap.null_type)
+            }
             Some(SyntaxKind::NeverKeyword) => Some(bootstrap.never_type),
             Some(SyntaxKind::ObjectKeyword) => Some(bootstrap.non_primitive_type),
             Some(SyntaxKind::IntrinsicKeyword) => Some(bootstrap.intrinsic_marker_type),

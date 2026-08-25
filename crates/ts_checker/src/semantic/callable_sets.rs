@@ -3638,6 +3638,7 @@ mod tests {
         assert_eq!(required.min_argument_count, 1);
         assert_eq!(optional.parameters, vec![null]);
         assert_eq!(optional.min_argument_count, 0);
+        let optional_parameter = store.signature(optional.signature).unwrap().parameters()[0];
 
         let warm = (
             store.type_len(),
@@ -3654,6 +3655,35 @@ mod tests {
             warm,
         );
         assert!(context.diagnostics().is_empty());
+
+        let original = context
+            .store()
+            .value_symbol_links(optional_parameter)
+            .cloned()
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            optional_parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(matches!(
+            validate_stored_callable_set(context.store(), callable),
+            StoredCallableSetValidation::Malformed {
+                family: CallableFamily::DeclaredCallSignatures,
+            }
+        ));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(optional_parameter, original)
+        );
+        assert!(matches!(
+            validate_stored_callable_set(context.store(), callable),
+            StoredCallableSetValidation::Valid { .. }
+        ));
     }
 
     #[test]
