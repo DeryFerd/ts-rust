@@ -32836,9 +32836,10 @@ fn recovered_protected_generic_default(
     let default_record = arena.get(default.node)?;
     let symbol = bound.symbol(parameter)?;
     let owner = store.symbol(symbol)?;
-    let locals = bound
-        .locals(class.declaration)
-        .and_then(|locals| store.symbol_table(locals))?;
+    let members = store
+        .symbol(class.symbol)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))?;
     (!parameters.has_trailing_comma
         && parameter_record.kind == SyntaxKind::TypeParameter
         && parameter_record.flags.0 == 0
@@ -32854,11 +32855,11 @@ fn recovered_protected_generic_default(
         && owner.name().as_utf8() == Some(name)
         && owner.declarations() == Some(&[parameter])
         && owner.value_declaration().is_none()
-        && owner.parent().is_none()
+        && owner.parent() == Some(class.symbol)
         && owner.export_symbol().is_none()
         && store.get_merged_symbol(symbol) == Some(symbol)
-        && locals.len() == 1
-        && locals.get_source(name) == Some(symbol))
+        && members.len() == 1
+        && members.get_source(name) == Some(symbol))
     .then_some(default)
 }
 
