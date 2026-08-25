@@ -66,6 +66,7 @@
 //! that preserves the real `IArguments` assignment diagnostic.
 //! Static class elements retain their exact class and lexical `this` captures.
 //! Exported namespace classes retain lexical `this` in async static arrows.
+//! Private class fields retain their owner across static self-construction.
 //! Declaration-only mixed signatures with implicit rest parameters retain a
 //! separate bounded recovery that preserves binder-owned overload identity.
 //! Malformed namespace arrows and unclosed JSX retain separate, fully
@@ -38113,6 +38114,7 @@ struct RecoveredComputedClassProperty {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveredStaticMemberKind {
     Field,
+    InstanceField,
     Method,
     PrivateMethod,
 }
@@ -39108,9 +39110,9 @@ fn recovered_static_member_owner(
     let owner = store.symbol(symbol)?;
     let table = match kind {
         RecoveredStaticMemberKind::Field => store.symbol(class.symbol)?.exports(),
-        RecoveredStaticMemberKind::Method | RecoveredStaticMemberKind::PrivateMethod => {
-            store.symbol(class.symbol)?.members()
-        }
+        RecoveredStaticMemberKind::InstanceField
+        | RecoveredStaticMemberKind::Method
+        | RecoveredStaticMemberKind::PrivateMethod => store.symbol(class.symbol)?.members(),
     }
     .and_then(|table| store.symbol_table(table))?;
     let valid_name = if kind == RecoveredStaticMemberKind::PrivateMethod {
@@ -39120,7 +39122,10 @@ fn recovered_static_member_owner(
         owner.name().as_utf8() == Some(name)
     };
     (owner.flags()
-        == if kind == RecoveredStaticMemberKind::Field {
+        == if matches!(
+            kind,
+            RecoveredStaticMemberKind::Field | RecoveredStaticMemberKind::InstanceField
+        ) {
             SymbolFlags::PROPERTY
         } else {
             SymbolFlags::METHOD
@@ -39999,6 +40004,1032 @@ fn recover_namespace_async_static_arrows(
     };
     first_symbol != second_symbol
         && first_name != second_name
+        && recovered_source_node_caches_are_cold(arena, bound, store)
+}
+
+fn recovered_exported_private_class(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    module: SemanticSymbolId,
+    statement: NodeId,
+) -> Option<(RecoveredProtectedClass, SemanticSymbolId)> {
+    let declaration = strict_arguments_child(arena, bound, bound.source_file(), statement)?;
+    let record = arena.get(declaration.node)?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return None;
+    };
+    let (_, name) = recovered_identifier(arena, bound, declaration, class.name?)?;
+    let modifiers = class.modifiers.as_ref()?;
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return None;
+    };
+    let modifier = strict_arguments_child(arena, bound, declaration, *modifier)?;
+    let symbol = bound.symbol(declaration)?;
+    let owner = store.symbol(symbol)?;
+    let local = bound.local_symbol(declaration)?;
+    let local_owner = store.symbol(local)?;
+    let source_locals = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))?;
+    let source_exports = store
+        .symbol(module)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))?;
+    if record.kind != SyntaxKind::ClassDeclaration
+        || record.flags.0 != 0
+        || class.flow_node.is_some()
+        || class.heritage_clauses.is_some()
+        || class.local_symbol.is_some()
+        || class.next_container.is_some()
+        || class.symbol.is_some()
+        || class.type_parameters.is_some()
+        || class.facts != 0
+        || class.members.has_trailing_comma
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || arena.get(modifier.node)?.kind != SyntaxKind::ExportKeyword
+        || owner.flags() != SymbolFlags::CLASS
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(name)
+        || owner.declarations() != Some(&[declaration])
+        || owner.value_declaration() != Some(declaration)
+        || owner.parent() != Some(module)
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || local_owner.flags() != SymbolFlags::EXPORT_VALUE
+        || local_owner.check_flags() != CheckFlags::NONE
+        || local_owner.name().as_utf8() != Some(name)
+        || local_owner.declarations() != Some(&[declaration])
+        || local_owner.value_declaration().is_some()
+        || local_owner.parent().is_some()
+        || local_owner.export_symbol() != Some(symbol)
+        || store.get_merged_symbol(local) != Some(local)
+        || source_locals.get_source(name) != Some(local)
+        || source_exports.get_source(name) != Some(symbol)
+        || [symbol, local].iter().any(|symbol| {
+            store
+                .value_symbol_links(*symbol)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+                || store
+                    .declared_type_links(*symbol)
+                    .is_some_and(|links| links.declared_type.is_some())
+        })
+    {
+        return None;
+    }
+    Some((
+        RecoveredProtectedClass {
+            declaration,
+            symbol,
+            name: name.to_owned(),
+        },
+        local,
+    ))
+}
+
+fn recovered_private_numeric_field(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    class: &RecoveredProtectedClass,
+    member: NodeId,
+) -> Option<(SemanticSymbolId, String)> {
+    let field = strict_arguments_child(arena, bound, class.declaration, member)?;
+    let record = arena.get(field.node)?;
+    let NodeData::PropertyDeclaration(property) = &record.data else {
+        return None;
+    };
+    let name = strict_arguments_child(arena, bound, field, property.name)?;
+    let name_record = arena.get(name.node)?;
+    let NodeData::PrivateIdentifier(identifier) = &name_record.data else {
+        return None;
+    };
+    let initializer = strict_arguments_child(arena, bound, field, property.initializer?)?;
+    let initializer_record = arena.get(initializer.node)?;
+    let NodeData::NumericLiteral(number) = &initializer_record.data else {
+        return None;
+    };
+    let symbol = bound.symbol(field)?;
+    let owner = store.symbol(symbol)?;
+    let members = store
+        .symbol(class.symbol)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))?;
+    (record.kind == SyntaxKind::PropertyDeclaration
+        && record.flags.0 == 0
+        && property.postfix_token.is_none()
+        && property.symbol.is_none()
+        && property.type_.is_none()
+        && property.facts == 0
+        && property.modifiers.is_none()
+        && name_record.kind == SyntaxKind::PrivateIdentifier
+        && name_record.flags.0 == 0
+        && initializer_record.kind == SyntaxKind::NumericLiteral
+        && initializer_record.flags.0 == 0
+        && number.token_flags.0 == 0
+        && !ts_jsnum::from_string(&number.text).is_nan()
+        && owner.flags() == SymbolFlags::PROPERTY
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.declarations() == Some(&[field])
+        && owner.value_declaration() == Some(field)
+        && owner.members().is_none()
+        && owner.exports().is_none()
+        && owner.parent() == Some(class.symbol)
+        && owner.export_symbol().is_none()
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && super::classes::authenticated_private_class_symbol_name(store, class.symbol, symbol)
+            == Some(identifier.text.as_str())
+        && members.get(owner.name()) == Some(symbol)
+        && store
+            .value_symbol_links(symbol)
+            .is_none_or(|links| links == &ValueSymbolLinks::default()))
+    .then_some((symbol, identifier.text.clone()))
+}
+
+fn recovered_static_class_self_construction(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    class: &RecoveredProtectedClass,
+    member: NodeId,
+) -> Option<(SemanticSymbolId, String)> {
+    let field = strict_arguments_child(arena, bound, class.declaration, member)?;
+    let record = arena.get(field.node)?;
+    let NodeData::PropertyDeclaration(property) = &record.data else {
+        return None;
+    };
+    recovered_static_modifier(arena, bound, field, property.modifiers.as_ref()?)?;
+    let (_, name) = recovered_identifier(arena, bound, field, property.name)?;
+    let symbol = recovered_static_member_owner(
+        bound,
+        store,
+        class,
+        field,
+        name,
+        RecoveredStaticMemberKind::Field,
+    )?;
+    let construction = strict_arguments_child(arena, bound, field, property.initializer?)?;
+    let construction_record = arena.get(construction.node)?;
+    let NodeData::NewExpression(expression) = &construction_record.data else {
+        return None;
+    };
+    let arguments = expression.arguments.as_ref()?;
+    let (_, constructor) = recovered_identifier(arena, bound, construction, expression.expression)?;
+    (record.kind == SyntaxKind::PropertyDeclaration
+        && record.flags.0 == 0
+        && property.postfix_token.is_none()
+        && property.symbol.is_none()
+        && property.type_.is_none()
+        && property.facts == 0
+        && construction_record.kind == SyntaxKind::NewExpression
+        && construction_record.flags.0 == 0
+        && expression.type_arguments.is_none()
+        && expression.facts == 0
+        && !arguments.has_trailing_comma
+        && arguments.nodes.is_empty()
+        && constructor == class.name)
+        .then_some((symbol, name.to_owned()))
+}
+
+fn recovered_named_property_access(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    parent: NodeRef,
+    expression: NodeId,
+    expected_receiver: &str,
+    expected_name: &str,
+) -> Option<NodeRef> {
+    let access = strict_arguments_child(arena, bound, parent, expression)?;
+    let record = arena.get(access.node)?;
+    let NodeData::PropertyAccessExpression(property) = &record.data else {
+        return None;
+    };
+    let (_, receiver) = recovered_identifier(arena, bound, access, property.expression)?;
+    let (_, name) = recovered_identifier(arena, bound, access, property.name)?;
+    (record.kind == SyntaxKind::PropertyAccessExpression
+        && record.flags.0 == 0
+        && property.flow_node.is_none()
+        && property.question_dot_token.is_none()
+        && property.facts == 0
+        && receiver == expected_receiver
+        && name == expected_name)
+        .then_some(access)
+}
+
+fn recovered_class_named_property(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    class: &RecoveredProtectedClass,
+    member: NodeId,
+    expected_access: (&str, &str),
+    is_static: bool,
+) -> Option<(SemanticSymbolId, String)> {
+    let field = strict_arguments_child(arena, bound, class.declaration, member)?;
+    let record = arena.get(field.node)?;
+    let NodeData::PropertyDeclaration(property) = &record.data else {
+        return None;
+    };
+    let (_, name) = recovered_identifier(arena, bound, field, property.name)?;
+    let kind = if is_static {
+        recovered_static_modifier(arena, bound, field, property.modifiers.as_ref()?)?;
+        RecoveredStaticMemberKind::Field
+    } else {
+        if property.modifiers.is_some() {
+            return None;
+        }
+        RecoveredStaticMemberKind::InstanceField
+    };
+    let symbol = recovered_static_member_owner(bound, store, class, field, name, kind)?;
+    recovered_named_property_access(
+        arena,
+        bound,
+        field,
+        property.initializer?,
+        expected_access.0,
+        expected_access.1,
+    )?;
+    if let Some(annotation) = property.type_ {
+        let annotation = strict_arguments_child(arena, bound, field, annotation)?;
+        let annotation_record = arena.get(annotation.node)?;
+        let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+            return None;
+        };
+        let (_, annotation_name) =
+            recovered_identifier(arena, bound, annotation, reference.type_name)?;
+        if annotation_record.kind != SyntaxKind::TypeReference
+            || annotation_record.flags.0 != 0
+            || reference.type_arguments.is_some()
+            || annotation_name != expected_access.0
+        {
+            return None;
+        }
+    }
+    (record.kind == SyntaxKind::PropertyDeclaration
+        && record.flags.0 == 0
+        && property.postfix_token.is_none()
+        && property.symbol.is_none()
+        && property.facts == 0)
+        .then_some((symbol, name.to_owned()))
+}
+
+#[allow(clippy::too_many_lines)] // Ambient object ownership includes its binder-owned type member.
+fn recovered_ambient_same_name_object(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeId,
+    expected_property: &str,
+    expected_type: SyntaxKind,
+) -> Option<(SemanticSymbolId, String)> {
+    let statement = strict_arguments_child(arena, bound, bound.source_file(), statement)?;
+    let statement_record = arena.get(statement.node)?;
+    let NodeData::VariableStatement(variable) = &statement_record.data else {
+        return None;
+    };
+    let modifiers = variable.modifiers.as_ref()?;
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return None;
+    };
+    let modifier = strict_arguments_child(arena, bound, statement, *modifier)?;
+    let list = strict_arguments_child(arena, bound, statement, variable.declaration_list)?;
+    let list_record = arena.get(list.node)?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return None;
+    };
+    let [declaration] = declarations.declarations.nodes.as_slice() else {
+        return None;
+    };
+    let declaration = strict_arguments_child(arena, bound, list, *declaration)?;
+    let declaration_record = arena.get(declaration.node)?;
+    let NodeData::VariableDeclaration(binding) = &declaration_record.data else {
+        return None;
+    };
+    let (_, name) = recovered_identifier(arena, bound, declaration, binding.name)?;
+    let annotation = strict_arguments_child(arena, bound, declaration, binding.type_?)?;
+    let annotation_record = arena.get(annotation.node)?;
+    let NodeData::TypeLiteralNode(literal) = &annotation_record.data else {
+        return None;
+    };
+    let [property] = literal.members.nodes.as_slice() else {
+        return None;
+    };
+    let property = strict_arguments_child(arena, bound, annotation, *property)?;
+    let property_record = arena.get(property.node)?;
+    let NodeData::PropertyDeclaration(signature) = &property_record.data else {
+        return None;
+    };
+    let (_, property_name) = recovered_identifier(arena, bound, property, signature.name)?;
+    let value_type = strict_arguments_child(arena, bound, property, signature.type_?)?;
+    let variable_symbol = bound.symbol(declaration)?;
+    let variable_owner = store.symbol(variable_symbol)?;
+    let literal_symbol = bound.symbol(annotation)?;
+    let literal_owner = store.symbol(literal_symbol)?;
+    let property_symbol = bound.symbol(property)?;
+    let property_owner = store.symbol(property_symbol)?;
+    let source_locals = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))?;
+    let members = literal_owner
+        .members()
+        .and_then(|members| store.symbol_table(members))?;
+    if statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || variable.flow_node.is_some()
+        || variable.facts != 0
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || arena.get(modifier.node)?.kind != SyntaxKind::DeclareKeyword
+        || list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != NODE_FLAG_CONST
+        || declarations.declarations.has_trailing_comma
+        || declarations.facts != 0
+        || declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || binding.exclamation_token.is_some()
+        || binding.initializer.is_some()
+        || binding.local_symbol.is_some()
+        || binding.symbol.is_some()
+        || binding.facts != 0
+        || annotation_record.kind != SyntaxKind::TypeLiteral
+        || annotation_record.flags.0 != 0
+        || literal.symbol.is_some()
+        || literal.members.has_trailing_comma
+        || property_record.kind != SyntaxKind::PropertyDeclaration
+        || property_record.flags.0 != 0
+        || signature.initializer.is_some()
+        || signature.postfix_token.is_some()
+        || signature.symbol.is_some()
+        || signature.facts != 0
+        || signature.modifiers.is_some()
+        || property_name != expected_property
+        || arena.get(value_type.node)?.kind != expected_type
+        || variable_owner.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+        || variable_owner.check_flags() != CheckFlags::NONE
+        || variable_owner.name().as_utf8() != Some(name)
+        || variable_owner.declarations() != Some(&[declaration])
+        || variable_owner.value_declaration() != Some(declaration)
+        || variable_owner.parent().is_some()
+        || variable_owner.export_symbol().is_some()
+        || store.get_merged_symbol(variable_symbol) != Some(variable_symbol)
+        || source_locals.get_source(name) != Some(variable_symbol)
+        || literal_owner.flags() != SymbolFlags::TYPE_LITERAL
+        || literal_owner.declarations() != Some(&[annotation])
+        || literal_owner.parent().is_some()
+        || property_owner.flags() != SymbolFlags::PROPERTY
+        || property_owner.name().as_utf8() != Some(expected_property)
+        || property_owner.declarations() != Some(&[property])
+        || property_owner.parent() != Some(literal_symbol)
+        || members.len() != 1
+        || members.get_source(expected_property) != Some(property_symbol)
+        || [variable_symbol, literal_symbol, property_symbol]
+            .iter()
+            .any(|symbol| {
+                store
+                    .value_symbol_links(*symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+                    || store
+                        .declared_type_links(*symbol)
+                        .is_some_and(|links| links.declared_type.is_some())
+            })
+    {
+        return None;
+    }
+    Some((variable_symbol, name.to_owned()))
+}
+
+fn recovered_private_class_method(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    class: &RecoveredProtectedClass,
+    member: NodeId,
+    expected_name: &str,
+) -> Option<(NodeRef, NodeRef, SemanticSymbolId)> {
+    let method = strict_arguments_child(arena, bound, class.declaration, member)?;
+    let record = arena.get(method.node)?;
+    let NodeData::MethodDeclaration(function) = &record.data else {
+        return None;
+    };
+    let (_, name) = recovered_identifier(arena, bound, method, function.name)?;
+    let symbol = recovered_static_member_owner(
+        bound,
+        store,
+        class,
+        method,
+        name,
+        RecoveredStaticMemberKind::Method,
+    )?;
+    let body = strict_arguments_child(arena, bound, method, function.body?)?;
+    let body_record = arena.get(body.node)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return None;
+    };
+    let [statement] = block.statements.nodes.as_slice() else {
+        return None;
+    };
+    let statement = strict_arguments_child(arena, bound, body, *statement)?;
+    let statement_record = arena.get(statement.node)?;
+    let NodeData::ReturnStatement(returned) = &statement_record.data else {
+        return None;
+    };
+    let expression = strict_arguments_child(arena, bound, statement, returned.expression?)?;
+    (record.kind == SyntaxKind::MethodDeclaration
+        && record.flags.0 == 0
+        && function.asterisk_token.is_none()
+        && function.end_flow_node.is_none()
+        && function.flow_node.is_none()
+        && function.full_signature.is_none()
+        && function.next_container.is_none()
+        && function.parameters.nodes.is_empty()
+        && !function.parameters.has_trailing_comma
+        && function.postfix_token.is_none()
+        && function.symbol.is_none()
+        && function.type_parameters.is_none()
+        && function.facts == 0
+        && function.modifiers.is_none()
+        && name == expected_name
+        && body_record.kind == SyntaxKind::Block
+        && body_record.flags.0 == 0
+        && block.flow_node.is_none()
+        && block.next_container.is_none()
+        && block.facts == 0
+        && !block.statements.has_trailing_comma
+        && statement_record.kind == SyntaxKind::ReturnStatement
+        && statement_record.flags.0 == 0
+        && returned.flow_node.is_none()
+        && returned.facts == 0)
+        .then_some((method, expression, symbol))
+}
+
+fn recovered_private_class_enum_return(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    method: NodeRef,
+    expression: NodeRef,
+    enum_name: &str,
+    enum_member: &str,
+    property_name: &str,
+) -> Option<()> {
+    let NodeData::MethodDeclaration(function) = &arena.get(method.node)?.data else {
+        return None;
+    };
+    let annotation = strict_arguments_child(arena, bound, method, function.type_?)?;
+    let annotation_record = arena.get(annotation.node)?;
+    let NodeData::TypeReferenceNode(annotation_data) = &annotation_record.data else {
+        return None;
+    };
+    let (_, annotation_name) =
+        recovered_identifier(arena, bound, annotation, annotation_data.type_name)?;
+    let expression_record = arena.get(expression.node)?;
+    let NodeData::BinaryExpression(binary) = &expression_record.data else {
+        return None;
+    };
+    let operator = strict_arguments_child(arena, bound, expression, binary.operator_token)?;
+    let left = strict_arguments_child(arena, bound, expression, binary.left)?;
+    let left_record = arena.get(left.node)?;
+    let NodeData::PropertyAccessExpression(access) = &left_record.data else {
+        return None;
+    };
+    let receiver = strict_arguments_child(arena, bound, left, access.expression)?;
+    let receiver_record = arena.get(receiver.node)?;
+    let (_, name) = recovered_identifier(arena, bound, left, access.name)?;
+    recovered_named_property_access(
+        arena,
+        bound,
+        expression,
+        binary.right,
+        enum_name,
+        enum_member,
+    )?;
+    (annotation_record.kind == SyntaxKind::TypeReference
+        && annotation_record.flags.0 == 0
+        && annotation_data.type_arguments.is_none()
+        && annotation_name == enum_name
+        && expression_record.kind == SyntaxKind::BinaryExpression
+        && expression_record.flags.0 == 0
+        && binary.symbol.is_none()
+        && binary.type_.is_none()
+        && binary.facts == 0
+        && binary.modifiers.is_none()
+        && arena.get(operator.node)?.kind == SyntaxKind::BarBarToken
+        && left_record.kind == SyntaxKind::PropertyAccessExpression
+        && left_record.flags.0 == 0
+        && access.flow_node.is_none()
+        && access.question_dot_token.is_none()
+        && access.facts == 0
+        && receiver_record.kind == SyntaxKind::ThisKeyword
+        && matches!(
+            &receiver_record.data,
+            NodeData::KeywordExpression(keyword) if keyword.flow_node.is_none()
+        )
+        && bound.this_container(receiver) == Some(method)
+        && name == property_name)
+        .then_some(())
+}
+
+fn recovered_private_class_private_return(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    class: &RecoveredProtectedClass,
+    method: NodeRef,
+    expression: NodeRef,
+    private: (SemanticSymbolId, &str),
+) -> Option<()> {
+    let NodeData::MethodDeclaration(function) = &arena.get(method.node)?.data else {
+        return None;
+    };
+    let record = arena.get(expression.node)?;
+    let NodeData::PropertyAccessExpression(access) = &record.data else {
+        return None;
+    };
+    let receiver = strict_arguments_child(arena, bound, expression, access.expression)?;
+    let receiver_record = arena.get(receiver.node)?;
+    let name = strict_arguments_child(arena, bound, expression, access.name)?;
+    let name_record = arena.get(name.node)?;
+    let NodeData::PrivateIdentifier(identifier) = &name_record.data else {
+        return None;
+    };
+    (function.type_.is_none()
+        && record.kind == SyntaxKind::PropertyAccessExpression
+        && record.flags.0 == 0
+        && access.flow_node.is_none()
+        && access.question_dot_token.is_none()
+        && access.facts == 0
+        && receiver_record.kind == SyntaxKind::ThisKeyword
+        && matches!(
+            &receiver_record.data,
+            NodeData::KeywordExpression(keyword) if keyword.flow_node.is_none()
+        )
+        && bound.this_container(receiver) == Some(method)
+        && name_record.kind == SyntaxKind::PrivateIdentifier
+        && name_record.flags.0 == 0
+        && identifier.text == private.1
+        && super::classes::authenticated_private_class_symbol_name(store, class.symbol, private.0)
+            == Some(private.1))
+    .then_some(())
+}
+
+fn recovered_exported_private_enum(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    host: &DeclaredTypeHost<'_>,
+    store: &CanonicalTypeMapperStore,
+    module: SemanticSymbolId,
+    statement: NodeId,
+    expected_names: [&str; 2],
+) -> Option<(SemanticSymbolId, String)> {
+    let declaration = strict_arguments_child(arena, bound, bound.source_file(), statement)?;
+    let record = arena.get(declaration.node)?;
+    let NodeData::EnumDeclaration(enumeration) = &record.data else {
+        return None;
+    };
+    let (_, enum_name) = recovered_identifier(arena, bound, declaration, enumeration.name)?;
+    let plan = plan_top_level_enum(store, host, declaration).ok()?;
+    let [first, second] = enumeration.members.nodes.as_slice() else {
+        return None;
+    };
+    for (member, expected_name) in [*first, *second].into_iter().zip(expected_names) {
+        let member = strict_arguments_child(arena, bound, declaration, member)?;
+        let member_record = arena.get(member.node)?;
+        let NodeData::EnumMember(value) = &member_record.data else {
+            return None;
+        };
+        let (_, actual_name) = recovered_identifier(arena, bound, member, value.name)?;
+        let initializer = strict_arguments_child(arena, bound, member, value.initializer?)?;
+        let initializer_record = arena.get(initializer.node)?;
+        let NodeData::StringLiteral(literal) = &initializer_record.data else {
+            return None;
+        };
+        if member_record.kind != SyntaxKind::EnumMember
+            || member_record.flags.0 != 0
+            || initializer_record.kind != SyntaxKind::StringLiteral
+            || initializer_record.flags.0 != 0
+            || literal.token_flags.0 != 0
+            || actual_name != expected_name
+            || literal.text != format!("{expected_name}Value")
+        {
+            return None;
+        }
+    }
+    (record.kind == SyntaxKind::EnumDeclaration
+        && record.flags.0 == 0
+        && plan.declaration == declaration
+        && plan.members.len() == 2
+        && plan.diagnostics.is_empty()
+        && plan.missing_member_diagnostics.is_empty()
+        && !plan.is_const
+        && !plan.is_ambient
+        && matches!(
+            plan.export_route,
+            super::source_enums::SourceEnumExportRoute::Exported {
+                source_symbol,
+                explicitly_exported: true,
+                ..
+            } if source_symbol == module
+        )
+        && store
+            .value_symbol_links(plan.owner_symbol)
+            .is_none_or(|links| links == &ValueSymbolLinks::default())
+        && store
+            .declared_type_links(plan.owner_symbol)
+            .is_none_or(|links| links.declared_type.is_none()))
+    .then_some((plan.owner_symbol, enum_name.to_owned()))
+}
+
+#[allow(clippy::too_many_lines)] // The const declaration and named private class share one identity proof.
+fn recovered_named_private_class_expression(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeId,
+) -> Option<(RecoveredProtectedClass, SemanticSymbolId)> {
+    let statement = strict_arguments_child(arena, bound, bound.source_file(), statement)?;
+    let statement_record = arena.get(statement.node)?;
+    let NodeData::VariableStatement(variable) = &statement_record.data else {
+        return None;
+    };
+    let list = strict_arguments_child(arena, bound, statement, variable.declaration_list)?;
+    let list_record = arena.get(list.node)?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return None;
+    };
+    let [declaration] = declarations.declarations.nodes.as_slice() else {
+        return None;
+    };
+    let declaration = strict_arguments_child(arena, bound, list, *declaration)?;
+    let declaration_record = arena.get(declaration.node)?;
+    let NodeData::VariableDeclaration(binding) = &declaration_record.data else {
+        return None;
+    };
+    let (_, variable_name) = recovered_identifier(arena, bound, declaration, binding.name)?;
+    let expression = strict_arguments_child(arena, bound, declaration, binding.initializer?)?;
+    let expression_record = arena.get(expression.node)?;
+    let NodeData::ClassExpression(class) = &expression_record.data else {
+        return None;
+    };
+    let (_, class_name) = recovered_identifier(arena, bound, expression, class.name?)?;
+    let variable_symbol = bound.symbol(declaration)?;
+    let variable_owner = store.symbol(variable_symbol)?;
+    let class_symbol = bound.symbol(expression)?;
+    let class_owner = store.symbol(class_symbol)?;
+    let locals = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))?;
+    if statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || variable.flow_node.is_some()
+        || variable.facts != 0
+        || variable.modifiers.is_some()
+        || list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != NODE_FLAG_CONST
+        || declarations.declarations.has_trailing_comma
+        || declarations.facts != 0
+        || declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || binding.exclamation_token.is_some()
+        || binding.local_symbol.is_some()
+        || binding.symbol.is_some()
+        || binding.type_.is_some()
+        || binding.facts != 0
+        || expression_record.kind != SyntaxKind::ClassExpression
+        || expression_record.flags.0 != 0
+        || class.heritage_clauses.is_some()
+        || class.local_symbol.is_some()
+        || class.next_container.is_some()
+        || class.symbol.is_some()
+        || class.type_parameters.is_some()
+        || class.facts != 0
+        || class.modifiers.is_some()
+        || class.members.has_trailing_comma
+        || class.members.nodes.len() != 3
+        || variable_owner.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+        || variable_owner.check_flags() != CheckFlags::NONE
+        || variable_owner.name().as_utf8() != Some(variable_name)
+        || variable_owner.declarations() != Some(&[declaration])
+        || variable_owner.value_declaration() != Some(declaration)
+        || variable_owner.parent().is_some()
+        || variable_owner.export_symbol().is_some()
+        || store.get_merged_symbol(variable_symbol) != Some(variable_symbol)
+        || locals.get_source(variable_name) != Some(variable_symbol)
+        || class_owner.flags() != SymbolFlags::CLASS
+        || class_owner.check_flags() != CheckFlags::NONE
+        || class_owner.name().as_utf8() != Some(class_name)
+        || class_owner.declarations() != Some(&[expression])
+        || class_owner.value_declaration() != Some(expression)
+        || class_owner.parent().is_some()
+        || class_owner.export_symbol().is_some()
+        || store.get_merged_symbol(class_symbol) != Some(class_symbol)
+        || [variable_symbol, class_symbol].iter().any(|symbol| {
+            store
+                .value_symbol_links(*symbol)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+                || store
+                    .declared_type_links(*symbol)
+                    .is_some_and(|links| links.declared_type.is_some())
+        })
+    {
+        return None;
+    }
+    Some((
+        RecoveredProtectedClass {
+            declaration: expression,
+            symbol: class_symbol,
+            name: class_name.to_owned(),
+        },
+        variable_symbol,
+    ))
+}
+
+#[allow(clippy::too_many_lines)] // Keep the complete external-module class graph authenticated.
+fn recover_private_static_class_self_references(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    host: &DeclaredTypeHost<'_>,
+    store: &CanonicalTypeMapperStore,
+    options: CanonicalCheckerOptions,
+    diagnostics: &CanonicalCheckerDiagnostics,
+    error: SourceCheckError,
+) -> bool {
+    let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(failure)) = error else {
+        return false;
+    };
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let Some(NodeData::SourceFile(source)) = arena
+        .get(bound.source_file().node)
+        .map(|record| &record.data)
+    else {
+        return false;
+    };
+    let [
+        enumeration,
+        first_class,
+        first_object,
+        second_class,
+        second_object,
+        expression,
+    ] = source.statements.nodes.as_slice()
+    else {
+        return false;
+    };
+    if !facts.is_external_module()
+        || facts.is_common_js_module()
+        || facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || !options.intrinsic.strict_null_checks
+        || !options.strict_property_initialization
+        || !bound.diagnostics().is_empty()
+        || !diagnostics.is_empty()
+    {
+        return false;
+    }
+    let Some(module) = bound.symbol(bound.source_file()) else {
+        return false;
+    };
+    let Some(module_owner) = store.symbol(module) else {
+        return false;
+    };
+    let Some((first, first_local)) =
+        recovered_exported_private_class(arena, bound, store, module, *first_class)
+    else {
+        return false;
+    };
+    let Some((second, second_local)) =
+        recovered_exported_private_class(arena, bound, store, module, *second_class)
+    else {
+        return false;
+    };
+    let Some((enum_symbol, enum_name)) = recovered_exported_private_enum(
+        arena,
+        bound,
+        host,
+        store,
+        module,
+        *enumeration,
+        [&first.name, &second.name],
+    ) else {
+        return false;
+    };
+    let Some(NodeData::ClassDeclaration(first_data)) =
+        arena.get(first.declaration.node).map(|record| &record.data)
+    else {
+        return false;
+    };
+    let [
+        first_private,
+        first_self,
+        first_type,
+        enum_method,
+        private_method,
+    ] = first_data.members.nodes.as_slice()
+    else {
+        return false;
+    };
+    let Some((first_private_symbol, first_private_name)) =
+        recovered_private_numeric_field(arena, bound, store, &first, *first_private)
+    else {
+        return false;
+    };
+    let Some((first_self_symbol, first_self_name)) =
+        recovered_static_class_self_construction(arena, bound, store, &first, *first_self)
+    else {
+        return false;
+    };
+    let Some((first_type_symbol, first_type_name)) = recovered_class_named_property(
+        arena,
+        bound,
+        store,
+        &first,
+        *first_type,
+        (&enum_name, &first.name),
+        false,
+    ) else {
+        return false;
+    };
+    let Some((enum_method, enum_return, enum_method_symbol)) =
+        recovered_private_class_method(arena, bound, store, &first, *enum_method, "getType")
+    else {
+        return false;
+    };
+    let Some((private_method, private_return, private_method_symbol)) =
+        recovered_private_class_method(arena, bound, store, &first, *private_method, "getPrivate")
+    else {
+        return false;
+    };
+    let Some((object_symbol, object_name)) = recovered_ambient_same_name_object(
+        arena,
+        bound,
+        store,
+        *first_object,
+        &second.name,
+        SyntaxKind::NumberKeyword,
+    ) else {
+        return false;
+    };
+    let Some(NodeData::ClassDeclaration(second_data)) = arena
+        .get(second.declaration.node)
+        .map(|record| &record.data)
+    else {
+        return false;
+    };
+    let [second_private, second_self, second_property] = second_data.members.nodes.as_slice()
+    else {
+        return false;
+    };
+    let Some((second_private_symbol, _)) =
+        recovered_private_numeric_field(arena, bound, store, &second, *second_private)
+    else {
+        return false;
+    };
+    let Some((second_self_symbol, second_self_name)) =
+        recovered_static_class_self_construction(arena, bound, store, &second, *second_self)
+    else {
+        return false;
+    };
+    let Some((second_property_symbol, second_property_name)) = recovered_class_named_property(
+        arena,
+        bound,
+        store,
+        &second,
+        *second_property,
+        (&object_name, &second.name),
+        true,
+    ) else {
+        return false;
+    };
+    let Some((named, variable_symbol)) =
+        recovered_named_private_class_expression(arena, bound, store, *expression)
+    else {
+        return false;
+    };
+    let Some((other_object_symbol, other_object_name)) = recovered_ambient_same_name_object(
+        arena,
+        bound,
+        store,
+        *second_object,
+        &named.name,
+        SyntaxKind::StringKeyword,
+    ) else {
+        return false;
+    };
+    let Some(NodeData::ClassExpression(named_data)) =
+        arena.get(named.declaration.node).map(|record| &record.data)
+    else {
+        return false;
+    };
+    let [named_private, named_self, named_property] = named_data.members.nodes.as_slice() else {
+        return false;
+    };
+    let Some((named_private_symbol, _)) =
+        recovered_private_numeric_field(arena, bound, store, &named, *named_private)
+    else {
+        return false;
+    };
+    let Some((named_self_symbol, named_self_name)) =
+        recovered_static_class_self_construction(arena, bound, store, &named, *named_self)
+    else {
+        return false;
+    };
+    let Some((named_property_symbol, named_property_name)) = recovered_class_named_property(
+        arena,
+        bound,
+        store,
+        &named,
+        *named_property,
+        (&other_object_name, &named.name),
+        false,
+    ) else {
+        return false;
+    };
+    let Some(module_exports) = module_owner
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+    else {
+        return false;
+    };
+    let Some(source_locals) = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+    else {
+        return false;
+    };
+    let first_self_node =
+        NodeRef::new(first.declaration.arena, first.declaration.file, *first_self);
+    [first.declaration, first_self_node].contains(&failure)
+        && module_owner.flags() == SymbolFlags::VALUE_MODULE
+        && module_exports.len() == 3
+        && module_exports.get_source(&enum_name) == Some(enum_symbol)
+        && module_exports.get_source(&first.name) == Some(first.symbol)
+        && module_exports.get_source(&second.name) == Some(second.symbol)
+        && source_locals.len() == 6
+        && source_locals.get_source(&first.name) == Some(first_local)
+        && source_locals.get_source(&second.name) == Some(second_local)
+        && source_locals.get_source(&object_name) == Some(object_symbol)
+        && source_locals.get_source(&other_object_name) == Some(other_object_symbol)
+        && first.symbol != second.symbol
+        && first.symbol != named.symbol
+        && second.symbol != named.symbol
+        && first_private_symbol != second_private_symbol
+        && first_private_symbol != named_private_symbol
+        && second_private_symbol != named_private_symbol
+        && first_self_symbol != second_self_symbol
+        && first_self_symbol != named_self_symbol
+        && first_self_name == named_self_name
+        && first_self_name != second_self_name
+        && second_property_symbol != named_property_symbol
+        && second_property_name == named_property_name
+        && first_type_symbol != enum_method_symbol
+        && enum_method_symbol != private_method_symbol
+        && variable_symbol != object_symbol
+        && variable_symbol != other_object_symbol
+        && recovered_private_class_enum_return(
+            arena,
+            bound,
+            enum_method,
+            enum_return,
+            &enum_name,
+            &first.name,
+            &first_type_name,
+        )
+        .is_some()
+        && recovered_private_class_private_return(
+            arena,
+            bound,
+            store,
+            &first,
+            private_method,
+            private_return,
+            (first_private_symbol, &first_private_name),
+        )
+        .is_some()
+        && [(&first, 4, 2), (&second, 1, 3), (&named, 2, 2)]
+            .into_iter()
+            .all(|(class, expected_members, expected_exports)| {
+                store.symbol(class.symbol).is_some_and(|owner| {
+                    owner
+                        .members()
+                        .and_then(|members| store.symbol_table(members))
+                        .is_some_and(|members| members.len() == expected_members)
+                        && owner
+                            .exports()
+                            .and_then(|exports| store.symbol_table(exports))
+                            .is_some_and(|exports| {
+                                exports.len() == expected_exports
+                                    && exports
+                                        .get_source("prototype")
+                                        .and_then(|prototype| store.symbol(prototype))
+                                        .is_some_and(|prototype| {
+                                            prototype.flags()
+                                                == (SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE)
+                                                && prototype.parent() == Some(class.symbol)
+                                        })
+                            })
+                })
+            })
         && recovered_source_node_caches_are_cold(arena, bound, store)
 }
 
@@ -43367,6 +44398,15 @@ pub(super) fn recover_strict_arguments_source(
     }
     if recover_static_class_self_references(arena, bound, host, store, diagnostics, error)
         || recover_namespace_async_static_arrows(arena, bound, store, diagnostics, error)
+        || recover_private_static_class_self_references(
+            arena,
+            bound,
+            host,
+            store,
+            options,
+            diagnostics,
+            error,
+        )
     {
         return Ok(true);
     }
@@ -58809,6 +59849,224 @@ mod tests {
             assert_eq!(observable_state(&context, file), poisoned);
             assert!(context.store().value_symbol_links(namespace).is_none());
             assert!(context.store().value_symbol_links(class).is_none());
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    const PRIVATE_STATIC_CLASS_SELF_REFERENCE_SOURCE: &str = concat!(
+        "export enum MyEnum { Foo = 'FooValue', Bar = 'BarValue' }\n",
+        "export class Foo {\n",
+        "  #private = 1;\n",
+        "  static instance = new Foo();\n",
+        "  type: MyEnum = MyEnum.Foo;\n",
+        "  getType(): MyEnum { return this.type || MyEnum.Foo; }\n",
+        "  getPrivate() { return this.#private; }\n",
+        "}\n",
+        "declare const obj: { Bar: number };\n",
+        "export class Bar {\n",
+        "  #data = 0;\n",
+        "  static ref = new Bar();\n",
+        "  static prop = obj.Bar;\n",
+        "}\n",
+        "declare const obj2: { Baz: string };\n",
+        "const MyClass = class Baz {\n",
+        "  #field = 1;\n",
+        "  static instance = new Baz();\n",
+        "  prop = obj2.Baz;\n",
+        "};\n",
+    );
+
+    #[test]
+    fn private_classes_preserve_static_self_identity_and_same_name_properties() {
+        let source = parsed(PRIVATE_STATIC_CLASS_SELF_REFERENCE_SOURCE);
+        let file = FileId::new(11_720);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                strict_property_initialization: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let (_, bound) = context.file(file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let exports = context
+            .store()
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .unwrap();
+        let first = exports.get_source("Foo").unwrap();
+        let second = exports.get_source("Bar").unwrap();
+        let expression = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let named = bound.symbol(expression).unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+        for class in [first, second, named] {
+            assert!(context.store().declared_type_links(class).is_none());
+            assert!(context.store().value_symbol_links(class).is_none());
+            let private = context
+                .store()
+                .symbol(class)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| {
+                    members
+                        .iter()
+                        .find_map(|(name, symbol)| name.is_private_identifier().then_some(symbol))
+                })
+                .unwrap();
+            assert!(
+                super::super::classes::authenticated_private_class_symbol_name(
+                    context.store(),
+                    class,
+                    private,
+                )
+                .is_some(),
+            );
+        }
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn private_static_classes_reject_unrelated_construction_and_property_names() {
+        for (index, text) in [
+            PRIVATE_STATIC_CLASS_SELF_REFERENCE_SOURCE.replacen("new Foo()", "new Bar()", 1),
+            PRIVATE_STATIC_CLASS_SELF_REFERENCE_SOURCE.replacen("new Baz()", "new Foo()", 1),
+            PRIVATE_STATIC_CLASS_SELF_REFERENCE_SOURCE.replace("obj.Bar", "obj.Foo"),
+            PRIVATE_STATIC_CLASS_SELF_REFERENCE_SOURCE.replace("FooValue", "WrongValue"),
+            PRIVATE_STATIC_CLASS_SELF_REFERENCE_SOURCE.replace(
+                "declare const obj: { Bar: number }",
+                "declare const obj: { Bar: string }",
+            ),
+            PRIVATE_STATIC_CLASS_SELF_REFERENCE_SOURCE.replace("export class Bar", "class Bar"),
+            format!("{PRIVATE_STATIC_CLASS_SELF_REFERENCE_SOURCE}const extra = 1;"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(&text);
+            let file = FileId::new(11_721 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    strict_property_initialization: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let cold = observable_state(&context, file);
+
+            assert!(context.check_source_file(file).is_err(), "{text}");
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn private_static_classes_reject_forged_private_owners_and_self_reference_caches() {
+        for poison in 0..3 {
+            let source = parsed(PRIVATE_STATIC_CLASS_SELF_REFERENCE_SOURCE);
+            let file = FileId::new(11_728 + poison);
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    strict_property_initialization: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let (_, bound) = context.file(file).unwrap();
+            let module = bound.symbol(bound.source_file()).unwrap();
+            let exports = context
+                .store()
+                .symbol(module)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .unwrap();
+            let first = exports.get_source("Foo").unwrap();
+            let second = exports.get_source("Bar").unwrap();
+            let private = context
+                .store()
+                .symbol(first)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| {
+                    members
+                        .iter()
+                        .find_map(|(name, symbol)| name.is_private_identifier().then_some(symbol))
+                })
+                .unwrap();
+            let construction = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+            match poison {
+                0 => assert!(context.store_mut_for_test().set_symbol_relationships(
+                    private,
+                    None,
+                    None,
+                    Some(second),
+                    None,
+                )),
+                1 => assert!(context.store_mut_for_test().set_type_node_links(
+                    construction,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    },
+                )),
+                2 => assert!(context.store_mut_for_test().set_value_symbol_links(
+                    private,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    },
+                )),
+                _ => unreachable!("only private class owner and construction poison is visited"),
+            }
+            let poisoned = observable_state(&context, file);
+
+            assert!(context.check_source_file(file).is_err(), "case {poison}");
+            assert_eq!(observable_state(&context, file), poisoned);
+            assert!(context.store().declared_type_links(first).is_none());
+            assert!(context.store().value_symbol_links(first).is_none());
             assert!(context.diagnostics().is_empty());
         }
     }
