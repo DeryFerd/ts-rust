@@ -21,6 +21,9 @@ use super::{
     ids::TypeId,
     links::ValueSymbolLinks,
     mapper::TypeMapper,
+    object_members::{
+        DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
+    },
     store::{SemanticStore, SourceNodeParent},
     type_records::{
         ConstrainedTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState, TypeData,
@@ -839,7 +842,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 continue;
             }
             if !record.object_flags().contains(ObjectFlags::OBJECT_LITERAL) {
-                return Err(DerivedTypeError::UnsupportedWideningType(*member));
+                if !matches!(
+                    validate_resolved_declared_property_object(self, *member),
+                    DeclaredPropertyObjectValidation::Valid(_)
+                ) {
+                    return Err(DerivedTypeError::UnsupportedWideningType(*member));
+                }
+                continue;
             }
 
             let mut regular_visiting = HashSet::new();
@@ -880,6 +889,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .type_payload(*member)
                 .ok_or(DerivedTypeError::Type(*member))?;
             if record.flags().intersects(TypeFlags::NULLABLE) {
+                constituents.push(WidenTransform::Identity(*member));
+                continue;
+            }
+            if !record.object_flags().contains(ObjectFlags::OBJECT_LITERAL) {
                 constituents.push(WidenTransform::Identity(*member));
                 continue;
             }
@@ -1517,6 +1530,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         for member in &data.union.types {
             let record = self.type_payload(*member)?;
             if record.flags().intersects(TypeFlags::NULLABLE) {
+                continue;
+            }
+            if !record.object_flags().contains(ObjectFlags::OBJECT_LITERAL) {
+                if !matches!(
+                    validate_resolved_declared_property_object(self, *member),
+                    DeclaredPropertyObjectValidation::Valid(_)
+                ) {
+                    return None;
+                }
                 continue;
             }
             let mut regular_visiting = HashSet::new();
@@ -3237,6 +3259,167 @@ mod tests {
                 .get_widened_type_with_global_types(value, &global_types),
             Ok(widened),
         );
+    }
+
+    #[test]
+    fn contextual_object_unions_preserve_declared_members_and_validate_their_provenance() {
+        let source = parsed(concat!(
+            "interface DeclaredInterface { valid: boolean; message: string } ",
+            "type DeclaredLiteral = { valid: boolean; detail: number }; ",
+            "declare const interfaceValue: DeclaredInterface; ",
+            "declare const literalValue: DeclaredLiteral; ",
+            "const first: any = { valid: true }; ",
+            "const second: any = { valid: true, highlighted: true }; ",
+            "const interfaceRead: any = interfaceValue; ",
+            "const literalRead: any = literalValue;",
+        ));
+        let file = FileId::new(84);
+        let mut context = checker_context(&[(file, &source)]);
+        context.check_source_file(file).unwrap();
+
+        let first =
+            resolved_expression_type(&context, variable_initializer(&source, file, "first"));
+        let second =
+            resolved_expression_type(&context, variable_initializer(&source, file, "second"));
+
+        for (read, declared_only_property) in
+            [("interfaceRead", "message"), ("literalRead", "detail")]
+        {
+            let declared =
+                resolved_expression_type(&context, variable_initializer(&source, file, read));
+            assert!(matches!(
+                validate_resolved_declared_property_object(context.store(), declared),
+                DeclaredPropertyObjectValidation::Valid(_)
+            ));
+            let union = context
+                .store_mut_for_test()
+                .expression_union_type(&[first, second, declared], UnionReduction::None)
+                .unwrap();
+
+            let flags = context
+                .store()
+                .type_payload(declared)
+                .unwrap()
+                .object_flags();
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_object_flags(declared, flags & !ObjectFlags::MEMBERS_RESOLVED)
+            );
+            let cold_poisoned = observable_state(context.store());
+            assert!(matches!(
+                context.store_mut_for_test().get_widened_type(union),
+                Err(DerivedTypeError::InvalidWidenedTypeCache { source, .. }) if source == union
+            ));
+            assert_eq!(observable_state(context.store()), cold_poisoned);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_object_flags(declared, flags)
+            );
+
+            let widened = context
+                .store_mut_for_test()
+                .get_widened_type(union)
+                .unwrap();
+            let TypeData::Union(widened_members) =
+                context.store().type_payload(widened).unwrap().data()
+            else {
+                panic!("fresh and declared objects must remain distinct union members");
+            };
+            assert_eq!(widened_members.union.types.len(), 3);
+            assert!(widened_members.union.types.contains(&declared));
+
+            let mut optional_highlighted = 0;
+            for member in widened_members
+                .union
+                .types
+                .iter()
+                .copied()
+                .filter(|member| *member != declared)
+            {
+                let shape = context.store().resolved_object_shape(member).unwrap();
+                assert_eq!(shape.properties.len(), 2);
+                assert!(
+                    shape.properties.iter().all(|property| {
+                        property.name.as_utf8() != Some(declared_only_property)
+                    })
+                );
+                let highlighted = property(&shape, "highlighted");
+                if context
+                    .store()
+                    .symbol(highlighted.symbol)
+                    .unwrap()
+                    .flags()
+                    .contains(SymbolFlags::OPTIONAL)
+                {
+                    optional_highlighted += 1;
+                    assert!(
+                        context.store().validate_contextual_widened_object_property(
+                            member,
+                            highlighted.symbol,
+                        )
+                    );
+                }
+            }
+            assert_eq!(optional_highlighted, 1);
+            assert!(
+                !context
+                    .store()
+                    .derived_types
+                    .contextual_widened_types
+                    .contains_key(&(union, declared))
+            );
+            assert!(
+                !context
+                    .store()
+                    .derived_types
+                    .widened_types
+                    .contains_key(&declared)
+            );
+
+            let warm = (
+                observable_state(context.store()),
+                context.store().derived_types.contextual_widened_types.len(),
+                context.store().derived_types.undefined_properties.len(),
+            );
+            assert_eq!(
+                context.store_mut_for_test().get_widened_type(union),
+                Ok(widened),
+            );
+            assert_eq!(
+                (
+                    observable_state(context.store()),
+                    context.store().derived_types.contextual_widened_types.len(),
+                    context.store().derived_types.undefined_properties.len(),
+                ),
+                warm,
+            );
+
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_object_flags(declared, flags & !ObjectFlags::MEMBERS_RESOLVED)
+            );
+            let poisoned = observable_state(context.store());
+            assert_eq!(
+                context.store_mut_for_test().get_widened_type(union),
+                Err(DerivedTypeError::InvalidWidenedTypeCache {
+                    source: union,
+                    cached: widened,
+                }),
+            );
+            assert_eq!(observable_state(context.store()), poisoned);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_object_flags(declared, flags)
+            );
+            assert_eq!(
+                context.store_mut_for_test().get_widened_type(union),
+                Ok(widened),
+            );
+        }
     }
 
     #[test]
