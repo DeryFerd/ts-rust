@@ -5703,6 +5703,11 @@ pub(super) fn authenticated_global_date_constructor_return(
                 resolved_type: Some(constructor),
                 ..ValueSymbolLinks::default()
             })
+        || store.type_node_links(value_annotation)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(constructor),
+                ..TypeNodeLinks::default()
+            })
         || store.symbol_node_links(value_annotation)
             != Some(&SymbolNodeLinks {
                 resolved_symbol: Some(owner),
@@ -5734,11 +5739,13 @@ pub(super) fn authenticated_global_date_constructor_return(
             .object_flags()
             .contains(ObjectFlags::INTERFACE)
         || instance_record.symbol() != Some(date)
+        || instance_record.alias().is_some()
         || constructor_record.flags() != TypeFlags::OBJECT
         || !constructor_record
             .object_flags()
             .contains(ObjectFlags::INTERFACE)
         || constructor_record.symbol() != Some(owner)
+        || constructor_record.alias().is_some()
         || record.flags() != SignatureFlags::CONSTRUCT
         || !record.parameters().is_empty()
         || !record.type_parameters().is_empty()
@@ -8528,6 +8535,156 @@ mod tests {
             assert_eq!(
                 validate_class_heritage_members(context.store(), model_type),
                 ClassHeritageMembersValidation::Valid,
+            );
+        }
+    }
+
+    #[test]
+    fn published_constructor_date_defaults_reject_forged_provider_types_and_aliases() {
+        let library = global_date_constructor_library();
+        let source = parse_source_file(concat!(
+            "class Model { ",
+            "constructor(readonly timestamp = new Date()) {} ",
+            "}",
+        ));
+        let library_file = FileId::new(1_879);
+        let source_file = FileId::new(1_880);
+        let mut context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+        let model = class_symbol(&source, source_file, &context, "Model");
+        let initializer = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        context.check_source_file(source_file).unwrap();
+
+        let (annotation, signature, instance, constructor, model_type) = {
+            let store = context.store();
+            let globals = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap();
+            let date = globals
+                .get_source("Date")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let owner = globals
+                .get_source("DateConstructor")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let annotation = store
+                .symbol(date)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .and_then(|declaration| store.source_direct_type_annotation(declaration))
+                .unwrap();
+            let signature = store
+                .signature_links(initializer)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let instance = store
+                .declared_type_links(date)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let constructor = store
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let model_type = store
+                .declared_type_links(model)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            (annotation, signature, instance, constructor, model_type)
+        };
+        let alias = context.store_mut_for_test().alloc_type_alias(None).unwrap();
+        assert_ne!(instance, constructor);
+
+        for poison in 0..3 {
+            match poison {
+                0 => assert!(context.store_mut_for_test().set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(instance),
+                        ..TypeNodeLinks::default()
+                    },
+                )),
+                1 => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_alias(instance, Some(alias))
+                ),
+                2 => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_alias(constructor, Some(alias))
+                ),
+                _ => unreachable!("Date provider poison cases are bounded"),
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().type_alias_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                authenticated_global_date_constructor_return(context.store(), signature),
+                None,
+                "case {poison}",
+            );
+            assert!(
+                !exact_global_date_initializer(context.store(), initializer, instance),
+                "case {poison}",
+            );
+            assert_eq!(
+                validate_class_heritage_members(context.store(), model_type),
+                ClassHeritageMembersValidation::Malformed,
+                "case {poison}",
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().type_alias_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+                "case {poison}",
+            );
+
+            match poison {
+                0 => assert!(context.store_mut_for_test().set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(constructor),
+                        ..TypeNodeLinks::default()
+                    },
+                )),
+                1 => assert!(context.store_mut_for_test().set_type_alias(instance, None)),
+                2 => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_alias(constructor, None)
+                ),
+                _ => unreachable!("Date provider poison cases are bounded"),
+            }
+            assert_eq!(
+                authenticated_global_date_constructor_return(context.store(), signature),
+                Some(instance),
+                "case {poison}",
+            );
+            assert_eq!(
+                validate_class_heritage_members(context.store(), model_type),
+                ClassHeritageMembersValidation::Valid,
+                "case {poison}",
             );
         }
     }
