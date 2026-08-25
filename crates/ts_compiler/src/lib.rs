@@ -1916,6 +1916,14 @@ impl Program {
     }
 
     fn load_remaining_program_graph(&mut self, file_system: &dyn FileSystem) {
+        if self.options.incremental
+            && self.options.incremental_specified
+            && self.options.ts_build_info_file.is_none()
+            && self.config_file_path.is_none()
+        {
+            self.diagnostics
+                .push(incremental_requires_config_diagnostic());
+        }
         if self.options.emit_declaration_only
             && !self.options.declaration
             && !self.options.composite
@@ -2310,6 +2318,16 @@ impl Program {
         if let Some(diagnostic) = program.common_source_directory_diagnostic(file_system) {
             config_diagnostics.push(diagnostic);
         }
+        config_diagnostics.sort_by(compare_program_diagnostics);
+        program.diagnostics.retain(|diagnostic| {
+            if diagnostic.file_name.is_some() {
+                return true;
+            }
+            diagnostic.code != Some(5074)
+                && !config_diagnostics.iter().any(|configured| {
+                    configured.code == diagnostic.code && configured.message == diagnostic.message
+                })
+        });
         config_diagnostics.append(&mut program.diagnostics);
         program.diagnostics = config_diagnostics;
         program
@@ -8764,6 +8782,18 @@ fn emit_declaration_only_diagnostic() -> ProgramDiagnostic {
     }
 }
 
+fn incremental_requires_config_diagnostic() -> ProgramDiagnostic {
+    let message = message_by_code(5074).expect("TS5074 must be in the generated catalog");
+    ProgramDiagnostic {
+        file_name: None,
+        range: None,
+        code: Some(message.code()),
+        category: message.category(),
+        message: message.text().to_owned(),
+        related_information: Vec::new(),
+    }
+}
+
 fn module_not_found_diagnostic(
     file_name: &str,
     range: TextRange,
@@ -8847,9 +8877,12 @@ fn compiler_option_diagnostic_range(
     diagnostic: &Diagnostic,
 ) -> Option<TextRange> {
     let (primary, fallback, value) = match diagnostic.code() {
+        5059 => ("reactNamespace", None, true),
+        5067 => ("jsxFactory", None, true),
         5095 | 5109 => ("moduleResolution", None, true),
         5110 => ("module", None, true),
         5096 => ("allowImportingTsExtensions", None, true),
+        18_035 => ("jsxFragmentFactory", None, true),
         5051 | 5052 | 5053 | 5069 | 5089 | 5091 | 5098 | 6082 => (
             diagnostic.arguments.first()?.as_str(),
             diagnostic.arguments.get(1).map(String::as_str),
@@ -15728,6 +15761,245 @@ export function create() { return new M.Value(); }"#,
             [5069]
         );
         assert!(program.emit().files.is_empty());
+    }
+
+    #[test]
+    fn incremental_compilation_requires_known_project_or_build_info() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/index.ts", "const value = 1;")
+            .unwrap();
+        let invalid = Program::new_with_options(
+            &fs,
+            "/project",
+            &["index.ts".to_owned()],
+            CompilerOptions {
+                incremental: true,
+                incremental_specified: true,
+                no_check: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let [diagnostic] = invalid.diagnostics() else {
+            panic!(
+                "expected one incremental diagnostic: {:?}",
+                invalid.diagnostics()
+            )
+        };
+        assert_eq!(diagnostic.code, Some(5074));
+        assert_eq!(
+            diagnostic.message,
+            "Option '--incremental' is only valid with a known configuration file (like 'tsconfig.json') or when '--tsBuildInfoFile' is explicitly provided.",
+        );
+
+        let explicit = Program::new_with_options(
+            &fs,
+            "/project",
+            &["index.ts".to_owned()],
+            CompilerOptions {
+                incremental: true,
+                incremental_specified: true,
+                ts_build_info_file: Some("/project/cache.tsbuildinfo".to_owned()),
+                no_check: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            explicit.diagnostics().is_empty(),
+            "{:?}",
+            explicit.diagnostics()
+        );
+
+        fs.write_file(
+            "/project/tsconfig.json",
+            concat!(
+                "{\"files\":[\"index.ts\"],\"compilerOptions\":{",
+                "\"incremental\":true,\"noCheck\":true,\"noLib\":true}}",
+            ),
+        )
+        .unwrap();
+        let configured = Program::from_config(&fs, "/project/tsconfig.json");
+        assert!(
+            configured.diagnostics().is_empty(),
+            "{:?}",
+            configured.diagnostics(),
+        );
+    }
+
+    #[test]
+    fn declaration_only_config_diagnostics_are_located_once_without_checking() {
+        let fs = MemoryFileSystem::new(true);
+        let config = concat!(
+            "{\n",
+            "  \"files\": [\"index.ts\"],\n",
+            "  \"compilerOptions\": {\n",
+            "    \"emitDeclarationOnly\": true,\n",
+            "    \"noCheck\": true,\n",
+            "    \"noEmit\": true,\n",
+            "    \"noLib\": true\n",
+            "  }\n",
+            "}\n",
+        );
+        fs.write_file("/project/tsconfig.json", config).unwrap();
+        fs.write_file("/project/index.ts", "export const value: number = 'wrong';")
+            .unwrap();
+
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected one declaration-only diagnostic: {:?}",
+                program.diagnostics()
+            )
+        };
+        assert_eq!(diagnostic.code, Some(5069));
+        let range = diagnostic.range.unwrap();
+        assert_eq!(
+            &config[usize::try_from(range.start.get()).unwrap()
+                ..usize::try_from(range.end.get()).unwrap()],
+            "\"emitDeclarationOnly\"",
+        );
+    }
+
+    #[test]
+    fn invalid_jsx_option_diagnostics_use_exact_config_value_ranges() {
+        for (options, code, value) in [
+            (
+                "\"jsxFactory\": \"Element.createElement=\"",
+                5067,
+                "\"Element.createElement=\"",
+            ),
+            (
+                "\"reactNamespace\": \"my-React-Lib\"",
+                5059,
+                "\"my-React-Lib\"",
+            ),
+            (
+                "\"jsxFactory\": \"h\", \"jsxFragmentFactory\": \"234\"",
+                18_035,
+                "\"234\"",
+            ),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            let config = format!(
+                "{{\"files\":[\"index.ts\"],\"compilerOptions\":{{{options},\"noLib\":true}}}}",
+            );
+            fs.write_file("/project/tsconfig.json", &config).unwrap();
+            fs.write_file("/project/index.ts", "export {};").unwrap();
+
+            let program = Program::from_config(&fs, "/project/tsconfig.json");
+            let [diagnostic] = program.diagnostics() else {
+                panic!("expected one JSX diagnostic: {:?}", program.diagnostics())
+            };
+            assert_eq!(diagnostic.code, Some(code));
+            let range = diagnostic.range.unwrap();
+            assert_eq!(
+                &config[usize::try_from(range.start.get()).unwrap()
+                    ..usize::try_from(range.end.get()).unwrap()],
+                value,
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_extension_import_diagnostic_uses_boolean_config_value() {
+        for (rewrite, expected) in [(false, Some(5096)), (true, None)] {
+            let fs = MemoryFileSystem::new(true);
+            let config = format!(concat!(
+                "{{\"files\":[\"index.ts\"],\"compilerOptions\":{{",
+                "\"allowImportingTsExtensions\":true,",
+                "\"rewriteRelativeImportExtensions\":{rewrite},",
+                "\"noCheck\":true,\"noLib\":true}}}}",
+            ),);
+            fs.write_file("/project/tsconfig.json", &config).unwrap();
+            fs.write_file("/project/index.ts", "export {};").unwrap();
+
+            let program = Program::from_config(&fs, "/project/tsconfig.json");
+            let diagnostic = program.diagnostics().first();
+            assert_eq!(diagnostic.and_then(|diagnostic| diagnostic.code), expected);
+            if let Some(diagnostic) = diagnostic {
+                let range = diagnostic.range.unwrap();
+                assert_eq!(
+                    &config[usize::try_from(range.start.get()).unwrap()
+                        ..usize::try_from(range.end.get()).unwrap()],
+                    "true",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_option_diagnostics_follow_source_span_order() {
+        let fs = MemoryFileSystem::new(true);
+        let config = concat!(
+            "{\n",
+            "  \"files\": [\"index.ts\"],\n",
+            "  \"compilerOptions\": {\n",
+            "    \"jsx\": \"react-jsx\",\n",
+            "    \"jsxFragmentFactory\": \"234\",\n",
+            "    \"jsxFactory\": \"h\",\n",
+            "    \"noEmit\": true,\n",
+            "    \"noLib\": true\n",
+            "  }\n",
+            "}\n",
+        );
+        fs.write_file("/project/tsconfig.json", config).unwrap();
+        fs.write_file("/project/index.ts", "export {};").unwrap();
+
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [5089, 18_035, 5089],
+        );
+        let spans = program
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| {
+                let range = diagnostic.range.unwrap();
+                &config[usize::try_from(range.start.get()).unwrap()
+                    ..usize::try_from(range.end.get()).unwrap()]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spans,
+            ["\"jsxFragmentFactory\"", "\"234\"", "\"jsxFactory\""]
+        );
+    }
+
+    #[test]
+    fn missing_node_module_kind_falls_back_to_compiler_options_config_key() {
+        let fs = MemoryFileSystem::new(true);
+        let config = concat!(
+            "{\n",
+            "  \"files\": [\"index.ts\"],\n",
+            "  \"compilerOptions\": {\n",
+            "    \"moduleResolution\": \"nodenext\",\n",
+            "    \"noEmit\": true,\n",
+            "    \"noLib\": true\n",
+            "  }\n",
+            "}\n",
+        );
+        fs.write_file("/project/tsconfig.json", config).unwrap();
+        fs.write_file("/project/index.ts", "export {};").unwrap();
+
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected one missing-module diagnostic: {:?}",
+                program.diagnostics()
+            )
+        };
+        assert_eq!(diagnostic.code, Some(5110));
+        let range = diagnostic.range.unwrap();
+        assert_eq!(
+            &config[usize::try_from(range.start.get()).unwrap()
+                ..usize::try_from(range.end.get()).unwrap()],
+            "\"compilerOptions\"",
+        );
     }
 
     #[test]

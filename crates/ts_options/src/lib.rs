@@ -1551,9 +1551,6 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
     validate_strict_options(options, diagnostics);
     validate_isolated_declaration_options(options, diagnostics);
 
-    if options.no_emit == Some(true) && options.emit_declaration_only == Some(true) {
-        diagnostics.push(diagnostic(5053, ["emitDeclarationOnly", "noEmit"]));
-    }
     if options.source_map == Some(true) && options.inline_source_map == Some(true) {
         diagnostics.push(diagnostic(5053, ["sourceMap", "inlineSourceMap"]));
     }
@@ -1583,6 +1580,12 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
 
     if options.check_js == Some(true) && options.allow_js == Some(false) {
         diagnostics.push(diagnostic(5052, ["checkJs", "allowJs"]));
+    }
+    if options.emit_declaration_only == Some(true) && !options_emit_declarations(options) {
+        diagnostics.push(diagnostic(
+            5069,
+            ["emitDeclarationOnly", "declaration", "composite"],
+        ));
     }
     if options.emit_decorator_metadata == Some(true)
         && options.experimental_decorators != Some(true)
@@ -1641,17 +1644,17 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
         diagnostics.push(diagnostic(5095, ["bundler"]));
     }
 
-    let (Some(module), Some(resolution)) = (options.module, options.module_resolution) else {
+    let Some(resolution) = options.module_resolution else {
         return;
     };
-    let required = match module {
-        ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20 => {
-            Some(ModuleResolutionKind::Node16)
+    let required = match options.module {
+        Some(module @ (ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20)) => {
+            Some((module, ModuleResolutionKind::Node16))
         }
-        ModuleKind::NodeNext => Some(ModuleResolutionKind::NodeNext),
+        Some(module @ ModuleKind::NodeNext) => Some((module, ModuleResolutionKind::NodeNext)),
         _ => None,
     };
-    if let Some(required) = required
+    if let Some((module, required)) = required
         && resolution != required
     {
         diagnostics.push(diagnostic(
@@ -1663,13 +1666,13 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
     match resolution {
         ModuleResolutionKind::Node16
             if !matches!(
-                module,
-                ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20
+                options.module,
+                Some(ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20)
             ) =>
         {
             diagnostics.push(diagnostic(5110, ["Node16", "Node16"]));
         }
-        ModuleResolutionKind::NodeNext if module != ModuleKind::NodeNext => {
+        ModuleResolutionKind::NodeNext if options.module != Some(ModuleKind::NodeNext) => {
             diagnostics.push(diagnostic(5110, ["NodeNext", "NodeNext"]));
         }
         _ => {}
@@ -1767,9 +1770,7 @@ fn validate_composite_options(options: &PartialOptions, diagnostics: &mut Vec<Di
 }
 
 fn validate_jsx_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>) {
-    let Some(jsx) = options.jsx else {
-        return;
-    };
+    let jsx = options.jsx.unwrap_or_default();
     let automatic = matches!(jsx, JsxEmit::ReactJsx | JsxEmit::ReactJsxDev);
     let jsx_name = match jsx {
         JsxEmit::ReactJsx => "react-jsx",
@@ -1777,41 +1778,57 @@ fn validate_jsx_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnost
         JsxEmit::React => "react",
         JsxEmit::Preserve => "preserve",
         JsxEmit::ReactNative => "react-native",
-        JsxEmit::None => return,
+        JsxEmit::None => "",
     };
+    let factory = options
+        .jsx_factory
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let fragment_factory = options
+        .jsx_fragment_factory
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let namespace = options
+        .react_namespace
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let import_source = options
+        .jsx_import_source
+        .as_deref()
+        .filter(|value| !value.is_empty());
 
-    if let Some(factory) = &options.jsx_factory {
-        if options.react_namespace.is_some() {
+    if let Some(factory) = factory {
+        if namespace.is_some() {
             diagnostics.push(diagnostic(5053, ["reactNamespace", "jsxFactory"]));
         }
         if automatic {
             diagnostics.push(diagnostic(5089, ["jsxFactory", jsx_name]));
         }
         if !is_jsx_entity_name(factory, false) {
-            diagnostics.push(diagnostic(5067, [factory.as_str()]));
+            diagnostics.push(diagnostic(5067, [factory]));
         }
-    } else if let Some(namespace) = &options.react_namespace
+    } else if let Some(namespace) = namespace
         && !is_jsx_identifier(namespace)
     {
-        diagnostics.push(diagnostic(5059, [namespace.as_str()]));
+        diagnostics.push(diagnostic(5059, [namespace]));
     }
 
-    if let Some(fragment_factory) = &options.jsx_fragment_factory {
-        if options.jsx_factory.is_none() {
+    if let Some(fragment_factory) = fragment_factory {
+        if factory.is_none() {
             diagnostics.push(diagnostic(5052, ["jsxFragmentFactory", "jsxFactory"]));
         }
         if automatic {
             diagnostics.push(diagnostic(5089, ["jsxFragmentFactory", jsx_name]));
         }
         if !is_jsx_entity_name(fragment_factory, true) {
-            diagnostics.push(diagnostic(18_035, [fragment_factory.as_str()]));
+            diagnostics.push(diagnostic(18_035, [fragment_factory]));
         }
     }
 
-    if automatic && options.react_namespace.is_some() {
+    if automatic && namespace.is_some() {
         diagnostics.push(diagnostic(5089, ["reactNamespace", jsx_name]));
     }
-    if jsx == JsxEmit::React && options.jsx_import_source.is_some() {
+    if jsx == JsxEmit::React && import_source.is_some() {
         diagnostics.push(diagnostic(5089, ["jsxImportSource", jsx_name]));
     }
 }
@@ -3313,6 +3330,47 @@ mod tests {
     }
 
     #[test]
+    fn validates_jsx_factory_options_without_an_explicit_jsx_mode() {
+        for (name, value, expected) in [
+            ("jsxFactory", "Element.createElement=", 5067),
+            ("reactNamespace", "my-React-Lib", 5059),
+        ] {
+            let invalid =
+                parse_compiler_options(&object([(name, JsonValue::String(value.to_owned()))]));
+            assert_eq!(
+                invalid
+                    .diagnostics
+                    .iter()
+                    .map(ts_diagnostics::Diagnostic::code)
+                    .collect::<Vec<_>>(),
+                [expected],
+                "{name}: {:?}",
+                invalid.diagnostics,
+            );
+        }
+
+        let fragment = parse_compiler_options(&object([(
+            "jsxFragmentFactory",
+            JsonValue::String("234".to_owned()),
+        )]));
+        assert_eq!(
+            fragment
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [5052, 18_035],
+        );
+
+        let empty = parse_compiler_options(&object([
+            ("jsxFactory", JsonValue::String(String::new())),
+            ("jsxFragmentFactory", JsonValue::String(String::new())),
+            ("reactNamespace", JsonValue::String(String::new())),
+        ]));
+        assert!(empty.is_ok(), "{:?}", empty.diagnostics);
+    }
+
+    #[test]
     fn parses_and_applies_preserve_const_enums() {
         let defaults = parse_compiler_options(&object([]));
         assert!(!defaults.options.preserve_const_enums);
@@ -3644,8 +3702,101 @@ mod tests {
                 .iter()
                 .map(ts_diagnostics::Diagnostic::code)
                 .collect::<Vec<_>>(),
-            [5053, 5109]
+            [5069, 5109]
         );
+    }
+
+    #[test]
+    fn node_module_resolution_requires_a_matching_explicit_module() {
+        for (resolution, expected) in [("node16", "Node16"), ("nodenext", "NodeNext")] {
+            let missing = parse_compiler_options(&object([(
+                "moduleResolution",
+                JsonValue::String(resolution.to_owned()),
+            )]));
+            assert_eq!(missing.diagnostics.len(), 1, "{resolution}");
+            assert_eq!(missing.diagnostics[0].code(), 5110);
+            assert_eq!(
+                missing.diagnostics[0].render().unwrap(),
+                format!(
+                    "Option 'module' must be set to '{expected}' when option 'moduleResolution' is set to '{expected}'."
+                ),
+            );
+
+            let matching = parse_compiler_options(&object([
+                ("module", JsonValue::String(resolution.to_owned())),
+                ("moduleResolution", JsonValue::String(resolution.to_owned())),
+            ]));
+            assert!(matching.is_ok(), "{resolution}: {:?}", matching.diagnostics);
+        }
+    }
+
+    #[test]
+    fn declaration_only_and_no_emit_follow_upstream_option_rules() {
+        let missing =
+            parse_compiler_options(&object([("emitDeclarationOnly", JsonValue::Bool(true))]));
+        assert_eq!(missing.diagnostics.len(), 1);
+        assert_eq!(missing.diagnostics[0].code(), 5069);
+        assert_eq!(
+            missing.diagnostics[0].render().unwrap(),
+            "Option 'emitDeclarationOnly' cannot be specified without specifying option 'declaration' or option 'composite'.",
+        );
+
+        let suppressed = parse_compiler_options(&object([
+            ("declaration", JsonValue::Bool(true)),
+            ("emitDeclarationOnly", JsonValue::Bool(true)),
+            ("noCheck", JsonValue::Bool(true)),
+            ("noEmit", JsonValue::Bool(true)),
+        ]));
+        assert!(suppressed.is_ok(), "{:?}", suppressed.diagnostics);
+
+        let unchecked_invalid = parse_compiler_options(&object([
+            ("emitDeclarationOnly", JsonValue::Bool(true)),
+            ("noCheck", JsonValue::Bool(true)),
+        ]));
+        assert_eq!(unchecked_invalid.diagnostics.len(), 1);
+        assert_eq!(unchecked_invalid.diagnostics[0].code(), 5069);
+
+        let isolated = parse_compiler_options(&object([
+            ("emitDeclarationOnly", JsonValue::Bool(true)),
+            ("isolatedDeclarations", JsonValue::Bool(true)),
+            ("noCheck", JsonValue::Bool(true)),
+        ]));
+        assert_eq!(
+            isolated
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [5069, 5069],
+        );
+        assert_eq!(isolated.diagnostics[0].arguments[0], "isolatedDeclarations");
+        assert_eq!(isolated.diagnostics[1].arguments[0], "emitDeclarationOnly");
+    }
+
+    #[test]
+    fn importing_typescript_extensions_accepts_each_upstream_emit_gate() {
+        for (gate, extra) in [
+            ("noEmit", None),
+            ("emitDeclarationOnly", Some("declaration")),
+            ("rewriteRelativeImportExtensions", None),
+        ] {
+            let mut entries = vec![
+                ("allowImportingTsExtensions", JsonValue::Bool(true)),
+                (gate, JsonValue::Bool(true)),
+            ];
+            if let Some(extra) = extra {
+                entries.push((extra, JsonValue::Bool(true)));
+            }
+            let valid = parse_compiler_options(&object(entries));
+            assert!(valid.is_ok(), "{gate}: {:?}", valid.diagnostics);
+        }
+
+        let unchecked = parse_compiler_options(&object([
+            ("allowImportingTsExtensions", JsonValue::Bool(true)),
+            ("noCheck", JsonValue::Bool(true)),
+        ]));
+        assert_eq!(unchecked.diagnostics.len(), 1);
+        assert_eq!(unchecked.diagnostics[0].code(), 5096);
     }
 
     #[test]
