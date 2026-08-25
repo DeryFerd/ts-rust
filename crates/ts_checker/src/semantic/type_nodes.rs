@@ -15315,6 +15315,49 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             TypeNodeUnavailable::InvalidLiteralType(node),
                         ));
                     }
+                    if let NodeData::CallSignatureDeclaration(signature) = &member_record.data
+                        && member_record.kind == SyntaxKind::CallSignature
+                    {
+                        for parameter in &signature.parameters.nodes {
+                            let parameter = NodeRef::new(member.arena, member.file, *parameter);
+                            let parameter_record =
+                                preflight_node(self.store, self.host, parameter)?;
+                            let NodeData::ParameterDeclaration(parameter_data) =
+                                &parameter_record.data
+                            else {
+                                return Err(type_node_unavailable(
+                                    TypeNodeUnavailable::InvalidLiteralType(node),
+                                ));
+                            };
+                            if parameter_record.kind != SyntaxKind::Parameter
+                                || parameter_record.parent != Some(member.node)
+                            {
+                                return Err(type_node_unavailable(
+                                    TypeNodeUnavailable::InvalidLiteralType(node),
+                                ));
+                            }
+                            if let Some(annotation) = parameter_data.type_ {
+                                contains |= self.type_node_contains_builtin_array_reference(
+                                    NodeRef::new(parameter.arena, parameter.file, annotation),
+                                    visited,
+                                )?;
+                            } else if parameter_data.dot_dot_dot_token.is_none() {
+                                return Err(type_node_unavailable(
+                                    TypeNodeUnavailable::UnsupportedSyntax {
+                                        node: member,
+                                        kind: SyntaxKind::CallSignature,
+                                    },
+                                ));
+                            }
+                        }
+                        if let Some(annotation) = signature.type_ {
+                            contains |= self.type_node_contains_builtin_array_reference(
+                                NodeRef::new(member.arena, member.file, annotation),
+                                visited,
+                            )?;
+                        }
+                        continue;
+                    }
                     let type_node = match (member_record.kind, &member_record.data) {
                         (
                             SyntaxKind::PropertyDeclaration,
@@ -16482,9 +16525,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         enums::get_enum_semantics(self.store, self.host, symbol).map_err(Into::into)
     }
 
-    /// Resolves the explicitly annotated return type of an exact function-type
-    /// signature. Return annotations remain lazy after the function object and
-    /// its parameter value types have been published.
+    /// Resolves an exact function-type or declared call-signature return type.
+    /// Function-type return annotations remain lazy after the callable and its
+    /// parameter value types have been published.
     pub(super) fn get_return_type_of_signature(
         &mut self,
         signature: SignatureId,
@@ -16608,6 +16651,42 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         match preflight_node(self.store, self.host, declaration)?.kind {
             SyntaxKind::FunctionDeclaration | SyntaxKind::ArrowFunction => {
                 return self.get_return_type_of_source_callable_signature(signature, declaration);
+            }
+            SyntaxKind::CallSignature => {
+                self.reject_type_reference_alias_capabilities()?;
+                let owner = self
+                    .store
+                    .declared_call_set_type_for_signature(signature)
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                            signature,
+                        ))
+                    })?;
+                let StoredCallableSetValidation::Valid { projection, .. } =
+                    validate_stored_callable_set(self.store, owner)
+                else {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                    ));
+                };
+                if !projection
+                    .call_signatures
+                    .iter()
+                    .any(|callable| callable.signature == signature)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                    ));
+                }
+                return self
+                    .store
+                    .signature(signature)
+                    .and_then(Signature::resolved_return_type)
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                            signature,
+                        ))
+                    });
             }
             SyntaxKind::FunctionType => {
                 if let Some(annotation) = self
@@ -19915,13 +19994,26 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         for signature in &literal.call_signatures {
             let mut parameter_types = Vec::with_capacity(signature.parameters.len());
             for parameter in &signature.parameters {
-                parameter_types.push(self.execute_type_node(
-                    parameter.type_node,
-                    plan,
-                    prepared,
-                )?);
+                parameter_types.push(if parameter.implicit_any_rest {
+                    source_callables::implicit_any_array_type(self.store).ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(
+                            signature.declaration,
+                        ))
+                    })?
+                } else {
+                    self.execute_type_node(parameter.type_node, plan, prepared)?
+                });
             }
-            let return_type = self.execute_type_node(signature.return_type, plan, prepared)?;
+            let return_type = if signature.implicit_any_return {
+                self.store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.any_type)
+                    .ok_or(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                    ))?
+            } else {
+                self.execute_type_node(signature.return_type, plan, prepared)?
+            };
             call_types.push(object_members::ResolvedCallSignatureTypes {
                 parameter_types,
                 return_type,
@@ -36990,6 +37082,303 @@ mod tests {
         assert_eq!(
             (store_state(&fixture.store), fixture.store.index_info_len()),
             warm_state
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep signature, rest, return, and warm identity together.
+    fn type_literal_call_signatures_preserve_implicit_any_rest_and_return_identity() {
+        for (source, implicit_return) in [
+            (
+                "type Callback = { (value: number, ...rest): string };",
+                false,
+            ),
+            ("type Callback = { (value: number, ...rest) };", true),
+        ] {
+            let mut fixture = fixture(source);
+            let alias =
+                canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Callback");
+            let literal = alias_parts(&fixture, "Callback").2;
+            let plan = {
+                let host = post_global_host(
+                    &fixture.parsed.arena,
+                    fixture.files.get(&fixture.file).unwrap(),
+                );
+                object_members::plan_type_literal(&fixture.store, &host, literal, Some(alias))
+                    .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+            };
+            let [planned] = plan.call_signatures.as_slice() else {
+                panic!("the type literal must retain exactly one binder-owned call signature")
+            };
+            assert_eq!(planned.implicit_any_return, implicit_return);
+            let [value, rest] = planned.parameters.as_slice() else {
+                panic!("the call signature must retain its value and rest parameters")
+            };
+            assert!(!value.implicit_any_rest);
+            assert!(rest.implicit_any_rest);
+            let declaration = planned.declaration;
+            let parameter_symbols = [value.symbol, rest.symbol];
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            let callable = query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+
+            let TypeData::Object(object) = fixture.store.type_payload(callable).unwrap().data()
+            else {
+                panic!("type-literal call signatures must retain their anonymous object")
+            };
+            assert_eq!(object.structured.call_signature_count, 1);
+            let [signature] = object.structured.signatures.as_deref().unwrap() else {
+                panic!("the type literal must publish exactly one canonical signature")
+            };
+            let signature = *signature;
+            let record = fixture.store.signature(signature).unwrap();
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let rest_type = source_callables::implicit_any_array_type(&fixture.store).unwrap();
+            let return_type = if implicit_return {
+                bootstrap.any_type
+            } else {
+                bootstrap.string_type
+            };
+            assert_eq!(record.declaration(), Some(declaration));
+            assert_eq!(record.flags(), SignatureFlags::HAS_REST_PARAMETER);
+            assert_eq!(record.parameters(), parameter_symbols.as_slice());
+            assert_eq!(record.min_argument_count(), 1);
+            assert_eq!(record.resolved_return_type(), Some(return_type));
+            assert_eq!(
+                fixture.store.callable_signature_parameter_types(signature),
+                Some([bootstrap.number_type, rest_type].as_slice()),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(parameter_symbols[1])
+                    .and_then(|links| links.resolved_type),
+                Some(rest_type),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .function_signature_return_annotation(signature)
+                    .is_none(),
+                implicit_return,
+            );
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(&fixture.store, callable)
+            else {
+                panic!("the published call signature must remain fully authenticated")
+            };
+            let [projected] = projection.call_signatures.as_ref() else {
+                panic!("the callable projection must expose exactly one call signature")
+            };
+            assert_eq!(projected.signature, signature);
+            assert_eq!(projected.parameters, [bootstrap.number_type]);
+            assert_eq!(projected.rest_parameter, Some(rest_type));
+            assert_eq!(projected.return_type, Some(return_type));
+            assert_eq!(
+                query_signature_return(&mut fixture, signature, &mut diagnostics),
+                Ok(return_type),
+            );
+
+            let warm = function_store_state(&fixture.store);
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(callable),
+            );
+            assert_eq!(
+                query_signature_return(&mut fixture, signature, &mut diagnostics),
+                Ok(return_type),
+            );
+            assert_eq!(function_store_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn mixed_type_literal_signatures_preserve_implicit_call_rest_and_constructor_identity() {
+        let mut fixture = fixture(concat!(
+            "type Callback = { ",
+            "new(value: string): number; ",
+            "(value: number, ...rest) ",
+            "};",
+        ));
+        let alias =
+            canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Callback");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let TypeData::Object(object) = fixture.store.type_payload(callable).unwrap().data() else {
+            panic!("mixed signatures must retain their anonymous object")
+        };
+        assert_eq!(object.structured.call_signature_count, 1);
+        let [call, construct] = object.structured.signatures.as_deref().unwrap() else {
+            panic!("mixed signatures must publish the call before the constructor")
+        };
+        let (call, construct) = (*call, *construct);
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (any, number, string) = (
+            bootstrap.any_type,
+            bootstrap.number_type,
+            bootstrap.string_type,
+        );
+        let rest = source_callables::implicit_any_array_type(&fixture.store).unwrap();
+        let call_record = fixture.store.signature(call).unwrap();
+        assert_eq!(call_record.flags(), SignatureFlags::HAS_REST_PARAMETER);
+        assert_eq!(call_record.min_argument_count(), 1);
+        assert_eq!(call_record.resolved_return_type(), Some(any));
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(call),
+            Some([number, rest].as_slice()),
+        );
+        assert!(
+            fixture
+                .store
+                .function_signature_return_annotation(call)
+                .is_none()
+        );
+        let construct_record = fixture.store.signature(construct).unwrap();
+        assert_eq!(construct_record.flags(), SignatureFlags::CONSTRUCT);
+        assert_eq!(construct_record.resolved_return_type(), Some(number));
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(construct),
+            Some([string].as_slice()),
+        );
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, callable)
+        else {
+            panic!("mixed implicit signatures must retain both authenticated families")
+        };
+        let [projected] = projection.call_signatures.as_ref() else {
+            panic!("the mixed object must expose one call signature")
+        };
+        assert_eq!(projected.signature, call);
+        assert_eq!(projected.rest_parameter, Some(rest));
+        assert_eq!(projection.construct_signatures.as_ref(), &[construct]);
+        assert_eq!(
+            query_signature_return(&mut fixture, call, &mut diagnostics),
+            Ok(any)
+        );
+
+        let warm = function_store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(callable),
+        );
+        assert_eq!(
+            query_signature_return(&mut fixture, call, &mut diagnostics),
+            Ok(any)
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn type_literal_call_signatures_reject_untyped_nonrest_parameters_atomically() {
+        let mut fixture = fixture("type Invalid = { (value): string };");
+        let alias = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Invalid");
+        let before = function_store_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert!(matches!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    kind: SyntaxKind::CallSignature,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(function_store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn type_literal_implicit_rest_rejects_forged_parameter_identity() {
+        let mut fixture = fixture("type Callback = { (value: number, ...rest) };");
+        let alias =
+            canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Callback");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let TypeData::Object(object) = fixture.store.type_payload(callable).unwrap().data() else {
+            panic!("the call signature must retain its type-literal owner")
+        };
+        let [signature] = object.structured.signatures.as_deref().unwrap() else {
+            panic!("the type literal must retain exactly one signature")
+        };
+        let rest = *fixture
+            .store
+            .signature(*signature)
+            .unwrap()
+            .parameters()
+            .last()
+            .unwrap();
+        let original = fixture.store.value_symbol_links(rest).unwrap().clone();
+        let forged = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_value_symbol_links(
+            rest,
+            ValueSymbolLinks {
+                resolved_type: Some(forged),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(matches!(
+            validate_stored_callable_set(&fixture.store, callable),
+            StoredCallableSetValidation::Malformed { .. }
+        ));
+
+        let poisoned = function_store_state(&fixture.store);
+        assert!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .is_err(),
+        );
+        assert_eq!(function_store_state(&fixture.store), poisoned);
+
+        assert!(fixture.store.set_value_symbol_links(rest, original));
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(callable),
         );
         assert!(diagnostics.is_empty());
     }

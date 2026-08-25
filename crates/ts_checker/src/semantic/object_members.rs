@@ -5,8 +5,9 @@
 //! and executes property, index, and signature annotations so one query
 //! retains a single dependency graph and resolution stack. Call and construct
 //! signatures retain authenticated generic parameters, overload order, and
-//! supported rest parameters. Construct signatures can also retain trailing
-//! optional `any` parameters.
+//! supported rest parameters. Type-literal calls may retain an implicit `any`
+//! return and trailing implicit `any[]` rest parameter. Construct signatures
+//! can also retain trailing optional `any` parameters.
 //! Named interface and type-literal methods retain their own binder symbols,
 //! authenticated method type parameters, annotated required or optional
 //! parameters, and authenticated array, tuple, or inferred rest parameters.
@@ -46,6 +47,7 @@ use super::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
     },
     signatures::SignatureFlags,
+    source_callables::implicit_any_array_type,
     source_namespaces::authenticated_merged_namespace_interface,
     store::SourceNodeParent,
     type_records::{
@@ -176,6 +178,7 @@ pub(super) struct PlannedCallParameter {
     identity_node: NodeRef,
     null_literal_identity: bool,
     optional: bool,
+    pub(super) implicit_any_rest: bool,
 }
 
 /// One binder-owned type parameter declared directly on a source signature.
@@ -223,6 +226,7 @@ pub(super) struct PlannedCallSignature {
     return_identity_node: NodeRef,
     return_null_literal_identity: bool,
     flags: SignatureFlags,
+    pub(super) implicit_any_return: bool,
 }
 
 impl PlannedCallSignature {
@@ -253,7 +257,7 @@ impl PlannedCallSignature {
         self.parameters
             .iter()
             .take(fixed)
-            .position(|parameter| parameter.optional)
+            .position(|parameter| parameter.optional || parameter.implicit_any_rest)
             .unwrap_or(fixed)
     }
 }
@@ -372,9 +376,10 @@ impl PropertyObjectPlan {
                         signature
                             .parameters
                             .iter()
+                            .filter(|parameter| !parameter.implicit_any_rest)
                             .map(|parameter| parameter.type_node),
                     )
-                    .chain(std::iter::once(signature.return_type))
+                    .chain((!signature.implicit_any_return).then_some(signature.return_type))
             })
             .chain(self.methods.iter().flat_map(|method| {
                 method
@@ -751,11 +756,7 @@ pub(super) fn validate_stored_declared_call_set(
         let Some(return_type) = signature_record.resolved_return_type() else {
             return StoredDeclaredCallSetValidation::Malformed;
         };
-        let Some((return_annotation, null_literal_identity)) =
-            store.function_signature_return_annotation(signature)
-        else {
-            return StoredDeclaredCallSetValidation::Malformed;
-        };
+        let return_annotation = store.function_signature_return_annotation(signature);
         let Ok(minimum) = usize::try_from(signature_record.min_argument_count()) else {
             return StoredDeclaredCallSetValidation::Malformed;
         };
@@ -827,12 +828,23 @@ pub(super) fn validate_stored_declared_call_set(
             || signature_record.isolated_signature_type().is_some()
             || signature_record.composite().is_some()
             || store.signature_has_circular_return_type(signature)
-            || !valid_signature_return_annotation(
-                store,
-                return_annotation,
-                null_literal_identity,
-                return_type,
-            )
+            || !match return_annotation {
+                Some((annotation, null_literal_identity)) => valid_signature_return_annotation(
+                    store,
+                    annotation,
+                    null_literal_identity,
+                    return_type,
+                ),
+                None => {
+                    !construct
+                        && store.source_node_kind(provider_declaration)
+                            == Some(SyntaxKind::TypeLiteral)
+                        && store.source_direct_type_annotation(declaration).is_none()
+                        && store
+                            .intrinsic_bootstrap()
+                            .is_some_and(|bootstrap| return_type == bootstrap.any_type)
+                }
+            }
             || parameter_types.len() != signature_record.parameters().len()
         {
             return StoredDeclaredCallSetValidation::Malformed;
@@ -868,6 +880,15 @@ pub(super) fn validate_stored_declared_call_set(
                         resolved_type: Some(*type_),
                         ..ValueSymbolLinks::default()
                     })
+                || declared_signature_parameter_is_implicit_any_rest(
+                    store,
+                    *parameter_declaration,
+                    *type_,
+                ) != (has_rest
+                    && parameter_index == fixed_parameter_count
+                    && store
+                        .source_direct_type_annotation(*parameter_declaration)
+                        .is_none())
                 || declared_signature_parameter_is_optional(store, *parameter_declaration, *type_)
                     .is_none_or(|optional| {
                         optional
@@ -875,9 +896,13 @@ pub(super) fn validate_stored_declared_call_set(
                                 && parameter_index >= minimum
                                 && parameter_index < fixed_parameter_count)
                     })
-                || declared_signature_parameter_is_rest(store, *parameter_declaration).is_none_or(
-                    |rest| rest != (has_rest && parameter_index == fixed_parameter_count),
-                )
+                || store
+                    .source_direct_type_annotation(*parameter_declaration)
+                    .is_some()
+                    && declared_signature_parameter_is_rest(store, *parameter_declaration)
+                        .is_none_or(|rest| {
+                            rest != (has_rest && parameter_index == fixed_parameter_count)
+                        })
             {
                 return StoredDeclaredCallSetValidation::Malformed;
             }
@@ -903,7 +928,10 @@ fn declared_signature_parameter_is_optional(
     declaration: NodeRef,
     type_: TypeId,
 ) -> Option<bool> {
-    let annotation = store.source_direct_type_annotation(declaration)?;
+    let Some(annotation) = store.source_direct_type_annotation(declaration) else {
+        return declared_signature_parameter_is_implicit_any_rest(store, declaration, type_)
+            .then_some(false);
+    };
     let question_index = annotation.node.index().checked_sub(1)?;
     let question = NodeRef::new(
         declaration.arena,
@@ -961,6 +989,39 @@ pub(super) fn declared_signature_parameter_is_rest(
         return None;
     }
     Some(found)
+}
+
+fn declared_signature_parameter_is_implicit_any_rest(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    type_: TypeId,
+) -> bool {
+    let Some(SourceNodeParent::Parent(signature)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(owner)) = store.source_node_parent(signature) else {
+        return false;
+    };
+    if store.source_node_kind(declaration) != Some(SyntaxKind::Parameter)
+        || store.source_node_kind(signature) != Some(SyntaxKind::CallSignature)
+        || store.source_node_kind(owner) != Some(SyntaxKind::TypeLiteral)
+        || store.source_direct_type_annotation(declaration).is_some()
+        || implicit_any_array_type(store) != Some(type_)
+    {
+        return false;
+    }
+    (0..declaration.node.index()).any(|index| {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let token = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            ts_ast::NodeId::new(index),
+        );
+        store.source_node_kind(token) == Some(SyntaxKind::DotDotDotToken)
+            && store.source_node_parent(token) == Some(SourceNodeParent::Parent(declaration))
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6312,6 +6373,7 @@ fn plan_interface_accessor(
                 identity_node: annotation,
                 null_literal_identity: false,
                 optional: false,
+                implicit_any_rest: false,
             }),
         )
     };
@@ -6847,6 +6909,7 @@ fn plan_interface_method_parameter(
             identity_node,
             null_literal_identity: is_null_literal_type(store, host, identity_node)?,
             optional,
+            implicit_any_rest: false,
         },
         rest.is_some(),
         optional,
@@ -6899,6 +6962,8 @@ fn plan_call_signature(
         _ => return Err(unsupported()),
     };
     let is_construct = record.kind == SyntaxKind::ConstructSignature;
+    let type_literal_call =
+        !is_construct && store.source_node_kind(owner) == Some(SyntaxKind::TypeLiteral);
     if record.parent != Some(owner.node)
         || record.flags.0 != 0
         || full_signature.is_some()
@@ -6910,17 +6975,23 @@ fn plan_call_signature(
     {
         return Err(unsupported());
     }
-    let Some(return_id) = type_ else {
-        return Err(unsupported());
+    let implicit_any_return = type_.is_none() && type_literal_call;
+    let return_type = match type_ {
+        Some(return_id) => {
+            let return_type = NodeRef::new(declaration.arena, declaration.file, return_id);
+            let return_record =
+                preflight_node(store, host, return_type).map_err(|_| unsupported())?;
+            if return_record.parent != Some(declaration.node)
+                || return_record.range.start < parameter_nodes.range.end
+                || return_record.range.end > record.range.end
+            {
+                return Err(unsupported());
+            }
+            return_type
+        }
+        None if implicit_any_return => declaration,
+        None => return Err(unsupported()),
     };
-    let return_type = NodeRef::new(declaration.arena, declaration.file, return_id);
-    let return_record = preflight_node(store, host, return_type).map_err(|_| unsupported())?;
-    if return_record.parent != Some(declaration.node)
-        || return_record.range.start < parameter_nodes.range.end
-        || return_record.range.end > record.range.end
-    {
-        return Err(unsupported());
-    }
 
     let bound = host.bound_file(declaration).ok_or_else(unsupported)?;
     let raw_call_symbol = bound.symbol(declaration).ok_or_else(unsupported)?;
@@ -7029,16 +7100,54 @@ fn plan_call_signature(
         {
             return Err(unsupported());
         }
-        let Some(type_id) = data.type_ else {
-            return Err(unsupported());
+        let implicit_any_rest =
+            type_literal_call && data.dot_dot_dot_token.is_some() && data.type_.is_none();
+        let (type_node, type_start, literal_type) = match data.type_ {
+            Some(type_id) => {
+                let type_node = NodeRef::new(parameter.arena, parameter.file, type_id);
+                let type_record =
+                    preflight_node(store, host, type_node).map_err(|_| unsupported())?;
+                if type_record.parent != Some(parameter.node)
+                    || type_record.range.start < name_record.range.end
+                    || type_record.range.end > parameter_record.range.end
+                {
+                    return Err(unsupported());
+                }
+                (
+                    type_node,
+                    type_record.range.start,
+                    type_record.kind == SyntaxKind::LiteralType,
+                )
+            }
+            None if implicit_any_rest => {
+                let dependency = parameters
+                    .last()
+                    .map(|previous: &PlannedCallParameter| previous.type_node)
+                    .or((!implicit_any_return).then_some(return_type))
+                    .ok_or_else(unsupported)?;
+                if implicit_any_array_type(store).is_none() {
+                    return Err(unsupported());
+                }
+                (dependency, parameter_record.range.end, false)
+            }
+            None => return Err(unsupported()),
         };
-        let type_node = NodeRef::new(parameter.arena, parameter.file, type_id);
-        let type_record = preflight_node(store, host, type_node).map_err(|_| unsupported())?;
-        if type_record.parent != Some(parameter.node)
-            || type_record.range.start < name_record.range.end
-            || type_record.range.end > parameter_record.range.end
-        {
-            return Err(unsupported());
+        if let Some(token) = data.dot_dot_dot_token {
+            let token = NodeRef::new(parameter.arena, parameter.file, token);
+            let token_record = preflight_node(store, host, token).map_err(|_| unsupported())?;
+            if index + 1 != parameter_nodes.nodes.len()
+                || token_record.kind != SyntaxKind::DotDotDotToken
+                || !matches!(token_record.data, NodeData::Token(_))
+                || token_record.flags.0 != 0
+                || token_record.parent != Some(parameter.node)
+                || token_record.range.start < parameter_record.range.start
+                || token_record.range.end > name_record.range.start
+                || !implicit_any_rest
+                    && !valid_declared_rest_parameter_annotation(store, host, type_node, false)
+            {
+                return Err(unsupported());
+            }
+            flags |= SignatureFlags::HAS_REST_PARAMETER;
         }
         let optional = if let Some(token) = data.question_token {
             let token = NodeRef::new(parameter.arena, parameter.file, token);
@@ -7050,9 +7159,17 @@ fn plan_call_signature(
                 || token_record.flags.0 != 0
                 || token_record.parent != Some(parameter.node)
                 || token_record.range.start < name_record.range.end
-                || token_record.range.end > type_record.range.start
-                || type_record.kind != SyntaxKind::AnyKeyword
-                || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
+                || token_record.range.end > type_start
+                || preflight_node(store, host, type_node)
+                    .map_err(|_| unsupported())?
+                    .kind
+                    != SyntaxKind::AnyKeyword
+                || !matches!(
+                    preflight_node(store, host, type_node)
+                        .map_err(|_| unsupported())?
+                        .data,
+                    NodeData::KeywordTypeNode(_)
+                )
             {
                 return Err(unsupported());
             }
@@ -7060,19 +7177,11 @@ fn plan_call_signature(
         } else {
             false
         };
-        if rest.is_some() {
-            if index + 1 != parameter_nodes.nodes.len()
-                || !valid_declared_rest_parameter_annotation(store, host, type_node, false)
-            {
-                return Err(unsupported());
-            }
-            flags |= SignatureFlags::HAS_REST_PARAMETER;
-        }
-        if optional_seen && !optional && rest.is_none() {
+        if optional_seen && !optional && rest.is_none() || implicit_any_rest && optional {
             return Err(unsupported());
         }
         optional_seen |= optional;
-        if type_record.kind == SyntaxKind::LiteralType {
+        if literal_type {
             flags |= SignatureFlags::HAS_LITERAL_TYPES;
         }
 
@@ -7099,13 +7208,19 @@ fn plan_call_signature(
         {
             return Err(unsupported());
         }
-        let identity_node = peel_parenthesized_type(store, host, type_node)?;
+        let identity_node = if implicit_any_rest {
+            name
+        } else {
+            peel_parenthesized_type(store, host, type_node)?
+        };
         parameters.push(PlannedCallParameter {
             symbol: parameter_symbol,
             type_node,
             identity_node,
-            null_literal_identity: is_null_literal_type(store, host, identity_node)?,
+            null_literal_identity: !implicit_any_rest
+                && is_null_literal_type(store, host, identity_node)?,
             optional,
+            implicit_any_rest,
         });
     }
     if locals.is_some_and(|locals| locals.len() != parameters.len() + type_parameters.len()) {
@@ -7114,7 +7229,11 @@ fn plan_call_signature(
     if i32::try_from(parameters.len()).is_err() {
         return Err(unsupported());
     }
-    let return_identity_node = peel_parenthesized_type(store, host, return_type)?;
+    let return_identity_node = if implicit_any_return {
+        declaration
+    } else {
+        peel_parenthesized_type(store, host, return_type)?
+    };
     Ok(PlannedCallSignature {
         declaration,
         symbol: call_symbol,
@@ -7122,8 +7241,10 @@ fn plan_call_signature(
         parameters,
         return_type,
         return_identity_node,
-        return_null_literal_identity: is_null_literal_type(store, host, return_identity_node)?,
+        return_null_literal_identity: !implicit_any_return
+            && is_null_literal_type(store, host, return_identity_node)?,
         flags,
+        implicit_any_return,
     })
 }
 
@@ -9568,6 +9689,55 @@ fn valid_signature_return_annotation(
         && store.source_node_parent(*declaration) == Some(SourceNodeParent::Parent(node))
 }
 
+fn valid_planned_signature_return(
+    store: &CanonicalTypeMapperStore,
+    signature: &PlannedCallSignature,
+    type_: TypeId,
+) -> bool {
+    if signature.implicit_any_return {
+        signature.return_type == signature.declaration
+            && signature.return_identity_node == signature.declaration
+            && !signature.return_null_literal_identity
+            && store.source_node_kind(signature.declaration) == Some(SyntaxKind::CallSignature)
+            && matches!(
+                store.source_node_parent(signature.declaration),
+                Some(SourceNodeParent::Parent(owner))
+                    if store.source_node_kind(owner) == Some(SyntaxKind::TypeLiteral)
+            )
+            && store
+                .source_direct_type_annotation(signature.declaration)
+                .is_none()
+            && store
+                .intrinsic_bootstrap()
+                .is_some_and(|bootstrap| type_ == bootstrap.any_type)
+    } else {
+        valid_signature_return_annotation(
+            store,
+            signature.return_identity_node,
+            signature.return_null_literal_identity,
+            type_,
+        )
+    }
+}
+
+fn planned_call_parameter_type(
+    store: &CanonicalTypeMapperStore,
+    parameter: &PlannedCallParameter,
+) -> Option<TypeId> {
+    if parameter.implicit_any_rest {
+        let declaration = store.symbol(parameter.symbol)?.value_declaration()?;
+        let type_ = implicit_any_array_type(store)?;
+        declared_signature_parameter_is_implicit_any_rest(store, declaration, type_)
+            .then_some(type_)
+    } else {
+        cached_annotation_identity(
+            store,
+            parameter.identity_node,
+            parameter.null_literal_identity,
+        )
+    }
+}
+
 fn peel_parenthesized_type(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -10080,16 +10250,11 @@ fn validate_resolved_call_signature(
         || record.composite().is_some()
         || store.signature_has_circular_return_type(signature)
         || store.function_signature_return_annotation(signature)
-            != Some((
+            != (!planned.implicit_any_return).then_some((
                 planned.return_identity_node,
                 planned.return_null_literal_identity,
             ))
-        || !valid_signature_return_annotation(
-            store,
-            planned.return_identity_node,
-            planned.return_null_literal_identity,
-            return_type,
-        )
+        || !valid_planned_signature_return(store, planned, return_type)
         || parameter_types.len() != planned.parameters.len()
     {
         return None;
@@ -10100,15 +10265,16 @@ fn validate_resolved_call_signature(
         .then(|| planned.parameters.len().saturating_sub(1));
     for (index, (parameter, type_)) in planned.parameters.iter().zip(parameter_types).enumerate() {
         let declaration = store.symbol(parameter.symbol)?.value_declaration()?;
-        if cached_annotation_identity(
-            store,
-            parameter.identity_node,
-            parameter.null_literal_identity,
-        ) != Some(*type_)
+        let actual_rest = if parameter.implicit_any_rest {
+            declared_signature_parameter_is_implicit_any_rest(store, declaration, *type_)
+                .then_some(true)
+        } else {
+            declared_signature_parameter_is_rest(store, declaration)
+        };
+        if planned_call_parameter_type(store, parameter) != Some(*type_)
             || declared_signature_parameter_is_optional(store, declaration, *type_)
                 != Some(parameter.optional)
-            || declared_signature_parameter_is_rest(store, declaration)
-                != Some(rest_index == Some(index))
+            || actual_rest != Some(rest_index == Some(index))
             || store.value_symbol_links(parameter.symbol)
                 != Some(&ValueSymbolLinks {
                     resolved_type: Some(*type_),
@@ -10848,10 +11014,15 @@ pub(super) fn publish_declared_members(
         .filter_map(|accessor| accessor.parameter)
         .filter(|parameter| store.value_symbol_links(parameter.symbol).is_none())
         .count();
+    let annotated_signature_count = plan
+        .call_signatures
+        .iter()
+        .filter(|signature| !signature.implicit_any_return)
+        .count();
     if !store.try_reserve_index_infos(plan.indexes.len())
         || !store.try_reserve_signatures(plan.call_signatures.len())
         || !store.try_reserve_value_symbol_links(missing_accessor_links)
-        || !store.try_reserve_function_signature_return_annotations(plan.call_signatures.len())
+        || !store.try_reserve_function_signature_return_annotations(annotated_signature_count)
         || !store.try_reserve_callable_signature_parameter_types(plan.call_signatures.len())
         || !store.try_reserve_declared_call_set_provenance(
             usize::from(!plan.call_signatures.is_empty()),
@@ -10862,29 +11033,21 @@ pub(super) fn publish_declared_members(
     }
 
     for (planned, resolved) in plan.call_signatures.iter().zip(call_types) {
-        if !valid_signature_return_annotation(
-            store,
-            planned.return_identity_node,
-            planned.return_null_literal_identity,
-            resolved.return_type,
-        ) || planned
-            .parameters
-            .iter()
-            .zip(&resolved.parameter_types)
-            .any(|(parameter, type_)| {
-                cached_annotation_identity(
-                    store,
-                    parameter.identity_node,
-                    parameter.null_literal_identity,
-                ) != Some(*type_)
-                    || store
-                        .symbol(parameter.symbol)
-                        .and_then(ts_binder::semantic::Symbol::value_declaration)
-                        .and_then(|declaration| {
-                            declared_signature_parameter_is_optional(store, declaration, *type_)
-                        })
-                        != Some(parameter.optional)
-            })
+        if !valid_planned_signature_return(store, planned, resolved.return_type)
+            || planned
+                .parameters
+                .iter()
+                .zip(&resolved.parameter_types)
+                .any(|(parameter, type_)| {
+                    planned_call_parameter_type(store, parameter) != Some(*type_)
+                        || store
+                            .symbol(parameter.symbol)
+                            .and_then(ts_binder::semantic::Symbol::value_declaration)
+                            .and_then(|declaration| {
+                                declared_signature_parameter_is_optional(store, declaration, *type_)
+                            })
+                            != Some(parameter.optional)
+                })
         {
             return Err(invalid_cache(plan, type_));
         }
@@ -10937,11 +11100,13 @@ pub(super) fn publish_declared_members(
         assert!(store.set_declared_call_set_provenance(type_, &signatures));
     }
     for (planned, signature) in plan.call_signatures.iter().zip(&signatures) {
-        assert!(store.set_function_signature_return_annotation(
-            *signature,
-            planned.return_identity_node,
-            planned.return_null_literal_identity,
-        ));
+        if !planned.implicit_any_return {
+            assert!(store.set_function_signature_return_annotation(
+                *signature,
+                planned.return_identity_node,
+                planned.return_null_literal_identity,
+            ));
+        }
         assert!(store.set_signature_links(
             planned.declaration,
             SignatureLinks {
