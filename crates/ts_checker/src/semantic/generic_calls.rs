@@ -2172,18 +2172,7 @@ fn infer_generic_call_type_arguments(
         } else {
             InferenceLiteralTreatment::Widen
         };
-        let candidate = if !contravariant_buckets[index].is_empty() {
-            infer_naked_type_parameter_variance_candidates(
-                store,
-                &buckets[index],
-                &contravariant_buckets[index],
-                treatment,
-                shape.array_targets,
-                |store, source, target| is_assignable(store, source, target),
-                |store, source, target| is_strict_subtype(store, source, target),
-                |store, source, target| is_subtype(store, source, target),
-            )?
-        } else {
+        let candidate = if contravariant_buckets[index].is_empty() {
             match shape.array_targets {
                 Some(array_targets) => infer_naked_type_parameter_candidates_with_array_targets(
                     store,
@@ -2201,6 +2190,17 @@ fn infer_generic_call_type_arguments(
                     |store, source, target| is_subtype(store, source, target),
                 )?,
             }
+        } else {
+            infer_naked_type_parameter_variance_candidates(
+                store,
+                &buckets[index],
+                &contravariant_buckets[index],
+                treatment,
+                shape.array_targets,
+                |store, source, target| is_assignable(store, source, target),
+                |store, source, target| is_strict_subtype(store, source, target),
+                |store, source, target| is_subtype(store, source, target),
+            )?
         };
         let mut argument = match candidate {
             Some(candidate) => candidate,
