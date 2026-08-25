@@ -1863,6 +1863,9 @@ fn namespace_generic_annotation_requires_deferral(
     namespace: SemanticSymbolId,
     annotation: NodeRef,
 ) -> Result<bool, SourceCheckError> {
+    if authenticated_react_mixin_statics_annotation(arena, bound, store, namespace, annotation) {
+        return Ok(true);
+    }
     let mut pending = vec![annotation];
     let mut visited = HashSet::new();
     while let Some(node) = pending.pop() {
@@ -1939,6 +1942,143 @@ fn namespace_generic_annotation_requires_deferral(
         record.for_each_child(|nested| pending.push(child(node, nested)));
     }
     Ok(false)
+}
+
+/// Keeps only React Mixin's optional `{ [key: string]: any }` statics property cold.
+fn authenticated_react_mixin_statics_annotation(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    annotation: NodeRef,
+) -> bool {
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let Some(namespace_owner) = store.symbol(namespace) else {
+        return false;
+    };
+    let Some(annotation_record) = arena.get(annotation.node) else {
+        return false;
+    };
+    let NodeData::TypeLiteralNode(literal) = &annotation_record.data else {
+        return false;
+    };
+    let [index] = literal.members.nodes.as_slice() else {
+        return false;
+    };
+    let index = child(annotation, *index);
+    let Some(index_record) = arena.get(index.node) else {
+        return false;
+    };
+    let NodeData::IndexSignatureDeclaration(index_data) = &index_record.data else {
+        return false;
+    };
+    let [parameter] = index_data.parameters.nodes.as_slice() else {
+        return false;
+    };
+    let parameter = child(index, *parameter);
+    let Some(parameter_record) = arena.get(parameter.node) else {
+        return false;
+    };
+    let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return false;
+    };
+    let Some(key_type) = parameter_data.type_.map(|type_| child(parameter, type_)) else {
+        return false;
+    };
+    let value_type = child(index, index_data.type_);
+    let Some(property) = annotation_record
+        .parent
+        .map(|parent| child(annotation, parent))
+    else {
+        return false;
+    };
+    let Some(property_record) = arena.get(property.node) else {
+        return false;
+    };
+    let NodeData::PropertyDeclaration(property_data) = &property_record.data else {
+        return false;
+    };
+    let property_name = child(property, property_data.name);
+    let Some(property_name_record) = arena.get(property_name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(property_identifier) = &property_name_record.data else {
+        return false;
+    };
+    let Some(interface) = property_record.parent.map(|parent| child(property, parent)) else {
+        return false;
+    };
+    let Some(interface_symbol) = bound
+        .symbol(interface)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(interface_owner) = store.symbol(interface_symbol) else {
+        return false;
+    };
+    let Some(property_symbol) = bound
+        .symbol(property)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(property_owner) = store.symbol(property_symbol) else {
+        return false;
+    };
+
+    facts.is_declaration_file()
+        && !facts.is_default_library()
+        && namespace_owner.name().as_utf8() == Some("React")
+        && namespace_owner.flags().intersects(SymbolFlags::NAMESPACE)
+        && namespace_owner.check_flags() == CheckFlags::NONE
+        && interface_owner.name().as_utf8() == Some("Mixin")
+        && interface_owner.flags().without(SymbolFlags::TRANSIENT) == SymbolFlags::INTERFACE
+        && interface_owner.check_flags() == CheckFlags::NONE
+        && store.get_parent_of_symbol(interface_symbol) == Some(namespace)
+        && namespace_owner
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("Mixin"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            == Some(interface_symbol)
+        && annotation_record.kind == SyntaxKind::TypeLiteral
+        && !literal.members.has_trailing_comma
+        && literal.symbol.is_none()
+        && property_record.kind == SyntaxKind::PropertyDeclaration
+        && property_record.parent == Some(interface.node)
+        && property_data.type_ == Some(annotation.node)
+        && property_data.postfix_token.is_some()
+        && property_name_record.kind == SyntaxKind::Identifier
+        && property_name_record.parent == Some(property.node)
+        && property_identifier.text == "statics"
+        && property_owner.name().as_utf8() == Some("statics")
+        && property_owner.flags() == SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL
+        && property_owner.check_flags() == CheckFlags::NONE
+        && store.get_parent_of_symbol(property_symbol) == Some(interface_symbol)
+        && interface_owner
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("statics"))
+            == Some(property_symbol)
+        && index_record.kind == SyntaxKind::IndexSignature
+        && index_record.parent == Some(annotation.node)
+        && index_data.type_parameters.is_none()
+        && index_data.modifiers.is_none()
+        && !index_data.parameters.has_trailing_comma
+        && parameter_record.kind == SyntaxKind::Parameter
+        && parameter_record.parent == Some(index.node)
+        && parameter_data.dot_dot_dot_token.is_none()
+        && parameter_data.question_token.is_none()
+        && parameter_data.initializer.is_none()
+        && arena.get(key_type.node).is_some_and(|record| {
+            record.kind == SyntaxKind::StringKeyword && record.parent == Some(parameter.node)
+        })
+        && arena.get(value_type.node).is_some_and(|record| {
+            record.kind == SyntaxKind::AnyKeyword && record.parent == Some(index.node)
+        })
 }
 
 /// Keeps only React's `mixins?: Array<Mixin<P, S>>` self-reference lazy.
@@ -14777,6 +14917,7 @@ mod tests {
                 "interface ComponentLifecycle<P, S, SS = any> {} ",
                 "interface Mixin<P, S> extends ComponentLifecycle<P, S> { ",
                 "mixins?: Array<Mixin<P, S>>; ",
+                "statics?: { [key: string]: any; }; ",
                 "getDefaultProps?(): P; getInitialState?(): S; ",
                 "} }",
             ),
@@ -14795,9 +14936,12 @@ mod tests {
             panic!("React must retain its lifecycle and generic mixin")
         };
         let mixins = generic.properties[0].annotation;
+        let statics = generic.properties[1].annotation;
 
         assert!(annotations.contains(&mixins));
         assert!(generic.annotation_is_deferred(mixins));
+        assert!(annotations.contains(&statics));
+        assert!(generic.annotation_is_deferred(statics));
         assert_eq!(generic.methods.len(), 2);
     }
 
