@@ -465,6 +465,40 @@ struct AuthenticatedBrandedConditional {
     false_type: TypeId,
 }
 
+#[derive(Clone, Copy)]
+struct AuthenticatedStringMapping {
+    symbol: SemanticSymbolId,
+    kind: StringMappingKind,
+    target: TypeId,
+}
+
+#[derive(Clone)]
+enum AuthenticatedBrandedStringRelation {
+    Intersections {
+        source: AuthenticatedBrandedStringIntersection,
+        target: AuthenticatedBrandedStringIntersection,
+    },
+    ProjectedIntersection {
+        source: TypeId,
+        target: TypeId,
+    },
+    Unrelated,
+    Templates {
+        source_texts: Vec<String>,
+        source_intersections: Vec<AuthenticatedBrandedStringIntersection>,
+        target_texts: Vec<String>,
+        target_intersections: Vec<AuthenticatedBrandedStringIntersection>,
+    },
+    Mappings {
+        source: AuthenticatedStringMapping,
+        target: AuthenticatedStringMapping,
+    },
+    LiteralMapping {
+        literal: TypeId,
+        mapping: TypeId,
+    },
+}
+
 /// One validated own property from the exact property-only object domain.
 ///
 /// This projection deliberately omits apparent/global members and index
@@ -1487,6 +1521,14 @@ impl<'store> RelaterSession<'store> {
             return self.branded_conditional_types_related_to(&source, &target, intersection_state);
         }
 
+        if (source_flags | target_flags).intersects(
+            TypeFlags::INTERSECTION | TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING,
+        ) && let Some(related) =
+            self.authenticated_branded_string_related_to(source, target, intersection_state)?
+        {
+            return Ok(related);
+        }
+
         if source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
             && self.cold_global_object_matches_empty_interface(source, target)?
@@ -1869,6 +1911,28 @@ impl<'store> RelaterSession<'store> {
         target: AuthenticatedBrandedStringIntersection,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
+        let forward = self.branded_string_intersection_directionally_related_to(
+            source,
+            target,
+            intersection_state,
+        )?;
+        if forward == Ternary::False {
+            return Ok(Ternary::False);
+        }
+        let reverse = self.branded_string_intersection_directionally_related_to(
+            target,
+            source,
+            intersection_state,
+        )?;
+        Ok(forward & reverse)
+    }
+
+    fn branded_string_intersection_directionally_related_to(
+        &mut self,
+        source: AuthenticatedBrandedStringIntersection,
+        target: AuthenticatedBrandedStringIntersection,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
         let literal = self.is_related_to_ex(
             source.literal,
             target.literal,
@@ -1878,22 +1942,93 @@ impl<'store> RelaterSession<'store> {
         if literal == Ternary::False {
             return Ok(Ternary::False);
         }
-        let forward = self.is_related_to_ex(
+        let brand = self.is_related_to_ex(
             source.brand,
             target.brand,
             RecursionFlags::BOTH,
             intersection_state,
         )?;
-        if forward == Ternary::False {
-            return Ok(Ternary::False);
-        }
-        let reverse = self.is_related_to_ex(
-            target.brand,
-            source.brand,
-            RecursionFlags::BOTH,
-            intersection_state,
-        )?;
-        Ok(literal & forward & reverse)
+        Ok(literal & brand)
+    }
+
+    fn authenticated_branded_string_related_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+    ) -> Result<Option<Ternary>, RelationUnavailable> {
+        let Some(relation) =
+            self.store
+                .authenticated_branded_string_relation(source, target, self.relation)?
+        else {
+            return Ok(None);
+        };
+        self.branded_string_relation_related_to(relation, intersection_state)
+            .map(Some)
+    }
+
+    fn branded_string_relation_related_to(
+        &mut self,
+        relation: AuthenticatedBrandedStringRelation,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        let related = match relation {
+            AuthenticatedBrandedStringRelation::Intersections { source, target } => self
+                .branded_string_intersection_directionally_related_to(
+                    source,
+                    target,
+                    intersection_state,
+                )?,
+            AuthenticatedBrandedStringRelation::ProjectedIntersection { source, target } => {
+                self.is_related_to_ex(source, target, RecursionFlags::BOTH, intersection_state)?
+            }
+            AuthenticatedBrandedStringRelation::Unrelated => Ternary::False,
+            AuthenticatedBrandedStringRelation::Templates {
+                source_texts,
+                source_intersections,
+                target_texts,
+                target_intersections,
+            } => {
+                if source_texts != target_texts
+                    || source_intersections.len() != target_intersections.len()
+                {
+                    return Ok(Ternary::False);
+                }
+                let mut result = Ternary::True;
+                for (source, target) in source_intersections.iter().zip(target_intersections) {
+                    let related = self.branded_string_intersection_directionally_related_to(
+                        *source,
+                        target,
+                        intersection_state,
+                    )?;
+                    if related == Ternary::False {
+                        return Ok(Ternary::False);
+                    }
+                    result &= related;
+                }
+                result
+            }
+            AuthenticatedBrandedStringRelation::Mappings { source, target } => {
+                if source.symbol != target.symbol || source.kind != target.kind {
+                    Ternary::False
+                } else {
+                    self.is_related_to_ex(
+                        source.target,
+                        target.target,
+                        RecursionFlags::BOTH,
+                        intersection_state,
+                    )?
+                }
+            }
+            AuthenticatedBrandedStringRelation::LiteralMapping { literal, mapping } => {
+                bool_to_ternary(
+                    self.store
+                        .is_member_of_string_mapping(literal, mapping)
+                        .map_err(|_| RelationUnavailable::MalformedStructuredType(mapping))?,
+                )
+            }
+        };
+        Ok(related)
     }
 
     /// A property-free function cannot satisfy a canonical tuple, and a tuple
@@ -6332,6 +6467,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 || self.is_simple_type_related_to(source, target, relation, bootstrap)?;
             return Ok(related);
         }
+        if (source_flags | target_flags).intersects(
+            TypeFlags::INTERSECTION | TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING,
+        ) && let Some(branded_relation) =
+            self.authenticated_branded_string_relation(source, target, relation)?
+        {
+            let mut session = RelaterSession::new_with_global_types_and_options(
+                self,
+                relation,
+                bootstrap,
+                global_types,
+                strict_function_types,
+            );
+            session.observe_type_surface(original_source);
+            session.observe_type_surface(original_target);
+            let result = session
+                .branded_string_relation_related_to(branded_relation, IntersectionState::NONE)?;
+            return Ok(session.finish_without_specialized_root_cache(result));
+        }
         if !relation.is_identity() {
             if let Some(related) =
                 self.authenticated_template_literal_relation(source, target, relation)?
@@ -6574,6 +6727,204 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Err(RelationUnavailable::MalformedStructuredType(type_));
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // Branded strings and mappings share one ordered admission.
+    fn authenticated_branded_string_relation(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+    ) -> Result<Option<AuthenticatedBrandedStringRelation>, RelationUnavailable> {
+        let source_flags = self.type_flags(source)?;
+        let target_flags = self.type_flags(target)?;
+        if relation.is_identity() && source_flags != target_flags {
+            return Ok(None);
+        }
+
+        if source_flags == TypeFlags::INTERSECTION || target_flags == TypeFlags::INTERSECTION {
+            let source_intersection = if source_flags == TypeFlags::INTERSECTION {
+                self.authenticated_branded_string_intersection_if_present(source)?
+            } else {
+                None
+            };
+            let target_intersection = if target_flags == TypeFlags::INTERSECTION {
+                self.authenticated_branded_string_intersection_if_present(target)?
+            } else {
+                None
+            };
+            return Ok(match (source_intersection, target_intersection) {
+                (Some(source), Some(target)) => {
+                    Some(AuthenticatedBrandedStringRelation::Intersections { source, target })
+                }
+                (Some(source), None) if target_flags == TypeFlags::OBJECT => {
+                    Some(AuthenticatedBrandedStringRelation::ProjectedIntersection {
+                        source: source.brand,
+                        target,
+                    })
+                }
+                (Some(source), None) if target_flags.intersects(TypeFlags::STRING_LIKE) => {
+                    Some(AuthenticatedBrandedStringRelation::ProjectedIntersection {
+                        source: source.literal,
+                        target,
+                    })
+                }
+                (None, Some(_))
+                    if source_flags.intersects(TypeFlags::STRING_LIKE | TypeFlags::OBJECT) =>
+                {
+                    Some(AuthenticatedBrandedStringRelation::Unrelated)
+                }
+                _ => None,
+            });
+        }
+
+        if source_flags == TypeFlags::TEMPLATE_LITERAL
+            && target_flags == TypeFlags::TEMPLATE_LITERAL
+        {
+            let source = self.authenticated_branded_conditional_operand(source)?;
+            let target = self.authenticated_branded_conditional_operand(target)?;
+            return Ok(match (source, target) {
+                (
+                    Some(AuthenticatedBrandedConditionalOperand::Template {
+                        texts: source_texts,
+                        intersections: source_intersections,
+                    }),
+                    Some(AuthenticatedBrandedConditionalOperand::Template {
+                        texts: target_texts,
+                        intersections: target_intersections,
+                    }),
+                ) => Some(AuthenticatedBrandedStringRelation::Templates {
+                    source_texts,
+                    source_intersections,
+                    target_texts,
+                    target_intersections,
+                }),
+                _ => None,
+            });
+        }
+
+        if source_flags == TypeFlags::STRING_MAPPING && target_flags == TypeFlags::STRING_MAPPING {
+            return Ok(Some(AuthenticatedBrandedStringRelation::Mappings {
+                source: self.authenticated_string_mapping_type(source)?,
+                target: self.authenticated_string_mapping_type(target)?,
+            }));
+        }
+
+        if !relation.is_identity() {
+            let pair = if source_flags == TypeFlags::STRING_LITERAL
+                && target_flags == TypeFlags::STRING_MAPPING
+            {
+                Some((source, target))
+            } else if relation == RelationKind::Comparable
+                && source_flags == TypeFlags::STRING_MAPPING
+                && target_flags == TypeFlags::STRING_LITERAL
+            {
+                Some((target, source))
+            } else {
+                None
+            };
+            if let Some((literal, mapping)) = pair {
+                self.validate_union_constituent(literal)
+                    .map_err(|error| union_validation_unavailable(literal, error))?;
+                self.authenticated_string_mapping_type(mapping)?;
+                return Ok(Some(AuthenticatedBrandedStringRelation::LiteralMapping {
+                    literal,
+                    mapping,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn authenticated_branded_string_intersection_if_present(
+        &self,
+        type_: TypeId,
+    ) -> Result<Option<AuthenticatedBrandedStringIntersection>, RelationUnavailable> {
+        let record = self
+            .type_payload(type_)
+            .ok_or(RelationUnavailable::Type(type_))?;
+        if record.flags() != TypeFlags::INTERSECTION {
+            return Ok(None);
+        }
+        let TypeData::Intersection(intersection) = record.data() else {
+            return Err(RelationUnavailable::MalformedIntersection(type_));
+        };
+        let [literal, brand] = intersection.intersection.types.as_slice() else {
+            return Ok(None);
+        };
+        if self.type_flags(*literal)? != TypeFlags::STRING_LITERAL
+            || self.type_flags(*brand)? != TypeFlags::OBJECT
+        {
+            return Ok(None);
+        }
+        self.authenticated_branded_string_intersection(type_)
+            .map(Some)
+    }
+
+    fn authenticated_string_mapping_type(
+        &self,
+        type_: TypeId,
+    ) -> Result<AuthenticatedStringMapping, RelationUnavailable> {
+        let mut active = HashSet::new();
+        let mut current = type_;
+        let mut first = None;
+        loop {
+            let malformed = RelationUnavailable::MalformedStructuredType(current);
+            if !active.insert(current) {
+                return Err(malformed);
+            }
+            let record = self.type_payload(current).ok_or(malformed)?;
+            let TypeData::StringMapping(mapping) = record.data() else {
+                return Err(malformed);
+            };
+            let symbol = record.symbol().ok_or(malformed)?;
+            let kind = self.string_mapping_kind(symbol).map_err(|_| malformed)?;
+            if record.flags() != TypeFlags::STRING_MAPPING
+                || record.alias().is_some()
+                || self
+                    .symbol(symbol)
+                    .is_none_or(|symbol| !symbol.flags().contains(SymbolFlags::TYPE_ALIAS))
+                || self.get_merged_symbol(symbol) != Some(symbol)
+                || self
+                    .cached_resolved_string_mapping_type(symbol, mapping.target)
+                    .map_err(|_| malformed)?
+                    != Some(current)
+            {
+                return Err(malformed);
+            }
+            if first.is_none() {
+                first = Some(AuthenticatedStringMapping {
+                    symbol,
+                    kind,
+                    target: mapping.target,
+                });
+            }
+
+            let target = self.type_payload(mapping.target).ok_or(malformed)?;
+            match target.data() {
+                TypeData::StringMapping(_) => current = mapping.target,
+                TypeData::TemplateLiteral(template) => {
+                    self.authenticate_template_literal_type(mapping.target)?;
+                    for placeholder in &template.types {
+                        if self.type_flags(*placeholder)? == TypeFlags::INTERSECTION {
+                            self.authenticated_branded_string_intersection_if_present(
+                                *placeholder,
+                            )?;
+                        }
+                    }
+                    break;
+                }
+                TypeData::Intersection(_) => {
+                    self.validate_intersection_type(mapping.target)
+                        .map_err(|_| RelationUnavailable::MalformedIntersection(mapping.target))?;
+                    break;
+                }
+                _ => break,
+            }
+        }
+
+        first.ok_or(RelationUnavailable::MalformedStructuredType(type_))
     }
 
     fn authenticated_branded_conditional_function_pair(
@@ -6867,13 +7218,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 {
                     return Ok(None);
                 }
+                let mut intersections = Vec::with_capacity(template.types.len());
+                for placeholder in &template.types {
+                    let Some(intersection) =
+                        self.authenticated_branded_string_intersection_if_present(*placeholder)?
+                    else {
+                        return Ok(None);
+                    };
+                    intersections.push(intersection);
+                }
                 self.authenticate_template_literal_type(type_)?;
-                let intersections = template
-                    .types
-                    .iter()
-                    .copied()
-                    .map(|type_| self.authenticated_branded_string_intersection(type_))
-                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(Some(AuthenticatedBrandedConditionalOperand::Template {
                     texts: template.texts.clone(),
                     intersections,
@@ -6902,26 +7256,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 let Some(intersection) = candidate else {
                     return Ok(None);
                 };
-                let symbol = record.symbol().ok_or_else(malformed)?;
-                let kind = self.string_mapping_kind(symbol).map_err(|_| malformed())?;
-                if record.flags() != TypeFlags::STRING_MAPPING
-                    || record.alias().is_some()
-                    || self
-                        .symbol(symbol)
-                        .is_none_or(|record| !record.flags().contains(SymbolFlags::TYPE_ALIAS))
-                    || self.get_merged_symbol(symbol) != Some(symbol)
-                    || self
-                        .cached_resolved_string_mapping_type(symbol, mapping.target)
-                        .map_err(|_| malformed())?
-                        != Some(type_)
-                {
-                    return Err(malformed());
-                }
+                let mapping = self.authenticated_string_mapping_type(type_)?;
                 let intersection = self.authenticated_branded_string_intersection(intersection)?;
                 Ok(Some(
                     AuthenticatedBrandedConditionalOperand::StringMapping {
-                        symbol,
-                        kind,
+                        symbol: mapping.symbol,
+                        kind: mapping.kind,
                         intersection,
                     },
                 ))
@@ -9229,6 +9569,471 @@ mod tests {
             Err(RelationUnavailable::MalformedFunctionType(left))
         );
         assert_eq!(fixture.store.relation_state_snapshot(), poisoned);
+    }
+
+    #[test]
+    fn branded_conditional_string_fixture_checks_without_diagnostics() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "type Uppercase<Input extends string> = intrinsic;",
+        ));
+        let source = parse_source_file(concat!(
+            "let a: (<T>() => T extends `${'a' & { a: 1 }}` ? 1 : 2) = null!; ",
+            "let b: (<T>() => T extends `${'a' & { a: 1 }}` ? 1 : 2) = null!; ",
+            "a = b; ",
+            "let c: (<T>() => T extends Uppercase<'a' & { a: 1 }> ? 1 : 2) = null!; ",
+            "let d: (<T>() => T extends Uppercase<'a' & { a: 1 }> ? 1 : 2) = null!; ",
+            "c = d;",
+        ));
+        assert!(library.diagnostics.is_empty());
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(96_470);
+        let mut context =
+            source_relation_context(&library, &source, file, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().conditional_root_len(),
+            context.store().relation_state_snapshot(),
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().conditional_root_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One branded intersection graph covers every direction.
+    fn branded_string_intersections_preserve_directional_structural_assignability() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Wide = 'a' & { tag: 1 }; ",
+            "type Same = 'a' & { tag: 1 }; ",
+            "type Narrow = 'a' & { tag: 1; extra: 2 }; ",
+            "type OtherLiteral = 'b' & { tag: 1 }; ",
+            "type OtherBrand = 'a' & { tag: 2 }; ",
+            "type Shape = { tag: 1 };",
+        ));
+        let [wide, same, narrow, other_literal, other_brand, shape] = [
+            "Wide",
+            "Same",
+            "Narrow",
+            "OtherLiteral",
+            "OtherBrand",
+            "Shape",
+        ]
+        .map(|name| query_type_alias(&mut fixture, name));
+        let literal = fixture
+            .store
+            .regular_string_literal_type("a".into())
+            .unwrap();
+        let wrong_literal = fixture
+            .store
+            .regular_string_literal_type("b".into())
+            .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+
+        assert_eq!(fixture.store.is_type_assignable_to(wide, same), Ok(true));
+        assert_eq!(fixture.store.is_type_assignable_to(narrow, wide), Ok(true));
+        assert_eq!(fixture.store.is_type_assignable_to(wide, narrow), Ok(false));
+        assert_eq!(
+            fixture.store.is_type_assignable_to(wide, other_literal),
+            Ok(false),
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(wide, other_brand),
+            Ok(false),
+        );
+        assert_eq!(fixture.store.is_type_assignable_to(wide, shape), Ok(true));
+        assert_eq!(fixture.store.is_type_assignable_to(shape, wide), Ok(false));
+        assert_eq!(fixture.store.is_type_assignable_to(wide, literal), Ok(true));
+        assert_eq!(
+            fixture.store.is_type_assignable_to(wide, wrong_literal),
+            Ok(false),
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(literal, wide),
+            Ok(false)
+        );
+        assert_eq!(fixture.store.is_type_assignable_to(wide, string), Ok(true));
+        assert_eq!(fixture.store.is_type_assignable_to(string, wide), Ok(false));
+        assert_eq!(fixture.store.is_type_identical_to(wide, same), Ok(true));
+        assert_eq!(fixture.store.is_type_identical_to(wide, narrow), Ok(false));
+
+        let root_key = fixture
+            .store
+            .relation_key_if_available(narrow, wide, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert_eq!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, root_key),
+            RelationComparisonResult::NONE,
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.relation_state_snapshot(),
+        );
+        assert_eq!(fixture.store.is_type_assignable_to(narrow, wide), Ok(true));
+        assert_eq!(fixture.store.is_type_assignable_to(wide, narrow), Ok(false));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.relation_state_snapshot(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Templates, mappings, and nested mappings share one graph.
+    fn branded_templates_and_intrinsic_mappings_compare_their_structural_targets() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Uppercase<Input extends string> = intrinsic; ",
+            "type Lowercase<Input extends string> = intrinsic; ",
+            "type Template = `${'a' & { tag: 1 }}`; ",
+            "type TemplateSame = `${'a' & { tag: 1 }}`; ",
+            "type TemplateNarrow = `${'a' & { tag: 1; extra: 2 }}`; ",
+            "type TemplateWrong = `${'a' & { tag: 2 }}`; ",
+            "type TemplatePrefix = `prefix-${'a' & { tag: 1 }}`; ",
+            "type Upper = Uppercase<'a' & { tag: 1 }>; ",
+            "type UpperSame = Uppercase<'a' & { tag: 1 }>; ",
+            "type UpperNarrow = Uppercase<'a' & { tag: 1; extra: 2 }>; ",
+            "type Lower = Lowercase<'a' & { tag: 1 }>; ",
+            "type Nested = Uppercase<Lowercase<'a' & { tag: 1 }>>; ",
+            "type NestedSame = Uppercase<Lowercase<'a' & { tag: 1 }>>; ",
+            "type NestedNarrow = Uppercase<Lowercase<'a' & { tag: 1; extra: 2 }>>; ",
+            "type UpperStrings = Uppercase<string>; ",
+            "type LowerStrings = Lowercase<string>; ",
+            "type UpperBrand = 'ABC' & { tag: 1 }; ",
+            "type UpperPattern = `A${string}`; ",
+            "type LowerPattern = `a${string}`;",
+        ));
+        let [
+            template,
+            template_same,
+            template_narrow,
+            template_wrong,
+            template_prefix,
+            upper,
+            upper_same,
+            upper_narrow,
+            lower,
+            nested,
+            nested_same,
+            nested_narrow,
+            upper_strings,
+            lower_strings,
+            upper_brand,
+            upper_pattern,
+            lower_pattern,
+        ] = [
+            "Template",
+            "TemplateSame",
+            "TemplateNarrow",
+            "TemplateWrong",
+            "TemplatePrefix",
+            "Upper",
+            "UpperSame",
+            "UpperNarrow",
+            "Lower",
+            "Nested",
+            "NestedSame",
+            "NestedNarrow",
+            "UpperStrings",
+            "LowerStrings",
+            "UpperBrand",
+            "UpperPattern",
+            "LowerPattern",
+        ]
+        .map(|name| query_type_alias(&mut fixture, name));
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(template, template_same),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(template_narrow, template),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(template, template_narrow),
+            Ok(false),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(template, template_wrong),
+            Ok(false),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(template, template_prefix),
+            Ok(false),
+        );
+        assert_eq!(
+            fixture.store.is_type_identical_to(template, template_same),
+            Ok(true),
+        );
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(upper, upper_same),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(upper_narrow, upper),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(upper, upper_narrow),
+            Ok(false),
+        );
+        assert_eq!(fixture.store.is_type_assignable_to(upper, lower), Ok(false));
+        assert_eq!(
+            fixture.store.is_type_identical_to(upper, upper_same),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(nested, nested_same),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(nested_narrow, nested),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(nested, nested_narrow),
+            Ok(false),
+        );
+
+        let uppercase = fixture
+            .store
+            .regular_string_literal_type("ABC".into())
+            .unwrap();
+        let lowercase = fixture
+            .store
+            .regular_string_literal_type("abc".into())
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(uppercase, upper_strings),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(lowercase, upper_strings),
+            Ok(false),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(lowercase, lower_strings),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_comparable_to(upper_strings, uppercase),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture.store.is_type_identical_to(uppercase, upper_strings),
+            Ok(false),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(upper_brand, upper_strings),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(upper_brand, lower_strings),
+            Ok(false),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(upper_strings, upper_brand),
+            Ok(false),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(upper_brand, upper_pattern),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(upper_brand, lower_pattern),
+            Ok(false),
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(upper, upper_same),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(nested_narrow, nested),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(uppercase, upper_strings),
+            Ok(true),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.relation_state_snapshot(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Template, mapping, and intersection poison share one graph.
+    fn branded_string_structural_relations_reject_forged_identities() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Uppercase<Input extends string> = intrinsic; ",
+            "type Brand = 'a' & { tag: 1 }; ",
+            "type SameBrand = 'a' & { tag: 1 }; ",
+            "type Template = `${Brand}`; ",
+            "type SameTemplate = `${SameBrand}`; ",
+            "type Upper = Uppercase<Brand>; ",
+            "type UpperStrings = Uppercase<string>;",
+        ));
+        let [
+            brand,
+            same_brand,
+            template,
+            same_template,
+            upper,
+            upper_strings,
+        ] = [
+            "Brand",
+            "SameBrand",
+            "Template",
+            "SameTemplate",
+            "Upper",
+            "UpperStrings",
+        ]
+        .map(|name| query_type_alias(&mut fixture, name));
+        assert_eq!(
+            fixture.store.is_type_assignable_to(brand, same_brand),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(template, same_template),
+            Ok(true),
+        );
+
+        let (texts, types) = match fixture.store.type_payload(template).unwrap().data() {
+            TypeData::TemplateLiteral(data) => (data.texts.clone(), data.types.clone()),
+            _ => unreachable!("the branded alias retains its template identity"),
+        };
+        let forged_template = fixture
+            .store
+            .alloc_template_literal_type(texts, types)
+            .unwrap();
+        let before_template = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(forged_template, same_template),
+            Err(RelationUnavailable::MalformedStructuredType(
+                forged_template
+            )),
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before_template);
+
+        let (symbol, target) = match fixture.store.type_payload(upper_strings).unwrap().data() {
+            TypeData::StringMapping(mapping) => (
+                fixture
+                    .store
+                    .type_payload(upper_strings)
+                    .unwrap()
+                    .symbol()
+                    .unwrap(),
+                mapping.target,
+            ),
+            _ => unreachable!("Uppercase<string> retains an intrinsic mapping"),
+        };
+        let forged_mapping = fixture
+            .store
+            .alloc_string_mapping_type(Some(symbol), target)
+            .unwrap();
+        let uppercase = fixture
+            .store
+            .regular_string_literal_type("ABC".into())
+            .unwrap();
+        let before_mapping = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(uppercase, forged_mapping),
+            Err(RelationUnavailable::MalformedStructuredType(forged_mapping)),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(forged_mapping, upper_strings),
+            Err(RelationUnavailable::MalformedStructuredType(forged_mapping)),
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before_mapping);
+
+        let key = fixture
+            .store
+            .intersection_keys_by_type
+            .remove(&brand)
+            .expect("the source brand retains its reverse intersection key");
+        let before_brand = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture.store.is_type_assignable_to(brand, same_brand),
+            Err(RelationUnavailable::MalformedIntersection(brand)),
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(upper, upper_strings),
+            Err(RelationUnavailable::MalformedIntersection(brand)),
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before_brand);
+        assert_eq!(
+            fixture.store.intersection_keys_by_type.insert(brand, key),
+            None
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(brand, same_brand),
+            Ok(true)
+        );
     }
 
     #[test]
