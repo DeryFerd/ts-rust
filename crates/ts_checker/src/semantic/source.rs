@@ -186,9 +186,10 @@ use super::{
         execute_top_level_enum, plan_local_const_enum, plan_local_enum, plan_top_level_enum,
     },
     source_flow::{
-        SourceEqualityCondition, SourceFlowAssignment, SourceFlowCondition, SourceFlowError,
-        SourceFlowFrame, SourceFlowInvariant, SourceFlowParameterAssignment, SourceFlowPlan,
-        SourceTruthinessCondition, SourceTypeofComparison, SourceTypeofCondition, SourceTypeofTag,
+        SourceEqualityCondition, SourceEqualityNarrowingError, SourceFlowAssignment,
+        SourceFlowCondition, SourceFlowError, SourceFlowFrame, SourceFlowInvariant,
+        SourceFlowParameterAssignment, SourceFlowPlan, SourceTruthinessCondition,
+        SourceTypeofComparison, SourceTypeofCondition, SourceTypeofTag, narrow_by_equality,
         narrow_by_typeof, source_block_scoped_use_before_declaration,
         source_typeof_narrowing_type_is_supported,
     },
@@ -18683,7 +18684,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     ) => {}
             PlannedExpressionKind::Boolean(_) => {}
             PlannedExpressionKind::Call(_)
-                if !contextual && self.is_global_math_random_condition(condition_target) => {}
+                if !contextual
+                    && (direct_return
+                        || self.is_global_math_random_condition(condition_target)) => {}
             _ => {
                 return Err(self.unsupported(
                     condition_target.node,
@@ -18692,7 +18695,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             }
         }
-        let Some(condition_expectation) = self.conditional_scalar_expectation(&condition)? else {
+        let Some(condition_expectation) =
+            self.conditional_scalar_expectation(&condition, direct_return)?
+        else {
             return Err(self.unsupported(
                 condition_target.node,
                 SyntaxKind::Identifier,
@@ -18700,21 +18705,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         };
         let when_true = self.plan_expression(when_true)?;
-        if !conditional_scalar_operand_plan_is_supported(&when_true) {
+        let when_true_supported = if direct_return {
+            conditional_return_operand_plan_is_supported(&when_true)
+        } else {
+            conditional_scalar_operand_plan_is_supported(&when_true)
+        };
+        if !when_true_supported {
             return Err(self.unsupported(
                 when_true.node,
                 self.node(when_true.node)?.kind,
                 SourceSyntaxRole::VariableInitializer,
             ));
         }
-        if direct_return && !conditional_return_operand_plan_is_supported(&when_true) {
-            return Err(self.unsupported(
-                when_true.node,
-                self.node(when_true.node)?.kind,
-                SourceSyntaxRole::VariableInitializer,
-            ));
-        }
-        let Some(when_true_expectation) = self.conditional_scalar_expectation(&when_true)? else {
+        let Some(when_true_expectation) =
+            self.conditional_scalar_expectation(&when_true, direct_return)?
+        else {
             return Err(self.unsupported(
                 when_true.node,
                 self.node(when_true.node)?.kind,
@@ -18737,21 +18742,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         let when_false = self.plan_expression(when_false)?;
-        if !conditional_scalar_operand_plan_is_supported(&when_false) {
+        let when_false_supported = if direct_return {
+            conditional_return_operand_plan_is_supported(&when_false)
+        } else {
+            conditional_scalar_operand_plan_is_supported(&when_false)
+        };
+        if !when_false_supported {
             return Err(self.unsupported(
                 when_false.node,
                 self.node(when_false.node)?.kind,
                 SourceSyntaxRole::VariableInitializer,
             ));
         }
-        if direct_return && !conditional_return_operand_plan_is_supported(&when_false) {
-            return Err(self.unsupported(
-                when_false.node,
-                self.node(when_false.node)?.kind,
-                SourceSyntaxRole::VariableInitializer,
-            ));
-        }
-        let Some(when_false_expectation) = self.conditional_scalar_expectation(&when_false)? else {
+        let Some(when_false_expectation) =
+            self.conditional_scalar_expectation(&when_false, direct_return)?
+        else {
             return Err(self.unsupported(
                 when_false.node,
                 self.node(when_false.node)?.kind,
@@ -18897,6 +18902,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     fn conditional_scalar_expectation(
         &self,
         expression: &PlannedExpression,
+        allow_calls: bool,
     ) -> Result<Option<ConditionalScalarExpectation>, SourceCheckError> {
         if matches!(
             expression.kind,
@@ -18925,14 +18931,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             PlannedExpressionKind::Number { .. } => Some(ConditionalScalarFamily::Number),
             PlannedExpressionKind::BigInt { .. } => Some(ConditionalScalarFamily::BigInt),
             PlannedExpressionKind::Boolean(_) => Some(ConditionalScalarFamily::Boolean),
-            PlannedExpressionKind::Call(_) if self.is_global_math_random_condition(expression) => {
+            PlannedExpressionKind::Call(_)
+                if allow_calls || self.is_global_math_random_condition(expression) =>
+            {
                 return Ok(Some(ConditionalScalarExpectation::Dynamic));
             }
             PlannedExpressionKind::Parenthesized(inner) => {
-                return self.conditional_scalar_expectation(inner);
+                return self.conditional_scalar_expectation(inner, allow_calls);
             }
             PlannedExpressionKind::Binary(binary) if binary.operator == SyntaxKind::CommaToken => {
-                return self.conditional_scalar_expectation(&binary.right);
+                return self.conditional_scalar_expectation(&binary.right, allow_calls);
             }
             PlannedExpressionKind::Identifier(read)
                 if read.kind == PlannedIdentifierReadKind::Unresolved =>
@@ -21221,7 +21229,8 @@ fn conditional_return_operand_plan_is_supported(expression: &PlannedExpression) 
         | PlannedExpressionKind::String(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
-        | PlannedExpressionKind::Boolean(_) => true,
+        | PlannedExpressionKind::Boolean(_)
+        | PlannedExpressionKind::Call(_) => true,
         PlannedExpressionKind::Identifier(read) => read.kind == PlannedIdentifierReadKind::Variable,
         PlannedExpressionKind::Conditional(conditional) => {
             conditional.direct_return
@@ -24231,7 +24240,7 @@ fn check_expression_type(
                 == ConditionalScalarExpectation::Dynamic
                 && matches!(
                     conditional.when_true.unparenthesized().kind,
-                    PlannedExpressionKind::Conditional(_)
+                    PlannedExpressionKind::Conditional(_) | PlannedExpressionKind::Call(_)
                 )
                 || matches!(
                     &conditional.when_true.unparenthesized().kind,
@@ -24276,7 +24285,7 @@ fn check_expression_type(
                 == ConditionalScalarExpectation::Dynamic
                 && matches!(
                     conditional.when_false.unparenthesized().kind,
-                    PlannedExpressionKind::Conditional(_)
+                    PlannedExpressionKind::Conditional(_) | PlannedExpressionKind::Call(_)
                 )
                 || matches!(
                     &conditional.when_false.unparenthesized().kind,
@@ -27654,7 +27663,15 @@ fn check_conditional_return_branches(
             continue;
         }
 
-        let checked = check_uncached_conditional_scalar(store, flow_types, expression)?;
+        let checked = if matches!(expression.kind, PlannedExpressionKind::Call(_)) {
+            let type_ = store
+                .type_node_links(expression.node)
+                .and_then(|links| links.resolved_type)
+                .ok_or(SourceCheckError::Conditional(expression.node))?;
+            CheckedExpressionTypes::leaf(type_, type_)
+        } else {
+            check_uncached_conditional_scalar(store, flow_types, expression)?
+        };
         let target_flags = store
             .type_payload(target)
             .map(TypeRecord::flags)
@@ -30033,33 +30050,63 @@ fn check_planned_loop_function_statements(
         None
     };
 
-    if let Some(condition) = condition
-        && let PlannedExpressionKind::Identifier(read) =
-            &statements.condition.unparenthesized().kind
-        && read.kind == PlannedIdentifierReadKind::Variable
-    {
-        let narrowed = narrow_by_truthiness(
-            store,
-            Some(global_types),
-            condition.raw,
-            TruthinessAssumption::Truthy,
-        )
-        .map_err(|error| {
-            SourcePlanner::source_flow_plan_error(
-                callable,
-                SourceFlowError::Narrowing {
-                    condition: statements.condition.node,
-                    error,
-                },
+    if let Some(condition) = condition {
+        if let Some(equality) = planned_loop_nullish_equality(&statements.condition) {
+            let current = loop_flow_types.get(&equality.symbol).copied().ok_or(
+                SourceCheckError::Variable(VariableInvariant::MissingCurrentFlowType(
+                    equality.symbol,
+                )),
+            )?;
+            let value = store
+                .type_node_links(equality.value.node)
+                .and_then(|links| links.resolved_type)
+                .ok_or(SourceCheckError::Function(
+                    SourceFunctionInvariant::Callable(callable.declaration),
+                ))?;
+            let narrowed = narrow_by_equality(
+                store,
+                global_types,
+                current,
+                value,
+                equality.strict,
+                equality.equal,
+                None,
             )
-        })?;
-        if loop_flow_types
-            .insert(read.value_symbol, narrowed)
-            .is_none()
+            .map_err(|error| match error {
+                SourceEqualityNarrowingError::Union(error) => error.into(),
+                error => SourcePlanner::source_flow_plan_error(
+                    callable,
+                    SourceFlowError::Invariant(SourceFlowInvariant::EqualityNarrowing(error)),
+                ),
+            })?;
+            loop_flow_types.insert(equality.symbol, narrowed);
+        } else if let PlannedExpressionKind::Identifier(read) =
+            &statements.condition.unparenthesized().kind
+            && read.kind == PlannedIdentifierReadKind::Variable
         {
-            return Err(SourceCheckError::Variable(
-                VariableInvariant::MissingCurrentFlowType(read.value_symbol),
-            ));
+            let narrowed = narrow_by_truthiness(
+                store,
+                Some(global_types),
+                condition.raw,
+                TruthinessAssumption::Truthy,
+            )
+            .map_err(|error| {
+                SourcePlanner::source_flow_plan_error(
+                    callable,
+                    SourceFlowError::Narrowing {
+                        condition: statements.condition.node,
+                        error,
+                    },
+                )
+            })?;
+            if loop_flow_types
+                .insert(read.value_symbol, narrowed)
+                .is_none()
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::MissingCurrentFlowType(read.value_symbol),
+                ));
+            }
         }
     }
     for statement in &statements.statements {
@@ -30420,6 +30467,45 @@ fn check_planned_loop_condition(
     callable: &SourceCallablePlan,
     statements: &PlannedLoopFunctionStatements,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    if let Some(equality) = planned_loop_nullish_equality(&statements.condition) {
+        let current =
+            flow_types
+                .get(&equality.symbol)
+                .copied()
+                .ok_or(SourceCheckError::Variable(
+                    VariableInvariant::MissingCurrentFlowType(equality.symbol),
+                ))?;
+        for operand in [&equality.binary.left, &equality.binary.right] {
+            let checked = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                flow_types,
+                preflighted_type_import_value_uses,
+                operand,
+                None,
+                deferred,
+            )?;
+            if operand.node == equality.identifier.node && checked.raw != current {
+                return Err(SourceCheckError::Function(
+                    SourceFunctionInvariant::Callable(callable.declaration),
+                ));
+            }
+        }
+        let boolean = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.boolean_type)
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        publish_expression_type(store, statements.condition.node, boolean)?;
+        return Ok(CheckedExpressionTypes::leaf(boolean, boolean));
+    }
+
     let checked = check_expression_type(
         store,
         host,
@@ -30451,6 +30537,59 @@ fn check_planned_loop_condition(
         statements.control.statement,
     )?;
     Ok(checked)
+}
+
+#[derive(Clone, Copy)]
+struct PlannedLoopNullishEquality<'expression> {
+    binary: &'expression PrimitiveBinaryPlan,
+    identifier: &'expression PlannedExpression,
+    value: &'expression PlannedExpression,
+    symbol: SemanticSymbolId,
+    strict: bool,
+    equal: bool,
+}
+
+fn planned_loop_nullish_equality(
+    expression: &PlannedExpression,
+) -> Option<PlannedLoopNullishEquality<'_>> {
+    let PlannedExpressionKind::Binary(binary) = &expression.kind else {
+        return None;
+    };
+    if binary.node != expression.node || !binary.prefix.is_empty() {
+        return None;
+    }
+    let (strict, equal) = match binary.operator {
+        SyntaxKind::EqualsEqualsEqualsToken => (true, true),
+        SyntaxKind::ExclamationEqualsEqualsToken => (true, false),
+        SyntaxKind::EqualsEqualsToken => (false, true),
+        SyntaxKind::ExclamationEqualsToken => (false, false),
+        _ => return None,
+    };
+    let (identifier, value) = match (&binary.left.kind, &binary.right.kind) {
+        (
+            PlannedExpressionKind::Identifier(_),
+            PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined,
+        ) => (&binary.left, &binary.right),
+        (
+            PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined,
+            PlannedExpressionKind::Identifier(_),
+        ) => (&binary.right, &binary.left),
+        _ => return None,
+    };
+    let PlannedExpressionKind::Identifier(read) = &identifier.kind else {
+        return None;
+    };
+    if read.kind != PlannedIdentifierReadKind::Variable {
+        return None;
+    }
+    Some(PlannedLoopNullishEquality {
+        binary,
+        identifier,
+        value,
+        symbol: read.value_symbol,
+        strict,
+        equal,
+    })
 }
 
 #[allow(clippy::too_many_arguments)] // Reuses the source-owned variable and callable transaction.
@@ -32696,7 +32835,47 @@ fn object_binding_property_type(
         return Ok(receiver);
     }
 
-    if receiver != unknown
+    let nullable_object = if options.intrinsic.strict_null_checks {
+        let record = store
+            .type_payload(receiver)
+            .ok_or(RelationUnavailable::Type(receiver))?;
+        match record.data() {
+            TypeData::Union(union) => match union.union.types.as_slice() {
+                [first, second] => {
+                    let first_flags = store
+                        .type_payload(*first)
+                        .map(TypeRecord::flags)
+                        .ok_or(RelationUnavailable::Type(*first))?;
+                    let second_flags = store
+                        .type_payload(*second)
+                        .map(TypeRecord::flags)
+                        .ok_or(RelationUnavailable::Type(*second))?;
+                    if first_flags.intersects(TypeFlags::NULLABLE)
+                        && second_flags == TypeFlags::OBJECT
+                    {
+                        Some(*second)
+                    } else if second_flags.intersects(TypeFlags::NULLABLE)
+                        && first_flags == TypeFlags::OBJECT
+                    {
+                        Some(*first)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(object) = nullable_object {
+        store
+            .validate_union_constituent_with_global_types(global_types, receiver)
+            .map_err(|error| super::relater::union_validation_unavailable(receiver, error))?;
+        store.resolved_own_property(object, property_name)?;
+    } else if receiver != unknown
         && let Some(property) = store.resolved_own_property(receiver, property_name)?
     {
         return if property.optional && options.intrinsic.strict_null_checks {
@@ -47618,6 +47797,150 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn while_equality_conditions_narrow_nullable_values_in_source_order() {
+        let source = parsed(concat!(
+            "declare function consume(value: string): void; ",
+            "interface Link { value: string; } ",
+            "function strict(value: string | null): void { ",
+            "while (value !== null) { const strictValue: string = value; consume(value); } } ",
+            "function reversed(value: string | null): void { ",
+            "while (null !== value) { const reversedValue: string = value; } } ",
+            "function loose(value: string | null | undefined): void { ",
+            "while (value != null) { const looseValue: string = value; } } ",
+            "function missing(value: string | undefined): void { ",
+            "while (undefined !== value) { const missingValue: string = value; } } ",
+            "function object(current: Link | null): void { ",
+            "while (current !== null) { ",
+            "const objectValue: string = current.value; consume(current.value); } }",
+        ));
+        let file = FileId::new(8_530);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let (string, boolean) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.boolean_type)
+        };
+        for name in [
+            "strictValue",
+            "reversedValue",
+            "looseValue",
+            "missingValue",
+            "objectValue",
+        ] {
+            assert_eq!(variable_value_type(&context, &source, file, name), string);
+        }
+        for read in identifier_expressions(&source, file, "value") {
+            let parent = source
+                .arena
+                .get(source.arena.get(read.node).unwrap().parent.unwrap())
+                .unwrap();
+            if matches!(&parent.data, NodeData::VariableDeclaration(variable)
+                if variable.initializer == Some(read.node))
+                || matches!(&parent.data, NodeData::CallExpression(call)
+                    if call.arguments.nodes.contains(&read.node))
+            {
+                assert_eq!(resolved_node_type(&context, read), string);
+            }
+        }
+        for (node, record) in source.arena.iter() {
+            if record.kind == SyntaxKind::BinaryExpression {
+                assert_eq!(
+                    resolved_node_type(&context, NodeRef::new(source.arena.id(), file, node)),
+                    boolean,
+                );
+            }
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn while_positive_nullish_equality_preserves_exact_nullable_constituents() {
+        let source = parsed(concat!(
+            "function strict(value: string | null): void { ",
+            "while (value === null) { const selectedNull: null = value; } } ",
+            "function loose(value: string | null | undefined): void { ",
+            "while (undefined == value) { ",
+            "const selectedMissing: null | undefined = value; } }",
+        ));
+        let file = FileId::new(8_531);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            variable_value_type(&context, &source, file, "selectedNull"),
+            bootstrap.null_type,
+        );
+        let missing = variable_value_type(&context, &source, file, "selectedMissing");
+        let TypeData::Union(union) = context.store().type_payload(missing).unwrap().data() else {
+            panic!("loose nullish equality must retain both nullable constituents")
+        };
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.contains(&bootstrap.null_type));
+        assert!(union.union.types.contains(&bootstrap.undefined_type));
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn shadowed_undefined_does_not_become_a_loop_nullish_condition() {
+        let source = parsed(concat!(
+            "function repeat(value: string | undefined, undefined: string): void { ",
+            "while (value !== undefined) { const selected: string = value; } }",
+        ));
+        let file = FileId::new(8_532);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    role: SourceSyntaxRole::BinaryOperand,
+                    ..
+                }
+            )),
+        ));
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
@@ -74500,6 +74823,157 @@ class Foo2 {
     }
 
     #[test]
+    fn nullable_object_bindings_report_exact_full_union_property_diagnostics() {
+        for (index, (nullable, expected_type)) in [
+            ("undefined", "{ value: string; } | undefined"),
+            ("null", "{ value: string; } | null"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = format!(
+                "declare var input: {{ value: string }} | {nullable}; const {{ value }} = input;",
+            );
+            let source = parsed(&text);
+            let file = FileId::new(9_930 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("a nullable object binding requires exactly one TS2339")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2339);
+            assert_eq!(diagnostic.diagnostic.arguments, ["value", expected_type]);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), "value");
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!("Property 'value' does not exist on type '{expected_type}'."),
+            );
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, "value"),
+                context.store().intrinsic_bootstrap().unwrap().error_type,
+            );
+            let receivers = identifier_expressions(&source, file, "input");
+            let [receiver] = receivers.as_slice() else {
+                panic!("the binding must retain its one nullable source read")
+            };
+            let TypeData::Union(union) = context
+                .store()
+                .type_payload(resolved_node_type(&context, *receiver))
+                .unwrap()
+                .data()
+            else {
+                panic!("the binding receiver must retain its original nullable union")
+            };
+            assert!(union.union.property_cache.is_none());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn nullable_object_bindings_anchor_each_shorthand_and_renamed_property() {
+        let source = parsed(concat!(
+            "declare var input: { first: string; second: number } | undefined; ",
+            "const { first, second: renamed } = input;",
+        ));
+        let file = FileId::new(9_932);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, expected) in diagnostics.iter().zip(["first", "second"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2339);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), expected);
+            assert_eq!(
+                diagnostic.diagnostic.arguments,
+                [expected, "{ first: string; second: number; } | undefined"],
+            );
+        }
+        let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+        for name in ["first", "renamed"] {
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, name),
+                error
+            );
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn initialized_nullable_object_bindings_preserve_authenticated_non_nullable_flow() {
+        let source = parsed(concat!(
+            "const input: { value: string } | undefined = { value: 'ready' }; ",
+            "const { value } = input; ",
+            "const observed = value;",
+        ));
+        let file = FileId::new(9_933);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "value"),
+            string
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "observed"),
+            string
+        );
+        let receivers = identifier_expressions(&source, file, "input");
+        let [receiver] = receivers.as_slice() else {
+            panic!("the binding must retain its one narrowed object read")
+        };
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, *receiver))
+                .unwrap(),
+            "{ value: string; }",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn object_bindings_preserve_optional_property_undefined_under_strict_null_checks() {
         let source = parsed(concat!(
             "interface Input { value?: string; } ",
@@ -77521,6 +77995,43 @@ class Foo2 {
     }
 
     #[test]
+    fn conditional_return_calls_keep_exact_invalid_branch_diagnostics() {
+        let source = parsed(concat!(
+            "declare function matches(value: string): boolean;\n",
+            "declare function getAny(): any;\n",
+            "function direct(value: string): string {\n",
+            "  return matches(value) ? getAny() : 1;\n",
+            "}\n",
+            "function accepted(value: string): string {\n",
+            "  return matches(value) ? 'ready' : value;\n",
+            "}\n",
+            "function asserted(value: string): string {\n",
+            "  return (matches(value) ? getAny() : 2) as string;\n",
+            "}\n",
+            "const arrow = (value: string): string => ",
+            "matches(value) ? getAny() : 3;\n",
+            "const assertedArrow = (value: string): string => ",
+            "(matches(value) ? getAny() : 4) as string;\n",
+        ));
+        let file = FileId::new(4_824);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, branch) in diagnostics.iter().zip(["1", "3"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), branch);
+            assert_eq!(diagnostic.diagnostic.arguments, ["number", "string"]);
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn inferred_arrow_conditionals_preserve_object_branches_and_warm_identity() {
         let source = parsed(concat!(
             "const blocked = (value: number) => {\n",
@@ -77557,10 +78068,7 @@ class Foo2 {
                 "{ value: number; }",
                 "arrow {name}",
             );
-            assert_eq!(
-                variable_value_type(&context, &source, file, name),
-                callable,
-            );
+            assert_eq!(variable_value_type(&context, &source, file, name), callable,);
         }
         for (node, record) in source.arena.iter() {
             if record.kind == SyntaxKind::ObjectLiteralExpression {

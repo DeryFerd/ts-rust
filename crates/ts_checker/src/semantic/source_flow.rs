@@ -2535,7 +2535,7 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, TypeNodeLinks,
     };
 
     fn flow() -> FlowRef {
@@ -3671,6 +3671,80 @@ mod tests {
             .snapshot_at(context.store_mut_for_test(), &globals, return_statement)
             .unwrap();
         assert_eq!(after_loop.type_of(symbol), Some(undefined));
+        let repeated = frame
+            .snapshot_at(context.store_mut_for_test(), &globals, return_statement)
+            .unwrap();
+        assert_eq!(repeated, after_loop);
+    }
+
+    #[test]
+    fn nullable_equality_loop_backedges_preserve_the_exact_false_edge() {
+        let parsed = parse_source_file(concat!(
+            "function loop(value: string | null): string | null {\n",
+            "  while (value !== null) {}\n",
+            "  return value;\n",
+            "}\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_435);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let (function, parameter, condition, return_statement) = loop_nodes(&parsed, file);
+        let NodeData::BinaryExpression(binary) = &parsed.arena.get(condition.node).unwrap().data
+        else {
+            panic!("expected a strict nullish equality condition")
+        };
+        let identifier = NodeRef::new(parsed.arena.id(), file, binary.left);
+        let null_literal = NodeRef::new(parsed.arena.id(), file, binary.right);
+        let symbol = bound.symbol(parameter).unwrap();
+        let (string, null) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.null_type)
+        };
+        assert!(context.store_mut_for_test().set_type_node_links(
+            null_literal,
+            TypeNodeLinks {
+                resolved_type: Some(null),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let input = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[string, null],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let plan = SourceFlowPlan::preflight(
+            &bound,
+            function,
+            None,
+            [identifier, return_statement],
+            [SourceFlowCondition::Equality(SourceEqualityCondition {
+                expression: condition,
+                symbol,
+                value: null_literal,
+                comparison: SourceTypeofComparison::NotEqual,
+                strict: true,
+                discriminant: None,
+            })],
+            [],
+        )
+        .unwrap();
+        let mut frame = plan
+            .frame(&bound, [(symbol, input)].into_iter().collect())
+            .unwrap();
+
+        let at_condition = frame
+            .snapshot_at(context.store_mut_for_test(), &globals, identifier)
+            .unwrap();
+        assert_eq!(at_condition.type_of(symbol), Some(input));
+        let after_loop = frame
+            .snapshot_at(context.store_mut_for_test(), &globals, return_statement)
+            .unwrap();
+        assert_eq!(after_loop.type_of(symbol), Some(null));
         let repeated = frame
             .snapshot_at(context.store_mut_for_test(), &globals, return_statement)
             .unwrap();
