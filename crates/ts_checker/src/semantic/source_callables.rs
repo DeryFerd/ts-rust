@@ -41,7 +41,7 @@ use super::{
         SignatureLinks, SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks,
     },
     reference_types::validate_direct_generic_reference,
-    signatures::{Signature, SignatureFlags, TypePredicateKind},
+    signatures::{ElementFlags, Signature, SignatureFlags, TypePredicateKind},
     store::{
         PreparedSourceGenericCallablePublication, ResolvedSourceCallableTypeParameter,
         SemanticStore, SourceCallableProvenance, SourceCallableReturnProvenance,
@@ -2920,7 +2920,7 @@ fn plan_source_callable_with_owner_shape(
                         && parameter.initializer.is_none()
                         && parameter.explicit_type_node().is_some() =>
                 {
-                    type_parameter.constraint.is_some_and(|constraint| {
+                    let unresolved = type_parameter.constraint.is_some_and(|constraint| {
                         exact_unresolved_source_type_parameter_constraint(store, host, constraint)
                             .is_ok_and(|valid| valid)
                     }) && is_naked_source_type_parameter_annotation(
@@ -2928,7 +2928,14 @@ fn plan_source_callable_with_owner_shape(
                         host,
                         parameter.identity_node,
                         type_parameter,
-                    )?
+                    )?;
+                    unresolved
+                        || exact_constrained_string_rest_tuple_parameter_annotation(
+                            store,
+                            host,
+                            type_parameter,
+                            parameter,
+                        )?
                 }
                 _ => false,
             };
@@ -4726,6 +4733,81 @@ fn is_exact_source_type_parameter_bound(
         }
     }
     Ok(false)
+}
+
+fn exact_constrained_string_rest_tuple_parameter_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_parameter: &SourceCallableTypeParameterPlan,
+    parameter: &SourceCallableParameterPlan,
+) -> Result<bool, SourceCallableError> {
+    let Some(constraint) = type_parameter.constraint else {
+        return Ok(false);
+    };
+    if type_parameter.default_type.is_some()
+        || store.source_node_kind(constraint) != Some(SyntaxKind::TupleType)
+    {
+        return Ok(false);
+    }
+
+    let annotation = parameter.identity_node;
+    let record = preflight_node(store, host, annotation)?;
+    let NodeData::TupleTypeNode(tuple) = &record.data else {
+        return Ok(false);
+    };
+    let [rest, variadic] = tuple.elements.nodes.as_slice() else {
+        return Ok(false);
+    };
+    if record.kind != SyntaxKind::TupleType
+        || record.flags.0 != 0
+        || record.parent != Some(parameter.declaration.node)
+        || tuple.elements.has_trailing_comma
+    {
+        return Ok(false);
+    }
+
+    let rest = NodeRef::new(annotation.arena, annotation.file, *rest);
+    let variadic = NodeRef::new(annotation.arena, annotation.file, *variadic);
+    let rest_record = preflight_node(store, host, rest)?;
+    let variadic_record = preflight_node(store, host, variadic)?;
+    let (NodeData::RestTypeNode(rest_type), NodeData::RestTypeNode(variadic_type)) =
+        (&rest_record.data, &variadic_record.data)
+    else {
+        return Ok(false);
+    };
+    if rest_record.kind != SyntaxKind::RestType
+        || rest_record.flags.0 != 0
+        || rest_record.parent != Some(annotation.node)
+        || variadic_record.kind != SyntaxKind::RestType
+        || variadic_record.flags.0 != 0
+        || variadic_record.parent != Some(annotation.node)
+    {
+        return Ok(false);
+    }
+
+    let array = NodeRef::new(rest.arena, rest.file, rest_type.type_);
+    let array_record = preflight_node(store, host, array)?;
+    let NodeData::ArrayTypeNode(array_type) = &array_record.data else {
+        return Ok(false);
+    };
+    let string = NodeRef::new(array.arena, array.file, array_type.element_type);
+    let string_record = preflight_node(store, host, string)?;
+    let variadic_parameter = NodeRef::new(variadic.arena, variadic.file, variadic_type.type_);
+    let variadic_parameter_record = preflight_node(store, host, variadic_parameter)?;
+    Ok(array_record.kind == SyntaxKind::ArrayType
+        && array_record.flags.0 == 0
+        && array_record.parent == Some(rest.node)
+        && string_record.kind == SyntaxKind::StringKeyword
+        && string_record.flags.0 == 0
+        && string_record.parent == Some(array.node)
+        && variadic_parameter_record.flags.0 == 0
+        && variadic_parameter_record.parent == Some(variadic.node)
+        && is_naked_source_type_parameter_annotation(
+            store,
+            host,
+            variadic_parameter,
+            type_parameter,
+        )?)
 }
 
 fn exact_ambient_namespace_generic_constraint(
@@ -7117,13 +7199,45 @@ fn valid_inferred_generic_source_callable(
                 else {
                     return false;
                 };
-                store.source_recovered_unresolved_type_reference_is_exact(constraint, error_type)
+                let unresolved = store
+                    .source_recovered_unresolved_type_reference_is_exact(constraint, error_type)
                     && source_type_parameter_annotation_links_are_cold_or_fully_warm(
                         store,
                         parameter.identity_node,
                         type_parameter.symbol,
                         type_,
-                    )
+                    );
+                let tuple = store
+                    .type_node_links(constraint)
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|resolved_constraint| {
+                        store.source_type_node_result_is_exact(constraint, resolved_constraint, &[])
+                            && store.source_node_kind(parameter.identity_node)
+                                == Some(SyntaxKind::TupleType)
+                            && store.source_node_parent(parameter.identity_node)
+                                == Some(SourceNodeParent::Parent(parameter.declaration))
+                            && store
+                                .symbol_node_links(parameter.identity_node)
+                                .is_none_or(|links| links == &SymbolNodeLinks::default())
+                            && store
+                                .type_node_links(parameter.identity_node)
+                                .is_none_or(|links| {
+                                    links == &TypeNodeLinks::default()
+                                        || links.resolved_type.is_some_and(|template| {
+                                            links
+                                                == &TypeNodeLinks {
+                                                    resolved_type: Some(template),
+                                                    outer_type_parameters: None,
+                                                }
+                                                && constrained_string_rest_tuple_parameter(
+                                                    store,
+                                                    template,
+                                                    &[type_],
+                                                ) == Some(resolved_constraint)
+                                        })
+                                })
+                    });
+                unresolved || tuple
             }
             _ => false,
         };
@@ -10329,6 +10443,48 @@ fn valid_fixed_generic_intrinsic_type(store: &CanonicalTypeMapperStore, type_: T
     .contains(&type_)
 }
 
+pub(super) fn constrained_string_rest_tuple_parameter(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    type_parameters: &[TypeId],
+) -> Option<TypeId> {
+    let [type_parameter] = type_parameters else {
+        return None;
+    };
+    let Some(TypeData::TypeParameter(parameter)) =
+        store.type_payload(*type_parameter).map(TypeRecord::data)
+    else {
+        return None;
+    };
+    let constraint = parameter.constraint?;
+    let string = store.intrinsic_bootstrap()?.string_type;
+    let constraint_tuple = store.canonical_tuple_shape(constraint).ok()??;
+    let [required] = constraint_tuple.element_infos() else {
+        return None;
+    };
+    if constraint_tuple.element_types() != [string]
+        || required.flags() != ElementFlags::REQUIRED
+        || required.labeled_declaration().is_some()
+        || constraint_tuple.min_length() != 1
+        || constraint_tuple.fixed_length() != 1
+        || constraint_tuple.is_readonly()
+    {
+        return None;
+    }
+
+    let tuple = store.canonical_tuple_shape(template).ok()??;
+    let [rest, variadic] = tuple.element_infos() else {
+        return None;
+    };
+    (tuple.element_types() == [string, *type_parameter]
+        && rest.flags() == ElementFlags::REST
+        && variadic.flags() == ElementFlags::VARIADIC
+        && rest.labeled_declaration().is_none()
+        && variadic.labeled_declaration().is_none()
+        && !tuple.is_readonly())
+    .then_some(constraint)
+}
+
 fn valid_generic_source_parameter_type(
     store: &CanonicalTypeMapperStore,
     array_targets: Option<CanonicalArrayTargets>,
@@ -10352,6 +10508,9 @@ fn valid_generic_source_parameter_type_worker(
     active: &mut HashSet<TypeId>,
 ) -> bool {
     if type_parameters.contains(&type_) {
+        return true;
+    }
+    if constrained_string_rest_tuple_parameter(store, type_, type_parameters).is_some() {
         return true;
     }
     if !active.insert(type_) {
@@ -10526,12 +10685,31 @@ fn valid_inferred_generic_signature_parameters(
     else {
         return false;
     };
-    if provenance.type_parameter != *type_parameter
-        || !store.source_recovered_unresolved_type_reference_is_exact(constraint, error_type)
-        || store
+    if provenance.type_parameter != *type_parameter {
+        return false;
+    }
+    let unresolved = store
+        .source_recovered_unresolved_type_reference_is_exact(constraint, error_type)
+        && store
             .callable_signature_parameter_types(signature)
-            .is_some_and(|types| types != [*type_parameter])
-    {
+            .is_none_or(|types| types == [*type_parameter]);
+    let tuple = store
+        .type_node_links(constraint)
+        .and_then(|links| links.resolved_type)
+        .is_some_and(|resolved_constraint| {
+            store.source_type_node_result_is_exact(constraint, resolved_constraint, &[])
+                && store
+                    .callable_signature_parameter_types(signature)
+                    .is_none_or(|types| {
+                        matches!(types, [template]
+                            if constrained_string_rest_tuple_parameter(
+                                store,
+                                *template,
+                                type_parameters,
+                            ) == Some(resolved_constraint))
+                    })
+        });
+    if !unresolved && !tuple {
         return false;
     }
     let Some([declaration]) = store
@@ -10546,11 +10724,21 @@ fn valid_inferred_generic_signature_parameters(
         })
         && store.value_symbol_links(*parameter).is_none_or(|links| {
             links == &ValueSymbolLinks::default()
-                || links
-                    == &ValueSymbolLinks {
-                        resolved_type: Some(*type_parameter),
-                        ..ValueSymbolLinks::default()
-                    }
+                || links.resolved_type.is_some_and(|resolved| {
+                    links
+                        == &ValueSymbolLinks {
+                            resolved_type: Some(resolved),
+                            ..ValueSymbolLinks::default()
+                        }
+                        && (unresolved && resolved == *type_parameter
+                            || tuple
+                                && constrained_string_rest_tuple_parameter(
+                                    store,
+                                    resolved,
+                                    type_parameters,
+                                )
+                                .is_some())
+                })
         })
 }
 
@@ -13843,6 +14031,149 @@ mod tests {
         assert_eq!(fixture.query_return(signature, &mut diagnostics), Ok(void));
         assert_eq!(generic_transaction_state(&fixture.store), before);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn constrained_rest_tuple_inferred_callable_publishes_once_and_authenticates_replay() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "function f<T extends [string]>(args: [...string[], ...T]) {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(42_105);
+        let mut context = bind_context(&parsed, file);
+        let (declaration, _) = function_and_type_parameter(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let owner = bound.symbol(declaration).unwrap();
+        let global_types = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let cold = generic_transaction_state(context.store());
+        let plan = plan_source_callable(
+            context.store(),
+            &host,
+            declaration,
+            owner,
+            Some(CanonicalArrayTargets::from_global_types(&global_types)),
+        )
+        .unwrap();
+        assert_eq!(plan.return_type, SourceCallableReturnPlan::Inferred);
+        assert_eq!(plan.type_parameters.len(), 1);
+        assert_eq!(plan.parameters.len(), 1);
+        assert_eq!(generic_transaction_state(context.store()), cold);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = CanonicalTypeQuery::new_with_global_types(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_source_callable(declaration, owner)
+        .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let [type_parameter] = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+        else {
+            panic!("expected one constrained source type parameter")
+        };
+        let type_parameter = *type_parameter;
+        let [template] = context
+            .store()
+            .callable_signature_parameter_types(signature)
+            .unwrap()
+        else {
+            panic!("expected the constrained rest tuple parameter")
+        };
+        let template = *template;
+        let Some(TypeData::TypeParameter(parameter)) = context
+            .store()
+            .type_payload(type_parameter)
+            .map(TypeRecord::data)
+        else {
+            panic!("expected the source signature's type parameter")
+        };
+        let constraint = parameter.constraint.unwrap();
+        assert_eq!(
+            constrained_string_rest_tuple_parameter(context.store(), template, &[type_parameter]),
+            Some(constraint),
+        );
+        assert_eq!(
+            validate_stored_source_callable(context.store(), callable),
+            StoredSourceCallableValidation::Pending,
+        );
+
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(
+            publish_inferred_source_callable_return(
+                context.store_mut_for_test(),
+                &plan,
+                signature,
+                void,
+            ),
+            Ok(void),
+        );
+        assert!(matches!(
+            validate_stored_source_callable(context.store(), callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        let warm = generic_transaction_state(context.store());
+        let replay = CanonicalTypeQuery::new_with_global_types(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_source_callable(declaration, owner)
+        .unwrap();
+        assert_eq!(replay, callable);
+        assert_eq!(generic_transaction_state(context.store()), warm);
+        assert!(diagnostics.is_empty());
+
+        let target = context
+            .store()
+            .canonical_tuple_shape(template)
+            .unwrap()
+            .unwrap()
+            .target();
+        let Some(TypeData::Tuple(tuple)) =
+            context.store().type_payload(target).map(TypeRecord::data)
+        else {
+            panic!("the parameter must retain its canonical tuple target")
+        };
+        let this_type = tuple.interface.this_type.unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_resolved_base_constraint(this_type, Some(number))
+        );
+        let poisoned = generic_transaction_state(context.store());
+        let result = CanonicalTypeQuery::new_with_global_types(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_source_callable(declaration, owner);
+        assert!(result.is_err());
+        assert_eq!(generic_transaction_state(context.store()), poisoned);
     }
 
     #[test]
