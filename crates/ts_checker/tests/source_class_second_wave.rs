@@ -236,7 +236,7 @@ fn protected_base_constructor_declaration_is_retained_by_subclass_signature() {
 }
 
 #[test]
-fn inaccessible_constructors_reject_external_construction_before_publication() {
+fn inaccessible_constructors_report_external_construction_diagnostics() {
     for (index, visibility) in ["private", "protected"].into_iter().enumerate() {
         let source = format!(
             "class Secret {{ {visibility} constructor() {{}} }} const secret = new Secret();"
@@ -254,15 +254,41 @@ fn inaccessible_constructors_reject_external_construction_before_publication() {
         };
         let constructor = NodeRef::new(parsed.arena.id(), file, expression.expression);
 
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the inaccessible constructor must produce one diagnostic")
+        };
         assert_eq!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
-                constructor,
-            )))
+            diagnostic.diagnostic.code(),
+            if index == 0 { 2673 } else { 2674 }
         );
-        assert!(context.store().declared_type_links(owner).is_none());
-        assert!(context.store().value_symbol_links(owner).is_none());
-        assert!(context.diagnostics().is_empty());
+        assert_eq!(diagnostic.diagnostic.arguments, ["Secret"]);
+        assert_eq!(diagnostic.node, Some(construction));
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(constructor)
+                .and_then(|links| links.resolved_symbol),
+            Some(owner),
+        );
+        assert!(context.store().declared_type_links(owner).is_some());
+        assert!(context.store().value_symbol_links(owner).is_some());
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            warm,
+        );
     }
 }
 
