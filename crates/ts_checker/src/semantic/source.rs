@@ -704,7 +704,7 @@ pub(super) struct LogicalBinaryPlan {
     parent: Option<DirectBinaryParent>,
 }
 
-/// Fully preflighted top-level conditional initializer or object spread donor.
+/// Fully preflighted conditional initializer, object spread, or function return.
 #[derive(Clone, Debug)]
 pub(super) struct ConditionalExpressionPlan {
     node: NodeRef,
@@ -716,6 +716,7 @@ pub(super) struct ConditionalExpressionPlan {
     when_false_expectation: ConditionalScalarExpectation,
     expected_result: TypeId,
     dynamic_result: bool,
+    direct_return: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18003,18 +18004,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 )
             })?;
         let owner_record = self.node(owner)?;
-        let contextual = match &owner_record.data {
+        let (contextual, direct_return) = match &owner_record.data {
             NodeData::VariableDeclaration(variable)
                 if owner_record.kind == SyntaxKind::VariableDeclaration
                     && variable.initializer == Some(root.node) =>
             {
-                variable.type_.is_some()
+                (variable.type_.is_some(), false)
             }
             NodeData::SpreadAssignment(spread)
                 if owner_record.kind == SyntaxKind::SpreadAssignment
                     && spread.expression == root.node =>
             {
-                false
+                (false, false)
+            }
+            NodeData::ReturnStatement(return_statement)
+                if owner_record.kind == SyntaxKind::ReturnStatement
+                    && return_statement.expression == Some(root.node)
+                    && self.is_direct_top_level_function_return(root)? =>
+            {
+                (false, true)
             }
             _ => {
                 return Err(self.unsupported(
@@ -18121,6 +18129,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableInitializer,
             ));
         }
+        if direct_return && !conditional_return_operand_plan_is_supported(&when_true) {
+            return Err(self.unsupported(
+                when_true.node,
+                self.node(when_true.node)?.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
         let Some(when_true_expectation) = self.conditional_scalar_expectation(&when_true)? else {
             return Err(self.unsupported(
                 when_true.node,
@@ -18145,6 +18160,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let when_false = self.plan_expression(when_false)?;
         if !conditional_scalar_operand_plan_is_supported(&when_false) {
+            return Err(self.unsupported(
+                when_false.node,
+                self.node(when_false.node)?.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+        if direct_return && !conditional_return_operand_plan_is_supported(&when_false) {
             return Err(self.unsupported(
                 when_false.node,
                 self.node(when_false.node)?.kind,
@@ -18228,6 +18250,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 when_false_expectation,
                 expected_result,
                 dynamic_result,
+                direct_return,
             })),
         ))
     }
@@ -20610,6 +20633,24 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
         | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::Binary(_)
         | PlannedExpressionKind::Logical(_) => false,
+    }
+}
+
+fn conditional_return_operand_plan_is_supported(expression: &PlannedExpression) -> bool {
+    match &expression.unparenthesized().kind {
+        PlannedExpressionKind::Null
+        | PlannedExpressionKind::GlobalUndefined
+        | PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::Number { .. }
+        | PlannedExpressionKind::BigInt { .. }
+        | PlannedExpressionKind::Boolean(_) => true,
+        PlannedExpressionKind::Identifier(read) => read.kind == PlannedIdentifierReadKind::Variable,
+        PlannedExpressionKind::Conditional(conditional) => {
+            conditional.direct_return
+                && conditional_return_operand_plan_is_supported(&conditional.when_true)
+                && conditional_return_operand_plan_is_supported(&conditional.when_false)
+        }
+        _ => false,
     }
 }
 
@@ -23485,6 +23526,7 @@ fn check_expression_type(
         }
         PlannedExpressionKind::Conditional(conditional) => {
             if contextual_type.is_some()
+                && !conditional.direct_return
                 && !matches!(
                     conditional.condition.unparenthesized().kind,
                     PlannedExpressionKind::Boolean(_)
@@ -23677,7 +23719,7 @@ fn check_expression_type(
                 &[when_true.result, when_false.result],
                 UnionReduction::Subtype,
             )?;
-            let result_type = if contextual_type.is_some() {
+            let result_type = if contextual_type.is_some() && !conditional.direct_return {
                 let widened_types = [
                     widened_fresh_literal_type(store, when_true.result)?,
                     widened_fresh_literal_type(store, when_false.result)?,
@@ -26855,6 +26897,25 @@ fn check_assignment_to_type(
         publish_expression_type(store, assignment_expression, source_types.result)?;
     }
     let source_type = source_types.result;
+    if let PlannedExpressionKind::Conditional(conditional) = &expression.unparenthesized().kind
+        && conditional.direct_return
+    {
+        check_conditional_return_branches(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            flow_types,
+            conditional,
+            target,
+        )?;
+        return Ok(CheckedAssignment {
+            declared_type: target,
+            assigned_type: source_type,
+        });
+    }
     let assignable = source_type_is_assignable_to(
         store,
         host,
@@ -26922,6 +26983,103 @@ fn check_assignment_to_type(
         declared_type: target,
         assigned_type: source_type,
     })
+}
+
+#[allow(clippy::too_many_arguments)] // Return branches retain the caller's exact relation state.
+fn check_conditional_return_branches(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    conditional: &ConditionalExpressionPlan,
+    target: TypeId,
+) -> Result<(), SourceCheckError> {
+    for (branch, assumption) in [
+        (&conditional.when_true, TruthinessAssumption::Truthy),
+        (&conditional.when_false, TruthinessAssumption::Falsy),
+    ] {
+        let branch_flow = match &conditional.condition.unparenthesized().kind {
+            PlannedExpressionKind::Identifier(read)
+                if read.kind == PlannedIdentifierReadKind::Variable
+                    && planned_expression_reads_symbol(branch, read.value_symbol) =>
+            {
+                let current = flow_types.get(&read.value_symbol).copied().ok_or(
+                    SourceCheckError::Variable(VariableInvariant::MissingCurrentFlowType(
+                        read.value_symbol,
+                    )),
+                )?;
+                let narrowed = narrow_by_truthiness(store, Some(global_types), current, assumption)
+                    .map_err(|error| match error {
+                        LogicalBinaryError::Literal(error) => error.into(),
+                        _ => SourceCheckError::Conditional(conditional.condition.node),
+                    })?;
+                let mut updated = flow_types.clone();
+                updated.insert(read.value_symbol, narrowed);
+                Some(updated)
+            }
+            _ => None,
+        };
+        let flow_types = branch_flow.as_ref().unwrap_or(flow_types);
+        let expression = branch.unparenthesized();
+        if let PlannedExpressionKind::Conditional(nested) = &expression.kind {
+            check_conditional_return_branches(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                flow_types,
+                nested,
+                target,
+            )?;
+            continue;
+        }
+
+        let checked = check_uncached_conditional_scalar(store, flow_types, expression)?;
+        let target_flags = store
+            .type_payload(target)
+            .map(TypeRecord::flags)
+            .ok_or(RelationUnavailable::Type(target))?;
+        let result = if target_flags.intersects(
+            TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::BIG_INT | TypeFlags::BOOLEAN,
+        ) {
+            widened_fresh_literal_type(store, checked.result)?
+        } else {
+            checked.result
+        };
+        let checked = CheckedExpressionTypes::leaf(checked.raw, result);
+        if source_type_is_assignable_to(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            checked.result,
+            target,
+        )? {
+            continue;
+        }
+
+        for diagnostic in super::object_diagnostics::diagnostics_for_failed_assignment(
+            store,
+            host,
+            global_types,
+            expression,
+            &checked,
+            target,
+            expression.node,
+            options,
+            session,
+        )? {
+            merge_retry_diagnostic(diagnostics, diagnostic);
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // Compound writes share the source assignment context.
@@ -74265,6 +74423,145 @@ class Foo2 {
         assert_eq!(context.type_to_string(truthy_type).unwrap(), "string");
         assert_eq!(context.type_to_string(falsy_type).unwrap(), "string | null");
         assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn direct_conditional_returns_report_each_invalid_branch_in_source_order() {
+        let source = parsed(concat!(
+            "function choose(value: boolean): 3 {\n",
+            "  return (value ? (1) : 2);\n",
+            "}\n",
+        ));
+        let file = FileId::new(4_815);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, expected) in diagnostics.iter().zip(["1", "2"]) {
+            let node = diagnostic.node.expect("expected an exact branch node");
+            assert_eq!(node_text(&source, node), expected);
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(diagnostic.diagnostic.arguments, [expected, "3"]);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!("Type '{expected}' is not assignable to type '3'."),
+            );
+        }
+        let conditional = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ConditionalExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, conditional))
+                .unwrap(),
+            "1 | 2",
+        );
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn direct_conditional_returns_preserve_nullable_branch_narrowing() {
+        let source = parsed(concat!(
+            "function truthy(value: string | undefined): string {\n",
+            "  return value ? value : 'fallback';\n",
+            "}\n",
+            "function falsy(value: string | null): string | null {\n",
+            "  return value ? 'ready' : value;\n",
+            "}\n",
+            "function inferred(value: boolean) {\n",
+            "  return value ? 1 : 2;\n",
+            "}\n",
+        ));
+        let file = FileId::new(4_816);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        for (name, expected) in [
+            ("truthy", "string"),
+            ("falsy", "string | null"),
+            ("inferred", "1 | 2"),
+        ] {
+            let statement = function_return_statement(&source, file, name);
+            let NodeData::ReturnStatement(returned) =
+                &source.arena.get(statement.node).unwrap().data
+            else {
+                panic!("expected a return statement")
+            };
+            let expression = NodeRef::new(
+                source.arena.id(),
+                file,
+                returned.expression.expect("expected a return expression"),
+            );
+            assert_eq!(
+                context
+                    .type_to_string(resolved_node_type(&context, expression))
+                    .unwrap(),
+                expected,
+                "function {name}",
+            );
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn direct_conditional_returns_widen_mismatched_primitives_and_recurse() {
+        let source = parsed(concat!(
+            "function mixed(condition: boolean, value: any): string {\n",
+            "  return condition ? value : 1;\n",
+            "}\n",
+            "function nested(first: boolean, second: boolean): 3 {\n",
+            "  return first ? 1 : second ? 2 : 3;\n",
+            "}\n",
+        ));
+        let file = FileId::new(4_817);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 3);
+        for (diagnostic, (node, source_type, target)) in
+            diagnostics
+                .iter()
+                .zip([("1", "number", "string"), ("1", "1", "3"), ("2", "2", "3")])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), node);
+            assert_eq!(diagnostic.diagnostic.arguments, [source_type, target]);
+        }
+        assert!(is_type_checked(&context, file));
 
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
