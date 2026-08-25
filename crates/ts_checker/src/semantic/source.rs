@@ -41965,7 +41965,9 @@ pub(super) fn check_source_file(
                     &assignment.jsdoc_type
                 {
                     let target = match cached_javascript_function_expando_object_type(
-                        store, assignment, annotation,
+                        store,
+                        &assignment,
+                        annotation,
                     )? {
                         Some(cached) => cached,
                         None => {
