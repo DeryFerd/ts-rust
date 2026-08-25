@@ -995,6 +995,7 @@ struct PlannedObjectVariable {
 #[derive(Clone, Debug)]
 struct PlannedObjectVariableElement {
     binding: PlannedObjectBindingElement,
+    computed_key: Option<PlannedExpression>,
     initializer: Option<PlannedExpression>,
 }
 
@@ -15695,15 +15696,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 VariableInvariant::InvalidBindingPattern(declaration),
                             ));
                         };
-                        let computed = matches!(data.elements.nodes.as_slice(), [element] if self
-                            .arena
-                            .get(*element)
-                            .and_then(|element| match &element.data {
-                                NodeData::BindingElement(element) => element.property_name,
-                                _ => None,
-                            })
-                            .and_then(|name| self.arena.get(name))
-                            .is_some_and(|name| name.kind == SyntaxKind::ComputedPropertyName));
+                        let computed = variable.type_.is_none()
+                            && matches!(data.elements.nodes.as_slice(), [element] if self
+                                .arena
+                                .get(*element)
+                                .and_then(|element| match &element.data {
+                                    NodeData::BindingElement(element) => element.property_name,
+                                    _ => None,
+                                })
+                                .and_then(|name| self.arena.get(name))
+                                .is_some_and(|name| name.kind == SyntaxKind::ComputedPropertyName));
                         return if computed {
                             self.plan_computed_variable_declaration(
                                 list,
@@ -15902,6 +15904,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     VariableInvariant::InvalidBindingPattern(element.name),
                 ));
             }
+            let computed_key = element
+                .computed_key
+                .map(|key| self.plan_computed_binding_key(key, element.property))
+                .transpose()?;
             let default = element
                 .initializer
                 .map(|initializer| {
@@ -15919,6 +15925,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             elements.push(PlannedObjectVariableElement {
                 binding: element,
+                computed_key,
                 initializer: default,
             });
         }
@@ -16112,40 +16119,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
 
-        let key_record = self.node(element.key)?;
-        let valid_key = match &key_record.data {
-            NodeData::CallExpression(call) if key_record.kind == SyntaxKind::CallExpression => {
-                call.arguments.nodes.is_empty()
-                    && !call.arguments.has_trailing_comma
-                    && call.type_arguments.is_none()
-                    && self.node(self.reference(call.expression))?.kind == SyntaxKind::Identifier
-            }
-            NodeData::Identifier(identifier) if key_record.kind == SyntaxKind::Identifier => {
-                identifier.flow_node.is_none() && !identifier.text.is_empty()
-            }
-            NodeData::StringLiteral(literal) if key_record.kind == SyntaxKind::StringLiteral => {
-                literal.token_flags.0 == 0
-            }
-            NodeData::NumericLiteral(literal) if key_record.kind == SyntaxKind::NumericLiteral => {
-                literal.token_flags.0 == 0
-            }
-            NodeData::NoSubstitutionTemplateLiteral(literal)
-                if key_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral =>
-            {
-                literal.token_flags.0 == 0 && literal.template_flags.0 == 0
-            }
-            _ => false,
-        };
-        if key_record.flags.0 != 0
-            || key_record.parent != Some(element.computed_name.node)
-            || !valid_key
-        {
-            return Err(self.unsupported(
-                element.key,
-                key_record.kind,
-                SourceSyntaxRole::VariableName,
-            ));
-        }
+        let key = self.plan_computed_binding_key(element.key, element.computed_name)?;
 
         let initializer_record = self.node(initializer)?;
         let NodeData::ObjectLiteralExpression(object) = &initializer_record.data else {
@@ -16170,25 +16144,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
 
-        let key = self.plan_expression(element.key)?;
-        let valid_key = match &key.kind {
-            PlannedExpressionKind::Call(call) => {
-                call.arguments.is_empty()
-                    && matches!(call.callee.kind, PlannedExpressionKind::Identifier(_))
-            }
-            PlannedExpressionKind::Identifier(read) => {
-                read.kind == PlannedIdentifierReadKind::Variable
-            }
-            PlannedExpressionKind::String(_) | PlannedExpressionKind::Number { .. } => true,
-            _ => false,
-        };
-        if !valid_key {
-            return Err(self.unsupported(
-                element.key,
-                self.node(element.key)?.kind,
-                SourceSyntaxRole::VariableName,
-            ));
-        }
         let initializer = self.plan_expression(initializer)?;
         if !matches!(&initializer.kind, PlannedExpressionKind::Object { .. }) {
             return Err(SourceCheckError::ObjectLiteral(
@@ -16218,6 +16173,61 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             key,
             initializer,
         })
+    }
+
+    fn plan_computed_binding_key(
+        &mut self,
+        key: NodeRef,
+        computed_name: NodeRef,
+    ) -> Result<PlannedExpression, SourceCheckError> {
+        let key_record = self.node(key)?;
+        let valid_key = match &key_record.data {
+            NodeData::CallExpression(call) if key_record.kind == SyntaxKind::CallExpression => {
+                call.arguments.nodes.is_empty()
+                    && !call.arguments.has_trailing_comma
+                    && call.type_arguments.is_none()
+                    && self.node(self.reference(call.expression))?.kind == SyntaxKind::Identifier
+            }
+            NodeData::Identifier(identifier) if key_record.kind == SyntaxKind::Identifier => {
+                identifier.flow_node.is_none() && !identifier.text.is_empty()
+            }
+            NodeData::StringLiteral(literal) if key_record.kind == SyntaxKind::StringLiteral => {
+                literal.token_flags.0 == 0
+            }
+            NodeData::NumericLiteral(literal) if key_record.kind == SyntaxKind::NumericLiteral => {
+                literal.token_flags.0 == 0
+            }
+            NodeData::NoSubstitutionTemplateLiteral(literal)
+                if key_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral =>
+            {
+                literal.token_flags.0 == 0 && literal.template_flags.0 == 0
+            }
+            _ => false,
+        };
+        if key_record.flags.0 != 0 || key_record.parent != Some(computed_name.node) || !valid_key {
+            return Err(self.unsupported(key, key_record.kind, SourceSyntaxRole::VariableName));
+        }
+
+        let planned = self.plan_expression(key)?;
+        let valid_key = match &planned.kind {
+            PlannedExpressionKind::Call(call) => {
+                call.arguments.is_empty()
+                    && matches!(call.callee.kind, PlannedExpressionKind::Identifier(_))
+            }
+            PlannedExpressionKind::Identifier(read) => {
+                read.kind == PlannedIdentifierReadKind::Variable
+            }
+            PlannedExpressionKind::String(_) | PlannedExpressionKind::Number { .. } => true,
+            _ => false,
+        };
+        if !valid_key {
+            return Err(self.unsupported(
+                key,
+                self.node(key)?.kind,
+                SourceSyntaxRole::VariableName,
+            ));
+        }
+        Ok(planned)
     }
 
     fn plan_variable_declaration(
@@ -46102,6 +46112,52 @@ pub(super) fn check_source_file(
 
                     let mut type_ = if binding.rest {
                         object_binding_rest_type(store, binding, receiver)?
+                    } else if let Some(key) = &element.computed_key {
+                        let checked_key = check_expression_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &current_flow_types,
+                            &preflighted_type_import_value_uses,
+                            key,
+                            None,
+                            &mut deferred,
+                        )?;
+                        if let Some(name) =
+                            literal_computed_property_name(store, checked_key.result)
+                        {
+                            object_binding_property_type(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                diagnostics,
+                                receiver,
+                                key.node,
+                                &name,
+                            )?
+                        } else {
+                            let checked = check_computed_binding_element(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                binding.element,
+                                receiver,
+                                checked_key.result,
+                            )
+                            .map_err(|error| {
+                                SourcePlanner::element_plan_error(binding.element, error)
+                            })?;
+                            if let Some(diagnostic) = checked.diagnostic {
+                                merge_retry_diagnostic(diagnostics, diagnostic);
+                            }
+                            checked.type_
+                        }
                     } else {
                         object_binding_property_type(
                             store,
@@ -78964,6 +79020,150 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn computed_object_bindings_mix_shorthand_and_broad_keys_without_losing_ts2537() {
+        let source = parsed(concat!(
+            "let key = 'dynamic'; ",
+            "let getKey = () => 'called'; ",
+            "const literalKey = 'literal'; ",
+            "const { fixed, [key]: selected, ['named']: named, ",
+            "[literalKey]: literal, [getKey()]: called } = ",
+            "{ fixed: 1, dynamic: 'ready', named: true, literal: 2, called: 'done' };",
+        ));
+        let file = FileId::new(10_313);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        for (diagnostic, key) in diagnostics.iter().zip(["key", "getKey()"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2537);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), key);
+        }
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "fixed"),
+            bootstrap.number_type,
+        );
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "selected"),
+            bootstrap.error_type,
+        );
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "named"),
+            bootstrap.boolean_type,
+        );
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "literal"),
+            bootstrap.number_type,
+        );
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "called"),
+            bootstrap.error_type,
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn annotated_mixed_computed_object_bindings_preserve_excess_property_diagnostics() {
+        for (index, source_text) in [
+            concat!(
+                "const { count, ['label']: renamed }: { count: number; label: string } = ",
+                "{ count: 1, label: 'ready', unexpected: true };",
+            ),
+            concat!(
+                "const { ['label']: renamed }: { label: string } = ",
+                "{ label: 'ready', unexpected: true };",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(source_text);
+            let file = FileId::new(10_314 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one excess-property diagnostic for {source_text}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2353);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), "unexpected");
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            if index == 0 {
+                assert_eq!(
+                    object_binding_value_type(&context, &source, file, "count"),
+                    bootstrap.number_type,
+                );
+            }
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, "renamed"),
+                bootstrap.string_type,
+            );
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn mixed_computed_object_bindings_reject_poisoned_symbol_links_before_publication() {
+        let source = parsed(concat!(
+            "let key = 'selected'; ",
+            "const { fixed, [key]: selected } = { fixed: 1, selected: 'ready' };",
+        ));
+        let file = FileId::new(10_316);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let binding = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::BindingElement(element) = &record.data else {
+                    return None;
+                };
+                let name = element.name.and_then(|name| source.arena.get(name))?;
+                matches!(&name.data, NodeData::Identifier(identifier)
+                    if identifier.text == "selected")
+                .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(binding).unwrap();
+        let expected = context.store().value_symbol_links(symbol).cloned().unwrap();
+        let mut poisoned = expected.clone();
+        poisoned.write_type = Some(context.store().intrinsic_bootstrap().unwrap().number_type);
+        mark_source_unchecked(&mut context, file);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(symbol, poisoned)
+        );
+        let before = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(VariableInvariant::InvalidValueLinks(actual)))
+                if actual == symbol
+        ));
+        assert_eq!(observable_state(&context, file), before);
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(symbol, expected)
+        );
+        context.check_source_file(file).unwrap();
+        assert!(is_type_checked(&context, file));
     }
 
     #[test]

@@ -97,6 +97,7 @@ pub(super) struct PlannedObjectBindingElement {
     pub(super) element: NodeRef,
     pub(super) property: NodeRef,
     pub(super) property_name: String,
+    pub(super) computed_key: Option<NodeRef>,
     pub(super) parent_properties: Vec<PlannedObjectBindingProperty>,
     pub(super) initializer: Option<NodeRef>,
     pub(super) rest: bool,
@@ -714,6 +715,7 @@ fn plan_object_binding_pattern(
 
     let source = bound.source_file();
     let mut excluded_properties = Vec::with_capacity(pattern_data.elements.nodes.len());
+    let mut has_dynamic_computed_property = false;
     for (index, element) in pattern_data.elements.nodes.iter().enumerate() {
         let element = NodeRef::new(pattern.arena, pattern.file, *element);
         let element_record = binding_child_node(arena, store, element, pattern)?;
@@ -744,6 +746,7 @@ fn plan_object_binding_pattern(
         } else {
             binding_child_node(arena, store, property, element)?
         };
+        let mut computed_key = None;
         let property_name = match &property_record.data {
             NodeData::Identifier(property)
                 if property_record.kind == SyntaxKind::Identifier
@@ -762,6 +765,75 @@ fn plan_object_binding_pattern(
                     && property.token_flags.0 == 0 =>
             {
                 property.text.clone()
+            }
+            NodeData::ComputedPropertyName(computed)
+                if property_record.kind == SyntaxKind::ComputedPropertyName
+                    && computed.facts == 0 =>
+            {
+                let key = NodeRef::new(property.arena, property.file, computed.expression);
+                let key_record = binding_child_node(arena, store, key, property)?;
+                if key_record.flags.0 != 0
+                    || key_record.range.start < property_record.range.start
+                    || key_record.range.end > property_record.range.end
+                {
+                    return Err(VariableInvariant::InvalidBindingPattern(key).into());
+                }
+                computed_key = Some(key);
+                match &key_record.data {
+                    NodeData::Identifier(key)
+                        if key_record.kind == SyntaxKind::Identifier && key.flow_node.is_none() =>
+                    {
+                        key.text.clone()
+                    }
+                    NodeData::StringLiteral(key)
+                        if key_record.kind == SyntaxKind::StringLiteral
+                            && key.token_flags.0 == 0 =>
+                    {
+                        key.text.clone()
+                    }
+                    NodeData::NumericLiteral(key)
+                        if key_record.kind == SyntaxKind::NumericLiteral
+                            && key.token_flags.0 == 0 =>
+                    {
+                        key.text.clone()
+                    }
+                    NodeData::NoSubstitutionTemplateLiteral(key)
+                        if key_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral
+                            && key.token_flags.0 == 0
+                            && key.template_flags.0 == 0 =>
+                    {
+                        key.text.clone()
+                    }
+                    NodeData::CallExpression(call)
+                        if key_record.kind == SyntaxKind::CallExpression
+                            && call.question_dot_token.is_none()
+                            && call.symbol.is_none()
+                            && call.facts == 0
+                            && call.type_arguments.is_none()
+                            && call.arguments.nodes.is_empty()
+                            && !call.arguments.has_trailing_comma =>
+                    {
+                        let callee = NodeRef::new(key.arena, key.file, call.expression);
+                        let callee_record = binding_child_node(arena, store, callee, key)?;
+                        let NodeData::Identifier(callee) = &callee_record.data else {
+                            return Err(VariablePlanError::Unsupported(
+                                VariableUnsupported::BindingPattern(key),
+                            ));
+                        };
+                        if callee_record.kind != SyntaxKind::Identifier
+                            || callee_record.flags.0 != 0
+                            || callee.flow_node.is_some()
+                        {
+                            return Err(VariableInvariant::InvalidBindingPattern(key).into());
+                        }
+                        callee.text.clone()
+                    }
+                    _ => {
+                        return Err(VariablePlanError::Unsupported(
+                            VariableUnsupported::BindingPattern(key),
+                        ));
+                    }
+                }
             }
             _ => {
                 return Err(VariablePlanError::Unsupported(
@@ -801,6 +873,7 @@ fn plan_object_binding_pattern(
                 || pattern_data.elements.has_trailing_comma
                 || data.property_name.is_some()
                 || initializer.is_some()
+                || has_dynamic_computed_property
             {
                 return Err(VariablePlanError::Unsupported(
                     VariableUnsupported::BindingPattern(element),
@@ -809,7 +882,11 @@ fn plan_object_binding_pattern(
         }
 
         if name_record.kind == SyntaxKind::ObjectBindingPattern {
-            if rest || initializer.is_some() || data.property_name.is_none() {
+            if rest
+                || initializer.is_some()
+                || data.property_name.is_none()
+                || computed_key.is_some()
+            {
                 return Err(VariablePlanError::Unsupported(
                     VariableUnsupported::BindingPattern(element),
                 ));
@@ -872,12 +949,19 @@ fn plan_object_binding_pattern(
             return Err(VariableInvariant::InvalidBindingPattern(element).into());
         }
         if !rest {
+            has_dynamic_computed_property |= computed_key.is_some_and(|key| {
+                matches!(
+                    store.source_node_kind(key),
+                    Some(SyntaxKind::Identifier | SyntaxKind::CallExpression)
+                )
+            });
             excluded_properties.push(property_name.clone());
         }
         planned.push(PlannedObjectBindingElement {
             element,
             property,
             property_name,
+            computed_key,
             parent_properties: parent_properties.to_vec(),
             initializer,
             rest,
@@ -2333,6 +2417,92 @@ mod tests {
     }
 
     #[test]
+    fn mixed_computed_object_bindings_preserve_keys_and_binder_owned_symbols() {
+        let fixture = binding_fixture(
+            concat!(
+                "let key = 'dynamic'; let getKey = () => 'called'; ",
+                "const { fixed, ['literal']: literal, [key]: dynamic, ",
+                "[getKey()]: called } = input;",
+            ),
+            10_320,
+        );
+        let declaration = binding_declaration(&fixture);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let planned = plan_top_level_object_binding_elements(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            declaration,
+            VariableBindingKind::Const,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(planned.len(), 4);
+        assert!(planned[0].computed_key.is_none());
+        for (element, kind) in planned[1..].iter().zip([
+            SyntaxKind::StringLiteral,
+            SyntaxKind::Identifier,
+            SyntaxKind::CallExpression,
+        ]) {
+            let key = element.computed_key.unwrap();
+            assert_eq!(fixture.store.source_node_kind(key), Some(kind));
+            assert_eq!(
+                fixture.store.source_node_parent(key),
+                Some(SourceNodeParent::Parent(element.property)),
+            );
+            assert_eq!(fixture.bound.symbol(element.element), Some(element.symbol));
+            assert!(fixture.store.value_symbol_links(element.symbol).is_none());
+        }
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn dynamic_computed_object_keys_do_not_forge_rest_exclusions() {
+        let fixture = binding_fixture("const { [key]: selected, ...remaining } = input;", 10_321);
+        let declaration = binding_declaration(&fixture);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            plan_top_level_object_binding_elements(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                declaration,
+                VariableBindingKind::Const,
+                false,
+            ),
+            Err(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(_)
+            ))
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
     fn object_binding_elements_preserve_defaults_nested_paths_and_rest_exclusions() {
         let fixture = binding_fixture(
             "const { first = 1, nested: { second: renamed = 2 }, ...remaining } = input;",
@@ -2413,7 +2583,6 @@ mod tests {
             "const { nested: {} } = input;",
             "const { nested: { value } = {} } = input;",
             "const { nested: [value] } = input;",
-            "const { [key]: value } = input;",
         ]
         .into_iter()
         .enumerate()
