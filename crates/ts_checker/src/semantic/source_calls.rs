@@ -9106,6 +9106,16 @@ mod tests {
                 "const filtered: boolean[] = ",
                 "values.filter((value): value is boolean => value !== null);",
             ),
+            concat!(
+                "declare const values: (boolean | string)[]; ",
+                "const filtered: boolean[] = ",
+                "values.filter((value): value is boolean => value !== undefined);",
+            ),
+            concat!(
+                "declare const values: ReadonlyArray<boolean | string>; ",
+                "const filtered: boolean[] = ",
+                "values.filter((value): value is boolean => value !== undefined);",
+            ),
         ]
         .into_iter()
         .enumerate()

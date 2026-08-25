@@ -28240,8 +28240,8 @@ fn authenticated_filter_predicate_nullish_comparison(
         ));
     };
     let expected_nullish = match &binary.right.unparenthesized().kind {
-        PlannedExpressionKind::Null => bootstrap.null_type,
-        PlannedExpressionKind::GlobalUndefined => bootstrap.undefined_type,
+        PlannedExpressionKind::Null => bootstrap.null_widening_type,
+        PlannedExpressionKind::GlobalUndefined => bootstrap.undefined_widening_type,
         _ => unreachable!("the nullish operand was authenticated above"),
     };
     if right_type != expected_nullish {
