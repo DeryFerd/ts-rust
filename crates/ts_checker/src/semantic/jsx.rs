@@ -5383,15 +5383,39 @@ fn legacy_react_fragment_attributes(
     };
     let property = child_ref(attributes, *property);
     let property_record = host.node(property).ok_or_else(invalid)?;
-    let NodeData::PropertySignatureDeclaration(children) = &property_record.data else {
-        return Err(invalid());
+    let (child_name, child_annotation, postfix) = match &property_record.data {
+        NodeData::PropertyDeclaration(children)
+            if property_record.kind == SyntaxKind::PropertyDeclaration
+                && children.initializer.is_none()
+                && children.symbol.is_none()
+                && children.facts == 0
+                && children.modifiers.is_none() =>
+        {
+            (
+                children.name,
+                children.type_.ok_or_else(invalid)?,
+                children.postfix_token,
+            )
+        }
+        NodeData::PropertySignatureDeclaration(children)
+            if property_record.kind == SyntaxKind::PropertySignature
+                && children.symbol.is_none()
+                && children.modifiers.is_none() =>
+        {
+            (children.name, children.type_, children.postfix_token)
+        }
+        _ => return Err(invalid()),
     };
-    let name = child_ref(property, children.name);
+    let postfix = postfix
+        .map(|postfix| child_ref(property, postfix))
+        .ok_or_else(invalid)?;
+    let postfix_record = host.node(postfix).ok_or_else(invalid)?;
+    let name = child_ref(property, child_name);
     let name_record = host.node(name).ok_or_else(invalid)?;
     let NodeData::Identifier(identifier) = &name_record.data else {
         return Err(invalid());
     };
-    let child_type = child_ref(property, children.type_);
+    let child_type = child_ref(property, child_annotation);
     let child_record = host.node(child_type).ok_or_else(invalid)?;
     let NodeData::TypeReferenceNode(child_reference) = &child_record.data else {
         return Err(invalid());
@@ -5433,9 +5457,11 @@ fn legacy_react_fragment_attributes(
         || attributes_record.kind != SyntaxKind::TypeLiteral
         || attributes_record.parent != Some(annotation.node)
         || literal.members.has_trailing_comma
-        || property_record.kind != SyntaxKind::PropertySignature
+        || property_record.flags.0 != 0
         || property_record.parent != Some(attributes.node)
-        || children.postfix_token.is_none()
+        || postfix_record.kind != SyntaxKind::QuestionToken
+        || postfix_record.flags.0 != 0
+        || postfix_record.parent != Some(property.node)
         || name_record.kind != SyntaxKind::Identifier
         || name_record.parent != Some(property.node)
         || identifier.text != "children"
@@ -8057,7 +8083,11 @@ mod runtime_tests {
                 "interface ComponentClass<P = {}, S = any> { ",
                 "new(props: P, context?: any): ReactElement; } ",
                 "interface StatelessComponent<P = {}> { ",
-                "(props: P & { children?: ReactNode }, context?: any): ReactElement | null; } ",
+                "(props: P & { children?: ReactNode }, context?: any): ReactElement | null; ",
+                "propTypes?: { value?: P }; ",
+                "contextTypes?: { value?: any }; ",
+                "defaultProps?: P; ",
+                "displayName?: string; } ",
                 "type ComponentType<P = {}> = ComponentClass<P> | StatelessComponent<P>; ",
                 "const Fragment: ComponentType; ",
                 "} ",
@@ -8067,6 +8097,30 @@ mod runtime_tests {
                 "interface IntrinsicElements { div: {}; } }",
             ),
         );
+
+        let library_file = FileId::new(u32::try_from(fixture.file.index()).unwrap() + 1_000);
+        let (library, _) = fixture.context.file(library_file).unwrap();
+        assert!(library.iter().any(|(_, record)| {
+            let NodeData::PropertyDeclaration(property) = &record.data else {
+                return false;
+            };
+            let Some(NodeData::Identifier(name)) =
+                library.get(property.name).map(|name| &name.data)
+            else {
+                return false;
+            };
+            name.text == "children"
+                && record
+                    .parent
+                    .and_then(|parent| library.get(parent))
+                    .is_some_and(|parent| {
+                        parent.kind == SyntaxKind::TypeLiteral
+                            && parent
+                                .parent
+                                .and_then(|parent| library.get(parent))
+                                .is_some_and(|parent| parent.kind == SyntaxKind::IntersectionType)
+                    })
+        }));
 
         fixture.context.check_source_file(fixture.file).unwrap();
 
@@ -8124,6 +8178,23 @@ mod runtime_tests {
                 .and_then(|record| record.name().as_utf8()),
             Some("StatelessComponent"),
         );
+        let members = fixture
+            .context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.context.store().symbol_table(members))
+            .unwrap();
+        for name in ["propTypes", "contextTypes", "defaultProps", "displayName"] {
+            let property = members.get_source(name).unwrap();
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .value_symbol_links(property)
+                    .is_none()
+            );
+        }
 
         let warm = (
             fixture.context.store().type_len(),
