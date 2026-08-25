@@ -22191,6 +22191,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         type_arguments: &[TypeId],
         constraints: &[(usize, TypeId)],
     ) -> Result<(), DeclaredTypeError> {
+        if self.authenticated_react_html_factory_constraints(reference, type_arguments, constraints)
+        {
+            return Ok(());
+        }
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
         let unsupported = || {
             type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported {
@@ -22233,6 +22237,225 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             issued.related_information = diagnostic.related_information;
         }
         Ok(())
+    }
+
+    /// Proves both React factory bounds without forcing cold DOM or attribute members.
+    #[allow(clippy::too_many_lines)] // Factory ownership, forwarded attributes, and DOM heritage form one proof.
+    fn authenticated_react_html_factory_constraints(
+        &self,
+        reference: &PlannedTypeReference,
+        type_arguments: &[TypeId],
+        constraints: &[(usize, TypeId)],
+    ) -> bool {
+        let [attributes_node, element_node] = reference.type_arguments.as_slice() else {
+            return false;
+        };
+        let [attributes, element] = type_arguments else {
+            return false;
+        };
+        let [(0, attribute_constraint), (1, element_constraint)] = constraints else {
+            return false;
+        };
+        let [attribute_plan, element_plan] = reference.direct_generic_constraints.as_slice() else {
+            return false;
+        };
+        let Some(NodeData::TypeReferenceNode(attributes_reference)) =
+            self.host.node(*attributes_node).map(|record| &record.data)
+        else {
+            return false;
+        };
+        let Some([nested_element]) = attributes_reference
+            .type_arguments
+            .as_ref()
+            .map(|arguments| arguments.nodes.as_slice())
+        else {
+            return false;
+        };
+        let nested_element =
+            NodeRef::new(attributes_node.arena, attributes_node.file, *nested_element);
+        let Some(element_symbol) = self
+            .store
+            .type_payload(*element)
+            .and_then(TypeRecord::symbol)
+        else {
+            return false;
+        };
+        let Some(element_constraint_symbol) = self
+            .store
+            .type_payload(*element_constraint)
+            .and_then(TypeRecord::symbol)
+        else {
+            return false;
+        };
+        let planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        );
+        if self
+            .store
+            .symbol(reference.symbol)
+            .and_then(|owner| owner.name().as_utf8())
+            != Some("DetailedHTMLFactory")
+            || self
+                .store
+                .symbol(element_constraint_symbol)
+                .and_then(|owner| owner.name().as_utf8())
+                != Some("HTMLElement")
+            || !planner.is_default_library_dom_interface_argument(*element_node, element_symbol)
+            || !planner.is_default_library_dom_interface_argument(nested_element, element_symbol)
+            || !planner.is_default_library_dom_interface_argument(
+                element_plan.node,
+                element_constraint_symbol,
+            )
+        {
+            return false;
+        }
+
+        let Some(factory) = self
+            .store
+            .declared_type_links(reference.symbol)
+            .and_then(|links| links.declared_type)
+        else {
+            return false;
+        };
+        let Some(TypeData::Interface(factory)) =
+            self.store.type_payload(factory).map(TypeRecord::data)
+        else {
+            return false;
+        };
+        let Some([attribute_parameter, element_parameter]) =
+            factory.reference.resolved_type_arguments.as_deref()
+        else {
+            return false;
+        };
+        let Ok(derived) = validate_direct_generic_reference(self.store, *attributes) else {
+            return false;
+        };
+        let Ok(base) = validate_direct_generic_reference(self.store, *attribute_constraint) else {
+            return false;
+        };
+        let Some(namespace) = self.store.get_parent_of_symbol(reference.symbol) else {
+            return false;
+        };
+        let Some(exports) = self
+            .store
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| self.store.symbol_table(exports))
+        else {
+            return false;
+        };
+        let Some(base_symbol) = self
+            .store
+            .type_payload(base.target)
+            .and_then(TypeRecord::symbol)
+        else {
+            return false;
+        };
+        let Some(derived_symbol) = self
+            .store
+            .type_payload(derived.target)
+            .and_then(TypeRecord::symbol)
+        else {
+            return false;
+        };
+        if cached_ordinary_type_parameter_owner(self.store, *attribute_parameter)
+            != Some(attribute_plan.parameter)
+            || cached_ordinary_type_parameter_owner(self.store, *element_parameter)
+                != Some(element_plan.parameter)
+            || derived.type_arguments.as_slice() != [*element]
+            || base.type_arguments.as_slice() != [*element_parameter]
+            || self
+                .store
+                .symbol(base_symbol)
+                .and_then(|owner| owner.name().as_utf8())
+                != Some("HTMLAttributes")
+            || [reference.symbol, base_symbol, derived_symbol]
+                .into_iter()
+                .any(|symbol| {
+                    self.store.symbol(symbol).is_none_or(|owner| {
+                        self.store.get_parent_of_symbol(symbol) != Some(namespace)
+                            || exports
+                                .get(owner.name())
+                                .and_then(|export| self.store.get_merged_symbol(export))
+                                != Some(symbol)
+                    })
+                })
+        {
+            return false;
+        }
+        if derived.target != base.target {
+            let Some(TypeData::Interface(interface)) = self
+                .store
+                .type_payload(derived.target)
+                .map(TypeRecord::data)
+            else {
+                return false;
+            };
+            let Some([parameter]) = interface.reference.resolved_type_arguments.as_deref() else {
+                return false;
+            };
+            let Some([inherited]) = interface.resolved_base_types.as_deref() else {
+                return false;
+            };
+            let Ok(inherited) = validate_direct_generic_reference(self.store, *inherited) else {
+                return false;
+            };
+            if inherited.target != base.target
+                || inherited.type_arguments.as_slice() != [*parameter]
+            {
+                return false;
+            }
+        }
+        if element == element_constraint {
+            return true;
+        }
+
+        let Some(owner) = self.store.symbol(element_symbol) else {
+            return false;
+        };
+        let Some(declarations) = owner.declarations() else {
+            return false;
+        };
+        let mut declarations = declarations.iter().filter_map(|declaration| {
+            self.host.node(*declaration).and_then(|record| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                Some((*declaration, interface))
+            })
+        });
+        let Some((declaration, interface)) = declarations.next() else {
+            return false;
+        };
+        if declarations.next().is_some() {
+            return false;
+        }
+        let Some(clauses) = interface.heritage_clauses.as_ref() else {
+            return false;
+        };
+        let Ok(heritage) = super::interface_heritage::plan_direct_interface_heritage(
+            self.store,
+            self.host,
+            declaration,
+            element_symbol,
+            clauses,
+        ) else {
+            return false;
+        };
+        matches!(
+            heritage.bases.as_slice(),
+            [base]
+                if base.kind == DirectInterfaceBaseKind::DefaultLibraryInterface
+                    && base.symbol == element_constraint_symbol
+                    && base.type_arguments.is_empty()
+        )
     }
 
     fn execute_generic_alias_instantiation(
