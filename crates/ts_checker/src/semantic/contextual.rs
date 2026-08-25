@@ -657,7 +657,11 @@ fn prepare_expression(
                 UnsupportedSourceSyntax::Call(expression.node),
             ));
         }
-        PlannedExpressionKind::Arrow(_) => PreparedExpression::Arrow(contextual_type),
+        PlannedExpressionKind::Arrow(_) => PreparedExpression::Arrow(
+            contextual_type
+                .map(|type_| contextual_arrow_initializer_type(store, global_types, type_))
+                .transpose()?,
+        ),
         PlannedExpressionKind::New(_) => {
             return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
                 expression.node,
@@ -1452,6 +1456,46 @@ fn validate_contextual_union(
         .map_err(Into::into)
 }
 
+/// Initialized arrows receive their callable context without its optional undefined branch.
+fn contextual_arrow_initializer_type(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    contextual_type: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return Ok(contextual_type);
+    };
+    if !bootstrap.options.strict_null_checks {
+        return Ok(contextual_type);
+    }
+    let Some(TypeData::Union(union)) = store.type_payload(contextual_type).map(TypeRecord::data)
+    else {
+        return Ok(contextual_type);
+    };
+    let [first, second] = union.union.types.as_slice() else {
+        return Ok(contextual_type);
+    };
+    let callable = if *first == bootstrap.undefined_type {
+        *second
+    } else if *second == bootstrap.undefined_type {
+        *first
+    } else {
+        return Ok(contextual_type);
+    };
+
+    validate_contextual_union(store, global_types, contextual_type)?;
+    match validate_stored_single_callable(store, callable) {
+        StoredSingleCallableValidation::Valid { .. } => Ok(callable),
+        StoredSingleCallableValidation::Pending { .. } => {
+            Err(RelationUnavailable::UnresolvedFunctionType(callable).into())
+        }
+        StoredSingleCallableValidation::Malformed { .. } => {
+            Err(RelationUnavailable::MalformedFunctionType(callable).into())
+        }
+        StoredSingleCallableValidation::NotCallable => Ok(contextual_type),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ts_ast::{FileId, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
@@ -2141,6 +2185,120 @@ mod tests {
             );
             assert!(store.type_node_links(object).is_none());
         }
+    }
+
+    #[test]
+    fn nullable_callback_properties_preserve_contextual_arrow_parameter_types() {
+        let parsed = parse_source_file(concat!(
+            "interface Target { callback: ((value: number) => number) | undefined; } ",
+            "const value: Target = { callback: value => value };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_081);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/contextual-undefined.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let parameter = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ArrowFunction(arrow) = &record.data else {
+                    return None;
+                };
+                let [parameter] = arrow.parameters.nodes.as_slice() else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), file, *parameter))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type),
+            Some(number),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn nullable_scalar_contexts_do_not_become_callable_contexts() {
+        let mut store = initialized();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (number, undefined) = (bootstrap.number_type, bootstrap.undefined_type);
+        let contextual = store
+            .literal_union_type(&[number, undefined], None)
+            .unwrap();
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+
+        assert_eq!(
+            contextual_arrow_initializer_type(&store, None, contextual),
+            Ok(contextual),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            ),
+            before,
+        );
     }
 
     #[test]
