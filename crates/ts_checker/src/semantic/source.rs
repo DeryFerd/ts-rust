@@ -232,21 +232,22 @@ use super::{
         plan_direct_source_property_syntax, prepare_source_property_diagnostic,
     },
     source_statements::{
-        SourceCapturedIterationBodySyntax, SourceCapturedIterationSyntax,
-        SourceConditionalEnumFunctionStatementsSyntax, SourceControlIfSyntax,
-        SourceControlLoopKind, SourceControlLoopSyntax, SourceEqualityConditionSyntax,
-        SourceFallthroughBranchSyntax, SourceForInStatementSyntax, SourceForOfStatementSyntax,
-        SourceFunctionStatementsError, SourceFunctionStatementsInvariant,
-        SourceFunctionStatementsSyntax, SourceJoinedFunctionStatementsError,
-        SourceJoinedFunctionStatementsInvariant, SourceJoinedFunctionStatementsSyntax,
-        SourceLinearFunctionStatementSyntax, SourceLinearFunctionStatementsSyntax,
-        SourceLocalDeclarationSyntax, SourceLoopFunctionStatementSyntax,
-        SourceLoopFunctionStatementsSyntax, SourceReturnBranchSyntax,
-        SourceSwitchArrayBindingSyntax, SourceSwitchFunctionStatementsSyntax,
-        SourceSwitchObjectBindingSyntax, SourceTypeofConditionSyntax,
-        SourceTypeofSwitchFunctionStatementsSyntax, SourceUnusedIterationDeclarationKind,
-        SourceUnusedIterationStatementSyntax, SourceVoidSwitchCallSyntax,
-        SourceVoidSwitchFunctionStatementsSyntax, plan_source_captured_iteration_statement_syntax,
+        SourceCapturedIterationBodySyntax, SourceCapturedIterationStatementSyntax,
+        SourceCapturedIterationSyntax, SourceConditionalEnumFunctionStatementsSyntax,
+        SourceControlIfSyntax, SourceControlLoopKind, SourceControlLoopSyntax,
+        SourceEqualityConditionSyntax, SourceFallthroughBranchSyntax, SourceForInStatementSyntax,
+        SourceForOfStatementSyntax, SourceFunctionStatementsError,
+        SourceFunctionStatementsInvariant, SourceFunctionStatementsSyntax,
+        SourceJoinedFunctionStatementsError, SourceJoinedFunctionStatementsInvariant,
+        SourceJoinedFunctionStatementsSyntax, SourceLinearFunctionStatementSyntax,
+        SourceLinearFunctionStatementsSyntax, SourceLocalDeclarationSyntax,
+        SourceLoopFunctionStatementSyntax, SourceLoopFunctionStatementsSyntax,
+        SourceReturnBranchSyntax, SourceSwitchArrayBindingSyntax,
+        SourceSwitchFunctionStatementsSyntax, SourceSwitchObjectBindingSyntax,
+        SourceTypeofConditionSyntax, SourceTypeofSwitchFunctionStatementsSyntax,
+        SourceUnusedIterationDeclarationKind, SourceUnusedIterationStatementSyntax,
+        SourceVoidSwitchCallSyntax, SourceVoidSwitchFunctionStatementsSyntax,
+        plan_source_captured_iteration_statement_syntax,
         plan_source_conditional_enum_function_statements_syntax, plan_source_control_if_syntax,
         plan_source_control_loop_syntax, plan_source_for_in_statement_syntax,
         plan_source_for_of_statement_syntax, plan_source_function_for_in_statement_syntax,
@@ -1555,14 +1556,34 @@ struct PlannedUnusedIteration {
 #[derive(Clone, Debug)]
 struct PlannedCapturedIteration {
     syntax: SourceCapturedIterationSyntax,
-    iterable: PlannedExpression,
+    iterable: Option<PlannedExpression>,
+    initializer: Option<PlannedExpression>,
+    condition: Option<PlannedExpression>,
+    incrementor: Option<PlannedCapturedIterationIncrementor>,
     body: PlannedCapturedIterationBody,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedCapturedIterationIncrementor {
+    expression: NodeRef,
+    operand: PlannedExpression,
+    symbol: SemanticSymbolId,
 }
 
 #[derive(Clone, Debug)]
 enum PlannedCapturedIterationBody {
     Function(Box<PlannedFunction>),
     ArrowVariable(Box<PlannedVariable>),
+    ControlFlow(Vec<PlannedCapturedIterationStatement>),
+}
+
+#[derive(Clone, Debug)]
+enum PlannedCapturedIterationStatement {
+    Expression(PlannedExpression),
+    ConditionalJump {
+        condition: PlannedExpression,
+        jump: NodeRef,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2327,12 +2348,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     )));
                 }
                 SyntaxKind::LabeledStatement => {
-                    if let Some(iteration) = self.plan_top_level_labeled_for_in(statement)? {
-                        statements.push(PlannedStatement::ForIn(Box::new(iteration)));
-                    } else {
-                        statements.push(PlannedStatement::ControlLoop(Box::new(
-                            self.plan_top_level_while(statement)?,
-                        )));
+                    match self.plan_top_level_labeled_for_in(statement) {
+                        Ok(Some(iteration)) => {
+                            statements.push(PlannedStatement::ForIn(Box::new(iteration)));
+                        }
+                        Ok(None) | Err(SourceCheckError::Unsupported(_)) => {
+                            match self.plan_top_level_while(statement) {
+                                Ok(iteration) => {
+                                    statements
+                                        .push(PlannedStatement::ControlLoop(Box::new(iteration)));
+                                }
+                                Err(SourceCheckError::Unsupported(_)) => {
+                                    statements.push(PlannedStatement::CapturedIteration(Box::new(
+                                        self.plan_top_level_captured_iteration(statement)?,
+                                    )));
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
                 SyntaxKind::ForInStatement => {
@@ -4298,9 +4332,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceCheckError::Function(SourceFunctionInvariant::Callable(statement))
             }
         })?;
-        let iterable = self.plan_expression(syntax.control.iterable.ok_or(
-            SourceCheckError::Function(SourceFunctionInvariant::Callable(statement)),
-        )?)?;
+        let iterable = syntax
+            .control
+            .iterable
+            .map(|iterable| self.plan_expression(iterable))
+            .transpose()?;
+        let initializer = syntax
+            .binding
+            .initializer
+            .map(|initializer| self.plan_expression(initializer))
+            .transpose()?;
 
         let prior_variables = self.prior_variables.clone();
         let readable_variables = self.readable_variables.clone();
@@ -4319,7 +4360,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             }
 
-            let body = match syntax.body {
+            let condition = syntax
+                .control
+                .condition
+                .map(|condition| {
+                    self.primitive_binary_position_roots.insert(condition);
+                    self.plan_expression(condition)
+                })
+                .transpose()?;
+            let body = match syntax.body.clone() {
                 SourceCapturedIterationBodySyntax::Function {
                     declaration,
                     symbol,
@@ -4383,6 +4432,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 await_expression: None,
                                 throw_expression: None,
                             }),
+                            loop_body: None,
                             body: PlannedArrowBody::Empty,
                         })),
                     );
@@ -4397,10 +4447,41 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         initializer: PlannedVariableInitializer::Expression(expression),
                     }))
                 }
+                SourceCapturedIterationBodySyntax::ControlFlow(statements) => {
+                    let mut planned = Vec::with_capacity(statements.len());
+                    for statement in statements {
+                        match statement {
+                            SourceCapturedIterationStatementSyntax::Expression(expression) => {
+                                planned.push(PlannedCapturedIterationStatement::Expression(
+                                    self.plan_expression(expression)?,
+                                ));
+                            }
+                            SourceCapturedIterationStatementSyntax::ConditionalJump {
+                                condition,
+                                jump,
+                            } => {
+                                self.primitive_binary_position_roots.insert(condition);
+                                planned.push(PlannedCapturedIterationStatement::ConditionalJump {
+                                    condition: self.plan_expression(condition)?,
+                                    jump,
+                                });
+                            }
+                        }
+                    }
+                    PlannedCapturedIterationBody::ControlFlow(planned)
+                }
             };
+            let incrementor = syntax
+                .control
+                .incrementor
+                .map(|expression| self.plan_captured_iteration_incrementor(expression))
+                .transpose()?;
             Ok(PlannedCapturedIteration {
                 syntax,
                 iterable,
+                initializer,
+                condition,
+                incrementor,
                 body,
             })
         })();
@@ -4409,6 +4490,58 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.assignable_mutable_variables = mutable_variables;
         self.hoisted_functions = hoisted_functions;
         result
+    }
+
+    fn plan_captured_iteration_incrementor(
+        &mut self,
+        expression: NodeRef,
+    ) -> Result<PlannedCapturedIterationIncrementor, SourceCheckError> {
+        let record = self.node(expression)?;
+        let (operand, operator) = match &record.data {
+            NodeData::PrefixUnaryExpression(update)
+                if record.kind == SyntaxKind::PrefixUnaryExpression =>
+            {
+                (update.operand, update.operator)
+            }
+            NodeData::PostfixUnaryExpression(update)
+                if record.kind == SyntaxKind::PostfixUnaryExpression =>
+            {
+                (update.operand, update.operator)
+            }
+            _ => return Err(SourceCheckError::PrimitiveOperator(expression)),
+        };
+        if record.flags.0 != 0
+            || !matches!(
+                operator,
+                SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+            )
+        {
+            return Err(SourceCheckError::PrimitiveOperator(expression));
+        }
+        let operand = self.reference(operand);
+        let record = self.node(operand)?;
+        if record.kind != SyntaxKind::Identifier
+            || record.flags.0 != 0
+            || record.parent != Some(expression.node)
+        {
+            return Err(SourceCheckError::PrimitiveOperator(expression));
+        }
+        let operand = self.plan_expression(operand)?;
+        let PlannedExpressionKind::Identifier(read) = &operand.kind else {
+            return Err(SourceCheckError::PrimitiveOperator(expression));
+        };
+        if read.kind != PlannedIdentifierReadKind::Variable
+            || !self
+                .assignable_mutable_variables
+                .contains(&read.value_symbol)
+        {
+            return Err(SourceCheckError::PrimitiveOperator(expression));
+        }
+        Ok(PlannedCapturedIterationIncrementor {
+            expression,
+            symbol: read.value_symbol,
+            operand,
+        })
     }
 
     fn uninitialized_variable_has_lexical_shadow(
@@ -15483,6 +15616,87 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && self.bound.flow_graph().container_is_complete(function) == Some(true))
     }
 
+    fn top_level_iteration_closure_statement_is_exact(
+        &self,
+        statement: NodeRef,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Ok(false);
+        };
+        let record = self.node(statement)?;
+        let NodeData::ExpressionStatement(data) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::ExpressionStatement
+            || record.flags.0 != 0
+            || data.flow_node.is_some()
+            || data.expression != expression.node
+        {
+            return Ok(false);
+        }
+        let Some(body) = record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let body_record = self.node(body)?;
+        let Some(iteration) = body_record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        if body_record.kind != SyntaxKind::Block
+            || !matches!(
+                self.node(iteration)?.kind,
+                SyntaxKind::ForStatement | SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement
+            )
+            || self.bound.container(statement) != Some(self.source.node_ref())
+            || self.bound.block_scope_container(statement) != Some(body)
+        {
+            return Ok(false);
+        }
+
+        let mut root = iteration;
+        loop {
+            let Some(parent) = self.node(root)?.parent.map(|node| self.reference(node)) else {
+                return Ok(false);
+            };
+            if parent == self.source.node_ref() {
+                break;
+            }
+            if self.node(parent)?.kind != SyntaxKind::LabeledStatement {
+                return Ok(false);
+            }
+            root = parent;
+        }
+
+        let syntax = match plan_source_captured_iteration_statement_syntax(
+            self.arena, self.bound, store, root,
+        ) {
+            Ok(syntax) => syntax,
+            Err(SourceFunctionStatementsError::Unsupported(_)) => return Ok(false),
+            Err(SourceFunctionStatementsError::Variable(error)) => {
+                return Err(Self::variable_plan_error(error));
+            }
+            Err(SourceFunctionStatementsError::Invariant(_)) => {
+                return Err(SourceCheckError::Function(
+                    SourceFunctionInvariant::Callable(root),
+                ));
+            }
+        };
+        let SourceCapturedIterationBodySyntax::ControlFlow(statements) = &syntax.body else {
+            return Ok(false);
+        };
+        Ok(syntax.control.statement == iteration
+            && syntax.control.body == body
+            && self.prior_variables.contains(&syntax.binding.symbol)
+            && self.readable_variables.contains(&syntax.binding.symbol)
+            && statements.iter().any(|candidate| {
+                matches!(
+                    candidate,
+                    SourceCapturedIterationStatementSyntax::Expression(candidate)
+                        if *candidate == expression
+                )
+            }))
+    }
+
     fn plan_nested_arrow_argument(
         &mut self,
         declaration: NodeRef,
@@ -15702,6 +15916,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 {
                     if !self.loop_closure_statement_is_exact(parent, argument)?
                         && !self.for_in_closure_statement_is_exact(parent, argument)?
+                        && !self.top_level_iteration_closure_statement_is_exact(parent, argument)?
                     {
                         return Err(SourceCheckError::Unsupported(
                             UnsupportedSourceSyntax::Arrow(declaration),
@@ -15951,6 +16166,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     if parent_record.parent != Some(self.source.node_ref().node)
                         && !self.loop_closure_statement_is_exact(parent, position)?
                         && !self.for_in_closure_statement_is_exact(parent, position)?
+                        && !self.top_level_iteration_closure_statement_is_exact(parent, position)?
                     {
                         return Err(unsupported());
                     }
@@ -41058,25 +41274,37 @@ pub(super) fn check_source_file(
                 }
             }
             PlannedStatement::CapturedIteration(iteration) => {
-                let iterable = check_expression_type(
-                    store,
-                    host,
-                    global_types,
-                    source,
-                    options,
-                    session,
-                    diagnostics,
-                    &current_flow_types,
-                    &preflighted_type_import_value_uses,
-                    &iteration.iterable,
-                    None,
-                    &mut deferred,
-                )?;
+                let iterable = iteration
+                    .iterable
+                    .as_ref()
+                    .map(|expression| {
+                        check_expression_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &current_flow_types,
+                            &preflighted_type_import_value_uses,
+                            expression,
+                            None,
+                            &mut deferred,
+                        )
+                    })
+                    .transpose()?;
                 let (iteration_type, iteration_diagnostic) = match iteration.syntax.control.kind {
                     SourceControlLoopKind::ForOf => {
+                        let iterable = iterable.as_ref().ok_or(SourceCheckError::Function(
+                            SourceFunctionInvariant::Callable(iteration.syntax.control.statement),
+                        ))?;
                         source_for_of_iteration_type(store, global_types, iterable.result)?
                     }
                     SourceControlLoopKind::ForIn => {
+                        let iterable = iterable.as_ref().ok_or(SourceCheckError::Function(
+                            SourceFunctionInvariant::Callable(iteration.syntax.control.statement),
+                        ))?;
                         let bootstrap =
                             store
                                 .intrinsic_bootstrap()
@@ -41101,6 +41329,47 @@ pub(super) fn check_source_file(
                             .then_some(2407),
                         )
                     }
+                    SourceControlLoopKind::For => {
+                        let initializer =
+                            iteration
+                                .initializer
+                                .as_ref()
+                                .ok_or(SourceCheckError::Function(
+                                    SourceFunctionInvariant::Callable(
+                                        iteration.syntax.binding.declaration,
+                                    ),
+                                ))?;
+                        if iterable.is_some() {
+                            return Err(SourceCheckError::Function(
+                                SourceFunctionInvariant::Callable(
+                                    iteration.syntax.control.statement,
+                                ),
+                            ));
+                        }
+                        let checked = check_expression_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &current_flow_types,
+                            &preflighted_type_import_value_uses,
+                            initializer,
+                            None,
+                            &mut deferred,
+                        )?;
+                        (
+                            inferred_variable_type(
+                                store,
+                                global_types,
+                                iteration.syntax.binding.binding,
+                                checked.result,
+                            )?,
+                            None,
+                        )
+                    }
                     _ => {
                         return Err(SourceCheckError::Function(
                             SourceFunctionInvariant::Callable(iteration.syntax.control.statement),
@@ -41108,13 +41377,25 @@ pub(super) fn check_source_file(
                     }
                 };
                 if let Some(code) = iteration_diagnostic {
+                    let expression =
+                        iteration
+                            .iterable
+                            .as_ref()
+                            .ok_or(SourceCheckError::Function(
+                                SourceFunctionInvariant::Callable(
+                                    iteration.syntax.control.statement,
+                                ),
+                            ))?;
+                    let iterable = iterable.as_ref().ok_or(SourceCheckError::Function(
+                        SourceFunctionInvariant::Callable(iteration.syntax.control.statement),
+                    ))?;
                     issue_source_iteration_diagnostic(
                         store,
                         host,
                         global_types,
                         options,
                         diagnostics,
-                        iteration.iterable.node,
+                        expression.node,
                         iterable.result,
                         code,
                     )?;
@@ -41149,8 +41430,24 @@ pub(super) fn check_source_file(
                         ),
                     ));
                 }
+                if let Some(condition) = &iteration.condition {
+                    check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &loop_flow_types,
+                        &preflighted_type_import_value_uses,
+                        condition,
+                        None,
+                        &mut deferred,
+                    )?;
+                }
 
-                let (local_name, local_symbol) = match &iteration.body {
+                let unused_local = match &iteration.body {
                     PlannedCapturedIterationBody::Function(function) => {
                         let materialized = materialize_checked_source_callable(
                             store,
@@ -41216,13 +41513,13 @@ pub(super) fn check_source_file(
                             statements.return_expression.as_ref(),
                         )?;
                         let SourceCapturedIterationBodySyntax::Function { name, symbol, .. } =
-                            iteration.syntax.body
+                            &iteration.syntax.body
                         else {
                             return Err(SourceCheckError::Function(
                                 SourceFunctionInvariant::Callable(function.callable.declaration),
                             ));
                         };
-                        (name, symbol)
+                        Some((*name, *symbol))
                     }
                     PlannedCapturedIterationBody::ArrowVariable(variable) => {
                         let PlannedVariableInitializer::Expression(initializer) =
@@ -41253,10 +41550,85 @@ pub(super) fn check_source_file(
                             variable.symbol,
                             checked.result,
                         )?;
-                        (variable.name, variable.symbol)
+                        Some((variable.name, variable.symbol))
+                    }
+                    PlannedCapturedIterationBody::ControlFlow(statements) => {
+                        for statement in statements {
+                            match statement {
+                                PlannedCapturedIterationStatement::Expression(expression) => {
+                                    check_expression_type(
+                                        store,
+                                        host,
+                                        global_types,
+                                        source,
+                                        options,
+                                        session,
+                                        diagnostics,
+                                        &loop_flow_types,
+                                        &preflighted_type_import_value_uses,
+                                        expression,
+                                        None,
+                                        &mut deferred,
+                                    )?;
+                                }
+                                PlannedCapturedIterationStatement::ConditionalJump {
+                                    condition,
+                                    jump,
+                                } => {
+                                    let jump_kind = host
+                                        .node(*jump)
+                                        .ok_or(SourceCheckError::Provenance(
+                                            SourceCheckProvenanceError::MissingNode(*jump),
+                                        ))?
+                                        .kind;
+                                    if !matches!(
+                                        jump_kind,
+                                        SyntaxKind::BreakStatement | SyntaxKind::ContinueStatement
+                                    ) {
+                                        return Err(SourceCheckError::Function(
+                                            SourceFunctionInvariant::Callable(*jump),
+                                        ));
+                                    }
+                                    let checked = check_expression_type(
+                                        store,
+                                        host,
+                                        global_types,
+                                        source,
+                                        options,
+                                        session,
+                                        diagnostics,
+                                        &loop_flow_types,
+                                        &preflighted_type_import_value_uses,
+                                        condition,
+                                        None,
+                                        &mut deferred,
+                                    )?;
+                                    if !source_truthiness_condition_type_is_supported(
+                                        store,
+                                        checked.result,
+                                        condition.node,
+                                        &mut HashSet::new(),
+                                    )? {
+                                        return Err(SourceCheckError::Function(
+                                            SourceFunctionInvariant::Callable(condition.node),
+                                        ));
+                                    }
+                                    emit_truthiness_operand_diagnostics(
+                                        store,
+                                        host,
+                                        diagnostics,
+                                        condition,
+                                        checked.result,
+                                        *jump,
+                                    )?;
+                                }
+                            }
+                        }
+                        None
                     }
                 };
-                if options.no_unused_locals
+                if let Some((local_name, local_symbol)) = unused_local
+                    && options.no_unused_locals
                     && bound
                         .source_facts()
                         .is_some_and(|facts| !facts.is_javascript_file())
@@ -41289,6 +41661,32 @@ pub(super) fn check_source_file(
                             related_information: Vec::new(),
                         },
                     );
+                }
+                if let Some(incrementor) = &iteration.incrementor {
+                    let checked = check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &loop_flow_types,
+                        &preflighted_type_import_value_uses,
+                        &incrementor.operand,
+                        None,
+                        &mut deferred,
+                    )?;
+                    if loop_flow_types.get(&incrementor.symbol) != Some(&checked.raw)
+                        || !store
+                            .type_payload(checked.result)
+                            .ok_or(RelationUnavailable::Type(checked.result))?
+                            .flags()
+                            .intersects(TypeFlags::NUMBER_LIKE | TypeFlags::BIG_INT_LIKE)
+                    {
+                        return Err(SourceCheckError::PrimitiveOperator(incrementor.expression));
+                    }
+                    publish_expression_type(store, incrementor.expression, checked.result)?;
                 }
             }
             PlannedStatement::Break(statement) => {
@@ -45073,6 +45471,147 @@ mod tests {
                 .set_value_symbol_links(binding, expected),
         );
         context.check_source_file(file).unwrap();
+    }
+
+    #[test]
+    fn labeled_top_level_iterations_preserve_closure_captures_and_jump_targets() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "numbers: for (let value of [1, 2]) { ",
+            "(function () { return value; }); (() => value); ",
+            "if (value === 1) { break; } ",
+            "if (value === 1) { break numbers; } ",
+            "if (value === 2) { continue; } ",
+            "if (value === 2) { continue numbers; } ",
+            "} ",
+            "outer: keys: for (const key in { first: 1 }) { ",
+            "(function () { return key; }); (() => key); ",
+            "if (key === 'first') { break outer; } ",
+            "if (key === 'other') { continue keys; } ",
+            "}",
+        ));
+        let library_file = FileId::new(9_092);
+        let file = FileId::new(9_093);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            variable_value_type(&context, &source, file, "value"),
+            bootstrap.number_type,
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "key"),
+            bootstrap.string_type,
+        );
+        for (name, expected) in [
+            ("value", bootstrap.number_type),
+            ("key", bootstrap.string_type),
+        ] {
+            for read in identifier_expressions(&source, file, name) {
+                assert_eq!(resolved_node_type(&context, read), expected);
+            }
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn labeled_iteration_const_captures_preserve_exact_ts2367_comparisons() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "type Zero = 0; ",
+            "declare const values: Zero[]; ",
+            "outer: for (const value of values) { ",
+            "(function () { return value; }); (() => value); ",
+            "if (value == 1) { break outer; } ",
+            "if (value == 2) { continue outer; } ",
+            "}",
+        ));
+        let library_file = FileId::new(9_094);
+        let file = FileId::new(9_095);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, value) in diagnostics.iter().zip(["1", "2"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2367);
+            assert_eq!(diagnostic.diagnostic.arguments, ["0", value]);
+            assert_eq!(
+                node_text(&source, diagnostic.node.unwrap()),
+                format!("value == {value}"),
+            );
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn labeled_classic_loops_preserve_captures_updates_and_const_comparisons() {
+        let source = parsed(concat!(
+            "counted: for (let value = 0; value < 2; ++value) { ",
+            "(function () { return value; }); (() => value); ",
+            "if (value == 1) { break; } ",
+            "if (value == 2) { continue counted; } ",
+            "} ",
+            "constant: for (const fixed = 0; fixed < 1;) { ",
+            "(function () { return fixed; }); (() => fixed); ",
+            "if (fixed == 1) { break; } ",
+            "if (fixed == 1) { break constant; } ",
+            "if (fixed == 2) { continue; } ",
+            "if (fixed == 2) { continue constant; } ",
+            "}",
+        ));
+        let file = FileId::new(9_096);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 4);
+        for (diagnostic, value) in diagnostics.iter().zip(["1", "1", "2", "2"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2367);
+            assert_eq!(diagnostic.diagnostic.arguments, ["0", value]);
+            assert_eq!(
+                node_text(&source, diagnostic.node.unwrap()),
+                format!("fixed == {value}"),
+            );
+        }
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "value"),
+            number
+        );
+        let incrementor = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PrefixUnaryExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(resolved_node_type(&context, incrementor), number);
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]

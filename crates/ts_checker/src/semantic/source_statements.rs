@@ -291,11 +291,19 @@ pub(super) struct SourceCapturedIterationBindingSyntax {
     pub(super) name: NodeRef,
     pub(super) symbol: SemanticSymbolId,
     pub(super) binding: VariableBindingKind,
+    pub(super) initializer: Option<NodeRef>,
     pub(super) destructured: bool,
 }
 
-/// One loop-local callable whose only statement reads the iteration binding.
+/// One standalone capture or authenticated conditional loop jump.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceCapturedIterationStatementSyntax {
+    Expression(NodeRef),
+    ConditionalJump { condition: NodeRef, jump: NodeRef },
+}
+
+/// One loop-local callable or a source-ordered set of captures and jumps.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SourceCapturedIterationBodySyntax {
     Function {
         declaration: NodeRef,
@@ -311,11 +319,13 @@ pub(super) enum SourceCapturedIterationBodySyntax {
         arrow: NodeRef,
         read: NodeRef,
     },
+    ControlFlow(Vec<SourceCapturedIterationStatementSyntax>),
 }
 
-/// One top-level lexical loop that retains a single captured local callable.
+/// One top-level lexical loop with authenticated captures and optional labels.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceCapturedIterationSyntax {
+    pub(super) labels: Vec<NodeRef>,
     pub(super) control: SourceControlLoopSyntax,
     pub(super) binding: SourceCapturedIterationBindingSyntax,
     pub(super) body: SourceCapturedIterationBodySyntax,
@@ -1570,7 +1580,6 @@ pub(super) fn plan_source_unused_iteration_statement_syntax(
             declaration_record.kind,
         ));
     }
-
     let binding_target = NodeRef::new(
         binding_declaration.arena,
         binding_declaration.file,
@@ -2063,48 +2072,794 @@ pub(super) fn plan_source_unused_iteration_statement_syntax(
     })
 }
 
-/// Reuses the complete unused-loop proof for captured local callables.
+/// Authenticates a top-level lexical loop, its captures, labels, and conditional jumps.
+#[allow(clippy::too_many_lines)] // The loop, captured callable, and binder scopes form one proof.
 pub(super) fn plan_source_captured_iteration_statement_syntax(
     arena: &NodeArena,
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
     statement: NodeRef,
 ) -> Result<SourceCapturedIterationSyntax, SourceFunctionStatementsError> {
-    let existing = plan_source_unused_iteration_statement_syntax(arena, bound, store, statement)?;
-    let body = match existing.local_kind {
-        SourceUnusedIterationDeclarationKind::Function => {
+    let source = bound.source_file();
+    let mut labels = Vec::new();
+    let mut iteration = statement;
+    let mut parent = source;
+    while control_statement_node(arena, bound, iteration)?.kind == SyntaxKind::LabeledStatement {
+        let record = control_statement_node(arena, bound, iteration)?;
+        let NodeData::LabeledStatement(labeled) = &record.data else {
+            return Err(unsupported_control_statement(iteration, record.kind));
+        };
+        let label = NodeRef::new(iteration.arena, iteration.file, labeled.label);
+        let next = validate_labeled_statement(arena, bound, iteration, parent)?;
+        labels.push(label);
+        parent = iteration;
+        iteration = next;
+    }
+    let statement = iteration;
+    let control = plan_source_control_loop_syntax(arena, bound, statement, parent)?;
+    if !matches!(
+        control.kind,
+        SourceControlLoopKind::For | SourceControlLoopKind::ForIn | SourceControlLoopKind::ForOf
+    ) {
+        return Err(unsupported_control_statement(
+            statement,
+            control_statement_node(arena, bound, statement)?.kind,
+        ));
+    }
+
+    let list =
+        control
+            .initializer
+            .ok_or(SourceFunctionStatementsInvariant::InvalidCallableEdge(
+                statement,
+            ))?;
+    let list_record = control_statement_node(arena, bound, list)?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return Err(unsupported_control_statement(list, list_record.kind));
+    };
+    let binding = match list_record.flags.0 {
+        NODE_FLAG_LET => VariableBindingKind::Let,
+        NODE_FLAG_CONST => VariableBindingKind::Const,
+        _ => return Err(unsupported_control_statement(list, list_record.kind)),
+    };
+    let [declaration] = declarations.declarations.nodes.as_slice() else {
+        return Err(unsupported_control_statement(list, list_record.kind));
+    };
+    if list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.parent != Some(statement.node)
+        || declarations.declarations.has_trailing_comma
+        || declarations.declarations.range.start <= list_record.range.start
+        || declarations.declarations.range.end != list_record.range.end
+        || declarations.facts != 0
+        || bound.container(list) != Some(source)
+        || bound.block_scope_container(list) != Some(statement)
+    {
+        return Err(unsupported_control_statement(list, list_record.kind));
+    }
+
+    let declaration = NodeRef::new(list.arena, list.file, *declaration);
+    let declaration_record = control_statement_node(arena, bound, declaration)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Err(unsupported_control_statement(
+            declaration,
+            declaration_record.kind,
+        ));
+    };
+    if declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || declaration_record.parent != Some(list.node)
+        || variable.exclamation_token.is_some()
+        || variable.initializer.is_some() != (control.kind == SourceControlLoopKind::For)
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.type_.is_some()
+        || variable.facts != 0
+        || bound.container(declaration) != Some(source)
+        || bound.block_scope_container(declaration) != Some(statement)
+    {
+        return Err(unsupported_control_statement(
+            declaration,
+            declaration_record.kind,
+        ));
+    }
+    let initializer = variable
+        .initializer
+        .map(|initializer| NodeRef::new(declaration.arena, declaration.file, initializer));
+    if let Some(initializer) = initializer {
+        let record = control_statement_node(arena, bound, initializer)?;
+        if record.parent != Some(declaration.node)
+            || record.flags.0 != 0
+            || bound.container(initializer) != Some(source)
+            || bound.block_scope_container(initializer) != Some(statement)
+        {
+            return Err(unsupported_control_statement(initializer, record.kind));
+        }
+    }
+
+    let name_or_pattern = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let pattern_record = control_statement_node(arena, bound, name_or_pattern)?;
+    let (binding_declaration, name, destructured) = match &pattern_record.data {
+        NodeData::Identifier(_) if pattern_record.kind == SyntaxKind::Identifier => {
+            (declaration, name_or_pattern, false)
+        }
+        NodeData::BindingPattern(pattern)
+            if control.kind == SourceControlLoopKind::ForOf
+                && pattern_record.kind == SyntaxKind::ObjectBindingPattern =>
+        {
+            let [element] = pattern.elements.nodes.as_slice() else {
+                return Err(unsupported_control_statement(
+                    name_or_pattern,
+                    pattern_record.kind,
+                ));
+            };
+            if pattern_record.flags.0 != 0
+                || pattern_record.parent != Some(declaration.node)
+                || pattern.elements.has_trailing_comma
+                || pattern.facts != 0
+                || bound.container(name_or_pattern) != Some(source)
+                || bound.block_scope_container(name_or_pattern) != Some(statement)
+                || bound.symbol(declaration).is_some()
+            {
+                return Err(unsupported_control_statement(
+                    name_or_pattern,
+                    pattern_record.kind,
+                ));
+            }
+            let element = NodeRef::new(name_or_pattern.arena, name_or_pattern.file, *element);
+            let element_record = control_statement_node(arena, bound, element)?;
+            let NodeData::BindingElement(binding_element) = &element_record.data else {
+                return Err(unsupported_control_statement(element, element_record.kind));
+            };
+            let name = binding_element
+                .name
+                .map(|name| NodeRef::new(element.arena, element.file, name))
+                .ok_or(SourceFunctionStatementsInvariant::InvalidCallableEdge(
+                    element,
+                ))?;
+            if element_record.kind != SyntaxKind::BindingElement
+                || element_record.flags.0 != 0
+                || element_record.parent != Some(name_or_pattern.node)
+                || binding_element.dot_dot_dot_token.is_some()
+                || binding_element.flow_node.is_some()
+                || binding_element.initializer.is_some()
+                || binding_element.local_symbol.is_some()
+                || binding_element.property_name.is_some()
+                || binding_element.symbol.is_some()
+                || binding_element.facts != 0
+                || bound.container(element) != Some(source)
+                || bound.block_scope_container(element) != Some(statement)
+            {
+                return Err(unsupported_control_statement(element, element_record.kind));
+            }
+            (element, name, true)
+        }
+        _ => {
+            return Err(unsupported_control_statement(
+                name_or_pattern,
+                pattern_record.kind,
+            ));
+        }
+    };
+    let name_record = control_statement_node(arena, bound, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported_control_statement(name, name_record.kind));
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(binding_declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || bound.container(name) != Some(source)
+        || bound.block_scope_container(name) != Some(statement)
+    {
+        return Err(unsupported_control_statement(name, name_record.kind));
+    }
+    let symbol = plan_top_level_variable(
+        bound,
+        store,
+        binding_declaration,
+        name,
+        &identifier.text,
+        binding,
+        false,
+    )?;
+    let locals = bound
+        .locals(statement)
+        .ok_or(SourceFunctionStatementsInvariant::MissingLocals(statement))?;
+    let actual = store
+        .symbol_table(locals)
+        .and_then(|locals| locals.get_source(&identifier.text));
+    if actual != Some(symbol) {
+        return Err(SourceFunctionStatementsInvariant::LocalTableMismatch {
+            declaration: binding_declaration,
+            scope: statement,
+            expected: symbol,
+            actual,
+        }
+        .into());
+    }
+
+    let body_record = control_statement_node(arena, bound, control.body)?;
+    let NodeData::Block(body) = &body_record.data else {
+        return Err(unsupported_control_statement(
+            control.body,
+            body_record.kind,
+        ));
+    };
+    if body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(statement.node)
+        || body.flow_node.is_some()
+        || body.next_container.is_some()
+        || body.statements.has_trailing_comma
+        || body.facts != 0
+        || bound.container(control.body) != Some(source)
+        || bound.block_scope_container(control.body) != Some(statement)
+    {
+        return Err(unsupported_control_statement(
+            control.body,
+            body_record.kind,
+        ));
+    }
+    if body.statements.nodes.is_empty() {
+        return Err(unsupported_control_statement(
+            control.body,
+            body_record.kind,
+        ));
+    }
+    let body_statement = body.statements.nodes[0];
+    let body_statement = NodeRef::new(control.body.arena, control.body.file, body_statement);
+    let statement_record = control_statement_node(arena, bound, body_statement)?;
+    if statement_record.parent != Some(control.body.node)
+        || statement_record.flags.0 != 0
+        || bound.container(body_statement) != Some(source)
+        || bound.block_scope_container(body_statement) != Some(control.body)
+    {
+        return Err(unsupported_control_statement(
+            body_statement,
+            statement_record.kind,
+        ));
+    }
+
+    let body = match &statement_record.data {
+        NodeData::FunctionDeclaration(function)
+            if statement_record.kind == SyntaxKind::FunctionDeclaration
+                && body.statements.nodes.len() == 1 =>
+        {
+            let local_name = function
+                .name
+                .map(|name| NodeRef::new(body_statement.arena, body_statement.file, name))
+                .ok_or(SourceFunctionStatementsInvariant::InvalidCallableEdge(
+                    body_statement,
+                ))?;
+            let local_symbol = bound.symbol(body_statement).ok_or(
+                SourceFunctionStatementsInvariant::MissingLocals(body_statement),
+            )?;
+            validate_captured_iteration_local_name(
+                arena,
+                bound,
+                store,
+                control.body,
+                body_statement,
+                local_name,
+                local_symbol,
+            )?;
+            if function.modifiers.is_some()
+                || function.asterisk_token.is_some()
+                || function.type_parameters.is_some()
+                || !function.parameters.nodes.is_empty()
+                || function.parameters.has_trailing_comma
+                || function.type_.is_some()
+                || function.facts != 0
+            {
+                return Err(unsupported_control_statement(
+                    body_statement,
+                    statement_record.kind,
+                ));
+            }
+            let function_body = function
+                .body
+                .map(|body| NodeRef::new(body_statement.arena, body_statement.file, body))
+                .ok_or(SourceFunctionStatementsInvariant::InvalidCallableEdge(
+                    body_statement,
+                ))?;
+            let read = captured_iteration_callable_read(
+                arena,
+                bound,
+                body_statement,
+                function_body,
+                &identifier.text,
+            )?;
             SourceCapturedIterationBodySyntax::Function {
-                declaration: existing.local_declaration,
-                name: existing.local_name,
-                symbol: existing.local_symbol,
-                read: existing.capture,
+                declaration: body_statement,
+                name: local_name,
+                symbol: local_symbol,
+                read,
             }
         }
-        SourceUnusedIterationDeclarationKind::ArrowVariable => {
-            SourceCapturedIterationBodySyntax::ArrowVariable {
-                declaration: existing.local_declaration,
-                name: existing.local_name,
-                symbol: existing.local_symbol,
-                binding: VariableBindingKind::Let,
-                arrow: existing.callable,
-                read: existing.capture,
+        NodeData::VariableStatement(variable_statement)
+            if statement_record.kind == SyntaxKind::VariableStatement
+                && body.statements.nodes.len() == 1 =>
+        {
+            if variable_statement.modifiers.is_some()
+                || variable_statement.flow_node.is_some()
+                || variable_statement.facts != 0
+            {
+                return Err(unsupported_control_statement(
+                    body_statement,
+                    statement_record.kind,
+                ));
             }
+            let local_list = NodeRef::new(
+                body_statement.arena,
+                body_statement.file,
+                variable_statement.declaration_list,
+            );
+            let local_list_record = control_statement_node(arena, bound, local_list)?;
+            let NodeData::VariableDeclarationList(local_declarations) = &local_list_record.data
+            else {
+                return Err(unsupported_control_statement(
+                    local_list,
+                    local_list_record.kind,
+                ));
+            };
+            let local_binding = match local_list_record.flags.0 {
+                NODE_FLAG_LET => VariableBindingKind::Let,
+                NODE_FLAG_CONST => VariableBindingKind::Const,
+                _ => {
+                    return Err(unsupported_control_statement(
+                        local_list,
+                        local_list_record.kind,
+                    ));
+                }
+            };
+            let [local_declaration] = local_declarations.declarations.nodes.as_slice() else {
+                return Err(unsupported_control_statement(
+                    local_list,
+                    local_list_record.kind,
+                ));
+            };
+            if local_list_record.kind != SyntaxKind::VariableDeclarationList
+                || local_list_record.parent != Some(body_statement.node)
+                || local_declarations.declarations.has_trailing_comma
+                || local_declarations.facts != 0
+                || bound.container(local_list) != Some(source)
+                || bound.block_scope_container(local_list) != Some(control.body)
+            {
+                return Err(unsupported_control_statement(
+                    local_list,
+                    local_list_record.kind,
+                ));
+            }
+            let local_declaration =
+                NodeRef::new(local_list.arena, local_list.file, *local_declaration);
+            let local_record = control_statement_node(arena, bound, local_declaration)?;
+            let NodeData::VariableDeclaration(local) = &local_record.data else {
+                return Err(unsupported_control_statement(
+                    local_declaration,
+                    local_record.kind,
+                ));
+            };
+            let local_name =
+                NodeRef::new(local_declaration.arena, local_declaration.file, local.name);
+            let arrow = local
+                .initializer
+                .map(|arrow| NodeRef::new(local_declaration.arena, local_declaration.file, arrow))
+                .ok_or(SourceFunctionStatementsInvariant::InvalidCallableEdge(
+                    local_declaration,
+                ))?;
+            if local_record.kind != SyntaxKind::VariableDeclaration
+                || local_record.flags.0 != 0
+                || local_record.parent != Some(local_list.node)
+                || local.exclamation_token.is_some()
+                || local.local_symbol.is_some()
+                || local.symbol.is_some()
+                || local.type_.is_some()
+                || local.facts != 0
+                || bound.container(local_declaration) != Some(source)
+                || bound.block_scope_container(local_declaration) != Some(control.body)
+            {
+                return Err(unsupported_control_statement(
+                    local_declaration,
+                    local_record.kind,
+                ));
+            }
+            let local_name_record = control_statement_node(arena, bound, local_name)?;
+            let NodeData::Identifier(local_identifier) = &local_name_record.data else {
+                return Err(unsupported_control_statement(
+                    local_name,
+                    local_name_record.kind,
+                ));
+            };
+            let local_symbol = plan_top_level_variable(
+                bound,
+                store,
+                local_declaration,
+                local_name,
+                &local_identifier.text,
+                local_binding,
+                false,
+            )?;
+            validate_captured_iteration_local_name(
+                arena,
+                bound,
+                store,
+                control.body,
+                local_declaration,
+                local_name,
+                local_symbol,
+            )?;
+
+            let arrow_record = control_statement_node(arena, bound, arrow)?;
+            let NodeData::ArrowFunction(arrow_data) = &arrow_record.data else {
+                return Err(unsupported_control_statement(arrow, arrow_record.kind));
+            };
+            if arrow_record.kind != SyntaxKind::ArrowFunction
+                || arrow_record.flags.0 != 0
+                || arrow_record.parent != Some(local_declaration.node)
+                || arrow_data.asterisk_token.is_some()
+                || arrow_data.modifiers.is_some()
+                || arrow_data.type_parameters.is_some()
+                || arrow_data.type_.is_some()
+                || !arrow_data.parameters.nodes.is_empty()
+                || arrow_data.parameters.has_trailing_comma
+                || arrow_data.facts != 0
+                || bound.container(arrow) != Some(source)
+                || bound.block_scope_container(arrow) != Some(control.body)
+            {
+                return Err(unsupported_control_statement(arrow, arrow_record.kind));
+            }
+            let arrow_body = NodeRef::new(arrow.arena, arrow.file, arrow_data.body);
+            let read = captured_iteration_callable_read(
+                arena,
+                bound,
+                arrow,
+                arrow_body,
+                &identifier.text,
+            )?;
+            SourceCapturedIterationBodySyntax::ArrowVariable {
+                declaration: local_declaration,
+                name: local_name,
+                symbol: local_symbol,
+                binding: local_binding,
+                arrow,
+                read,
+            }
+        }
+        NodeData::ExpressionStatement(_) => {
+            let statements = plan_captured_iteration_control_flow(
+                arena,
+                bound,
+                &control,
+                &body.statements.nodes,
+                &labels,
+            )?;
+            SourceCapturedIterationBodySyntax::ControlFlow(statements)
+        }
+        _ => {
+            return Err(unsupported_control_statement(
+                body_statement,
+                statement_record.kind,
+            ));
         }
     };
 
     Ok(SourceCapturedIterationSyntax {
-        control: existing.control,
+        labels,
+        control,
         binding: SourceCapturedIterationBindingSyntax {
-            declaration: existing
-                .binding_element
-                .unwrap_or(existing.binding_declaration),
-            name: existing.binding_name,
-            symbol: existing.binding_symbol,
-            binding: existing.binding,
-            destructured: existing.binding_element.is_some(),
+            declaration: binding_declaration,
+            name,
+            symbol,
+            binding,
+            initializer,
+            destructured,
         },
         body,
     })
+}
+
+fn plan_captured_iteration_control_flow(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    control: &SourceControlLoopSyntax,
+    nodes: &[NodeId],
+    labels: &[NodeRef],
+) -> Result<Vec<SourceCapturedIterationStatementSyntax>, SourceFunctionStatementsError> {
+    let source = bound.source_file();
+    let mut statements = Vec::with_capacity(nodes.len());
+    let mut captures = 0usize;
+    for node in nodes {
+        let statement = NodeRef::new(control.body.arena, control.body.file, *node);
+        let record = control_statement_node(arena, bound, statement)?;
+        if record.flags.0 != 0
+            || record.parent != Some(control.body.node)
+            || bound.container(statement) != Some(source)
+            || bound.block_scope_container(statement) != Some(control.body)
+        {
+            return Err(unsupported_control_statement(statement, record.kind));
+        }
+        match &record.data {
+            NodeData::ExpressionStatement(expression)
+                if record.kind == SyntaxKind::ExpressionStatement
+                    && expression.flow_node.is_none() =>
+            {
+                let expression =
+                    NodeRef::new(statement.arena, statement.file, expression.expression);
+                let expression_record = control_statement_node(arena, bound, expression)?;
+                if expression_record.flags.0 != 0
+                    || expression_record.parent != Some(statement.node)
+                    || bound.container(expression) != Some(source)
+                    || bound.block_scope_container(expression) != Some(control.body)
+                {
+                    return Err(unsupported_control_statement(
+                        expression,
+                        expression_record.kind,
+                    ));
+                }
+
+                let mut closure = expression;
+                loop {
+                    let closure_record = control_statement_node(arena, bound, closure)?;
+                    let NodeData::ParenthesizedExpression(parenthesized) = &closure_record.data
+                    else {
+                        break;
+                    };
+                    if closure_record.kind != SyntaxKind::ParenthesizedExpression
+                        || closure_record.flags.0 != 0
+                    {
+                        return Err(unsupported_control_statement(closure, closure_record.kind));
+                    }
+                    let child = NodeRef::new(closure.arena, closure.file, parenthesized.expression);
+                    let child_record = control_statement_node(arena, bound, child)?;
+                    if child_record.parent != Some(closure.node)
+                        || bound.container(child) != Some(source)
+                        || bound.block_scope_container(child) != Some(control.body)
+                    {
+                        return Err(unsupported_control_statement(child, child_record.kind));
+                    }
+                    closure = child;
+                }
+                let kind = control_statement_node(arena, bound, closure)?.kind;
+                if !matches!(
+                    kind,
+                    SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction
+                ) {
+                    return Err(unsupported_control_statement(closure, kind));
+                }
+                captures += 1;
+                statements.push(SourceCapturedIterationStatementSyntax::Expression(
+                    expression,
+                ));
+            }
+            NodeData::IfStatement(_) if record.kind == SyntaxKind::IfStatement => {
+                let (condition, jump) = plan_captured_iteration_conditional_jump(
+                    arena,
+                    bound,
+                    statement,
+                    control.body,
+                    labels,
+                )?;
+                statements.push(SourceCapturedIterationStatementSyntax::ConditionalJump {
+                    condition,
+                    jump,
+                });
+            }
+            _ => return Err(unsupported_control_statement(statement, record.kind)),
+        }
+    }
+    if captures == 0 {
+        return Err(unsupported_control_statement(
+            control.body,
+            SyntaxKind::Block,
+        ));
+    }
+    Ok(statements)
+}
+
+fn plan_captured_iteration_conditional_jump(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    statement: NodeRef,
+    parent: NodeRef,
+    labels: &[NodeRef],
+) -> Result<(NodeRef, NodeRef), SourceFunctionStatementsError> {
+    let source = bound.source_file();
+    let control = plan_source_control_if_syntax(arena, bound, statement, parent)?;
+    if control.else_statement.is_some()
+        || !control.nested_export_diagnostics.is_empty()
+        || bound.block_scope_container(control.condition) != Some(parent)
+    {
+        return Err(unsupported_control_statement(
+            statement,
+            SyntaxKind::IfStatement,
+        ));
+    }
+
+    let branch = control_statement_node(arena, bound, control.then_statement)?;
+    let (jump, scope, expected_parent) = if let NodeData::Block(block) = &branch.data {
+        let [jump] = block.statements.nodes.as_slice() else {
+            return Err(unsupported_control_statement(
+                control.then_statement,
+                branch.kind,
+            ));
+        };
+        if branch.kind != SyntaxKind::Block
+            || branch.flags.0 != 0
+            || branch.parent != Some(statement.node)
+            || block.flow_node.is_some()
+            || block.next_container.is_some()
+            || block.statements.has_trailing_comma
+            || block.facts != 0
+            || bound.container(control.then_statement) != Some(source)
+            || bound.block_scope_container(control.then_statement) != Some(parent)
+        {
+            return Err(unsupported_control_statement(
+                control.then_statement,
+                branch.kind,
+            ));
+        }
+        (
+            NodeRef::new(
+                control.then_statement.arena,
+                control.then_statement.file,
+                *jump,
+            ),
+            control.then_statement,
+            control.then_statement,
+        )
+    } else {
+        (control.then_statement, parent, statement)
+    };
+    let record = control_statement_node(arena, bound, jump)?;
+    let (label, flow_node) = match &record.data {
+        NodeData::BreakStatement(jump) if record.kind == SyntaxKind::BreakStatement => {
+            (jump.label, jump.flow_node)
+        }
+        NodeData::ContinueStatement(jump) if record.kind == SyntaxKind::ContinueStatement => {
+            (jump.label, jump.flow_node)
+        }
+        _ => return Err(unsupported_control_statement(jump, record.kind)),
+    };
+    if record.flags.0 != 0
+        || record.parent != Some(expected_parent.node)
+        || flow_node.is_some()
+        || bound.container(jump) != Some(source)
+        || bound.block_scope_container(jump) != Some(scope)
+        || bound.flow_container(jump) != Some(source)
+        || bound.flow_at(jump).is_none()
+    {
+        return Err(unsupported_control_statement(jump, record.kind));
+    }
+    if let Some(label) = label {
+        let label = NodeRef::new(jump.arena, jump.file, label);
+        let label_record = control_statement_node(arena, bound, label)?;
+        let NodeData::Identifier(identifier) = &label_record.data else {
+            return Err(unsupported_control_statement(label, label_record.kind));
+        };
+        if label_record.kind != SyntaxKind::Identifier
+            || label_record.flags.0 != 0
+            || label_record.parent != Some(jump.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || bound.container(label) != Some(source)
+            || bound.block_scope_container(label) != Some(scope)
+            || !labels.iter().any(|candidate| {
+                matches!(
+                    control_statement_node(arena, bound, *candidate).map(|node| &node.data),
+                    Ok(NodeData::Identifier(name)) if name.text == identifier.text
+                )
+            })
+        {
+            return Err(unsupported_control_statement(label, label_record.kind));
+        }
+    }
+    Ok((control.condition, jump))
+}
+
+fn validate_captured_iteration_local_name(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    scope: NodeRef,
+    declaration: NodeRef,
+    name: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<(), SourceFunctionStatementsError> {
+    let record = control_statement_node(arena, bound, name)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(unsupported_control_statement(name, record.kind));
+    };
+    if record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || bound.symbol(declaration) != Some(symbol)
+    {
+        return Err(unsupported_control_statement(name, record.kind));
+    }
+    let locals = bound
+        .locals(scope)
+        .ok_or(SourceFunctionStatementsInvariant::MissingLocals(scope))?;
+    let actual = store
+        .symbol_table(locals)
+        .and_then(|locals| locals.get_source(&identifier.text));
+    if actual != Some(symbol) {
+        return Err(SourceFunctionStatementsInvariant::LocalTableMismatch {
+            declaration,
+            scope,
+            expected: symbol,
+            actual,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn captured_iteration_callable_read(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    callable: NodeRef,
+    body: NodeRef,
+    expected: &str,
+) -> Result<NodeRef, SourceFunctionStatementsError> {
+    let body_record = control_statement_node(arena, bound, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(unsupported_control_statement(body, body_record.kind));
+    };
+    let [statement] = block.statements.nodes.as_slice() else {
+        return Err(unsupported_control_statement(body, body_record.kind));
+    };
+    if body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(callable.node)
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.statements.has_trailing_comma
+        || block.facts != 0
+        || bound.container(body) != Some(callable)
+        || bound.block_scope_container(body) != Some(callable)
+    {
+        return Err(unsupported_control_statement(body, body_record.kind));
+    }
+    let statement = NodeRef::new(body.arena, body.file, *statement);
+    let statement_record = control_statement_node(arena, bound, statement)?;
+    let NodeData::ExpressionStatement(expression) = &statement_record.data else {
+        return Err(unsupported_control_statement(
+            statement,
+            statement_record.kind,
+        ));
+    };
+    if statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.flags.0 != 0
+        || statement_record.parent != Some(body.node)
+        || expression.flow_node.is_some()
+        || bound.container(statement) != Some(callable)
+        || bound.block_scope_container(statement) != Some(callable)
+    {
+        return Err(unsupported_control_statement(
+            statement,
+            statement_record.kind,
+        ));
+    }
+    let read = NodeRef::new(statement.arena, statement.file, expression.expression);
+    let record = control_statement_node(arena, bound, read)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(unsupported_control_statement(read, record.kind));
+    };
+    if record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || record.parent != Some(statement.node)
+        || identifier.flow_node.is_some()
+        || identifier.text != expected
+        || bound.container(read) != Some(callable)
+        || bound.block_scope_container(read) != Some(callable)
+        || bound.flow_container(read) != Some(callable)
+    {
+        return Err(unsupported_control_statement(read, record.kind));
+    }
+    Ok(read)
 }
 
 /// Validates a switch and retains every case/default clause in source order.
@@ -10148,6 +10903,142 @@ mod joined_tests {
             }
             .into()),
         );
+    }
+
+    #[test]
+    fn labeled_captured_iterations_authenticate_standalone_closures_and_jumps() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "outer: inner: for (let value of [1, 2]) { ",
+                "(function () { return value; }); (() => value); ",
+                "if (value === 1) { break; } ",
+                "if (value === 1) { break outer; } ",
+                "if (value === 2) { continue; } ",
+                "if (value === 2) { continue inner; } ",
+                "}",
+            ),
+            FileId::new(1_480),
+        );
+        let source = fixture
+            .parsed
+            .arena
+            .get(fixture.parsed.source_file)
+            .unwrap();
+        let NodeData::SourceFile(source) = &source.data else {
+            panic!("expected a source root")
+        };
+        let root = NodeRef::new(
+            fixture.parsed.arena.id(),
+            fixture.file,
+            source.statements.nodes[0],
+        );
+
+        let syntax = plan_source_captured_iteration_statement_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            root,
+        )
+        .unwrap();
+
+        assert_eq!(syntax.labels.len(), 2);
+        assert_eq!(syntax.control.kind, SourceControlLoopKind::ForOf);
+        let SourceCapturedIterationBodySyntax::ControlFlow(statements) = syntax.body else {
+            panic!("expected standalone closures and conditional jumps")
+        };
+        assert_eq!(statements.len(), 6);
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| matches!(
+                    statement,
+                    SourceCapturedIterationStatementSyntax::ConditionalJump { .. }
+                ))
+                .count(),
+            4,
+        );
+    }
+
+    #[test]
+    fn labeled_captured_iterations_reject_foreign_jump_targets_and_other_bodies() {
+        for (index, source) in [
+            "outer: for (let value of [1]) { (() => value); if (value) { break missing; } }",
+            "outer: for (let value of [1]) { (() => value); if (value) { continue missing; } }",
+            "outer: for (let value of [1]) { (() => value); if (value) { break; } else { continue; } }",
+            "outer: for (let value of [1]) { consume(value); if (value) { break outer; } }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_481 + u32::try_from(index).unwrap()));
+            let root = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::LabeledStatement
+                        && record.parent == Some(fixture.parsed.source_file))
+                    .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    plan_source_captured_iteration_statement_syntax(
+                        &fixture.parsed.arena,
+                        &fixture.bound,
+                        &fixture.store,
+                        root,
+                    ),
+                    Err(SourceFunctionStatementsError::Unsupported(_)),
+                ),
+                "unexpectedly admitted unsupported labeled iteration: {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn labeled_captured_iterations_authenticate_classic_initializer_and_updates() {
+        for (index, source) in [
+            concat!(
+                "outer: for (let value = 0; value < 2; ++value) { ",
+                "(function () { return value; }); (() => value); ",
+                "if (value === 1) { continue outer; } }",
+            ),
+            concat!(
+                "outer: for (const value = 0; value < 1;) { ",
+                "(function () { return value; }); (() => value); ",
+                "if (value == 1) { break outer; } }",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_485 + u32::try_from(index).unwrap()));
+            let root = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::LabeledStatement
+                        && record.parent == Some(fixture.parsed.source_file))
+                    .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                })
+                .unwrap();
+
+            let syntax = plan_source_captured_iteration_statement_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                root,
+            )
+            .unwrap();
+
+            assert_eq!(syntax.control.kind, SourceControlLoopKind::For);
+            assert!(syntax.binding.initializer.is_some());
+            assert_eq!(syntax.control.incrementor.is_some(), index == 0);
+        }
     }
 
     #[test]
