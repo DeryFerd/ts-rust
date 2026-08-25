@@ -3356,7 +3356,7 @@ fn generic_call_union_instantiation_matches(
     }
     if actual_types.iter().copied().any(|candidate| {
         !templates.iter().copied().any(|template| {
-            generic_call_type_instantiation_matches(
+            generic_call_union_template_matches(
                 store,
                 array_targets,
                 template,
@@ -3370,8 +3370,31 @@ fn generic_call_union_instantiation_matches(
         return false;
     }
     templates.iter().copied().all(|template| {
+        if let Some(mapped) =
+            generic_call_mapped_union_constituents(store, array_targets, template, sources, targets)
+        {
+            return mapped.iter().copied().all(|member| {
+                actual_types.iter().copied().any(|candidate| {
+                    generic_call_type_instantiation_matches(
+                        store,
+                        array_targets,
+                        member,
+                        candidate,
+                        sources,
+                        targets,
+                        active_templates,
+                    )
+                }) || generic_call_mapped_template_is_redundant(
+                    store,
+                    member,
+                    actual_types,
+                    sources,
+                    targets,
+                )
+            });
+        }
         actual_types.iter().copied().any(|candidate| {
-            generic_call_type_instantiation_matches(
+            generic_call_union_template_matches(
                 store,
                 array_targets,
                 template,
@@ -3388,6 +3411,61 @@ fn generic_call_union_instantiation_matches(
             targets,
         )
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generic_call_union_template_matches(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    template: TypeId,
+    actual: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    active_templates: &mut Vec<TypeId>,
+) -> bool {
+    if generic_call_type_instantiation_matches(
+        store,
+        array_targets,
+        template,
+        actual,
+        sources,
+        targets,
+        active_templates,
+    ) {
+        return true;
+    }
+    generic_call_mapped_union_constituents(store, array_targets, template, sources, targets)
+        .is_some_and(|constituents| constituents.contains(&actual))
+}
+
+fn generic_call_mapped_union_constituents<'store>(
+    store: &'store CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    template: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+) -> Option<&'store [TypeId]> {
+    let mapped = sources
+        .iter()
+        .position(|source| *source == template)
+        .and_then(|index| targets.get(index))
+        .copied()?;
+    let record = store.type_payload(mapped)?;
+    let TypeData::Union(union) = record.data() else {
+        return None;
+    };
+    if record.alias().is_some()
+        || union.origin.is_some()
+        || match array_targets {
+            Some(array_targets) => store
+                .validate_cached_union_result_with_array_targets(array_targets, mapped, None)
+                .is_err(),
+            None => store.validate_cached_union_result(mapped, None).is_err(),
+        }
+    {
+        return None;
+    }
+    Some(&union.union.types)
 }
 
 fn generic_call_mapped_template_is_redundant(
@@ -6016,6 +6094,7 @@ mod tests {
         );
         assert_eq!(remaining.projection.instantiation.type_arguments, [bigint]);
 
+        let signature = combined.projection.instantiation.signature;
         let warm = vector_cache_graph_counts(&store);
         assert_eq!(
             project_vector(
@@ -6026,6 +6105,26 @@ mod tests {
             Ok(combined),
         );
         assert_eq!(vector_cache_graph_counts(&store), warm);
+
+        let parameter = store.signature(signature).unwrap().parameters()[0];
+        let mut links = store.value_symbol_links(parameter).unwrap().clone();
+        links.resolved_type = Some(matched);
+        assert!(store.set_value_symbol_links(parameter, links));
+        let forged = vector_cache_graph_counts(&store);
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &callable,
+                vector_request(callable.owner, None, &[multiple]),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidCachedInstantiation {
+                    target: callable.signature,
+                    signature,
+                },
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), forged);
     }
 
     #[test]
