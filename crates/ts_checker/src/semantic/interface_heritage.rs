@@ -1872,8 +1872,8 @@ mod tests {
     use super::*;
     use crate::semantic::{
         AliasTargetState, CanonicalCheckerContext, CanonicalCheckerDiagnostics,
-        CanonicalCheckerOptions, SourceCheckError, TypeData, production::GlobalMergeCompletion,
-        type_nodes::CanonicalTypeQuery,
+        CanonicalCheckerOptions, SourceCheckError, TypeData, bootstrap::LiteralTypeCacheError,
+        production::GlobalMergeCompletion, type_nodes::CanonicalTypeQuery,
     };
 
     fn checker_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -2170,6 +2170,10 @@ mod tests {
         };
         assert!(!interface.base_types_resolved);
         assert!(!interface.declared_members_resolved);
+        assert_eq!(
+            context.store().validate_union_constituent(array_shell),
+            Ok(())
+        );
         assert!(
             context
                 .store()
@@ -2204,6 +2208,17 @@ mod tests {
             warm,
         );
         assert!(diagnostics.is_empty());
+
+        assert!(context.store_mut_for_test().set_interface_base_resolution(
+            array_shell,
+            true,
+            None,
+            None
+        ));
+        assert_eq!(
+            context.store().validate_union_constituent(array_shell),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(array_shell)),
+        );
     }
 
     #[test]
