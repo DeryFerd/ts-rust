@@ -1535,13 +1535,13 @@ fn validate_value_import_attributes(
     Ok(())
 }
 
-/// Proves one complete top-level named or namespace reexport without checker writes.
+/// Proves one complete top-level named, namespace, or star reexport without checker writes.
 ///
 /// `export { source as public } from "./target"` and
-/// `export * as public from "./target"` forms are admitted. Module names can
-/// be identifiers or string literals, and named bindings can use `default`.
-/// Star, local, attribute-bearing, and `CommonJS` forms require separate module
-/// support.
+/// `export * as public from "./target"` forms retain their exact alias bindings.
+/// Plain value-star declarations retain the binder-owned `EXPORT_STAR` symbol
+/// and have no immediate alias bindings. Local, type-only star,
+/// attribute-bearing, and `CommonJS` forms require separate support.
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_lines)] // One exact export-declaration provenance walk.
 pub(super) fn plan_top_level_named_reexport(
@@ -1627,10 +1627,51 @@ pub(super) fn plan_top_level_named_reexport(
         )));
     }
 
-    let clause = export
+    let Some(clause) = export
         .export_clause
         .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
-        .ok_or_else(|| unsupported(SourceImportUnsupported::ExportClause(declaration)))?;
+    else {
+        if export.is_type_only {
+            return Err(unsupported(SourceImportUnsupported::ExportClause(
+                declaration,
+            )));
+        }
+        let module = bound
+            .symbol(source)
+            .ok_or_else(|| invariant(SourceImportInvariant::InvalidSource(source)))?;
+        let star = bound
+            .symbol(declaration)
+            .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(declaration)))?;
+        let star_record = store
+            .symbol(star)
+            .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(star)))?;
+        if star_record.flags() != SymbolFlags::EXPORT_STAR
+            || star_record.check_flags() != CheckFlags::NONE
+            || star_record.name() != InternalSymbolName::ExportStar.as_ref()
+            || star_record
+                .declarations()
+                .is_none_or(|declarations| !declarations.contains(&declaration))
+            || star_record.value_declaration().is_some()
+            || star_record.members().is_some()
+            || star_record.exports().is_some()
+            || star_record.parent() != Some(module)
+            || star_record.export_symbol().is_some()
+            || store.get_merged_symbol(star) != Some(star)
+            || store
+                .symbol(module)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get(InternalSymbolName::ExportStar.as_ref()))
+                != Some(star)
+        {
+            return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(star)));
+        }
+        return Ok(SourceNamedReexportPlan {
+            declaration,
+            module_specifier,
+            bindings: Vec::new(),
+        });
+    };
     let clause_record = checked_node(arena, bound, store, clause)?;
     if let NodeData::NamespaceExport(namespace) = &clause_record.data {
         if clause_record.kind != SyntaxKind::NamespaceExport
@@ -11545,6 +11586,106 @@ mod tests {
     }
 
     #[test]
+    fn package_declaration_star_reexports_preserve_value_and_type_import_identity() {
+        let mut fixture = fixture_with_declaration_files(
+            &[
+                concat!(
+                    "import { value as selected } from 'package'; ",
+                    "import type { Model } from 'package'; ",
+                    "const result = selected; ",
+                    "declare var model: Model;",
+                ),
+                "export * from './internal';",
+                "export * from './declarations';",
+                concat!(
+                    "export const value: number; ",
+                    "export interface Model { value: number; }",
+                ),
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 0,
+                    specifier: 1,
+                    target: Some(1),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(2),
+                },
+                Route {
+                    source: 2,
+                    specifier: 0,
+                    target: Some(3),
+                },
+            ],
+            &[1, 2, 3],
+        );
+        let value_import = fixture.plan_import(0, 0);
+        let type_import = fixture.plan_type_import(0, 1);
+        let first_star = fixture.plan_reexport(1, 0);
+        let second_star = fixture.plan_reexport(2, 0);
+        assert!(first_star.bindings.is_empty());
+        assert!(second_star.bindings.is_empty());
+
+        let values = resolve_all(&mut fixture, &value_import.bindings).unwrap();
+        let types = resolve_all_types(&mut fixture, &type_import.bindings).unwrap();
+        let value = direct_export(&fixture, 3, "value");
+        let model = direct_export(&fixture, 3, "Model");
+        assert_eq!(values[0].immediate_target_symbol, value);
+        assert_eq!(values[0].target_symbol, value);
+        assert_eq!(types[0].immediate_target_symbol, model);
+        assert_eq!(types[0].target_symbol, model);
+
+        let importer = &fixture.files[0];
+        let bound = fixture.bound.get(&importer.file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &importer.parsed.arena,
+            bound,
+            &fixture.store,
+            &value_import.bindings[0],
+            identifier_initializer(&fixture, 0, "selected"),
+            "selected",
+            value_import.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let prepared = prepare_one(&mut fixture, &values[0], &read).unwrap();
+        assert_eq!(
+            prepared.type_,
+            fixture.store.intrinsic_bootstrap().unwrap().number_type,
+        );
+        let reference = type_reference(&fixture, 0, "Model");
+        let capability = plan_type_reference_capability(&fixture, &types[0], reference);
+        let imported_model =
+            query_type_with_import_capability(&mut fixture, reference, capability).unwrap();
+        assert_eq!(
+            fixture.store.type_payload(imported_model).unwrap().symbol(),
+            Some(model),
+        );
+
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            resolve_all(&mut fixture, &value_import.bindings).unwrap(),
+            values,
+        );
+        assert_eq!(
+            resolve_all_types(&mut fixture, &type_import.bindings).unwrap(),
+            types,
+        );
+        assert_eq!(
+            prepare_one(&mut fixture, &values[0], &read).unwrap(),
+            prepared
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
     fn named_value_reexport_chain_retains_each_immediate_alias_and_final_target() {
         let mut fixture = fixture(
             &[
@@ -11943,7 +12084,7 @@ mod tests {
     }
 
     #[test]
-    fn star_local_and_commonjs_reexports_remain_boundaries() {
+    fn star_reexports_require_exact_binder_ownership_and_reject_type_only_forms() {
         let star = fixture(
             &[
                 r#"export * from "./base";"#,
@@ -11955,13 +12096,71 @@ mod tests {
                 target: Some(1),
             }],
         );
+        let planned = star.plan_reexport(0, 0);
+        assert!(planned.bindings.is_empty());
+
+        let type_only = fixture(
+            &[
+                r#"export type * from "./base";"#,
+                "export interface Model {}",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
         assert!(matches!(
-            star.try_plan_reexport(0, 0),
+            type_only.try_plan_reexport(0, 0),
             Err(SourceImportError::Unsupported(
                 SourceImportUnsupported::ExportClause(_)
             ))
         ));
 
+        let mut forged = fixture(
+            &[
+                r#"export * from "./base";"#,
+                r"export const value: number = 1;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let source = &forged.files[0];
+        let declaration = source
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ExportDeclaration).then_some(NodeRef::new(
+                    source.parsed.arena.id(),
+                    source.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = forged
+            .bound
+            .get(&source.file)
+            .and_then(|bound| bound.symbol(declaration))
+            .unwrap();
+        assert!(
+            forged
+                .store
+                .set_symbol_relationships(symbol, None, None, None, None),
+        );
+        assert_eq!(
+            forged.try_plan_reexport(0, 0),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::InvalidTargetSymbol(symbol),
+            )),
+        );
+    }
+
+    #[test]
+    fn local_and_commonjs_reexports_remain_boundaries() {
         let local = fixture(&[r"const value: number = 1; export { value };"], &[]);
         assert!(matches!(
             local.try_plan_reexport(0, 0),

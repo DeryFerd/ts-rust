@@ -2304,11 +2304,27 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
     }
 
     fn direct_export<MapperPayload>(
+        &self,
         store: &CanonicalSemanticStore<MapperPayload>,
         declaration: NodeRef,
         module: SemanticSymbolId,
         name: &str,
     ) -> Result<SemanticSymbolId, CanonicalAliasTargetUnavailable> {
+        self.direct_export_in_star_chain(store, declaration, module, name, &mut Vec::new())?
+            .ok_or(CanonicalAliasTargetUnavailable::MissingExport {
+                declaration,
+                module,
+            })
+    }
+
+    fn direct_export_in_star_chain<MapperPayload>(
+        &self,
+        store: &CanonicalSemanticStore<MapperPayload>,
+        declaration: NodeRef,
+        module: SemanticSymbolId,
+        name: &str,
+        visited: &mut Vec<SemanticSymbolId>,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalAliasTargetUnavailable> {
         let module_record =
             store
                 .symbol(module)
@@ -2317,10 +2333,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     module,
                 })?;
         let Some(exports) = module_record.exports() else {
-            return Err(CanonicalAliasTargetUnavailable::MissingExport {
-                declaration,
-                module,
-            });
+            return Ok(None);
         };
         let exports = store.symbol_table(exports).ok_or(
             CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
@@ -2329,29 +2342,121 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             },
         )?;
         if let Some(target) = exports.get_source(name) {
-            return store.symbol(target).is_some().then_some(target).ok_or(
-                CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
-                    declaration,
-                    module,
-                },
-            );
-        }
-        if name != "default"
-            && exports
-                .get(InternalSymbolName::ExportStar.as_ref())
+            return store
+                .symbol(target)
                 .is_some()
-        {
-            return Err(
-                CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported {
+                .then_some(Some(target))
+                .ok_or(CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
                     declaration,
                     module,
-                },
-            );
+                });
         }
-        Err(CanonicalAliasTargetUnavailable::MissingExport {
+        if name == "default" || visited.contains(&module) {
+            return Ok(None);
+        }
+        let Some(star) = exports.get(InternalSymbolName::ExportStar.as_ref()) else {
+            return Ok(None);
+        };
+        let unsupported = || CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported {
             declaration,
             module,
-        })
+        };
+        let malformed = || CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+            declaration,
+            module,
+        };
+        let star_record = store.symbol(star).ok_or_else(malformed)?;
+        let Some(declarations) = star_record.declarations() else {
+            return Err(malformed());
+        };
+        if star_record.flags() != SymbolFlags::EXPORT_STAR
+            || star_record.check_flags() != CheckFlags::NONE
+            || star_record.name() != InternalSymbolName::ExportStar.as_ref()
+            || star_record.value_declaration().is_some()
+            || star_record.members().is_some()
+            || star_record.exports().is_some()
+            || star_record.parent() != Some(module)
+            || star_record.export_symbol().is_some()
+            || declarations.is_empty()
+            || store.get_merged_symbol(star) != Some(star)
+        {
+            return Err(malformed());
+        }
+
+        visited.push(module);
+        let result = (|| {
+            let mut selected = None;
+            for &star_declaration in declarations {
+                let source = self
+                    .sources
+                    .get(star_declaration.file)
+                    .ok_or_else(malformed)?;
+                let statement = source
+                    .arena
+                    .get(star_declaration.node)
+                    .ok_or_else(malformed)?;
+                let NodeData::ExportDeclaration(export) = &statement.data else {
+                    return Err(malformed());
+                };
+                let specifier = export
+                    .module_specifier
+                    .map(|node| NodeRef::new(star_declaration.arena, star_declaration.file, node))
+                    .ok_or_else(malformed)?;
+                let specifier_node = source.arena.get(specifier.node).ok_or_else(malformed)?;
+                if !star_declaration.is_for(source.arena.id(), source.bound.file_id())
+                    || !source.bound.contains(star_declaration)
+                    || !store.contains_node_ref(star_declaration)
+                    || source.bound.symbol(star_declaration) != Some(star)
+                    || source.bound.symbol(source.bound.source_file()) != Some(module)
+                    || statement.kind != SyntaxKind::ExportDeclaration
+                    || statement.parent != Some(source.bound.source_file().node)
+                    || statement.flags.0 != 0
+                    || export.export_clause.is_some()
+                    || export.is_type_only
+                    || export.attributes.is_some()
+                    || export.modifiers.is_some()
+                    || export.flow_node.is_some()
+                    || export.symbol.is_some()
+                    || export.facts != 0
+                    || !source.bound.contains(specifier)
+                    || !store.contains_node_ref(specifier)
+                    || specifier_node.kind != SyntaxKind::StringLiteral
+                    || specifier_node.parent != Some(star_declaration.node)
+                    || specifier_node.flags.0 != 0
+                    || !matches!(
+                        &specifier_node.data,
+                        NodeData::StringLiteral(literal)
+                            if literal.token_flags.0 == 0 && !literal.text.is_empty()
+                    )
+                {
+                    return Err(unsupported());
+                }
+
+                let resolved = self
+                    .resolved_module(star_declaration, specifier, store)
+                    .map_err(|_| unsupported())?;
+                let target = self
+                    .direct_source_module(store, star_declaration, resolved, false)
+                    .map_err(|_| unsupported())?;
+                if Self::export_equals_target(store, star_declaration, target)?.is_some() {
+                    return Err(unsupported());
+                }
+                let Some(candidate) =
+                    self.direct_export_in_star_chain(store, declaration, target, name, visited)?
+                else {
+                    continue;
+                };
+                if selected.is_some_and(|selected| {
+                    store.get_merged_symbol(selected) != store.get_merged_symbol(candidate)
+                }) {
+                    return Err(unsupported());
+                }
+                selected = Some(candidate);
+            }
+            Ok(selected)
+        })();
+        visited.pop();
+        result
     }
 
     fn ambient_export_equals_member<MapperPayload>(
@@ -2721,7 +2826,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 export_equals.unwrap_or(module)
             }
             SupportedAliasDeclaration::DefaultModuleMember { .. } => {
-                Self::direct_export(store, declaration, module, "default")?
+                self.direct_export(store, declaration, module, "default")?
             }
             SupportedAliasDeclaration::NamedModuleMember { name, .. }
                 if resolved.is_ambient_module() && export_equals.is_some() =>
@@ -2736,7 +2841,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 )?
             }
             SupportedAliasDeclaration::NamedModuleMember { name, .. } => {
-                Self::direct_export(store, declaration, module, name)?
+                self.direct_export(store, declaration, module, name)?
             }
             SupportedAliasDeclaration::ExternalImportEquals { .. } => {
                 export_equals.unwrap_or(module)
@@ -6280,6 +6385,150 @@ mod tests {
                 Some(&AliasSymbolLinks::default())
             );
         }
+    }
+
+    #[test]
+    fn named_imports_follow_authenticated_star_reexport_chains() {
+        let importer = parsed("import { value as selected, shadowed } from 'package';");
+        let outer = parsed(concat!(
+            "export * from './middle'; ",
+            "export const shadowed: number = 2;",
+        ));
+        let middle = parsed("export * from './outer'; export * from './base';");
+        let base = parsed(concat!(
+            "export const value: number = 1; ",
+            "export const shadowed: number = 3;",
+        ));
+        let importer_file = FileId::new(6_240);
+        let outer_file = FileId::new(6_241);
+        let middle_file = FileId::new(6_242);
+        let base_file = FileId::new(6_243);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (outer_file, &outer, CanonicalModuleState::External),
+            (middle_file, &middle, CanonicalModuleState::External),
+            (base_file, &base, CanonicalModuleState::External),
+        ];
+        let middle_specifiers = module_specifiers(&middle);
+        let entries = [
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&importer, importer_file, module_specifiers(&importer)[0]),
+                esm(outer_file),
+            ),
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&outer, outer_file, module_specifiers(&outer)[0]),
+                esm(middle_file),
+            ),
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&middle, middle_file, middle_specifiers[0]),
+                esm(outer_file),
+            ),
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&middle, middle_file, middle_specifiers[1]),
+                esm(base_file),
+            ),
+        ];
+        let (mut store, bound_files, manifest) =
+            fixture(&files, CanonicalModuleResolutionManifestInput::new(entries));
+        let selected = alias(
+            &bound_files,
+            alias_declaration_named(&importer, importer_file, "selected"),
+        );
+        let shadowed = alias(
+            &bound_files,
+            alias_declaration_named(&importer, importer_file, "shadowed"),
+        );
+        let base_value = direct_export(&store, &bound_files, base_file, "value");
+        let outer_shadowed = direct_export(&store, &bound_files, outer_file, "shadowed");
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+
+        for (imported, expected) in [(selected, base_value), (shadowed, outer_shadowed)] {
+            assert_eq!(
+                CanonicalAliasResolver::new(&mut store, &mut host)
+                    .get_immediate_aliased_symbol(imported)
+                    .unwrap(),
+                Some(expected),
+            );
+            assert_eq!(
+                CanonicalAliasResolver::new(&mut store, &mut host)
+                    .resolve_alias(imported)
+                    .unwrap()
+                    .target,
+                AliasTargetState::Resolved(expected),
+            );
+        }
+
+        let allocations = (store.symbol_len(), store.symbol_store().symbol_table_len());
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(selected)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(base_value),
+        );
+        assert_eq!(
+            (store.symbol_len(), store.symbol_store().symbol_table_len()),
+            allocations,
+        );
+    }
+
+    #[test]
+    fn star_reexports_reject_ambiguous_named_exports() {
+        let importer = parsed("import { value } from './barrel';");
+        let barrel = parsed("export * from './first'; export * from './second';");
+        let first = parsed("export const value: number = 1;");
+        let second = parsed("export const value: number = 2;");
+        let importer_file = FileId::new(6_244);
+        let barrel_file = FileId::new(6_245);
+        let first_file = FileId::new(6_246);
+        let second_file = FileId::new(6_247);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (barrel_file, &barrel, CanonicalModuleState::External),
+            (first_file, &first, CanonicalModuleState::External),
+            (second_file, &second, CanonicalModuleState::External),
+        ];
+        let barrel_specifiers = module_specifiers(&barrel);
+        let entries = [
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&importer, importer_file, module_specifiers(&importer)[0]),
+                esm(barrel_file),
+            ),
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&barrel, barrel_file, barrel_specifiers[0]),
+                esm(first_file),
+            ),
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&barrel, barrel_file, barrel_specifiers[1]),
+                esm(second_file),
+            ),
+        ];
+        let (mut store, bound_files, manifest) =
+            fixture(&files, CanonicalModuleResolutionManifestInput::new(entries));
+        let declaration = alias_declaration_named(&importer, importer_file, "value");
+        let imported = alias(&bound_files, declaration);
+        let module = source_module(&bound_files, barrel_file);
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+
+        assert_eq!(
+            unavailable_reason(
+                CanonicalAliasResolver::new(&mut store, &mut host)
+                    .resolve_alias(imported)
+                    .unwrap_err(),
+            ),
+            CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported {
+                declaration,
+                module,
+            },
+        );
+        assert_eq!(
+            store.alias_symbol_links(imported),
+            Some(&AliasSymbolLinks::default())
+        );
     }
 
     #[test]
