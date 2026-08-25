@@ -15106,6 +15106,7 @@ fn comma_left_is_side_effect_free(expression: &PlannedExpression) -> bool {
     match &expression.kind {
         PlannedExpressionKind::Null
         | PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::RegularExpression(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
