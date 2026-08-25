@@ -44,6 +44,7 @@ use super::{
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
 
 /// One identifier parameter and the existing type-node dependency required by its signature.
+#[allow(clippy::struct_excessive_bools)] // Signature syntax flags are independent and validated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct FunctionParameterPlan {
     pub(super) declaration: NodeRef,
