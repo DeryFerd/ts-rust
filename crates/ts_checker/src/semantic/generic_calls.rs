@@ -3455,7 +3455,7 @@ fn generic_call_mapped_union_constituents<'store>(
         return None;
     };
     if record.alias().is_some()
-        || union.origin.is_some()
+        || union.origin.is_some() && !authenticated_nongeneric_keyof_union(store, mapped)
         || match array_targets {
             Some(array_targets) => store
                 .validate_cached_union_result_with_array_targets(array_targets, mapped, None)
@@ -7806,6 +7806,38 @@ mod tests {
         let a = store.regular_string_literal_type("a".into()).unwrap();
         let b = store.regular_string_literal_type("b".into()).unwrap();
         let c = store.regular_string_literal_type("c".into()).unwrap();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let (union_callable, union_parameter, _) = union_vector_callable(store, &[string]);
+        assert_eq!(
+            generic_call_mapped_union_constituents(
+                store,
+                None,
+                union_parameter,
+                &[union_parameter],
+                &[constraint],
+            ),
+            Some(keys.as_slice()),
+        );
+        let union_resolution = project_vector(
+            store,
+            &union_callable,
+            vector_request(union_callable.owner, Some(&[constraint]), &[a]),
+        )
+        .unwrap();
+        assert_eq!(
+            union_resolution.projection.instantiation.type_arguments,
+            [constraint],
+        );
+        let union_warm = vector_cache_graph_counts(store);
+        assert_eq!(
+            project_vector(
+                store,
+                &union_callable,
+                vector_request(union_callable.owner, Some(&[constraint]), &[a]),
+            ),
+            Ok(union_resolution),
+        );
+        assert_eq!(vector_cache_graph_counts(store), union_warm);
 
         let inferred =
             project_vector(store, &callable, vector_request(callable.owner, None, &[a])).unwrap();
@@ -7906,6 +7938,25 @@ mod tests {
             .unwrap();
         assert_ne!(forged, constraint);
         assert!(!authenticated_nongeneric_keyof_union(store, forged));
+        assert_eq!(
+            generic_call_mapped_union_constituents(
+                store,
+                None,
+                union_parameter,
+                &[union_parameter],
+                &[forged],
+            ),
+            None,
+        );
+        assert!(!generic_call_union_instantiation_matches(
+            store,
+            None,
+            &[union_parameter, string],
+            string,
+            &[union_parameter],
+            &[forged],
+            &mut Vec::new(),
+        ));
         let (forged_callable, parameters) = vector_callable(
             store,
             &["U"],
