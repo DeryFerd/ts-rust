@@ -8249,12 +8249,15 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let source = parsed(&format!(concat!(
-                "declare function match(value: number): boolean; ",
-                "declare const values: {receiver}; ",
-                "const first: number = values.findIndex(match); ",
-                "const second: number = values.findIndex(match, undefined);",
-            ),));
+            let source = parsed(&format!(
+                concat!(
+                    "declare function match(value: number): boolean; ",
+                    "declare const values: {receiver}; ",
+                    "const first: number = values.findIndex(match); ",
+                    "const second: number = values.findIndex(match, undefined);",
+                ),
+                receiver = receiver,
+            ));
             let library_file = FileId::new(4_980 + u32::try_from(index * 2).unwrap());
             let source_file = FileId::new(4_981 + u32::try_from(index * 2).unwrap());
             let mut context =
