@@ -31034,7 +31034,7 @@ fn source_callable_inferred_return_type(
 fn source_awaited_expression_type(
     store: &CanonicalTypeMapperStore,
     expression: NodeRef,
-    type_: TypeId,
+    mut type_: TypeId,
 ) -> Result<TypeId, SourceCheckError> {
     let Some(promise) = store
         .intrinsic_bootstrap()
@@ -31044,16 +31044,19 @@ fn source_awaited_expression_type(
     else {
         return Ok(type_);
     };
-    if store.type_payload(type_).and_then(TypeRecord::symbol) != Some(promise) {
-        return Ok(type_);
+    let mut visited = HashSet::new();
+    while store.type_payload(type_).and_then(TypeRecord::symbol) == Some(promise) {
+        if !visited.insert(type_) {
+            return Err(SourceCheckError::Arrow(expression));
+        }
+        let reference = validate_direct_generic_reference(store, type_)
+            .map_err(|_| SourceCheckError::Arrow(expression))?;
+        let [awaited] = reference.type_arguments.as_slice() else {
+            return Err(SourceCheckError::Arrow(expression));
+        };
+        type_ = *awaited;
     }
-
-    let reference = validate_direct_generic_reference(store, type_)
-        .map_err(|_| SourceCheckError::Arrow(expression))?;
-    let [awaited] = reference.type_arguments.as_slice() else {
-        return Err(SourceCheckError::Arrow(expression));
-    };
-    Ok(*awaited)
+    Ok(type_)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -61007,6 +61010,128 @@ class Foo2 {
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn async_arrows_recursively_unwrap_nested_promise_returns_and_awaits() {
+        let library = parsed("interface Promise<T> {}");
+        let source = parsed(concat!(
+            "declare function nested(): Promise<Promise<Promise<number>>>; ",
+            "const forwarded = async () => nested(); ",
+            "const object = { f: async () => { await nested(); } };",
+        ));
+        let library_file = FileId::new(9_370);
+        let file = FileId::new(9_371);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let forwarded = variable_value_type(&context, &source, file, "forwarded");
+        assert_eq!(
+            context.type_to_string(forwarded).unwrap(),
+            "() => Promise<number>",
+        );
+        let signature = context
+            .store()
+            .source_callable_provenance(forwarded)
+            .unwrap()
+            .signature;
+        let returned = context
+            .store()
+            .signature(signature)
+            .and_then(super::super::signatures::Signature::resolved_return_type)
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), returned)
+                .unwrap()
+                .type_arguments,
+            [number],
+        );
+
+        let awaited = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::AwaitExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(resolved_node_type(&context, awaited), number);
+        let object = variable_initializer(&source, file, "object");
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, object, "f"))
+                .unwrap(),
+            "() => Promise<void>",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn awaited_promise_rejects_cyclic_reference_cache_without_publication() {
+        let library = parsed("interface Promise<T> {}");
+        let source = parsed("const value = async () => 1;");
+        let library_file = FileId::new(9_372);
+        let file = FileId::new(9_373);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+        context.check_source_file(file).unwrap();
+
+        let arrow = variable_initializer(&source, file, "value");
+        let callable = variable_value_type(&context, &source, file, "value");
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let promise = context
+            .store()
+            .signature(signature)
+            .and_then(super::super::signatures::Signature::resolved_return_type)
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            source_awaited_expression_type(context.store(), arrow, promise),
+            Ok(number),
+        );
+
+        assert!(context.store_mut_for_test().set_type_reference_resolution(
+            promise,
+            None,
+            Some(vec![promise]),
+        ));
+        let poisoned = observable_state(&context, file);
+        assert_eq!(
+            source_awaited_expression_type(context.store(), arrow, promise),
+            Err(SourceCheckError::Arrow(arrow)),
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+
+        assert!(context.store_mut_for_test().set_type_reference_resolution(
+            promise,
+            None,
+            Some(vec![number]),
+        ));
+        assert_eq!(
+            source_awaited_expression_type(context.store(), arrow, promise),
+            Ok(number),
+        );
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
