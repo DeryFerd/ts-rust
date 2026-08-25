@@ -1613,6 +1613,30 @@ impl Program {
                     .insert((containing, specifier), target);
                 self.load_file(file_system, &resolved.resolved_file_name, false);
             }
+            if !self
+                .canonical_commonjs_import_helpers(&self.source_files[file_index])
+                .is_empty()
+                && let Some(resolved) = resolver
+                    .resolve_with_mode("tslib", &containing_file, ModuleFormat::CommonJs)
+                    .resolved
+            {
+                if let Some(package_json) = resolved.package_json.as_deref() {
+                    self.register_package_export_specifiers(file_system, package_json);
+                }
+                let containing = canonicalize(
+                    &containing_file,
+                    &self.current_directory,
+                    self.case_sensitivity,
+                );
+                let target = canonicalize(
+                    &resolved.resolved_file_name,
+                    &self.current_directory,
+                    self.case_sensitivity,
+                );
+                self.resolved_modules
+                    .insert((containing, "tslib".to_owned()), target);
+                self.load_file(file_system, &resolved.resolved_file_name, false);
+            }
             let source_mode = self.canonical_emit_module_mode(&self.source_files[file_index]);
             let usage_modes = canonical_static_module_specifiers(&self.source_files[file_index])
                 .unwrap_or_default()
@@ -4092,6 +4116,11 @@ impl Program {
                 .map_err(|error| CanonicalProgramCheckError::SourceCheck { file_name, error })?;
             self.add_missing_jsx_option_diagnostics(source, &mut diagnostics);
             self.add_erasable_import_assignment_diagnostics(source, &mut diagnostics);
+            self.add_missing_commonjs_import_helper_diagnostics(
+                source,
+                &context,
+                &mut diagnostics,
+            )?;
             checked_sources.push(file);
         }
 
@@ -4201,6 +4230,147 @@ impl Program {
             }) {
                 diagnostics.push(diagnostic);
             }
+        }
+        Ok(())
+    }
+
+    fn canonical_commonjs_import_helpers(
+        &self,
+        source: &SourceFile,
+    ) -> Vec<(NodeRef, &'static str)> {
+        if self.checker != ProgramChecker::Canonical
+            || self.options.no_check
+            || !self.options.import_helpers
+            || !self.options.es_module_interop
+            || self.options.no_emit
+            || self.options.emit_declaration_only
+            || self.options.module != ModuleKind::CommonJs
+            || source.is_default_library
+            || ts_path::is_declaration_file(&source.file_name)
+            || !source_is_external_module(source)
+        {
+            return Vec::new();
+        }
+
+        let Some(NodeData::SourceFile(file)) = source
+            .parse
+            .arena
+            .get(source.parse.source_file)
+            .map(|node| &node.data)
+        else {
+            return Vec::new();
+        };
+        let runtime_uses = runtime_identifier_uses(&source.parse.arena, source.parse.source_file);
+        let mut requirements = Vec::new();
+        for statement in &file.statements.nodes {
+            let Some(NodeData::ImportDeclaration(import)) =
+                source.parse.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some(NodeData::ImportClause(clause)) = import
+                .import_clause
+                .and_then(|clause| source.parse.arena.get(clause))
+                .map(|node| &node.data)
+            else {
+                continue;
+            };
+            if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
+                continue;
+            }
+
+            let namespace_used = clause
+                .named_bindings
+                .and_then(|bindings| source.parse.arena.get(bindings))
+                .and_then(|node| match &node.data {
+                    NodeData::NamespaceImport(namespace) => source.parse.arena.get(namespace.name),
+                    _ => None,
+                })
+                .is_some_and(|node| {
+                    matches!(
+                        &node.data,
+                        NodeData::Identifier(identifier)
+                            if runtime_uses.contains(&identifier.text)
+                    )
+                });
+            let default_used = clause
+                .name
+                .and_then(|name| source.parse.arena.get(name))
+                .is_some_and(|node| {
+                    matches!(
+                        &node.data,
+                        NodeData::Identifier(identifier)
+                            if runtime_uses.contains(&identifier.text)
+                    )
+                });
+            let helper = if namespace_used {
+                "__importStar"
+            } else if default_used {
+                "__importDefault"
+            } else {
+                continue;
+            };
+            let Some(statement) = source.node_ref(*statement) else {
+                continue;
+            };
+            requirements.push((statement, helper));
+        }
+        requirements
+    }
+
+    fn add_missing_commonjs_import_helper_diagnostics(
+        &self,
+        source: &SourceFile,
+        context: &CanonicalCheckerContext<'_>,
+        diagnostics: &mut Vec<ProgramDiagnostic>,
+    ) -> Result<(), CanonicalProgramCheckError> {
+        let requirements = self.canonical_commonjs_import_helpers(source);
+        if requirements.is_empty() {
+            return Ok(());
+        }
+
+        let containing = canonicalize(
+            &source.file_name,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
+        let Some(target) = self
+            .resolved_modules
+            .get(&(containing, "tslib".to_owned()))
+            .and_then(|file_name| self.source_file(file_name))
+        else {
+            return Ok(());
+        };
+        let Some((_, bound)) = context.file(target.id) else {
+            return Err(CanonicalProgramCheckError::MissingBoundFile {
+                file_name: target.file_name.clone(),
+                file: target.id,
+            });
+        };
+        let Some(module) = bound.symbol(bound.source_file()) else {
+            return Ok(());
+        };
+        let exports = context
+            .store()
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports));
+        let message = message_by_code(2343).expect("TS2343 must be in the diagnostic catalog");
+
+        for (statement, helper) in requirements {
+            let available = exports
+                .and_then(|exports| exports.get_source(helper))
+                .and_then(|symbol| context.store().symbol(symbol))
+                .is_some_and(|symbol| symbol.flags().intersects(SymbolFlags::VALUE));
+            if available {
+                continue;
+            }
+            diagnostics.push(self.canonical_program_diagnostic(
+                Some(statement),
+                None,
+                &Diagnostic::with_arguments(message, ["tslib", helper]),
+                std::iter::empty(),
+            )?);
         }
         Ok(())
     }
