@@ -9916,6 +9916,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let NodeData::Identifier(identifier) = &name_record.data else {
             return false;
         };
+        let intrinsic_element = (identifier.text.starts_with("HTML")
+            || identifier.text.starts_with("SVG"))
+            && identifier.text.ends_with("Element")
+            && self.is_react_intrinsic_dom_generic_argument(node);
+        let native_event = identifier.text.ends_with("Event")
+            && self.is_react_native_default_library_event_alias(node, &identifier.text);
         if reference_record.kind != SyntaxKind::TypeReference
             || reference_record.flags.0 != 0
             || reference.type_arguments.is_some()
@@ -9923,10 +9929,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || name_record.flags.0 != 0
             || name_record.parent != Some(node.node)
             || identifier.flow_node.is_some()
-            || !(identifier.text.starts_with("HTML") || identifier.text.starts_with("SVG"))
-            || !identifier.text.ends_with("Element")
+            || !(intrinsic_element || native_event)
             || !self.global_symbol_has_name(symbol, &identifier.text)
-            || !self.is_react_intrinsic_dom_generic_argument(node)
         {
             return false;
         }
@@ -9944,6 +9948,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || owner.exports().is_some()
             || owner.export_symbol().is_some()
             || self.store.get_merged_symbol(symbol) != Some(symbol)
+            || native_event
+                && !owner
+                    .flags()
+                    .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
         {
             return false;
         }
@@ -10096,6 +10104,135 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .flags()
                 .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
                 == value_declaration.is_some()
+    }
+
+    /// Authenticates React's private `NativeFooEvent = FooEvent` module aliases.
+    #[allow(clippy::too_many_lines)] // The private alias and ambient-module owner form one proof.
+    fn is_react_native_default_library_event_alias(&self, node: NodeRef, event: &str) -> bool {
+        let Some(reference) = self.host.node(node) else {
+            return false;
+        };
+        let Some(alias_id) = reference.parent else {
+            return false;
+        };
+        let alias = NodeRef::new(node.arena, node.file, alias_id);
+        let Some(alias_record) = self.host.node(alias) else {
+            return false;
+        };
+        let NodeData::TypeAliasDeclaration(alias_data) = &alias_record.data else {
+            return false;
+        };
+        let alias_name = NodeRef::new(alias.arena, alias.file, alias_data.name);
+        let Some(alias_name_record) = self.host.node(alias_name) else {
+            return false;
+        };
+        let NodeData::Identifier(identifier) = &alias_name_record.data else {
+            return false;
+        };
+        let Some(bound) = self.host.bound_file(alias) else {
+            return false;
+        };
+        let Some(facts) = bound.source_facts() else {
+            return false;
+        };
+        let Some(symbol) = bound
+            .symbol(alias)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+        else {
+            return false;
+        };
+        let Some(owner) = self.store.symbol(symbol) else {
+            return false;
+        };
+        let Some(block_id) = alias_record.parent else {
+            return false;
+        };
+        let block = NodeRef::new(alias.arena, alias.file, block_id);
+        let Some(block_record) = self.host.node(block) else {
+            return false;
+        };
+        let NodeData::ModuleBlock(module_block) = &block_record.data else {
+            return false;
+        };
+        let Some(module_id) = block_record.parent else {
+            return false;
+        };
+        let module = NodeRef::new(block.arena, block.file, module_id);
+        let Some(module_record) = self.host.node(module) else {
+            return false;
+        };
+        let NodeData::ModuleDeclaration(module_data) = &module_record.data else {
+            return false;
+        };
+        let module_name = NodeRef::new(module.arena, module.file, module_data.name);
+        let Some(module_name_record) = self.host.node(module_name) else {
+            return false;
+        };
+        let NodeData::StringLiteral(module_identifier) = &module_name_record.data else {
+            return false;
+        };
+        let Some(module_symbol) = bound
+            .symbol(module)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+        else {
+            return false;
+        };
+        let Some(module_owner) = self.store.symbol(module_symbol) else {
+            return false;
+        };
+
+        facts.is_declaration_file()
+            && !facts.is_default_library()
+            && !facts.is_javascript_file()
+            && !facts.is_external_or_common_js_module()
+            && alias_record.kind == SyntaxKind::TypeAliasDeclaration
+            && alias_record.flags.0 == 0
+            && alias_data.type_ == node.node
+            && alias_data.type_parameters.is_none()
+            && alias_data.modifiers.is_none()
+            && alias_name_record.kind == SyntaxKind::Identifier
+            && alias_name_record.flags.0 == 0
+            && alias_name_record.parent == Some(alias.node)
+            && identifier.flow_node.is_none()
+            && identifier.text.strip_prefix("Native") == Some(event)
+            && owner.flags() == SymbolFlags::TYPE_ALIAS
+            && owner.check_flags() == CheckFlags::NONE
+            && owner.name().as_utf8() == Some(identifier.text.as_str())
+            && owner.declarations() == Some(&[alias])
+            && owner.value_declaration().is_none()
+            && owner.members().is_none()
+            && owner.exports().is_none()
+            && owner.parent().is_none()
+            && owner.export_symbol().is_none()
+            && self.store.get_merged_symbol(symbol) == Some(symbol)
+            && block_record.kind == SyntaxKind::ModuleBlock
+            && module_block
+                .statements
+                .nodes
+                .iter()
+                .filter(|statement| **statement == alias.node)
+                .count()
+                == 1
+            && module_record.kind == SyntaxKind::ModuleDeclaration
+            && module_record.parent == Some(bound.source_file().node)
+            && module_data.keyword == SyntaxKind::ModuleKeyword
+            && module_data.body == Some(block.node)
+            && module_name_record.kind == SyntaxKind::StringLiteral
+            && module_name_record.parent == Some(module.node)
+            && module_identifier.text == "react"
+            && module_owner.flags().intersects(SymbolFlags::MODULE)
+            && module_owner.check_flags() == CheckFlags::NONE
+            && bound
+                .locals(module)
+                .and_then(|locals| self.store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&identifier.text))
+                .and_then(|local| self.store.get_merged_symbol(local))
+                == Some(symbol)
+            && module_owner
+                .exports()
+                .and_then(|exports| self.store.symbol_table(exports))
+                .and_then(|exports| exports.get_source(&identifier.text))
+                .is_none()
     }
 
     #[allow(clippy::too_many_lines)] // Proves the full React generic and JSX property ancestry.
@@ -28964,6 +29101,163 @@ mod tests {
             warm,
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve private React aliases, event members, and forged warm links.
+    fn private_react_native_event_aliases_keep_default_library_heritage_and_members_lazy() {
+        let library = parse_source_file(concat!(
+            "interface Event { readonly type: string; stopPropagation(): void; } ",
+            "declare var Event: unknown; ",
+            "interface AnimationEvent extends Event { readonly animationName: string; } ",
+            "declare var AnimationEvent: unknown; ",
+            "interface ClipboardEvent extends Event { readonly clipboardData: string; } ",
+            "declare var ClipboardEvent: unknown;",
+        ));
+        let source = parse_source_file(concat!(
+            "declare module 'react' { ",
+            "type NativeAnimationEvent = AnimationEvent; ",
+            "type NativeClipboardEvent = ClipboardEvent; ",
+            "export = React; ",
+            "namespace React {} ",
+            "}",
+        ));
+        let (mut context, library_file, source_file) =
+            default_library_interface_context(&library, &source, true);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(source_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+        let base = context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("Event"))
+            .unwrap();
+        let events = ["AnimationEvent", "ClipboardEvent"].map(|name| {
+            context
+                .store()
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source(name))
+                .unwrap()
+        });
+        let aliases = ["NativeAnimationEvent", "NativeClipboardEvent"].map(|name| {
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    (identifier_text(&source.arena, alias.name) == Some(name))
+                        .then_some(NodeRef::new(source.arena.id(), source_file, node))
+                })
+                .unwrap();
+            let NodeData::TypeAliasDeclaration(alias) =
+                &source.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!("the declaration was selected by its alias syntax")
+            };
+            (
+                source_bound.symbol(declaration).unwrap(),
+                NodeRef::new(declaration.arena, declaration.file, alias.type_),
+            )
+        });
+        let type_aliases = HashMap::new();
+        let planner =
+            TypeQueryPlanner::new(context.store(), &host, None, None, false, &type_aliases);
+        for ((_, reference), event) in aliases.iter().zip(events) {
+            assert!(planner.is_default_library_dom_interface_argument(*reference, event));
+        }
+        let method = context
+            .store()
+            .symbol(base)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("stopPropagation"))
+            .unwrap();
+
+        let mut resolved = Vec::new();
+        for ((alias, reference), event) in aliases.iter().copied().zip(events) {
+            let type_ = context.get_declared_type_of_symbol(alias).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .declared_type_links(event)
+                    .and_then(|links| links.declared_type),
+                Some(type_),
+            );
+            assert_eq!(context.get_type_from_type_node(reference), Ok(type_));
+            let record = context.store().type_payload(type_).unwrap();
+            let TypeData::Interface(interface) = record.data() else {
+                panic!("native DOM events must retain their default-library interface identity")
+            };
+            assert_eq!(record.symbol(), Some(event));
+            assert!(!interface.base_types_resolved);
+            assert!(!interface.declared_members_resolved);
+            assert!(interface.resolved_base_types.is_none());
+            assert!(interface.reference.object.structured.properties.is_none());
+            resolved.push(type_);
+        }
+        assert!(context.store().declared_type_links(base).is_none());
+        assert!(context.store().value_symbol_links(method).is_none());
+        let warm = (
+            store_state(context.store()),
+            context.store().signature_len(),
+            context.store().index_info_len(),
+        );
+        for ((alias, reference), expected) in aliases.iter().copied().zip(resolved) {
+            assert_eq!(context.get_declared_type_of_symbol(alias), Ok(expected));
+            assert_eq!(context.get_type_from_type_node(reference), Ok(expected));
+        }
+        assert_eq!(
+            (
+                store_state(context.store()),
+                context.store().signature_len(),
+                context.store().index_info_len(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let animation = events[0];
+        let original = context
+            .store()
+            .declared_type_links(animation)
+            .unwrap()
+            .clone();
+        let mut forged = original.clone();
+        forged.declared_type = Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_declared_type_links(animation, forged)
+        );
+        let poisoned = (
+            store_state(context.store()),
+            context.store().signature_len(),
+            context.store().index_info_len(),
+        );
+        assert!(context.get_type_from_type_node(aliases[0].1).is_err());
+        assert_eq!(
+            (
+                store_state(context.store()),
+                context.store().signature_len(),
+                context.store().index_info_len(),
+            ),
+            poisoned,
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_declared_type_links(animation, original)
+        );
     }
 
     #[test]
