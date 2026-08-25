@@ -4512,22 +4512,22 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || parameter.export_symbol().is_some()
             || self.store.get_merged_symbol(symbol) != Some(symbol)
             || !self.host.symbol_matches(self.store, declaration, symbol)
-            || !signature
+            || signature
                 .type_parameters
                 .as_ref()
-                .is_some_and(|parameters| parameters.nodes.as_slice() == [declaration.node])
-            || !bound
+                .is_none_or(|parameters| parameters.nodes.as_slice() != [declaration.node])
+            || bound
                 .source_facts()
-                .is_some_and(|facts| facts.is_default_library() && facts.is_declaration_file())
+                .is_none_or(|facts| !facts.is_default_library() || !facts.is_declaration_file())
             || !self.global_symbol_has_name(owner_symbol, "PromiseConstructor")
             || self
                 .store
                 .symbol(owner_symbol)
-                .and_then(|owner| owner.members())
+                .and_then(ts_binder::semantic::Symbol::members)
                 .and_then(|members| self.store.symbol_table(members))
                 .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
                 .and_then(|constructor| self.store.symbol(constructor))
-                .and_then(|constructor| constructor.declarations())
+                .and_then(ts_binder::semantic::Symbol::declarations)
                 .is_none_or(|declarations| !declarations.contains(&construction))
         {
             return Ok(false);
@@ -14512,10 +14512,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     true,
                     false,
                 );
-        let alias = match resolved {
-            Ok(Some(alias))
-            | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) => alias,
-            Ok(None) | Err(_) => return None,
+        let (Ok(Some(alias))
+        | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias))) = resolved
+        else {
+            return None;
         };
         let record = self.store.symbol(alias)?;
         let [declaration] = record.declarations()? else {
@@ -18236,7 +18236,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )?;
             let mut types = Vec::with_capacity(interface.properties.len());
             for property in &interface.properties {
-                let type_ = if property.type_node == property.name_node {
+                let property_type = if property.type_node == property.name_node {
                     self.store
                         .intrinsic_bootstrap()
                         .map(|bootstrap| bootstrap.any_type)
@@ -18246,7 +18246,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 } else {
                     self.execute_type_node(property.type_node, plan, prepared)?
                 };
-                types.push(type_);
+                types.push(property_type);
             }
             for accessor in &interface.accessors {
                 self.execute_type_node(accessor.type_node, plan, prepared)?;
