@@ -5986,8 +5986,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if preflight_node(self.store, self.host, union)?.kind != SyntaxKind::UnionType {
             return Ok(false);
         }
-        let Some(alias) = self.direct_union_alias(union)? else {
-            return Ok(false);
+        let alias = match self.direct_union_alias(union) {
+            Ok(Some(alias)) => alias,
+            Ok(None) => return Ok(false),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported { node, .. },
+            )) if node == union => return Ok(false),
+            Err(error) => return Err(error),
         };
         Ok(self
             .plan
