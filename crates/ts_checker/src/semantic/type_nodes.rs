@@ -3119,18 +3119,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             if fallback.is_none()
                 && let Some(cached) = cached
             {
-                let TypeData::TypeReference(reference) = self
-                    .store
-                    .type_payload(cached)
-                    .expect("the generic-global cache was preflighted")
-                    .data()
-                else {
-                    unreachable!("an initialized generic-global cache owns references")
-                };
-                let cached_element = reference
-                    .resolved_type_arguments
-                    .as_deref()
-                    .expect("the generic-global cache was preflighted")[0];
+                let cached_element = generic_global_instantiation_argument(self.store, cached)
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+                    })?;
                 if self.cached_array_element_identity(element_type)? != Some(cached_element) {
                     return Err(type_node_unavailable(
                         TypeNodeUnavailable::InvalidTypeReference(node),
@@ -38744,6 +38736,65 @@ mod tests {
             query_array_node(&mut fixture, array_type, first_node, &mut diagnostics,),
             Ok(first)
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_array_identity_cache_replays_interface_targets_and_rejects_foreign_elements() {
+        let mut fixture = fixture("interface Array<T> { values: T[]; }");
+        let target = canonical_array_target(&mut fixture);
+        let node = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrayType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_array_node(&mut fixture, target, node, &mut diagnostics),
+            Ok(target),
+        );
+        assert!(matches!(
+            fixture.store.type_payload(target).map(TypeRecord::data),
+            Some(TypeData::Interface(_)),
+        ));
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_array_node(&mut fixture, target, node, &mut diagnostics),
+            Ok(target),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let foreign = create_type_from_generic_global_type(
+            &mut fixture.store,
+            target,
+            number,
+            ObjectFlags::NONE,
+        )
+        .unwrap();
+        assert!(fixture.store.set_type_node_links(
+            node,
+            TypeNodeLinks {
+                resolved_type: Some(foreign),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = store_state(&fixture.store);
+        assert!(matches!(
+            query_array_node(&mut fixture, target, node, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(error)
+            )) if error == node
+        ));
+        assert_eq!(store_state(&fixture.store), poisoned);
         assert!(diagnostics.is_empty());
     }
 
