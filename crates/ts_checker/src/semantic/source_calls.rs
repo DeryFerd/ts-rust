@@ -1,8 +1,8 @@
-//! Exact source integration for identifier, nested, or authenticated property calls.
+//! Exact source integration for identifier, nested, immediate, or property calls.
 //!
 //! This admits `identifier(arguments)`, authenticated public or private
-//! property calls and tagged templates, proven nested call callees, and exact
-//! parenthesized async-arrow invocations.
+//! property calls and tagged templates, proven nested call callees, and
+//! immediately invoked anonymous or async callables.
 //! Arguments may contain scalar
 //! values, identifier and property reads, object and array literals, arrow
 //! functions, type assertions, nested direct calls, or recursively proven primitive
@@ -604,6 +604,14 @@ pub(super) fn plan_direct_source_call_syntax(
                 )
             }
             (
+                SyntaxKind::ParenthesizedExpression | SyntaxKind::FunctionExpression,
+                NodeData::ParenthesizedExpression(_) | NodeData::FunctionExpression(_),
+            ) if is_immediately_invoked_source_callable(arena, node) => (
+                actual_callee,
+                SourceCallCalleeForm::Identifier,
+                actual_callee,
+            ),
+            (
                 SyntaxKind::PropertyAccessExpression,
                 NodeData::PropertyAccessExpression(property),
             ) => {
@@ -819,6 +827,59 @@ pub(super) fn plan_direct_source_call_syntax(
         argument_arrow_nodes,
         array_argument_arrow_nodes,
     })
+}
+
+/// Authenticates a zero-argument call of an anonymous function or arrow.
+pub(super) fn is_immediately_invoked_source_callable(arena: &NodeArena, node: NodeRef) -> bool {
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    let NodeData::CallExpression(call) = &record.data else {
+        return false;
+    };
+    if record.kind != SyntaxKind::CallExpression
+        || record.flags.0 != 0
+        || call.question_dot_token.is_some()
+        || call.symbol.is_some()
+        || call.type_arguments.is_some()
+        || call.facts != 0
+        || !call.arguments.nodes.is_empty()
+        || call.arguments.has_trailing_comma
+        || call.arguments.range.end != record.range.end
+    {
+        return false;
+    }
+
+    let mut current = NodeRef::new(node.arena, node.file, call.expression);
+    let mut expected_parent = node.node;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current.node) {
+            return false;
+        }
+        let Some(expression) = arena.get(current.node) else {
+            return false;
+        };
+        if expression.flags.0 != 0 || expression.parent != Some(expected_parent) {
+            return false;
+        }
+        match (&expression.data, expression.kind) {
+            (
+                NodeData::ParenthesizedExpression(parenthesized),
+                SyntaxKind::ParenthesizedExpression,
+            ) => {
+                expected_parent = current.node;
+                current = NodeRef::new(current.arena, current.file, parenthesized.expression);
+            }
+            (NodeData::FunctionExpression(function), SyntaxKind::FunctionExpression) => {
+                return function.name.is_none() && function.parameters.nodes.is_empty();
+            }
+            (NodeData::ArrowFunction(arrow), SyntaxKind::ArrowFunction) => {
+                return arrow.parameters.nodes.is_empty() && arrow.modifiers.is_none();
+            }
+            _ => return false,
+        }
+    }
 }
 
 fn plan_tagged_template_source_call_syntax(
@@ -1073,6 +1134,18 @@ pub(super) fn finish_direct_source_call_plan(
         (PlannedExpressionKind::Identifier(_), SourceCallCalleeForm::Identifier) => true,
         (PlannedExpressionKind::Call(call), SourceCallCalleeForm::Identifier) => {
             call.node == callee.node && syntax.callee_diagnostic_node == syntax.callee
+        }
+        (
+            PlannedExpressionKind::Parenthesized(_) | PlannedExpressionKind::Arrow(_),
+            SourceCallCalleeForm::Identifier,
+        ) => {
+            syntax.arguments.is_empty()
+                && syntax.type_arguments.is_none()
+                && syntax.callee_diagnostic_node == syntax.callee
+                && matches!(
+                    callee.unparenthesized().kind,
+                    PlannedExpressionKind::Arrow(_)
+                )
         }
         (PlannedExpressionKind::Property(property), SourceCallCalleeForm::RequiredOwnProperty) => {
             property.is_call_callee_for(syntax.node, syntax.callee_diagnostic_node)
