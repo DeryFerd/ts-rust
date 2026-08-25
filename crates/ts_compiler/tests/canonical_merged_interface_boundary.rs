@@ -16,7 +16,7 @@ fn canonical_global_interface_merge_is_a_typed_boundary_not_a_panic() {
     )
     .unwrap();
 
-    let error = Program::try_new_with_canonical_checker(
+    let Err(error) = Program::try_new_with_canonical_checker(
         &fs,
         "/project",
         &["main.ts".to_owned()],
@@ -25,8 +25,9 @@ fn canonical_global_interface_merge_is_a_typed_boundary_not_a_panic() {
             skip_lib_check: true,
             ..CompilerOptions::default()
         },
-    )
-    .unwrap_err();
+    ) else {
+        panic!("expected an unsupported global interface merge");
+    };
 
     assert!(error.is_unsupported_boundary(), "{error:?}");
 }

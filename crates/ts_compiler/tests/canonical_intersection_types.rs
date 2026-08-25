@@ -83,13 +83,14 @@ fn canonical_program_keeps_array_intersection_properties_as_a_typed_boundary() {
     )
     .unwrap();
 
-    let error = Program::try_new_with_canonical_checker(
+    let Err(error) = Program::try_new_with_canonical_checker(
         &fs,
         "/project",
         &["main.ts".to_owned()],
         canonical_options(),
-    )
-    .unwrap_err();
+    ) else {
+        panic!("expected unsupported array intersection properties");
+    };
 
     assert_eq!(
         error.failure_class(),

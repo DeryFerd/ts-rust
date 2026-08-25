@@ -74,13 +74,14 @@ fn canonical_program_rejects_unsupported_class_construction_as_a_typed_boundary(
     )
     .unwrap();
 
-    let error = Program::try_new_with_canonical_checker(
+    let Err(error) = Program::try_new_with_canonical_checker(
         &fs,
         "/project",
         &["main.ts".to_owned()],
         canonical_options(),
-    )
-    .unwrap_err();
+    ) else {
+        panic!("expected unsupported class construction");
+    };
 
     assert_eq!(
         error.failure_class(),

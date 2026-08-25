@@ -50,13 +50,14 @@ fn canonical_program_keeps_unannotated_ambient_variable_as_a_typed_boundary() {
     fs.write_file("/project/main.ts", "export {};\ndeclare const missing;\n")
         .unwrap();
 
-    let error = Program::try_new_with_canonical_checker(
+    let Err(error) = Program::try_new_with_canonical_checker(
         &fs,
         "/project",
         &["main.ts".to_owned()],
         canonical_options(),
-    )
-    .unwrap_err();
+    ) else {
+        panic!("expected an unsupported unannotated ambient variable");
+    };
 
     assert_eq!(
         error.failure_class(),
