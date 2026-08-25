@@ -1646,61 +1646,100 @@ pub(super) fn authenticated_pending_recursive_arrow_display(
     host: &DeclaredTypeHost<'_>,
     type_: TypeId,
 ) -> bool {
-    if source_callables::validate_stored_source_callable(store, type_)
-        != source_callables::StoredSourceCallableValidation::Pending
-    {
-        return false;
-    }
+    source_callables::validate_stored_source_callable(store, type_)
+        == source_callables::StoredSourceCallableValidation::Pending
+        && authenticated_recursive_arrow_name(store, host, type_).is_some()
+}
+
+/// Accepts only the canonical `any` return recovered for an exact recursive arrow.
+pub(super) fn authenticated_recovered_recursive_arrow_return(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+    signature: SignatureId,
+) -> bool {
+    store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+        store
+            .signature(signature)
+            .and_then(Signature::resolved_return_type)
+            == Some(bootstrap.any_type)
+    }) && store
+        .source_callable_provenance(type_)
+        .is_some_and(|provenance| provenance.signature == signature)
+        && matches!(
+            source_callables::validate_stored_source_callable(store, type_),
+            source_callables::StoredSourceCallableValidation::Valid(_)
+        )
+        && authenticated_recursive_arrow_name(store, host, type_).is_some()
+}
+
+fn authenticated_recursive_arrow_name(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+) -> Option<NodeRef> {
     let Some(provenance) = store.source_callable_provenance(type_) else {
-        return false;
+        return None;
     };
     let arrow = provenance.declaration;
     let Some(record) = host.node(arrow) else {
-        return false;
+        return None;
     };
     let NodeData::ArrowFunction(function) = &record.data else {
-        return false;
+        return None;
     };
     let Some(declaration) = record
         .parent
         .map(|parent| NodeRef::new(arrow.arena, arrow.file, parent))
     else {
-        return false;
+        return None;
     };
     let Some(NodeData::VariableDeclaration(variable)) =
         host.node(declaration).map(|record| &record.data)
     else {
-        return false;
+        return None;
+    };
+    let variable_name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let Some(variable_name_record) = host.node(variable_name) else {
+        return None;
+    };
+    let NodeData::Identifier(variable_identifier) = &variable_name_record.data else {
+        return None;
     };
     let Some(variable_symbol) = host
         .bound_file(declaration)
         .and_then(|bound| bound.symbol(declaration))
         .and_then(|symbol| store.get_merged_symbol(symbol))
     else {
-        return false;
+        return None;
     };
     let body = NodeRef::new(arrow.arena, arrow.file, function.body);
     let Some(NodeData::SatisfiesExpression(satisfaction)) =
         host.node(body).map(|record| &record.data)
     else {
-        return false;
+        return None;
     };
     let query = NodeRef::new(body.arena, body.file, satisfaction.type_);
     let Some(NodeData::TypeQueryNode(type_query)) = host.node(query).map(|record| &record.data)
     else {
-        return false;
+        return None;
     };
     let name = NodeRef::new(query.arena, query.file, type_query.expr_name);
     let Some(NodeData::Identifier(identifier)) = host.node(name).map(|record| &record.data) else {
-        return false;
+        return None;
     };
     let Some(owner) = store.symbol(variable_symbol) else {
-        return false;
+        return None;
     };
     if provenance.family != SourceCallableFamily::ArrowFunction
         || provenance.owner_symbol == variable_symbol
         || variable.initializer != Some(arrow.node)
         || variable.type_.is_some()
+        || variable_name_record.kind != SyntaxKind::Identifier
+        || variable_name_record.flags != NodeFlags::default()
+        || variable_name_record.parent != Some(declaration.node)
+        || variable_identifier.flow_node.is_some()
+        || variable_identifier.text != identifier.text
         || owner.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
         || owner.check_flags() != CheckFlags::NONE
         || owner.name().as_utf8() != Some(identifier.text.as_str())
@@ -1726,7 +1765,7 @@ pub(super) fn authenticated_pending_recursive_arrow_display(
                         })
             })
     {
-        return false;
+        return None;
     }
 
     let aliases = HashMap::new();
@@ -1735,6 +1774,7 @@ pub(super) fn authenticated_pending_recursive_arrow_display(
     planner
         .authenticated_recursive_arrow_type_query(query, declaration, arrow)
         .is_ok_and(|authenticated| authenticated == Some(type_))
+        .then_some(variable_name)
 }
 
 struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
@@ -19644,13 +19684,50 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         .map_err(|error| source_callable_signature_error(error, callable.family, signature))?;
         if callable.return_type.is_inferred() {
             self.reject_type_reference_alias_capabilities()?;
-            return source_callables::validate_inferred_source_callable_return(
+            if let Some(return_type) = source_callables::validate_inferred_source_callable_return(
                 self.store, &callable, signature,
             )
             .map_err(|error| source_callable_signature_error(error, callable.family, signature))?
-            .ok_or_else(|| {
-                type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
-            });
+            {
+                return Ok(return_type);
+            }
+            let invalid =
+                || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature));
+            let type_ = self
+                .store
+                .source_callable_type_for_signature(signature)
+                .filter(|type_| {
+                    authenticated_pending_recursive_arrow_display(self.store, self.host, *type_)
+                })
+                .ok_or_else(&invalid)?;
+            let name = authenticated_recursive_arrow_name(self.store, self.host, type_)
+                .ok_or_else(&invalid)?;
+            let Some(NodeData::Identifier(identifier)) =
+                self.host.node(name).map(|record| &record.data)
+            else {
+                return Err(invalid());
+            };
+            let any = self
+                .store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.any_type)
+                .ok_or(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                ))?;
+            let return_type = source_callables::publish_inferred_source_callable_return(
+                self.store, &callable, signature, any,
+            )
+            .map_err(|error| source_callable_signature_error(error, callable.family, signature))?;
+            if self.options.no_implicit_any {
+                self.diagnostics.lookup_or_issue(
+                    Some(name),
+                    Diagnostic::with_arguments(
+                        message_by_code(7023).expect("TS7023 is in the diagnostic catalog"),
+                        [identifier.text.as_str()],
+                    ),
+                );
+            }
+            return Ok(return_type);
         }
         if callable.return_type.is_ambient_implicit_any() {
             self.reject_type_reference_alias_capabilities()?;
@@ -42722,6 +42799,201 @@ mod tests {
             );
         }
         assert_eq!(store_state(&fixture.store), poisoned);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn recursive_arrow_inferred_return_recovers_any_once_with_option_gated_ts7023() {
+        for no_implicit_any in [false, true] {
+            let mut fixture = fixture("const value = () => 42 satisfies typeof value;");
+            let declaration = named_node(&fixture, SyntaxKind::VariableDeclaration, "value");
+            let NodeData::VariableDeclaration(variable) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+            let arrow = variable_initializer_node(&fixture, "value");
+            let owner = node_symbol(&fixture, arrow);
+            let query = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::TypeQuery).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable =
+                query_source_callable(&mut fixture, arrow, owner, &mut diagnostics).unwrap();
+            let signature = function_signature(&fixture.store, arrow);
+
+            let cold = store_state(&fixture.store);
+            assert_eq!(
+                query_signature_return(&mut fixture, signature, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                )),
+            );
+            assert_eq!(store_state(&fixture.store), cold);
+            assert!(diagnostics.is_empty());
+
+            assert_eq!(
+                query_node(&mut fixture, query, &mut diagnostics),
+                Ok(callable)
+            );
+            let options = CanonicalTypeQueryOptions {
+                no_implicit_any,
+                ..CanonicalTypeQueryOptions::default()
+            };
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+            assert_eq!(
+                CanonicalTypeQuery::new(&mut fixture.store, &host, options, &mut diagnostics)
+                    .unwrap()
+                    .get_return_type_of_signature(signature),
+                Ok(any),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(any),
+            );
+            assert!(matches!(
+                validate_stored_source_callable(&fixture.store, callable),
+                StoredSourceCallableValidation::Valid(_),
+            ));
+            assert!(!fixture.store.signature_has_circular_return_type(signature));
+            let variable = fixture
+                .store
+                .get_merged_symbol(node_symbol(&fixture, declaration))
+                .unwrap();
+            assert!(fixture.store.value_symbol_links(variable).is_none());
+            if no_implicit_any {
+                let [diagnostic] = diagnostics.as_slice() else {
+                    panic!("the recursive arrow must report exactly one implicit return")
+                };
+                assert_eq!(diagnostic.node, Some(name));
+                assert_eq!(diagnostic.diagnostic.code(), 7023);
+                assert_eq!(diagnostic.diagnostic.arguments, ["value"]);
+            } else {
+                assert!(diagnostics.is_empty());
+            }
+
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                CanonicalTypeQuery::new(&mut fixture.store, &host, options, &mut diagnostics)
+                    .unwrap()
+                    .get_return_type_of_signature(signature),
+                Ok(any),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+            assert_eq!(diagnostics.len(), usize::from(no_implicit_any));
+        }
+    }
+
+    #[test]
+    fn recursive_arrow_return_recovery_rejects_poisoned_query_and_value_caches() {
+        for poison in ["query", "symbol", "value"] {
+            let mut fixture = fixture("const value = () => 42 satisfies typeof value;");
+            let declaration = named_node(&fixture, SyntaxKind::VariableDeclaration, "value");
+            let variable = fixture
+                .store
+                .get_merged_symbol(node_symbol(&fixture, declaration))
+                .unwrap();
+            let arrow = variable_initializer_node(&fixture, "value");
+            let owner = node_symbol(&fixture, arrow);
+            let query = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::TypeQuery).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let name = type_query_name(&fixture, query);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable =
+                query_source_callable(&mut fixture, arrow, owner, &mut diagnostics).unwrap();
+            let signature = function_signature(&fixture.store, arrow);
+            assert_eq!(
+                query_node(&mut fixture, query, &mut diagnostics),
+                Ok(callable)
+            );
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            match poison {
+                "query" => assert!(fixture.store.set_type_node_links(
+                    query,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    },
+                )),
+                "symbol" => assert!(fixture.store.set_symbol_node_links(
+                    name,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(owner),
+                    },
+                )),
+                "value" => assert!(fixture.store.set_value_symbol_links(
+                    variable,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    },
+                )),
+                _ => unreachable!(),
+            }
+
+            let before = store_state(&fixture.store);
+            assert_eq!(
+                query_signature_return(&mut fixture, signature, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                )),
+                "poison: {poison}",
+            );
+            assert_eq!(store_state(&fixture.store), before, "poison: {poison}");
+            assert!(
+                fixture
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type()
+                    .is_none(),
+                "poison: {poison}",
+            );
+            assert!(diagnostics.is_empty(), "poison: {poison}");
+        }
+
+        let mut unrelated = fixture("const value = () => 42;");
+        let arrow = variable_initializer_node(&unrelated, "value");
+        let owner = node_symbol(&unrelated, arrow);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        query_source_callable(&mut unrelated, arrow, owner, &mut diagnostics).unwrap();
+        let signature = function_signature(&unrelated.store, arrow);
+        let before = store_state(&unrelated.store);
+        assert_eq!(
+            query_signature_return(&mut unrelated, signature, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(signature),
+            )),
+        );
+        assert_eq!(store_state(&unrelated.store), before);
         assert!(diagnostics.is_empty());
     }
 

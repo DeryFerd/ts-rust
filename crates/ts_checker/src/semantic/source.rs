@@ -280,7 +280,9 @@ use super::{
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_nodes::{
         CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, TypeNodeUnavailable,
-        normalize_bigint_literal, normalize_numeric_separators,
+        authenticated_pending_recursive_arrow_display,
+        authenticated_recovered_recursive_arrow_return, normalize_bigint_literal,
+        normalize_numeric_separators,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -29582,9 +29584,24 @@ fn source_type_is_assignable_to(
             options.strict_function_types,
         ) {
             Ok(assignable) => return Ok(assignable),
-            Err(RelationUnavailable::UnresolvedSignatureReturn(signature)) => {
+            Err(
+                error @ (RelationUnavailable::UnresolvedSignatureReturn(_)
+                | RelationUnavailable::UnresolvedFunctionType(_)),
+            ) => {
+                let signature = match error {
+                    RelationUnavailable::UnresolvedSignatureReturn(signature) => signature,
+                    RelationUnavailable::UnresolvedFunctionType(type_)
+                        if authenticated_pending_recursive_arrow_display(store, host, type_) =>
+                    {
+                        store
+                            .source_callable_provenance(type_)
+                            .map(|provenance| provenance.signature)
+                            .ok_or(error)?
+                    }
+                    _ => return Err(error.into()),
+                };
                 if !resolved_signatures.insert(signature) {
-                    return Err(RelationUnavailable::UnresolvedSignatureReturn(signature).into());
+                    return Err(error.into());
                 }
                 let mut resolution_diagnostics = CanonicalCheckerDiagnostics::default();
                 let resolved = CanonicalTypeQuery::new_with_global_types_and_session(
@@ -36206,6 +36223,14 @@ fn publish_checked_source_callable_return(
         callable,
         inferred,
     )?;
+    if let Some(type_) = store.source_callable_type_for_signature(signature)
+        && authenticated_recovered_recursive_arrow_return(store, host, type_, signature)
+    {
+        return store
+            .signature(signature)
+            .and_then(super::signatures::Signature::resolved_return_type)
+            .ok_or_else(|| SourceCheckError::Arrow(callable.declaration));
+    }
     publish_inferred_source_callable_return(store, callable, signature, inferred)
         .map_err(SourcePlanner::callable_plan_error)
 }
@@ -68134,6 +68159,141 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn recursive_arrow_satisfies_recovers_any_and_gates_ts7023_on_no_implicit_any() {
+        for (index, no_implicit_any) in [false, true].into_iter().enumerate() {
+            let source = parsed("const value = () => 42 satisfies typeof value;");
+            let file = FileId::new(9_778 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    no_implicit_any,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let name = variable_name(&source, file, "value");
+            let arrow = variable_initializer(&source, file, "value");
+            let body = arrow_body(&source, file, "value");
+            let NodeData::SatisfiesExpression(satisfaction) =
+                &source.arena.get(body.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let query = NodeRef::new(body.arena, body.file, satisfaction.type_);
+
+            context.check_source_file(file).unwrap();
+
+            let callable = variable_value_type(&context, &source, file, "value");
+            assert_eq!(context.type_to_string(callable).unwrap(), "() => any");
+            assert_eq!(resolved_node_type(&context, query), callable);
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .filter(|provenance| provenance.declaration == arrow)
+                .unwrap()
+                .signature;
+            let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(any),
+            );
+            assert!(
+                !context
+                    .store()
+                    .signature_has_circular_return_type(signature)
+            );
+
+            let diagnostics = context.diagnostics().as_slice();
+            let expected_codes: &[u32] = if no_implicit_any {
+                &[7023, 1360]
+            } else {
+                &[1360]
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.diagnostic.code())
+                    .collect::<Vec<_>>(),
+                expected_codes,
+            );
+            if no_implicit_any {
+                assert_eq!(diagnostics[0].node, Some(name));
+                assert_eq!(diagnostics[0].diagnostic.arguments, ["value"]);
+            }
+            let mismatch = diagnostics.last().unwrap();
+            assert_eq!(mismatch.node, Some(body));
+            assert_eq!(mismatch.diagnostic.arguments, ["number", "() => any"]);
+            let range = mismatch.range_override.unwrap().range();
+            let start = usize::try_from(range.start.get()).unwrap();
+            let end = usize::try_from(range.end.get()).unwrap();
+            assert_eq!(
+                source.arena.source_text().unwrap().get(start..end),
+                Some("satisfies"),
+            );
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn recursive_arrow_satisfies_rejects_poisoned_type_query_cache_on_replay() {
+        let source = parsed("const value = () => 42 satisfies typeof value;");
+        let file = FileId::new(9_780);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let body = arrow_body(&source, file, "value");
+        let NodeData::SatisfiesExpression(satisfaction) =
+            &source.arena.get(body.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let query = NodeRef::new(body.arena, body.file, satisfaction.type_);
+
+        context.check_source_file(file).unwrap();
+        let original = context.store().type_node_links(query).cloned().unwrap();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            query,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        mark_source_unchecked(&mut context, file);
+        let poisoned = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::DeclaredType(
+                DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::InvalidTypeReference(
+                    query,
+                )),
+            )),
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert_eq!(context.diagnostics().len(), 2);
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(query, original)
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(context.diagnostics().len(), 2);
+        assert!(is_type_checked(&context, file));
     }
 
     #[test]
