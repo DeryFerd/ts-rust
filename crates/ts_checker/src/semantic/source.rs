@@ -14906,6 +14906,149 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
+    fn for_in_closure_statement_is_exact(
+        &self,
+        statement: NodeRef,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let record = self.node(statement)?;
+        let NodeData::ExpressionStatement(data) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::ExpressionStatement
+            || record.flags.0 != 0
+            || data.expression != expression.node
+            || data.flow_node.is_some()
+        {
+            return Ok(false);
+        }
+
+        let Some(body) = record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let body_record = self.node(body)?;
+        let NodeData::Block(block) = &body_record.data else {
+            return Ok(false);
+        };
+        let Some(iteration) = body_record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let iteration_record = self.node(iteration)?;
+        let NodeData::ForInOrOfStatement(loop_data) = &iteration_record.data else {
+            return Ok(false);
+        };
+        let source = self.source.node_ref();
+        if body_record.kind != SyntaxKind::Block
+            || body_record.flags.0 != 0
+            || block.flow_node.is_some()
+            || block.next_container.is_some()
+            || block.statements.has_trailing_comma
+            || block.facts != 0
+            || !block.statements.nodes.contains(&statement.node)
+            || iteration_record.kind != SyntaxKind::ForInStatement
+            || iteration_record.parent != Some(source.node)
+            || loop_data.statement != body.node
+            || self.bound.container(statement) != Some(source)
+            || self.bound.container(body) != Some(source)
+            || self.bound.container(iteration) != Some(source)
+            || self.bound.block_scope_container(statement) != Some(body)
+            || self.bound.block_scope_container(body) != Some(iteration)
+            || self.bound.flow_container(statement) != Some(source)
+            || self.bound.flow_graph().container_is_complete(source) != Some(true)
+        {
+            return Ok(false);
+        }
+
+        let initializer = self.reference(loop_data.initializer);
+        let initializer_record = self.node(initializer)?;
+        let NodeData::VariableDeclarationList(bindings) = &initializer_record.data else {
+            return Ok(false);
+        };
+        let [binding] = bindings.declarations.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let binding = self.reference(*binding);
+        let Some(symbol) = self.bound.symbol(binding) else {
+            return Ok(false);
+        };
+        Ok(
+            initializer_record.kind == SyntaxKind::VariableDeclarationList
+                && matches!(initializer_record.flags.0, NODE_FLAG_LET | NODE_FLAG_CONST)
+                && initializer_record.parent == Some(iteration.node)
+                && self.bound.block_scope_container(binding) == Some(iteration)
+                && self.prior_variables.contains(&symbol)
+                && self.readable_variables.contains(&symbol),
+        )
+    }
+
+    fn anonymous_function_return_is_exact(
+        &self,
+        statement: NodeRef,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let record = self.node(statement)?;
+        let NodeData::ReturnStatement(return_statement) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::ReturnStatement
+            || record.flags.0 != 0
+            || return_statement.expression != Some(expression.node)
+            || return_statement.flow_node.is_some()
+            || return_statement.facts != 0
+        {
+            return Ok(false);
+        }
+
+        let Some(body) = record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let body_record = self.node(body)?;
+        let NodeData::Block(block) = &body_record.data else {
+            return Ok(false);
+        };
+        let Some(function) = body_record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let function_record = self.node(function)?;
+        let NodeData::FunctionExpression(declaration) = &function_record.data else {
+            return Ok(false);
+        };
+
+        Ok(body_record.kind == SyntaxKind::Block
+            && body_record.flags.0 == 0
+            && block.flow_node.is_none()
+            && block.next_container.is_none()
+            && !block.statements.has_trailing_comma
+            && block.statements.nodes.as_slice() == [statement.node]
+            && block.facts == 0
+            && function_record.kind == SyntaxKind::FunctionExpression
+            && function_record.flags.0 == 0
+            && declaration.body == body.node
+            && declaration.name.is_none()
+            && declaration.modifiers.is_none()
+            && declaration.asterisk_token.is_none()
+            && declaration.type_parameters.is_none()
+            && declaration.type_.is_none()
+            && declaration.parameters.nodes.is_empty()
+            && !declaration.parameters.has_trailing_comma
+            && declaration.full_signature.is_none()
+            && declaration.next_container.is_none()
+            && declaration.symbol.is_none()
+            && declaration.flow_node.is_none()
+            && declaration.end_flow_node.is_none()
+            && declaration.return_flow_node.is_none()
+            && declaration.facts == 0
+            && self.bound.symbol(function).is_some()
+            && self.bound.container(body) == Some(function)
+            && self.bound.container(statement) == Some(function)
+            && self.bound.container(expression) == Some(function)
+            && self.bound.block_scope_container(body) == Some(function)
+            && self.bound.block_scope_container(statement) == Some(function)
+            && self.bound.block_scope_container(expression) == Some(function)
+            && self.bound.flow_container(statement) == Some(function)
+            && self.bound.flow_graph().container_is_complete(function) == Some(true))
+    }
+
     fn plan_nested_arrow_argument(
         &mut self,
         declaration: NodeRef,
@@ -15108,11 +15251,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                     break;
                 }
+                NodeData::ReturnStatement(return_statement)
+                    if record.kind == SyntaxKind::ReturnStatement
+                        && return_statement.expression == Some(argument.node) =>
+                {
+                    if !self.anonymous_function_return_is_exact(parent, argument)? {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ));
+                    }
+                    break;
+                }
                 NodeData::ExpressionStatement(statement)
                     if record.kind == SyntaxKind::ExpressionStatement
                         && statement.expression == argument.node =>
                 {
-                    if !self.loop_closure_statement_is_exact(parent, argument)? {
+                    if !self.loop_closure_statement_is_exact(parent, argument)?
+                        && !self.for_in_closure_statement_is_exact(parent, argument)?
+                    {
                         return Err(SourceCheckError::Unsupported(
                             UnsupportedSourceSyntax::Arrow(declaration),
                         ));
@@ -15360,6 +15516,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 {
                     if parent_record.parent != Some(self.source.node_ref().node)
                         && !self.loop_closure_statement_is_exact(parent, position)?
+                        && !self.for_in_closure_statement_is_exact(parent, position)?
                     {
                         return Err(unsupported());
                     }
@@ -42189,6 +42346,236 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn for_in_anonymous_closures_return_captured_arrows_with_stable_callable_identity() {
+        let source = parsed(concat!(
+            "declare function use(value: any): void; ",
+            "const key = 1; ",
+            "for (let key in { first: 1 }) { ",
+            "((function () { return (() => key); })); ",
+            "} ",
+            "for (const key in { second: 2 }) { ",
+            "(function () { return () => key; }); ",
+            "} ",
+            "use(key);",
+        ));
+        let file = FileId::new(9_360);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let (_, bound) = context.file(file).unwrap();
+        let mut loops = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::ForInOrOfStatement(iteration) = &record.data else {
+                    return None;
+                };
+                if record.kind != SyntaxKind::ForInStatement {
+                    return None;
+                }
+                let NodeData::VariableDeclarationList(bindings) =
+                    &source.arena.get(iteration.initializer)?.data
+                else {
+                    return None;
+                };
+                let [binding] = bindings.declarations.nodes.as_slice() else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(source.arena.id(), file, node),
+                    bound.symbol(NodeRef::new(source.arena.id(), file, *binding))?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        loops.sort_unstable_by_key(|(node, _)| source.arena.get(node.node).unwrap().range.start);
+        let [(_, first_key), (_, second_key)] = loops.as_slice() else {
+            panic!("expected one let binding and one const binding")
+        };
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let outer_key = variable_symbol(&context, &source, file, "key");
+        for symbol in [*first_key, *second_key] {
+            assert_ne!(symbol, outer_key);
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(string),
+            );
+        }
+        assert_ne!(first_key, second_key);
+
+        let mut functions = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        functions.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        let mut arrows = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        arrows.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        assert_eq!(functions.len(), 2);
+        assert_eq!(arrows.len(), 2);
+
+        let mut callable_identities = Vec::new();
+        for (function, arrow) in functions.iter().copied().zip(arrows.iter().copied()) {
+            let function_owner = bound.symbol(function).unwrap();
+            let arrow_owner = bound.symbol(arrow).unwrap();
+            let function_type = context
+                .store()
+                .source_callable_type_for_owner(function_owner)
+                .unwrap();
+            let arrow_type = context
+                .store()
+                .source_callable_type_for_owner(arrow_owner)
+                .unwrap();
+            assert_eq!(resolved_node_type(&context, function), function_type);
+            assert_eq!(resolved_node_type(&context, arrow), arrow_type);
+            assert_eq!(
+                context.type_to_string(function_type).unwrap(),
+                "() => () => string"
+            );
+            assert_eq!(context.type_to_string(arrow_type).unwrap(), "() => string");
+
+            let function_signature = context
+                .store()
+                .source_callable_provenance(function_type)
+                .unwrap()
+                .signature;
+            let arrow_signature = context
+                .store()
+                .source_callable_provenance(arrow_type)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                context
+                    .store()
+                    .signature(function_signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(arrow_type),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .signature(arrow_signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(string),
+            );
+            callable_identities.push((function_owner, function_type, arrow_owner, arrow_type));
+        }
+
+        let mut reads = identifier_expressions(&source, file, "key");
+        reads.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        let [first_capture, second_capture, trailing] = reads.as_slice() else {
+            panic!("expected two captured loop keys and one top-level key")
+        };
+        for (read, expected) in [
+            (*first_capture, *first_key),
+            (*second_capture, *second_key),
+            (*trailing, outer_key),
+        ] {
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(read)
+                    .and_then(|links| links.resolved_symbol),
+                Some(expected),
+            );
+        }
+        assert_eq!(resolved_node_type(&context, *first_capture), string);
+        assert_eq!(resolved_node_type(&context, *second_capture), string);
+        assert_eq!(
+            resolved_node_type(&context, *trailing),
+            variable_value_type(&context, &source, file, "key"),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        for (function_owner, function_type, arrow_owner, arrow_type) in callable_identities {
+            assert_eq!(
+                context
+                    .store()
+                    .source_callable_type_for_owner(function_owner),
+                Some(function_type),
+            );
+            assert_eq!(
+                context.store().source_callable_type_for_owner(arrow_owner),
+                Some(arrow_type),
+            );
+        }
+    }
+
+    #[test]
+    fn for_in_captured_closures_reject_named_or_parameterized_function_expressions() {
+        for (index, expression) in [
+            "(function named() { return () => key; });",
+            "(function (value) { return () => key; });",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = format!("const key = 1; for (let key in {{ first: 1 }}) {{ {expression} }}");
+            let source = parsed(&text);
+            let file = FileId::new(9_361 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let function = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let (_, bound) = context.file(file).unwrap();
+            let owner = bound.symbol(function).unwrap();
+            let outer_key = variable_symbol(&context, &source, file, "key");
+            let cold = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                    node,
+                    kind: SyntaxKind::FunctionExpression,
+                    role: SourceSyntaxRole::VariableInitializer,
+                })) if node == function
+            ));
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(
+                context
+                    .store()
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
+            assert!(context.store().value_symbol_links(outer_key).is_none());
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
