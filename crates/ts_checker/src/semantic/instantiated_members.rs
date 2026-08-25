@@ -1585,13 +1585,15 @@ fn instantiate_generic_method_signature(
         ));
     }
     for (fresh, source) in fresh_parameters.into_iter().zip(source_parameters) {
-        let (constraint, default_type) =
-            match store.type_payload(source).map(|record| record.data()) {
-                Some(TypeData::TypeParameter(parameter)) => {
-                    (parameter.constraint, parameter.resolved_default_type)
-                }
-                _ => return Err(GenericInterfaceMemberError::InvalidMember(method)),
-            };
+        let (constraint, default_type) = match store
+            .type_payload(source)
+            .map(super::type_records::TypeRecord::data)
+        {
+            Some(TypeData::TypeParameter(parameter)) => {
+                (parameter.constraint, parameter.resolved_default_type)
+            }
+            _ => return Err(GenericInterfaceMemberError::InvalidMember(method)),
+        };
         let constraint = constraint
             .map(|constraint| {
                 instantiate_generic_member_type(store, constraint, mapper, array_targets, session)
@@ -1615,31 +1617,24 @@ fn instantiate_generic_method_signature(
         }
     }
 
-    let (parameter_types, return_type) = match precomputed {
-        Some(resolved) => resolved,
-        None => {
-            let parameters = parameter_templates
-                .iter()
-                .copied()
-                .map(|parameter| {
-                    instantiate_generic_member_type(
-                        store,
-                        parameter,
-                        mapper,
-                        array_targets,
-                        session,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let return_type = instantiate_generic_member_type(
-                store,
-                return_template,
-                mapper,
-                array_targets,
-                session,
-            )?;
-            (parameters, return_type)
-        }
+    let (parameter_types, return_type) = if let Some(resolved) = precomputed {
+        resolved
+    } else {
+        let parameters = parameter_templates
+            .iter()
+            .copied()
+            .map(|parameter| {
+                instantiate_generic_member_type(store, parameter, mapper, array_targets, session)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let return_type = instantiate_generic_member_type(
+            store,
+            return_template,
+            mapper,
+            array_targets,
+            session,
+        )?;
+        (parameters, return_type)
     };
     let parameters = store
         .signature(signature)

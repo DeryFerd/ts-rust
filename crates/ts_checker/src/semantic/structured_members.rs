@@ -1648,8 +1648,12 @@ fn matching_generic_method_type(
         return true;
     }
     let matches = match (
-        store.type_payload(first).map(|record| record.data()),
-        store.type_payload(second).map(|record| record.data()),
+        store
+            .type_payload(first)
+            .map(super::type_records::TypeRecord::data),
+        store
+            .type_payload(second)
+            .map(super::type_records::TypeRecord::data),
     ) {
         (Some(TypeData::Union(first)), Some(TypeData::Union(second))) => {
             first.union.types.len() == second.union.types.len()
