@@ -17674,8 +17674,9 @@ fn execute_direct_derived_class_members(
     let generic_base_capacity = base_state
         .as_ref()
         .filter(|_| !base_heritage.type_arguments.is_empty())
-        .map(|base| store.try_reserve_object_instantiations(base.shells.instance_type, 1))
-        .unwrap_or(true);
+        .map_or(true, |base| {
+            store.try_reserve_object_instantiations(base.shells.instance_type, 1)
+        });
     if !store.try_reserve_types(type_count)
         || !generic_base_capacity
         || !store.try_reserve_signatures(signature_count)

@@ -1176,7 +1176,7 @@ pub(super) fn exact_global_date_initializer(
     };
     let Some(constructor_signature) = store
         .symbol(owner)
-        .and_then(|owner| owner.members())
+        .and_then(ts_binder::semantic::Symbol::members)
         .and_then(|members| store.symbol_table(members))
         .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
     else {
