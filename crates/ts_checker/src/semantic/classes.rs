@@ -25,6 +25,8 @@
 //! A derived constructor may retain one public, interface-typed parameter
 //! property and forward one primitive interface property to its base.
 //! Numeric instance and static fields can retain a direct numeric initializer.
+//! One authenticated class/interface merge can retain a string auto-accessor
+//! and its shared binder-owned property symbol in either declaration order.
 //! An instance field may also reference its own constructor parameter and
 //! retain the upstream error-recovery `any` type for the source diagnostic.
 //! Simple same-file namespaces can merge with a class and contribute numeric
@@ -202,6 +204,17 @@ struct ClassNamespaceExportPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MergedAutoAccessorClass {
+    class_declaration: NodeRef,
+    interface_declaration: NodeRef,
+    class_property: NodeRef,
+    interface_property: NodeRef,
+    interface_annotation: NodeRef,
+    symbol: SemanticSymbolId,
+    optional: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClassPropertyDecoratorSignature {
     RestAny,
     StandardAnyPair,
@@ -221,7 +234,10 @@ pub(super) struct ClassPropertyPlan {
     type_node: NodeRef,
     initializer_node: Option<NodeRef>,
     initializer_text: Option<String>,
+    initializer_string: Option<String>,
     initializer_parameter_name: Option<String>,
+    merged_interface_annotation: Option<NodeRef>,
+    auto_accessor: bool,
     name: String,
     side: ClassPropertySide,
     optional: bool,
@@ -965,6 +981,7 @@ fn class_property_modifiers(
     declaration: NodeRef,
     name: NodeRef,
     modifiers: Option<&ts_ast::ModifierList>,
+    auto_accessor: Option<MergedAutoAccessorClass>,
 ) -> Result<(ClassPropertySide, bool), ClassError> {
     let Some(modifiers) = modifiers else {
         return Ok((ClassPropertySide::Instance, false));
@@ -989,6 +1006,11 @@ fn class_property_modifiers(
             (ClassPropertySide::Instance, false)
         }
         [SyntaxKind::PublicKeyword] => (ClassPropertySide::Instance, false),
+        [SyntaxKind::AccessorKeyword]
+            if auto_accessor.is_some_and(|accessor| accessor.class_property == declaration) =>
+        {
+            (ClassPropertySide::Instance, false)
+        }
         [SyntaxKind::ReadonlyKeyword] => (ClassPropertySide::Instance, true),
         [SyntaxKind::PublicKeyword, SyntaxKind::ReadonlyKeyword] => {
             (ClassPropertySide::Instance, true)
@@ -2491,6 +2513,7 @@ fn plan_method(
         declaration,
         name_node,
         method.modifiers.as_ref(),
+        None,
     )?;
     if readonly
         || side == ClassPropertySide::Static
@@ -3097,8 +3120,16 @@ fn plan_property(
     {
         return Err(invariant(ClassInvariant::InvalidName(name)));
     }
-    let (side, readonly) =
-        class_property_modifiers(store, host, member, name, property.modifiers.as_ref())?;
+    let merged_auto_accessor = authenticated_merged_auto_accessor_class(store, host, owner)
+        .filter(|merged| merged.class_property == member);
+    let (side, readonly) = class_property_modifiers(
+        store,
+        host,
+        member,
+        name,
+        property.modifiers.as_ref(),
+        merged_auto_accessor,
+    )?;
 
     let type_node = NodeRef::new(member.arena, member.file, type_node);
     let type_record = preflight_node(store, host, type_node)?;
@@ -3111,7 +3142,7 @@ fn plan_property(
     let initializer_node = property
         .initializer
         .map(|initializer| NodeRef::new(member.arena, member.file, initializer));
-    let (initializer_text, initializer_parameter_name) =
+    let (initializer_text, initializer_string, initializer_parameter_name) =
         if let Some(initializer_node) = initializer_node {
             let initializer_record = preflight_node(store, host, initializer_node)?;
             if property.postfix_token.is_some()
@@ -3126,6 +3157,9 @@ fn plan_property(
             let text = match &initializer_record.data {
                 NodeData::NumericLiteral(literal) => literal.text.as_str(),
                 NodeData::Identifier(identifier) => identifier.text.as_str(),
+                NodeData::StringLiteral(literal) if merged_auto_accessor.is_some() => {
+                    literal.text.as_str()
+                }
                 _ => {
                     return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
                 }
@@ -3134,10 +3168,25 @@ fn plan_property(
                 .source(initializer_node)
                 .and_then(|(arena, _)| arena.source_text())
                 .is_none_or(|source| {
-                    source.get(
+                    let spelling = source.get(
                         initializer_record.range.start.get() as usize
                             ..initializer_record.range.end.get() as usize,
-                    ) == Some(text)
+                    );
+                    if matches!(initializer_record.data, NodeData::StringLiteral(_)) {
+                        spelling.is_some_and(|spelling| {
+                            spelling
+                                .strip_prefix('"')
+                                .and_then(|value| value.strip_suffix('"'))
+                                .or_else(|| {
+                                    spelling
+                                        .strip_prefix('\'')
+                                        .and_then(|value| value.strip_suffix('\''))
+                                })
+                                == Some(text)
+                        })
+                    } else {
+                        spelling == Some(text)
+                    }
                 });
             if !spelling_matches {
                 return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
@@ -3154,7 +3203,7 @@ fn plan_property(
                     {
                         return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
                     }
-                    (Some(literal.text.clone()), None)
+                    (Some(literal.text.clone()), None, None)
                 }
                 NodeData::Identifier(identifier) => {
                     if side != ClassPropertySide::Instance
@@ -3168,12 +3217,24 @@ fn plan_property(
                     {
                         return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
                     }
-                    (None, Some(identifier.text.clone()))
+                    (None, None, Some(identifier.text.clone()))
+                }
+                NodeData::StringLiteral(literal) => {
+                    if merged_auto_accessor.is_none()
+                        || side != ClassPropertySide::Instance
+                        || initializer_record.kind != SyntaxKind::StringLiteral
+                        || literal.token_flags.0 != 0
+                        || type_record.kind != SyntaxKind::StringKeyword
+                        || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
+                    {
+                        return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
+                    }
+                    (None, Some(literal.text.clone()), None)
                 }
                 _ => unreachable!("unsupported initializer syntax was rejected above"),
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
 
     let (optional, definite) = match property.postfix_token {
@@ -3218,6 +3279,7 @@ fn plan_property(
         .symbol(symbol)
         .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(member)))?;
     if symbol_record.flags().intersects(SymbolFlags::ACCESSOR)
+        && merged_auto_accessor.is_none()
         && symbol_record.declarations().is_some_and(|declarations| {
             declarations.iter().any(|declaration| {
                 host.node(*declaration)
@@ -3245,9 +3307,15 @@ fn plan_property(
     {
         return Err(unsupported(ClassUnsupported::DuplicateProperty(member)));
     }
+    let optional = merged_auto_accessor.map_or(optional, |merged| merged.optional);
     let expected_flags = SymbolFlags::PROPERTY
         | if optional {
             SymbolFlags::OPTIONAL
+        } else {
+            SymbolFlags::NONE
+        }
+        | if merged_auto_accessor.is_some() {
+            SymbolFlags::ACCESSOR
         } else {
             SymbolFlags::NONE
         };
@@ -3261,12 +3329,23 @@ fn plan_property(
         ClassPropertySide::Static => Some(static_members),
     }
     .and_then(|table| store.symbol_table(table));
+    let declarations_match = if let Some(merged) = merged_auto_accessor {
+        symbol == merged.symbol
+            && symbol_record.declarations().is_some_and(|declarations| {
+                declarations.len() == 2
+                    && declarations.contains(&merged.class_property)
+                    && declarations.contains(&merged.interface_property)
+                    && symbol_record.value_declaration() == declarations.first().copied()
+            })
+    } else {
+        symbol_record.declarations() == Some(&[member])
+            && symbol_record.value_declaration() == Some(member)
+    };
     if symbol_record.flags() != expected_flags
         || (symbol_record.check_flags() != CheckFlags::NONE
             && symbol_record.check_flags() != expected_check_flags)
         || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
-        || symbol_record.declarations() != Some(&[member])
-        || symbol_record.value_declaration() != Some(member)
+        || !declarations_match
         || symbol_record.members().is_some()
         || symbol_record.exports().is_some()
         || symbol_record.parent() != Some(owner)
@@ -3284,7 +3363,10 @@ fn plan_property(
         type_node,
         initializer_node,
         initializer_text,
+        initializer_string,
         initializer_parameter_name,
+        merged_interface_annotation: merged_auto_accessor.map(|merged| merged.interface_annotation),
+        auto_accessor: merged_auto_accessor.is_some(),
         name: identifier.text.clone(),
         side,
         optional,
@@ -3407,7 +3489,10 @@ fn plan_ambient_private_implicit_any_property(
         type_node: name,
         initializer_node: None,
         initializer_text: None,
+        initializer_string: None,
         initializer_parameter_name: None,
+        merged_interface_annotation: None,
+        auto_accessor: false,
         name: identifier.text.clone(),
         side: ClassPropertySide::Instance,
         optional: false,
@@ -3470,8 +3555,16 @@ fn reject_reserved_static_prototype(
         if record.parent != Some(declaration.node) || name_record.parent != Some(member.node) {
             return Err(invariant(ClassInvariant::InvalidProperty(member)));
         }
-        let (side, _) =
-            class_property_modifiers(store, host, member, name, property.modifiers.as_ref())?;
+        let auto_accessor = bound_symbol(store, host, declaration)
+            .and_then(|owner| authenticated_merged_auto_accessor_class(store, host, owner));
+        let (side, _) = class_property_modifiers(
+            store,
+            host,
+            member,
+            name,
+            property.modifiers.as_ref(),
+            auto_accessor,
+        )?;
         if side == ClassPropertySide::Static {
             return Err(unsupported(ClassUnsupported::ReservedStaticProperty(
                 member,
@@ -4102,6 +4195,253 @@ fn plan_class_namespace_variable(
     ))
 }
 
+fn authenticated_merged_auto_accessor_class(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+) -> Option<MergedAutoAccessorClass> {
+    let record = store.symbol(owner)?;
+    let [first, second] = record.declarations()? else {
+        return None;
+    };
+    let (class_declaration, interface_declaration) = match (
+        store.source_node_kind(*first),
+        store.source_node_kind(*second),
+    ) {
+        (Some(SyntaxKind::ClassDeclaration), Some(SyntaxKind::InterfaceDeclaration)) => {
+            (*first, *second)
+        }
+        (Some(SyntaxKind::InterfaceDeclaration), Some(SyntaxKind::ClassDeclaration)) => {
+            (*second, *first)
+        }
+        _ => return None,
+    };
+    let class_record = preflight_node(store, host, class_declaration).ok()?;
+    let interface_record = preflight_node(store, host, interface_declaration).ok()?;
+    let NodeData::ClassDeclaration(class) = &class_record.data else {
+        return None;
+    };
+    let NodeData::InterfaceDeclaration(interface) = &interface_record.data else {
+        return None;
+    };
+    let declarations_in_source_order = if *first == class_declaration {
+        class_record.range.end <= interface_record.range.start
+    } else {
+        interface_record.range.end <= class_record.range.start
+    };
+    let [class_property] = class.members.nodes.as_slice() else {
+        return None;
+    };
+    let [interface_property] = interface.members.nodes.as_slice() else {
+        return None;
+    };
+    if record.flags() != (SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+        || record.check_flags() != CheckFlags::NONE
+        || record.value_declaration() != Some(class_declaration)
+        || record.parent().is_some()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || !class_declaration.is_for(interface_declaration.arena, interface_declaration.file)
+        || !declarations_in_source_order
+        || class_record.parent != interface_record.parent
+        || class_record.flags.0 != 0
+        || interface_record.flags.0 != 0
+        || class.modifiers.is_some()
+        || class.type_parameters.is_some()
+        || class.heritage_clauses.is_some()
+        || class.members.has_trailing_comma
+        || interface.modifiers.is_some()
+        || interface.type_parameters.is_some()
+        || interface.heritage_clauses.is_some()
+        || interface.members.has_trailing_comma
+        || !host.symbol_matches(store, class_declaration, owner)
+        || !host.symbol_matches(store, interface_declaration, owner)
+    {
+        return None;
+    }
+
+    let class_property = NodeRef::new(
+        class_declaration.arena,
+        class_declaration.file,
+        *class_property,
+    );
+    let interface_property = NodeRef::new(
+        interface_declaration.arena,
+        interface_declaration.file,
+        *interface_property,
+    );
+    let class_property_record = preflight_node(store, host, class_property).ok()?;
+    let interface_property_record = preflight_node(store, host, interface_property).ok()?;
+    let NodeData::PropertyDeclaration(class_member) = &class_property_record.data else {
+        return None;
+    };
+    let NodeData::PropertyDeclaration(interface_member) = &interface_property_record.data else {
+        return None;
+    };
+    let class_name = NodeRef::new(class_property.arena, class_property.file, class_member.name);
+    let interface_name = NodeRef::new(
+        interface_property.arena,
+        interface_property.file,
+        interface_member.name,
+    );
+    let class_name_record = preflight_node(store, host, class_name).ok()?;
+    let interface_name_record = preflight_node(store, host, interface_name).ok()?;
+    let NodeData::Identifier(class_identifier) = &class_name_record.data else {
+        return None;
+    };
+    let NodeData::Identifier(interface_identifier) = &interface_name_record.data else {
+        return None;
+    };
+    let modifiers = class_member.modifiers.as_ref()?;
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return None;
+    };
+    let modifier = NodeRef::new(class_property.arena, class_property.file, *modifier);
+    let modifier_record = preflight_node(store, host, modifier).ok()?;
+    let class_annotation = NodeRef::new(
+        class_property.arena,
+        class_property.file,
+        class_member.type_?,
+    );
+    let interface_annotation = NodeRef::new(
+        interface_property.arena,
+        interface_property.file,
+        interface_member.type_?,
+    );
+    let class_annotation_record = preflight_node(store, host, class_annotation).ok()?;
+    let interface_annotation_record = preflight_node(store, host, interface_annotation).ok()?;
+    let initializer = NodeRef::new(
+        class_property.arena,
+        class_property.file,
+        class_member.initializer?,
+    );
+    let initializer_record = preflight_node(store, host, initializer).ok()?;
+    let NodeData::StringLiteral(initializer_literal) = &initializer_record.data else {
+        return None;
+    };
+    if class_property_record.kind != SyntaxKind::PropertyDeclaration
+        || class_property_record.flags.0 != 0
+        || class_property_record.parent != Some(class_declaration.node)
+        || class_member.postfix_token.is_some()
+        || class_member.symbol.is_some()
+        || class_member.facts != 0
+        || interface_property_record.kind != SyntaxKind::PropertyDeclaration
+        || interface_property_record.flags.0 != 0
+        || interface_property_record.parent != Some(interface_declaration.node)
+        || interface_member.initializer.is_some()
+        || interface_member.symbol.is_some()
+        || interface_member.facts != 0
+        || interface_member.modifiers.is_some()
+        || class_name_record.kind != SyntaxKind::Identifier
+        || class_name_record.parent != Some(class_property.node)
+        || class_identifier.flow_node.is_some()
+        || class_identifier.text.is_empty()
+        || interface_name_record.kind != SyntaxKind::Identifier
+        || interface_name_record.parent != Some(interface_property.node)
+        || interface_identifier.flow_node.is_some()
+        || interface_identifier.text != class_identifier.text
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifiers.list.range.start != class_property_record.range.start
+        || modifiers.list.range.end > class_name_record.range.start
+        || modifier_record.kind != SyntaxKind::AccessorKeyword
+        || modifier_record.flags.0 != 0
+        || modifier_record.parent != Some(class_property.node)
+        || !matches!(modifier_record.data, NodeData::Token(_))
+        || class_annotation_record.kind != SyntaxKind::StringKeyword
+        || class_annotation_record.flags.0 != 0
+        || class_annotation_record.parent != Some(class_property.node)
+        || !matches!(class_annotation_record.data, NodeData::KeywordTypeNode(_))
+        || interface_annotation_record.kind != SyntaxKind::StringKeyword
+        || interface_annotation_record.flags.0 != 0
+        || interface_annotation_record.parent != Some(interface_property.node)
+        || !matches!(
+            interface_annotation_record.data,
+            NodeData::KeywordTypeNode(_)
+        )
+        || initializer_record.kind != SyntaxKind::StringLiteral
+        || initializer_record.flags.0 != 0
+        || initializer_record.parent != Some(class_property.node)
+        || initializer_record.range.start < class_annotation_record.range.end
+        || initializer_literal.token_flags.0 != 0
+    {
+        return None;
+    }
+    let optional = if let Some(token) = interface_member.postfix_token {
+        let token = NodeRef::new(interface_property.arena, interface_property.file, token);
+        let token_record = preflight_node(store, host, token).ok()?;
+        if token_record.kind != SyntaxKind::QuestionToken
+            || token_record.flags.0 != 0
+            || token_record.parent != Some(interface_property.node)
+            || token_record.range.start < interface_name_record.range.end
+            || token_record.range.end > interface_annotation_record.range.start
+        {
+            return None;
+        }
+        true
+    } else {
+        false
+    };
+
+    let bound = host.bound_file(class_declaration)?;
+    let symbol = bound.symbol(class_property)?;
+    if bound.symbol(interface_property) != Some(symbol) {
+        return None;
+    }
+    let member = store.symbol(symbol)?;
+    let expected_flags = SymbolFlags::PROPERTY
+        | SymbolFlags::ACCESSOR
+        | if optional {
+            SymbolFlags::OPTIONAL
+        } else {
+            SymbolFlags::NONE
+        };
+    let expected_declarations = if *first == class_declaration {
+        [class_property, interface_property]
+    } else {
+        [interface_property, class_property]
+    };
+    let members = record
+        .members()
+        .and_then(|members| store.symbol_table(members))?;
+    if member.flags() != expected_flags
+        || member.check_flags() != CheckFlags::NONE
+        || member.name().as_utf8() != Some(class_identifier.text.as_str())
+        || member.declarations() != Some(expected_declarations.as_slice())
+        || member.value_declaration() != expected_declarations.first().copied()
+        || member.members().is_some()
+        || member.exports().is_some()
+        || member.parent() != Some(owner)
+        || member.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || members.len() != 1
+        || members.get_source(&class_identifier.text) != Some(symbol)
+    {
+        return None;
+    }
+
+    Some(MergedAutoAccessorClass {
+        class_declaration,
+        interface_declaration,
+        class_property,
+        interface_property,
+        interface_annotation,
+        symbol,
+        optional,
+    })
+}
+
+/// Recognizes the interface side of one authenticated auto-accessor class merge.
+pub(super) fn is_merged_auto_accessor_interface(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
+    authenticated_merged_auto_accessor_class(store, host, owner)
+        .is_some_and(|merged| merged.interface_declaration == declaration)
+}
+
 fn plan_class_owner_declarations(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -4114,6 +4454,11 @@ fn plan_class_owner_declarations(
             return Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)));
         };
         return Ok((*declaration, Vec::new()));
+    }
+    if flags == (SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
+        let merged = authenticated_merged_auto_accessor_class(store, host, symbol)
+            .ok_or_else(|| unsupported(ClassUnsupported::MergedDeclarations(symbol)))?;
+        return Ok((merged.class_declaration, Vec::new()));
     }
     if flags != (SymbolFlags::CLASS | SymbolFlags::NAMESPACE_MODULE)
         && flags != (SymbolFlags::CLASS | SymbolFlags::VALUE_MODULE)
@@ -5564,16 +5909,21 @@ fn property_initializer_fresh_literal_type(
     store: &CanonicalTypeMapperStore,
     property: &ClassPropertyPlan,
 ) -> Result<Option<TypeId>, ClassError> {
-    let Some(number) = property_initializer_number(property) else {
-        return Ok(None);
+    let initializer = match property.initializer_node {
+        Some(initializer) => initializer,
+        None => return Ok(None),
     };
-    let initializer = property
-        .initializer_node
-        .ok_or_else(|| invariant(ClassInvariant::InvalidPlan(property.declaration)))?;
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(initializer)))?;
-    let Some(regular) = bootstrap.cached_number_literal_type(number) else {
+    let regular = if let Some(value) = property.initializer_string.as_deref() {
+        bootstrap.cached_string_literal_type(value)
+    } else if let Some(number) = property_initializer_number(property) {
+        bootstrap.cached_number_literal_type(number)
+    } else {
+        return Ok(None);
+    };
+    let Some(regular) = regular else {
         return Ok(None);
     };
     store
@@ -5630,7 +5980,10 @@ fn planned_property_type(
             || !matches!(modifier_record.data, NodeData::Token(_))
             || property.initializer_node.is_some()
             || property.initializer_text.is_some()
+            || property.initializer_string.is_some()
             || property.initializer_parameter_name.is_some()
+            || property.merged_interface_annotation.is_some()
+            || property.auto_accessor
             || property.side != ClassPropertySide::Instance
             || property.optional
             || property.definite
@@ -5660,6 +6013,35 @@ fn planned_property_type(
         return store
             .intrinsic_bootstrap()
             .map(|bootstrap| bootstrap.any_type)
+            .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(property.type_node)));
+    }
+    if let Some(expected) = &property.initializer_string {
+        let initializer = property
+            .initializer_node
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPlan(property.declaration)))?;
+        let initializer_record = preflight_node(store, host, initializer)?;
+        let NodeData::StringLiteral(literal) = &initializer_record.data else {
+            return Err(unsupported(ClassUnsupported::PropertyInitializer(
+                property.declaration,
+            )));
+        };
+        if !property.auto_accessor
+            || property.merged_interface_annotation.is_none()
+            || initializer_record.kind != SyntaxKind::StringLiteral
+            || initializer_record.flags.0 != 0
+            || initializer_record.parent != Some(property.declaration.node)
+            || literal.token_flags.0 != 0
+            || &literal.text != expected
+            || record.kind != SyntaxKind::StringKeyword
+            || !matches!(record.data, NodeData::KeywordTypeNode(_))
+        {
+            return Err(unsupported(ClassUnsupported::PropertyInitializer(
+                property.declaration,
+            )));
+        }
+        return store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.string_type)
             .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(property.type_node)));
     }
     if let Some(expected) = &property.initializer_text {
@@ -6166,7 +6548,7 @@ fn validate_property_cache_state(
 ) -> Result<(), ClassError> {
     let initializer_type = if property.initializer_parameter_name.is_some() {
         Some(property_type)
-    } else if property.initializer_text.is_some() {
+    } else if property.initializer_text.is_some() || property.initializer_string.is_some() {
         property_initializer_fresh_literal_type(store, property)?
     } else {
         None
@@ -6207,6 +6589,9 @@ fn validate_property_cache_state(
         && initializer != property.type_node
     {
         validate_node(initializer, initializer_type)?;
+    }
+    if let Some(annotation) = property.merged_interface_annotation {
+        validate_node(annotation, Some(property_type))?;
     }
 
     let expected_check_flags = expected_property_check_flags(property);
@@ -6269,7 +6654,7 @@ fn exact_property_type_links(
     }
     let initializer_type = if property.initializer_parameter_name.is_some() {
         Some(property_type)
-    } else if property.initializer_text.is_some() {
+    } else if property.initializer_text.is_some() || property.initializer_string.is_some() {
         property_initializer_fresh_literal_type(store, property)
             .ok()
             .flatten()
@@ -6295,7 +6680,15 @@ fn exact_property_type_links(
                     ..TypeNodeLinks::default()
                 })
         })
-    })
+    }) && property
+        .merged_interface_annotation
+        .is_none_or(|annotation| {
+            store.type_node_links(annotation)
+                == Some(&TypeNodeLinks {
+                    resolved_type: Some(property_type),
+                    ..TypeNodeLinks::default()
+                })
+        })
 }
 
 fn validate_index_type_cache(
@@ -6496,9 +6889,15 @@ fn plan_initialized_setter_grammar_diagnostic(
         return None;
     }
     let (name_node, name) = accessor_name(store, host, setter, accessor.name).ok()?;
-    let (side, readonly) =
-        class_property_modifiers(store, host, setter, name_node, accessor.modifiers.as_ref())
-            .ok()?;
+    let (side, readonly) = class_property_modifiers(
+        store,
+        host,
+        setter,
+        name_node,
+        accessor.modifiers.as_ref(),
+        None,
+    )
+    .ok()?;
     if readonly
         || accessor
             .modifiers
@@ -7500,8 +7899,15 @@ fn plan_generic_array_method_grammar_diagnostic(
         return None;
     }
     let (method_name, method_text) = accessor_name(store, host, method, data.name).ok()?;
-    let (side, readonly) =
-        class_property_modifiers(store, host, method, method_name, data.modifiers.as_ref()).ok()?;
+    let (side, readonly) = class_property_modifiers(
+        store,
+        host,
+        method,
+        method_name,
+        data.modifiers.as_ref(),
+        None,
+    )
+    .ok()?;
     if side != ClassPropertySide::Instance || readonly {
         return None;
     }
@@ -10840,7 +11246,11 @@ fn prepare_class_literal_types(
         })
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let mut numbers = Vec::new();
+    let mut strings = Vec::new();
     numbers
+        .try_reserve_exact(capacity)
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    strings
         .try_reserve_exact(capacity)
         .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     for class in std::iter::once(plan).chain(base) {
@@ -10851,15 +11261,22 @@ fn prepare_class_literal_types(
                 .iter()
                 .filter_map(property_initializer_number),
         );
+        strings.extend(
+            class
+                .class
+                .properties
+                .iter()
+                .filter_map(|property| property.initializer_string.clone()),
+        );
         if let Some(accessor) = class.class.accessor.as_ref() {
             numbers.push(accessor_literal_number(accessor));
         }
     }
-    if numbers.is_empty() {
+    if numbers.is_empty() && strings.is_empty() {
         return Ok(());
     }
     store
-        .prepare_regular_literal_types(&[], &numbers, &[])
+        .prepare_regular_literal_types(&strings, &numbers, &[])
         .map_err(|error| {
             if error == LiteralTypeCacheError::Capacity {
                 invariant(ClassInvariant::Capacity(plan.class.declaration))
@@ -10900,6 +11317,18 @@ fn publish_class_property(
                 ),
                 Some(regular),
             )
+        } else if let Some(value) = property.initializer_string.as_deref() {
+            let regular = store
+                .regular_string_literal_type(value.to_owned())
+                .expect("the class transaction prepared its string auto-accessor literal");
+            (
+                Some(
+                    store
+                        .fresh_type_of_literal_type(regular)
+                        .expect("the prepared string field literal retains its fresh type"),
+                ),
+                Some(regular),
+            )
         } else if property.initializer_parameter_name.is_some() {
             (Some(property_type), None)
         } else {
@@ -10930,7 +11359,18 @@ fn publish_class_property(
             },
         ));
     }
-    assert!(store.set_source_property_readonly(property.symbol, property.readonly));
+    if let Some(annotation) = property.merged_interface_annotation {
+        assert!(store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(property_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+    }
+    if !property.auto_accessor {
+        assert!(store.set_source_property_readonly(property.symbol, property.readonly));
+    }
     let resolved_type =
         if property.readonly && property.initializer_node == Some(property.type_node) {
             regular_type.expect("an inferred readonly field retains its regular literal type")
@@ -10971,7 +11411,9 @@ pub(super) fn execute_nongeneric_class_members(
             plan.class
                 .properties
                 .iter()
-                .filter(|property| property.initializer_text.is_some())
+                .filter(|property| {
+                    property.initializer_text.is_some() || property.initializer_string.is_some()
+                })
                 .count()
                 .checked_mul(2)
                 .and_then(|literals| count.checked_add(literals))
@@ -11070,6 +11512,7 @@ pub(super) fn execute_nongeneric_class_members(
                         .initializer_node
                         .filter(|initializer| *initializer != property.type_node),
                 )
+                .chain(property.merged_interface_annotation)
         })
         .filter(|node| store.type_node_links(*node).is_none())
         .count();
@@ -11537,6 +11980,7 @@ fn execute_direct_derived_class_members(
                         .initializer_node
                         .filter(|initializer| *initializer != property.type_node),
                 )
+                .chain(property.merged_interface_annotation)
         })
         .filter(|node| store.type_node_links(*node).is_none())
         .count();
@@ -11647,7 +12091,9 @@ fn execute_direct_derived_class_members(
                 .properties
                 .iter()
                 .chain(&base_plan.class.properties)
-                .filter(|property| property.initializer_text.is_some())
+                .filter(|property| {
+                    property.initializer_text.is_some() || property.initializer_string.is_some()
+                })
                 .count()
                 .checked_mul(2)
                 .and_then(|literals| count.checked_add(literals))
@@ -12317,6 +12763,157 @@ enum StoredClassIndexState {
     Present(StoredClassIndex),
 }
 
+fn exact_stored_merged_auto_accessor(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    property: SemanticSymbolId,
+) -> Option<NodeRef> {
+    let owner_record = store.symbol(owner)?;
+    let [first_owner, second_owner] = owner_record.declarations()? else {
+        return None;
+    };
+    let interface_declaration = if *first_owner == owner_declaration {
+        *second_owner
+    } else if *second_owner == owner_declaration {
+        *first_owner
+    } else {
+        return None;
+    };
+    let record = store.symbol(property)?;
+    let [first, second] = record.declarations()? else {
+        return None;
+    };
+    let (class_property, interface_property) = match (
+        store.source_node_parent(*first),
+        store.source_node_parent(*second),
+    ) {
+        (Some(SourceNodeParent::Parent(left)), Some(SourceNodeParent::Parent(right)))
+            if left == owner_declaration && right == interface_declaration =>
+        {
+            (*first, *second)
+        }
+        (Some(SourceNodeParent::Parent(left)), Some(SourceNodeParent::Parent(right)))
+            if left == interface_declaration && right == owner_declaration =>
+        {
+            (*second, *first)
+        }
+        _ => return None,
+    };
+    let expected_declarations = if *first_owner == owner_declaration {
+        [class_property, interface_property]
+    } else {
+        [interface_property, class_property]
+    };
+    if owner_record.flags() != (SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+        || owner_record.value_declaration() != Some(owner_declaration)
+        || !first_owner.is_for(second_owner.arena, second_owner.file)
+        || first_owner.node.index() >= second_owner.node.index()
+        || store.source_node_kind(owner_declaration) != Some(SyntaxKind::ClassDeclaration)
+        || store.source_node_kind(interface_declaration) != Some(SyntaxKind::InterfaceDeclaration)
+        || store.source_node_parent(owner_declaration)
+            != store.source_node_parent(interface_declaration)
+        || store.source_node_kind(class_property) != Some(SyntaxKind::PropertyDeclaration)
+        || store.source_node_kind(interface_property) != Some(SyntaxKind::PropertyDeclaration)
+        || record
+            .flags()
+            .without(SymbolFlags::PROPERTY | SymbolFlags::ACCESSOR | SymbolFlags::OPTIONAL)
+            != SymbolFlags::NONE
+        || !record
+            .flags()
+            .contains(SymbolFlags::PROPERTY | SymbolFlags::ACCESSOR)
+        || record.check_flags() != CheckFlags::NONE
+        || record.declarations() != Some(expected_declarations.as_slice())
+        || record.value_declaration() != Some(*first)
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent() != Some(owner)
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(property) != Some(property)
+        || owner_record
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(record.name()))
+            != Some(property)
+    {
+        return None;
+    }
+
+    let mut modifier = None;
+    let mut annotation = None;
+    let mut initializer = None;
+    let mut names = 0usize;
+    for index in 0..class_property.node.index() {
+        let node = NodeRef::new(
+            class_property.arena,
+            class_property.file,
+            ts_ast::NodeId::new(u32::try_from(index).ok()?),
+        );
+        if store.source_node_parent(node) != Some(SourceNodeParent::Parent(class_property)) {
+            continue;
+        }
+        match store.source_node_kind(node)? {
+            SyntaxKind::AccessorKeyword if modifier.replace(node).is_none() => {}
+            SyntaxKind::StringKeyword if annotation.replace(node).is_none() => {}
+            SyntaxKind::StringLiteral if initializer.replace(node).is_none() => {}
+            SyntaxKind::Identifier => names += 1,
+            _ => return None,
+        }
+    }
+    let annotation = annotation?;
+    let initializer = initializer?;
+    if modifier.is_none() || names != 1 {
+        return None;
+    }
+    let interface_annotation = store.source_primitive_type_annotation(interface_property)?;
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let string = bootstrap.string_type;
+    let initializer_type = store.type_node_links(initializer)?.resolved_type?;
+    let literal_record = store.type_payload(initializer_type)?;
+    let TypeData::Literal(literal) = literal_record.data() else {
+        return None;
+    };
+    let super::type_records::LiteralValue::String(value) = &literal.value else {
+        return None;
+    };
+    let optional = (0..interface_property.node.index()).any(|index| {
+        u32::try_from(index)
+            .ok()
+            .map(ts_ast::NodeId::new)
+            .map(|node| NodeRef::new(interface_property.arena, interface_property.file, node))
+            .is_some_and(|node| {
+                store.source_node_parent(node) == Some(SourceNodeParent::Parent(interface_property))
+                    && store.source_node_kind(node) == Some(SyntaxKind::QuestionToken)
+            })
+    });
+    (record.flags().contains(SymbolFlags::OPTIONAL) == optional
+        && store.source_node_kind(interface_annotation) == Some(SyntaxKind::StringKeyword)
+        && store.type_node_links(annotation)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            })
+        && store.type_node_links(interface_annotation)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            })
+        && store.type_node_links(initializer)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(initializer_type),
+                ..TypeNodeLinks::default()
+            })
+        && literal_record.flags() == TypeFlags::STRING_LITERAL
+        && bootstrap.cached_string_literal_type(value) == Some(literal.regular_type)
+        && store.fresh_type_of_literal_type(literal.regular_type) == Ok(initializer_type)
+        && store.value_symbol_links(property)
+            == Some(&ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            }))
+    .then_some(class_property)
+}
+
 fn exact_stored_constructor_parameter_property(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
@@ -12485,6 +13082,9 @@ fn exact_stored_property(
     property: SemanticSymbolId,
 ) -> Option<NodeRef> {
     let record = store.symbol(property)?;
+    if record.flags().intersects(SymbolFlags::ACCESSOR) {
+        return exact_stored_merged_auto_accessor(store, owner, owner_declaration, property);
+    }
     let [declaration] = record.declarations()? else {
         return None;
     };
@@ -13487,6 +14087,26 @@ fn stored_class_owner_declaration(
             return None;
         };
         return Some(*declaration);
+    }
+    if flags == (SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
+        let [first, second] = record.declarations()? else {
+            return None;
+        };
+        let declaration = match (
+            store.source_node_kind(*first),
+            store.source_node_kind(*second),
+        ) {
+            (Some(SyntaxKind::ClassDeclaration), Some(SyntaxKind::InterfaceDeclaration)) => *first,
+            (Some(SyntaxKind::InterfaceDeclaration), Some(SyntaxKind::ClassDeclaration)) => *second,
+            _ => return None,
+        };
+        return (record.parent().is_none()
+            && record.value_declaration() == Some(declaration)
+            && first.is_for(second.arena, second.file)
+            && first.node.index() < second.node.index()
+            && store.source_node_parent(*first) == store.source_node_parent(*second)
+            && store.get_merged_symbol(owner) == Some(owner))
+        .then_some(declaration);
     }
     if flags != (SymbolFlags::CLASS | SymbolFlags::NAMESPACE_MODULE)
         && flags != (SymbolFlags::CLASS | SymbolFlags::VALUE_MODULE)
@@ -15077,6 +15697,298 @@ mod tests {
             assert!(fixture.store.declared_type_links(owner).is_none());
             assert!(fixture.store.value_symbol_links(owner).is_none());
         }
+    }
+
+    #[test]
+    fn merged_class_auto_accessor_preserves_binder_identity_in_both_declaration_orders() {
+        for (source, class_first) in [
+            (
+                r#"class Foo { accessor x: string = "abc"; } interface Foo { x: string; }"#,
+                true,
+            ),
+            (
+                r#"interface Foo { x: string; } class Foo { accessor x: string = "abc"; }"#,
+                false,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Foo");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let merged = authenticated_merged_auto_accessor_class(&fixture.store, &host, owner)
+                .expect("the exact class and interface share one auto-accessor property");
+            let expected_owner_declarations = if class_first {
+                [merged.class_declaration, merged.interface_declaration]
+            } else {
+                [merged.interface_declaration, merged.class_declaration]
+            };
+            let expected_property_declarations = if class_first {
+                [merged.class_property, merged.interface_property]
+            } else {
+                [merged.interface_property, merged.class_property]
+            };
+            let owner_record = fixture.store.symbol(owner).unwrap();
+            let property_record = fixture.store.symbol(merged.symbol).unwrap();
+            assert_eq!(
+                owner_record.flags(),
+                SymbolFlags::CLASS | SymbolFlags::INTERFACE
+            );
+            assert_eq!(
+                owner_record.declarations(),
+                Some(expected_owner_declarations.as_slice()),
+                "{source}",
+            );
+            assert_eq!(
+                property_record.flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::ACCESSOR,
+            );
+            assert_eq!(
+                property_record.declarations(),
+                Some(expected_property_declarations.as_slice()),
+                "{source}",
+            );
+            assert_eq!(
+                property_record.value_declaration(),
+                expected_property_declarations.first().copied(),
+            );
+            assert_eq!(bound.symbol(merged.class_property), Some(merged.symbol));
+            assert_eq!(bound.symbol(merged.interface_property), Some(merged.symbol));
+
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("the merged auto-accessor belongs to one direct class")
+            };
+            let [property] = class.class.properties.as_slice() else {
+                panic!("the merged class retains one binder-owned auto-accessor")
+            };
+            let property = property.clone();
+            assert!(property.auto_accessor);
+            assert!(property.ambient_private_modifier.is_none());
+
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+            let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            let regular = fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_string_literal_type("abc")
+                .unwrap();
+            let fresh = fixture.store.fresh_type_of_literal_type(regular).unwrap();
+            assert_eq!(members.declared_instance_properties(), &[merged.symbol]);
+            for annotation in [property.type_node, merged.interface_annotation] {
+                assert_eq!(
+                    fixture.store.type_node_links(annotation),
+                    Some(&TypeNodeLinks {
+                        resolved_type: Some(string),
+                        ..TypeNodeLinks::default()
+                    }),
+                    "{source}",
+                );
+            }
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(property.initializer_node.unwrap()),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(fresh),
+                    ..TypeNodeLinks::default()
+                }),
+            );
+            assert_eq!(
+                fixture.store.value_symbol_links(merged.symbol),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(string),
+                    ..ValueSymbolLinks::default()
+                }),
+            );
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+                ClassHeritageMembersValidation::Valid,
+            );
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+                Ok(members),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.symbol_store().symbol_table_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn merged_class_auto_accessor_rejects_unsupported_shapes_and_forged_provenance() {
+        for source in [
+            r#"class Foo { accessor x: string = "abc"; } interface Foo { x: number; }"#,
+            r#"class Foo { accessor x: string = "abc"; } interface Foo {}"#,
+            r#"class Foo { accessor x: string = "abc"; } interface Foo { x: string; y: string; }"#,
+            r#"class Foo { accessor x: string = "abc"; y: string; } interface Foo { x: string; }"#,
+        ] {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Foo");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(unsupported(ClassUnsupported::MergedDeclarations(owner))),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+        }
+
+        for poison_order in [false, true] {
+            let mut fixture = fixture(
+                r#"class Foo { accessor x: string = "abc"; } interface Foo { x: string; }"#,
+            );
+            let owner = class_symbol(&fixture, "Foo");
+            let merged = {
+                let bound = &fixture.files[&fixture.file];
+                let host = host(&fixture.parsed.arena, bound);
+                authenticated_merged_auto_accessor_class(&fixture.store, &host, owner).unwrap()
+            };
+            if poison_order {
+                assert!(fixture.store.set_symbol_declarations(
+                    owner,
+                    Some(vec![merged.interface_declaration, merged.class_declaration]),
+                    Some(merged.class_declaration),
+                ));
+                assert!(fixture.store.set_symbol_declarations(
+                    merged.symbol,
+                    Some(vec![merged.interface_property, merged.class_property]),
+                    Some(merged.interface_property),
+                ));
+            } else {
+                assert!(fixture.store.set_symbol_flags(
+                    merged.symbol,
+                    SymbolFlags::PROPERTY | SymbolFlags::ACCESSOR | SymbolFlags::OPTIONAL,
+                    CheckFlags::NONE,
+                ));
+            }
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+
+            assert!(
+                authenticated_merged_auto_accessor_class(&fixture.store, &host, owner).is_none(),
+            );
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(unsupported(ClassUnsupported::MergedDeclarations(owner))),
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn merged_class_auto_accessor_rejects_poisoned_interface_annotation_cache() {
+        let mut fixture =
+            fixture(r#"class Foo { accessor x: string = "abc"; } interface Foo { x: string; }"#);
+        let owner = class_symbol(&fixture, "Foo");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("the merged auto-accessor belongs to one direct class")
+        };
+        let annotation = class.class.properties[0]
+            .merged_interface_annotation
+            .unwrap();
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+
+        assert_eq!(
+            plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+            Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                annotation
+            ))),
+        );
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
+    }
+
+    #[test]
+    fn implicit_ambient_private_fields_preserve_untyped_identity_and_warm_replay() {
+        let mut fixture = fixture("declare class Hidden { private secret; }");
+        let owner = class_symbol(&fixture, "Hidden");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("an ambient private field belongs to one direct class")
+        };
+        let property = class.class.properties[0].clone();
+        assert!(property.ambient_private_modifier.is_some());
+        assert!(!property.auto_accessor);
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+        assert_eq!(members.declared_instance_properties(), &[property.symbol]);
+        assert!(fixture.store.type_node_links(property.type_node).is_none());
+        assert_eq!(
+            fixture.store.value_symbol_links(property.symbol),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(any),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
     }
 
     #[test]

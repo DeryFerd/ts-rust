@@ -2184,6 +2184,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
                             ))?;
                     if let Some((store, host)) = self.semantic {
+                        if super::classes::is_merged_auto_accessor_interface(
+                            store, host, symbol, statement,
+                        ) {
+                            continue;
+                        }
                         if interface.type_parameters.is_some() {
                             if let Some(augmentation) =
                                 plan_global_array_call_augmentation(store, host, statement, symbol)
@@ -40922,16 +40927,38 @@ mod tests {
     }
 
     #[test]
-    fn reopened_interface_properties_and_accessor_pairs_check_in_both_source_orders() {
-        let source = parsed(concat!(
-            "interface EntityMetadata1 { ",
-            "get tableName(): string; set tableName(name: string); ",
-            "} interface EntityMetadata1 { tableName: string; } ",
-            "interface EntityMetadata2 { tableName: string; } ",
-            "interface EntityMetadata2 { ",
-            "get tableName(): string; set tableName(name: string); ",
-            "}",
-        ));
+    fn reopened_interface_and_class_auto_accessor_merges_check_in_both_source_orders() {
+        let source = parsed(
+            r#"interface EntityMetadata1 {
+    get tableName(): string;
+    set tableName(name: string);
+}
+interface EntityMetadata1 {
+    tableName: string;
+}
+
+interface EntityMetadata2 {
+    tableName: string;
+}
+interface EntityMetadata2 {
+    get tableName(): string;
+    set tableName(name: string);
+}
+
+class Foo1 {
+    accessor x: string = "abc"
+}
+interface Foo1 {
+    x: string
+}
+
+interface Foo2 {
+    x: string
+}
+class Foo2 {
+    accessor x: string = "abc"
+}"#,
+        );
         let file = FileId::new(8_684);
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
 
@@ -40964,6 +40991,118 @@ mod tests {
                     .declared_type_links(owner)
                     .and_then(|links| links.declared_type)
                     .is_some()
+            );
+        }
+        let regular = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .cached_string_literal_type("abc")
+            .unwrap();
+        let fresh = context.store().fresh_type_of_literal_type(regular).unwrap();
+        for (name, class_first) in [("Foo1", true), ("Foo2", false)] {
+            let owner = global_symbol(&context, name);
+            let owner_record = context.store().symbol(owner).unwrap();
+            assert_eq!(
+                owner_record.flags(),
+                SymbolFlags::CLASS | SymbolFlags::INTERFACE,
+            );
+            let [first, second] = owner_record.declarations().unwrap() else {
+                panic!("{name} retains one class and one interface declaration")
+            };
+            let (class, interface) = if class_first {
+                (*first, *second)
+            } else {
+                (*second, *first)
+            };
+            assert_eq!(owner_record.value_declaration(), Some(class));
+            let NodeData::ClassDeclaration(class_data) =
+                &source.arena.get(class.node).unwrap().data
+            else {
+                panic!("{name} retains its class declaration")
+            };
+            let NodeData::InterfaceDeclaration(interface_data) =
+                &source.arena.get(interface.node).unwrap().data
+            else {
+                panic!("{name} retains its interface declaration")
+            };
+            let class_property = NodeRef::new(source.arena.id(), file, class_data.members.nodes[0]);
+            let interface_property =
+                NodeRef::new(source.arena.id(), file, interface_data.members.nodes[0]);
+            let (_, bound) = context.file(file).unwrap();
+            let property = bound.symbol(class_property).unwrap();
+            assert_eq!(bound.symbol(interface_property), Some(property));
+            let expected_declarations = if class_first {
+                [class_property, interface_property]
+            } else {
+                [interface_property, class_property]
+            };
+            let property_record = context.store().symbol(property).unwrap();
+            assert_eq!(
+                property_record.flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::ACCESSOR,
+            );
+            assert_eq!(
+                property_record.declarations(),
+                Some(expected_declarations.as_slice()),
+            );
+            assert_eq!(
+                property_record.value_declaration(),
+                expected_declarations.first().copied(),
+            );
+            assert_eq!(
+                context.store().value_symbol_links(property),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(string),
+                    ..ValueSymbolLinks::default()
+                }),
+            );
+            let NodeData::PropertyDeclaration(class_property_data) =
+                &source.arena.get(class_property.node).unwrap().data
+            else {
+                panic!("{name} retains its auto-accessor property")
+            };
+            let NodeData::PropertyDeclaration(interface_property_data) =
+                &source.arena.get(interface_property.node).unwrap().data
+            else {
+                panic!("{name} retains its interface property")
+            };
+            for annotation in [
+                NodeRef::new(source.arena.id(), file, class_property_data.type_.unwrap()),
+                NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    interface_property_data.type_.unwrap(),
+                ),
+            ] {
+                assert_eq!(
+                    context.store().type_node_links(annotation),
+                    Some(&TypeNodeLinks {
+                        resolved_type: Some(string),
+                        ..TypeNodeLinks::default()
+                    }),
+                );
+            }
+            let initializer = NodeRef::new(
+                source.arena.id(),
+                file,
+                class_property_data.initializer.unwrap(),
+            );
+            assert_eq!(
+                context.store().type_node_links(initializer),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(fresh),
+                    ..TypeNodeLinks::default()
+                }),
+            );
+            let instance = context
+                .store()
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            assert_eq!(
+                validate_class_heritage_members(context.store(), instance),
+                ClassHeritageMembersValidation::Valid,
             );
         }
         assert!(context.diagnostics().is_empty());
