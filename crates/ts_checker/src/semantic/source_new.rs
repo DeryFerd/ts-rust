@@ -983,8 +983,14 @@ pub(super) fn plan_direct_default_new(
             symbol,
         }));
     };
+    let omitted_defaulted_class_parameter = argument.is_none()
+        && parameter.is_some()
+        && matches!(
+            &target,
+            SourceNewTarget::Class(class) if class.constructor_minimum_argument_count() == 0
+        );
     if !matches!(&target, SourceNewTarget::ImportedClass(_))
-        && (argument.is_some() != parameter.is_some()
+        && (argument.is_some() != parameter.is_some() && !omitted_defaulted_class_parameter
             || argument
                 .as_ref()
                 .zip(parameter)
@@ -2402,14 +2408,21 @@ fn constructor_parameter(
     let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
         return Err(invalid());
     };
+    let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+    let name_record = host.node(name).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
     let type_node = parameter_data
         .type_
         .map(|node| NodeRef::new(parameter.arena, parameter.file, node))
         .ok_or_else(invalid)?;
     let type_record = host.node(type_node).ok_or_else(invalid)?;
-    let raw = host
-        .bound_file(parameter)
-        .and_then(|bound| bound.symbol(parameter))
+    let bound = host.bound_file(parameter).ok_or_else(invalid)?;
+    let raw = bound
+        .locals(declaration)
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&identifier.text))
         .ok_or_else(invalid)?;
     let symbol = store.get_merged_symbol(raw).ok_or_else(invalid)?;
     let symbol_record = store.symbol(symbol).ok_or_else(invalid)?;
@@ -2422,11 +2435,17 @@ fn constructor_parameter(
     if constructor.kind != SyntaxKind::Constructor
         || parameter_record.kind != SyntaxKind::Parameter
         || parameter_record.parent != Some(declaration.node)
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(parameter.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
         || type_record.parent != Some(parameter.node)
         || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
         || raw != symbol
+        || class.constructor_parameter_symbol() != Some(symbol)
         || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
         || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
         || symbol_record.declarations() != Some(&[parameter])
         || symbol_record.value_declaration() != Some(parameter)
     {
@@ -4869,7 +4888,7 @@ fn validate_selected_default_signature(
         || signature_record.type_parameters() != type_parameters
         || signature_record.parameters() != parameter.map(|parameter| parameter.symbol).as_slice()
         || signature_record.this_parameter().is_some()
-        || signature_record.min_argument_count() != i32::from(parameter.is_some())
+        || signature_record.min_argument_count() != class.constructor_minimum_argument_count()
         || signature_record.resolved_min_argument_count() != -1
         || signature_record.resolved_return_type() != Some(instance_type)
         || signature_record.resolved_type_predicate().is_some()
@@ -6993,11 +7012,130 @@ mod tests {
     }
 
     #[test]
+    fn defaulted_parameter_property_constructors_accept_omitted_and_supplied_arguments() {
+        for (source, numeric, supplied) in [
+            (
+                concat!(
+                    "class Model { constructor(public value: number = 1) {} } ",
+                    "const model = new Model();",
+                ),
+                true,
+                false,
+            ),
+            (
+                concat!(
+                    "class Model { constructor(public value: number = 1) {} } ",
+                    "const model = new Model(2);",
+                ),
+                true,
+                true,
+            ),
+            (
+                concat!(
+                    "class Model { constructor(readonly value: string = 'ready') {} } ",
+                    "const model = new Model();",
+                ),
+                false,
+                false,
+            ),
+            (
+                concat!(
+                    "class Model { constructor(public readonly value: string = 'ready') {} } ",
+                    "const model = new Model('done');",
+                ),
+                false,
+                true,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{source}: {:?}",
+                parsed.diagnostics,
+            );
+            let file = FileId::new(1_855);
+            let mut context = context(&parsed, file);
+            let owner = class_symbol(&parsed, file, &context, "Model");
+            let (construction, constructor) = variable_new(&parsed, file, "model");
+
+            context.check_source_file(file).unwrap();
+
+            let store = context.store();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let expected = if numeric {
+                bootstrap.number_type
+            } else {
+                bootstrap.string_type
+            };
+            let signature = store
+                .signature_links(construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let signature_record = store.signature(signature).unwrap();
+            let [parameter] = signature_record.parameters() else {
+                panic!("the defaulted constructor must retain its parameter symbol")
+            };
+            let parameter = *parameter;
+            let property = store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source("value"))
+                .unwrap();
+            assert_ne!(parameter, property, "{source}");
+            assert_eq!(signature_record.min_argument_count(), 0, "{source}");
+            for symbol in [parameter, property] {
+                assert_eq!(
+                    store.value_symbol_links(symbol),
+                    Some(&ValueSymbolLinks {
+                        resolved_type: Some(expected),
+                        ..ValueSymbolLinks::default()
+                    }),
+                    "{source}",
+                );
+            }
+            assert_eq!(
+                store
+                    .symbol_node_links(constructor)
+                    .and_then(|links| links.resolved_symbol),
+                Some(owner),
+                "{source}",
+            );
+            if supplied {
+                let argument = constructor_argument(&parsed, construction);
+                assert!(store.type_node_links(argument).is_some(), "{source}");
+            }
+            assert!(context.diagnostics().is_empty(), "{source}");
+            let warm = (
+                store.type_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            );
+
+            context.recheck_source_file(file).unwrap();
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
     fn incompatible_constructor_arguments_reject_before_class_publication() {
         for source in [
             "class Model { constructor(value: string) {} } const model = new Model(1);",
             "class Model { constructor(value: number) {} } const model = new Model(\"ready\");",
             "class Model { constructor(value: string) {} } const model = new Model();",
+            concat!(
+                "class Model { constructor(public value: number = 1) {} } ",
+                "const model = new Model(\"wrong\");",
+            ),
             "class Model {} const model = new Model(\"ready\");",
         ] {
             let parsed = parse_source_file(source);
