@@ -3727,6 +3727,233 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .map_err(|error| source_callable_error(error, SourceCallableFamily::ArrowFunction))
     }
 
+    /// Authenticates `RefObject<T>.current: T | null` in the React namespace.
+    #[allow(clippy::too_many_lines)] // The readonly property and React-owned generic parameter form one proof.
+    fn is_authenticated_react_ref_object_union_type_parameter(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(parameter) = self.store.symbol(symbol) else {
+            return Ok(false);
+        };
+        let Some([declaration]) = parameter.declarations() else {
+            return Ok(false);
+        };
+        let declaration = *declaration;
+        let declaration_record = preflight_node(self.store, self.host, declaration)?;
+        let NodeData::TypeParameterDeclaration(parameter_data) = &declaration_record.data else {
+            return Ok(false);
+        };
+        let Some(interface_id) = declaration_record.parent else {
+            return Ok(false);
+        };
+        let interface = NodeRef::new(declaration.arena, declaration.file, interface_id);
+        let interface_record = preflight_node(self.store, self.host, interface)?;
+        let NodeData::InterfaceDeclaration(interface_data) = &interface_record.data else {
+            return Ok(false);
+        };
+        let Some(parameters) = interface_data.type_parameters.as_ref() else {
+            return Ok(false);
+        };
+        let [interface_parameter] = parameters.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let Some(bound) = self.host.bound_file(interface) else {
+            return Ok(false);
+        };
+        let Some(facts) = bound.source_facts() else {
+            return Ok(false);
+        };
+        let Some(owner) = bound
+            .symbol(interface)
+            .and_then(|owner| self.store.get_merged_symbol(owner))
+        else {
+            return Ok(false);
+        };
+        let Some(owner_record) = self.store.symbol(owner) else {
+            return Ok(false);
+        };
+        let Some(namespace) = self.store.get_parent_of_symbol(owner) else {
+            return Ok(false);
+        };
+        let Some(namespace_record) = self.store.symbol(namespace) else {
+            return Ok(false);
+        };
+        let Some(members) = owner_record
+            .members()
+            .and_then(|members| self.store.symbol_table(members))
+        else {
+            return Ok(false);
+        };
+        let reference_record = preflight_node(self.store, self.host, node)?;
+        let NodeData::TypeReferenceNode(reference) = &reference_record.data else {
+            return Ok(false);
+        };
+        let reference_name = NodeRef::new(node.arena, node.file, reference.type_name);
+        let reference_name_record = preflight_node(self.store, self.host, reference_name)?;
+        let NodeData::Identifier(reference_identifier) = &reference_name_record.data else {
+            return Ok(false);
+        };
+        let Some(union_id) = reference_record.parent else {
+            return Ok(false);
+        };
+        let union = NodeRef::new(node.arena, node.file, union_id);
+        let union_record = preflight_node(self.store, self.host, union)?;
+        let NodeData::UnionTypeNode(union_data) = &union_record.data else {
+            return Ok(false);
+        };
+        let [value, null] = union_data.types.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let null = NodeRef::new(union.arena, union.file, *null);
+        let null_record = preflight_node(self.store, self.host, null)?;
+        let NodeData::LiteralTypeNode(null_literal) = &null_record.data else {
+            return Ok(false);
+        };
+        let null_value = NodeRef::new(null.arena, null.file, null_literal.literal);
+        let null_value_record = preflight_node(self.store, self.host, null_value)?;
+        let Some(property_id) = union_record.parent else {
+            return Ok(false);
+        };
+        let property = NodeRef::new(union.arena, union.file, property_id);
+        let property_record = preflight_node(self.store, self.host, property)?;
+        let (property_name, property_type, optional) = match &property_record.data {
+            NodeData::PropertyDeclaration(property_data)
+                if property_record.kind == SyntaxKind::PropertyDeclaration
+                    && property_data.initializer.is_none()
+                    && property_data.symbol.is_none()
+                    && property_data.facts == 0 =>
+            {
+                (
+                    property_data.name,
+                    property_data.type_,
+                    property_data.postfix_token,
+                )
+            }
+            NodeData::PropertySignatureDeclaration(property_data)
+                if property_record.kind == SyntaxKind::PropertySignature
+                    && property_data.symbol.is_none() =>
+            {
+                (
+                    property_data.name,
+                    Some(property_data.type_),
+                    property_data.postfix_token,
+                )
+            }
+            _ => return Ok(false),
+        };
+        let property_name = NodeRef::new(property.arena, property.file, property_name);
+        let property_name_record = preflight_node(self.store, self.host, property_name)?;
+        let NodeData::Identifier(property_identifier) = &property_name_record.data else {
+            return Ok(false);
+        };
+        let Some(property_symbol) = bound
+            .symbol(property)
+            .and_then(|property| self.store.get_merged_symbol(property))
+        else {
+            return Ok(false);
+        };
+        let Some(property_owner) = self.store.symbol(property_symbol) else {
+            return Ok(false);
+        };
+        let Some((arena, _)) = self.host.source(property) else {
+            return Ok(false);
+        };
+
+        Ok(facts.is_declaration_file()
+            && !facts.is_default_library()
+            && !facts.is_javascript_file()
+            && !facts.is_external_or_common_js_module()
+            && parameter.flags() == SymbolFlags::TYPE_PARAMETER
+            && parameter.check_flags() == CheckFlags::NONE
+            && parameter.name().as_utf8() == Some("T")
+            && parameter.value_declaration().is_none()
+            && parameter.members().is_none()
+            && parameter.exports().is_none()
+            && parameter.export_symbol().is_none()
+            && self.store.get_merged_symbol(symbol) == Some(symbol)
+            && self.store.get_parent_of_symbol(symbol) == Some(owner)
+            && self.host.symbol_matches(self.store, declaration, symbol)
+            && declaration_record.kind == SyntaxKind::TypeParameter
+            && declaration_record.flags.0 == 0
+            && *interface_parameter == declaration.node
+            && !parameters.has_trailing_comma
+            && parameter_data.constraint.is_none()
+            && parameter_data.default_type.is_none()
+            && interface_record.kind == SyntaxKind::InterfaceDeclaration
+            && interface_record.flags.0 == 0
+            && interface_data.heritage_clauses.is_none()
+            && interface_data.members.nodes.as_slice() == [property.node]
+            && self.host.symbol_matches(self.store, interface, owner)
+            && owner_record.flags() == SymbolFlags::INTERFACE
+            && owner_record.check_flags() == CheckFlags::NONE
+            && owner_record.name().as_utf8() == Some("RefObject")
+            && owner_record.declarations() == Some(&[interface])
+            && owner_record.value_declaration().is_none()
+            && owner_record.exports().is_none()
+            && owner_record.export_symbol().is_none()
+            && members.len() == 2
+            && members
+                .get(parameter.name())
+                .and_then(|candidate| self.store.get_merged_symbol(candidate))
+                == Some(symbol)
+            && namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+            && namespace_record.check_flags() == CheckFlags::NONE
+            && namespace_record.name().as_utf8() == Some("React")
+            && namespace_record
+                .exports()
+                .and_then(|exports| self.store.symbol_table(exports))
+                .and_then(|exports| exports.get_source("RefObject"))
+                .and_then(|candidate| self.store.get_merged_symbol(candidate))
+                == Some(owner)
+            && self.is_react_ambient_module_namespace(namespace, interface)
+            && reference_record.kind == SyntaxKind::TypeReference
+            && reference_record.flags.0 == 0
+            && reference.type_arguments.is_none()
+            && reference_name_record.kind == SyntaxKind::Identifier
+            && reference_name_record.flags.0 == 0
+            && reference_name_record.parent == Some(node.node)
+            && reference_identifier.flow_node.is_none()
+            && reference_identifier.text == "T"
+            && union_record.kind == SyntaxKind::UnionType
+            && union_record.flags.0 == 0
+            && *value == node.node
+            && !union_data.types.has_trailing_comma
+            && null_record.kind == SyntaxKind::LiteralType
+            && null_record.flags.0 == 0
+            && null_record.parent == Some(union.node)
+            && null_value_record.kind == SyntaxKind::NullKeyword
+            && null_value_record.flags.0 == 0
+            && null_value_record.parent == Some(null.node)
+            && property_record.flags.0 == 0
+            && property_record.parent == Some(interface.node)
+            && property_type == Some(union.node)
+            && optional.is_none()
+            && canonical_has_syntactic_modifier(arena, property.node, SyntaxKind::ReadonlyKeyword)
+            && property_name_record.kind == SyntaxKind::Identifier
+            && property_name_record.flags.0 == 0
+            && property_name_record.parent == Some(property.node)
+            && property_identifier.flow_node.is_none()
+            && property_identifier.text == "current"
+            && property_owner.flags() == SymbolFlags::PROPERTY
+            && matches!(
+                property_owner.check_flags(),
+                CheckFlags::NONE | CheckFlags::READONLY
+            )
+            && property_owner.name().as_utf8() == Some("current")
+            && property_owner.declarations() == Some(&[property])
+            && property_owner.value_declaration() == Some(property)
+            && property_owner.members().is_none()
+            && property_owner.exports().is_none()
+            && property_owner.export_symbol().is_none()
+            && self.store.get_parent_of_symbol(property_symbol) == Some(owner)
+            && members
+                .get_source("current")
+                .and_then(|candidate| self.store.get_merged_symbol(candidate))
+                == Some(property_symbol))
+    }
+
     #[allow(clippy::too_many_lines)] // Method, interface, and parameter ownership form one proof.
     fn is_authenticated_method_union_type_parameter(
         &self,
@@ -7611,7 +7838,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && (!flags.contains(SymbolFlags::TYPE_PARAMETER)
                 || !self.is_authenticated_bivariant_alias_type_parameter(node, symbol)?
                     && !self.is_authenticated_method_union_type_parameter(node, symbol)?
-                    && !self.is_authenticated_jsdoc_arrow_union_type_parameter(node, symbol)?)
+                    && !self.is_authenticated_jsdoc_arrow_union_type_parameter(node, symbol)?
+                    && !self
+                        .is_authenticated_react_ref_object_union_type_parameter(node, symbol)?)
         {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedUnionConstituent(node),
@@ -21972,6 +22201,187 @@ mod tests {
             Ok(resolved),
         );
         assert_eq!(union_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the ambient React owner, readonly member, and union cache together.
+    fn react_ref_object_nullable_union_preserves_parameter_identity_and_rejects_forged_caches() {
+        let parsed = parse_source_file(concat!(
+            "declare module 'react' { ",
+            "export = React; ",
+            "namespace React { ",
+            "interface RefObject<T> { readonly current: T | null; } ",
+            "} }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_793);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source("\"/react-ref-object.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            })
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let root_symbols = store
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in root_symbols {
+            store.merge_global_symbol(globals, symbol).unwrap();
+        }
+        let interface = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                (identifier_text(&parsed.arena, interface.name) == Some("RefObject"))
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let NodeData::InterfaceDeclaration(interface_data) =
+            &parsed.arena.get(interface.node).unwrap().data
+        else {
+            unreachable!("the declaration was selected by its interface payload")
+        };
+        let parameter = NodeRef::new(
+            interface.arena,
+            interface.file,
+            interface_data.type_parameters.as_ref().unwrap().nodes[0],
+        );
+        let parameter_symbol = bound.symbol(parameter).unwrap();
+        let property = NodeRef::new(
+            interface.arena,
+            interface.file,
+            interface_data.members.nodes[0],
+        );
+        let property_symbol = bound.symbol(property).unwrap();
+        let NodeData::PropertyDeclaration(property_data) =
+            &parsed.arena.get(property.node).unwrap().data
+        else {
+            panic!("RefObject.current must retain its readonly property declaration")
+        };
+        let union = NodeRef::new(property.arena, property.file, property_data.type_.unwrap());
+        let NodeData::UnionTypeNode(union_data) = &parsed.arena.get(union.node).unwrap().data
+        else {
+            panic!("RefObject.current must retain its nullable union annotation")
+        };
+        let reference = NodeRef::new(union.arena, union.file, union_data.types.nodes[0]);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let aliases = HashMap::new();
+        assert!(
+            TypeQueryPlanner::new(&store, &host, None, None, false, &aliases)
+                .is_authenticated_react_ref_object_union_type_parameter(reference, parameter_symbol)
+                .unwrap()
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(union)
+        .unwrap();
+        let parameter_type = store
+            .declared_type_links(parameter_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let null = store.intrinsic_bootstrap().unwrap().null_type;
+        assert_eq!(union_types(&store, resolved).len(), 2);
+        assert!(union_types(&store, resolved).contains(&parameter_type));
+        assert!(union_types(&store, resolved).contains(&null));
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&store, parameter_type),
+            Some(parameter_symbol),
+        );
+        assert_eq!(store.validate_union_constituent(parameter_type), Ok(()));
+        assert_eq!(
+            store
+                .symbol_node_links(reference)
+                .and_then(|links| links.resolved_symbol),
+            Some(parameter_symbol),
+        );
+        assert!(store.value_symbol_links(property_symbol).is_none());
+        let warm = union_state(&store);
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(union),
+            Ok(resolved),
+        );
+        assert_eq!(union_state(&store), warm);
+
+        let original = store.declared_type_links(parameter_symbol).unwrap().clone();
+        let mut forged = original.clone();
+        forged.declared_type = Some(store.intrinsic_bootstrap().unwrap().string_type);
+        assert!(store.set_declared_type_links(parameter_symbol, forged));
+        let poisoned = union_state(&store);
+        assert!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(union)
+            .is_err()
+        );
+        assert_eq!(union_state(&store), poisoned);
+        assert!(store.set_declared_type_links(parameter_symbol, original));
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(union),
+            Ok(resolved),
+        );
         assert!(diagnostics.is_empty());
     }
 
