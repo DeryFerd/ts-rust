@@ -537,7 +537,7 @@ pub(super) fn cached_ordinary_type_parameter_owner(
     Some(symbol)
 }
 
-fn cached_class_type(
+pub(super) fn cached_class_type(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     symbol: SemanticSymbolId,
 ) -> Result<Option<TypeId>, DeclaredTypeError> {

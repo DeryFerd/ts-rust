@@ -19,7 +19,10 @@ use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
 use super::{
     CanonicalTypeMapperStore, TypeId,
     array_types::CanonicalArrayTargets,
-    declared::{cached_ordinary_type_parameter_owner, malformed_alias_merge, type_list_key},
+    declared::{
+        cached_class_type, cached_ordinary_type_parameter_owner, malformed_alias_merge,
+        type_list_key,
+    },
     instantiate::{
         InstantiationLimits, InstantiationSession, instantiate_type_with_vector_and_session,
     },
@@ -592,13 +595,30 @@ fn validate_reference_argument_graph(
         _ => return Ok(()),
     };
     if target == reference {
-        if arguments.is_empty()
-            && matches!(record.data(), TypeData::Interface(_))
-            && record.object_flags().contains(ObjectFlags::INTERFACE)
-        {
-            validate_nongeneric_interface_argument_origin(store, reference)?;
-            validated.insert(reference);
-            return Ok(());
+        if arguments.is_empty() && matches!(record.data(), TypeData::Interface(_)) {
+            if record.object_flags().contains(ObjectFlags::INTERFACE) {
+                validate_nongeneric_interface_argument_origin(store, reference)?;
+                validated.insert(reference);
+                return Ok(());
+            }
+            if record.object_flags().contains(ObjectFlags::CLASS) {
+                let owner = record
+                    .symbol()
+                    .filter(|owner| {
+                        store
+                            .symbol(*owner)
+                            .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+                    })
+                    .ok_or(DirectGenericReferenceError::InvalidTarget(reference))?;
+                if cached_class_type(store, owner)
+                    .map_err(|_| DirectGenericReferenceError::InvalidTarget(reference))?
+                    != Some(reference)
+                {
+                    return Err(DirectGenericReferenceError::InvalidTarget(reference));
+                }
+                validated.insert(reference);
+                return Ok(());
+            }
         }
         // The origin's `(type parameters) -> origin` edge is the legal
         // recursive identity installed by declared-type initialization.
@@ -1331,6 +1351,85 @@ mod tests {
         assert_eq!(
             (store.type_len(), store.mapper_len(), store.symbol_len()),
             warm
+        );
+    }
+
+    #[test]
+    fn nongeneric_class_arguments_reuse_authenticated_origins_and_reject_poison() {
+        let parsed = parse_source_file("class Payload {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = tuple_array_context(&parsed, FileId::new(9_402));
+        let owner = context
+            .store()
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| context.store().symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Payload"))
+            .unwrap();
+        let argument = context.get_declared_type_of_symbol(owner).unwrap();
+        let (target, _) = generic_target(
+            context.store_mut_for_test(),
+            "Wrapper",
+            ObjectFlags::INTERFACE,
+            1,
+        );
+        let reference = create_direct_generic_reference(
+            context.store_mut_for_test(),
+            target,
+            &[argument],
+            ObjectFlags::FROM_TYPE_NODE,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), reference),
+            Ok(DirectGenericReference {
+                target,
+                type_arguments: vec![argument],
+            }),
+        );
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+        );
+        assert_eq!(
+            create_direct_generic_reference(
+                context.store_mut_for_test(),
+                target,
+                &[argument],
+                ObjectFlags::NONE,
+            ),
+            Ok(reference),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+            ),
+            warm,
+        );
+
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            owner,
+            SymbolFlags::INTERFACE,
+            CheckFlags::NONE,
+        ));
+        assert_eq!(
+            create_direct_generic_reference(
+                context.store_mut_for_test(),
+                target,
+                &[argument],
+                ObjectFlags::NONE,
+            ),
+            Err(DirectGenericReferenceError::InvalidTarget(argument)),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+            ),
+            warm,
         );
     }
 
