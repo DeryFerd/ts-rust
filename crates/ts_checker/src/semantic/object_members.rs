@@ -8114,7 +8114,7 @@ fn valid_unresolved_jsx_element_interface(
         return false;
     };
     let Some(heritage) = heritage else {
-        return has_own_properties;
+        return true;
     };
     if has_own_properties {
         return false;
@@ -17639,41 +17639,46 @@ mod generic_publication_tests {
     }
 
     #[test]
-    fn unresolved_jsx_element_heritage_shell_has_an_empty_authenticated_type_graph() {
-        let mut fixture = interface_fixture(
+    fn unresolved_jsx_element_shells_have_an_empty_authenticated_type_graph() {
+        for (index, source) in [
+            "declare namespace JSX { interface Element {} }",
             "declare namespace JSX { interface Element extends Base {} } interface Base {}",
-            3_775,
-        );
-        let host = host(&fixture.parsed, &fixture.bound);
-        let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
-        let type_ = get_declared_class_interface_or_type_parameter(
-            &mut fixture.store,
-            &host,
-            fixture.symbol,
-            flags,
-        )
-        .unwrap()
-        .unwrap();
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture = interface_fixture(source, 3_775 + u32::try_from(index).unwrap());
+            let host = host(&fixture.parsed, &fixture.bound);
+            let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+            let type_ = get_declared_class_interface_or_type_parameter(
+                &mut fixture.store,
+                &host,
+                fixture.symbol,
+                flags,
+            )
+            .unwrap()
+            .unwrap();
 
-        assert_eq!(
-            validate_resolved_declared_property_object(&fixture.store, type_),
-            DeclaredPropertyObjectValidation::NotDeclared,
-        );
-        assert!(matches!(
-            validate_resolved_declared_property_type_graph(&fixture.store, type_),
-            DeclaredPropertyTypeGraphValidation::Traversable(property_types)
-                if property_types.is_empty()
-        ));
+            assert_eq!(
+                validate_resolved_declared_property_object(&fixture.store, type_),
+                DeclaredPropertyObjectValidation::NotDeclared,
+            );
+            assert!(matches!(
+                validate_resolved_declared_property_type_graph(&fixture.store, type_),
+                DeclaredPropertyTypeGraphValidation::Traversable(property_types)
+                    if property_types.is_empty()
+            ));
 
-        assert!(
-            fixture
-                .store
-                .set_interface_base_resolution(type_, true, None, None)
-        );
-        assert!(matches!(
-            validate_resolved_declared_property_type_graph(&fixture.store, type_),
-            DeclaredPropertyTypeGraphValidation::Malformed
-        ));
+            assert!(
+                fixture
+                    .store
+                    .set_interface_base_resolution(type_, true, None, None)
+            );
+            assert!(matches!(
+                validate_resolved_declared_property_type_graph(&fixture.store, type_),
+                DeclaredPropertyTypeGraphValidation::Malformed
+            ));
+        }
     }
 
     #[test]
