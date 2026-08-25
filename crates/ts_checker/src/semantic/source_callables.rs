@@ -7769,12 +7769,12 @@ pub(super) fn publish_source_callable_parameter_types(
                 || generic_type_parameters
                     .as_ref()
                     .is_some_and(|type_parameters| {
-                        !valid_generic_source_parameter_type(
+                        !(valid_generic_source_parameter_type(
                             store,
                             callable.plan.array_targets,
                             supplied_base,
                             type_parameters,
-                        ) && !(callable.plan.family == SourceCallableFamily::ArrowFunction
+                        ) || callable.plan.family == SourceCallableFamily::ArrowFunction
                             && valid_optional_generic_source_parameter_type(
                                 store,
                                 callable.plan.array_targets,
