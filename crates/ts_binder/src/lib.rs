@@ -651,7 +651,7 @@ impl BindResult {
 /// Panics if `source_file` is not a `SourceFile` node in `arena`.
 #[must_use]
 pub fn bind_source_file(arena: &NodeArena, source_file: NodeId) -> BindResult {
-    Binder::new(arena, source_file, None).bind()
+    Binder::new(arena, source_file, None, None).bind()
 }
 
 /// Binds one source file using its stable identity in a compiler Program.
@@ -665,7 +665,22 @@ pub fn bind_source_file_in_file(
     source_file: NodeId,
     file_id: FileId,
 ) -> BindResult {
-    Binder::new(arena, source_file, Some(file_id)).bind()
+    Binder::new(arena, source_file, Some(file_id), None).bind()
+}
+
+/// Binds one Program source file with its compiler-owned source facts.
+///
+/// # Panics
+///
+/// Panics if `source_file` is not a `SourceFile` node in `arena`.
+#[must_use]
+pub fn bind_source_file_in_file_with_facts(
+    arena: &NodeArena,
+    source_file: NodeId,
+    file_id: FileId,
+    facts: CanonicalSourceFileFacts,
+) -> BindResult {
+    Binder::new(arena, source_file, Some(file_id), Some(facts)).bind()
 }
 
 struct Binder<'a> {
@@ -673,10 +688,16 @@ struct Binder<'a> {
     result: BindResult,
     children: HashMap<NodeId, Vec<NodeId>>,
     implicit_export_depth: usize,
+    source_facts: Option<CanonicalSourceFileFacts>,
 }
 
 impl<'a> Binder<'a> {
-    fn new(arena: &'a NodeArena, source_file: NodeId, file_id: Option<FileId>) -> Self {
+    fn new(
+        arena: &'a NodeArena,
+        source_file: NodeId,
+        file_id: Option<FileId>,
+        source_facts: Option<CanonicalSourceFileFacts>,
+    ) -> Self {
         assert!(
             matches!(
                 arena.get(source_file).map(|node| &node.data),
@@ -695,6 +716,7 @@ impl<'a> Binder<'a> {
             result: BindResult::new(arena, source_file, file_id),
             children,
             implicit_export_depth: 0,
+            source_facts,
         }
     }
 
@@ -799,6 +821,7 @@ impl<'a> Binder<'a> {
                 }
             }
             NodeData::FunctionDeclaration(data) => {
+                self.check_strict_mode_eval_or_arguments(node_id, data.name);
                 let symbol = data.name.and_then(|name| {
                     self.declare_and_export(
                         scope,
@@ -1192,6 +1215,7 @@ impl<'a> Binder<'a> {
                 );
             }
             NodeData::FunctionExpression(data) => {
+                self.check_strict_mode_eval_or_arguments(node_id, data.name);
                 self.bind_function_like(
                     node_id,
                     scope,
@@ -1251,8 +1275,28 @@ impl<'a> Binder<'a> {
                 self.declare_export_alias(node_id, name, None, parent_symbol);
                 self.bind_node(data.expression, scope, container, parent_symbol);
             }
-            NodeData::BinaryExpression(_) => {
+            NodeData::BinaryExpression(data) => {
+                if self
+                    .arena
+                    .get(data.operator_token)
+                    .is_some_and(|operator| operator.kind.is_assignment_operator())
+                {
+                    self.check_strict_mode_eval_or_arguments(node_id, Some(data.left));
+                }
                 self.bind_binary_expression_children(node_id, scope, container, parent_symbol);
+            }
+            NodeData::PostfixUnaryExpression(data) => {
+                self.check_strict_mode_eval_or_arguments(node_id, Some(data.operand));
+                self.bind_children(node_id, scope, container, parent_symbol);
+            }
+            NodeData::PrefixUnaryExpression(data) => {
+                if matches!(
+                    data.operator,
+                    SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+                ) {
+                    self.check_strict_mode_eval_or_arguments(node_id, Some(data.operand));
+                }
+                self.bind_children(node_id, scope, container, parent_symbol);
             }
             _ => self.bind_children(node_id, scope, container, parent_symbol),
         }
@@ -1274,10 +1318,16 @@ impl<'a> Binder<'a> {
             .copied()
             .collect::<Vec<_>>();
         while let Some(child) = pending.pop() {
-            if matches!(
-                self.arena.get(child).map(|node| &node.data),
-                Some(NodeData::BinaryExpression(_))
-            ) {
+            if let Some(NodeData::BinaryExpression(expression)) =
+                self.arena.get(child).map(|node| &node.data)
+            {
+                if self
+                    .arena
+                    .get(expression.operator_token)
+                    .is_some_and(|operator| operator.kind.is_assignment_operator())
+                {
+                    self.check_strict_mode_eval_or_arguments(child, Some(expression.left));
+                }
                 self.result.containers.insert(child, container);
                 if let Some(children) = self.children.get(&child) {
                     pending.extend(children.iter().rev().copied());
@@ -1609,6 +1659,7 @@ impl<'a> Binder<'a> {
         excludes: SymbolFlags,
         parent_symbol: Option<SymbolId>,
     ) {
+        self.check_strict_mode_eval_or_arguments(declaration, Some(name));
         let Some(node) = self.arena.get(name) else {
             return;
         };
@@ -1863,6 +1914,17 @@ impl<'a> Binder<'a> {
         }
     }
 
+    fn check_strict_mode_eval_or_arguments(&mut self, context: NodeId, name: Option<NodeId>) {
+        let Some(facts) = self.source_facts.as_ref() else {
+            return;
+        };
+        if let Some(diagnostic) =
+            canonical::strict_mode_eval_or_arguments_diagnostic(self.arena, context, name, facts)
+        {
+            self.result.diagnostics.push(diagnostic);
+        }
+    }
+
     fn has_modifier(&self, declaration: NodeId, modifier: SyntaxKind) -> bool {
         let modifiers = match &self.arena.get(declaration).map(|node| &node.data) {
             Some(NodeData::FunctionDeclaration(data)) => data.modifiers.as_ref(),
@@ -2057,8 +2119,9 @@ mod tests {
     use ts_parser::parse_source_file;
 
     use super::{
-        BoundFlowGraph, ScopeKind, SymbolFlags, UnsupportedFlowKind, bind_source_file,
-        bind_source_file_in_file, can_merge,
+        BoundFlowGraph, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName, ScopeKind, SymbolFlags, UnsupportedFlowKind, bind_source_file,
+        bind_source_file_in_file, bind_source_file_in_file_with_facts, can_merge,
     };
 
     fn nodes_of_kind(arena: &NodeArena, kind: SyntaxKind) -> Vec<NodeId> {
@@ -2391,6 +2454,50 @@ mod tests {
         assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
         assert_eq!(result.diagnostics[0].diagnostic.code(), 2300);
     }
+
+    #[test]
+    fn program_binding_uses_source_facts_for_strict_identifier_diagnostics() {
+        let source = concat!(
+            "var arguments = 0;\n",
+            "function example(eval: number) { arguments = eval = 1; }\n",
+            "type Callback = (...arguments: number[]) => void;\n",
+            "const value = { arguments: 0 }; value.arguments = 1;\n",
+        );
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(71);
+        let facts = CanonicalSourceFileFacts::new(
+            EscapedName::source("\"/project/strict\""),
+            CanonicalSourceLanguage::TypeScript,
+            false,
+            CanonicalModuleState::Script,
+        )
+        .with_always_strict(true);
+        let result =
+            bind_source_file_in_file_with_facts(&parsed.arena, parsed.source_file, file, facts);
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.diagnostic.code(),
+                    diagnostic.diagnostic.arguments[0].as_str(),
+                    parsed.arena.get(diagnostic.node).unwrap().range.start.get(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (1100, "arguments", 4),
+                (1100, "eval", 36),
+                (1100, "arguments", 52),
+                (1100, "eval", 64),
+                (1100, "arguments", 96),
+            ]
+        );
+        assert_eq!(result.file_id(), Some(file));
+        assert!(result.is_for_source(&parsed.arena, parsed.source_file));
+    }
+
     struct AstBuilder {
         arena: NodeArena,
     }

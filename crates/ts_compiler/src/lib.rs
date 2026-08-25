@@ -11,6 +11,7 @@ use ts_binder::{
     BindResult, CanonicalBindError, CanonicalBinder, CanonicalDeclarationError,
     CanonicalModuleState, CanonicalNameResolutionError, CanonicalSourceFileFacts,
     CanonicalSourceLanguage, EscapedName, SymbolFlags, bind_source_file_in_file,
+    bind_source_file_in_file_with_facts,
 };
 use ts_checker::semantic::formatter::FunctionTypeDisplayUnavailable;
 use ts_checker::semantic::production::{CanonicalJsxRuntime, CanonicalJsxRuntimeEvidence};
@@ -4878,10 +4879,35 @@ impl Program {
         let index = self.source_files.len();
         let file_id =
             FileId::new(u32::try_from(index).expect("Program exceeds u32::MAX source files"));
+        let implied_node_format = implied_node_format(file_system, file_name);
         // SourceFile retains this compatibility binding for existing Program
         // consumers. Canonical mode never publishes its diagnostics or passes
         // it to the canonical checker.
-        let binding = bind_source_file_in_file(&parse.arena, parse.source_file, file_id);
+        let binding = if self.checker == ProgramChecker::Legacy {
+            let language = if is_javascript {
+                CanonicalSourceLanguage::JavaScript
+            } else {
+                CanonicalSourceLanguage::TypeScript
+            };
+            let is_declaration_file = ts_path::is_declaration_file(file_name);
+            let facts = CanonicalSourceFileFacts::new(
+                EscapedName::source(format!("\"{}\"", remove_file_extension(file_name))),
+                language,
+                is_declaration_file,
+                source_file_module_state(
+                    file_name,
+                    &parse,
+                    language,
+                    is_declaration_file,
+                    implied_node_format,
+                    &self.options,
+                ),
+            )
+            .with_always_strict(self.options.always_strict);
+            bind_source_file_in_file_with_facts(&parse.arena, parse.source_file, file_id, facts)
+        } else {
+            bind_source_file_in_file(&parse.arena, parse.source_file, file_id)
+        };
         if self.checker == ProgramChecker::Legacy
             && source_check_js_directive(&source_text) != Some(false)
         {
@@ -4940,7 +4966,7 @@ impl Program {
                 binding,
                 checking,
                 is_default_library: false,
-                implied_node_format: implied_node_format(file_system, file_name),
+                implied_node_format,
             },
         );
     }
@@ -5094,9 +5120,6 @@ fn canonical_source_file_facts(
     };
 
     let is_declaration_file = ts_path::is_declaration_file(&source.file_name);
-    let extension = Path::new(&source.file_name)
-        .extension()
-        .and_then(|extension| extension.to_str());
     if source_contains_import_meta(&source.parse) {
         return Err(
             CanonicalProgramCheckError::ImportMetaModuleIndicatorUnsupported {
@@ -5105,37 +5128,14 @@ fn canonical_source_file_facts(
         );
     }
 
-    let fixed_module_file = extension.is_some_and(|extension| {
-        ["mts", "cts", "mjs", "cjs"]
-            .iter()
-            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-    });
-    let node_esm_file = matches!(
-        options.module,
-        ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20 | ModuleKind::NodeNext
-    ) && source.implied_node_format == ModuleKind::EsNext;
-    let jsx_module = matches!(
-        options.jsx,
-        ts_options::JsxEmit::ReactJsx | ts_options::JsxEmit::ReactJsxDev
-    ) && source.parse.arena.iter().any(|(_, node)| {
-        matches!(
-            node.data,
-            NodeData::JsxElement(_) | NodeData::JsxSelfClosingElement(_) | NodeData::JsxFragment(_)
-        )
-    });
-    let is_external_module = source_file_is_external_module(&source.parse)
-        || (!is_declaration_file
-            && (options.module_detection == ModuleDetectionKind::Force
-                || (options.module_detection == ModuleDetectionKind::Auto
-                    && (fixed_module_file || node_esm_file || jsx_module))));
-    let is_common_js_module = language == CanonicalSourceLanguage::JavaScript
-        && source_file_has_commonjs_indicator(&source.parse);
-    let module_state = match (is_external_module, is_common_js_module) {
-        (true, true) => CanonicalModuleState::ExternalAndCommonJs,
-        (true, false) => CanonicalModuleState::External,
-        (false, true) => CanonicalModuleState::CommonJs,
-        (false, false) => CanonicalModuleState::Script,
-    };
+    let module_state = source_file_module_state(
+        &source.file_name,
+        &source.parse,
+        language,
+        is_declaration_file,
+        source.implied_node_format,
+        options,
+    );
     Ok(CanonicalSourceFileFacts::new_with_default_library(
         EscapedName::source(format!("\"{}\"", remove_file_extension(&source.file_name))),
         language,
@@ -5144,6 +5144,50 @@ fn canonical_source_file_facts(
         module_state,
     )
     .with_always_strict(options.always_strict))
+}
+
+fn source_file_module_state(
+    file_name: &str,
+    parse: &ParseResult,
+    language: CanonicalSourceLanguage,
+    is_declaration_file: bool,
+    implied_node_format: ModuleKind,
+    options: &CompilerOptions,
+) -> CanonicalModuleState {
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|extension| extension.to_str());
+    let fixed_module_file = extension.is_some_and(|extension| {
+        ["mts", "cts", "mjs", "cjs"]
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    });
+    let node_esm_file = matches!(
+        options.module,
+        ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20 | ModuleKind::NodeNext
+    ) && implied_node_format == ModuleKind::EsNext;
+    let jsx_module = matches!(
+        options.jsx,
+        ts_options::JsxEmit::ReactJsx | ts_options::JsxEmit::ReactJsxDev
+    ) && parse.arena.iter().any(|(_, node)| {
+        matches!(
+            node.data,
+            NodeData::JsxElement(_) | NodeData::JsxSelfClosingElement(_) | NodeData::JsxFragment(_)
+        )
+    });
+    let is_external_module = source_file_is_external_module(parse)
+        || (!is_declaration_file
+            && (options.module_detection == ModuleDetectionKind::Force
+                || (options.module_detection == ModuleDetectionKind::Auto
+                    && (fixed_module_file || node_esm_file || jsx_module))));
+    let is_common_js_module = language == CanonicalSourceLanguage::JavaScript
+        && source_file_has_commonjs_indicator(parse);
+    match (is_external_module, is_common_js_module) {
+        (true, true) => CanonicalModuleState::ExternalAndCommonJs,
+        (true, false) => CanonicalModuleState::External,
+        (false, true) => CanonicalModuleState::CommonJs,
+        (false, false) => CanonicalModuleState::Script,
+    }
 }
 
 fn resolve_reference_path(
@@ -10282,6 +10326,61 @@ mod tests {
                 "alwaysStrict={always_strict}: {:?}",
                 program.diagnostics()
             );
+        }
+    }
+
+    #[test]
+    fn production_program_forwards_upstream_strict_mode_namespace_diagnostics() {
+        let fs = MemoryFileSystem::new(true);
+        let source = concat!(
+            "namespace M {\n",
+            "    export function f() {\n",
+            "        var arguments = [];\n",
+            "    }\n",
+            "}",
+        );
+        fs.write_file("/.src/alwaysStrictModule.ts", source)
+            .unwrap();
+
+        for (always_strict, expected_count) in [(false, 0), (true, 1)] {
+            let program = Program::new_with_options(
+                &fs,
+                "/.src",
+                &["alwaysStrictModule.ts".to_owned()],
+                CompilerOptions {
+                    always_strict,
+                    module: ModuleKind::CommonJs,
+                    module_specified: true,
+                    target: ScriptTarget::Es2015,
+                    ..CompilerOptions::default()
+                },
+            );
+            let diagnostics = program
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Some(1100))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                diagnostics.len(),
+                expected_count,
+                "alwaysStrict={always_strict}: {:?}",
+                program.diagnostics()
+            );
+            if let Some(diagnostic) = diagnostics.first() {
+                assert_eq!(
+                    diagnostic.file_name.as_deref(),
+                    Some("/.src/alwaysStrictModule.ts")
+                );
+                assert_eq!(
+                    diagnostic.range,
+                    Some(TextRange::new(TextPos::new(52), TextPos::new(61)))
+                );
+                assert_eq!(
+                    diagnostic.message,
+                    "Invalid use of 'arguments' in strict mode."
+                );
+            }
         }
     }
 

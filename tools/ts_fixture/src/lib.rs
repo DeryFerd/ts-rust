@@ -6230,6 +6230,163 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep the four upstream fixtures and their exact locations together.
+    fn legacy_checker_preserves_upstream_strict_arguments_diagnostics() {
+        let cases: [(&str, &str, &[(usize, usize)]); 4] = [
+            (
+                "alwaysStrictModule.ts",
+                concat!(
+                    "// @target: es2015\n",
+                    "// @module: commonjs\n",
+                    "// @alwaysStrict: true\n",
+                    "\n",
+                    "namespace M {\n",
+                    "    export function f() {\n",
+                    "        var arguments = [];\n",
+                    "    }\n",
+                    "}",
+                ),
+                &[(3, 13)],
+            ),
+            (
+                "argumentsBindsToFunctionScopeArgumentList.ts",
+                concat!(
+                    "// @target: es2015\n",
+                    "// @ignoreDeprecations: 6.0\n",
+                    "// @strict: false\n",
+                    "// @alwaysStrict: true\n",
+                    "var arguments = 10;\n",
+                    "function foo(a) {\n",
+                    "    arguments = 10;  /// This shouldnt be of type number and result in error.\n",
+                    "}",
+                ),
+                &[(1, 5), (3, 5)],
+            ),
+            (
+                "collisionArgumentsArrowFunctions.ts",
+                concat!(
+                    "// @target: es2015\n",
+                    "// @ignoreDeprecations: 6.0\n",
+                    "// @strict: false\n",
+                    "// @alwaysStrict: true\n",
+                    "var f1 = (i: number, ...arguments) => { //arguments is error\n",
+                    "    var arguments: any[]; // no error\n",
+                    "}\n",
+                    "var f12 = (arguments: number, ...rest) => { //arguments is error\n",
+                    "    var arguments = 10; // no error\n",
+                    "}\n",
+                    "var f1NoError = (arguments: number) => { // no error\n",
+                    "    var arguments = 10; // no error\n",
+                    "}\n",
+                    "\n",
+                    "var f2 = (...restParameters) => {\n",
+                    "    var arguments = 10; // No Error\n",
+                    "}\n",
+                    "var f2NoError = () => {\n",
+                    "    var arguments = 10; // no error\n",
+                    "}",
+                ),
+                &[
+                    (1, 25),
+                    (2, 9),
+                    (4, 12),
+                    (5, 9),
+                    (7, 18),
+                    (8, 9),
+                    (12, 9),
+                    (15, 9),
+                ],
+            ),
+            (
+                "collisionArgumentsInType.ts",
+                concat!(
+                    "// @target: es2015\n",
+                    "// @ignoreDeprecations: 6.0\n",
+                    "// @strict: false\n",
+                    "// @alwaysStrict: true\n",
+                    "var v1: (i: number, ...arguments) => void; // no error - no code gen\n",
+                    "var v12: (arguments: number, ...restParameters) => void; // no error - no code gen\n",
+                    "var v2: {\n",
+                    "    (arguments: number, ...restParameters); // no error - no code gen\n",
+                    "    new (arguments: number, ...restParameters); // no error - no code gen\n",
+                    "    foo(arguments: number, ...restParameters); // no error - no code gen\n",
+                    "    prop: (arguments: number, ...restParameters) => void; // no error - no code gen\n",
+                    "}\n",
+                    "var v21: {\n",
+                    "    (i: number, ...arguments); // no error - no code gen\n",
+                    "    new (i: number, ...arguments); // no error - no code gen\n",
+                    "    foo(i: number, ...arguments); // no error - no code gen\n",
+                    "    prop: (i: number, ...arguments) => void; // no error - no code gen\n",
+                    "}",
+                ),
+                &[
+                    (1, 24),
+                    (2, 11),
+                    (4, 6),
+                    (5, 10),
+                    (6, 9),
+                    (7, 12),
+                    (10, 20),
+                    (11, 24),
+                    (12, 23),
+                    (13, 26),
+                ],
+            ),
+        ];
+
+        for (file_name, fixture, expected_positions) in cases {
+            let case = Case::parse(
+                format!("_submodules/TypeScript/tests/cases/compiler/{file_name}"),
+                fixture,
+            )
+            .unwrap();
+            let compilation = compile_case(&case).unwrap();
+            let expected_path = format!("/.src/{file_name}");
+            let positions = compilation
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Some(1100))
+                .map(|diagnostic| {
+                    assert_eq!(
+                        diagnostic.file_name.as_deref(),
+                        Some(expected_path.as_str())
+                    );
+                    assert_eq!(
+                        diagnostic.message,
+                        "Invalid use of 'arguments' in strict mode."
+                    );
+                    let source = diagnostic.source_text.as_ref().unwrap().as_scannable_str();
+                    let range = diagnostic.range.unwrap();
+                    assert_eq!(
+                        &source[range.start.get() as usize..range.end.get() as usize],
+                        "arguments"
+                    );
+                    super::line_and_utf16_column(source, range.start.get() as usize)
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                positions.as_slice(),
+                expected_positions,
+                "{file_name}: {:?}",
+                compilation.diagnostics
+            );
+            if file_name == "alwaysStrictModule.ts" {
+                assert_eq!(
+                    compilation.diagnostic_text,
+                    "alwaysStrictModule.ts(3,13): error TS1100: Invalid use of 'arguments' in strict mode.\r\n"
+                );
+                let artifact = render_error_baseline(&case, &compilation.diagnostics);
+                assert!(
+                    artifact.unsupported_details.is_empty(),
+                    "{:?}",
+                    artifact.unsupported_details
+                );
+            }
+        }
+    }
+
+    #[test]
     fn baseline_virtual_unit_names_remove_leading_current_directory_segments() {
         let case = Case::parse(
             "relativeUnits.ts",

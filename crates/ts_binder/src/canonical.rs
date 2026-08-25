@@ -17,8 +17,8 @@ use ts_ast::{
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use crate::{
-    AstScope, BoundFlowGraph, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData,
-    SymbolFlags, SymbolStore, SymbolTableId,
+    AstScope, BindDiagnostic, BoundFlowGraph, EscapedName, InternalSymbolName, SemanticSymbolId,
+    SymbolData, SymbolFlags, SymbolStore, SymbolTableId,
     flow_builder::{FlowTraversalHooks, build_flow_graph_with_hooks},
     should_replace_value_declaration,
 };
@@ -2568,28 +2568,20 @@ impl CanonicalBinder {
         name: Option<NodeId>,
         facts: &CanonicalSourceFileFacts,
     ) {
-        let Some(name) = name else {
+        let Some(diagnostic) =
+            strict_mode_eval_or_arguments_diagnostic(arena, context, name, facts)
+        else {
             return;
         };
-        let Some(NodeData::Identifier(identifier)) = arena.get(name).map(|node| &node.data) else {
-            return;
-        };
-        if !matches!(identifier.text.as_str(), "arguments" | "eval")
-            || is_ambient_node(arena, context, facts)
-        {
-            return;
-        }
-
-        let code = if containing_class(arena, context).is_some() {
-            1210
-        } else if facts.is_external_module() {
-            1215
-        } else if facts.is_always_strict() {
-            1100
-        } else {
-            return;
-        };
-        self.push_bind_diagnostic(arena, file, name, code, [identifier.text.as_str()]);
+        self.files
+            .get_mut(&file)
+            .expect("diagnostic file is registered")
+            .diagnostics
+            .push(CanonicalBindDiagnostic {
+                node: NodeRef::new(arena.id(), file, diagnostic.node),
+                diagnostic: diagnostic.diagnostic,
+                related_information: Vec::new(),
+            });
     }
 
     fn declaration_facts_for(
@@ -4237,6 +4229,37 @@ fn is_ambient_node(arena: &NodeArena, mut node: NodeId, facts: &CanonicalSourceF
         };
         node = parent;
     }
+}
+
+pub(crate) fn strict_mode_eval_or_arguments_diagnostic(
+    arena: &NodeArena,
+    context: NodeId,
+    name: Option<NodeId>,
+    facts: &CanonicalSourceFileFacts,
+) -> Option<BindDiagnostic> {
+    let name = name?;
+    let NodeData::Identifier(identifier) = &arena.get(name)?.data else {
+        return None;
+    };
+    if !matches!(identifier.text.as_str(), "arguments" | "eval")
+        || is_ambient_node(arena, context, facts)
+    {
+        return None;
+    }
+
+    let code = if containing_class(arena, context).is_some() {
+        1210
+    } else if facts.is_external_module() {
+        1215
+    } else if facts.is_always_strict() {
+        1100
+    } else {
+        return None;
+    };
+    Some(BindDiagnostic {
+        node: name,
+        diagnostic: make_diagnostic(code, [identifier.text.as_str()]),
+    })
 }
 
 fn container_has_export_context(
