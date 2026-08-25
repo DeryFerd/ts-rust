@@ -16172,12 +16172,16 @@ export function create() { return new M.Value(); }"#,
     fn typescript_extension_import_diagnostic_uses_boolean_config_value() {
         for (rewrite, expected) in [(false, Some(5096)), (true, None)] {
             let fs = MemoryFileSystem::new(true);
-            let config = format!(concat!(
-                "{{\"files\":[\"index.ts\"],\"compilerOptions\":{{",
-                "\"allowImportingTsExtensions\":true,",
-                "\"rewriteRelativeImportExtensions\":{rewrite},",
-                "\"noCheck\":true,\"noLib\":true}}}}",
-            ),);
+            let config = serde_json::json!({
+                "files": ["index.ts"],
+                "compilerOptions": {
+                    "allowImportingTsExtensions": true,
+                    "rewriteRelativeImportExtensions": rewrite,
+                    "noCheck": true,
+                    "noLib": true,
+                },
+            })
+            .to_string();
             fs.write_file("/project/tsconfig.json", &config).unwrap();
             fs.write_file("/project/index.ts", "export {};").unwrap();
 
