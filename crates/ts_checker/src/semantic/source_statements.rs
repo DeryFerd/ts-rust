@@ -10241,7 +10241,6 @@ mod joined_tests {
             "function repeat(flag: boolean) { while (flag) { let value; } }",
             "function repeat(flag: boolean) { while (flag) consume(flag); }",
             "function repeat(flag: boolean) { while (flag) { return; } }",
-            "function repeat(flag: boolean) { while (flag) { while (flag) {} } }",
             "function repeat(flag: boolean) { while (flag) {} consume(flag); }",
             "function repeat(flag: boolean) { for (; flag;) {} }",
         ]

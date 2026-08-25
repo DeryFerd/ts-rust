@@ -19991,6 +19991,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .and_then(|locals| locals.get_source("undefined"))
             .is_some_and(|symbol| {
                 store.get_merged_symbol(symbol) != Some(bootstrap.undefined_symbol)
+            })
+            || self.readable_variables.iter().any(|&symbol| {
+                store.get_merged_symbol(symbol) != Some(bootstrap.undefined_symbol)
+                    && store
+                        .symbol(symbol)
+                        .and_then(|record| record.name().as_utf8())
+                        == Some("undefined")
             });
         global_matches && !locally_shadowed
     }
@@ -75463,7 +75470,13 @@ class Foo2 {
         let file = FileId::new(9_977);
         let mut context = context(
             &[(library_file, &library), (file, &source)],
-            CanonicalCheckerOptions::default(),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
         );
 
         context.check_source_file(file).unwrap();
