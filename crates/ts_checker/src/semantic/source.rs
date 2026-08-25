@@ -15996,7 +15996,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 | PlannedExpressionKind::Boolean(_)
                 | PlannedExpressionKind::Object { .. }
         );
-        if const_assertion && !supported_const_operand {
+        if const_assertion
+            && !supported_const_operand
+            && !self.is_const_enum_member_operand(&operand)?
+        {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::ConstAssertion(expression),
             ));
@@ -16009,6 +16012,62 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 const_assertion,
             },
         ))
+    }
+
+    fn is_const_enum_member_operand(
+        &self,
+        operand: &PlannedExpression,
+    ) -> Result<bool, SourceCheckError> {
+        let (receiver, name) = match &operand.unparenthesized().kind {
+            PlannedExpressionKind::Property(property) => {
+                let NodeData::PropertyAccessExpression(access) = &self.node(property.node)?.data
+                else {
+                    return Ok(false);
+                };
+                let name = self.reference(access.name);
+                let NodeData::Identifier(identifier) = &self.node(name)?.data else {
+                    return Ok(false);
+                };
+                (&property.receiver, identifier.text.as_str())
+            }
+            PlannedExpressionKind::Element(element) => {
+                let PlannedExpressionKind::String(name) = &element.index.unparenthesized().kind
+                else {
+                    return Ok(false);
+                };
+                (&element.receiver, name.as_str())
+            }
+            _ => return Ok(false),
+        };
+        let PlannedExpressionKind::Identifier(receiver) = &receiver.unparenthesized().kind else {
+            return Ok(false);
+        };
+        if receiver.kind != PlannedIdentifierReadKind::DeclaredValue {
+            return Ok(false);
+        }
+        let Some((store, _)) = self.semantic else {
+            return Ok(false);
+        };
+        let Some(owner) = store.get_merged_symbol(receiver.value_symbol) else {
+            return Ok(false);
+        };
+        let Some(record) = store.symbol(owner) else {
+            return Ok(false);
+        };
+        if !record.flags().intersects(SymbolFlags::ENUM) || !self.prior_enums.contains(&owner) {
+            return Ok(false);
+        }
+        let Some(member) = record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(name))
+        else {
+            return Ok(false);
+        };
+        Ok(store.get_merged_symbol(member) == Some(member)
+            && store.symbol(member).is_some_and(|record| {
+                record.flags() == SymbolFlags::ENUM_MEMBER && record.parent() == Some(owner)
+            }))
     }
 
     fn is_const_assertion_type(&self, type_node: NodeRef) -> Result<bool, SourceCheckError> {
@@ -20720,7 +20779,23 @@ fn check_expression_type(
                 let target = match record.data() {
                     TypeData::Literal(literal) => {
                         let target = literal.regular_type;
-                        store.validate_union_constituent(target)?;
+                        if record.flags().intersects(TypeFlags::ENUM_LIKE) {
+                            let owner = super::enums::canonical_enum_type_owner(
+                                store,
+                                operand_types.result,
+                            )
+                            .ok_or(SourceCheckError::LiteralCache(
+                                SourceLiteralCacheError::InvalidCachedLiteral(operand_types.result),
+                            ))?;
+                            if super::enums::canonical_enum_type_owner(store, target) != Some(owner)
+                            {
+                                return Err(SourceCheckError::LiteralCache(
+                                    SourceLiteralCacheError::InvalidCachedLiteral(target),
+                                ));
+                            }
+                        } else {
+                            store.validate_union_constituent(target)?;
+                        }
                         target
                     }
                     TypeData::Object(_)
@@ -46924,6 +46999,180 @@ mod tests {
             expected_truth
         );
         assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn computed_enum_const_assertions_preserve_member_identity_and_mutable_widening() {
+        let source = parsed(concat!(
+            "declare function computed(value: number): number; ",
+            "enum E { A = computed(0), B = computed(1) } ",
+            "const preserved = E.B as const; ",
+            "const wrapped = (E.B) as const; ",
+            "let indexed = E['B'] as const; ",
+            "let widened = E.B; ",
+            "let asserted = E.B as const; ",
+            "const exact = E.A; ",
+            "enum Literal { First = 1, Second = 2 } ",
+            "let literal = Literal.First as const;",
+        ));
+        let file = FileId::new(9_390);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let owner = global_symbol(&context, "E");
+        let declared = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .expect("the computed enum must retain its declared union");
+        let exports = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .unwrap();
+        let first = exports.get_source("A").unwrap();
+        let second = exports.get_source("B").unwrap();
+        let first_fresh = context
+            .store()
+            .value_symbol_links(first)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let second_fresh = context
+            .store()
+            .value_symbol_links(second)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let TypeData::Literal(second_literal) =
+            context.store().type_payload(second_fresh).unwrap().data()
+        else {
+            panic!("computed enum members must retain their exact literal identity")
+        };
+        let second_regular = second_literal.regular_type;
+
+        assert_ne!(first_fresh, second_fresh);
+        assert_eq!(
+            context.store().type_payload(first_fresh).unwrap().flags(),
+            TypeFlags::ENUM,
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "exact"),
+            first_fresh,
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "widened"),
+            declared,
+        );
+        for name in ["preserved", "wrapped", "indexed", "asserted"] {
+            let assertion = variable_initializer(&source, file, name);
+            assert_eq!(
+                variable_value_type(&context, &source, file, name),
+                second_regular,
+            );
+            assert_eq!(resolved_node_type(&context, assertion), second_regular);
+            assert_eq!(
+                context.store().assertion_links(assertion),
+                Some(&AssertionLinks {
+                    expr_type: Some(second_fresh),
+                }),
+            );
+            assert_eq!(context.type_to_string(second_regular).unwrap(), "E.B");
+        }
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "literal"))
+                .unwrap(),
+            "Literal.First",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn computed_local_enum_returns_preserve_union_identity_and_diagnostic_order() {
+        let source = parsed(concat!(
+            "declare function computed(value: number): number; ",
+            "function selected() { ",
+            "return Dynamic.Second; ",
+            "enum Dynamic { First = computed(0), Second = computed(1) } ",
+            "}",
+        ));
+        let file = FileId::new(9_391);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                allow_unreachable_code: Some(false),
+                no_implicit_any: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2450, 7027],
+        );
+        assert_eq!(node_text(&source, diagnostics[0].node.unwrap()), "Dynamic");
+        assert_eq!(
+            node_text(&source, diagnostics[1].node.unwrap()),
+            "enum Dynamic { First = computed(0), Second = computed(1) }",
+        );
+        let declaration = diagnostics[1].node.unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let enum_owner = bound.symbol(declaration).unwrap();
+        let enum_type = context
+            .store()
+            .declared_type_links(enum_owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let function = function_symbol(&context, &source, file, "selected");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(function)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            Some(enum_type),
+        );
+        assert!(super::super::enums::is_canonical_enum_union(
+            context.store(),
+            enum_type,
+        ));
+
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);

@@ -885,7 +885,17 @@ fn is_numeric_computed_initializer(
         })
     };
     match &record.data {
-        NodeData::Identifier(identifier) => member_is_computed(&identifier.text),
+        NodeData::Identifier(identifier) => {
+            member_is_computed(&identifier.text)
+                || is_numeric_local_reference(
+                    store,
+                    host,
+                    expression,
+                    &identifier.text,
+                    enum_name,
+                    previous_members,
+                )
+        }
         NodeData::ParenthesizedExpression(parenthesized) => is_numeric_computed_initializer(
             store,
             host,
@@ -893,6 +903,23 @@ fn is_numeric_computed_initializer(
             enum_name,
             previous_members,
         ),
+        NodeData::PrefixUnaryExpression(prefix)
+            if matches!(
+                prefix.operator,
+                SyntaxKind::PlusToken | SyntaxKind::MinusToken | SyntaxKind::TildeToken
+            ) =>
+        {
+            is_known_numeric_expression(
+                store,
+                host,
+                NodeRef::new(expression.arena, expression.file, prefix.operand),
+                enum_name,
+                previous_members,
+            )
+        }
+        NodeData::BinaryExpression(_) => {
+            is_known_numeric_expression(store, host, expression, enum_name, previous_members)
+        }
         NodeData::PropertyAccessExpression(access) if access.question_dot_token.is_none() => {
             let Some(base) = host.node(NodeRef::new(
                 expression.arena,
@@ -1074,6 +1101,65 @@ fn local_constant_initializer(
         declaration.file,
         initializer,
     ))
+}
+
+fn is_numeric_local_reference(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    name: &str,
+    enum_name: &str,
+    previous_members: &[EnumMemberPlan],
+) -> bool {
+    if local_constant_initializer(store, host, expression, name).is_some_and(|initializer| {
+        is_known_numeric_expression(store, host, initializer, enum_name, previous_members)
+    }) {
+        return true;
+    }
+
+    let Some(bound) = host.bound_file(expression) else {
+        return false;
+    };
+    let Some(local) = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(name))
+    else {
+        return false;
+    };
+    let Some(local_record) = store.symbol(local) else {
+        return false;
+    };
+    let Some(symbol) = store.symbol(local_record.export_symbol().unwrap_or(local)) else {
+        return false;
+    };
+    let Some([declaration]) = symbol.declarations() else {
+        return false;
+    };
+    let Some(record) = host.node(*declaration) else {
+        return false;
+    };
+    let NodeData::VariableDeclaration(variable) = &record.data else {
+        return false;
+    };
+    let Some(annotation) = variable.type_ else {
+        return false;
+    };
+    symbol.flags().intersects(SymbolFlags::VARIABLE)
+        && record.range.end
+            <= host
+                .node(expression)
+                .map_or(record.range.start, |node| node.range.start)
+        && host
+            .node(NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                annotation,
+            ))
+            .is_some_and(|annotation| {
+                annotation.kind == SyntaxKind::NumberKeyword
+                    && annotation.parent == Some(declaration.node)
+            })
 }
 
 fn is_numeric_string_method_call(
@@ -1366,15 +1452,24 @@ fn is_known_numeric_expression(
                 previous_members,
             )
         }
-        NodeData::Identifier(identifier) => previous_members.iter().any(|member| {
-            matches!(
-                member.value,
-                CanonicalEnumMemberValue::Number(_) | CanonicalEnumMemberValue::Computed
-            ) && store
-                .symbol(member.symbol)
-                .and_then(|symbol| symbol.name().as_utf8())
-                == Some(identifier.text.as_str())
-        }),
+        NodeData::Identifier(identifier) => {
+            previous_members.iter().any(|member| {
+                matches!(
+                    member.value,
+                    CanonicalEnumMemberValue::Number(_) | CanonicalEnumMemberValue::Computed
+                ) && store
+                    .symbol(member.symbol)
+                    .and_then(|symbol| symbol.name().as_utf8())
+                    == Some(identifier.text.as_str())
+            }) || is_numeric_local_reference(
+                store,
+                host,
+                expression,
+                &identifier.text,
+                enum_name,
+                previous_members,
+            )
+        }
         _ => is_numeric_computed_initializer(store, host, expression, enum_name, previous_members),
     }
 }
@@ -3342,6 +3437,116 @@ mod tests {
             member(&result, &fixture, "Next").value,
             CanonicalEnumMemberValue::Number(Number::new(11.0))
         );
+    }
+
+    #[test]
+    fn authenticated_numeric_expressions_preserve_distinct_computed_enum_members() {
+        let mut fixture = fixture(concat!(
+            "declare function computed(value: number): number; ",
+            "const seed = computed(1); ",
+            "let scale: number = 2; ",
+            "enum Numeric { ",
+            "Direct = seed, ",
+            "Scaled = seed * scale, ",
+            "Negated = -computed(2), ",
+            "Bitwise = (Numeric.Scaled | 1), ",
+            "Indexed = Numeric['Direct'] + 4, ",
+            "Reset = 10, ",
+            "Next, ",
+            "}",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Numeric");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert!(
+            preflight_enum_diagnostics(&fixture.store, &host, owner)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        for name in ["Direct", "Scaled", "Negated", "Bitwise", "Indexed"] {
+            let current = member(&result, &fixture, name);
+            assert_eq!(current.value, CanonicalEnumMemberValue::Computed);
+            assert_eq!(
+                fixture
+                    .store
+                    .type_payload(current.fresh_type)
+                    .unwrap()
+                    .flags(),
+                TypeFlags::ENUM,
+            );
+        }
+        assert_ne!(
+            member(&result, &fixture, "Direct").fresh_type,
+            member(&result, &fixture, "Scaled").fresh_type,
+        );
+        assert_eq!(
+            member(&result, &fixture, "Next").value,
+            CanonicalEnumMemberValue::Number(Number::new(11.0)),
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            get_enum_semantics(&mut fixture.store, &host, owner),
+            Ok(result),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn untyped_mutable_computed_enum_references_remain_atomic_boundaries() {
+        let mut fixture = fixture("let value = 1; enum Invalid { Value = value * 2 }");
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Invalid");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            get_enum_semantics(&mut fixture.store, &host, owner),
+            Err(EnumTypeError::Unsupported(
+                EnumTypeUnsupported::Initializer(_)
+            ))
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
     }
 
     #[test]
