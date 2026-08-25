@@ -1260,7 +1260,7 @@ fn production_source_checks_generic_interface_properties_and_assignability() {
 
 #[test]
 #[allow(clippy::too_many_lines)] // The class boundary needs a complete canonical generic shell.
-fn class_and_composite_union_member_boundaries_remain_explicit() {
+fn composite_union_members_resolve_while_class_boundaries_remain_explicit() {
     let mut fixture = Fixture::new(
         concat!(
             "class Box<T> { value!: T }\n",
@@ -1286,14 +1286,39 @@ fn class_and_composite_union_member_boundaries_remain_explicit() {
         .store
         .create_direct_generic_reference_type(bad.type_, &[string])
         .unwrap();
-    let before = counts(&fixture.store);
+    let members = fixture
+        .store
+        .resolve_generic_interface_members(bad_reference, None)
+        .unwrap();
+    assert_eq!(members.properties().len(), 1);
+    let property = fixture
+        .store
+        .resolve_generic_interface_property(bad_reference, "mixed", None)
+        .unwrap()
+        .unwrap();
+    let pair_of_string = fixture
+        .store
+        .create_direct_generic_reference_type(pair.type_, &[string])
+        .unwrap();
+    let TypeData::Union(instantiated) = fixture
+        .store
+        .type_payload(property.type_id())
+        .unwrap()
+        .data()
+    else {
+        panic!("the composite generic property must remain a union")
+    };
+    assert_eq!(instantiated.union.types.len(), 2);
+    assert!(instantiated.union.types.contains(&pair_of_string));
+    assert!(instantiated.union.types.contains(&string));
+    let warm = counts(&fixture.store);
     assert_eq!(
         fixture
             .store
             .resolve_generic_interface_members(bad_reference, None),
-        Err(GenericInterfaceMemberError::UnsupportedPropertyType(mixed)),
+        Ok(members),
     );
-    assert_eq!(counts(&fixture.store), before);
+    assert_eq!(counts(&fixture.store), warm);
 
     let class_declaration = fixture
         .parsed
