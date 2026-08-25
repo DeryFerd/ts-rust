@@ -76,7 +76,10 @@ enum LiteralKind {
 /// projections because mapped properties do not have source declarations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ContextualPropertyObject {
-    Declared(ResolvedDeclaredPropertyObject),
+    Declared {
+        object: ResolvedDeclaredPropertyObject,
+        string_index: Option<TypeId>,
+    },
     Synthetic(Vec<(EscapedName, TypeId)>),
     FiniteRecord(FiniteRecordMappedProjection),
     BroadRecord(BroadRecordMappedProjection),
@@ -94,10 +97,14 @@ pub(super) struct BroadRecordMappedProjection {
 impl ContextualPropertyObject {
     fn property_types(&self) -> Vec<TypeId> {
         match self {
-            Self::Declared(object) => object
+            Self::Declared {
+                object,
+                string_index,
+            } => object
                 .properties()
                 .iter()
                 .map(|property| property.type_)
+                .chain(string_index.iter().copied())
                 .collect(),
             Self::Synthetic(properties) => properties.iter().map(|(_, type_)| *type_).collect(),
             Self::FiniteRecord(object) => object
@@ -111,7 +118,13 @@ impl ContextualPropertyObject {
 
     fn get_source(&self, name: &str) -> Option<TypeId> {
         match self {
-            Self::Declared(object) => object.get_source(name).map(|property| property.type_),
+            Self::Declared {
+                object,
+                string_index,
+            } => object
+                .get_source(name)
+                .map(|property| property.type_)
+                .or(*string_index),
             Self::Synthetic(properties) => {
                 let name = EscapedName::source(name);
                 properties
@@ -773,10 +786,29 @@ fn resolve_contextual_property_object(
     if let Some(properties) = synthetic_contextual_property_projection(store, contextual_type)? {
         return Ok(Some(ContextualPropertyObject::Synthetic(properties)));
     }
-    store
-        .resolved_declared_property_object(host, contextual_type)
-        .map(|object| object.map(ContextualPropertyObject::Declared))
-        .map_err(Into::into)
+    let Some(object) = store.resolved_declared_property_object(host, contextual_type)? else {
+        return Ok(None);
+    };
+    let string = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?
+        .string_type;
+    let string_index = store
+        .type_payload(contextual_type)
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.index_infos.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .find_map(|index| {
+            store
+                .index_info(*index)
+                .filter(|index| index.key_type() == string)
+                .map(super::signatures::IndexInfo::value_type)
+        });
+    Ok(Some(ContextualPropertyObject::Declared {
+        object,
+        string_index,
+    }))
 }
 
 /// Retains informative constituent properties instead of an `any`-merged value.
@@ -2293,6 +2325,70 @@ mod tests {
 
         assert!(store.set_value_symbol_links(property, original));
         assert!(prepare_expression_context(store, &host, &expression, target).is_ok());
+        assert!(store.type_node_links(object).is_none());
+    }
+
+    #[test]
+    fn declared_string_indexes_supply_context_to_every_object_property() {
+        let parsed = parse_source_file(concat!(
+            "type Dictionary = { [key: string]: 'ready' }; ",
+            "const value: Dictionary = { first: 'ready', second: 'ready' };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_071);
+        let mut context = mapped_record_context(&parsed, file);
+        let (annotation, object) = mapped_record_nodes(&parsed, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let expression = mapped_record_expression(&parsed, context.store(), &host, object);
+        let store = context.store_mut_for_test();
+
+        let prepared = prepare_expression_context(store, &host, &expression, target).unwrap();
+        assert_eq!(
+            prepared,
+            PreparedExpression::Object(vec![
+                PreparedExpression::Literal(LiteralTreatment::Regular),
+                PreparedExpression::Literal(LiteralTreatment::Regular),
+            ]),
+        );
+        let contextual = resolve_contextual_property_object(store, &host, target)
+            .unwrap()
+            .unwrap();
+        let expected = contextual.get_source("first").unwrap();
+        assert_eq!(contextual.get_source("second"), Some(expected));
+        assert_eq!(contextual.get_source("later"), Some(expected));
+        assert!(matches!(
+            store.type_payload(expected).map(TypeRecord::data),
+            Some(TypeData::Literal(literal))
+                if matches!(&literal.value, LiteralValue::String(value) if value == "ready")
+        ));
+
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.mapper_len(),
+            store.symbol_len(),
+            store.index_info_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            prepare_expression_context(store, &host, &expression, target),
+            Ok(prepared),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.index_info_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            ),
+            warm,
+        );
         assert!(store.type_node_links(object).is_none());
     }
 

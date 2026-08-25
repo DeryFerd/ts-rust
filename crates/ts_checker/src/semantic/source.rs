@@ -12942,7 +12942,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
-    fn is_contextual_object_property_call_argument(
+    fn is_contextual_object_property_expression(
         &self,
         store: &CanonicalTypeMapperStore,
         declaration: NodeRef,
@@ -12954,29 +12954,45 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         else {
             return Ok(false);
         };
-        let Some(object) = self.node(property)?.parent.map(|node| self.reference(node)) else {
+        let Some(mut object) = self.node(property)?.parent.map(|node| self.reference(node)) else {
             return Ok(false);
         };
-        let Some(call) = self.node(object)?.parent.map(|node| self.reference(node)) else {
-            return Ok(false);
-        };
-        let record = self.node(call)?;
-        let NodeData::CallExpression(syntax) = &record.data else {
-            return Ok(false);
-        };
-        if record.kind != SyntaxKind::CallExpression
-            || syntax
-                .arguments
-                .nodes
-                .iter()
-                .filter(|argument| **argument == object.node)
-                .count()
-                != 1
-        {
-            return Ok(false);
+
+        loop {
+            let Some(parent) = self.node(object)?.parent.map(|node| self.reference(node)) else {
+                return Ok(false);
+            };
+            let record = self.node(parent)?;
+            match &record.data {
+                NodeData::ParenthesizedExpression(parenthesized)
+                    if record.kind == SyntaxKind::ParenthesizedExpression
+                        && parenthesized.expression == object.node =>
+                {
+                    object = parent;
+                }
+                NodeData::SatisfiesExpression(satisfaction)
+                    if record.kind == SyntaxKind::SatisfiesExpression
+                        && satisfaction.expression == object.node =>
+                {
+                    let target = self.reference(satisfaction.type_);
+                    return Ok(self.node(target)?.parent == Some(parent.node));
+                }
+                NodeData::CallExpression(call)
+                    if record.kind == SyntaxKind::CallExpression
+                        && call
+                            .arguments
+                            .nodes
+                            .iter()
+                            .filter(|argument| **argument == object.node)
+                            .count()
+                            == 1 =>
+                {
+                    let syntax = plan_direct_source_call_syntax(self.arena, store, parent)?;
+                    return Ok(syntax.arguments().contains(&object));
+                }
+                _ => return Ok(false),
+            }
         }
-        let syntax = plan_direct_source_call_syntax(self.arena, store, call)?;
-        Ok(syntax.arguments().contains(&object))
     }
 
     fn loop_closure_statement_is_exact(
@@ -13385,7 +13401,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let javascript_object_property_arrow = is_javascript && object_property_arrow;
         let contextual_object_property_arrow = !is_javascript
             && object_property_arrow
-            && self.is_contextual_object_property_call_argument(store, declaration)?;
+            && self.is_contextual_object_property_expression(store, declaration)?;
         let contextual_direct_call_arrow = !is_javascript
             && source_direct_call_argument_arrow_is_exact(store, host, declaration)
                 .map_err(Self::callable_plan_error)?;
@@ -22074,17 +22090,36 @@ fn check_deferred_assertions(
             assertion.target_type,
             flags,
         )?;
-        let diagnostic = Diagnostic::with_arguments(
+        let mut diagnostic = Diagnostic::with_arguments(
             message_by_code(2352).ok_or(SourceCheckError::MissingDiagnostic(2352))?,
             [display.source, display.target],
         );
+        let mut related_information = Vec::new();
+        if let Some(missing) = super::object_diagnostics::missing_declared_property_diagnostic(
+            store,
+            host,
+            global_types,
+            operand,
+            assertion.target_type,
+            assertion.node,
+            flags,
+        )? {
+            diagnostic.details.push(format!(
+                "  {}",
+                missing
+                    .diagnostic
+                    .render()
+                    .map_err(|_| SourceCheckError::MissingDiagnostic(missing.diagnostic.code()))?
+            ));
+            related_information = missing.related_information;
+        }
         merge_retry_diagnostic(
             diagnostics,
             CanonicalCheckerDiagnostic {
                 node: Some(assertion.node),
                 range_override: None,
                 diagnostic,
-                related_information: Vec::new(),
+                related_information,
             },
         );
     }
@@ -46292,6 +46327,185 @@ mod tests {
             source.arena.source_text().unwrap().get(start..end),
             Some("satisfies")
         );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn satisfies_string_indexes_contextually_type_object_callback_parameters() {
+        let source = parsed(concat!(
+            "type Predicates = { [name: string]: (value: number) => boolean }; ",
+            "const predicates = ({ ",
+            "isEven: value => value % 2 === 0, ",
+            "isOdd: value => value % 2 === 1, ",
+            "}) satisfies Predicates;",
+        ));
+        let file = FileId::new(9_773);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let initializer = variable_initializer(&source, file, "predicates");
+        let NodeData::SatisfiesExpression(satisfaction) =
+            &source.arena.get(initializer.node).unwrap().data
+        else {
+            panic!("the predicate object must retain its satisfies expression")
+        };
+        let wrapper = NodeRef::new(source.arena.id(), file, satisfaction.expression);
+        let NodeData::ParenthesizedExpression(parenthesized) =
+            &source.arena.get(wrapper.node).unwrap().data
+        else {
+            panic!("the predicate object must retain its parenthesized wrapper")
+        };
+        let object = NodeRef::new(source.arena.id(), file, parenthesized.expression);
+        let (_, bound) = context.file(file).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for name in ["isEven", "isOdd"] {
+            let arrow = object_property_initializer(&source, file, object, name);
+            let NodeData::ArrowFunction(syntax) = &source.arena.get(arrow.node).unwrap().data
+            else {
+                panic!("the indexed predicate must retain its callback")
+            };
+            let [parameter] = syntax.parameters.nodes.as_slice() else {
+                panic!("the indexed predicate must retain one callback parameter")
+            };
+            let parameter = NodeRef::new(source.arena.id(), file, *parameter);
+            let parameter = bound.symbol(parameter).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(parameter)
+                    .and_then(|links| links.resolved_type),
+                Some(bootstrap.number_type),
+            );
+            let callable = object_property_type(&context, object, name);
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(bootstrap.boolean_type),
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn satisfies_index_mismatches_keep_property_local_diagnostics() {
+        let source = parsed(concat!(
+            "type Facts = { [key: string]: boolean }; ",
+            "const values = { valid: true, invalid: 'false' } satisfies Facts;",
+        ));
+        let file = FileId::new(9_774);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one indexed-property mismatch")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(diagnostic.diagnostic.arguments, ["string", "boolean"]);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "invalid");
+        assert_eq!(diagnostic.related_information.len(), 1);
+        assert_eq!(diagnostic.related_information[0].diagnostic.code(), 6501);
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn structured_assertions_retain_missing_property_details_and_declaration_anchors() {
+        let source = parsed(concat!(
+            "interface Actual { present: number; } ",
+            "interface Single { required: string; } ",
+            "interface Multiple { first: string; second: boolean; } ",
+            "declare const actual: Actual; ",
+            "const first = actual as Single; ",
+            "const second = <Multiple>actual;",
+        ));
+        let file = FileId::new(9_775);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [single, multiple] = context.diagnostics().as_slice() else {
+            panic!("expected two structured assertion diagnostics")
+        };
+        assert_eq!(single.diagnostic.code(), 2352);
+        assert_eq!(single.diagnostic.arguments, ["Actual", "Single"]);
+        assert_eq!(
+            single.diagnostic.details,
+            ["  Property 'required' is missing in type 'Actual' but required in type 'Single'."],
+        );
+        let [related] = single.related_information.as_slice() else {
+            panic!("a missing required property must retain its declaration")
+        };
+        assert_eq!(related.diagnostic.code(), 2728);
+        assert_eq!(node_text(&source, related.node.unwrap()), "required");
+
+        assert_eq!(multiple.diagnostic.code(), 2352);
+        assert_eq!(multiple.diagnostic.arguments, ["Actual", "Multiple"]);
+        assert_eq!(
+            multiple.diagnostic.details,
+            [
+                "  Type 'Actual' is missing the following properties from type 'Multiple': first, second"
+            ],
+        );
+        assert!(multiple.related_information.is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn jsx_lexical_sources_keep_safe_as_and_satisfies_assertion_chains() {
+        let source = ts_parser::parse_jsx_source_file(concat!(
+            "const initial = 1 as number; ",
+            "const checked = (initial! as number) satisfies number;",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(9_776);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "initial"),
+            number,
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "checked"),
+            number,
+        );
+        assert!(
+            !source
+                .arena
+                .iter()
+                .any(|(_, record)| record.kind == SyntaxKind::TypeAssertionExpression)
+        );
+        assert!(context.diagnostics().is_empty());
 
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
