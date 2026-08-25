@@ -221,6 +221,8 @@ type DeclaredTargetHeader = (
     Vec<IndexInfoId>,
 );
 
+type InheritedInterfaceMembers = (Vec<SemanticSymbolId>, Vec<IndexInfoId>);
+
 #[derive(Clone, Debug)]
 struct GenericInterfaceShape {
     reference: TypeId,
@@ -960,8 +962,9 @@ pub(super) fn validate_instantiated_array_property_callable(
     else {
         return malformed();
     };
-    let Some(TypeData::Interface(interface)) =
-        store.type_payload(target).map(|record| record.data())
+    let Some(TypeData::Interface(interface)) = store
+        .type_payload(target)
+        .map(super::type_records::TypeRecord::data)
     else {
         return malformed();
     };
@@ -1658,7 +1661,7 @@ fn cached_inherited_properties(
     store: &CanonicalTypeMapperStore,
     shape: &GenericInterfaceShape,
     array_targets: Option<CanonicalArrayTargets>,
-) -> Result<Option<(Vec<SemanticSymbolId>, Vec<IndexInfoId>)>, GenericInterfaceMemberError> {
+) -> Result<Option<InheritedInterfaceMembers>, GenericInterfaceMemberError> {
     let mut inherited = Vec::new();
     let mut inherited_indexes = Vec::new();
     let mut names = shape

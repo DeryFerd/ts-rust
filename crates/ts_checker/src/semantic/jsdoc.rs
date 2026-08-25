@@ -1605,7 +1605,7 @@ pub fn resolve_planned_jsdoc_type(
     )
 }
 
-/// Validates a nongeneric source-owned JSDoc function annotation without publishing a type.
+/// Validates a nongeneric source-owned `JSDoc` function annotation without publishing a type.
 pub(super) fn preflight_source_jsdoc_function_type(
     store: &CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -2007,9 +2007,7 @@ pub(super) fn validate_stored_source_jsdoc_function_type(
         }
     }
     let return_type = signature_record.resolved_return_type()?;
-    if store.type_payload(return_type).is_none() {
-        return None;
-    }
+    store.type_payload(return_type)?;
     let mut edges = parameter_types.to_vec();
     edges.push(return_type);
     Some(edges)

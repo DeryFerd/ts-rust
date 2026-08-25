@@ -1071,10 +1071,10 @@ fn resolve_cross_file_global_value_symbol(
     let mut callback_host = host
         .name_resolver_host(store)
         .map_err(VariablePlanError::DeclaredType)?;
-    let mut resolver =
+    let mut name_lookup =
         CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
             .map_err(|error| name_resolution_error(node, error))?;
-    let Some(resolved) = resolver
+    let Some(resolved) = name_lookup
         .resolve(
             Some(CanonicalResolutionLocation::Bound(node)),
             name,
