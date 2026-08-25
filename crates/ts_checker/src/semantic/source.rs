@@ -22,6 +22,7 @@
 //! top-level `for...of` loops with one const binding and one direct call,
 //! ordinary direct identifier calls, bounded annotated arrow call arguments,
 //! anonymous zero-parameter function expressions with bounded block bodies,
+//! authenticated shorthand object-assignment defaults inside bounded function bodies,
 //! strict top-level call expression statements, exhaustive grouped literal
 //! switch returns, inferred-void string switches with exact unreachable ranges,
 //! atomic primitive/literal scalar binary operators, direct top-level and function-local
@@ -954,6 +955,7 @@ enum PlannedArrowBody {
 enum PlannedFunctionBody {
     Ambient,
     Empty,
+    ObjectShorthandAssignment(Box<PlannedObjectShorthandAssignment>),
     Return {
         statement: NodeRef,
         expression: PlannedExpression,
@@ -976,6 +978,17 @@ enum PlannedFunctionBody {
     ConditionalEnum(Box<PlannedConditionalEnumFunctionStatements>),
     Statements(Box<PlannedFunctionStatements>),
     JoinedStatements(Box<PlannedJoinedFunctionStatements>),
+}
+
+#[derive(Clone, Debug)]
+struct PlannedObjectShorthandAssignment {
+    local_symbol: SemanticSymbolId,
+    assignment: NodeRef,
+    parenthesized: NodeRef,
+    shorthand: super::object_members::PlannedObjectAssignmentShorthand,
+    target: PlannedExpression,
+    initializer: PlannedExpression,
+    source: PlannedExpression,
 }
 
 #[derive(Clone, Debug)]
@@ -6794,6 +6807,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         {
             return Ok(PlannedFunctionBody::Empty);
         }
+        if let Some(assignment) =
+            self.plan_object_shorthand_assignment_function_body(callable, &statements)?
+        {
+            return Ok(PlannedFunctionBody::ObjectShorthandAssignment(Box::new(
+                assignment,
+            )));
+        }
         if !statements.is_empty() {
             return self.plan_function_statements(callable);
         }
@@ -6803,6 +6823,219 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         Ok(PlannedFunctionBody::Empty)
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the local, assignment, and binder proofs together.
+    fn plan_object_shorthand_assignment_function_body(
+        &mut self,
+        callable: &SourceCallablePlan,
+        statements: &[NodeId],
+    ) -> Result<Option<PlannedObjectShorthandAssignment>, SourceCheckError> {
+        let [local_statement, assignment_statement] = statements else {
+            return Ok(None);
+        };
+        if callable.family != SourceCallableFamily::FunctionDeclaration
+            || !callable.return_type.is_inferred()
+            || callable.parameters.len() != 1
+            || !callable.type_parameters.is_empty()
+            || callable.is_async
+        {
+            return Ok(None);
+        }
+        let local_statement = self.reference(*local_statement);
+        let local_record = self.node(local_statement)?;
+        let NodeData::VariableStatement(local_data) = &local_record.data else {
+            return Ok(None);
+        };
+        let list = self.reference(local_data.declaration_list);
+        let list_record = self.node(list)?;
+        let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
+            return Ok(None);
+        };
+        let [declaration] = list_data.declarations.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let local_declaration = self.reference(*declaration);
+        let declaration_record = self.node(local_declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Ok(None);
+        };
+        let local_name = self.reference(variable.name);
+        let local_name_record = self.node(local_name)?;
+        let NodeData::Identifier(local_identifier) = &local_name_record.data else {
+            return Ok(None);
+        };
+        let local_name_text = local_identifier.text.clone();
+        if local_record.kind != SyntaxKind::VariableStatement
+            || local_record.flags.0 != 0
+            || local_record.parent != Some(callable.body.node)
+            || local_data.modifiers.is_some()
+            || local_data.flow_node.is_some()
+            || local_data.facts != 0
+            || list_record.kind != SyntaxKind::VariableDeclarationList
+            || list_record.flags.0 != NODE_FLAG_LET
+            || list_record.parent != Some(local_statement.node)
+            || list_data.declarations.has_trailing_comma
+            || list_data.facts != 0
+            || declaration_record.kind != SyntaxKind::VariableDeclaration
+            || declaration_record.flags.0 != 0
+            || declaration_record.parent != Some(list.node)
+            || variable.initializer.is_some()
+            || variable.type_.is_some()
+            || variable.exclamation_token.is_some()
+            || variable.local_symbol.is_some()
+            || variable.symbol.is_some()
+            || variable.facts != 0
+            || local_name_record.kind != SyntaxKind::Identifier
+            || local_name_record.flags.0 != 0
+            || local_name_record.parent != Some(local_declaration.node)
+            || local_identifier.flow_node.is_some()
+            || local_name_text.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some((store, host)) = self.semantic else {
+            return Ok(None);
+        };
+        let local_symbol = self
+            .bound
+            .symbol(local_declaration)
+            .filter(|symbol| store.get_merged_symbol(*symbol) == Some(*symbol))
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let local_symbol_record = store
+            .symbol(local_symbol)
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let any = store
+            .intrinsic_bootstrap()
+            .ok_or_else(|| Self::unsupported_function_body(callable))?
+            .any_type;
+        if local_symbol_record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+            || local_symbol_record.check_flags() != CheckFlags::NONE
+            || local_symbol_record.name().as_utf8() != Some(local_name_text.as_str())
+            || local_symbol_record.declarations() != Some(&[local_declaration])
+            || local_symbol_record.value_declaration() != Some(local_declaration)
+            || local_symbol_record.members().is_some()
+            || local_symbol_record.exports().is_some()
+            || local_symbol_record.parent().is_some()
+            || local_symbol_record.export_symbol().is_some()
+            || self.bound.container(local_declaration) != Some(callable.declaration)
+            || self.bound.local_symbol(local_declaration).is_some()
+            || self
+                .bound
+                .locals(callable.declaration)
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&local_name_text))
+                != Some(local_symbol)
+            || store.value_symbol_links(local_symbol).is_some_and(|links| {
+                links != &ValueSymbolLinks::default()
+                    && links
+                        != &(ValueSymbolLinks {
+                            resolved_type: Some(any),
+                            ..ValueSymbolLinks::default()
+                        })
+            })
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+
+        let assignment_statement = self.reference(*assignment_statement);
+        let statement_record = self.node(assignment_statement)?;
+        let NodeData::ExpressionStatement(statement) = &statement_record.data else {
+            return Ok(None);
+        };
+        let parenthesized = self.reference(statement.expression);
+        let parenthesized_record = self.node(parenthesized)?;
+        let NodeData::ParenthesizedExpression(parentheses) = &parenthesized_record.data else {
+            return Ok(None);
+        };
+        let assignment = self.reference(parentheses.expression);
+        let assignment_record = self.node(assignment)?;
+        let NodeData::BinaryExpression(binary) = &assignment_record.data else {
+            return Ok(None);
+        };
+        let object = self.reference(binary.left);
+        let operator = self.reference(binary.operator_token);
+        let source = self.reference(binary.right);
+        let operator_record = self.node(operator)?;
+        if statement_record.kind != SyntaxKind::ExpressionStatement
+            || statement_record.flags.0 != 0
+            || statement_record.parent != Some(callable.body.node)
+            || statement.flow_node.is_some()
+            || parenthesized_record.kind != SyntaxKind::ParenthesizedExpression
+            || parenthesized_record.flags.0 != 0
+            || parenthesized_record.parent != Some(assignment_statement.node)
+            || assignment_record.kind != SyntaxKind::BinaryExpression
+            || assignment_record.flags.0 != 0
+            || assignment_record.parent != Some(parenthesized.node)
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.facts != 0
+            || binary.modifiers.is_some()
+            || self.node(object)?.parent != Some(assignment.node)
+            || operator_record.kind != SyntaxKind::EqualsToken
+            || operator_record.flags.0 != 0
+            || operator_record.parent != Some(assignment.node)
+            || !matches!(operator_record.data, NodeData::Token(_))
+            || self.node(source)?.parent != Some(assignment.node)
+        {
+            return Ok(None);
+        }
+        let Some(shorthand) =
+            super::object_members::plan_object_assignment_shorthand(store, host, object)
+                .map_err(|_| Self::unsupported_function_body(callable))?
+        else {
+            return Ok(None);
+        };
+        let shorthand_name = self.node(shorthand.name)?;
+        let NodeData::Identifier(shorthand_identifier) = &shorthand_name.data else {
+            return Ok(None);
+        };
+        if self
+            .bound
+            .symbol(object)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(shorthand.owner)
+            || shorthand_name.kind != SyntaxKind::Identifier
+            || shorthand.name == local_name
+            || shorthand_identifier.text != local_name_text
+            || self.node(shorthand.initializer)?.kind != SyntaxKind::ArrowFunction
+        {
+            return Ok(None);
+        }
+        if !self.prior_variables.insert(local_symbol)
+            || !self.readable_variables.insert(local_symbol)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(local_symbol),
+            ));
+        }
+        let target = self.plan_expression(shorthand.name)?;
+        let source = self.plan_expression(source)?;
+        let initializer = self.plan_expression(shorthand.initializer)?;
+        if !matches!(
+            &target.kind,
+            PlannedExpressionKind::Identifier(read)
+                if read.kind == PlannedIdentifierReadKind::Variable
+                    && read.value_symbol == local_symbol
+        ) || !matches!(
+            &source.kind,
+            PlannedExpressionKind::Identifier(read)
+                if read.kind == PlannedIdentifierReadKind::Variable
+                    && callable.parameters[0].symbol == read.value_symbol
+        ) || !matches!(&initializer.kind, PlannedExpressionKind::Arrow(_))
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+
+        Ok(Some(PlannedObjectShorthandAssignment {
+            local_symbol,
+            assignment,
+            parenthesized,
+            shorthand,
+            target,
+            initializer,
+            source,
+        }))
     }
 
     fn plan_constant_boolean_return_if(
@@ -11262,6 +11495,45 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                     break;
                 }
+                NodeData::ShorthandPropertyAssignment(property)
+                    if record.kind == SyntaxKind::ShorthandPropertyAssignment
+                        && property.object_assignment_initializer == Some(argument.node) =>
+                {
+                    let object = record.parent.map(|node| self.reference(node)).ok_or(
+                        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(declaration)),
+                    )?;
+                    let shorthand = super::object_members::plan_object_assignment_shorthand(
+                        store, host, object,
+                    )
+                    .map_err(|_| {
+                        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(declaration))
+                    })?
+                    .ok_or(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Arrow(declaration),
+                    ))?;
+                    let assignment = self
+                        .node(object)?
+                        .parent
+                        .map(|node| self.reference(node))
+                        .ok_or(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ))?;
+                    if shorthand.declaration != parent
+                        || shorthand.initializer != argument
+                        || !matches!(
+                            &self.node(assignment)?.data,
+                            NodeData::BinaryExpression(binary)
+                                if binary.left == object.node
+                                    && self.node(self.reference(binary.operator_token))?.kind
+                                        == SyntaxKind::EqualsToken
+                        )
+                    {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ));
+                    }
+                    break;
+                }
                 NodeData::VariableDeclaration(variable)
                     if record.kind == SyntaxKind::VariableDeclaration
                         && variable.initializer == Some(argument.node) =>
@@ -14743,6 +15015,35 @@ fn preflight_inferred_function_return_dependencies(
         let body_supported = match &function.body {
             PlannedFunctionBody::Ambient => !function.callable.return_type.is_inferred(),
             PlannedFunctionBody::Empty | PlannedFunctionBody::ReturnJsx { .. } => true,
+            PlannedFunctionBody::ObjectShorthandAssignment(assignment) => {
+                locals.insert(assignment.local_symbol);
+                let source_is_closed = expression_is_closed(
+                    &assignment.source,
+                    &function.callable.parameters,
+                    &locals,
+                    functions,
+                );
+                let target_is_closed = expression_is_closed(
+                    &assignment.target,
+                    &function.callable.parameters,
+                    &locals,
+                    functions,
+                );
+                let initializer_is_closed = match &assignment.initializer.kind {
+                    PlannedExpressionKind::Arrow(arrow) => match &arrow.body {
+                        PlannedArrowBody::Empty => true,
+                        PlannedArrowBody::Return { expression, .. } => expression_is_closed(
+                            expression,
+                            &arrow.callable.parameters,
+                            &HashSet::new(),
+                            functions,
+                        ),
+                        PlannedArrowBody::ReturnJsx { .. } => false,
+                    },
+                    _ => false,
+                };
+                source_is_closed && target_is_closed && initializer_is_closed
+            }
             PlannedFunctionBody::Return { expression, .. } => expression_is_closed(
                 expression,
                 &function.callable.parameters,
@@ -20084,6 +20385,109 @@ fn publish_typeof_switch_string_method_call(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // Reuses the source-owned callable and publication state.
+fn check_planned_object_shorthand_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    mut flow_types: HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    assignment: &PlannedObjectShorthandAssignment,
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+) -> Result<(), SourceCheckError> {
+    if options.no_implicit_any {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    }
+    let any = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?
+        .any_type;
+    let value = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &flow_types,
+        preflighted_type_import_value_uses,
+        &assignment.source,
+        None,
+        deferred,
+    )?;
+    if value.result != any {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    }
+    stage_value_type(
+        store,
+        staged_value_types,
+        value_order,
+        assignment.local_symbol,
+        any,
+    )?;
+    if flow_types.insert(assignment.local_symbol, any).is_some() {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::DuplicateCurrentFlowType(assignment.local_symbol),
+        ));
+    }
+    let target = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &flow_types,
+        preflighted_type_import_value_uses,
+        &assignment.target,
+        None,
+        deferred,
+    )?;
+    if target.result != any {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    }
+    check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &flow_types,
+        preflighted_type_import_value_uses,
+        &assignment.initializer,
+        None,
+        deferred,
+    )?;
+    if store
+        .value_symbol_links(assignment.shorthand.symbol)
+        .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || store.type_node_links(assignment.shorthand.object).is_some()
+    {
+        return Err(SourceCheckError::ObjectLiteral(
+            SourceObjectLiteralError::InvalidCache {
+                node: assignment.shorthand.object,
+                type_: None,
+            },
+        ));
+    }
+    publish_expression_type(store, assignment.assignment, any)?;
+    publish_expression_type(store, assignment.parenthesized, any)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Reuses the existing source flow and publication transaction.
 fn check_planned_linear_function_statements(
     bound: &BoundFile,
@@ -24641,6 +25045,39 @@ pub(super) fn check_source_file(
         )?;
         let (expression, return_flow_types) = match &function.body {
             PlannedFunctionBody::Empty => (None, body_flow_types),
+            PlannedFunctionBody::ObjectShorthandAssignment(assignment) => {
+                check_planned_object_shorthand_assignment(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    &mut function_diagnostics,
+                    body_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &mut deferred,
+                    &function.callable,
+                    assignment,
+                    &mut staged_value_types,
+                    &mut value_order,
+                )?;
+                let void = store
+                    .intrinsic_bootstrap()
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?
+                    .void_type;
+                publish_inferred_source_callable_return(
+                    store,
+                    &function.callable,
+                    materialized.signature,
+                    void,
+                )
+                .map_err(SourcePlanner::callable_plan_error)?;
+                inferred_function_diagnostics[index] = Some(function_diagnostics);
+                continue;
+            }
             PlannedFunctionBody::Return { expression, .. } => (Some(expression), body_flow_types),
             PlannedFunctionBody::ReturnJsx { expression, .. } => {
                 let mut jsx_diagnostics = CanonicalCheckerDiagnostics::default();
@@ -25739,6 +26176,7 @@ pub(super) fn check_source_file(
                 match &function.body {
                     PlannedFunctionBody::Ambient
                     | PlannedFunctionBody::VoidSwitch(_)
+                    | PlannedFunctionBody::ObjectShorthandAssignment(_)
                     | PlannedFunctionBody::TypeofSwitch(_)
                     | PlannedFunctionBody::ConditionalEnum(_) => {
                         return Err(SourceCheckError::Function(
@@ -40613,6 +41051,148 @@ mod tests {
             Some(object_type)
         );
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn upstream_shorthand_property_assignment_keeps_local_and_arrow_identities() {
+        let source = parsed(concat!(
+            "// @noEmit: true\n\n",
+            "// https://github.com/microsoft/typescript-go/issues/3789\n\n",
+            "function ff(f: any) {\n",
+            "    let g;\n",
+            "    ({ g = (x: any, y: any) => x + y } = f);\n",
+            "}\n",
+        ));
+        let file = FileId::new(8_460);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let shorthand =
+            source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ShorthandPropertyAssignment)
+                        .then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .unwrap();
+        let arrow = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (property, arrow_owner) = {
+            let (_, bound) = context.file(file).unwrap();
+            (
+                bound.symbol(shorthand).unwrap(),
+                bound.symbol(arrow).unwrap(),
+            )
+        };
+
+        context.check_source_file(file).unwrap();
+
+        let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        let local = variable_symbol(&context, &source, file, "g");
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(local)
+                .and_then(|links| links.resolved_type),
+            Some(any),
+        );
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(arrow_owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        assert_eq!(
+            context
+                .store()
+                .callable_signature_parameter_types(signature),
+            Some([any, any].as_slice()),
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(any),
+        );
+        assert_eq!(resolved_node_type(&context, arrow), callable);
+        assert!(context.store().value_symbol_links(property).is_none());
+        let function = function_symbol(&context, &source, file, "ff");
+        let function_type = context
+            .store()
+            .source_callable_type_for_owner(function)
+            .unwrap();
+        let function_signature = context
+            .store()
+            .source_callable_provenance(function_type)
+            .unwrap()
+            .signature;
+        assert_eq!(
+            context
+                .store()
+                .signature(function_signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(void),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn shorthand_assignment_rejects_poisoned_pattern_before_source_publication() {
+        let source = parsed(concat!(
+            "function ff(f: any) {\n",
+            "    let g;\n",
+            "    ({ g = (x: any, y: any) => x + y } = f);\n",
+            "}\n",
+        ));
+        let file = FileId::new(8_461);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let shorthand =
+            source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ShorthandPropertyAssignment)
+                        .then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .unwrap();
+        let property = context.file(file).unwrap().1.symbol(shorthand).unwrap();
+        let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(any),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let before = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(_))
+            ))
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        assert!(!is_type_checked(&context, file));
     }
 
     #[test]

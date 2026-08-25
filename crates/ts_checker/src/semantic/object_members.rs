@@ -84,6 +84,17 @@ struct ResolvedObjectProperty {
     readonly: bool,
 }
 
+/// One binder-owned shorthand assignment with an explicit default expression.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PlannedObjectAssignmentShorthand {
+    pub object: NodeRef,
+    pub owner: SemanticSymbolId,
+    pub declaration: NodeRef,
+    pub symbol: SemanticSymbolId,
+    pub name: NodeRef,
+    pub initializer: NodeRef,
+}
+
 const fn source_property_check_flags(readonly: bool) -> CheckFlags {
     if readonly {
         CheckFlags::READONLY
@@ -1042,6 +1053,114 @@ fn plan_javascript_expando_object_literal(
         alias_symbol: None,
         heritage: None,
     })
+}
+
+/// Authenticates an object assignment pattern without treating it as a value literal.
+#[allow(clippy::too_many_lines)] // Validates the complete binder-owned assignment pattern together.
+pub(super) fn plan_object_assignment_shorthand(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<PlannedObjectAssignmentShorthand>, PropertyObjectError> {
+    let invalid = || PropertyObjectError::InvalidObjectLiteral(node);
+    let record = preflight_node(store, host, node).map_err(|_| invalid())?;
+    let NodeData::ObjectLiteralExpression(object) = &record.data else {
+        return Ok(None);
+    };
+    let [property] = object.properties.nodes.as_slice() else {
+        return Ok(None);
+    };
+    let declaration = NodeRef::new(node.arena, node.file, *property);
+    let property_record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+    let NodeData::ShorthandPropertyAssignment(property) = &property_record.data else {
+        return Ok(None);
+    };
+    let (Some(equals), Some(initializer)) = (
+        property.equals_token,
+        property.object_assignment_initializer,
+    ) else {
+        return Ok(None);
+    };
+    let equals = NodeRef::new(node.arena, node.file, equals);
+    let initializer = NodeRef::new(node.arena, node.file, initializer);
+    let name = NodeRef::new(node.arena, node.file, property.name);
+    let equals_record = preflight_node(store, host, equals).map_err(|_| invalid())?;
+    let initializer_record = preflight_node(store, host, initializer).map_err(|_| invalid())?;
+    let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    let owner = bound_symbol(store, host, node).ok_or_else(invalid)?;
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    let symbol = bound_symbol(store, host, declaration).ok_or_else(invalid)?;
+    let symbol_record = store.symbol(symbol).ok_or_else(invalid)?;
+    let members = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::ObjectLiteralExpression
+        || record.flags.0 & NODE_FLAG_JSDOC != 0
+        || object.symbol.is_some()
+        || object.facts != 0
+        || object.properties.range != record.range
+        || object.properties.has_trailing_comma
+        || owner_record.flags() != SymbolFlags::OBJECT_LITERAL
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name() != InternalSymbolName::Object.as_ref()
+        || owner_record.declarations() != Some(&[node])
+        || owner_record.value_declaration() != Some(node)
+        || owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || property_record.kind != SyntaxKind::ShorthandPropertyAssignment
+        || property_record.flags.0 != 0
+        || property_record.parent != Some(node.node)
+        || property.postfix_token.is_some()
+        || property.modifiers.is_some()
+        || property.type_.is_some()
+        || property.symbol.is_some()
+        || property.facts != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || equals_record.kind != SyntaxKind::EqualsToken
+        || equals_record.flags.0 != 0
+        || equals_record.parent != Some(declaration.node)
+        || !matches!(equals_record.data, NodeData::Token(_))
+        || initializer_record.parent != Some(declaration.node)
+        || name_record.range.end > equals_record.range.start
+        || equals_record.range.end > initializer_record.range.start
+        || initializer_record.range.end > property_record.range.end
+        || symbol_record.flags() != SymbolFlags::PROPERTY
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.declarations() != Some(&[declaration])
+        || symbol_record.value_declaration() != Some(declaration)
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || members.len() != 1
+        || members.get_source(&identifier.text) != Some(symbol)
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return Err(invalid());
+    }
+
+    Ok(Some(PlannedObjectAssignmentShorthand {
+        object: node,
+        owner,
+        declaration,
+        symbol,
+        name,
+        initializer,
+    }))
 }
 
 fn object_literal_has_const_assertion(
@@ -11334,6 +11453,54 @@ mod generic_publication_tests {
             before,
         );
         assert!(fixture.store.type_node_links(object).is_none());
+    }
+
+    #[test]
+    fn shorthand_assignment_defaults_preserve_binder_owned_pattern_symbols() {
+        let (fixture, object) = object_fixture(concat!(
+            "function assign(source: any) { let value; ",
+            "({ value = (left: any, right: any) => left + right } = source); }",
+        ));
+        let host = host(&fixture.parsed, &fixture.bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let planned = plan_object_assignment_shorthand(&fixture.store, &host, object)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(planned.owner, fixture.symbol);
+        assert_eq!(
+            fixture.bound.symbol(planned.declaration),
+            Some(planned.symbol)
+        );
+        assert_eq!(
+            fixture.store.source_node_kind(planned.declaration),
+            Some(SyntaxKind::ShorthandPropertyAssignment),
+        );
+        assert_eq!(
+            fixture.store.source_node_kind(planned.initializer),
+            Some(SyntaxKind::ArrowFunction),
+        );
+        assert!(fixture.store.value_symbol_links(planned.symbol).is_none());
+        assert!(fixture.store.type_node_links(object).is_none());
+        assert_eq!(
+            plan_object_assignment_shorthand(&fixture.store, &host, object),
+            Ok(Some(planned)),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]
