@@ -2353,11 +2353,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         )));
                         continue;
                     }
-                    self.reject_class_declaration_modifiers(
+                    let export_modifier = self.validate_class_declaration_modifiers(
                         statement,
                         node.range,
                         name,
                         class.modifiers.as_ref(),
+                        is_external_module,
                     )?;
                     let Some((store, host)) = self.semantic else {
                         return Err(SourceCheckError::Unsupported(
@@ -2389,6 +2390,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         }
                         Err(error) => return Err(Self::class_plan_error(statement, error)),
                     };
+                    if export_modifier.is_some() != class.export_local().is_some() {
+                        return Err(SourceCheckError::Class(statement));
+                    }
                     if class
                         .base_plan()
                         .is_some_and(|base| self.prior_classes.get(&base.symbol()) != Some(base))
@@ -6480,25 +6484,35 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(Some(modifier))
     }
 
-    fn reject_class_declaration_modifiers(
+    fn validate_class_declaration_modifiers(
         &self,
         declaration: NodeRef,
         declaration_range: TextRange,
         name: NodeId,
         modifiers: Option<&ModifierList>,
-    ) -> Result<(), SourceCheckError> {
+        is_external_module: bool,
+    ) -> Result<Option<NodeRef>, SourceCheckError> {
         let Some(modifiers) = modifiers else {
-            return Ok(());
+            return Ok(None);
         };
-        match self.validate_named_type_modifiers(
+        let name_start = self.node(self.reference(name))?.range.start.get();
+        match self.validate_function_modifiers(
             declaration,
             declaration_range,
-            name,
+            name_start,
             Some(modifiers),
-            SyntaxKind::ClassDeclaration,
-            SourceSyntaxRole::Statement,
         ) {
             Err(error @ SourceCheckError::Provenance(_)) => Err(error),
+            Ok(PlannedFunctionModifierMode::Declare) => Ok(None),
+            Ok(PlannedFunctionModifierMode::ExportDeclare(export)) if is_external_module => {
+                Ok(Some(export))
+            }
+            Ok(PlannedFunctionModifierMode::ExportDeclare(export)) => Err(
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::MissingExternalModuleFact {
+                    node: export,
+                    role: SourceSyntaxRole::Statement,
+                }),
+            ),
             Ok(_) | Err(_) => Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Class(declaration),
             )),
@@ -25248,6 +25262,15 @@ pub(super) fn check_source_file(
                 let declaration = class.declaration();
                 let materialized = execute_nongeneric_class_member_query(store, host, &class)
                     .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
+                if let Some(local) = class.export_local() {
+                    stage_value_type(
+                        store,
+                        &mut staged_value_types,
+                        &mut value_order,
+                        local,
+                        materialized.shells().value_type(),
+                    )?;
+                }
                 if current_flow_types
                     .insert(class.symbol(), materialized.shells().value_type())
                     .is_some()

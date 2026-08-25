@@ -14,7 +14,8 @@
 //! graph is in the same supported family; the whole-source adapter consumes
 //! that graph only after seeing the exact direct base plan earlier in source.
 //! Empty methods retain their canonical callable identities, including one
-//! authenticated `...args: any[]` rest parameter.
+//! authenticated `...args: any[]` rest parameter. Ambient classes also admit
+//! bodyless methods with direct primitive parameter and return annotations.
 //! Direct classes can also retain one string-to-number index signature.
 //! Annotated fields admit one authenticated ambient-function decorator.
 //! One direct getter/setter pair can expose an annotated numeric property.
@@ -110,8 +111,18 @@ struct ClassMethodPlan {
     name_node: NodeRef,
     name: String,
     side: ClassPropertySide,
+    ambient: bool,
     return_type_node: Option<NodeRef>,
+    parameters: Vec<ClassMethodParameterPlan>,
     rest_parameter: Option<ClassMethodRestParameterPlan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClassMethodParameterPlan {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    type_node: NodeRef,
+    type_: TypeId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,6 +239,8 @@ impl ClassPropertyPlan {
 pub(super) struct ClassDeclarationPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
+    ambient: bool,
+    export_local: Option<SemanticSymbolId>,
     base: Option<DirectClassBasePlan>,
     null_base: Option<NullClassBasePlan>,
     implementations: Vec<DirectClassImplementationPlan>,
@@ -1719,6 +1732,119 @@ fn plan_class_method_rest_parameter(
     })
 }
 
+fn plan_ambient_class_method_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    method: NodeRef,
+    parameter: NodeRef,
+    parameters: &ts_ast::NodeList,
+    previous_end: ts_core::TextPos,
+) -> Result<ClassMethodParameterPlan, ClassError> {
+    let reject = || accessor_member_error(method, SyntaxKind::MethodDeclaration);
+    let record = preflight_node(store, host, parameter)?;
+    let NodeData::ParameterDeclaration(data) = &record.data else {
+        return Err(reject());
+    };
+    if record.kind != SyntaxKind::Parameter
+        || record.flags.0 != 0
+        || record.parent != Some(method.node)
+        || record.range.start < previous_end
+        || record.range.start < parameters.range.start
+        || record.range.end > parameters.range.end
+        || data.dot_dot_dot_token.is_some()
+        || data.initializer.is_some()
+        || data.question_token.is_some()
+        || data.symbol.is_some()
+        || data.facts != 0
+        || data.modifiers.is_some()
+    {
+        return Err(reject());
+    }
+
+    let name = NodeRef::new(parameter.arena, parameter.file, data.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(reject());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(parameter.node)
+        || name_record.range.start < record.range.start
+        || name_record.range.end > record.range.end
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || identifier.text == "this"
+    {
+        return Err(reject());
+    }
+
+    let Some(type_node) = data.type_ else {
+        return Err(reject());
+    };
+    let type_node = NodeRef::new(parameter.arena, parameter.file, type_node);
+    let type_record = preflight_node(store, host, type_node)?;
+    if type_record.flags.0 != 0
+        || type_record.parent != Some(parameter.node)
+        || type_record.range.start < name_record.range.end
+        || type_record.range.end != record.range.end
+        || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
+    {
+        return Err(reject());
+    }
+    let type_ = primitive_keyword_type(store, type_node, type_record.kind).map_err(|error| {
+        if matches!(error, ClassError::Unsupported(_)) {
+            reject()
+        } else {
+            error
+        }
+    })?;
+    validate_index_type_cache(store, type_node, type_)?;
+
+    let symbol = bound_symbol(store, host, parameter)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let symbol_record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let locals = host
+        .bound_file(method)
+        .and_then(|bound| bound.locals(method))
+        .and_then(|locals| store.symbol_table(locals));
+    if symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.declarations() != Some(&[parameter])
+        || symbol_record.value_declaration() != Some(parameter)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent().is_some()
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || locals.is_none_or(|locals| {
+            locals.len() != parameters.nodes.len()
+                || locals.get_source(&identifier.text) != Some(symbol)
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(parameter)));
+    }
+    if store.value_symbol_links(symbol).is_some_and(|links| {
+        links != &ValueSymbolLinks::default()
+            && links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+    }
+
+    Ok(ClassMethodParameterPlan {
+        declaration: parameter,
+        symbol,
+        type_node,
+        type_,
+    })
+}
+
 fn plan_method(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1726,6 +1852,7 @@ fn plan_method(
     declaration: NodeRef,
     instance_members: Option<SymbolTableId>,
     static_members: SymbolTableId,
+    ambient: bool,
 ) -> Result<ClassMethodPlan, ClassError> {
     let record = preflight_node(store, host, declaration)?;
     let NodeData::MethodDeclaration(method) = &record.data else {
@@ -1748,27 +1875,51 @@ fn plan_method(
             kind: SyntaxKind::MethodDeclaration,
         }));
     }
-    if method.parameters.nodes.len() > 1 || method.parameters.has_trailing_comma {
+    if !ambient && method.parameters.nodes.len() > 1 || method.parameters.has_trailing_comma {
         return Err(unsupported(ClassUnsupported::Member {
             node: declaration,
             kind: SyntaxKind::MethodDeclaration,
         }));
     }
-    let rest_parameter = method
-        .parameters
-        .nodes
-        .first()
-        .copied()
-        .map(|parameter| {
-            plan_class_method_rest_parameter(
+    let mut parameters = Vec::new();
+    let rest_parameter = if ambient {
+        parameters
+            .try_reserve_exact(method.parameters.nodes.len())
+            .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
+        let mut previous_end = method.parameters.range.start;
+        for parameter in &method.parameters.nodes {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+            let planned = plan_ambient_class_method_parameter(
                 store,
                 host,
                 declaration,
-                NodeRef::new(declaration.arena, declaration.file, parameter),
+                parameter,
                 &method.parameters,
-            )
-        })
-        .transpose()?;
+                previous_end,
+            )?;
+            previous_end = preflight_node(store, host, parameter)?.range.end;
+            parameters.push(planned);
+        }
+        i32::try_from(parameters.len())
+            .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
+        None
+    } else {
+        method
+            .parameters
+            .nodes
+            .first()
+            .copied()
+            .map(|parameter| {
+                plan_class_method_rest_parameter(
+                    store,
+                    host,
+                    declaration,
+                    NodeRef::new(declaration.arena, declaration.file, parameter),
+                    &method.parameters,
+                )
+            })
+            .transpose()?
+    };
     let name_node = NodeRef::new(declaration.arena, declaration.file, method.name);
     let name_record = preflight_node(store, host, name_node)?;
     let NodeData::Identifier(identifier) = &name_record.data else {
@@ -1818,34 +1969,43 @@ fn plan_method(
         }
         body_start = type_record.range.end;
     }
-    let body = method
-        .body
-        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
-        .ok_or_else(|| {
-            unsupported(ClassUnsupported::Member {
+    if ambient {
+        if method.body.is_some() || return_type_node.is_none() || body_start != record.range.end {
+            return Err(unsupported(ClassUnsupported::Member {
                 node: declaration,
                 kind: SyntaxKind::MethodDeclaration,
-            })
-        })?;
-    let body_record = preflight_node(store, host, body)?;
-    let NodeData::Block(block) = &body_record.data else {
-        return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
-    };
-    if body_record.kind != SyntaxKind::Block
-        || body_record.parent != Some(declaration.node)
-        || body_record.flags.0 != 0
-        || body_record.range.start < body_start
-        || body_record.range.end != record.range.end
-        || block.facts != 0
-        || block.statements.has_trailing_comma
-    {
-        return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
-    }
-    if !block.statements.nodes.is_empty() {
-        return Err(unsupported(ClassUnsupported::Member {
-            node: declaration,
-            kind: SyntaxKind::MethodDeclaration,
-        }));
+            }));
+        }
+    } else {
+        let body = method
+            .body
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            .ok_or_else(|| {
+                unsupported(ClassUnsupported::Member {
+                    node: declaration,
+                    kind: SyntaxKind::MethodDeclaration,
+                })
+            })?;
+        let body_record = preflight_node(store, host, body)?;
+        let NodeData::Block(block) = &body_record.data else {
+            return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+        };
+        if body_record.kind != SyntaxKind::Block
+            || body_record.parent != Some(declaration.node)
+            || body_record.flags.0 != 0
+            || body_record.range.start < body_start
+            || body_record.range.end != record.range.end
+            || block.facts != 0
+            || block.statements.has_trailing_comma
+        {
+            return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+        }
+        if !block.statements.nodes.is_empty() {
+            return Err(unsupported(ClassUnsupported::Member {
+                node: declaration,
+                kind: SyntaxKind::MethodDeclaration,
+            }));
+        }
     }
 
     let symbol = bound_symbol(store, host, declaration)
@@ -1853,6 +2013,16 @@ fn plan_method(
     let symbol_record = store
         .symbol(symbol)
         .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
+    if ambient
+        && symbol_record
+            .declarations()
+            .is_some_and(|declarations| declarations.len() > 1)
+    {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: declaration,
+            kind: SyntaxKind::MethodDeclaration,
+        }));
+    }
     let table = match side {
         ClassPropertySide::Instance => instance_members,
         ClassPropertySide::Static => Some(static_members),
@@ -1881,7 +2051,9 @@ fn plan_method(
         name_node,
         name: identifier.text.clone(),
         side,
+        ambient,
         return_type_node,
+        parameters,
         rest_parameter,
     })
 }
@@ -3537,6 +3709,142 @@ fn authenticated_javascript_class_expando(
     first_assignment
 }
 
+fn plan_class_declaration_modifiers(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    owner: &Symbol,
+    name: NodeRef,
+    modifiers: Option<&ts_ast::ModifierList>,
+) -> Result<(bool, Option<SemanticSymbolId>), ClassError> {
+    let bound = host
+        .bound_file(declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
+    let Some(modifiers) = modifiers else {
+        if owner.parent().is_some() || bound.local_symbol(declaration).is_some() {
+            return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+        }
+        return Ok((false, None));
+    };
+    let declaration_record = preflight_node(store, host, declaration)?;
+    let name_record = preflight_node(store, host, name)?;
+    if modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifiers.list.range.start != declaration_record.range.start
+        || modifiers.list.range.end > name_record.range.start
+    {
+        return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
+    }
+
+    let expected = match modifiers.list.nodes.as_slice() {
+        [_] => &[SyntaxKind::DeclareKeyword][..],
+        [_, _] => &[SyntaxKind::ExportKeyword, SyntaxKind::DeclareKeyword][..],
+        _ => {
+            return Err(unsupported(ClassUnsupported::DeclarationModifiers(
+                declaration,
+            )));
+        }
+    };
+    let source = host
+        .source(declaration)
+        .and_then(|(arena, _)| arena.source_text())
+        .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(declaration)))?;
+    let mut previous_end = declaration_record.range.start;
+    for (modifier_id, kind) in modifiers.list.nodes.iter().zip(expected) {
+        let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier_id);
+        let record = preflight_node(store, host, modifier)?;
+        let spelling = match kind {
+            SyntaxKind::ExportKeyword => "export",
+            SyntaxKind::DeclareKeyword => "declare",
+            _ => unreachable!("only exported ambient class modifiers are planned"),
+        };
+        if record.kind != *kind {
+            return Err(unsupported(ClassUnsupported::DeclarationModifiers(
+                declaration,
+            )));
+        }
+        if record.flags.0 != 0
+            || record.parent != Some(declaration.node)
+            || !matches!(record.data, NodeData::Token(_))
+            || record.range.start < previous_end
+            || record.range.end > name_record.range.start
+            || source.get(record.range.start.get() as usize..record.range.end.get() as usize)
+                != Some(spelling)
+        {
+            return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
+        }
+        previous_end = record.range.end;
+    }
+
+    if expected.len() == 1 {
+        if owner.parent().is_some() || bound.local_symbol(declaration).is_some() {
+            return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+        }
+        return Ok((true, None));
+    }
+
+    let Some(parent) = owner.parent() else {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    };
+    let Some(local) = bound.local_symbol(declaration) else {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    };
+    let Some(parent_record) = store.symbol(parent) else {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    };
+    let Some(local_record) = store.symbol(local) else {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    };
+    let Some(NodeData::Identifier(identifier)) = host.node(name).map(|record| &record.data) else {
+        return Err(invariant(ClassInvariant::InvalidName(name)));
+    };
+    let source_locals = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals));
+    if !bound
+        .source_facts()
+        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_external_module)
+        || bound.symbol(bound.source_file()) != Some(parent)
+        || store.get_merged_symbol(parent) != Some(parent)
+        || parent_record.flags() != SymbolFlags::VALUE_MODULE
+        || parent_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&identifier.text))
+            != Some(symbol)
+        || local == symbol
+        || local_record.flags() != SymbolFlags::EXPORT_VALUE
+        || local_record.check_flags() != CheckFlags::NONE
+        || local_record.name().as_utf8() != Some(identifier.text.as_str())
+        || local_record.declarations() != Some(&[declaration])
+        || local_record.value_declaration().is_some()
+        || local_record.members().is_some()
+        || local_record.exports().is_some()
+        || local_record.parent().is_some()
+        || local_record.export_symbol() != Some(symbol)
+        || store.get_merged_symbol(local) != Some(local)
+        || source_locals.and_then(|locals| locals.get_source(&identifier.text)) != Some(local)
+        || store.value_symbol_links(local).is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && store
+                    .value_symbol_links(symbol)
+                    .and_then(|owner_links| owner_links.resolved_type)
+                    .is_none_or(|type_| {
+                        links
+                            != &(ValueSymbolLinks {
+                                resolved_type: Some(type_),
+                                ..ValueSymbolLinks::default()
+                            })
+                    })
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    }
+
+    Ok((true, Some(local)))
+}
+
 /// Produces the opaque syntax/binder proof consumed by the class shell
 /// executor and the root annotation adapter.
 fn plan_class_declaration(
@@ -3558,7 +3866,6 @@ fn plan_class_declaration(
         plan_class_owner_declarations(store, host, symbol, symbol_record)?;
     if symbol_record.check_flags() != CheckFlags::NONE
         || symbol_record.value_declaration() != Some(declaration)
-        || symbol_record.parent().is_some()
         || symbol_record.export_symbol().is_some()
     {
         return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
@@ -3586,11 +3893,19 @@ fn plan_class_declaration(
     {
         return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
     }
-    if class.modifiers.is_some() {
-        return Err(unsupported(ClassUnsupported::DeclarationModifiers(
-            declaration,
-        )));
-    }
+    let Some(name) = class.name else {
+        return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, name);
+    let (ambient, export_local) = plan_class_declaration_modifiers(
+        store,
+        host,
+        declaration,
+        symbol,
+        symbol_record,
+        name,
+        class.modifiers.as_ref(),
+    )?;
     if class.type_parameters.is_some() {
         return Err(unsupported(ClassUnsupported::Generic(declaration)));
     }
@@ -3635,10 +3950,6 @@ fn plan_class_declaration(
             }
         }
     };
-    let Some(name) = class.name else {
-        return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
-    };
-    let name = NodeRef::new(declaration.arena, declaration.file, name);
     let name_record = preflight_node(store, host, name)?;
     let NodeData::Identifier(identifier) = &name_record.data else {
         return Err(invariant(ClassInvariant::InvalidName(name)));
@@ -3776,6 +4087,7 @@ fn plan_class_declaration(
                 member,
                 instance_members,
                 static_members,
+                ambient,
             )?;
             let names = match method.side {
                 ClassPropertySide::Instance => &mut instance_names,
@@ -3796,6 +4108,14 @@ fn plan_class_declaration(
                 node: member,
                 kind: member_record.kind,
             }));
+        }
+        if ambient
+            && matches!(
+                &member_record.data,
+                NodeData::PropertyDeclaration(property) if property.initializer.is_some()
+            )
+        {
+            return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
         }
         let property = plan_property(
             store,
@@ -3938,6 +4258,8 @@ fn plan_class_declaration(
     Ok(ClassDeclarationPlan {
         declaration,
         symbol,
+        ambient,
+        export_local,
         base,
         null_base,
         implementations,
@@ -4066,6 +4388,12 @@ impl ClassMemberQueryPlan {
     pub(super) const fn symbol(&self) -> SemanticSymbolId {
         match self {
             Self::Direct(plan) | Self::Derived { class: plan, .. } => plan.symbol(),
+        }
+    }
+
+    pub(super) const fn export_local(&self) -> Option<SemanticSymbolId> {
+        match self {
+            Self::Direct(plan) | Self::Derived { class: plan, .. } => plan.class.export_local,
         }
     }
 
@@ -4611,10 +4939,11 @@ fn method_return_type(
     if record.flags.0 != 0
         || record.parent != Some(method.declaration.node)
         || !matches!(record.data, NodeData::KeywordTypeNode(_))
-        || !matches!(
-            record.kind,
-            SyntaxKind::VoidKeyword | SyntaxKind::AnyKeyword | SyntaxKind::UndefinedKeyword
-        )
+        || !method.ambient
+            && !matches!(
+                record.kind,
+                SyntaxKind::VoidKeyword | SyntaxKind::AnyKeyword | SyntaxKind::UndefinedKeyword
+            )
     {
         return Err(unsupported(ClassUnsupported::Member {
             node: method.declaration,
@@ -4634,6 +4963,7 @@ fn exact_method_callable(
         method.symbol,
         method.declaration,
         return_type,
+        &method.parameters,
         method.rest_parameter,
     )
 }
@@ -4643,6 +4973,7 @@ fn exact_method_value(
     symbol: SemanticSymbolId,
     declaration: NodeRef,
     return_type: TypeId,
+    parameters: &[ClassMethodParameterPlan],
     rest_parameter: Option<ClassMethodRestParameterPlan>,
 ) -> Option<(TypeId, SignatureId)> {
     let links = store.value_symbol_links(symbol)?;
@@ -4663,17 +4994,57 @@ fn exact_method_value(
         return None;
     };
     let signature_record = store.signature(*signature)?;
+    let minimum_argument_count = if rest_parameter.is_some() {
+        0
+    } else {
+        i32::try_from(parameters.len()).ok()?
+    };
     let parameters_valid = match rest_parameter {
-        None => {
+        None if parameters.is_empty() => {
             signature_record.flags() == SignatureFlags::NONE
                 && signature_record.parameters().is_empty()
                 && store
                     .callable_signature_parameter_types(*signature)
                     .is_none_or(<[TypeId]>::is_empty)
         }
+        None => {
+            signature_record.flags() == SignatureFlags::NONE
+                && signature_record.parameters().len() == parameters.len()
+                && signature_record.parameters().iter().zip(parameters).all(
+                    |(symbol, parameter)| {
+                        *symbol == parameter.symbol
+                            && store.source_node_kind(parameter.declaration)
+                                == Some(SyntaxKind::Parameter)
+                            && store.source_node_parent(parameter.declaration)
+                                == Some(SourceNodeParent::Parent(declaration))
+                            && store.source_direct_type_annotation(parameter.declaration)
+                                == Some(parameter.type_node)
+                            && store.type_node_links(parameter.type_node)
+                                == Some(&TypeNodeLinks {
+                                    resolved_type: Some(parameter.type_),
+                                    ..TypeNodeLinks::default()
+                                })
+                            && store.value_symbol_links(parameter.symbol)
+                                == Some(&ValueSymbolLinks {
+                                    resolved_type: Some(parameter.type_),
+                                    ..ValueSymbolLinks::default()
+                                })
+                    },
+                )
+                && store
+                    .callable_signature_parameter_types(*signature)
+                    .is_none_or(|cached| {
+                        cached.len() == parameters.len()
+                            && cached
+                                .iter()
+                                .zip(parameters)
+                                .all(|(cached, parameter)| *cached == parameter.type_)
+                    })
+        }
         Some(parameter) => {
             let any = store.intrinsic_bootstrap()?.any_type;
-            signature_record.flags() == SignatureFlags::HAS_REST_PARAMETER
+            parameters.is_empty()
+                && signature_record.flags() == SignatureFlags::HAS_REST_PARAMETER
                 && signature_record.parameters() == [parameter.symbol]
                 && store.source_node_kind(parameter.declaration) == Some(SyntaxKind::Parameter)
                 && store.source_node_parent(parameter.declaration)
@@ -4720,7 +5091,7 @@ fn exact_method_value(
         || signature_record.declaration() != Some(declaration)
         || !signature_record.type_parameters().is_empty()
         || signature_record.this_parameter().is_some()
-        || signature_record.min_argument_count() != 0
+        || signature_record.min_argument_count() != minimum_argument_count
         || signature_record.resolved_min_argument_count() != -1
         || signature_record.resolved_return_type() != Some(return_type)
         || signature_record.resolved_type_predicate().is_some()
@@ -4757,6 +5128,24 @@ fn validate_method_cache_state(
         return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
             type_node,
         )));
+    }
+    for parameter in &method.parameters {
+        validate_index_type_cache(store, parameter.type_node, parameter.type_)?;
+        if store
+            .value_symbol_links(parameter.symbol)
+            .is_some_and(|links| {
+                links != &ValueSymbolLinks::default()
+                    && links
+                        != &(ValueSymbolLinks {
+                            resolved_type: Some(parameter.type_),
+                            ..ValueSymbolLinks::default()
+                        })
+            })
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+                parameter.symbol,
+            )));
+        }
     }
     if let Some(parameter) = method.rest_parameter {
         let any = store
@@ -4939,6 +5328,9 @@ fn uninitialized_instance_properties(
     class: &ClassDeclarationPlan,
     property_types: &[TypeId],
 ) -> Result<Vec<NodeRef>, ClassError> {
+    if class.ambient {
+        return Ok(Vec::new());
+    }
     let mut uninitialized = Vec::new();
     uninitialized
         .try_reserve(class.instance_properties.len())
@@ -5222,11 +5614,11 @@ pub(super) fn plan_nongeneric_class_member_query(
             .class
             .methods
             .iter()
-            .any(|method| method.rest_parameter.is_some())
+            .any(|method| method.rest_parameter.is_some() || !method.parameters.is_empty())
         || class
             .methods
             .iter()
-            .any(|method| method.rest_parameter.is_some())
+            .any(|method| method.rest_parameter.is_some() || !method.parameters.is_empty())
         || base_plan
             .class
             .constructor
@@ -9280,8 +9672,15 @@ fn prepare_class_method_signatures(
             .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
         let mut parameters = Vec::new();
         parameters
-            .try_reserve_exact(usize::from(method.rest_parameter.is_some()))
+            .try_reserve_exact(
+                method
+                    .parameters
+                    .len()
+                    .checked_add(usize::from(method.rest_parameter.is_some()))
+                    .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?,
+            )
             .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+        parameters.extend(method.parameters.iter().map(|parameter| parameter.symbol));
         if let Some(parameter) = method.rest_parameter {
             parameters.push(parameter.symbol);
         }
@@ -9338,7 +9737,8 @@ fn publish_class_methods(
                 parameters,
                 Some(*return_type),
                 None,
-                0,
+                i32::try_from(method.parameters.len())
+                    .expect("the class method plan retained a bounded parameter count"),
             )
             .expect("the class transaction reserved the method signature");
         signatures.push(signature);
@@ -9348,6 +9748,22 @@ fn publish_class_methods(
                 TypeNodeLinks {
                     resolved_type: Some(*return_type),
                     ..TypeNodeLinks::default()
+                },
+            ));
+        }
+        for parameter in &method.parameters {
+            assert!(store.set_type_node_links(
+                parameter.type_node,
+                TypeNodeLinks {
+                    resolved_type: Some(parameter.type_),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_value_symbol_links(
+                parameter.symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(parameter.type_),
+                    ..ValueSymbolLinks::default()
                 },
             ));
         }
@@ -9718,6 +10134,13 @@ pub(super) fn execute_nongeneric_class_members(
         .flat_map(|parameter| [parameter.type_node, parameter.element_type_node])
         .filter(|type_node| store.type_node_links(*type_node).is_none())
         .count();
+    let missing_method_parameter_type_node_links = plan
+        .class
+        .methods
+        .iter()
+        .flat_map(|method| &method.parameters)
+        .filter(|parameter| store.type_node_links(parameter.type_node).is_none())
+        .count();
     let missing_index_type_node_links = plan.class.index.map_or(0, |index| {
         [index.key_type_node, index.value_type_node]
             .into_iter()
@@ -9744,6 +10167,7 @@ pub(super) fn execute_nongeneric_class_members(
     let missing_type_node_links = missing_property_type_node_links
         .checked_add(missing_method_type_node_links)
         .and_then(|count| count.checked_add(missing_method_rest_type_node_links))
+        .and_then(|count| count.checked_add(missing_method_parameter_type_node_links))
         .and_then(|count| count.checked_add(missing_index_type_node_links))
         .and_then(|count| count.checked_add(missing_accessor_type_node_links))
         .and_then(|count| count.checked_add(missing_constructor_parameter_type_node_links))
@@ -9768,6 +10192,13 @@ pub(super) fn execute_nongeneric_class_members(
         .methods
         .iter()
         .filter_map(|method| method.rest_parameter)
+        .filter(|parameter| store.value_symbol_links(parameter.symbol).is_none())
+        .count();
+    let missing_method_parameter_value_links = plan
+        .class
+        .methods
+        .iter()
+        .flat_map(|method| &method.parameters)
         .filter(|parameter| store.value_symbol_links(parameter.symbol).is_none())
         .count();
     let missing_accessor_value_links = plan.class.accessor.as_ref().map_or(0, |accessor| {
@@ -9807,6 +10238,7 @@ pub(super) fn execute_nongeneric_class_members(
         .checked_add(missing_owner_value_link)
         .and_then(|count| count.checked_add(missing_method_value_links))
         .and_then(|count| count.checked_add(missing_method_rest_value_links))
+        .and_then(|count| count.checked_add(missing_method_parameter_value_links))
         .and_then(|count| count.checked_add(missing_accessor_value_links))
         .and_then(|count| count.checked_add(missing_constructor_parameter_value_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
@@ -11011,8 +11443,8 @@ fn exact_stored_method_return_type(
     declaration: NodeRef,
     return_type: TypeId,
 ) -> bool {
-    // Empty class method bodies follow the optional return annotation in the arena.
-    let Some(body_index) = declaration
+    // A bodyless ambient method ends at its annotation; ordinary methods end at their block.
+    let Some(last_index) = declaration
         .node
         .index()
         .checked_sub(1)
@@ -11020,29 +11452,35 @@ fn exact_stored_method_return_type(
     else {
         return false;
     };
-    let body = NodeRef::new(
+    let last = NodeRef::new(
         declaration.arena,
         declaration.file,
-        ts_ast::NodeId::new(body_index),
+        ts_ast::NodeId::new(last_index),
     );
-    if store.source_node_kind(body) != Some(SyntaxKind::Block)
-        || store.source_node_parent(body) != Some(SourceNodeParent::Parent(declaration))
-    {
+    if store.source_node_parent(last) != Some(SourceNodeParent::Parent(declaration)) {
         return false;
     }
-    let Some(previous_index) = body
-        .node
-        .index()
-        .checked_sub(1)
-        .and_then(|index| u32::try_from(index).ok())
-    else {
+    let bodyless = store.source_node_kind(last) != Some(SyntaxKind::Block);
+    if bodyless && store.source_direct_type_annotation(declaration) != Some(last) {
         return false;
+    }
+    let previous = if !bodyless {
+        let Some(previous_index) = last
+            .node
+            .index()
+            .checked_sub(1)
+            .and_then(|index| u32::try_from(index).ok())
+        else {
+            return false;
+        };
+        NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            ts_ast::NodeId::new(previous_index),
+        )
+    } else {
+        last
     };
-    let previous = NodeRef::new(
-        declaration.arena,
-        declaration.file,
-        ts_ast::NodeId::new(previous_index),
-    );
     if store.source_node_parent(previous) != Some(SourceNodeParent::Parent(declaration)) {
         return false;
     }
@@ -11050,7 +11488,16 @@ fn exact_stored_method_return_type(
         Some(SyntaxKind::Identifier | SyntaxKind::Parameter) => store
             .intrinsic_bootstrap()
             .is_some_and(|bootstrap| return_type == bootstrap.void_type),
-        Some(SyntaxKind::VoidKeyword | SyntaxKind::AnyKeyword | SyntaxKind::UndefinedKeyword) => {
+        Some(kind)
+            if kind.is_keyword_type()
+                && (bodyless
+                    || matches!(
+                        kind,
+                        SyntaxKind::VoidKeyword
+                            | SyntaxKind::AnyKeyword
+                            | SyntaxKind::UndefinedKeyword
+                    )) =>
+        {
             store.type_node_links(previous)
                 == Some(&TypeNodeLinks {
                     resolved_type: Some(return_type),
@@ -11188,6 +11635,66 @@ fn exact_stored_class_method_rest_parameter(
     ))
 }
 
+fn exact_stored_ambient_class_method_parameters(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    signature: SignatureId,
+) -> Option<Vec<ClassMethodParameterPlan>> {
+    let signature_record = store.signature(signature)?;
+    if signature_record.flags() != SignatureFlags::NONE
+        || signature_record.parameters().is_empty()
+        || store.source_direct_type_annotation(declaration).is_none()
+    {
+        return None;
+    }
+
+    let mut planned = Vec::new();
+    planned
+        .try_reserve_exact(signature_record.parameters().len())
+        .ok()?;
+    for &symbol in signature_record.parameters() {
+        let record = store.symbol(symbol)?;
+        let [parameter] = record.declarations()? else {
+            return None;
+        };
+        let parameter = *parameter;
+        let type_node = store.source_primitive_type_annotation(parameter)?;
+        let kind = store.source_node_kind(type_node)?;
+        let type_ = primitive_keyword_type(store, type_node, kind).ok()?;
+        if record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || record.check_flags() != CheckFlags::NONE
+            || record.value_declaration() != Some(parameter)
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent().is_some()
+            || record.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || store.source_node_kind(parameter) != Some(SyntaxKind::Parameter)
+            || store.source_node_parent(parameter) != Some(SourceNodeParent::Parent(declaration))
+            || store.source_node_parent(type_node) != Some(SourceNodeParent::Parent(parameter))
+            || store.type_node_links(type_node)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(type_),
+                    ..TypeNodeLinks::default()
+                })
+            || store.value_symbol_links(symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return None;
+        }
+        planned.push(ClassMethodParameterPlan {
+            declaration: parameter,
+            symbol,
+            type_node,
+            type_,
+        });
+    }
+    Some(planned)
+}
+
 fn exact_stored_method(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
@@ -11204,11 +11711,23 @@ fn exact_stored_method(
     let [signature] = structured.signatures.as_deref()? else {
         return None;
     };
-    let rest_parameter =
-        match exact_stored_class_method_rest_parameter(store, *declaration, *signature)? {
-            StoredClassMethodRestParameter::Absent => None,
-            StoredClassMethodRestParameter::Present(parameter) => Some(parameter),
-        };
+    let signature_record = store.signature(*signature)?;
+    let (parameters, rest_parameter) = if signature_record.flags() == SignatureFlags::NONE
+        && !signature_record.parameters().is_empty()
+    {
+        (
+            exact_stored_ambient_class_method_parameters(store, *declaration, *signature)?,
+            None,
+        )
+    } else {
+        (
+            Vec::new(),
+            match exact_stored_class_method_rest_parameter(store, *declaration, *signature)? {
+                StoredClassMethodRestParameter::Absent => None,
+                StoredClassMethodRestParameter::Present(parameter) => Some(parameter),
+            },
+        )
+    };
     let return_type = store.signature(*signature)?.resolved_return_type()?;
     (record.flags() == SymbolFlags::METHOD
         && record.check_flags() == CheckFlags::NONE
@@ -11222,8 +11741,14 @@ fn exact_stored_method(
         && store.source_node_parent(*declaration)
             == Some(SourceNodeParent::Parent(owner_declaration))
         && exact_stored_method_return_type(store, *declaration, return_type)
-        && exact_method_value(store, method, *declaration, return_type, rest_parameter)
-            == Some((method_type, *signature)))
+        && exact_method_value(
+            store,
+            method,
+            *declaration,
+            return_type,
+            &parameters,
+            rest_parameter,
+        ) == Some((method_type, *signature)))
     .then_some(*declaration)
 }
 

@@ -717,6 +717,242 @@ fn later_unannotated_variable_keeps_classes_and_field_diagnostics_cold_across_re
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One fixture verifies ambient class and method identities.
+fn ambient_class_methods_preserve_parameter_identities_and_replay_warm() {
+    let source = concat!(
+        "declare class Point { ",
+        "add(dx: number, dy: number): void; ",
+        "label(): string; ",
+        "value: number; ",
+        "}",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(71);
+    let mut context = checker_context_with_options(
+        &parsed,
+        file,
+        CanonicalModuleState::Script,
+        strict_property_options(),
+    );
+    let owner = class_symbol(&parsed, file, &context, "Point");
+    let declaration = class_declaration(&parsed, file, "Point");
+    let NodeData::ClassDeclaration(class) = &parsed.arena.get(declaration.node).unwrap().data
+    else {
+        panic!("Point must retain its class declaration")
+    };
+    let method = NodeRef::new(parsed.arena.id(), file, class.members.nodes[0]);
+    let NodeData::MethodDeclaration(method_data) = &parsed.arena.get(method.node).unwrap().data
+    else {
+        panic!("Point.add must retain its method declaration")
+    };
+    let parameter_declarations = method_data
+        .parameters
+        .nodes
+        .iter()
+        .map(|parameter| NodeRef::new(parsed.arena.id(), file, *parameter))
+        .collect::<Vec<_>>();
+    let parameter_symbols = parameter_declarations
+        .iter()
+        .map(|parameter| context.file(file).unwrap().1.symbol(*parameter).unwrap())
+        .collect::<Vec<_>>();
+
+    context.check_source_file(file).unwrap();
+
+    let members = context.get_nongeneric_class_members(owner).unwrap();
+    let names = members
+        .instance_properties()
+        .iter()
+        .map(|symbol| {
+            context
+                .store()
+                .symbol(*symbol)
+                .unwrap()
+                .name()
+                .as_utf8()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["add", "label", "value"]);
+    assert!(context.diagnostics().is_empty());
+
+    let add = members.instance_properties()[0];
+    let add_type = context
+        .store()
+        .value_symbol_links(add)
+        .and_then(|links| links.resolved_type)
+        .unwrap();
+    let TypeData::Object(callable) = context.store().type_payload(add_type).unwrap().data() else {
+        panic!("Point.add must retain one callable object")
+    };
+    let [signature] = callable.structured.signatures.as_deref().unwrap() else {
+        panic!("Point.add must retain exactly one signature")
+    };
+    let signature = context.store().signature(*signature).unwrap();
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    assert_eq!(signature.flags(), SignatureFlags::NONE);
+    assert_eq!(signature.declaration(), Some(method));
+    assert_eq!(signature.parameters(), parameter_symbols.as_slice());
+    assert_eq!(signature.min_argument_count(), 2);
+    assert_eq!(signature.resolved_return_type(), Some(bootstrap.void_type));
+    for symbol in parameter_symbols {
+        assert_eq!(
+            context.store().value_symbol_links(symbol),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(bootstrap.number_type),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+    }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.store().relation_state_snapshot(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        context.get_nongeneric_class_members(owner).unwrap(),
+        members
+    );
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+fn exported_ambient_classes_publish_their_existing_local_alias() {
+    let parsed = parse_source_file(concat!(
+        "export declare class Point { ",
+        "readonly value: number; ",
+        "getValue(): number; ",
+        "}",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(72);
+    let mut context = checker_context_with_options(
+        &parsed,
+        file,
+        CanonicalModuleState::External,
+        strict_property_options(),
+    );
+    let declaration = class_declaration(&parsed, file, "Point");
+    let bound = context.file(file).unwrap().1;
+    let owner = bound.symbol(declaration).unwrap();
+    let local = bound.local_symbol(declaration).unwrap();
+    assert_ne!(owner, local);
+
+    context.check_source_file(file).unwrap();
+
+    let members = context.get_nongeneric_class_members(owner).unwrap();
+    let expected = ValueSymbolLinks {
+        resolved_type: Some(members.shells().value_type()),
+        ..ValueSymbolLinks::default()
+    };
+    assert_eq!(context.store().value_symbol_links(owner), Some(&expected));
+    assert_eq!(context.store().value_symbol_links(local), Some(&expected));
+    assert_eq!(members.instance_properties().len(), 2);
+    assert!(context.diagnostics().is_empty());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.store().relation_state_snapshot(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        context.get_nongeneric_class_members(owner).unwrap(),
+        members
+    );
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+fn unsupported_ambient_class_shapes_leave_class_publication_cold() {
+    let cases = [
+        ("declare class Generic<T> {}", "Generic"),
+        (
+            "declare class Private { private value: number; }",
+            "Private",
+        ),
+        (
+            concat!(
+                "declare class Overloaded { ",
+                "value(input: string): void; ",
+                "value(input: number): void; ",
+                "}",
+            ),
+            "Overloaded",
+        ),
+        (
+            "declare class Executable { value(): void {} }",
+            "Executable",
+        ),
+    ];
+
+    for (index, (source, name)) in cases.into_iter().enumerate() {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(73 + u32::try_from(index).unwrap());
+        let mut context = checker_context(&parsed, file);
+        let owner = class_symbol(&parsed, file, &context, name);
+        let cold = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+        );
+
+        assert!(
+            matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(_)
+                ))
+            ),
+            "{source}",
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            cold,
+            "{source}",
+        );
+        assert!(context.store().declared_type_links(owner).is_none());
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(context.diagnostics().is_empty());
+    }
+}
+
+#[test]
 fn exported_class_is_unsupported_before_export_symbol_planning() {
     let parsed = parse_source_file("export class Exported { value?: string; }");
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
