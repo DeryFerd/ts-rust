@@ -217,7 +217,7 @@ pub(super) struct SourceControlLoopSyntax {
     pub(super) body: NodeRef,
 }
 
-/// One top-level `for (const item of value) { call(item); }` loop.
+/// One top-level `for...of` loop with a direct call or an iteration-property read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceForOfStatementSyntax {
     pub(super) control: SourceControlLoopSyntax,
@@ -282,6 +282,43 @@ pub(super) struct SourceUnusedIterationStatementSyntax {
     pub(super) callable_symbol: SemanticSymbolId,
     pub(super) capture_statement: NodeRef,
     pub(super) capture: NodeRef,
+}
+
+/// One identifier or shorthand object binding owned by a top-level loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceCapturedIterationBindingSyntax {
+    pub(super) declaration: NodeRef,
+    pub(super) name: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) binding: VariableBindingKind,
+    pub(super) destructured: bool,
+}
+
+/// One loop-local callable whose only statement reads the iteration binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceCapturedIterationBodySyntax {
+    Function {
+        declaration: NodeRef,
+        name: NodeRef,
+        symbol: SemanticSymbolId,
+        read: NodeRef,
+    },
+    ArrowVariable {
+        declaration: NodeRef,
+        name: NodeRef,
+        symbol: SemanticSymbolId,
+        binding: VariableBindingKind,
+        arrow: NodeRef,
+        read: NodeRef,
+    },
+}
+
+/// One top-level lexical loop that retains a single captured local callable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceCapturedIterationSyntax {
+    pub(super) control: SourceControlLoopSyntax,
+    pub(super) binding: SourceCapturedIterationBindingSyntax,
+    pub(super) body: SourceCapturedIterationBodySyntax,
 }
 
 impl SourceControlLoopSyntax {
@@ -901,55 +938,101 @@ pub(super) fn plan_source_for_of_statement_syntax(
         expression.expression,
     );
     let call_record = control_statement_node(arena, bound, call)?;
-    let NodeData::CallExpression(call_data) = &call_record.data else {
-        return Err(unsupported_control_statement(call, call_record.kind));
-    };
-    let [argument] = call_data.arguments.nodes.as_slice() else {
-        return Err(unsupported_control_statement(call, call_record.kind));
-    };
-    if call_record.kind != SyntaxKind::CallExpression
-        || call_record.flags.0 != 0
+    if call_record.flags.0 != 0
         || call_record.parent != Some(body_statement.node)
-        || call_data.question_dot_token.is_some()
-        || call_data.symbol.is_some()
-        || call_data.type_arguments.is_some()
-        || call_data.arguments.has_trailing_comma
-        || call_data.facts != 0
         || bound.container(call) != Some(source)
         || bound.block_scope_container(call) != Some(control.body)
     {
         return Err(unsupported_control_statement(call, call_record.kind));
     }
-    let callee = NodeRef::new(call.arena, call.file, call_data.expression);
-    let callee_record = control_statement_node(arena, bound, callee)?;
-    let NodeData::Identifier(callee_name) = &callee_record.data else {
-        return Err(unsupported_control_statement(callee, callee_record.kind));
+    let reads = match &call_record.data {
+        NodeData::CallExpression(call_data) if call_record.kind == SyntaxKind::CallExpression => {
+            let [argument] = call_data.arguments.nodes.as_slice() else {
+                return Err(unsupported_control_statement(call, call_record.kind));
+            };
+            if call_data.question_dot_token.is_some()
+                || call_data.symbol.is_some()
+                || call_data.type_arguments.is_some()
+                || call_data.arguments.has_trailing_comma
+                || call_data.facts != 0
+            {
+                return Err(unsupported_control_statement(call, call_record.kind));
+            }
+            let callee = NodeRef::new(call.arena, call.file, call_data.expression);
+            let callee_record = control_statement_node(arena, bound, callee)?;
+            let NodeData::Identifier(callee_name) = &callee_record.data else {
+                return Err(unsupported_control_statement(callee, callee_record.kind));
+            };
+            let argument = NodeRef::new(call.arena, call.file, *argument);
+            let argument_record = control_statement_node(arena, bound, argument)?;
+            let NodeData::Identifier(argument_name) = &argument_record.data else {
+                return Err(unsupported_control_statement(
+                    argument,
+                    argument_record.kind,
+                ));
+            };
+            if callee_record.kind != SyntaxKind::Identifier
+                || callee_record.flags.0 != 0
+                || callee_record.parent != Some(call.node)
+                || callee_name.flow_node.is_some()
+                || callee_name.text.is_empty()
+                || argument_record.kind != SyntaxKind::Identifier
+                || argument_record.flags.0 != 0
+                || argument_record.parent != Some(call.node)
+                || argument_name.flow_node.is_some()
+                || argument_name.text != identifier.text
+                || bound.container(callee) != Some(source)
+                || bound.container(argument) != Some(source)
+                || bound.block_scope_container(callee) != Some(control.body)
+                || bound.block_scope_container(argument) != Some(control.body)
+            {
+                return Err(unsupported_control_statement(call, call_record.kind));
+            }
+            vec![callee, argument]
+        }
+        NodeData::PropertyAccessExpression(property)
+            if call_record.kind == SyntaxKind::PropertyAccessExpression =>
+        {
+            let receiver = NodeRef::new(call.arena, call.file, property.expression);
+            let receiver_record = control_statement_node(arena, bound, receiver)?;
+            let NodeData::Identifier(receiver_name) = &receiver_record.data else {
+                return Err(unsupported_control_statement(
+                    receiver,
+                    receiver_record.kind,
+                ));
+            };
+            let property_name = NodeRef::new(call.arena, call.file, property.name);
+            let property_record = control_statement_node(arena, bound, property_name)?;
+            let NodeData::Identifier(property_identifier) = &property_record.data else {
+                return Err(unsupported_control_statement(
+                    property_name,
+                    property_record.kind,
+                ));
+            };
+            if property.flow_node.is_some()
+                || property.question_dot_token.is_some()
+                || property.facts != 0
+                || receiver_record.kind != SyntaxKind::Identifier
+                || receiver_record.flags.0 != 0
+                || receiver_record.parent != Some(call.node)
+                || receiver_name.flow_node.is_some()
+                || receiver_name.text != identifier.text
+                || property_record.kind != SyntaxKind::Identifier
+                || property_record.flags.0 != 0
+                || property_record.parent != Some(call.node)
+                || property_identifier.flow_node.is_some()
+                || property_identifier.text.is_empty()
+                || bound.container(receiver) != Some(source)
+                || bound.container(property_name) != Some(source)
+                || bound.block_scope_container(receiver) != Some(control.body)
+                || bound.block_scope_container(property_name) != Some(control.body)
+            {
+                return Err(unsupported_control_statement(call, call_record.kind));
+            }
+            vec![receiver]
+        }
+        _ => return Err(unsupported_control_statement(call, call_record.kind)),
     };
-    let argument = NodeRef::new(call.arena, call.file, *argument);
-    let argument_record = control_statement_node(arena, bound, argument)?;
-    let NodeData::Identifier(argument_name) = &argument_record.data else {
-        return Err(unsupported_control_statement(
-            argument,
-            argument_record.kind,
-        ));
-    };
-    if callee_record.kind != SyntaxKind::Identifier
-        || callee_record.flags.0 != 0
-        || callee_record.parent != Some(call.node)
-        || callee_name.flow_node.is_some()
-        || callee_name.text.is_empty()
-        || argument_record.kind != SyntaxKind::Identifier
-        || argument_record.flags.0 != 0
-        || argument_record.parent != Some(call.node)
-        || argument_name.flow_node.is_some()
-        || argument_name.text != identifier.text
-        || bound.container(callee) != Some(source)
-        || bound.container(argument) != Some(source)
-        || bound.block_scope_container(callee) != Some(control.body)
-        || bound.block_scope_container(argument) != Some(control.body)
-    {
-        return Err(unsupported_control_statement(call, call_record.kind));
-    }
 
     let graph = bound.flow_graph();
     let binding_flow = bound.flow_at(body_statement).ok_or(
@@ -971,10 +1054,10 @@ pub(super) fn plan_source_for_of_statement_syntax(
         || binding_node.antecedent.is_none()
         || !binding_node.antecedents.is_empty()
         || bound.flow_container(body_statement) != Some(source)
-        || bound.flow_container(callee) != Some(source)
-        || bound.flow_container(argument) != Some(source)
-        || bound.flow_at(callee) != Some(binding_flow)
-        || bound.flow_at(argument) != Some(binding_flow)
+        || reads.iter().any(|read| {
+            bound.flow_container(*read) != Some(source)
+                || bound.flow_at(*read) != Some(binding_flow)
+        })
     {
         return Err(SourceFunctionStatementsInvariant::InvalidFlowContainer {
             node: body_statement,
@@ -1977,6 +2060,50 @@ pub(super) fn plan_source_unused_iteration_statement_syntax(
         callable_symbol,
         capture_statement,
         capture,
+    })
+}
+
+/// Reuses the complete unused-loop proof for captured local callables.
+pub(super) fn plan_source_captured_iteration_statement_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<SourceCapturedIterationSyntax, SourceFunctionStatementsError> {
+    let existing = plan_source_unused_iteration_statement_syntax(arena, bound, store, statement)?;
+    let body = match existing.local_kind {
+        SourceUnusedIterationDeclarationKind::Function => {
+            SourceCapturedIterationBodySyntax::Function {
+                declaration: existing.local_declaration,
+                name: existing.local_name,
+                symbol: existing.local_symbol,
+                read: existing.capture,
+            }
+        }
+        SourceUnusedIterationDeclarationKind::ArrowVariable => {
+            SourceCapturedIterationBodySyntax::ArrowVariable {
+                declaration: existing.local_declaration,
+                name: existing.local_name,
+                symbol: existing.local_symbol,
+                binding: VariableBindingKind::Let,
+                arrow: existing.callable,
+                read: existing.capture,
+            }
+        }
+    };
+
+    Ok(SourceCapturedIterationSyntax {
+        control: existing.control,
+        binding: SourceCapturedIterationBindingSyntax {
+            declaration: existing
+                .binding_element
+                .unwrap_or(existing.binding_declaration),
+            name: existing.binding_name,
+            symbol: existing.binding_symbol,
+            binding: existing.binding,
+            destructured: existing.binding_element.is_some(),
+        },
+        body,
     })
 }
 
@@ -9855,6 +9982,172 @@ mod joined_tests {
             assert_eq!(fixture.bound.flow_at(argument), Some(syntax.binding_flow));
             assert!(fixture.bound.flow_at(syntax.call).is_none());
         }
+    }
+
+    #[test]
+    fn for_of_syntax_authenticates_direct_iteration_property_reads() {
+        let fixture = JoinedFixture::new(
+            "for (const item of values) { item.value; }",
+            FileId::new(1_460),
+        );
+        let statement = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ForOfStatement).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        let syntax = plan_source_for_of_statement_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            statement,
+        )
+        .unwrap();
+
+        let NodeData::PropertyAccessExpression(property) =
+            &fixture.parsed.arena.get(syntax.call.node).unwrap().data
+        else {
+            panic!("expected one authenticated iteration property read")
+        };
+        let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, property.expression);
+        assert_eq!(fixture.bound.flow_at(receiver), Some(syntax.binding_flow));
+    }
+
+    #[test]
+    fn captured_iteration_syntax_authenticates_loop_local_callables() {
+        for (index, (source, kind, destructured, arrow)) in [
+            (
+                "for (let x of [1, 2]) { function f() { x; } }",
+                SourceControlLoopKind::ForOf,
+                false,
+                false,
+            ),
+            (
+                "for (let x of [1, 2]) { let f = () => { x; }; }",
+                SourceControlLoopKind::ForOf,
+                false,
+                true,
+            ),
+            (
+                "for (const x in { a: 1 }) { function f() { x; } }",
+                SourceControlLoopKind::ForIn,
+                false,
+                false,
+            ),
+            (
+                "for (let { x } of [{ x: 1 }]) { let f = () => { x; }; }",
+                SourceControlLoopKind::ForOf,
+                true,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_470 + u32::try_from(index).unwrap()));
+            let statement = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(
+                        record.kind,
+                        SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement
+                    )
+                    .then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+
+            let syntax = plan_source_captured_iteration_statement_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                statement,
+            )
+            .unwrap();
+
+            assert_eq!(syntax.control.kind, kind);
+            assert_eq!(syntax.binding.destructured, destructured);
+            assert_eq!(
+                matches!(
+                    syntax.body,
+                    SourceCapturedIterationBodySyntax::ArrowVariable { .. }
+                ),
+                arrow,
+            );
+        }
+    }
+
+    #[test]
+    fn captured_iteration_syntax_rejects_forged_loop_local_symbols() {
+        let mut fixture = JoinedFixture::new(
+            "for (let item of [1]) { let retained = () => { item; }; }",
+            FileId::new(1_474),
+        );
+        let statement = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ForOfStatement).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let syntax = plan_source_captured_iteration_statement_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            statement,
+        )
+        .unwrap();
+        let SourceCapturedIterationBodySyntax::ArrowVariable {
+            declaration,
+            symbol,
+            ..
+        } = syntax.body
+        else {
+            panic!("expected one authenticated loop-local arrow")
+        };
+        let locals = fixture.bound.locals(syntax.control.body).unwrap();
+        assert_eq!(
+            fixture.store.insert_symbol(
+                locals,
+                EscapedName::source("retained"),
+                syntax.binding.symbol,
+            ),
+            Some(Some(symbol)),
+        );
+
+        assert_eq!(
+            plan_source_captured_iteration_statement_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                statement,
+            ),
+            Err(SourceFunctionStatementsInvariant::LocalTableMismatch {
+                declaration,
+                scope: syntax.control.body,
+                expected: symbol,
+                actual: Some(syntax.binding.symbol),
+            }
+            .into()),
+        );
     }
 
     #[test]

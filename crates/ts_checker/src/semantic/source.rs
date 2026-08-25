@@ -27,6 +27,7 @@
 //! top-level `for...of` loops with one const binding and one direct call,
 //! function-owned `for`, `for...in`, `for...of`, and condition loops with lexical captures,
 //! iteration loops whose unused nested callables capture their lexical bindings,
+//! captured local callables, shorthand object bindings, and exact union-iteration diagnostics,
 //! ordinary direct identifier calls, bounded annotated arrow call arguments,
 //! authenticated interpolated template expressions and contextual template types,
 //! authenticated zero-parameter async functions and arrows, awaited expressions,
@@ -231,6 +232,7 @@ use super::{
         plan_direct_source_property_syntax, prepare_source_property_diagnostic,
     },
     source_statements::{
+        SourceCapturedIterationBodySyntax, SourceCapturedIterationSyntax,
         SourceConditionalEnumFunctionStatementsSyntax, SourceControlIfSyntax,
         SourceControlLoopKind, SourceControlLoopSyntax, SourceEqualityConditionSyntax,
         SourceFallthroughBranchSyntax, SourceForInStatementSyntax, SourceForOfStatementSyntax,
@@ -244,7 +246,7 @@ use super::{
         SourceSwitchObjectBindingSyntax, SourceTypeofConditionSyntax,
         SourceTypeofSwitchFunctionStatementsSyntax, SourceUnusedIterationDeclarationKind,
         SourceUnusedIterationStatementSyntax, SourceVoidSwitchCallSyntax,
-        SourceVoidSwitchFunctionStatementsSyntax,
+        SourceVoidSwitchFunctionStatementsSyntax, plan_source_captured_iteration_statement_syntax,
         plan_source_conditional_enum_function_statements_syntax, plan_source_control_if_syntax,
         plan_source_control_loop_syntax, plan_source_for_in_statement_syntax,
         plan_source_for_of_statement_syntax, plan_source_function_for_in_statement_syntax,
@@ -1550,6 +1552,19 @@ struct PlannedUnusedIteration {
     capture: PlannedExpression,
 }
 
+#[derive(Clone, Debug)]
+struct PlannedCapturedIteration {
+    syntax: SourceCapturedIterationSyntax,
+    iterable: PlannedExpression,
+    body: PlannedCapturedIterationBody,
+}
+
+#[derive(Clone, Debug)]
+enum PlannedCapturedIterationBody {
+    Function(Box<PlannedFunction>),
+    ArrowVariable(Box<PlannedVariable>),
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PlannedCatchObjectRest {
     name: NodeRef,
@@ -1639,6 +1654,7 @@ enum PlannedStatement {
     ForIn(Box<PlannedLexicalIteration>),
     ForOf(Box<PlannedTopLevelForOf>),
     UnusedIteration(Box<PlannedUnusedIteration>),
+    CapturedIteration(Box<PlannedCapturedIteration>),
     CatchObjectRest(PlannedCatchObjectRest),
     Break(NodeRef),
     ExpressionValue(PlannedExpression),
@@ -2325,9 +2341,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     {
                         statements.push(PlannedStatement::UnusedIteration(Box::new(iteration)));
                     } else {
-                        statements.push(PlannedStatement::ForIn(Box::new(
-                            self.plan_top_level_for_in(statement)?,
-                        )));
+                        match self.plan_top_level_for_in(statement) {
+                            Ok(iteration) => {
+                                statements.push(PlannedStatement::ForIn(Box::new(iteration)));
+                            }
+                            Err(SourceCheckError::Unsupported(_)) => {
+                                statements.push(PlannedStatement::CapturedIteration(Box::new(
+                                    self.plan_top_level_captured_iteration(statement)?,
+                                )));
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                 }
                 SyntaxKind::ForOfStatement => {
@@ -2336,9 +2360,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     {
                         statements.push(PlannedStatement::UnusedIteration(Box::new(iteration)));
                     } else {
-                        statements.push(PlannedStatement::ForOf(Box::new(
-                            self.plan_top_level_for_of(statement)?,
-                        )));
+                        match self.plan_top_level_for_of(statement) {
+                            Ok(iteration) => {
+                                statements.push(PlannedStatement::ForOf(Box::new(iteration)));
+                            }
+                            Err(SourceCheckError::Unsupported(_)) => {
+                                statements.push(PlannedStatement::CapturedIteration(Box::new(
+                                    self.plan_top_level_captured_iteration(statement)?,
+                                )));
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                 }
                 SyntaxKind::BreakStatement => {
@@ -3904,21 +3936,30 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
 
             let body = self.plan_expression(syntax.call)?;
-            let PlannedExpressionKind::Call(call) = &body.kind else {
-                return Err(SourceCheckError::Call(syntax.call));
-            };
-            let [argument] = call.arguments.as_slice() else {
-                return Err(SourceCheckError::Call(syntax.call));
-            };
-            if !matches!(call.callee.kind, PlannedExpressionKind::Identifier(_))
-                || !matches!(
-                    &argument.kind,
+            let valid = match &body.kind {
+                PlannedExpressionKind::Call(call) => {
+                    let [argument] = call.arguments.as_slice() else {
+                        return Err(SourceCheckError::Call(syntax.call));
+                    };
+                    matches!(call.callee.kind, PlannedExpressionKind::Identifier(_))
+                        && matches!(
+                            &argument.kind,
+                            PlannedExpressionKind::Identifier(read)
+                                if read.kind == PlannedIdentifierReadKind::Variable
+                                    && read.resolved_symbol == syntax.symbol
+                                    && read.value_symbol == syntax.symbol
+                        )
+                }
+                PlannedExpressionKind::Property(property) => matches!(
+                    &property.receiver.kind,
                     PlannedExpressionKind::Identifier(read)
                         if read.kind == PlannedIdentifierReadKind::Variable
                             && read.resolved_symbol == syntax.symbol
                             && read.value_symbol == syntax.symbol
-                )
-            {
+                ),
+                _ => false,
+            };
+            if !valid {
                 return Err(SourceCheckError::Variable(
                     VariableInvariant::InvalidSymbolShape(syntax.symbol),
                 ));
@@ -4229,6 +4270,145 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             callable,
             capture: result?,
         }))
+    }
+
+    fn plan_top_level_captured_iteration(
+        &mut self,
+        statement: NodeRef,
+    ) -> Result<PlannedCapturedIteration, SourceCheckError> {
+        let Some((store, host)) = self.semantic else {
+            return Err(self.unsupported(
+                statement,
+                self.node(statement)?.kind,
+                SourceSyntaxRole::Statement,
+            ));
+        };
+        let syntax = plan_source_captured_iteration_statement_syntax(
+            self.arena, self.bound, store, statement,
+        )
+        .map_err(|error| match error {
+            SourceFunctionStatementsError::Unsupported(_) => self.unsupported(
+                statement,
+                self.node(statement)
+                    .map_or(SyntaxKind::Unknown, |node| node.kind),
+                SourceSyntaxRole::Statement,
+            ),
+            SourceFunctionStatementsError::Variable(error) => Self::variable_plan_error(error),
+            SourceFunctionStatementsError::Invariant(_) => {
+                SourceCheckError::Function(SourceFunctionInvariant::Callable(statement))
+            }
+        })?;
+        let iterable = self.plan_expression(syntax.control.iterable.ok_or(
+            SourceCheckError::Function(SourceFunctionInvariant::Callable(statement)),
+        )?)?;
+
+        let prior_variables = self.prior_variables.clone();
+        let readable_variables = self.readable_variables.clone();
+        let mutable_variables = self.assignable_mutable_variables.clone();
+        let hoisted_functions = self.hoisted_functions.clone();
+        let result = (|| {
+            if !self.prior_variables.insert(syntax.binding.symbol)
+                || !self.readable_variables.insert(syntax.binding.symbol)
+                || syntax.binding.binding == VariableBindingKind::Let
+                    && !self
+                        .assignable_mutable_variables
+                        .insert(syntax.binding.symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(syntax.binding.symbol),
+                ));
+            }
+
+            let body = match syntax.body {
+                SourceCapturedIterationBodySyntax::Function {
+                    declaration,
+                    symbol,
+                    ..
+                } => {
+                    let callable =
+                        plan_source_callable(store, host, declaration, symbol, self.array_targets)
+                            .map_err(Self::callable_plan_error)?;
+                    if callable.family != SourceCallableFamily::FunctionDeclaration
+                        || callable.owner_symbol != symbol
+                        || callable.body_mode != SourceCallableBodyMode::Present
+                        || !callable.return_type.is_inferred()
+                        || !callable.parameters.is_empty()
+                        || !callable.type_parameters.is_empty()
+                    {
+                        return Err(Self::unsupported_function_body(&callable));
+                    }
+                    let (parameter_initializers, body) = self.plan_function_body(&callable)?;
+                    if !matches!(&body, PlannedFunctionBody::Linear(_)) {
+                        return Err(Self::unsupported_function_body(&callable));
+                    }
+                    PlannedCapturedIterationBody::Function(Box::new(PlannedFunction {
+                        callable,
+                        parameter_initializers,
+                        body,
+                    }))
+                }
+                SourceCapturedIterationBodySyntax::ArrowVariable {
+                    declaration,
+                    name,
+                    symbol,
+                    binding,
+                    arrow,
+                    read,
+                } => {
+                    let owner = self
+                        .bound
+                        .symbol(arrow)
+                        .ok_or(SourceCheckError::Arrow(arrow))?;
+                    let callable =
+                        plan_source_callable(store, host, arrow, owner, self.array_targets)
+                            .map_err(Self::callable_plan_error)?;
+                    if callable.family != SourceCallableFamily::ArrowFunction
+                        || callable.owner_symbol != owner
+                        || callable.body_mode != SourceCallableBodyMode::Present
+                        || !callable.return_type.is_inferred()
+                        || !callable.parameters.is_empty()
+                        || !callable.type_parameters.is_empty()
+                    {
+                        return Err(SourceCheckError::Arrow(arrow));
+                    }
+                    let read = self.plan_expression(read)?;
+                    self.nested_arrow_callables.push(callable.clone());
+                    let expression = PlannedExpression::new(
+                        arrow,
+                        PlannedExpressionKind::Arrow(Box::new(PlannedArrowExpression {
+                            callable,
+                            parameter_initializers: Vec::new(),
+                            expression_statement: Some(PlannedArrowExpressionStatement {
+                                expression: read,
+                                await_expression: None,
+                                throw_expression: None,
+                            }),
+                            body: PlannedArrowBody::Empty,
+                        })),
+                    );
+                    PlannedCapturedIterationBody::ArrowVariable(Box::new(PlannedVariable {
+                        declaration,
+                        name,
+                        symbol,
+                        binding,
+                        evolving_array: false,
+                        type_node: None,
+                        jsdoc_type: None,
+                        initializer: PlannedVariableInitializer::Expression(expression),
+                    }))
+                }
+            };
+            Ok(PlannedCapturedIteration {
+                syntax,
+                iterable,
+                body,
+            })
+        })();
+        self.prior_variables = prior_variables;
+        self.readable_variables = readable_variables;
+        self.assignable_mutable_variables = mutable_variables;
+        self.hoisted_functions = hoisted_functions;
+        result
     }
 
     fn uninitialized_variable_has_lexical_shadow(
@@ -23123,7 +23303,7 @@ fn check_expression_type(
                 None,
                 deferred,
             )?;
-            let checked = check_direct_source_element(
+            let checked = match check_direct_source_element(
                 store,
                 host,
                 global_types,
@@ -23131,8 +23311,31 @@ fn check_expression_type(
                 element,
                 receiver.result,
                 index.result,
-            )
-            .map_err(|error| SourcePlanner::element_plan_error(element.node, error))?;
+            ) {
+                Ok(checked) => checked,
+                Err(
+                    error @ SourceElementError::Unsupported(
+                        SourceElementUnsupported::IndexSignatureSurface(_),
+                    ),
+                ) => {
+                    if let Some(checked) = recover_non_iterable_union_element(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        diagnostics,
+                        element,
+                        receiver.result,
+                        index.result,
+                    )? {
+                        return Ok(checked);
+                    }
+                    return Err(SourcePlanner::element_plan_error(element.node, error));
+                }
+                Err(error) => {
+                    return Err(SourcePlanner::element_plan_error(element.node, error));
+                }
+            };
             if let Some(diagnostic) = checked.diagnostic {
                 merge_retry_diagnostic(diagnostics, diagnostic);
             }
@@ -28287,7 +28490,6 @@ fn check_planned_lexical_iteration(
         ))?;
     let string_type = bootstrap.string_type;
     let error_type = bootstrap.error_type;
-    let any_type = bootstrap.any_type;
     let flags = store
         .type_payload(iterable.result)
         .ok_or(RelationUnavailable::Type(iterable.result))?
@@ -28305,17 +28507,7 @@ fn check_planned_lexical_iteration(
             .then_some(2407),
         ),
         SourceControlLoopKind::ForOf => {
-            if let Some(element) =
-                store.canonical_array_element_type(global_types, iterable.result)?
-            {
-                (element, None)
-            } else if flags.intersects(TypeFlags::STRING_LIKE) {
-                (string_type, None)
-            } else if iterable.result == any_type || iterable.result == error_type {
-                (iterable.result, None)
-            } else {
-                (error_type, Some(2495))
-            }
+            source_for_of_iteration_type(store, global_types, iterable.result)?
         }
         _ => {
             return Err(SourceCheckError::Function(
@@ -28324,29 +28516,16 @@ fn check_planned_lexical_iteration(
         }
     };
     if let Some(code) = diagnostic_code {
-        let mut display_flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
-        if options.no_error_truncation {
-            display_flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
-        }
-        let operand = type_to_string_with_host_global_types_and_flags(
+        issue_source_iteration_diagnostic(
             store,
             host,
             global_types,
-            iterable.result,
-            display_flags,
-        )?;
-        merge_retry_diagnostic(
+            options,
             diagnostics,
-            CanonicalCheckerDiagnostic {
-                node: Some(iteration.iterable.node),
-                range_override: None,
-                diagnostic: Diagnostic::with_arguments(
-                    message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
-                    [operand],
-                ),
-                related_information: Vec::new(),
-            },
-        );
+            iteration.iterable.node,
+            iterable.result,
+            code,
+        )?;
     }
 
     let destructured = iteration
@@ -30733,6 +30912,246 @@ fn inferred_variable_type(
     store
         .get_widened_type_with_global_types(initializer_type, global_types)
         .map_err(Into::into)
+}
+
+/// Resolves arrays, strings, and iterable unions without accepting invalid union members.
+fn source_for_of_iteration_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    iterable: TypeId,
+) -> Result<(TypeId, Option<u32>), SourceCheckError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    let string = bootstrap.string_type;
+    let error = bootstrap.error_type;
+    let any = bootstrap.any_type;
+    if iterable == any || iterable == error {
+        return Ok((iterable, None));
+    }
+
+    if let Some(element) = store.canonical_array_element_type(global_types, iterable)? {
+        return Ok((element, None));
+    }
+    let record = store
+        .type_payload(iterable)
+        .ok_or(RelationUnavailable::Type(iterable))?;
+    if record.flags().intersects(TypeFlags::STRING_LIKE) {
+        return Ok((string, None));
+    }
+    let TypeData::Union(union) = record.data() else {
+        return Ok((error, Some(2495)));
+    };
+
+    let constituents = union.union.types.clone();
+    let mut elements = Vec::with_capacity(constituents.len());
+    for constituent in constituents {
+        let (element, diagnostic) = source_for_of_iteration_type(store, global_types, constituent)?;
+        if diagnostic.is_some() {
+            return Ok((error, Some(2488)));
+        }
+        elements.push(element);
+    }
+    if elements.is_empty() {
+        return Ok((error, Some(2488)));
+    }
+    let element = if let [element] = elements.as_slice() {
+        *element
+    } else {
+        store.expression_union_type_with_global_types(
+            global_types,
+            &elements,
+            UnionReduction::Subtype,
+        )?
+    };
+    Ok((element, None))
+}
+
+#[allow(clippy::too_many_arguments)] // Diagnostic formatting uses the active source checker state.
+fn issue_source_iteration_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    node: NodeRef,
+    iterable: TypeId,
+    code: u32,
+) -> Result<(), SourceCheckError> {
+    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    if options.no_error_truncation {
+        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+    }
+    let operand = type_to_string_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        iterable,
+        flags,
+    )?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
+                [operand],
+            ),
+            related_information: Vec::new(),
+        },
+    );
+    Ok(())
+}
+
+fn captured_iteration_property_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    receiver: TypeId,
+    name: NodeRef,
+    host: &DeclaredTypeHost<'_>,
+) -> Result<TypeId, SourceCheckError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    if receiver == bootstrap.any_type || receiver == bootstrap.error_type {
+        return Ok(receiver);
+    }
+    let NodeData::Identifier(identifier) = &host
+        .node(name)
+        .ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingNode(name),
+        ))?
+        .data
+    else {
+        return Err(SourceCheckError::Property(name));
+    };
+    let constituents = match store
+        .type_payload(receiver)
+        .ok_or(RelationUnavailable::Type(receiver))?
+        .data()
+    {
+        TypeData::Union(union) => union.union.types.clone(),
+        _ => vec![receiver],
+    };
+    let mut property_types = Vec::with_capacity(constituents.len());
+    for constituent in constituents {
+        let property = store
+            .resolved_own_property(constituent, &identifier.text)?
+            .ok_or(SourceCheckError::Property(name))?;
+        property_types.push(property.type_);
+    }
+    if let [property] = property_types.as_slice() {
+        Ok(*property)
+    } else {
+        store
+            .expression_union_type_with_global_types(
+                global_types,
+                &property_types,
+                UnionReduction::Subtype,
+            )
+            .map_err(Into::into)
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // The recovered access keeps its exact source-owned caches.
+fn recover_non_iterable_union_element(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    element: &SourceElementPlan,
+    receiver: TypeId,
+    index: TypeId,
+) -> Result<Option<CheckedExpressionTypes>, SourceCheckError> {
+    let receiver_record = store
+        .type_payload(receiver)
+        .ok_or(RelationUnavailable::Type(receiver))?;
+    let TypeData::Union(union) = receiver_record.data() else {
+        return Ok(None);
+    };
+    let constituents = union.union.types.clone();
+    if !store
+        .type_payload(index)
+        .ok_or(RelationUnavailable::Type(index))?
+        .flags()
+        .intersects(TypeFlags::NUMBER_LITERAL)
+    {
+        return Ok(None);
+    }
+    let mut has_array = false;
+    for constituent in constituents {
+        if store
+            .canonical_array_element_type(global_types, constituent)?
+            .is_some()
+        {
+            has_array = true;
+        }
+    }
+    if !has_array || source_for_of_iteration_type(store, global_types, receiver)?.1 != Some(2488) {
+        return Ok(None);
+    }
+
+    let error = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?
+        .error_type;
+    if store
+        .symbol_node_links(element.node)
+        .and_then(|links| links.resolved_symbol)
+        .is_some()
+    {
+        return Err(SourceCheckError::Element(element.node));
+    }
+    preflight_source_expression_cache(store, element.node, error)?;
+    if options.no_implicit_any {
+        let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+        if options.no_error_truncation {
+            flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+        }
+        let index_text = type_to_string_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            index,
+            flags,
+        )?;
+        let receiver_text = type_to_string_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            receiver,
+            flags,
+        )?;
+        let detail = Diagnostic::with_arguments(
+            message_by_code(2339).ok_or(SourceCheckError::MissingDiagnostic(2339))?,
+            [index_text.clone(), receiver_text.clone()],
+        )
+        .render()
+        .map_err(|_| SourceCheckError::MissingDiagnostic(2339))?;
+        merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: Some(element.node),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(7053).ok_or(SourceCheckError::MissingDiagnostic(7053))?,
+                    [index_text, receiver_text],
+                )
+                .with_details([format!("  {detail}")]),
+                related_information: Vec::new(),
+            },
+        );
+    }
+    publish_expression_type(store, element.node, error)?;
+    Ok(Some(CheckedExpressionTypes::leaf(error, error)))
 }
 
 #[allow(clippy::too_many_arguments)] // Keeps property diagnostics in the source execution context.
@@ -35830,6 +36249,23 @@ pub(super) fn check_source_file(
                     iteration.callable.owner_symbol,
                 )?;
             }
+            PlannedStatement::CapturedIteration(iteration) => {
+                if let PlannedCapturedIterationBody::Function(function) = &iteration.body {
+                    session.reset_query();
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        &mut type_import_preflight_diagnostics,
+                    )?
+                    .preflight_type_of_source_callable(
+                        function.callable.declaration,
+                        function.callable.owner_symbol,
+                    )?;
+                }
+            }
             PlannedStatement::Namespace(namespace) => {
                 preflight_source_namespace_annotations(
                     store,
@@ -39459,16 +39895,58 @@ pub(super) fn check_source_file(
                     )?
                     .result
                 };
+                let union_iteration_type = if matches!(
+                    store
+                        .type_payload(initializer)
+                        .ok_or(RelationUnavailable::Type(initializer))?
+                        .data(),
+                    TypeData::Union(_)
+                ) {
+                    let (type_, diagnostic) =
+                        source_for_of_iteration_type(store, global_types, initializer)?;
+                    if let Some(code) = diagnostic {
+                        issue_source_iteration_diagnostic(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            diagnostics,
+                            variable.pattern,
+                            initializer,
+                            code,
+                        )?;
+                    }
+                    Some(type_)
+                } else {
+                    None
+                };
                 for element in &variable.elements {
                     let binding = &element.binding;
-                    let checked = check_planned_array_binding_element(
-                        store,
-                        host,
-                        global_types,
-                        options,
-                        binding,
-                        initializer,
-                    )?;
+                    let checked = if let Some(type_) = union_iteration_type {
+                        let error = store
+                            .intrinsic_bootstrap()
+                            .ok_or(SourceCheckError::LiteralCache(
+                                SourceLiteralCacheError::BootstrapUninitialized,
+                            ))?
+                            .error_type;
+                        CheckedSourceElement {
+                            type_: if binding.rest && type_ != error {
+                                store.create_canonical_array_type(global_types, type_, false)?
+                            } else {
+                                type_
+                            },
+                            diagnostic: None,
+                        }
+                    } else {
+                        check_planned_array_binding_element(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            binding,
+                            initializer,
+                        )?
+                    };
                     if let Some(diagnostic) = checked.diagnostic {
                         merge_retry_diagnostic(diagnostics, diagnostic);
                     }
@@ -40356,55 +40834,20 @@ pub(super) fn check_source_file(
                     None,
                     &mut deferred,
                 )?;
-                let bootstrap =
-                    store
-                        .intrinsic_bootstrap()
-                        .ok_or(SourceCheckError::LiteralCache(
-                            SourceLiteralCacheError::BootstrapUninitialized,
-                        ))?;
-                let string_type = bootstrap.string_type;
-                let error_type = bootstrap.error_type;
-                let any_type = bootstrap.any_type;
-                let iteration_type = if let Some(element) =
-                    store.canonical_array_element_type(global_types, iterable.result)?
-                {
-                    element
-                } else if store
-                    .type_payload(iterable.result)
-                    .ok_or(RelationUnavailable::Type(iterable.result))?
-                    .flags()
-                    .intersects(TypeFlags::STRING_LIKE)
-                {
-                    string_type
-                } else if iterable.result == any_type || iterable.result == error_type {
-                    iterable.result
-                } else {
-                    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
-                    if options.no_error_truncation {
-                        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
-                    }
-                    let operand = type_to_string_with_host_global_types_and_flags(
+                let (iteration_type, diagnostic) =
+                    source_for_of_iteration_type(store, global_types, iterable.result)?;
+                if let Some(code) = diagnostic {
+                    issue_source_iteration_diagnostic(
                         store,
                         host,
                         global_types,
-                        iterable.result,
-                        flags,
-                    )?;
-                    merge_retry_diagnostic(
+                        options,
                         diagnostics,
-                        CanonicalCheckerDiagnostic {
-                            node: Some(iteration.iterable.node),
-                            range_override: None,
-                            diagnostic: Diagnostic::with_arguments(
-                                message_by_code(2495)
-                                    .ok_or(SourceCheckError::MissingDiagnostic(2495))?,
-                                [operand],
-                            ),
-                            related_information: Vec::new(),
-                        },
-                    );
-                    error_type
-                };
+                        iteration.iterable.node,
+                        iterable.result,
+                        code,
+                    )?;
+                }
 
                 let mut loop_flow_types = current_flow_types.clone();
                 if loop_flow_types
@@ -40459,65 +40902,95 @@ pub(super) fn check_source_file(
                             SourceLiteralCacheError::BootstrapUninitialized,
                         ))?;
                 let string_type = bootstrap.string_type;
+                let error_type = bootstrap.error_type;
+                let any_type = bootstrap.any_type;
                 let void_type = bootstrap.void_type;
-                let mut binding_type = match iteration.syntax.control.kind {
+                let (mut binding_type, iteration_diagnostic) = match iteration.syntax.control.kind {
                     SourceControlLoopKind::ForIn => {
                         let flags = store
                             .type_payload(iterable.result)
                             .ok_or(RelationUnavailable::Type(iterable.result))?
                             .flags();
-                        if !flags.intersects(TypeFlags::ANY | TypeFlags::OBJECT) {
-                            return Err(SourceCheckError::Unsupported(
-                                UnsupportedSourceSyntax::Syntax {
-                                    node: iteration.iterable.node,
-                                    kind: host
-                                        .node(iteration.iterable.node)
-                                        .map_or(SyntaxKind::Unknown, |node| node.kind),
-                                    role: SourceSyntaxRole::Statement,
-                                },
-                            ));
-                        }
-                        string_type
+                        (
+                            string_type,
+                            (iterable.result != error_type
+                                && !flags.intersects(
+                                    TypeFlags::ANY
+                                        | TypeFlags::OBJECT
+                                        | TypeFlags::NON_PRIMITIVE
+                                        | TypeFlags::INSTANTIABLE_NON_PRIMITIVE,
+                                ))
+                            .then_some(2407),
+                        )
                     }
-                    SourceControlLoopKind::ForOf => store
-                        .canonical_array_element_type(global_types, iterable.result)?
-                        .ok_or(SourceCheckError::Unsupported(
-                            UnsupportedSourceSyntax::Syntax {
-                                node: iteration.iterable.node,
-                                kind: host
-                                    .node(iteration.iterable.node)
-                                    .map_or(SyntaxKind::Unknown, |node| node.kind),
-                                role: SourceSyntaxRole::Statement,
-                            },
-                        ))?,
+                    SourceControlLoopKind::ForOf => {
+                        source_for_of_iteration_type(store, global_types, iterable.result)?
+                    }
                     _ => {
                         return Err(SourceCheckError::Function(
                             SourceFunctionInvariant::Callable(iteration.syntax.control.statement),
                         ));
                     }
                 };
-                if iteration.syntax.binding_element.is_some() {
-                    let record = host.node(iteration.syntax.binding_name).ok_or(
-                        SourceCheckError::Provenance(SourceCheckProvenanceError::MissingNode(
-                            iteration.syntax.binding_name,
-                        )),
+                if let Some(code) = iteration_diagnostic {
+                    issue_source_iteration_diagnostic(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        diagnostics,
+                        iteration.iterable.node,
+                        iterable.result,
+                        code,
                     )?;
-                    let NodeData::Identifier(name) = &record.data else {
-                        return Err(SourceCheckError::Variable(
-                            VariableInvariant::InvalidSymbolShape(iteration.syntax.binding_symbol),
-                        ));
-                    };
-                    let property = store
-                        .resolved_own_property(binding_type, &name.text)?
-                        .ok_or(SourceCheckError::Variable(
-                            VariableInvariant::InvalidSymbolShape(iteration.syntax.binding_symbol),
-                        ))?;
-                    if property.optional {
-                        return Err(SourceCheckError::Variable(
-                            VariableInvariant::InvalidSymbolShape(iteration.syntax.binding_symbol),
-                        ));
+                }
+                if iteration.syntax.binding_element.is_some() {
+                    let union_or_recovery = binding_type == error_type
+                        || binding_type == any_type
+                        || matches!(
+                            store
+                                .type_payload(binding_type)
+                                .ok_or(RelationUnavailable::Type(binding_type))?
+                                .data(),
+                            TypeData::Union(_)
+                        );
+                    if union_or_recovery {
+                        binding_type = captured_iteration_property_type(
+                            store,
+                            global_types,
+                            binding_type,
+                            iteration.syntax.binding_name,
+                            host,
+                        )?;
+                    } else {
+                        let record = host.node(iteration.syntax.binding_name).ok_or(
+                            SourceCheckError::Provenance(SourceCheckProvenanceError::MissingNode(
+                                iteration.syntax.binding_name,
+                            )),
+                        )?;
+                        let NodeData::Identifier(name) = &record.data else {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolShape(
+                                    iteration.syntax.binding_symbol,
+                                ),
+                            ));
+                        };
+                        let property = store
+                            .resolved_own_property(binding_type, &name.text)?
+                            .ok_or(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolShape(
+                                    iteration.syntax.binding_symbol,
+                                ),
+                            ))?;
+                        if property.optional {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolShape(
+                                    iteration.syntax.binding_symbol,
+                                ),
+                            ));
+                        }
+                        binding_type = property.type_;
                     }
-                    binding_type = property.type_;
                 }
 
                 let mut loop_flow_types = current_flow_types.clone();
@@ -40582,6 +41055,240 @@ pub(super) fn check_source_file(
                         iteration.syntax.local_symbol,
                         materialized.type_,
                     )?;
+                }
+            }
+            PlannedStatement::CapturedIteration(iteration) => {
+                let iterable = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &iteration.iterable,
+                    None,
+                    &mut deferred,
+                )?;
+                let (iteration_type, iteration_diagnostic) = match iteration.syntax.control.kind {
+                    SourceControlLoopKind::ForOf => {
+                        source_for_of_iteration_type(store, global_types, iterable.result)?
+                    }
+                    SourceControlLoopKind::ForIn => {
+                        let bootstrap =
+                            store
+                                .intrinsic_bootstrap()
+                                .ok_or(SourceCheckError::LiteralCache(
+                                    SourceLiteralCacheError::BootstrapUninitialized,
+                                ))?;
+                        let string = bootstrap.string_type;
+                        let error = bootstrap.error_type;
+                        let flags = store
+                            .type_payload(iterable.result)
+                            .ok_or(RelationUnavailable::Type(iterable.result))?
+                            .flags();
+                        (
+                            string,
+                            (iterable.result != error
+                                && !flags.intersects(
+                                    TypeFlags::ANY
+                                        | TypeFlags::OBJECT
+                                        | TypeFlags::NON_PRIMITIVE
+                                        | TypeFlags::INSTANTIABLE_NON_PRIMITIVE,
+                                ))
+                            .then_some(2407),
+                        )
+                    }
+                    _ => {
+                        return Err(SourceCheckError::Function(
+                            SourceFunctionInvariant::Callable(iteration.syntax.control.statement),
+                        ));
+                    }
+                };
+                if let Some(code) = iteration_diagnostic {
+                    issue_source_iteration_diagnostic(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        diagnostics,
+                        iteration.iterable.node,
+                        iterable.result,
+                        code,
+                    )?;
+                }
+
+                let binding_type = if iteration.syntax.binding.destructured {
+                    captured_iteration_property_type(
+                        store,
+                        global_types,
+                        iteration_type,
+                        iteration.syntax.binding.name,
+                        host,
+                    )?
+                } else {
+                    iteration_type
+                };
+                stage_value_type(
+                    store,
+                    &mut staged_value_types,
+                    &mut value_order,
+                    iteration.syntax.binding.symbol,
+                    binding_type,
+                )?;
+                let mut loop_flow_types = current_flow_types.clone();
+                if loop_flow_types
+                    .insert(iteration.syntax.binding.symbol, binding_type)
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::DuplicateCurrentFlowType(
+                            iteration.syntax.binding.symbol,
+                        ),
+                    ));
+                }
+
+                let (local_name, local_symbol) = match &iteration.body {
+                    PlannedCapturedIterationBody::Function(function) => {
+                        let materialized = materialize_checked_source_callable(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            diagnostics,
+                            &function.callable,
+                            &type_import_capabilities,
+                        )?;
+                        let flow_types = check_callable_parameter_initializers(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &loop_flow_types,
+                            &preflighted_type_import_value_uses,
+                            &mut deferred,
+                            &function.callable,
+                            &function.parameter_initializers,
+                        )?;
+                        let PlannedFunctionBody::Linear(statements) = &function.body else {
+                            return Err(SourcePlanner::unsupported_function_body(
+                                &function.callable,
+                            ));
+                        };
+                        let flow_types = check_planned_linear_function_statements(
+                            bound,
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            flow_types,
+                            &preflighted_type_import_value_uses,
+                            &type_import_capabilities,
+                            &mut deferred,
+                            &function.callable,
+                            None,
+                            statements,
+                            &mut staged_value_types,
+                            &mut value_order,
+                        )?;
+                        publish_checked_source_callable_return(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &flow_types,
+                            &preflighted_type_import_value_uses,
+                            &mut deferred,
+                            &function.callable,
+                            materialized.signature,
+                            statements.return_expression.as_ref(),
+                        )?;
+                        let SourceCapturedIterationBodySyntax::Function { name, symbol, .. } =
+                            iteration.syntax.body
+                        else {
+                            return Err(SourceCheckError::Function(
+                                SourceFunctionInvariant::Callable(function.callable.declaration),
+                            ));
+                        };
+                        (name, symbol)
+                    }
+                    PlannedCapturedIterationBody::ArrowVariable(variable) => {
+                        let PlannedVariableInitializer::Expression(initializer) =
+                            &variable.initializer
+                        else {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolShape(variable.symbol),
+                            ));
+                        };
+                        let checked = check_expression_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &loop_flow_types,
+                            &preflighted_type_import_value_uses,
+                            initializer,
+                            None,
+                            &mut deferred,
+                        )?;
+                        stage_value_type(
+                            store,
+                            &mut staged_value_types,
+                            &mut value_order,
+                            variable.symbol,
+                            checked.result,
+                        )?;
+                        (variable.name, variable.symbol)
+                    }
+                };
+                if options.no_unused_locals
+                    && bound
+                        .source_facts()
+                        .is_some_and(|facts| !facts.is_javascript_file())
+                    && !identifier_reads.iter().any(|(_, symbol)| {
+                        *symbol == local_symbol
+                            || store.get_merged_symbol(*symbol) == Some(local_symbol)
+                    })
+                {
+                    let NodeData::Identifier(identifier) = &host
+                        .node(local_name)
+                        .ok_or(SourceCheckError::Provenance(
+                            SourceCheckProvenanceError::MissingNode(local_name),
+                        ))?
+                        .data
+                    else {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidSymbolShape(local_symbol),
+                        ));
+                    };
+                    merge_retry_diagnostic(
+                        diagnostics,
+                        CanonicalCheckerDiagnostic {
+                            node: Some(local_name),
+                            range_override: None,
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(6133)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(6133))?,
+                                [identifier.text.clone()],
+                            ),
+                            related_information: Vec::new(),
+                        },
+                    );
                 }
             }
             PlannedStatement::Break(statement) => {
@@ -44103,6 +44810,269 @@ mod tests {
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn for_of_non_iterable_union_reports_ts2488_and_preserves_error_bindings() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "type A = { a: string }; ",
+            "type B = { b: string }; ",
+            "declare const data: A[] | B; ",
+            "declare function consume(value: any): void; ",
+            "for (const item of data) { consume(item); } ",
+            "for (const ignoredItem of data) { consume(ignoredItem); }",
+        ));
+        let library_file = FileId::new(9_080);
+        let file = FileId::new(9_081);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic.diagnostic.code(), 2488);
+            assert_eq!(diagnostic.diagnostic.arguments, ["A[] | B"]);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), "data");
+        }
+        let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+        for name in ["item", "ignoredItem"] {
+            assert_eq!(variable_value_type(&context, &source, file, name), error);
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn for_of_iterable_unions_preserve_each_constituent_element_type() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "declare const data: string | number[]; ",
+            "declare function consume(value: string | number): void; ",
+            "for (const item of data) { consume(item); }",
+        ));
+        let library_file = FileId::new(9_082);
+        let file = FileId::new(9_083);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let expected = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .string_or_number_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "item"),
+            expected
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn array_bindings_reject_non_iterable_unions_at_the_binding_pattern() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "type A = { a: string }; ",
+            "type B = { b: string }; ",
+            "declare const data: A[] | B; ",
+            "const [item] = data;",
+        ));
+        let library_file = FileId::new(9_084);
+        let file = FileId::new(9_085);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one non-iterable union diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2488);
+        assert_eq!(diagnostic.diagnostic.arguments, ["A[] | B"]);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "[item]");
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "item"),
+            context.store().intrinsic_bootstrap().unwrap().error_type,
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn non_iterable_union_fixture_preserves_iteration_and_index_diagnostics() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "type A = { a: string };\n",
+            "type B = { b: string };\n",
+            "declare const data: A[] | B;\n",
+            "for (const item of data) { item.b; }\n",
+            "for (const ignoredItem of data) { ignoredItem.b; }\n",
+            "const [el] = data;\n",
+            "el.b;\n",
+            "const el2 = data[0];\n",
+            "el2.b;\n",
+        ));
+        let library_file = FileId::new(9_086);
+        let file = FileId::new(9_087);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 4);
+        for (diagnostic, (code, text)) in diagnostics.iter().zip([
+            (2488, "data"),
+            (2488, "data"),
+            (2488, "[el]"),
+            (7053, "data[0]"),
+        ]) {
+            assert_eq!(diagnostic.diagnostic.code(), code);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), text);
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn unused_loop_callables_report_exact_diagnostics_without_flagging_captures() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "for (let x of [1, 2]) { function f() { x; } }\n",
+            "for (let x of [1, 2]) { let f = () => { x; }; }\n",
+            "for (const x of [1, 2]) { function g() { x; } }\n",
+            "for (let x in { a: 1, b: 2 }) { function f2() { x; } }\n",
+            "for (let x in { a: 1, b: 2 }) { let f2 = () => { x; }; }\n",
+            "for (const x in { a: 1, b: 2 }) { function g2() { x; } }\n",
+            "for (let { x } of [{ x: 1 }, { x: 2 }]) { function f3() { x; } }\n",
+            "for (let { x } of [{ x: 1 }, { x: 2 }]) { let f3 = () => { x; }; }\n",
+            "for (const { x } of [{ x: 1 }, { x: 2 }]) { function g3() { x; } }\n",
+        ));
+        let library_file = FileId::new(9_088);
+        let file = FileId::new(9_089);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                no_unused_locals: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 9);
+        for (diagnostic, name) in diagnostics
+            .iter()
+            .zip(["f", "f", "g", "f2", "f2", "g2", "f3", "f3", "g3"])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), 6133);
+            assert_eq!(diagnostic.diagnostic.arguments, [name]);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), name);
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn captured_loop_locals_follow_the_unused_option_and_reject_poisoned_bindings() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("for (let item of [1]) { function retained() { item; } }");
+        let library_file = FileId::new(9_090);
+        let file = FileId::new(9_091);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let binding = variable_symbol(&context, &source, file, "item");
+        let expected = context
+            .store()
+            .value_symbol_links(binding)
+            .cloned()
+            .unwrap();
+        let (number, string) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        mark_source_unchecked(&mut context, file);
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            binding,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::CachedValueTypeMismatch {
+                    symbol: binding,
+                    cached: string,
+                    expected: number,
+                },
+            )),
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(binding, expected),
+        );
+        context.check_source_file(file).unwrap();
     }
 
     #[test]
