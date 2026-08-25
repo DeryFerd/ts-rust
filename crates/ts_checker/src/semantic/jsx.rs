@@ -4796,6 +4796,16 @@ fn resolve_component_tag(
         {
             projection.call_signatures[0].clone()
         }
+        StoredCallableSetValidation::Valid { projection, .. }
+            if projection.call_signatures.is_empty()
+                && projection.construct_signatures.len() == 1 =>
+        {
+            return resolve_construct_component_signature(
+                store,
+                opening,
+                projection.construct_signatures[0],
+            );
+        }
         StoredCallableSetValidation::NotCallable
             if tag.namespace_member.is_some()
                 && store
@@ -4891,6 +4901,36 @@ fn resolve_component_tag(
             .empty_object_type
     });
     Ok((attributes_type, callable.signature))
+}
+
+fn resolve_construct_component_signature(
+    store: &CanonicalTypeMapperStore,
+    opening: NodeRef,
+    signature: SignatureId,
+) -> Result<(TypeId, SignatureId), SourceCheckError> {
+    let invalid = || SourceCheckError::Call(opening);
+    let record = store.signature(signature).ok_or_else(invalid)?;
+    let [parameter] = record.parameters() else {
+        return Err(unsupported(opening, SyntaxKind::JsxOpeningElement));
+    };
+    let attributes = store
+        .value_symbol_links(*parameter)
+        .and_then(|links| links.resolved_type)
+        .filter(|type_| store.type_payload(*type_).is_some())
+        .ok_or_else(invalid)?;
+    let result = record.resolved_return_type().ok_or_else(invalid)?;
+    let allowed = SignatureFlags::CONSTRUCT | SignatureFlags::HAS_LITERAL_TYPES;
+    if !record.flags().contains(SignatureFlags::CONSTRUCT)
+        || record.flags().bits() & !allowed.bits() != 0
+        || record.this_parameter().is_some()
+        || !record.type_parameters().is_empty()
+        || !(0..=1).contains(&record.min_argument_count())
+        || store.callable_signature_parameter_types(signature) != Some([attributes].as_slice())
+        || store.type_payload(result).is_none()
+    {
+        return Err(invalid());
+    }
+    Ok((attributes, signature))
 }
 
 fn resolve_namespace_component_type(
@@ -13433,6 +13473,111 @@ mod runtime_tests {
                 context.store().checker_link_allocated_lengths(),
             ),
             cold,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Constructor identity, child diagnostics, and warm caches stay linked.
+    fn construct_only_jsx_components_check_props_and_children_without_new_signatures() {
+        let source = concat!(
+            "declare namespace JSX { ",
+            "interface Element {} ",
+            "interface ElementChildrenAttribute { children: {}; } ",
+            "}\n",
+            "interface Props { label: string; children?: string; }\n",
+            "declare const Widget: { new(props: Props): JSX.Element; };\n",
+            "const valid = <Widget label=\"ready\">okay</Widget>;\n",
+            "const invalidAttribute = <Widget label={123}>okay</Widget>;\n",
+            "const invalidChild = <Widget label=\"ready\">{123}</Widget>;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_187);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/construct-jsx-component.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, expected) in diagnostics.iter().zip(["label", "{123}"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type 'number' is not assignable to type 'string'.",
+            );
+            let range = parsed
+                .arena
+                .get(diagnostic.node.unwrap().node)
+                .unwrap()
+                .range;
+            assert_eq!(
+                source.get(range.start.get() as usize..range.end.get() as usize),
+                Some(expected),
+            );
+        }
+
+        let mut signatures = Vec::new();
+        for (node, record) in parsed.arena.iter() {
+            if record.kind != SyntaxKind::JsxOpeningElement {
+                continue;
+            }
+            let opening = NodeRef::new(parsed.arena.id(), file, node);
+            let signature = context
+                .store()
+                .signature_links(opening)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let constructor = context.store().signature(signature).unwrap();
+            assert!(constructor.flags().contains(SignatureFlags::CONSTRUCT));
+            assert_eq!(constructor.parameters().len(), 1);
+            signatures.push(signature);
+        }
+        assert_eq!(signatures.len(), 3);
+        assert!(
+            signatures
+                .iter()
+                .all(|signature| *signature == signatures[0])
+        );
+
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            warm,
         );
     }
 
