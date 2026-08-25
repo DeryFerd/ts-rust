@@ -247,7 +247,7 @@ use super::{
         plan_source_control_loop_syntax, plan_source_for_in_statement_syntax,
         plan_source_for_of_statement_syntax, plan_source_function_for_in_statement_syntax,
         plan_source_function_for_of_statement_syntax, plan_source_function_statements_syntax,
-        plan_source_joined_function_statements_syntax,
+        plan_source_joined_function_statements_syntax, plan_source_labeled_for_in_statement_syntax,
         plan_source_linear_function_statements_syntax, plan_source_loop_function_statements_syntax,
         plan_source_switch_function_statements_syntax,
         plan_source_typeof_switch_function_statements_syntax,
@@ -2266,10 +2266,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         condition,
                     })));
                 }
-                SyntaxKind::WhileStatement | SyntaxKind::LabeledStatement => {
+                SyntaxKind::WhileStatement => {
                     statements.push(PlannedStatement::ControlLoop(Box::new(
                         self.plan_top_level_while(statement)?,
                     )));
+                }
+                SyntaxKind::LabeledStatement => {
+                    if let Some(iteration) = self.plan_top_level_labeled_for_in(statement)? {
+                        statements.push(PlannedStatement::ForIn(Box::new(iteration)));
+                    } else {
+                        statements.push(PlannedStatement::ControlLoop(Box::new(
+                            self.plan_top_level_while(statement)?,
+                        )));
+                    }
                 }
                 SyntaxKind::ForInStatement => {
                     if self.no_unused_locals
@@ -3891,6 +3900,94 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         statement: NodeRef,
     ) -> Result<PlannedLexicalIteration, SourceCheckError> {
+        self.plan_top_level_for_in_with_parent(statement, self.source.node_ref())
+    }
+
+    fn plan_top_level_labeled_for_in(
+        &mut self,
+        statement: NodeRef,
+    ) -> Result<Option<PlannedLexicalIteration>, SourceCheckError> {
+        let mut iteration = statement;
+        while self.node(iteration)?.kind == SyntaxKind::LabeledStatement {
+            let record = self.node(iteration)?;
+            let NodeData::LabeledStatement(labeled) = &record.data else {
+                return Err(self.unsupported(
+                    iteration,
+                    SyntaxKind::LabeledStatement,
+                    SourceSyntaxRole::Statement,
+                ));
+            };
+            iteration = self.reference(labeled.statement);
+        }
+        if self.node(iteration)?.kind != SyntaxKind::ForInStatement {
+            return Ok(None);
+        }
+
+        let source = self.source.node_ref();
+        let mut parent = source;
+        let mut current = statement;
+        let mut labels = HashSet::new();
+        while current != iteration {
+            let record = self.node(current)?;
+            let NodeData::LabeledStatement(labeled) = &record.data else {
+                return Err(self.unsupported(
+                    current,
+                    SyntaxKind::LabeledStatement,
+                    SourceSyntaxRole::Statement,
+                ));
+            };
+            if record.kind != SyntaxKind::LabeledStatement
+                || record.flags.0 != 0
+                || record.parent != Some(parent.node)
+                || labeled.flow_node.is_some()
+                || self.bound.container(current) != Some(source)
+                || self.bound.block_scope_container(current) != Some(source)
+            {
+                return Err(self.unsupported(
+                    current,
+                    SyntaxKind::LabeledStatement,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+
+            let label = self.reference(labeled.label);
+            let label_record = self.node(label)?;
+            let NodeData::Identifier(identifier) = &label_record.data else {
+                return Err(self.unsupported(
+                    label,
+                    label_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            };
+            if label_record.kind != SyntaxKind::Identifier
+                || label_record.flags.0 != 0
+                || label_record.parent != Some(current.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+                || self.bound.container(label) != Some(source)
+                || self.bound.block_scope_container(label) != Some(source)
+                || !labels.insert(identifier.text.clone())
+            {
+                return Err(self.unsupported(
+                    label,
+                    label_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+
+            parent = current;
+            current = self.reference(labeled.statement);
+        }
+
+        self.plan_top_level_for_in_with_parent(iteration, parent)
+            .map(Some)
+    }
+
+    fn plan_top_level_for_in_with_parent(
+        &mut self,
+        statement: NodeRef,
+        parent: NodeRef,
+    ) -> Result<PlannedLexicalIteration, SourceCheckError> {
         let Some((store, _)) = self.semantic else {
             return Err(self.unsupported(
                 statement,
@@ -3898,18 +3995,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::Statement,
             ));
         };
-        let syntax = plan_source_for_in_statement_syntax(self.arena, self.bound, store, statement)
-            .map_err(|error| match error {
-                SourceFunctionStatementsError::Unsupported(_) => self.unsupported(
-                    statement,
-                    SyntaxKind::ForInStatement,
-                    SourceSyntaxRole::Statement,
-                ),
-                SourceFunctionStatementsError::Variable(error) => Self::variable_plan_error(error),
-                SourceFunctionStatementsError::Invariant(_) => {
-                    SourceCheckError::Function(SourceFunctionInvariant::Callable(statement))
-                }
-            })?;
+        let syntax = if parent == self.source.node_ref() {
+            plan_source_for_in_statement_syntax(self.arena, self.bound, store, statement)
+        } else {
+            plan_source_labeled_for_in_statement_syntax(
+                self.arena, self.bound, store, statement, parent,
+            )
+        }
+        .map_err(|error| match error {
+            SourceFunctionStatementsError::Unsupported(_) => self.unsupported(
+                statement,
+                SyntaxKind::ForInStatement,
+                SourceSyntaxRole::Statement,
+            ),
+            SourceFunctionStatementsError::Variable(error) => Self::variable_plan_error(error),
+            SourceFunctionStatementsError::Invariant(_) => {
+                SourceCheckError::Function(SourceFunctionInvariant::Callable(statement))
+            }
+        })?;
         self.finish_for_in_statement(syntax)
     }
 
@@ -14946,7 +15049,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || block.facts != 0
             || !block.statements.nodes.contains(&statement.node)
             || iteration_record.kind != SyntaxKind::ForInStatement
-            || iteration_record.parent != Some(source.node)
             || loop_data.statement != body.node
             || self.bound.container(statement) != Some(source)
             || self.bound.container(body) != Some(source)
@@ -14957,6 +15059,29 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || self.bound.flow_graph().container_is_complete(source) != Some(true)
         {
             return Ok(false);
+        }
+
+        let mut current = iteration;
+        let mut parent = iteration_record.parent.map(|node| self.reference(node));
+        while parent != Some(source) {
+            let Some(label) = parent else {
+                return Ok(false);
+            };
+            let record = self.node(label)?;
+            let NodeData::LabeledStatement(labeled) = &record.data else {
+                return Ok(false);
+            };
+            if record.kind != SyntaxKind::LabeledStatement
+                || record.flags.0 != 0
+                || labeled.statement != current.node
+                || labeled.flow_node.is_some()
+                || self.bound.container(label) != Some(source)
+                || self.bound.block_scope_container(label) != Some(source)
+            {
+                return Ok(false);
+            }
+            current = label;
+            parent = record.parent.map(|node| self.reference(node));
         }
 
         let initializer = self.reference(loop_data.initializer);
@@ -42575,6 +42700,234 @@ mod tests {
             );
             assert!(context.store().value_symbol_links(outer_key).is_none());
             assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn labeled_for_in_closures_preserve_lexical_capture_and_callable_identity() {
+        let source = parsed(concat!(
+            "declare function use(value: any): void; ",
+            "const key = 1; ",
+            "outer: for (let key in { first: 1 }) { ",
+            "(function () { return key; }); (() => key); ",
+            "} ",
+            "first: second: for (const key in { second: 2 }) { ",
+            "(function () { return (() => key); }); (() => key); ",
+            "} ",
+            "use(key);",
+        ));
+        let file = FileId::new(9_363);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let (_, bound) = context.file(file).unwrap();
+        let mut loops = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::ForInOrOfStatement(iteration) = &record.data else {
+                    return None;
+                };
+                if record.kind != SyntaxKind::ForInStatement {
+                    return None;
+                }
+                let NodeData::VariableDeclarationList(bindings) =
+                    &source.arena.get(iteration.initializer)?.data
+                else {
+                    return None;
+                };
+                let [binding] = bindings.declarations.nodes.as_slice() else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(source.arena.id(), file, node),
+                    bound.symbol(NodeRef::new(source.arena.id(), file, *binding))?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        loops.sort_unstable_by_key(|(node, _)| source.arena.get(node.node).unwrap().range.start);
+        let [(_, first_key), (_, second_key)] = loops.as_slice() else {
+            panic!("expected one single-label loop and one double-label loop")
+        };
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let outer_key = variable_symbol(&context, &source, file, "key");
+        for symbol in [*first_key, *second_key] {
+            assert_ne!(symbol, outer_key);
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(string),
+            );
+        }
+        assert_ne!(first_key, second_key);
+
+        let mut functions = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        functions.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        let [direct_function, nested_function] = functions.as_slice() else {
+            panic!("expected one anonymous function in each labeled loop")
+        };
+
+        let mut callable_identities = Vec::new();
+        for (function, expected) in [
+            (*direct_function, "() => string"),
+            (*nested_function, "() => () => string"),
+        ] {
+            let owner = bound.symbol(function).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            assert_eq!(resolved_node_type(&context, function), callable);
+            assert_eq!(context.type_to_string(callable).unwrap(), expected);
+            callable_identities.push((owner, callable));
+        }
+
+        let mut arrows = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        arrows.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        assert_eq!(arrows.len(), 3);
+        for arrow in arrows {
+            let owner = bound.symbol(arrow).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            assert_eq!(resolved_node_type(&context, arrow), callable);
+            assert_eq!(context.type_to_string(callable).unwrap(), "() => string");
+            callable_identities.push((owner, callable));
+        }
+
+        let mut reads = identifier_expressions(&source, file, "key");
+        reads.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        let [
+            first_function,
+            first_arrow,
+            nested_arrow,
+            second_arrow,
+            trailing,
+        ] = reads.as_slice()
+        else {
+            panic!("expected four loop captures and one top-level key")
+        };
+        for (read, expected) in [
+            (*first_function, *first_key),
+            (*first_arrow, *first_key),
+            (*nested_arrow, *second_key),
+            (*second_arrow, *second_key),
+            (*trailing, outer_key),
+        ] {
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(read)
+                    .and_then(|links| links.resolved_symbol),
+                Some(expected),
+            );
+        }
+        assert_eq!(
+            resolved_node_type(&context, *trailing),
+            variable_value_type(&context, &source, file, "key"),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        for (owner, callable) in callable_identities {
+            assert_eq!(
+                context.store().source_callable_type_for_owner(owner),
+                Some(callable)
+            );
+        }
+    }
+
+    #[test]
+    fn labeled_for_in_invalid_operands_preserve_ts2407_and_captured_string_keys() {
+        let source = parsed(concat!(
+            "outer: for (const key in 1) { ",
+            "(function () { return key; }); (() => key); ",
+            "}",
+        ));
+        let file = FileId::new(9_364);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one invalid labeled for-in operand diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2407);
+        assert_eq!(diagnostic.diagnostic.arguments, ["1"]);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "1");
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(variable_value_type(&context, &source, file, "key"), string);
+        for read in identifier_expressions(&source, file, "key") {
+            assert_eq!(resolved_node_type(&context, read), string);
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn malformed_labeled_for_in_loops_fail_before_source_state_publication() {
+        for (index, iteration) in [
+            "outer: for (var key in ready) { (() => key); }",
+            "outer: for (const key in ready) (() => key);",
+            "outer: for (let key in ready) { let nested = key; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = format!("const ready = {{ first: 1 }}; {iteration}");
+            let source = parsed(&text);
+            let file = FileId::new(9_365 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let ready = variable_symbol(&context, &source, file, "ready");
+            let cold = observable_state(&context, file);
+
+            assert!(
+                matches!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Syntax {
+                            kind: SyntaxKind::ForInStatement,
+                            role: SourceSyntaxRole::Statement,
+                            ..
+                        }
+                    )),
+                ),
+                "unexpectedly admitted malformed labeled for-in loop: {iteration}",
+            );
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.store().value_symbol_links(ready).is_none());
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
         }
     }
 

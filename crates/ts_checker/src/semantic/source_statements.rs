@@ -985,6 +985,25 @@ pub(super) fn plan_source_for_in_statement_syntax(
     )
 }
 
+/// Proves one labeled top-level string key and its direct expression statements.
+pub(super) fn plan_source_labeled_for_in_statement_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+    parent: NodeRef,
+) -> Result<SourceForInStatementSyntax, SourceFunctionStatementsError> {
+    plan_source_scoped_iteration_statement_syntax(
+        arena,
+        bound,
+        store,
+        statement,
+        parent,
+        bound.source_file(),
+        SourceControlLoopKind::ForIn,
+    )
+}
+
 /// Proves one function-owned `for...in` body and its lexical iteration binding.
 pub(super) fn plan_source_function_for_in_statement_syntax(
     arena: &NodeArena,
@@ -9512,6 +9531,79 @@ mod joined_tests {
                         | Err(SourceFunctionStatementsError::Invariant(_)),
                 ),
                 "unexpectedly admitted unsupported unused-iteration shape: {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn labeled_for_in_syntax_authenticates_lexical_keys_and_direct_expression_bodies() {
+        for (index, (source, expected_binding)) in [
+            (
+                "outer: for (let key in {}) { (() => key); }",
+                VariableBindingKind::Let,
+            ),
+            (
+                "outer: inner: for (const key in value) { (function () { return key; }); }",
+                VariableBindingKind::Const,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_441 + u32::try_from(index).unwrap()));
+            let statement = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ForInStatement).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let parent = NodeRef::new(
+                fixture.parsed.arena.id(),
+                fixture.file,
+                fixture
+                    .parsed
+                    .arena
+                    .get(statement.node)
+                    .unwrap()
+                    .parent
+                    .unwrap(),
+            );
+
+            let syntax = plan_source_labeled_for_in_statement_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                statement,
+                parent,
+            )
+            .unwrap();
+
+            assert_eq!(syntax.control.kind, SourceControlLoopKind::ForIn);
+            assert_eq!(syntax.binding, expected_binding);
+            assert_eq!(syntax.body_statements.len(), 1);
+            assert_eq!(
+                fixture.bound.symbol(syntax.declaration),
+                Some(syntax.symbol)
+            );
+            assert_eq!(
+                fixture.bound.flow_at(syntax.body_statements[0].statement),
+                syntax.binding_flow,
+            );
+            assert!(
+                plan_source_for_in_statement_syntax(
+                    &fixture.parsed.arena,
+                    &fixture.bound,
+                    &fixture.store,
+                    statement,
+                )
+                .is_err()
             );
         }
     }
