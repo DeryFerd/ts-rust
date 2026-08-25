@@ -295,7 +295,7 @@ pub(super) struct SourceCallablePlan {
     pub(super) return_type: SourceCallableReturnPlan,
     pub(super) type_predicate: Option<CallableTypePredicatePlan>,
     pub(super) body_mode: SourceCallableBodyMode,
-    /// True only for an authenticated async arrow or zero-parameter JSX function.
+    /// True only for an authenticated async arrow or zero-parameter function.
     pub(super) is_async: bool,
     /// The actual body for `Present`, or the declaration diagnostic anchor for
     /// `AmbientDeclaration`.
@@ -6060,7 +6060,8 @@ fn validate_modifiers(
         }
         [SyntaxKind::AsyncKeyword]
             if !is_declaration_file
-                && valid_async_jsx_source_function(store, host, declaration, view)? =>
+                && (valid_async_jsx_source_function(store, host, declaration, view)?
+                    || valid_async_source_function(store, host, declaration, view)?) =>
         {
             Ok(SourceCallableBodyMode::Present)
         }
@@ -6090,6 +6091,102 @@ fn validate_modifiers(
             SourceCallableUnsupported::Modifiers(declaration),
         )),
     }
+}
+
+fn valid_async_source_function(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    view: &SourceSyntaxView<'_>,
+) -> Result<bool, SourceCallableError> {
+    if view.family != SourceCallableFamily::FunctionDeclaration
+        || !view.parameters.nodes.is_empty()
+        || view.parameters.has_trailing_comma
+        || view.type_parameters.is_some()
+        || host.bound_file(declaration).is_none_or(|bound| {
+            bound
+                .source_facts()
+                .is_none_or(|facts| facts.is_declaration_file() || facts.is_javascript_file())
+        })
+    {
+        return Ok(false);
+    }
+
+    let Some(body) = view
+        .body
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return Ok(false);
+    };
+    let body_record = preflight_node(store, host, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Ok(false);
+    };
+    if body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(declaration.node)
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.statements.has_trailing_comma
+        || block.facts != 0
+    {
+        return Ok(false);
+    }
+    for statement in &block.statements.nodes {
+        let statement = NodeRef::new(body.arena, body.file, *statement);
+        let statement_record = preflight_node(store, host, statement)?;
+        if let NodeData::ReturnStatement(returned) = &statement_record.data
+            && returned.expression.is_some_and(|expression| {
+                matches!(
+                    store.source_node_kind(NodeRef::new(body.arena, body.file, expression)),
+                    Some(
+                        SyntaxKind::JsxElement
+                            | SyntaxKind::JsxSelfClosingElement
+                            | SyntaxKind::JsxFragment
+                    )
+                )
+            })
+        {
+            return Ok(false);
+        }
+    }
+
+    let Some(annotation) = view
+        .return_type
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return Ok(true);
+    };
+    let annotation_record = preflight_node(store, host, annotation)?;
+    let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+        return Ok(false);
+    };
+    let Some(arguments) = &reference.type_arguments else {
+        return Ok(false);
+    };
+    let [argument] = arguments.nodes.as_slice() else {
+        return Ok(false);
+    };
+    let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Ok(false);
+    };
+    let argument = NodeRef::new(annotation.arena, annotation.file, *argument);
+    let argument_record = preflight_node(store, host, argument)?;
+
+    Ok(annotation_record.kind == SyntaxKind::TypeReference
+        && annotation_record.flags.0 == 0
+        && annotation_record.parent == Some(declaration.node)
+        && !arguments.has_trailing_comma
+        && name_record.kind == SyntaxKind::Identifier
+        && name_record.flags.0 == 0
+        && name_record.parent == Some(annotation.node)
+        && identifier.flow_node.is_none()
+        && identifier.text == "Promise"
+        && argument_record.kind == SyntaxKind::NumberKeyword
+        && argument_record.flags.0 == 0
+        && argument_record.parent == Some(annotation.node))
 }
 
 fn valid_async_jsx_source_function(
@@ -14692,7 +14789,7 @@ mod tests {
     }
 
     #[test]
-    fn async_jsx_functions_require_one_unannotated_zero_parameter_return() {
+    fn async_jsx_functions_preserve_their_exact_zero_parameter_return_shape() {
         let fixture = QueryFixture::jsx(
             "async function render() { return <view />; }",
             FileId::new(1_271),
@@ -14728,7 +14825,6 @@ mod tests {
         for (index, source) in [
             "async function render(value: string) { return <view />; }",
             "async function render(): any { return <view />; }",
-            "async function render() { return 1; }",
             "async function render() { return <first />; return <second />; }",
         ]
         .into_iter()
@@ -14765,6 +14861,30 @@ mod tests {
                 "{source}"
             );
         }
+
+        let ordinary =
+            QueryFixture::jsx("async function render() { return 1; }", FileId::new(1_276));
+        let declaration = ordinary
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    ordinary.parsed.arena.id(),
+                    ordinary.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = ordinary.bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&ordinary.parsed.arena, &ordinary.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_source_callable(&ordinary.store, &host, declaration, owner, None).unwrap();
+        assert!(plan.is_async);
+        assert_eq!(plan.family, SourceCallableFamily::FunctionDeclaration);
     }
 
     #[test]

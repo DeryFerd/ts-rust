@@ -29,6 +29,9 @@
 //! iteration loops whose unused nested callables capture their lexical bindings,
 //! ordinary direct identifier calls, bounded annotated arrow call arguments,
 //! authenticated interpolated template expressions and contextual template types,
+//! authenticated zero-parameter async functions and arrows, awaited expressions,
+//! selective default-library `Promise.resolve` and `Promise.all` calls, and the
+//! exact counted async loop that captures its block-scoped index,
 //! anonymous zero-parameter function expressions with bounded block bodies,
 //! parenthesized standalone closures, lexical captures, and immediate invocation,
 //! authenticated shorthand object-assignment defaults inside bounded function bodies
@@ -595,6 +598,8 @@ pub(super) struct PlannedExpression {
     array_spreads: Vec<(usize, NodeRef)>,
     object_spreads: Vec<PlannedExpression>,
     non_null_assertion: bool,
+    awaited: bool,
+    promise_call: Option<PlannedPromiseCall>,
     jsdoc_type: Option<PlannedJsDocType>,
     used_before_assignment: bool,
 }
@@ -607,6 +612,8 @@ impl PlannedExpression {
             array_spreads: Vec::new(),
             object_spreads: Vec::new(),
             non_null_assertion: false,
+            awaited: false,
+            promise_call: None,
             jsdoc_type: None,
             used_before_assignment: false,
         }
@@ -620,6 +627,8 @@ impl PlannedExpression {
     pub(super) fn unparenthesized(&self) -> &Self {
         let mut expression = self;
         while !expression.non_null_assertion
+            && !expression.awaited
+            && expression.promise_call.is_none()
             && expression.jsdoc_type.is_none()
             && let PlannedExpressionKind::Parenthesized(inner) = &expression.kind
         {
@@ -633,6 +642,21 @@ impl PlannedExpression {
             .iter()
             .find_map(|(position, node)| (*position == index).then_some(*node))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannedPromiseCallKind {
+    Resolve,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedPromiseCall {
+    kind: PlannedPromiseCallKind,
+    receiver: NodeRef,
+    property: NodeRef,
+    receiver_symbol: SemanticSymbolId,
+    method_symbol: SemanticSymbolId,
 }
 
 /// Fully preflighted scalar-binary source shape with an optional flattened prefix.
@@ -1081,6 +1105,7 @@ enum PlannedFunctionBody {
         else_statement: NodeRef,
         else_expression: PlannedExpression,
     },
+    AsyncCapturedLoop(Box<PlannedAsyncCapturedLoop>),
     Linear(Box<PlannedLinearFunctionStatements>),
     ForIn(Box<PlannedLexicalIteration>),
     ForOf(Box<PlannedLexicalIteration>),
@@ -1091,6 +1116,30 @@ enum PlannedFunctionBody {
     ConditionalEnum(Box<PlannedConditionalEnumFunctionStatements>),
     Statements(Box<PlannedFunctionStatements>),
     JoinedStatements(Box<PlannedJoinedFunctionStatements>),
+}
+
+#[derive(Clone, Debug)]
+struct PlannedAsyncCapturedLoop {
+    array: PlannedVariable,
+    index: PlannedVariable,
+    condition: PlannedExpression,
+    incrementor: NodeRef,
+    increment_operand: PlannedExpression,
+    awaited: PlannedExpression,
+    push: PlannedExpression,
+    push_method: SemanticSymbolId,
+    ending: PlannedAsyncCapturedLoopEnding,
+}
+
+#[derive(Clone, Debug)]
+enum PlannedAsyncCapturedLoopEnding {
+    None,
+    Break(NodeRef),
+    Continue(NodeRef),
+    Return {
+        statement: NodeRef,
+        expression: PlannedExpression,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -7773,6 +7822,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         {
             return Ok(PlannedFunctionBody::Empty);
         }
+        if let Some(captured) = self.plan_async_captured_loop(callable, &statements)? {
+            return Ok(PlannedFunctionBody::AsyncCapturedLoop(Box::new(captured)));
+        }
         if let Some(assignment) =
             self.plan_object_shorthand_assignment_function_body(callable, &statements)?
         {
@@ -7789,6 +7841,509 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         Ok(PlannedFunctionBody::Empty)
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the counted loop and lexical capture proofs together.
+    fn plan_async_captured_loop(
+        &mut self,
+        callable: &SourceCallablePlan,
+        statements: &[NodeId],
+    ) -> Result<Option<PlannedAsyncCapturedLoop>, SourceCheckError> {
+        let [array_statement, iteration] = statements else {
+            return Ok(None);
+        };
+        if callable.family != SourceCallableFamily::FunctionDeclaration
+            || !callable.is_async
+            || !callable.parameters.is_empty()
+            || !callable.type_parameters.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let array_statement = self.reference(*array_statement);
+        let iteration = self.reference(*iteration);
+        let array_record = self.node(array_statement)?;
+        let NodeData::VariableStatement(array_statement_data) = &array_record.data else {
+            return Ok(None);
+        };
+        if self.node(iteration)?.kind != SyntaxKind::ForStatement {
+            return Ok(None);
+        }
+        if array_record.kind != SyntaxKind::VariableStatement
+            || array_record.flags.0 != 0
+            || array_record.parent != Some(callable.body.node)
+            || array_statement_data.modifiers.is_some()
+            || array_statement_data.flow_node.is_some()
+            || array_statement_data.facts != 0
+            || self.bound.container(array_statement) != Some(callable.declaration)
+            || self.bound.block_scope_container(array_statement) != Some(callable.declaration)
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+
+        let array_list = self.reference(array_statement_data.declaration_list);
+        let array = self.plan_async_captured_loop_binding(
+            callable,
+            array_list,
+            array_statement,
+            callable.declaration,
+            "ar",
+        )?;
+        let PlannedVariableInitializer::Expression(array_initializer) = &array.initializer else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if !matches!(&array_initializer.kind, PlannedExpressionKind::Array(elements) if elements.is_empty())
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+
+        let control =
+            plan_source_control_loop_syntax(self.arena, self.bound, iteration, callable.body)
+                .map_err(|error| Self::function_statements_plan_error(callable, error))?;
+        if control.kind != SourceControlLoopKind::For || control.iterable.is_some() {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let index_list = control
+            .initializer
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let index =
+            self.plan_async_captured_loop_binding(callable, index_list, iteration, iteration, "i")?;
+        let PlannedVariableInitializer::Expression(index_initializer) = &index.initializer else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if !matches!(index_initializer.kind, PlannedExpressionKind::Number { .. })
+            || !self.source_spelling_matches(index_initializer.node, "0")
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+
+        let condition_node = control
+            .condition
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        self.primitive_binary_position_roots.insert(condition_node);
+        let condition = self.plan_expression(condition_node)?;
+        let PlannedExpressionKind::Binary(comparison) = &condition.kind else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if comparison.operator != SyntaxKind::LessThanToken
+            || !matches!(
+                &comparison.left.kind,
+                PlannedExpressionKind::Identifier(read)
+                    if read.kind == PlannedIdentifierReadKind::Variable
+                        && read.value_symbol == index.symbol
+            )
+            || !matches!(comparison.right.kind, PlannedExpressionKind::Number { .. })
+            || !self.source_spelling_matches(comparison.right.node, "1")
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+
+        let incrementor = control
+            .incrementor
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let increment_record = self.node(incrementor)?;
+        let NodeData::PostfixUnaryExpression(increment) = &increment_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let increment_operand = self.reference(increment.operand);
+        let operand_record = self.node(increment_operand)?;
+        if increment_record.kind != SyntaxKind::PostfixUnaryExpression
+            || increment_record.flags.0 != 0
+            || increment_record.parent != Some(iteration.node)
+            || increment.operator != SyntaxKind::PlusPlusToken
+            || operand_record.kind != SyntaxKind::Identifier
+            || operand_record.flags.0 != 0
+            || operand_record.parent != Some(incrementor.node)
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let increment_operand = self.plan_expression(increment_operand)?;
+        if !matches!(
+            &increment_operand.kind,
+            PlannedExpressionKind::Identifier(read)
+                if read.kind == PlannedIdentifierReadKind::Variable
+                    && read.value_symbol == index.symbol
+        ) {
+            return Err(Self::unsupported_function_body(callable));
+        }
+
+        let body_record = self.node(control.body)?;
+        let NodeData::Block(body) = &body_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if body_record.kind != SyntaxKind::Block
+            || body_record.flags.0 != 0
+            || body_record.parent != Some(iteration.node)
+            || body.flow_node.is_some()
+            || body.next_container.is_some()
+            || body.statements.has_trailing_comma
+            || body.facts != 0
+            || !(2..=3).contains(&body.statements.nodes.len())
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let body_statements = body.statements.nodes.clone();
+        let awaited_statement = self.reference(body_statements[0]);
+        let push_statement = self.reference(body_statements[1]);
+        let awaited_record = self.node(awaited_statement)?;
+        let NodeData::ExpressionStatement(awaited_statement_data) = &awaited_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if awaited_record.kind != SyntaxKind::ExpressionStatement
+            || awaited_record.flags.0 != 0
+            || awaited_record.parent != Some(control.body.node)
+            || awaited_statement_data.flow_node.is_some()
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let awaited = self.plan_expression(self.reference(awaited_statement_data.expression))?;
+        let PlannedExpressionKind::Parenthesized(operand) = &awaited.kind else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if !awaited.awaited
+            || !matches!(operand.kind, PlannedExpressionKind::Number { .. })
+            || !self.source_spelling_matches(operand.node, "1")
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+
+        let push_record = self.node(push_statement)?;
+        let NodeData::ExpressionStatement(push_statement_data) = &push_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if push_record.kind != SyntaxKind::ExpressionStatement
+            || push_record.flags.0 != 0
+            || push_record.parent != Some(control.body.node)
+            || push_statement_data.flow_node.is_some()
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let push = self.plan_expression(self.reference(push_statement_data.expression))?;
+        let PlannedExpressionKind::Call(call) = &push.kind else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let PlannedExpressionKind::Property(property) = &call.callee.kind else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let property_record = self.node(property.node)?;
+        let NodeData::PropertyAccessExpression(access) = &property_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let property_name = self.reference(access.name);
+        let name_record = self.node(property_name)?;
+        let NodeData::Identifier(name) = &name_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let [argument] = call.arguments.as_slice() else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let PlannedExpressionKind::Arrow(arrow) = &argument.kind else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let PlannedArrowBody::Return {
+            expression: captured,
+            ..
+        } = &arrow.body
+        else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if name.text != "push"
+            || !matches!(
+                &property.receiver.kind,
+                PlannedExpressionKind::Identifier(read)
+                    if read.kind == PlannedIdentifierReadKind::Variable
+                        && read.value_symbol == array.symbol
+            )
+            || !arrow.callable.parameters.is_empty()
+            || !arrow.callable.type_parameters.is_empty()
+            || arrow.callable.is_async
+            || !arrow.parameter_initializers.is_empty()
+            || arrow.expression_statement.is_some()
+            || !matches!(
+                &captured.kind,
+                PlannedExpressionKind::Identifier(read)
+                    if read.kind == PlannedIdentifierReadKind::Variable
+                        && read.value_symbol == index.symbol
+            )
+            || self.bound.container(captured.node) != Some(arrow.callable.declaration)
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let push_method = self.plan_async_captured_loop_push_method(callable, property.node)?;
+
+        let ending = if let Some(statement) = body_statements.get(2).copied() {
+            let statement = self.reference(statement);
+            let record = self.node(statement)?;
+            if record.flags.0 != 0 || record.parent != Some(control.body.node) {
+                return Err(Self::unsupported_function_body(callable));
+            }
+            match &record.data {
+                NodeData::BreakStatement(data)
+                    if record.kind == SyntaxKind::BreakStatement
+                        && data.flow_node.is_none()
+                        && data.label.is_none() =>
+                {
+                    PlannedAsyncCapturedLoopEnding::Break(statement)
+                }
+                NodeData::ContinueStatement(data)
+                    if record.kind == SyntaxKind::ContinueStatement
+                        && data.flow_node.is_none()
+                        && data.label.is_none() =>
+                {
+                    PlannedAsyncCapturedLoopEnding::Continue(statement)
+                }
+                NodeData::ReturnStatement(data)
+                    if record.kind == SyntaxKind::ReturnStatement
+                        && data.flow_node.is_none()
+                        && data.facts == 0 =>
+                {
+                    let expression = data
+                        .expression
+                        .map(|node| self.reference(node))
+                        .ok_or_else(|| Self::unsupported_function_body(callable))?;
+                    if self.node(expression)?.parent != Some(statement.node)
+                        || !self.source_spelling_matches(expression, "1")
+                    {
+                        return Err(Self::unsupported_function_body(callable));
+                    }
+                    PlannedAsyncCapturedLoopEnding::Return {
+                        statement,
+                        expression: self.plan_expression(expression)?,
+                    }
+                }
+                _ => return Err(Self::unsupported_function_body(callable)),
+            }
+        } else {
+            PlannedAsyncCapturedLoopEnding::None
+        };
+        if matches!(ending, PlannedAsyncCapturedLoopEnding::Return { .. })
+            == callable.return_type.is_inferred()
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+
+        Ok(Some(PlannedAsyncCapturedLoop {
+            array,
+            index,
+            condition,
+            incrementor,
+            increment_operand,
+            awaited,
+            push,
+            push_method,
+            ending,
+        }))
+    }
+
+    fn plan_async_captured_loop_binding(
+        &mut self,
+        callable: &SourceCallablePlan,
+        list: NodeRef,
+        parent: NodeRef,
+        scope: NodeRef,
+        expected_name: &str,
+    ) -> Result<PlannedVariable, SourceCheckError> {
+        let list_record = self.node(list)?;
+        let NodeData::VariableDeclarationList(data) = &list_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let [declaration] = data.declarations.nodes.as_slice() else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if list_record.kind != SyntaxKind::VariableDeclarationList
+            || list_record.flags.0 != NODE_FLAG_LET
+            || list_record.parent != Some(parent.node)
+            || data.declarations.has_trailing_comma
+            || data.facts != 0
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let declaration = self.reference(*declaration);
+        let declaration_record = self.node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let name = self.reference(variable.name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let initializer = variable
+            .initializer
+            .map(|node| self.reference(node))
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let initializer_record = self.node(initializer)?;
+        if declaration_record.kind != SyntaxKind::VariableDeclaration
+            || declaration_record.flags.0 != 0
+            || declaration_record.parent != Some(list.node)
+            || variable.exclamation_token.is_some()
+            || variable.local_symbol.is_some()
+            || variable.symbol.is_some()
+            || variable.type_.is_some()
+            || variable.facts != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || identifier.text != expected_name
+            || initializer_record.parent != Some(declaration.node)
+            || self.bound.container(declaration) != Some(callable.declaration)
+            || self.bound.block_scope_container(declaration) != Some(scope)
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let Some((store, _)) = self.semantic else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let symbol = plan_top_level_variable(
+            self.bound,
+            store,
+            declaration,
+            name,
+            expected_name,
+            VariableBindingKind::Let,
+            false,
+        )
+        .map_err(Self::variable_plan_error)?;
+        if self
+            .bound
+            .locals(scope)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(expected_name))
+            != Some(symbol)
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let initializer = self.plan_expression(initializer)?;
+        if !self.prior_variables.insert(symbol) || !self.readable_variables.insert(symbol) {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(symbol),
+            ));
+        }
+
+        Ok(PlannedVariable {
+            declaration,
+            name,
+            symbol,
+            binding: VariableBindingKind::Let,
+            evolving_array: false,
+            type_node: None,
+            jsdoc_type: None,
+            initializer: PlannedVariableInitializer::Expression(initializer),
+        })
+    }
+
+    fn plan_async_captured_loop_push_method(
+        &mut self,
+        callable: &SourceCallablePlan,
+        property: NodeRef,
+    ) -> Result<SemanticSymbolId, SourceCheckError> {
+        let Some((store, host)) = self.semantic else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let owner = store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Array"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let array = store
+            .symbol(owner)
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let method = array
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("push"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let method_record = store
+            .symbol(method)
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let declarations = method_record
+            .declarations()
+            .filter(|declarations| !declarations.is_empty())
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        if !array.flags().contains(SymbolFlags::INTERFACE)
+            || array.check_flags() != CheckFlags::NONE
+            || array.name().as_utf8() != Some("Array")
+            || array.parent().is_some()
+            || method_record.flags() != SymbolFlags::METHOD
+            || method_record.check_flags() != CheckFlags::NONE
+            || method_record.name().as_utf8() != Some("push")
+            || method_record
+                .parent()
+                .and_then(|parent| store.get_merged_symbol(parent))
+                != Some(owner)
+            || declarations.iter().any(|declaration| {
+                host.bound_file(*declaration).is_none_or(|bound| {
+                    !bound
+                        .source_facts()
+                        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_default_library)
+                        || !host.symbol_matches(store, *declaration, method)
+                })
+            })
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let Some(declaration) = declarations.iter().copied().find(|declaration| {
+            let Some(record) = host.node(*declaration) else {
+                return false;
+            };
+            let NodeData::MethodSignatureDeclaration(signature) = &record.data else {
+                return false;
+            };
+            let [parameter] = signature.parameters.nodes.as_slice() else {
+                return false;
+            };
+            let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+            let Some(parameter_record) = host.node(parameter) else {
+                return false;
+            };
+            let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
+                return false;
+            };
+            let Some(return_type) = signature
+                .type_
+                .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            else {
+                return false;
+            };
+            record.kind == SyntaxKind::MethodSignature
+                && record.flags.0 == 0
+                && parameter_record.kind == SyntaxKind::Parameter
+                && parameter_record.flags.0 == 0
+                && parameter_record.parent == Some(declaration.node)
+                && data.dot_dot_dot_token.is_some()
+                && data.type_.is_some()
+                && data.initializer.is_none()
+                && data.question_token.is_none()
+                && host.node(return_type).is_some_and(|returned| {
+                    returned.kind == SyntaxKind::NumberKeyword
+                        && returned.parent == Some(declaration.node)
+                })
+        }) else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if !host.symbol_matches(store, declaration, method) {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        if store
+            .symbol_node_links(property)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|cached| cached != method)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolNodeCache {
+                    node: property,
+                    cached: store
+                        .symbol_node_links(property)
+                        .and_then(|links| links.resolved_symbol),
+                    expected: method,
+                },
+            ));
+        }
+        self.identifier_reads.push((property, method));
+        Ok(method)
     }
 
     fn plan_typeof_return_condition(
@@ -15444,6 +15999,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 planned.non_null_assertion = true;
                 Ok(planned)
             }
+            SyntaxKind::AwaitExpression => self.plan_await_expression(expression),
             SyntaxKind::BinaryExpression => self.plan_binary(expression),
             SyntaxKind::ConditionalExpression => self.plan_conditional(expression),
             SyntaxKind::PrefixUnaryExpression => self.plan_prefix_unary(expression),
@@ -15488,6 +16044,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ))
             }
             SyntaxKind::CallExpression | SyntaxKind::TaggedTemplateExpression => {
+                if kind == SyntaxKind::CallExpression
+                    && let Some(promise) = self.plan_global_promise_call(expression)?
+                {
+                    return Ok(promise);
+                }
                 let Some((store, _)) = self.semantic else {
                     return Err(SourceCheckError::Unsupported(
                         UnsupportedSourceSyntax::Call(expression),
@@ -15744,6 +16305,381 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 substitutions,
             })),
         ))
+    }
+
+    fn plan_await_expression(
+        &mut self,
+        expression: NodeRef,
+    ) -> Result<PlannedExpression, SourceCheckError> {
+        let record = self.node(expression)?;
+        let NodeData::AwaitExpression(awaited) = &record.data else {
+            return Err(self.unsupported(
+                expression,
+                record.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        };
+        let operand = self.reference(awaited.expression);
+        let operand_record = self.node(operand)?;
+        if record.kind != SyntaxKind::AwaitExpression
+            || record.flags.0 != 0
+            || record.parent.is_none()
+            || operand_record.parent != Some(expression.node)
+            || operand_record.flags.0 != 0
+            || operand_record.range.start < record.range.start
+            || operand_record.range.end > record.range.end
+        {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::AwaitExpression,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+
+        let Some((store, host)) = self.semantic else {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::AwaitExpression,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        };
+        let mut current = expression;
+        let callable = loop {
+            let child = self.node(current)?;
+            let parent = child
+                .parent
+                .map(|node| self.reference(node))
+                .ok_or_else(|| {
+                    self.unsupported(
+                        expression,
+                        SyntaxKind::AwaitExpression,
+                        SourceSyntaxRole::VariableInitializer,
+                    )
+                })?;
+            let parent_record = self.node(parent)?;
+            if child.range.start < parent_record.range.start
+                || child.range.end > parent_record.range.end
+            {
+                return Err(self.unsupported(
+                    expression,
+                    SyntaxKind::AwaitExpression,
+                    SourceSyntaxRole::VariableInitializer,
+                ));
+            }
+            if matches!(
+                parent_record.kind,
+                SyntaxKind::FunctionDeclaration
+                    | SyntaxKind::FunctionExpression
+                    | SyntaxKind::ArrowFunction
+            ) {
+                break parent;
+            }
+            if parent_record.kind == SyntaxKind::SourceFile {
+                return Err(self.unsupported(
+                    expression,
+                    SyntaxKind::AwaitExpression,
+                    SourceSyntaxRole::VariableInitializer,
+                ));
+            }
+            current = parent;
+        };
+        let owner = self.bound.symbol(callable).ok_or_else(|| {
+            self.unsupported(
+                expression,
+                SyntaxKind::AwaitExpression,
+                SourceSyntaxRole::VariableInitializer,
+            )
+        })?;
+        let planned = plan_source_callable(store, host, callable, owner, self.array_targets)
+            .map_err(Self::callable_plan_error)?;
+        if !planned.is_async
+            || planned.body_mode != SourceCallableBodyMode::Present
+            || self.bound.container(expression) != Some(callable)
+            || self.bound.container(operand) != Some(callable)
+        {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::AwaitExpression,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+
+        let mut planned = PlannedExpression::new(
+            expression,
+            PlannedExpressionKind::Parenthesized(Box::new(self.plan_expression(operand)?)),
+        );
+        planned.awaited = true;
+        Ok(planned)
+    }
+
+    #[allow(clippy::too_many_lines)] // Authenticate the real global value and constructor member.
+    fn plan_global_promise_call(
+        &mut self,
+        expression: NodeRef,
+    ) -> Result<Option<PlannedExpression>, SourceCheckError> {
+        let record = self.node(expression)?;
+        let NodeData::CallExpression(call) = &record.data else {
+            return Ok(None);
+        };
+        let property = self.reference(call.expression);
+        let property_record = self.node(property)?;
+        let NodeData::PropertyAccessExpression(access) = &property_record.data else {
+            return Ok(None);
+        };
+        let receiver = self.reference(access.expression);
+        let receiver_record = self.node(receiver)?;
+        let NodeData::Identifier(receiver_name) = &receiver_record.data else {
+            return Ok(None);
+        };
+        let name = self.reference(access.name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(method_name) = &name_record.data else {
+            return Ok(None);
+        };
+        if receiver_name.text != "Promise" {
+            return Ok(None);
+        }
+        let kind = match method_name.text.as_str() {
+            "resolve" => PlannedPromiseCallKind::Resolve,
+            "all" => PlannedPromiseCallKind::All,
+            _ => return Ok(None),
+        };
+        let Some((store, host)) = self.semantic else {
+            return Ok(None);
+        };
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        let Some(receiver_symbol) = store
+            .symbol_table(bootstrap.globals)
+            .and_then(|globals| globals.get_source("Promise"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+        else {
+            return Ok(None);
+        };
+
+        let mut callback_host = host.name_resolver_host(store)?;
+        let resolved = CanonicalNameResolver::new(
+            self.arena,
+            self.bound,
+            store.symbol_store(),
+            &mut callback_host,
+        )
+        .map_err(DeclaredTypeError::from)?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(receiver)),
+            "Promise",
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        );
+        let resolved = match resolved {
+            Ok(resolved) => resolved,
+            Err(ts_binder::CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(DeclaredTypeError::from(error).into()),
+        };
+        if resolved.and_then(|symbol| store.get_merged_symbol(symbol)) != Some(receiver_symbol) {
+            return Ok(None);
+        }
+        if record.kind != SyntaxKind::CallExpression
+            || record.flags.0 != 0
+            || call.arguments.has_trailing_comma
+            || call.type_arguments.is_some()
+            || call.question_dot_token.is_some()
+            || call.symbol.is_some()
+            || call.facts != 0
+            || property_record.kind != SyntaxKind::PropertyAccessExpression
+            || property_record.flags.0 != 0
+            || property_record.parent != Some(expression.node)
+            || access.question_dot_token.is_some()
+            || access.flow_node.is_some()
+            || access.facts != 0
+            || receiver_record.kind != SyntaxKind::Identifier
+            || receiver_record.flags.0 != 0
+            || receiver_record.parent != Some(property.node)
+            || receiver_name.flow_node.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(property.node)
+            || method_name.flow_node.is_some()
+            || match kind {
+                PlannedPromiseCallKind::Resolve => call.arguments.nodes.len() > 1,
+                PlannedPromiseCallKind::All => call.arguments.nodes.len() != 1,
+            }
+        {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Call(expression),
+            ));
+        }
+
+        let owner = store
+            .symbol(receiver_symbol)
+            .ok_or(SourceCheckError::Call(expression))?;
+        let declaration = owner
+            .value_declaration()
+            .ok_or(SourceCheckError::Call(expression))?;
+        let declaration_record = host
+            .node(declaration)
+            .ok_or(SourceCheckError::Call(expression))?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Err(SourceCheckError::Call(expression));
+        };
+        let annotation = variable
+            .type_
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            .ok_or(SourceCheckError::Call(expression))?;
+        let annotation_record = host
+            .node(annotation)
+            .ok_or(SourceCheckError::Call(expression))?;
+        let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+            return Err(SourceCheckError::Call(expression));
+        };
+        let constructor_name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+        let constructor_name_record = host
+            .node(constructor_name)
+            .ok_or(SourceCheckError::Call(expression))?;
+        let NodeData::Identifier(constructor_identifier) = &constructor_name_record.data else {
+            return Err(SourceCheckError::Call(expression));
+        };
+        if !owner.flags().contains(SymbolFlags::INTERFACE)
+            || !owner.flags().intersects(SymbolFlags::VALUE)
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some("Promise")
+            || owner.parent().is_some()
+            || declaration_record.kind != SyntaxKind::VariableDeclaration
+            || declaration_record.flags.0 != 0
+            || variable.initializer.is_some()
+            || annotation_record.kind != SyntaxKind::TypeReference
+            || annotation_record.flags.0 != 0
+            || annotation_record.parent != Some(declaration.node)
+            || reference.type_arguments.is_some()
+            || constructor_name_record.kind != SyntaxKind::Identifier
+            || constructor_name_record.flags.0 != 0
+            || constructor_name_record.parent != Some(annotation.node)
+            || constructor_identifier.text != "PromiseConstructor"
+            || host.bound_file(declaration).is_none_or(|bound| {
+                !bound
+                    .source_facts()
+                    .is_some_and(ts_binder::CanonicalSourceFileFacts::is_default_library)
+                    || !host.symbol_matches(store, declaration, receiver_symbol)
+            })
+        {
+            return Err(SourceCheckError::Call(expression));
+        }
+
+        let constructor = store
+            .symbol_table(bootstrap.globals)
+            .and_then(|globals| globals.get_source("PromiseConstructor"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or(SourceCheckError::Call(expression))?;
+        let constructor_record = store
+            .symbol(constructor)
+            .ok_or(SourceCheckError::Call(expression))?;
+        let method_symbol = constructor_record
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(&method_name.text))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or(SourceCheckError::Call(expression))?;
+        let method = store
+            .symbol(method_symbol)
+            .ok_or(SourceCheckError::Call(expression))?;
+        if constructor_record.flags() != SymbolFlags::INTERFACE
+            || constructor_record.name().as_utf8() != Some("PromiseConstructor")
+            || method.flags() != SymbolFlags::METHOD
+            || method.check_flags() != CheckFlags::NONE
+            || method.name().as_utf8() != Some(method_name.text.as_str())
+            || method
+                .parent()
+                .and_then(|parent| store.get_merged_symbol(parent))
+                != Some(constructor)
+            || method.declarations().is_none_or(|declarations| {
+                declarations.is_empty()
+                    || declarations.iter().any(|declaration| {
+                        host.node(*declaration)
+                            .is_none_or(|record| record.kind != SyntaxKind::MethodSignature)
+                            || host.bound_file(*declaration).is_none_or(|bound| {
+                                !bound.source_facts().is_some_and(
+                                    ts_binder::CanonicalSourceFileFacts::is_default_library,
+                                ) || !host.symbol_matches(store, *declaration, method_symbol)
+                            })
+                    })
+            })
+        {
+            return Err(SourceCheckError::Call(expression));
+        }
+
+        for (node, symbol) in [(receiver, receiver_symbol), (property, method_symbol)] {
+            if store
+                .symbol_node_links(node)
+                .and_then(|links| links.resolved_symbol)
+                .is_some_and(|cached| cached != symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolNodeCache {
+                        node,
+                        cached: store
+                            .symbol_node_links(node)
+                            .and_then(|links| links.resolved_symbol),
+                        expected: symbol,
+                    },
+                ));
+            }
+            self.identifier_reads.push((node, symbol));
+        }
+
+        let syntax = plan_direct_source_call_syntax(self.arena, store, expression)?;
+        let property_syntax =
+            plan_direct_source_property_call_syntax(self.arena, store, property, expression)
+                .map_err(Self::property_plan_error)?;
+        if syntax.callee_form() != SourceCallCalleeForm::RequiredOwnProperty
+            || syntax.callee() != property
+            || property_syntax.receiver() != receiver
+            || property_syntax.name_node() != syntax.callee_diagnostic_node()
+        {
+            return Err(SourceCheckError::Call(expression));
+        }
+        let callee = finish_direct_source_property_plan(
+            &property_syntax,
+            PlannedExpression::new(
+                receiver,
+                PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                    resolved_symbol: receiver_symbol,
+                    value_symbol: receiver_symbol,
+                    kind: PlannedIdentifierReadKind::DeclaredValue,
+                }),
+            ),
+        )
+        .map_err(Self::property_plan_error)?;
+        let arguments = syntax
+            .arguments()
+            .iter()
+            .copied()
+            .map(|argument| {
+                self.primitive_binary_position_roots.insert(argument);
+                self.plan_expression(argument)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let call = finish_direct_source_call_plan(
+            &syntax,
+            PlannedExpression::new(property, PlannedExpressionKind::Property(Box::new(callee))),
+            arguments,
+        )?;
+        let mut planned =
+            PlannedExpression::new(expression, PlannedExpressionKind::Call(Box::new(call)));
+        planned.promise_call = Some(PlannedPromiseCall {
+            kind,
+            receiver,
+            property,
+            receiver_symbol,
+            method_symbol,
+        });
+        Ok(Some(planned))
     }
 
     fn plan_conditional(
@@ -18646,6 +19582,27 @@ fn preflight_inferred_function_return_dependencies(
             }
             PlannedExpressionKind::TypeImportValueUse(_) => false,
             PlannedExpressionKind::New(construction) => construction.requires_early_preparation(),
+            PlannedExpressionKind::Parenthesized(inner) if expression.awaited => {
+                match &inner.kind {
+                    PlannedExpressionKind::Identifier(read)
+                        if read.kind == PlannedIdentifierReadKind::Import =>
+                    {
+                        true
+                    }
+                    PlannedExpressionKind::Call(call)
+                        if matches!(
+                            &call.callee.unparenthesized().kind,
+                            PlannedExpressionKind::Identifier(read)
+                                if read.kind == PlannedIdentifierReadKind::Import
+                        ) =>
+                    {
+                        call.arguments.iter().all(|argument| {
+                            expression_is_closed(argument, parameters, locals, functions)
+                        })
+                    }
+                    _ => expression_is_closed(inner, parameters, locals, functions),
+                }
+            }
             PlannedExpressionKind::Parenthesized(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => {
                 expression_is_closed(inner, parameters, locals, functions)
@@ -18668,6 +19625,11 @@ fn preflight_inferred_function_return_dependencies(
                     && expression_is_closed(&element.index, parameters, locals, functions)
             }
             PlannedExpressionKind::Call(call) => {
+                if expression.promise_call.is_some() {
+                    return call.arguments.iter().all(|argument| {
+                        expression_is_closed(argument, parameters, locals, functions)
+                    });
+                }
                 let callee = call.callee.unparenthesized();
                 let PlannedExpressionKind::Identifier(read) = &callee.kind else {
                     return false;
@@ -18808,6 +19770,15 @@ fn preflight_inferred_function_return_dependencies(
                         &function.callable.parameters,
                         &locals,
                         functions,
+                    )
+            }
+            PlannedFunctionBody::AsyncCapturedLoop(statements) => {
+                function.callable.is_async
+                    && function.callable.parameters.is_empty()
+                    && function.callable.type_parameters.is_empty()
+                    && !matches!(
+                        statements.ending,
+                        PlannedAsyncCapturedLoopEnding::Return { .. }
                     )
             }
             PlannedFunctionBody::Linear(statements) => {
@@ -20899,6 +21870,35 @@ fn check_expression_type(
     session.reset_query();
     emit_enum_use_before_declaration_diagnostics(store, host, options, diagnostics, expression)?;
     issue_invalid_const_enum_value_diagnostic(store, host, diagnostics, expression)?;
+    if expression.awaited {
+        let PlannedExpressionKind::Parenthesized(operand) = &expression.kind else {
+            return Err(SourceCheckError::Arrow(expression.node));
+        };
+        if expression.non_null_assertion
+            || expression.jsdoc_type.is_some()
+            || expression.promise_call.is_some()
+        {
+            return Err(SourceCheckError::Arrow(expression.node));
+        }
+        let checked = check_expression_type(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            current_flow_types,
+            preflighted_type_import_value_uses,
+            operand,
+            None,
+            deferred,
+        )?;
+        let awaited = source_awaited_expression_type(store, expression.node, checked.result)?;
+        preflight_source_expression_cache(store, expression.node, awaited)?;
+        publish_expression_type(store, expression.node, awaited)?;
+        return Ok(CheckedExpressionTypes::leaf(awaited, awaited));
+    }
     if options.intrinsic.strict_null_checks
         || host
             .bound_file(source.node_ref())
@@ -21861,6 +22861,23 @@ fn check_expression_type(
             ))
         }
         PlannedExpressionKind::Call(call) => {
+            if let Some(promise) = expression.promise_call {
+                return check_planned_global_promise_call(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    current_flow_types,
+                    preflighted_type_import_value_uses,
+                    deferred,
+                    expression,
+                    call,
+                    promise,
+                );
+            }
             emit_call_type_argument_grammar_diagnostics(diagnostics, call)?;
             let callee = check_expression_type(
                 store,
@@ -26508,6 +27525,262 @@ fn check_planned_loop_condition(
     Ok(checked)
 }
 
+#[allow(clippy::too_many_arguments)] // Reuses the source-owned variable and callable transaction.
+fn check_planned_async_captured_loop(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    base_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    return_type: Option<NodeRef>,
+    statements: &PlannedAsyncCapturedLoop,
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+) -> Result<(), SourceCheckError> {
+    if !callable.is_async || !callable.parameters.is_empty() || !callable.type_parameters.is_empty()
+    {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    }
+    let (number, boolean) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| (bootstrap.number_type, bootstrap.boolean_type))
+        .ok_or(DerivedTypeError::BootstrapUninitialized)?;
+    let PlannedVariableInitializer::Expression(array_initializer) = &statements.array.initializer
+    else {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    };
+    check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        base_flow_types,
+        preflighted_type_import_value_uses,
+        array_initializer,
+        None,
+        deferred,
+    )?;
+    stage_value_type(
+        store,
+        staged_value_types,
+        value_order,
+        statements.array.symbol,
+        global_types.any_array_type,
+    )?;
+    let mut flow_types = base_flow_types.clone();
+    if flow_types
+        .insert(statements.array.symbol, global_types.any_array_type)
+        .is_some()
+    {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::DuplicateCurrentFlowType(statements.array.symbol),
+        ));
+    }
+
+    let PlannedVariableInitializer::Expression(index_initializer) = &statements.index.initializer
+    else {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    };
+    check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &flow_types,
+        preflighted_type_import_value_uses,
+        index_initializer,
+        None,
+        deferred,
+    )?;
+    stage_value_type(
+        store,
+        staged_value_types,
+        value_order,
+        statements.index.symbol,
+        number,
+    )?;
+    if flow_types.insert(statements.index.symbol, number).is_some() {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::DuplicateCurrentFlowType(statements.index.symbol),
+        ));
+    }
+
+    let condition = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &flow_types,
+        preflighted_type_import_value_uses,
+        &statements.condition,
+        None,
+        deferred,
+    )?;
+    if condition.result != boolean {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    }
+    let increment = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &flow_types,
+        preflighted_type_import_value_uses,
+        &statements.increment_operand,
+        None,
+        deferred,
+    )?;
+    if increment.result != number {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    }
+    preflight_source_expression_cache(store, statements.incrementor, number)?;
+    publish_expression_type(store, statements.incrementor, number)?;
+
+    check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &flow_types,
+        preflighted_type_import_value_uses,
+        &statements.awaited,
+        None,
+        deferred,
+    )?;
+    let PlannedExpressionKind::Call(call) = &statements.push.kind else {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    };
+    let PlannedExpressionKind::Property(property) = &call.callee.kind else {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    };
+    let [callback] = call.arguments.as_slice() else {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    };
+    let receiver = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &flow_types,
+        preflighted_type_import_value_uses,
+        &property.receiver,
+        None,
+        deferred,
+    )?;
+    if receiver.result != global_types.any_array_type {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    }
+    let callback = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &flow_types,
+        preflighted_type_import_value_uses,
+        callback,
+        None,
+        deferred,
+    )?;
+    let callback_return = store
+        .source_callable_provenance(callback.result)
+        .and_then(|provenance| store.signature(provenance.signature))
+        .and_then(super::signatures::Signature::resolved_return_type);
+    if callback_return != Some(number) {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    }
+    publish_selective_source_call_signature(
+        store,
+        host,
+        statements.push.node,
+        statements.push_method,
+        1,
+        number,
+    )?;
+
+    match (&statements.ending, return_type) {
+        (PlannedAsyncCapturedLoopEnding::None, None) => {}
+        (PlannedAsyncCapturedLoopEnding::Break(statement), None)
+        | (PlannedAsyncCapturedLoopEnding::Continue(statement), None) => {
+            if host.node(*statement).is_none() {
+                return Err(SourcePlanner::unsupported_function_body(callable));
+            }
+        }
+        (
+            PlannedAsyncCapturedLoopEnding::Return {
+                statement,
+                expression,
+            },
+            Some(annotation),
+        ) => {
+            session.reset_query();
+            let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+            let declared = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                &mut annotation_diagnostics,
+            )?
+            .get_type_from_type_node(annotation);
+            merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+            let declared = declared?;
+            let expected = source_awaited_expression_type(store, annotation, declared)?;
+            if expected != number {
+                return Err(SourcePlanner::unsupported_function_body(callable));
+            }
+            check_assignment_to_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                &flow_types,
+                preflighted_type_import_value_uses,
+                deferred,
+                expected,
+                None,
+                expression,
+                *statement,
+                None,
+            )?;
+            issue_node_diagnostic(diagnostics, annotation, 2366)?;
+        }
+        _ => return Err(SourcePlanner::unsupported_function_body(callable)),
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Reuses the existing source flow and publication transaction.
 fn check_planned_linear_function_statements(
     bound: &BoundFile,
@@ -29476,6 +30749,345 @@ fn source_awaited_expression_type(
         return Err(SourceCheckError::Arrow(expression));
     };
     Ok(*awaited)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn check_planned_global_promise_call(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    expression: &PlannedExpression,
+    call: &SourceCallPlan,
+    promise: PlannedPromiseCall,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    let PlannedExpressionKind::Property(property) = &call.callee.kind else {
+        return Err(SourceCheckError::Call(expression.node));
+    };
+    let PlannedExpressionKind::Identifier(receiver) = &property.receiver.kind else {
+        return Err(SourceCheckError::Call(expression.node));
+    };
+    if call.node != expression.node
+        || call.callee.node != promise.property
+        || property.node != promise.property
+        || property.receiver.node != promise.receiver
+        || receiver.kind != PlannedIdentifierReadKind::DeclaredValue
+        || receiver.resolved_symbol != promise.receiver_symbol
+        || receiver.value_symbol != promise.receiver_symbol
+        || store
+            .symbol(promise.method_symbol)
+            .is_none_or(|method| method.flags() != SymbolFlags::METHOD)
+    {
+        return Err(SourceCheckError::Call(expression.node));
+    }
+
+    let value = match promise.kind {
+        PlannedPromiseCallKind::Resolve => {
+            let Some(argument) = call.arguments.first() else {
+                let void = store
+                    .intrinsic_bootstrap()
+                    .ok_or(DerivedTypeError::BootstrapUninitialized)?
+                    .void_type;
+                return publish_planned_promise_call_type(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    expression.node,
+                    void,
+                    promise.method_symbol,
+                    0,
+                );
+            };
+            if call.arguments.len() != 1 {
+                return Err(SourceCheckError::Call(expression.node));
+            }
+            let checked = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                flow_types,
+                preflighted_type_import_value_uses,
+                argument,
+                None,
+                deferred,
+            )?;
+            let awaited = source_awaited_expression_type(store, argument.node, checked.result)?;
+            let widened = widened_fresh_literal_type(store, awaited)?;
+            store.get_widened_type_with_global_types(widened, global_types)?
+        }
+        PlannedPromiseCallKind::All => {
+            let [argument] = call.arguments.as_slice() else {
+                return Err(SourceCheckError::Call(expression.node));
+            };
+            let element = if let PlannedExpressionKind::Array(elements) = &argument.kind {
+                if !argument.array_spreads.is_empty() {
+                    return Err(SourceCheckError::Call(expression.node));
+                }
+                let mut original = Vec::with_capacity(elements.len());
+                let mut awaited = Vec::with_capacity(elements.len());
+                for element in elements {
+                    let checked = check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        flow_types,
+                        preflighted_type_import_value_uses,
+                        element,
+                        None,
+                        deferred,
+                    )?;
+                    original.push(checked.result);
+                    let unwrapped =
+                        source_awaited_expression_type(store, element.node, checked.result)?;
+                    let widened = widened_fresh_literal_type(store, unwrapped)?;
+                    awaited.push(store.get_widened_type_with_global_types(widened, global_types)?);
+                }
+                let empty = store
+                    .intrinsic_bootstrap()
+                    .ok_or(DerivedTypeError::BootstrapUninitialized)?
+                    .never_type;
+                let original_element = if original.is_empty() {
+                    empty
+                } else {
+                    store.expression_union_type_with_global_types(
+                        global_types,
+                        &original,
+                        UnionReduction::Subtype,
+                    )?
+                };
+                let original_array =
+                    store.create_canonical_array_type(global_types, original_element, false)?;
+                let original_array =
+                    store.create_array_literal_type(global_types, original_array)?;
+                preflight_source_expression_cache(store, argument.node, original_array)?;
+                publish_expression_type(store, argument.node, original_array)?;
+                if awaited.is_empty() {
+                    empty
+                } else {
+                    store.expression_union_type_with_global_types(
+                        global_types,
+                        &awaited,
+                        UnionReduction::Subtype,
+                    )?
+                }
+            } else {
+                let checked = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    flow_types,
+                    preflighted_type_import_value_uses,
+                    argument,
+                    None,
+                    deferred,
+                )?;
+                let element = store
+                    .canonical_array_element_type(global_types, checked.result)?
+                    .ok_or(SourceCheckError::Call(expression.node))?;
+                source_awaited_expression_type(store, argument.node, element)?
+            };
+            store.create_canonical_array_type(global_types, element, false)?
+        }
+    };
+
+    publish_planned_promise_call_type(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        expression.node,
+        value,
+        promise.method_symbol,
+        call.arguments.len(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_planned_promise_call_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    node: NodeRef,
+    value: TypeId,
+    method: SemanticSymbolId,
+    argument_count: usize,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    session.reset_query();
+    let mut promise_diagnostics = CanonicalCheckerDiagnostics::default();
+    let promise = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        &mut promise_diagnostics,
+    )?
+    .get_global_promise_type(value);
+    merge_retry_diagnostics(diagnostics, promise_diagnostics);
+    let promise = promise?;
+    publish_selective_source_call_signature(store, host, node, method, argument_count, promise)?;
+    Ok(CheckedExpressionTypes::leaf(promise, promise))
+}
+
+fn publish_selective_source_call_signature(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    method: SemanticSymbolId,
+    argument_count: usize,
+    return_type: TypeId,
+) -> Result<(), SourceCheckError> {
+    let declarations = store
+        .symbol(method)
+        .and_then(ts_binder::semantic::Symbol::declarations)
+        .ok_or(SourceCheckError::Call(node))?;
+    let declaration = declarations
+        .iter()
+        .copied()
+        .find(|declaration| {
+            matches!(
+                host.node(*declaration).map(|record| &record.data),
+                Some(NodeData::MethodSignatureDeclaration(signature))
+                    if signature.parameters.nodes.len() == argument_count
+            )
+        })
+        .ok_or(SourceCheckError::Call(node))?;
+    let declaration_record = host.node(declaration).ok_or(SourceCheckError::Call(node))?;
+    let NodeData::MethodSignatureDeclaration(signature) = &declaration_record.data else {
+        return Err(SourceCheckError::Call(node));
+    };
+    let bound = host
+        .bound_file(declaration)
+        .ok_or(SourceCheckError::Call(node))?;
+    let mut flags = SignatureFlags::NONE;
+    let mut minimum_argument_count = 0usize;
+    let parameters = signature
+        .parameters
+        .nodes
+        .iter()
+        .map(|parameter| {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+            let symbol = bound
+                .symbol(parameter)
+                .ok_or(SourceCheckError::Call(node))?;
+            let record = host.node(parameter).ok_or(SourceCheckError::Call(node))?;
+            let NodeData::ParameterDeclaration(data) = &record.data else {
+                return Err(SourceCheckError::Call(node));
+            };
+            if store.get_merged_symbol(symbol) != Some(symbol)
+                || record.kind != SyntaxKind::Parameter
+                || record.parent != Some(declaration.node)
+            {
+                return Err(SourceCheckError::Call(node));
+            }
+            if data.dot_dot_dot_token.is_some() {
+                flags |= SignatureFlags::HAS_REST_PARAMETER;
+            } else if data.question_token.is_none() && data.initializer.is_none() {
+                minimum_argument_count += 1;
+            }
+            Ok(symbol)
+        })
+        .collect::<Result<Vec<_>, SourceCheckError>>()?;
+    let expected_type = TypeNodeLinks {
+        resolved_type: Some(return_type),
+        ..TypeNodeLinks::default()
+    };
+    let type_links = store.type_node_links(node).cloned();
+    let signature_links = store.signature_links(node).cloned();
+
+    if let (Some(type_links), Some(signature_links)) = (&type_links, &signature_links)
+        && type_links == &expected_type
+        && let super::links::ResolvedSignatureState::Resolved(signature) =
+            signature_links.resolved_signature
+    {
+        let expected_links = super::links::SignatureLinks {
+            resolved_signature: super::links::ResolvedSignatureState::Resolved(signature),
+            ..super::links::SignatureLinks::default()
+        };
+        let Some(record) = store.signature(signature) else {
+            return Err(SourceCheckError::Call(node));
+        };
+        let expected_count =
+            i32::try_from(minimum_argument_count).map_err(|_| SourceCheckError::Call(node))?;
+        return if signature_links == &expected_links
+            && record.flags() == flags
+            && record.declaration() == Some(declaration)
+            && record.type_parameters().is_empty()
+            && record.this_parameter().is_none()
+            && record.parameters() == parameters.as_slice()
+            && record.min_argument_count() == expected_count
+            && record.resolved_min_argument_count() == -1
+            && record.resolved_return_type() == Some(return_type)
+            && record.resolved_type_predicate().is_none()
+            && record.target().is_none()
+            && record.mapper().is_none()
+            && record.isolated_signature_type().is_none()
+            && record.composite().is_none()
+        {
+            Ok(())
+        } else {
+            Err(SourceCheckError::Call(node))
+        };
+    }
+
+    if type_links.is_some_and(|links| links != TypeNodeLinks::default())
+        || signature_links.is_some_and(|links| links != super::links::SignatureLinks::default())
+        || !store.try_reserve_signatures(1)
+        || !store.try_reserve_signature_links(usize::from(store.signature_links(node).is_none()))
+        || !store.try_reserve_type_node_links(usize::from(store.type_node_links(node).is_none()))
+    {
+        return Err(SourceCheckError::Call(node));
+    }
+    let expected_count =
+        i32::try_from(minimum_argument_count).map_err(|_| SourceCheckError::Call(node))?;
+    let signature = store
+        .alloc_signature(
+            flags,
+            Some(declaration),
+            Vec::new(),
+            None,
+            parameters,
+            Some(return_type),
+            None,
+            expected_count,
+        )
+        .ok_or(SourceCheckError::Call(node))?;
+    let expected_signature = super::links::SignatureLinks {
+        resolved_signature: super::links::ResolvedSignatureState::Resolved(signature),
+        ..super::links::SignatureLinks::default()
+    };
+    if !store.set_signature_links(node, expected_signature)
+        || !store.set_type_node_links(node, expected_type)
+    {
+        return Err(SourceCheckError::Call(node));
+    }
+    Ok(())
 }
 
 fn captured_callable_flow_types(
@@ -33180,6 +34792,26 @@ pub(super) fn check_source_file(
                 inferred_function_diagnostics[index] = Some(function_diagnostics);
                 continue;
             }
+            PlannedFunctionBody::AsyncCapturedLoop(statements) => {
+                check_planned_async_captured_loop(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    &mut function_diagnostics,
+                    &body_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &mut deferred,
+                    &function.callable,
+                    None,
+                    statements,
+                    &mut staged_value_types,
+                    &mut value_order,
+                )?;
+                (None, body_flow_types)
+            }
             PlannedFunctionBody::Statements(statements) => {
                 let return_types = check_planned_inferred_function_statements(
                     bound,
@@ -34326,23 +35958,57 @@ pub(super) fn check_source_file(
                         expression,
                     } => {
                         session.reset_query();
-                        check_planned_assignment(
-                            store,
-                            host,
-                            global_types,
-                            source,
-                            options,
-                            session,
-                            diagnostics,
-                            &body_flow_types,
-                            &preflighted_type_import_value_uses,
-                            &mut deferred,
-                            return_type,
-                            &[],
-                            expression,
-                            *statement,
-                            None,
-                        )?;
+                        if function.callable.is_async {
+                            let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+                            let declared = CanonicalTypeQuery::new_with_global_types_and_session(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                session,
+                                &mut annotation_diagnostics,
+                            )?
+                            .get_type_from_type_node(return_type);
+                            merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+                            let declared = declared?;
+                            let expected =
+                                source_awaited_expression_type(store, return_type, declared)?;
+                            check_assignment_to_type(
+                                store,
+                                host,
+                                global_types,
+                                source,
+                                options,
+                                session,
+                                diagnostics,
+                                &body_flow_types,
+                                &preflighted_type_import_value_uses,
+                                &mut deferred,
+                                expected,
+                                None,
+                                expression,
+                                *statement,
+                                None,
+                            )?;
+                        } else {
+                            check_planned_assignment(
+                                store,
+                                host,
+                                global_types,
+                                source,
+                                options,
+                                session,
+                                diagnostics,
+                                &body_flow_types,
+                                &preflighted_type_import_value_uses,
+                                &mut deferred,
+                                return_type,
+                                &[],
+                                expression,
+                                *statement,
+                                None,
+                            )?;
+                        }
                     }
                     PlannedFunctionBody::TypeofReturn {
                         statement,
@@ -34423,6 +36089,25 @@ pub(super) fn check_source_file(
                                 None,
                             )?;
                         }
+                    }
+                    PlannedFunctionBody::AsyncCapturedLoop(statements) => {
+                        check_planned_async_captured_loop(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &body_flow_types,
+                            &preflighted_type_import_value_uses,
+                            &mut deferred,
+                            &function.callable,
+                            Some(return_type),
+                            statements,
+                            &mut staged_value_types,
+                            &mut value_order,
+                        )?;
                     }
                     PlannedFunctionBody::ReturnJsx {
                         statement,
@@ -58619,6 +60304,384 @@ class Foo2 {
             [context.store().intrinsic_bootstrap().unwrap().void_type],
         );
         assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn async_functions_and_global_promise_calls_preserve_awaited_types() {
+        let library = parsed(concat!(
+            "interface Array<T> {} ",
+            "interface Promise<T> {} ",
+            "interface PromiseConstructor { ",
+            "resolve<T>(value: T): Promise<T>; ",
+            "resolve(): Promise<void>; ",
+            "all<T>(values: T[]): Promise<T[]>; ",
+            "} declare var Promise: PromiseConstructor;",
+        ));
+        let source = parsed(concat!(
+            "async function literal() { return await 1; } ",
+            "async function resolved() { return await Promise.resolve(1); } ",
+            "async function collected() { ",
+            "return await Promise.all([Promise.resolve(1), Promise.resolve(2)]); } ",
+            "async function annotated(): Promise<number> { return 1; } ",
+            "async function empty() {} ",
+            "const arrow = async () => await Promise.resolve(3); ",
+            "const settled = Promise.resolve('value'); ",
+            "const all = Promise.all([Promise.resolve(1), Promise.resolve(2)]); ",
+            "const nothing = Promise.resolve();",
+        ));
+        let library_file = FileId::new(9_360);
+        let file = FileId::new(9_361);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        for (name, expected) in [
+            ("literal", "() => Promise<number>"),
+            ("resolved", "() => Promise<number>"),
+            ("collected", "() => Promise<number[]>"),
+            ("annotated", "() => Promise<number>"),
+            ("empty", "() => Promise<void>"),
+        ] {
+            let owner = function_symbol(&context, &source, file, name);
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            assert_eq!(context.type_to_string(callable).unwrap(), expected);
+        }
+        for (name, expected) in [
+            ("arrow", "() => Promise<number>"),
+            ("settled", "Promise<string>"),
+            ("all", "Promise<number[]>"),
+            ("nothing", "Promise<void>"),
+        ] {
+            assert_eq!(
+                context
+                    .type_to_string(variable_value_type(&context, &source, file, name))
+                    .unwrap(),
+                expected,
+            );
+        }
+        let mut awaited = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::AwaitExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        awaited.sort_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        assert_eq!(
+            awaited
+                .iter()
+                .map(|node| context
+                    .type_to_string(resolved_node_type(&context, *node))
+                    .unwrap())
+                .collect::<Vec<_>>(),
+            ["1", "number", "number[]", "number"],
+        );
+        for (node, record) in source.arena.iter() {
+            if record.kind != SyntaxKind::CallExpression {
+                continue;
+            }
+            let node = NodeRef::new(source.arena.id(), file, node);
+            let signature = context
+                .store()
+                .signature_links(node)
+                .and_then(|links| links.resolved_signature.signature())
+                .expect("Promise calls publish their authenticated resolved signature");
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .and_then(super::super::signatures::Signature::resolved_return_type),
+                Some(resolved_node_type(&context, node)),
+            );
+        }
+        let constructor = global_symbol(&context, "PromiseConstructor");
+        assert!(
+            context
+                .store()
+                .declared_type_links(constructor)
+                .and_then(|links| links.declared_type)
+                .is_none(),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn async_functions_await_annotated_import_aliases_without_checking_the_target() {
+        let library = parsed(concat!(
+            "interface Promise<T> {} ",
+            "interface PromiseConstructor { resolve<T>(value: T): Promise<T>; } ",
+            "declare var Promise: PromiseConstructor;",
+        ));
+        let source = parsed(concat!(
+            "import { value, get } from './target'; ",
+            "async function read() { return await value; }",
+            "async function called() { return await get(); }",
+        ));
+        let target = parsed(concat!(
+            "export const value: Promise<number> = Promise.resolve(1); ",
+            "export function get(): Promise<number> { return Promise.resolve(1); }",
+        ));
+        let library_file = FileId::new(9_362);
+        let source_file = FileId::new(9_363);
+        let target_file = FileId::new(9_364);
+        let files = [
+            (library_file, &library),
+            (source_file, &source),
+            (target_file, &target),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for &(file, parsed) in &files {
+            let facts = if file == library_file {
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source(format!("\"/project/{}.d.ts\"", file.index())),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    true,
+                    CanonicalModuleState::Script,
+                )
+            } else {
+                source_facts_with_module_state(file, CanonicalModuleState::External)
+            };
+            binder
+                .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+                .unwrap();
+        }
+        for &(file, parsed) in &files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let route = CanonicalModuleResolutionEntry::resolved(
+            NodeRef::new(
+                source.arena.id(),
+                source_file,
+                source_module_specifiers(&source)[0],
+            ),
+            CanonicalResolvedModuleInput::new(
+                target_file,
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::Esm,
+            ),
+        );
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new([route]),
+        )
+        .unwrap();
+
+        context.check_source_file(source_file).unwrap();
+        assert!(!is_type_checked(&context, target_file));
+        for name in ["read", "called"] {
+            let owner = function_symbol(&context, &source, source_file, name);
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            assert_eq!(
+                context.type_to_string(callable).unwrap(),
+                "() => Promise<number>",
+            );
+        }
+        let awaited = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::AwaitExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(awaited.len(), 2);
+        for expression in awaited {
+            assert_eq!(
+                context
+                    .type_to_string(resolved_node_type(&context, expression))
+                    .unwrap(),
+                "number",
+            );
+        }
+        context.check_source_file(target_file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let source_warm = observable_state(&context, source_file);
+        let target_warm = observable_state(&context, target_file);
+        context.recheck_source_file(source_file).unwrap();
+        context.recheck_source_file(target_file).unwrap();
+        assert_eq!(observable_state(&context, source_file), source_warm);
+        assert_eq!(observable_state(&context, target_file), target_warm);
+    }
+
+    #[test]
+    fn async_captured_block_scope_fixture_preserves_types_and_one_return_diagnostic() {
+        let library = parsed(concat!(
+            "interface Array<T> { push(...items: T[]): number; } ",
+            "interface Promise<T> {}",
+        ));
+        let source = parsed(concat!(
+            "async function fn1() {\n",
+            "  let ar = [];\n",
+            "  for (let i = 0; i < 1; i++) {\n",
+            "    await 1;\n",
+            "    ar.push(() => i);\n",
+            "  }\n",
+            "}\n",
+            "async function fn2() {\n",
+            "  let ar = [];\n",
+            "  for (let i = 0; i < 1; i++) {\n",
+            "    await 1;\n",
+            "    ar.push(() => i);\n",
+            "    break;\n",
+            "  }\n",
+            "}\n",
+            "async function fn3() {\n",
+            "  let ar = [];\n",
+            "  for (let i = 0; i < 1; i++) {\n",
+            "    await 1;\n",
+            "    ar.push(() => i);\n",
+            "    continue;\n",
+            "  }\n",
+            "}\n",
+            "async function fn4(): Promise<number> {\n",
+            "  let ar = [];\n",
+            "  for (let i = 0; i < 1; i++) {\n",
+            "    await 1;\n",
+            "    ar.push(() => i);\n",
+            "    return 1;\n",
+            "  }\n",
+            "}\n",
+        ));
+        let library_file = FileId::new(9_365);
+        let file = FileId::new(9_366);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected only the exact missing-return diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2366);
+        assert_eq!(
+            node_text(&source, diagnostic.node.unwrap()),
+            "Promise<number>"
+        );
+        for (name, expected) in [
+            ("fn1", "() => Promise<void>"),
+            ("fn2", "() => Promise<void>"),
+            ("fn3", "() => Promise<void>"),
+            ("fn4", "() => Promise<number>"),
+        ] {
+            let owner = function_symbol(&context, &source, file, name);
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            assert_eq!(context.type_to_string(callable).unwrap(), expected);
+        }
+        let (_, bound) = context.file(file).unwrap();
+        for (node, record) in source.arena.iter() {
+            let node = NodeRef::new(source.arena.id(), file, node);
+            match &record.data {
+                NodeData::VariableDeclaration(variable) => {
+                    let NodeData::Identifier(name) = &source.arena.get(variable.name).unwrap().data
+                    else {
+                        panic!("expected an identifier-named loop binding")
+                    };
+                    let symbol = bound.symbol(node).unwrap();
+                    let type_ = context
+                        .store()
+                        .value_symbol_links(symbol)
+                        .and_then(|links| links.resolved_type)
+                        .unwrap();
+                    assert_eq!(
+                        context.type_to_string(type_).unwrap(),
+                        if name.text == "ar" { "any[]" } else { "number" },
+                    );
+                    if name.text == "ar" {
+                        let initializer =
+                            NodeRef::new(source.arena.id(), file, variable.initializer.unwrap());
+                        assert_eq!(
+                            context
+                                .type_to_string(resolved_node_type(&context, initializer))
+                                .unwrap(),
+                            "never[]",
+                        );
+                    }
+                }
+                NodeData::AwaitExpression(_) => {
+                    assert_eq!(
+                        context
+                            .type_to_string(resolved_node_type(&context, node))
+                            .unwrap(),
+                        "1",
+                    );
+                }
+                NodeData::ArrowFunction(_) => {
+                    assert_eq!(
+                        context
+                            .type_to_string(resolved_node_type(&context, node))
+                            .unwrap(),
+                        "() => number",
+                    );
+                }
+                NodeData::CallExpression(_) => {
+                    assert_eq!(
+                        context
+                            .type_to_string(resolved_node_type(&context, node))
+                            .unwrap(),
+                        "number",
+                    );
+                    let signature = context
+                        .store()
+                        .signature_links(node)
+                        .and_then(|links| links.resolved_signature.signature())
+                        .unwrap();
+                    assert!(
+                        context
+                            .store()
+                            .signature(signature)
+                            .unwrap()
+                            .has_rest_parameter()
+                    );
+                }
+                _ => {}
+            }
+        }
 
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
