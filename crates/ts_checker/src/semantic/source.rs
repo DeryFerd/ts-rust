@@ -34,7 +34,8 @@
 //! selective default-library `Promise.resolve` and `Promise.all` calls, and the
 //! exact counted async loop that captures its block-scoped index,
 //! anonymous zero-parameter function expressions with bounded block bodies,
-//! parenthesized standalone closures, lexical captures, and immediate invocation,
+//! parenthesized standalone closures, lexical captures, immediate invocation,
+//! and contextually typed class prototype method implementations,
 //! authenticated shorthand object-assignment defaults inside bounded function bodies
 //! and variable initializer expressions,
 //! strict top-level call expression statements, exhaustive grouped literal
@@ -48,7 +49,8 @@
 //! objects, arrays, and strings, direct-identifier `typeof`, nullable equality,
 //! and declared-discriminant flow and guard-return checks, and direct simple or
 //! arithmetic compound assignments to supported mutable declarations or
-//! binder-authenticated `CommonJS` exports and function or arrow expandos.
+//! binder-authenticated `CommonJS` exports, function or arrow expandos, and
+//! authenticated class or JavaScript function-alias prototype members.
 //! Option-gated unused-local, unused-parameter, and unused-import diagnostics
 //! run after complete source value and reference publication.
 //! The complete source tree and complete supported-statement plan are validated
@@ -167,7 +169,7 @@ use super::{
         publish_inferred_source_callable_return, publish_jsdoc_contextual_source_callable,
         publish_jsdoc_parameterized_source_callable, source_direct_call_argument_arrow_is_exact,
         source_object_property_arrow_symbol, source_promise_constructor_argument_arrow_is_exact,
-        validate_stored_source_callable,
+        source_prototype_assignment_function_is_exact, validate_stored_source_callable,
     },
     source_calls::{
         SourceCallCalleeForm, SourceCallPlan, check_direct_source_call,
@@ -1062,6 +1064,7 @@ pub(super) struct PlannedArrowExpression {
     parameter_initializers: Vec<PlannedParameterInitializer>,
     expression_statement: Option<PlannedArrowExpressionStatement>,
     loop_body: Option<Box<PlannedLoopFunctionStatements>>,
+    prototype_this: Option<NodeRef>,
     body: PlannedArrowBody,
 }
 
@@ -1513,6 +1516,19 @@ struct PlannedObjectExpandoAssignment {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedPrototypeAssignment {
+    expression: NodeRef,
+    left: NodeRef,
+    receiver: PlannedExpression,
+    prototype: NodeRef,
+    receiver_symbol: SemanticSymbolId,
+    owner_symbol: SemanticSymbolId,
+    prototype_symbol: Option<SemanticSymbolId>,
+    property_symbol: Option<SemanticSymbolId>,
+    right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 struct PlannedImportedNamespaceAssignment {
     expression: NodeRef,
     left: NodeRef,
@@ -1727,6 +1743,7 @@ enum PlannedStatement {
     JavaScriptRequireAlias(PlannedJavaScriptRequireAlias),
     ArrowExpandoAssignment(PlannedArrowExpandoAssignment),
     ObjectExpandoAssignment(PlannedObjectExpandoAssignment),
+    PrototypeAssignment(PlannedPrototypeAssignment),
     ImportedNamespaceAssignment(PlannedImportedNamespaceAssignment),
     NamespaceAssignment(PlannedNamespaceAssignment),
     ControlIf(Box<PlannedTopLevelIf>),
@@ -3628,6 +3645,51 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             SourceSyntaxRole::Statement,
                         ));
                     };
+                    if let Some(assignment) = super::assignment::plan_prototype_assignment(
+                        self.arena, self.bound, store, statement,
+                    )
+                    .map_err(Self::assignment_plan_error)?
+                    {
+                        if assignment.property_symbol.is_some()
+                            && !self.planned_classes.contains(&assignment.owner_symbol)
+                            || assignment.property_symbol.is_none()
+                                && !self.prior_variables.contains(&assignment.receiver_symbol)
+                        {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Assignment(
+                                    AssignmentUnsupported::TargetNotPrior {
+                                        node: assignment.receiver,
+                                        symbol: assignment.receiver_symbol,
+                                    },
+                                ),
+                            ));
+                        }
+                        let receiver = self.plan_expression(assignment.receiver)?;
+                        self.primitive_binary_position_roots
+                            .insert(assignment.right);
+                        let right = self.plan_expression(assignment.right)?;
+                        if let Some(prototype) = assignment.prototype_symbol {
+                            self.identifier_reads
+                                .push((assignment.prototype, prototype));
+                        }
+                        if let Some(property) = assignment.property_symbol {
+                            self.identifier_reads.push((assignment.left, property));
+                        }
+                        statements.push(PlannedStatement::PrototypeAssignment(
+                            PlannedPrototypeAssignment {
+                                expression: assignment.expression,
+                                left: assignment.left,
+                                receiver,
+                                prototype: assignment.prototype,
+                                receiver_symbol: assignment.receiver_symbol,
+                                owner_symbol: assignment.owner_symbol,
+                                prototype_symbol: assignment.prototype_symbol,
+                                property_symbol: assignment.property_symbol,
+                                right,
+                            },
+                        ));
+                        continue;
+                    }
                     let commonjs_assignment = match super::assignment::plan_commonjs_assignment(
                         self.arena, self.bound, store, statement,
                     )
@@ -4732,6 +4794,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 throw_expression: None,
                             }),
                             loop_body: None,
+                            prototype_this: None,
                             body: PlannedArrowBody::Empty,
                         })),
                     );
@@ -17184,6 +17247,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 parameter_initializers,
                 expression_statement,
                 loop_body: None,
+                prototype_this: None,
                 body,
             })
         })();
@@ -17215,6 +17279,58 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let NodeData::FunctionExpression(function) = &record.data else {
             return Err(unsupported());
         };
+        let prototype_assignment = record
+            .parent
+            .map(|node| self.reference(node))
+            .filter(|assignment| {
+                matches!(
+                    self.node(*assignment).map(|record| &record.data),
+                    Ok(NodeData::BinaryExpression(binary)) if binary.right == declaration.node
+                )
+            })
+            .and_then(|assignment| self.node(assignment).ok()?.parent)
+            .map(|statement| {
+                super::assignment::plan_prototype_assignment(
+                    self.arena,
+                    self.bound,
+                    store,
+                    self.reference(statement),
+                )
+                .map_err(Self::assignment_plan_error)
+            })
+            .transpose()?
+            .flatten();
+        let commonjs_assignment = if prototype_assignment.is_none()
+            && self
+                .bound
+                .source_facts()
+                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_common_js_module)
+        {
+            record
+                .parent
+                .map(|node| self.reference(node))
+                .and_then(|assignment| self.node(assignment).ok()?.parent)
+                .map(|statement| {
+                    let statement = self.reference(statement);
+                    super::assignment::plan_commonjs_assignment(
+                        self.arena, self.bound, store, statement,
+                    )
+                    .map_err(Self::assignment_plan_error)?
+                    .map_or_else(
+                        || {
+                            super::assignment::plan_commonjs_named_assignment(
+                                self.arena, self.bound, store, statement,
+                            )
+                            .map_err(Self::assignment_plan_error)
+                        },
+                        |assignment| Ok(Some(assignment)),
+                    )
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         if record.kind != SyntaxKind::FunctionExpression
             || record.flags.0 != 0
             || function.name.is_some()
@@ -17223,6 +17339,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || function.type_parameters.is_some()
             || function.type_.is_some()
             || !function.parameters.nodes.is_empty()
+                && prototype_assignment
+                    .as_ref()
+                    .is_none_or(|assignment| assignment.property_symbol.is_none())
             || function.parameters.has_trailing_comma
             || function.full_signature.is_some()
             || function.next_container.is_some()
@@ -17299,6 +17418,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         return Err(unsupported());
                     }
                 }
+                NodeData::BinaryExpression(binary)
+                    if parent_record.kind == SyntaxKind::BinaryExpression
+                        && binary.right == position.node
+                        && (prototype_assignment
+                            .as_ref()
+                            .is_some_and(|assignment| assignment.expression == parent)
+                            || commonjs_assignment
+                                .as_ref()
+                                .is_some_and(|assignment| assignment.expression == parent)) => {}
                 NodeData::ExpressionStatement(statement)
                     if parent_record.kind == SyntaxKind::ExpressionStatement
                         && parent_record.flags.0 == 0
@@ -17327,6 +17455,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || callable.declaration != declaration
             || callable.owner_symbol != owner
             || !callable.parameters.is_empty()
+                && prototype_assignment
+                    .as_ref()
+                    .is_none_or(|assignment| assignment.property_symbol.is_none())
             || !callable.type_parameters.is_empty()
             || !callable.return_type.is_inferred()
             || callable.body_mode != SourceCallableBodyMode::Present
@@ -17354,8 +17485,49 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
         let statements = body.statements.nodes.clone();
         let mut loop_body = None;
+        let mut prototype_this = None;
         let body = match statements.as_slice() {
             [] => PlannedArrowBody::Empty,
+            [statement]
+                if prototype_assignment
+                    .as_ref()
+                    .is_some_and(|assignment| assignment.property_symbol.is_none())
+                    && self.node(self.reference(*statement))?.kind
+                        == SyntaxKind::ExpressionStatement =>
+            {
+                let statement = self.reference(*statement);
+                let statement_record = self.node(statement)?;
+                let NodeData::ExpressionStatement(expression_statement) = &statement_record.data
+                else {
+                    return Err(unsupported());
+                };
+                let this = self.reference(expression_statement.expression);
+                let this_record = self.node(this)?;
+                let NodeData::KeywordExpression(keyword) = &this_record.data else {
+                    return Err(unsupported());
+                };
+                if statement_record.flags.0 != 0
+                    || statement_record.parent != Some(block.node)
+                    || expression_statement.flow_node.is_some()
+                    || this_record.kind != SyntaxKind::ThisKeyword
+                    || this_record.flags.0 != 0
+                    || this_record.parent != Some(statement.node)
+                    || keyword.flow_node.is_some()
+                    || self.bound.container(this) != Some(declaration)
+                    || self.bound.this_container(this) != Some(declaration)
+                {
+                    return Err(unsupported());
+                }
+                let any = store
+                    .intrinsic_bootstrap()
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?
+                    .any_type;
+                preflight_source_expression_cache(store, this, any)?;
+                prototype_this = Some(this);
+                PlannedArrowBody::Empty
+            }
             [statement]
                 if self.node(self.reference(*statement))?.kind == SyntaxKind::ReturnStatement =>
             {
@@ -17405,6 +17577,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 parameter_initializers: Vec::new(),
                 expression_statement: None,
                 loop_body,
+                prototype_this,
                 body,
             })),
         ))
@@ -25867,6 +26040,7 @@ fn check_planned_arrow_argument(
     if host
         .node(expression)
         .is_some_and(|record| record.kind == SyntaxKind::FunctionExpression)
+        && arrow.callable.parameters.is_empty()
     {
         if !arrow.parameter_initializers.is_empty()
             || arrow.expression_statement.is_some()
@@ -25878,6 +26052,16 @@ fn check_planned_arrow_argument(
             materialize_anonymous_source_function_expression(store, &arrow.callable)
                 .map_err(SourcePlanner::callable_plan_error)?;
         preflight_source_expression_cache(store, expression, type_)?;
+        if let Some(this) = arrow.prototype_this {
+            let any = store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?
+                .any_type;
+            preflight_source_expression_cache(store, this, any)?;
+            publish_expression_type(store, this, any)?;
+        }
         if let Some(statements) = &arrow.loop_body {
             let mut staged_values = HashMap::new();
             let mut value_order = Vec::new();
@@ -25971,7 +26155,12 @@ fn check_planned_arrow_argument(
         publish_expression_type(store, expression, type_)?;
         return Ok(CheckedExpressionTypes::leaf(type_, type_));
     }
-    issue_arrow_line_terminator_diagnostic(host, diagnostics, expression)?;
+    if host
+        .node(expression)
+        .is_some_and(|record| record.kind == SyntaxKind::ArrowFunction)
+    {
+        issue_arrow_line_terminator_diagnostic(host, diagnostics, expression)?;
+    }
     let contextual_property = if !host
         .bound_file(expression)
         .and_then(BoundFile::source_facts)
@@ -26368,6 +26557,8 @@ fn check_contextual_direct_call_arrow(
                     arrow.callable.declaration,
                 )
             })
+        && !source_prototype_assignment_function_is_exact(store, host, arrow.callable.declaration)
+            .map_err(SourcePlanner::callable_plan_error)?
         || !arrow.parameter_initializers.is_empty()
         || arrow.expression_statement.is_some()
         || !arrow.callable.type_parameters.is_empty()
@@ -46311,6 +46502,137 @@ pub(super) fn check_source_file(
                     },
                 );
             }
+            PlannedStatement::PrototypeAssignment(assignment) => {
+                let receiver = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &assignment.receiver,
+                    None,
+                    &mut deferred,
+                )?;
+                let PlannedExpressionKind::Identifier(receiver_read) = &assignment.receiver.kind
+                else {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.receiver_symbol),
+                    ));
+                };
+                if receiver_read.value_symbol != assignment.receiver_symbol {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.receiver_symbol),
+                    ));
+                }
+
+                match (assignment.prototype_symbol, assignment.property_symbol) {
+                    (Some(prototype), Some(property)) => {
+                        let instance = store
+                            .declared_type_links(assignment.owner_symbol)
+                            .and_then(|links| links.declared_type)
+                            .ok_or(SourceCheckError::Assignment(
+                                AssignmentInvariant::InvalidSymbolShape(assignment.owner_symbol),
+                            ))?;
+                        let method_type = store
+                            .value_symbol_links(property)
+                            .and_then(|links| links.resolved_type)
+                            .ok_or(SourceCheckError::Assignment(
+                                AssignmentInvariant::InvalidSymbolShape(property),
+                            ))?;
+                        if store
+                            .value_symbol_links(assignment.owner_symbol)
+                            .and_then(|links| links.resolved_type)
+                            != Some(receiver.result)
+                            || validate_class_heritage_members(store, instance)
+                                != ClassHeritageMembersValidation::Valid
+                            || store
+                                .symbol(assignment.owner_symbol)
+                                .and_then(ts_binder::semantic::Symbol::exports)
+                                .and_then(|exports| store.symbol_table(exports))
+                                .and_then(|exports| exports.get_source("prototype"))
+                                != Some(prototype)
+                        {
+                            return Err(SourceCheckError::Assignment(
+                                AssignmentInvariant::InvalidSymbolShape(assignment.owner_symbol),
+                            ));
+                        }
+                        preflight_source_expression_cache(store, assignment.prototype, instance)?;
+                        preflight_source_expression_cache(store, assignment.left, method_type)?;
+                        publish_expression_type(store, assignment.prototype, instance)?;
+                        check_assignment_to_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &current_flow_types,
+                            &preflighted_type_import_value_uses,
+                            &mut deferred,
+                            method_type,
+                            None,
+                            &assignment.right,
+                            assignment.left,
+                            Some(assignment.expression),
+                        )?;
+                    }
+                    (None, None) => {
+                        if current_flow_types.get(&assignment.receiver_symbol)
+                            != Some(&receiver.result)
+                            || store.source_callable_type_for_owner(assignment.owner_symbol)
+                                != Some(receiver.result)
+                            || !matches!(
+                                validate_stored_source_callable(store, receiver.result),
+                                StoredSourceCallableValidation::Valid(_)
+                            )
+                        {
+                            return Err(SourceCheckError::Assignment(
+                                AssignmentInvariant::InvalidSymbolShape(assignment.owner_symbol),
+                            ));
+                        }
+                        let any = store
+                            .intrinsic_bootstrap()
+                            .ok_or(SourceCheckError::LiteralCache(
+                                SourceLiteralCacheError::BootstrapUninitialized,
+                            ))?
+                            .any_type;
+                        preflight_source_expression_cache(store, assignment.prototype, any)?;
+                        publish_expression_type(store, assignment.prototype, any)?;
+                        let assigned = check_expression_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &current_flow_types,
+                            &preflighted_type_import_value_uses,
+                            &assignment.right,
+                            None,
+                            &mut deferred,
+                        )?;
+                        preflight_source_expression_cache(store, assignment.left, assigned.result)?;
+                        preflight_source_expression_cache(
+                            store,
+                            assignment.expression,
+                            assigned.result,
+                        )?;
+                        publish_expression_type(store, assignment.left, assigned.result)?;
+                        publish_expression_type(store, assignment.expression, assigned.result)?;
+                    }
+                    _ => {
+                        return Err(SourceCheckError::Assignment(
+                            AssignmentInvariant::InvalidSymbolShape(assignment.owner_symbol),
+                        ));
+                    }
+                }
+            }
             PlannedStatement::CommonJsAssignment(assignment) => {
                 let expected_flags = if assignment.named {
                     if matches!(assignment.right.kind, PlannedExpressionKind::Identifier(_)) {
@@ -46321,7 +46643,9 @@ pub(super) fn check_source_file(
                 } else {
                     match &assignment.right.kind {
                         PlannedExpressionKind::Identifier(_) => SymbolFlags::ALIAS,
-                        PlannedExpressionKind::Object { .. } => SymbolFlags::PROPERTY,
+                        PlannedExpressionKind::Object { .. } | PlannedExpressionKind::Arrow(_) => {
+                            SymbolFlags::PROPERTY
+                        }
                         _ => {
                             return Err(SourceCheckError::Assignment(
                                 AssignmentInvariant::InvalidSymbolShape(assignment.target_symbol),
@@ -71141,6 +71465,64 @@ class Foo2 {
     }
 
     #[test]
+    fn commonjs_exports_publish_anonymous_function_values_without_new_symbols() {
+        for (index, text) in [
+            "module.exports = function () {};",
+            "exports.method = function () {};",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parse_javascript_source_file(text);
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let file = FileId::new(9_998 + u32::try_from(index).unwrap());
+            let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+            context.check_source_file(file).unwrap();
+
+            let (left, right) = assignment_parts(&source, file, 0);
+            let (_, bound) = context.file(file).unwrap();
+            let owner = bound.symbol(right).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            assert_eq!(resolved_node_type(&context, right), callable, "{text}");
+            assert_eq!(resolved_node_type(&context, left), callable, "{text}");
+            assert!(context.diagnostics().is_empty(), "{text}");
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm, "{text}");
+        }
+    }
+
+    #[test]
+    fn commonjs_function_exports_preserve_checked_javascript_assignment_diagnostics() {
+        let source = parse_javascript_source_file(concat!(
+            "/** @type {number} */ ",
+            "exports.method = function () {};",
+        ));
+        let file = FileId::new(10_000);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected the annotated CommonJS function assignment diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            node_text(&source, diagnostic.node.unwrap()),
+            "exports.method"
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn nested_commonjs_named_exports_preserve_export_types_and_warm_caches() {
         let source = parse_javascript_source_file(concat!(
             "module.exports.value = 1; ",
@@ -75533,6 +75915,161 @@ class Foo2 {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn ambient_class_prototype_assignments_contextually_type_method_parameters() {
+        let source = parsed(concat!(
+            "declare class Point { add(dx: number, dy: number): void; } ",
+            "Point.prototype.add = function(dx, dy) {};",
+        ));
+        let file = FileId::new(9_995);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let class = global_symbol(&context, "Point");
+        let method = context
+            .store()
+            .symbol(class)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("add"))
+            .unwrap();
+        let (left, right) = assignment_parts(&source, file, 0);
+        let NodeData::PropertyAccessExpression(member) = &source.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected an ambient class prototype member")
+        };
+        let prototype = NodeRef::new(source.arena.id(), file, member.expression);
+        let method_type = context
+            .store()
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(resolved_node_type(&context, left), method_type);
+        assert_eq!(
+            resolved_node_type(&context, prototype),
+            context
+                .store()
+                .declared_type_links(class)
+                .and_then(|links| links.declared_type)
+                .unwrap(),
+        );
+        let callable = resolved_node_type(&context, right);
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .and_then(|provenance| context.store().signature(provenance.signature))
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(signature.parameters().len(), 2);
+        assert!(signature.parameters().iter().all(|parameter| {
+            context
+                .store()
+                .value_symbol_links(*parameter)
+                .and_then(|links| links.resolved_type)
+                == Some(number)
+        }));
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_function_alias_prototype_assignments_preserve_owner_and_this() {
+        let source = parse_javascript_source_file(concat!(
+            "const original = function () {}; ",
+            "var alias = original; ",
+            "alias.prototype.method = function () { this; };",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(9_996);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let original = variable_value_type(&context, &source, file, "original");
+        assert_eq!(
+            variable_value_type(&context, &source, file, "alias"),
+            original,
+        );
+        let (left, right) = assignment_parts(&source, file, 0);
+        let NodeData::PropertyAccessExpression(member) = &source.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected an aliased function prototype member")
+        };
+        let prototype = NodeRef::new(source.arena.id(), file, member.expression);
+        let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+        assert_eq!(resolved_node_type(&context, prototype), any);
+        let this = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ThisKeyword).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(resolved_node_type(&context, this), any);
+        let callable = resolved_node_type(&context, right);
+        assert_ne!(callable, original);
+        assert_eq!(resolved_node_type(&context, left), callable);
+        let (_, bound) = context.file(file).unwrap();
+        let assignment = NodeRef::new(
+            source.arena.id(),
+            file,
+            source.arena.get(left.node).unwrap().parent.unwrap(),
+        );
+        assert!(bound.symbol(assignment).is_none());
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn prototype_assignments_reject_poisoned_receiver_caches() {
+        let source = parsed(concat!(
+            "declare class Point { add(dx: number, dy: number): void; } ",
+            "Point.prototype.add = function(dx, dy) {};",
+        ));
+        let file = FileId::new(9_997);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let (left, _) = assignment_parts(&source, file, 0);
+        let NodeData::PropertyAccessExpression(member) = &source.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected an ambient class prototype member")
+        };
+        let prototype = NodeRef::new(source.arena.id(), file, member.expression);
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            prototype,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        mark_source_unchecked(&mut context, file);
+        let poisoned = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Assertion(_))
+        ));
+        assert_eq!(observable_state(&context, file), poisoned);
     }
 
     #[test]

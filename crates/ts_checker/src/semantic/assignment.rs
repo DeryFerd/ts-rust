@@ -10,6 +10,8 @@
 //! before admission.
 //! Separate `CommonJS` routes admit binder-authenticated assignments to
 //! `module.exports` and static named assignments on `exports` or `module.exports`.
+//! Prototype writes reuse an existing class method or authenticate a JavaScript
+//! function alias without inventing an assignment-owned property.
 //! Direct arrow and function expandos retain their binder-owned properties and
 //! authenticate the source declaration before admission.
 //! JavaScript object expandos retain the initializer's real assignment exports.
@@ -103,6 +105,20 @@ pub(super) struct ObjectExpandoAssignmentPlan {
     pub(super) variable_symbol: SemanticSymbolId,
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) property_symbol: SemanticSymbolId,
+}
+
+/// One unbound prototype write that reuses a class member or function owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PrototypeAssignmentPlan {
+    pub(super) expression: NodeRef,
+    pub(super) left: NodeRef,
+    pub(super) right: NodeRef,
+    pub(super) receiver: NodeRef,
+    pub(super) prototype: NodeRef,
+    pub(super) receiver_symbol: SemanticSymbolId,
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) prototype_symbol: Option<SemanticSymbolId>,
+    pub(super) property_symbol: Option<SemanticSymbolId>,
 }
 
 /// The syntactic position at which the assignment slice ended.
@@ -392,6 +408,21 @@ pub(super) fn plan_javascript_object_expando_assignment(
     .plan_object_expando(statement)
 }
 
+/// Authenticates class-member and JavaScript function-alias prototype writes.
+pub(super) fn plan_prototype_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<Option<PrototypeAssignmentPlan>, AssignmentPlanError> {
+    CommonJsAssignmentPlanner {
+        arena,
+        bound,
+        store,
+    }
+    .plan_prototype(statement)
+}
+
 /// Authenticates an imported property against its ambient module declaration.
 pub(super) fn plan_imported_namespace_assignment(
     arena: &NodeArena,
@@ -479,6 +510,347 @@ pub(super) fn plan_simple_assignment_with_all_source_targets(
 }
 
 impl CommonJsAssignmentPlanner<'_> {
+    #[allow(clippy::too_many_lines)] // Authenticate the complete prototype chain and its owner.
+    fn plan_prototype(
+        &self,
+        statement: NodeRef,
+    ) -> Result<Option<PrototypeAssignmentPlan>, AssignmentPlanError> {
+        self.preflight_program()?;
+        let Some(facts) = self.bound.source_facts() else {
+            return Ok(None);
+        };
+        if facts.is_declaration_file() {
+            return Ok(None);
+        }
+
+        let statement_record = self.node(statement)?;
+        let NodeData::ExpressionStatement(statement_data) = &statement_record.data else {
+            return Ok(None);
+        };
+        if statement_record.parent != Some(self.bound.source_file().node)
+            || statement_record.flags.0 != 0
+            || statement_data.flow_node.is_some()
+        {
+            return Err(AssignmentInvariant::InvalidStatementShape(statement).into());
+        }
+        let expression = self.reference(statement_data.expression);
+        self.require_parent(expression, Some(statement.node))?;
+        let expression_record = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &expression_record.data else {
+            return Ok(None);
+        };
+        if expression_record.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.modifiers.is_some()
+            || binary.facts != 0
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryAssignment(expression),
+            ));
+        }
+        let operator = self.reference(binary.operator_token);
+        self.require_parent(operator, Some(expression.node))?;
+        let operator_record = self.node(operator)?;
+        if !matches!(operator_record.data, NodeData::Token(_)) || operator_record.flags.0 != 0 {
+            return Err(AssignmentInvariant::InvalidOperatorToken(operator).into());
+        }
+        if operator_record.kind != SyntaxKind::EqualsToken
+            || self.bound.symbol(expression).is_some()
+        {
+            return Ok(None);
+        }
+
+        let left = self.reference(binary.left);
+        let right = self.reference(binary.right);
+        self.require_parent(left, Some(expression.node))?;
+        self.require_parent(right, Some(expression.node))?;
+        let left_record = self.node(left)?;
+        let NodeData::PropertyAccessExpression(member_access) = &left_record.data else {
+            return Ok(None);
+        };
+        if left_record.flags.0 != 0
+            || member_access.flow_node.is_some()
+            || member_access.question_dot_token.is_some()
+            || member_access.facts != 0
+        {
+            return Err(AssignmentInvariant::InvalidStatementShape(left).into());
+        }
+        let prototype = self.reference(member_access.expression);
+        let member_name = self.reference(member_access.name);
+        self.require_parent(prototype, Some(left.node))?;
+        self.require_parent(member_name, Some(left.node))?;
+        let prototype_record = self.node(prototype)?;
+        let NodeData::PropertyAccessExpression(prototype_access) = &prototype_record.data else {
+            return Ok(None);
+        };
+        if prototype_record.flags.0 != 0
+            || prototype_access.flow_node.is_some()
+            || prototype_access.question_dot_token.is_some()
+            || prototype_access.facts != 0
+        {
+            return Err(AssignmentInvariant::InvalidStatementShape(prototype).into());
+        }
+        let receiver = self.reference(prototype_access.expression);
+        let prototype_name = self.reference(prototype_access.name);
+        self.require_parent(receiver, Some(prototype.node))?;
+        self.require_parent(prototype_name, Some(prototype.node))?;
+        if !self.is_identifier_named(prototype_name, "prototype")? {
+            return Ok(None);
+        }
+        let receiver_record = self.node(receiver)?;
+        let NodeData::Identifier(receiver_name) = &receiver_record.data else {
+            return Ok(None);
+        };
+        if receiver_record.flags.0 != 0
+            || receiver_name.flow_node.is_some()
+            || receiver_name.text.is_empty()
+        {
+            return Err(AssignmentInvariant::InvalidIdentifierShape(receiver).into());
+        }
+        let member_record = self.node(member_name)?;
+        let NodeData::Identifier(member_name_data) = &member_record.data else {
+            return Ok(None);
+        };
+        if member_record.flags.0 != 0
+            || member_name_data.flow_node.is_some()
+            || member_name_data.text.is_empty()
+        {
+            return Err(AssignmentInvariant::InvalidIdentifierShape(member_name).into());
+        }
+
+        let Some(receiver_symbol) = self
+            .bound
+            .locals(self.bound.source_file())
+            .and_then(|locals| self.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&receiver_name.text))
+        else {
+            return Ok(None);
+        };
+        let receiver_symbol_record = self
+            .store
+            .symbol(receiver_symbol)
+            .ok_or(AssignmentInvariant::InvalidSymbol(receiver_symbol))?;
+        if self.store.get_merged_symbol(receiver_symbol) != Some(receiver_symbol) {
+            return Err(AssignmentInvariant::InvalidMergedSymbol(receiver_symbol).into());
+        }
+        if let Some(cached) = self
+            .store
+            .symbol_node_links(receiver)
+            .and_then(|links| links.resolved_symbol)
+            && cached != receiver_symbol
+        {
+            return Err(AssignmentInvariant::ResolvedSymbolMismatch {
+                node: receiver,
+                expected: receiver_symbol,
+                actual: cached,
+            }
+            .into());
+        }
+
+        let (owner_symbol, prototype_symbol, property_symbol) = if receiver_symbol_record.flags()
+            == SymbolFlags::CLASS
+        {
+            let owner = receiver_symbol_record;
+            let Some([declaration]) = owner.declarations() else {
+                return Err(AssignmentInvariant::InvalidSymbolShape(receiver_symbol).into());
+            };
+            if owner.check_flags() != CheckFlags::NONE
+                || owner.name().as_utf8() != Some(receiver_name.text.as_str())
+                || owner.value_declaration() != Some(*declaration)
+                || owner.parent().is_some()
+                || owner.export_symbol().is_some()
+                || self.bound.symbol(*declaration) != Some(receiver_symbol)
+                || self.store.source_node_kind(*declaration) != Some(SyntaxKind::ClassDeclaration)
+            {
+                return Err(AssignmentInvariant::InvalidSymbolShape(receiver_symbol).into());
+            }
+            let prototype_symbol = owner
+                .exports()
+                .and_then(|exports| self.store.symbol_table(exports))
+                .and_then(|exports| exports.get_source("prototype"))
+                .ok_or(AssignmentInvariant::MissingExportSymbol(receiver_symbol))?;
+            let prototype_record = self
+                .store
+                .symbol(prototype_symbol)
+                .ok_or(AssignmentInvariant::InvalidSymbol(prototype_symbol))?;
+            if prototype_record.flags() != SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE
+                || prototype_record.check_flags() != CheckFlags::NONE
+                || prototype_record.declarations().is_some()
+                || prototype_record.value_declaration().is_some()
+                || prototype_record.members().is_some()
+                || prototype_record.exports().is_some()
+                || prototype_record.parent() != Some(receiver_symbol)
+                || prototype_record.export_symbol().is_some()
+                || self.store.get_merged_symbol(prototype_symbol) != Some(prototype_symbol)
+            {
+                return Err(AssignmentInvariant::InvalidSymbolShape(prototype_symbol).into());
+            }
+            let property_symbol = owner
+                .members()
+                .and_then(|members| self.store.symbol_table(members))
+                .and_then(|members| members.get_source(&member_name_data.text))
+                .ok_or(AssignmentInvariant::MissingExportSymbol(receiver_symbol))?;
+            let property = self
+                .store
+                .symbol(property_symbol)
+                .ok_or(AssignmentInvariant::InvalidSymbol(property_symbol))?;
+            let Some([declaration]) = property.declarations() else {
+                return Err(AssignmentInvariant::InvalidSymbolShape(property_symbol).into());
+            };
+            if property.flags() != SymbolFlags::METHOD
+                || property.check_flags() != CheckFlags::NONE
+                || property.name().as_utf8() != Some(member_name_data.text.as_str())
+                || property.value_declaration() != Some(*declaration)
+                || property.members().is_some()
+                || property.exports().is_some()
+                || property.parent() != Some(receiver_symbol)
+                || property.export_symbol().is_some()
+                || self.store.get_merged_symbol(property_symbol) != Some(property_symbol)
+                || self.bound.symbol(*declaration) != Some(property_symbol)
+                || self.store.source_node_kind(*declaration) != Some(SyntaxKind::MethodDeclaration)
+            {
+                return Err(AssignmentInvariant::InvalidSymbolShape(property_symbol).into());
+            }
+            (
+                receiver_symbol,
+                Some(prototype_symbol),
+                Some(property_symbol),
+            )
+        } else if facts.is_javascript_file() {
+            let Some(owner_symbol) =
+                self.prototype_function_owner(receiver_symbol, &receiver_name.text)?
+            else {
+                return Ok(None);
+            };
+            (owner_symbol, None, None)
+        } else {
+            return Ok(None);
+        };
+
+        for (node, expected) in [(prototype, prototype_symbol), (left, property_symbol)] {
+            let Some(expected) = expected else {
+                continue;
+            };
+            if let Some(cached) = self
+                .store
+                .symbol_node_links(node)
+                .and_then(|links| links.resolved_symbol)
+                && cached != expected
+            {
+                return Err(AssignmentInvariant::ResolvedSymbolMismatch {
+                    node,
+                    expected,
+                    actual: cached,
+                }
+                .into());
+            }
+        }
+
+        Ok(Some(PrototypeAssignmentPlan {
+            expression,
+            left,
+            right,
+            receiver,
+            prototype,
+            receiver_symbol,
+            owner_symbol,
+            prototype_symbol,
+            property_symbol,
+        }))
+    }
+
+    fn prototype_function_owner(
+        &self,
+        symbol: SemanticSymbolId,
+        expected_name: &str,
+    ) -> Result<Option<SemanticSymbolId>, AssignmentPlanError> {
+        let mut current = symbol;
+        let mut expected = expected_name;
+        for _ in 0..2 {
+            let record = self
+                .store
+                .symbol(current)
+                .ok_or(AssignmentInvariant::InvalidSymbol(current))?;
+            let Some([declaration]) = record.declarations() else {
+                return Ok(None);
+            };
+            if !matches!(
+                record.flags(),
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE
+            ) || record.check_flags() != CheckFlags::NONE
+                || record.name().as_utf8() != Some(expected)
+                || record.value_declaration() != Some(*declaration)
+                || record.members().is_some()
+                || record.exports().is_some()
+                || record.parent().is_some()
+                || record.export_symbol().is_some()
+                || self.store.get_merged_symbol(current) != Some(current)
+                || self.bound.symbol(*declaration) != Some(current)
+            {
+                return Err(AssignmentInvariant::InvalidSymbolShape(current).into());
+            }
+            let declaration_record = self.node(*declaration)?;
+            let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+                return Ok(None);
+            };
+            let Some(initializer) = variable.initializer.map(|node| self.reference(node)) else {
+                return Ok(None);
+            };
+            self.require_parent(initializer, Some(declaration.node))?;
+            match &self.node(initializer)?.data {
+                NodeData::Identifier(identifier) if !identifier.text.is_empty() => {
+                    expected = identifier.text.as_str();
+                    current = self
+                        .bound
+                        .locals(self.bound.source_file())
+                        .and_then(|locals| self.store.symbol_table(locals))
+                        .and_then(|locals| locals.get_source(expected))
+                        .ok_or(AssignmentInvariant::MissingDeclarationSymbol(initializer))?;
+                    if let Some(cached) = self
+                        .store
+                        .symbol_node_links(initializer)
+                        .and_then(|links| links.resolved_symbol)
+                        && cached != current
+                    {
+                        return Err(AssignmentInvariant::ResolvedSymbolMismatch {
+                            node: initializer,
+                            expected: current,
+                            actual: cached,
+                        }
+                        .into());
+                    }
+                }
+                NodeData::FunctionExpression(_) => {
+                    let owner = self
+                        .bound
+                        .symbol(initializer)
+                        .ok_or(AssignmentInvariant::MissingDeclarationSymbol(initializer))?;
+                    let owner_record = self
+                        .store
+                        .symbol(owner)
+                        .ok_or(AssignmentInvariant::InvalidSymbol(owner))?;
+                    if owner_record.flags() != SymbolFlags::FUNCTION
+                        || owner_record.check_flags() != CheckFlags::NONE
+                        || owner_record.name() != InternalSymbolName::Function.as_ref()
+                        || owner_record.declarations() != Some(&[initializer])
+                        || owner_record.value_declaration() != Some(initializer)
+                        || owner_record.members().is_some()
+                        || owner_record.exports().is_some()
+                        || owner_record.parent().is_some()
+                        || owner_record.export_symbol().is_some()
+                        || self.store.get_merged_symbol(owner) != Some(owner)
+                    {
+                        return Err(AssignmentInvariant::InvalidSymbolShape(owner).into());
+                    }
+                    return Ok(Some(owner));
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
     #[allow(clippy::too_many_lines)] // Proves the assignment, import, and ambient member together.
     fn plan_imported_namespace(
         &self,
@@ -1804,6 +2176,14 @@ impl CommonJsAssignmentPlanner<'_> {
                 Ok(Some(false))
             }
             NodeData::ArrayLiteralExpression(array) if array.facts == 0 => Ok(Some(false)),
+            NodeData::FunctionExpression(function)
+                if record.kind == SyntaxKind::FunctionExpression
+                    && function.name.is_none()
+                    && function.parameters.nodes.is_empty()
+                    && !function.parameters.has_trailing_comma =>
+            {
+                Ok(Some(false))
+            }
             _ => Ok(None),
         }
     }
@@ -2164,6 +2544,15 @@ impl CommonJsAssignmentPlanner<'_> {
                     && right_node.flags.0 == 0
                     && object.symbol.is_none()
                     && object.facts == 0 =>
+            {
+                None
+            }
+            NodeData::FunctionExpression(function)
+                if right_node.kind == SyntaxKind::FunctionExpression
+                    && right_node.flags.0 == 0
+                    && function.name.is_none()
+                    && function.parameters.nodes.is_empty()
+                    && !function.parameters.has_trailing_comma =>
             {
                 None
             }
@@ -3868,6 +4257,18 @@ mod tests {
             )
         }
 
+        fn prototype_plan(
+            &self,
+            index: usize,
+        ) -> Result<Option<PrototypeAssignmentPlan>, AssignmentPlanError> {
+            plan_prototype_assignment(
+                &self.parsed.arena,
+                &self.bound,
+                &self.store,
+                self.expression_statement(index),
+            )
+        }
+
         fn imported_namespace_plan(
             &self,
             index: usize,
@@ -4342,6 +4743,178 @@ mod tests {
             )),
         );
         assert_eq!(observable_state(&poisoned.store), before);
+    }
+
+    #[test]
+    fn prototype_assignments_reuse_ambient_class_method_ownership() {
+        let fixture = Fixture::new(concat!(
+            "declare class Point { add(dx: number, dy: number): void; } ",
+            "Point.prototype.add = function(dx, dy) {};",
+        ));
+        let statement = fixture.expression_statement(0);
+        let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+        let NodeData::PropertyAccessExpression(member) =
+            &fixture.parsed.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected the prototype member access")
+        };
+        let prototype = NodeRef::new(fixture.parsed.arena.id(), fixture.file, member.expression);
+        let NodeData::PropertyAccessExpression(access) =
+            &fixture.parsed.arena.get(prototype.node).unwrap().data
+        else {
+            panic!("expected the class prototype access")
+        };
+        let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, access.expression);
+        let owner = fixture.source_local("Point");
+        let owner_record = fixture.store.symbol(owner).unwrap();
+        let prototype_symbol = owner_record
+            .exports()
+            .and_then(|exports| fixture.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("prototype"))
+            .unwrap();
+        let property = owner_record
+            .members()
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("add"))
+            .unwrap();
+        let before = observable_state(&fixture.store);
+
+        assert_eq!(fixture.bound.symbol(expression), None);
+        assert_eq!(
+            fixture.prototype_plan(0),
+            Ok(Some(PrototypeAssignmentPlan {
+                expression,
+                left,
+                right,
+                receiver,
+                prototype,
+                receiver_symbol: owner,
+                owner_symbol: owner,
+                prototype_symbol: Some(prototype_symbol),
+                property_symbol: Some(property),
+            })),
+        );
+        assert_eq!(observable_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn javascript_prototype_assignments_follow_one_function_alias() {
+        let fixture = Fixture::javascript(concat!(
+            "const original = function () {}; ",
+            "var alias = original; ",
+            "alias.prototype.method = function () { this; };",
+        ));
+        let statement = fixture.expression_statement(0);
+        let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+        let NodeData::PropertyAccessExpression(member) =
+            &fixture.parsed.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected the prototype member access")
+        };
+        let prototype = NodeRef::new(fixture.parsed.arena.id(), fixture.file, member.expression);
+        let NodeData::PropertyAccessExpression(access) =
+            &fixture.parsed.arena.get(prototype.node).unwrap().data
+        else {
+            panic!("expected the function prototype access")
+        };
+        let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, access.expression);
+        let original = fixture.variable_declaration("original");
+        let NodeData::VariableDeclaration(variable) =
+            &fixture.parsed.arena.get(original.node).unwrap().data
+        else {
+            panic!("expected the original function declaration")
+        };
+        let function = NodeRef::new(
+            fixture.parsed.arena.id(),
+            fixture.file,
+            variable.initializer.unwrap(),
+        );
+        let before = observable_state(&fixture.store);
+
+        assert_eq!(fixture.bound.symbol(expression), None);
+        assert_eq!(
+            fixture.prototype_plan(0),
+            Ok(Some(PrototypeAssignmentPlan {
+                expression,
+                left,
+                right,
+                receiver,
+                prototype,
+                receiver_symbol: fixture.source_local("alias"),
+                owner_symbol: fixture.bound.symbol(function).unwrap(),
+                prototype_symbol: None,
+                property_symbol: None,
+            })),
+        );
+        assert_eq!(observable_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn prototype_assignments_reject_poisoned_member_resolution() {
+        let mut fixture = Fixture::new(concat!(
+            "declare class Point { add(dx: number, dy: number): void; } ",
+            "Point.prototype.add = function(dx, dy) {};",
+        ));
+        let statement = fixture.expression_statement(0);
+        let (_, left, _) = assignment_parts(&fixture.parsed, statement);
+        let owner = fixture.source_local("Point");
+        let method = fixture
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("add"))
+            .unwrap();
+        assert!(fixture.store.set_symbol_node_links(
+            left,
+            SymbolNodeLinks {
+                resolved_symbol: Some(owner),
+            },
+        ));
+        let before = observable_state(&fixture.store);
+
+        assert_eq!(
+            fixture.prototype_plan(0),
+            Err(AssignmentPlanError::Invariant(
+                AssignmentInvariant::ResolvedSymbolMismatch {
+                    node: left,
+                    expected: method,
+                    actual: owner,
+                },
+            )),
+        );
+        assert_eq!(observable_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn commonjs_function_assignments_keep_their_binder_owned_exports() {
+        for (source, named) in [
+            ("module.exports = function () {};", false),
+            ("exports.method = function () {};", true),
+        ] {
+            let fixture = Fixture::javascript(source);
+            let statement = fixture.expression_statement(0);
+            let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+            let target = fixture.bound.symbol(expression).unwrap();
+            let before = observable_state(&fixture.store);
+
+            let planned = if named {
+                fixture.commonjs_named_plan(0)
+            } else {
+                fixture.commonjs_plan(0)
+            };
+            assert_eq!(
+                planned,
+                Ok(Some(CommonJsAssignmentPlan {
+                    expression,
+                    left,
+                    right,
+                    target_symbol: target,
+                })),
+                "{source}",
+            );
+            assert_eq!(observable_state(&fixture.store), before, "{source}");
+        }
     }
 
     #[test]

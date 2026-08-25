@@ -2415,6 +2415,9 @@ fn plan_source_callable_with_owner_shape(
     let array_sort_argument_arrow = implicit_any_arrow_shape
         && view.parameters.nodes.len() == 2
         && source_array_sort_argument_arrow_is_exact(store, host, declaration);
+    let prototype_assignment_function = implicit_any_arrow_shape
+        && record.kind == SyntaxKind::FunctionExpression
+        && source_prototype_assignment_function_is_exact(store, host, declaration)?;
     let direct_call_argument_arrow = implicit_any_arrow_shape
         && !direct_implicit_any_arrow
         && !array_implicit_any_arrow
@@ -2423,6 +2426,7 @@ fn plan_source_callable_with_owner_shape(
             || source_promise_constructor_argument_arrow_is_exact(store, host, declaration)?)
         && (eligible_implicit_any_arrow
             || array_sort_argument_arrow
+            || prototype_assignment_function
             || source_direct_call_arrow_has_zero_parameter_target(store, host, declaration)?);
     let javascript_object_implicit_any_arrow = eligible_implicit_any_arrow
         && object_property_arrow
@@ -3191,6 +3195,9 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
 ) -> Result<bool, SourceCallableError> {
+    if store.source_node_kind(declaration) == Some(SyntaxKind::FunctionExpression) {
+        return source_prototype_assignment_function_is_exact(store, host, declaration);
+    }
     if store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction) {
         return Ok(false);
     }
@@ -3342,6 +3349,41 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
                 && symbol.export_symbol().is_none()
         })
         && callee_valid)
+}
+
+/// Authenticates an anonymous function assigned to a real class prototype method.
+pub(super) fn source_prototype_assignment_function_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> Result<bool, SourceCallableError> {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::FunctionExpression) {
+        return Ok(false);
+    }
+    let Some(SourceNodeParent::Parent(assignment)) = store.source_node_parent(declaration) else {
+        return Ok(false);
+    };
+    let assignment_record = preflight_node(store, host, assignment)?;
+    let NodeData::BinaryExpression(binary) = &assignment_record.data else {
+        return Ok(false);
+    };
+    if assignment_record.kind != SyntaxKind::BinaryExpression || binary.right != declaration.node {
+        return Ok(false);
+    }
+    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(assignment) else {
+        return Ok(false);
+    };
+    let Some((arena, bound)) = host.source(declaration) else {
+        return Ok(false);
+    };
+    let plan = super::assignment::plan_prototype_assignment(arena, bound, store, statement)
+        .map_err(|_| invariant(SourceCallableInvariant::InvalidOwnerSymbol(declaration)))?;
+    Ok(plan.is_some_and(|plan| {
+        plan.expression == assignment
+            && plan.right == declaration
+            && plan.prototype_symbol.is_some()
+            && plan.property_symbol.is_some()
+    }))
 }
 
 /// Authenticates the one-parameter executor of a top-level global Promise construction.
@@ -3629,6 +3671,31 @@ fn stored_direct_call_argument_arrow_is_exact(
     let Some(owner) = store.symbol(owner_symbol) else {
         return false;
     };
+    if store.source_node_kind(declaration) == Some(SyntaxKind::FunctionExpression) {
+        let Some(SourceNodeParent::Parent(assignment)) = store.source_node_parent(declaration)
+        else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(assignment) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(statement) else {
+            return false;
+        };
+        return store.source_node_kind(assignment) == Some(SyntaxKind::BinaryExpression)
+            && store.source_node_kind(statement) == Some(SyntaxKind::ExpressionStatement)
+            && store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
+            && owner.flags() == SymbolFlags::FUNCTION
+            && owner.check_flags() == CheckFlags::NONE
+            && owner.name() == InternalSymbolName::Function.as_ref()
+            && owner.declarations() == Some(&[declaration])
+            && owner.value_declaration() == Some(declaration)
+            && owner.members().is_none()
+            && owner.exports().is_none()
+            && owner.parent().is_none()
+            && owner.export_symbol().is_none()
+            && store.get_merged_symbol(owner_symbol) == Some(owner_symbol);
+    }
     let Some(SourceNodeParent::Parent(call)) = store.source_node_parent(declaration) else {
         return false;
     };
@@ -7826,8 +7893,10 @@ fn publish_prepared_contextual_source_callable(
     let direct_call_anchor = prepared.variable_symbol.is_none();
     let owner = store.symbol(prepared.owner_symbol);
     let owner_valid = owner.is_some_and(|owner| {
-        store.source_node_kind(prepared.declaration) == Some(SyntaxKind::ArrowFunction)
-            && owner.flags() == SymbolFlags::FUNCTION
+        matches!(
+            store.source_node_kind(prepared.declaration),
+            Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression)
+        ) && owner.flags() == SymbolFlags::FUNCTION
             && owner.check_flags() == CheckFlags::NONE
             && owner.name() == InternalSymbolName::Function.as_ref()
             && owner.declarations() == Some(&[prepared.declaration])
