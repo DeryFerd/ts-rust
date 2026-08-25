@@ -1387,6 +1387,45 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let Some(prototype_access) = unique_property_access(left) else {
             return false;
         };
+        let Some(facts) = self.source_node_facts.get(&declaration.arena) else {
+            return false;
+        };
+        let mut assignment_children = facts.iter().enumerate().filter_map(|(index, facts)| {
+            let facts = facts.as_ref()?;
+            (facts.parent == Some(assignment.node)).then_some((index, facts.kind))
+        });
+        if assignment_children.next()
+            != Some((left.node.index(), SyntaxKind::PropertyAccessExpression))
+            || assignment_children
+                .next()
+                .is_none_or(|(_, kind)| kind != SyntaxKind::EqualsToken)
+            || assignment_children.next()
+                != Some((declaration.node.index(), SyntaxKind::FunctionExpression))
+            || assignment_children.next().is_some()
+        {
+            return false;
+        }
+
+        let mut prototype_children = facts.iter().enumerate().filter_map(|(index, facts)| {
+            let facts = facts.as_ref()?;
+            (facts.parent == Some(prototype_access.node)).then_some((index, facts.kind))
+        });
+        let Some((receiver_index, SyntaxKind::Identifier)) = prototype_children.next() else {
+            return false;
+        };
+        if !matches!(prototype_children.next(), Some((_, SyntaxKind::Identifier)))
+            || prototype_children.next().is_some()
+        {
+            return false;
+        }
+        let Ok(receiver_index) = u32::try_from(receiver_index) else {
+            return false;
+        };
+        let receiver = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            NodeId::new(receiver_index),
+        );
         let Some(method_symbol) = self
             .links
             .value_symbol
@@ -1429,6 +1468,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         else {
             return false;
         };
+        let Some(class_value) = self
+            .value_symbol_links(class_symbol)
+            .and_then(|links| links.resolved_type)
+        else {
+            return false;
+        };
         let Some(prototype_symbol) = class
             .exports()
             .and_then(|exports| self.symbol_table(exports))
@@ -1454,6 +1499,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || class.parent().is_some()
             || class.export_symbol().is_some()
             || self.get_merged_symbol(class_symbol) != Some(class_symbol)
+            || self.value_symbol_links(class_symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(class_value),
+                    ..ValueSymbolLinks::default()
+                })
             || self.source_node_kind(class_declaration) != Some(SyntaxKind::ClassDeclaration)
             || self.source_node_parent(class_declaration) != Some(SourceNodeParent::Parent(source))
             || class
@@ -1471,6 +1521,18 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || prototype.parent() != Some(class_symbol)
             || prototype.export_symbol().is_some()
             || self.get_merged_symbol(prototype_symbol) != Some(prototype_symbol)
+            || self.type_node_links(receiver)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(class_value),
+                    ..TypeNodeLinks::default()
+                })
+            || self.symbol_node_links(receiver).is_some_and(|links| {
+                links != &SymbolNodeLinks::default()
+                    && links
+                        != &SymbolNodeLinks {
+                            resolved_symbol: Some(class_symbol),
+                        }
+            })
             || self.type_node_links(left)
                 != Some(&TypeNodeLinks {
                     resolved_type: Some(contextual_target),
@@ -1507,6 +1569,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         else {
             return false;
         };
+        if self.declared_method_linked_type(target_signature, method_symbol)
+            != Some(contextual_target)
+        {
+            return false;
+        }
         let Some(target_record) = self.signature(target_signature) else {
             return false;
         };
@@ -8584,6 +8651,192 @@ mod tests {
             property_owner,
             property_symbol,
         ));
+    }
+
+    #[test]
+    fn prototype_contextual_callables_reject_forged_method_and_receiver_caches() {
+        for poison in 0..7 {
+            let parsed = parse_source_file(concat!(
+                "declare class Point { add(dx: number, dy: number): void; } ",
+                "Point.prototype.add = function(dx, dy) {};",
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(90_044 + poison);
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/prototype-contextual-callable.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(file, &parsed.arena)],
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+            context.check_source_file(file).unwrap();
+
+            let declaration = node_ref_of_kind(&parsed.arena, file, SyntaxKind::FunctionExpression);
+            let assignment = node_ref_of_kind(&parsed.arena, file, SyntaxKind::BinaryExpression);
+            let NodeData::BinaryExpression(binary) =
+                &parsed.arena.get(assignment.node).unwrap().data
+            else {
+                panic!("the prototype fixture retains one binary assignment")
+            };
+            let left = NodeRef::new(parsed.arena.id(), file, binary.left);
+            let operator = NodeRef::new(parsed.arena.id(), file, binary.operator_token);
+            let NodeData::PropertyAccessExpression(member) =
+                &parsed.arena.get(left.node).unwrap().data
+            else {
+                panic!("the prototype fixture retains its method access")
+            };
+            let prototype = NodeRef::new(parsed.arena.id(), file, member.expression);
+            let NodeData::PropertyAccessExpression(access) =
+                &parsed.arena.get(prototype.node).unwrap().data
+            else {
+                panic!("the prototype fixture retains its class receiver")
+            };
+            let receiver = NodeRef::new(parsed.arena.id(), file, access.expression);
+            let store = context.store_mut_for_test();
+            let class = store
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                .and_then(|globals| globals.get_source("Point"))
+                .unwrap();
+            let method = store
+                .symbol(class)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source("add"))
+                .unwrap();
+            let method_declaration = store.symbol(method).unwrap().declarations().unwrap()[0];
+            let method_signature = store
+                .signature_links(method_declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let method_parameter = store.signature(method_signature).unwrap().parameters()[0];
+            let method_parameter_declaration = store
+                .symbol(method_parameter)
+                .unwrap()
+                .declarations()
+                .unwrap()[0];
+            let callable = store
+                .type_node_links(declaration)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let provenance = store.source_callable_provenance(callable).unwrap();
+            let source_parameter = store.signature(provenance.signature).unwrap().parameters()[0];
+            let contextual_target = provenance.contextual_target.unwrap();
+            let wrong = store.intrinsic_bootstrap().unwrap().string_type;
+            assert!(store.source_prototype_contextual_callable_is_exact(
+                declaration,
+                provenance.owner_symbol,
+                provenance.signature,
+                contextual_target,
+            ));
+
+            match poison {
+                0 => {
+                    for parameter in [method_parameter, source_parameter] {
+                        assert!(store.set_value_symbol_links(
+                            parameter,
+                            ValueSymbolLinks {
+                                resolved_type: Some(wrong),
+                                ..ValueSymbolLinks::default()
+                            },
+                        ));
+                    }
+                }
+                1 => {
+                    for signature in [method_signature, provenance.signature] {
+                        assert!(store.set_signature_resolved_return_type(signature, Some(wrong)));
+                    }
+                }
+                2 => {
+                    assert!(store.set_type_node_links(
+                        receiver,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                3 => {
+                    assert!(store.set_symbol_node_links(
+                        receiver,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(method),
+                        },
+                    ));
+                }
+                4 => {
+                    assert!(store.set_value_symbol_links(
+                        class,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                5 => {
+                    store.source_node_facts.get_mut(&operator.arena).unwrap()
+                        [operator.node.index()]
+                    .as_mut()
+                    .unwrap()
+                    .kind = SyntaxKind::PlusEqualsToken;
+                }
+                6 => {
+                    let annotation = store
+                        .source_direct_type_annotation(method_parameter_declaration)
+                        .unwrap();
+                    assert!(store.set_type_node_links(
+                        annotation,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                _ => unreachable!("prototype poison cases are bounded"),
+            }
+            let before = (
+                store.type_len(),
+                store.signature_len(),
+                store.source_callable_provenance_lengths(),
+                store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                !store.source_prototype_contextual_callable_is_exact(
+                    declaration,
+                    provenance.owner_symbol,
+                    provenance.signature,
+                    contextual_target,
+                ),
+                "poison case {poison}",
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.source_callable_provenance_lengths(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+                "poison case {poison}",
+            );
+        }
     }
 
     #[test]
