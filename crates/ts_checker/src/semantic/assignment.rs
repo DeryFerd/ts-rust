@@ -13,7 +13,8 @@
 //! Prototype writes reuse an existing class method or authenticate a JavaScript
 //! function alias without inventing an assignment-owned property.
 //! Direct arrow and function expandos retain their binder-owned properties and
-//! authenticate the source declaration before admission.
+//! authenticate the source declaration before admission. Nested JavaScript
+//! function-expando writes reuse their previously declared outer property.
 //! JavaScript object expandos retain the initializer's real assignment exports.
 //! Name lookup follows the pinned lexical resolver and checker export/merge routing.
 //! Valid syntax outside that closure is a typed unsupported result; malformed AST,
@@ -391,6 +392,21 @@ pub(super) fn plan_function_expando_assignment(
         store,
     }
     .plan_function_expando(statement)
+}
+
+/// Authenticates a write through an earlier binder-owned function expando.
+pub(super) fn plan_nested_function_expando_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<Option<FunctionExpandoAssignmentPlan>, AssignmentPlanError> {
+    CommonJsAssignmentPlanner {
+        arena,
+        bound,
+        store,
+    }
+    .plan_nested_function_expando(statement)
 }
 
 /// Authenticates `object.name` and `object["name"]` against binder-owned exports.
@@ -1394,6 +1410,192 @@ impl CommonJsAssignmentPlanner<'_> {
                 actual: cached,
             }
             .into());
+        }
+
+        Ok(Some(FunctionExpandoAssignmentPlan {
+            expression,
+            left,
+            right,
+            receiver,
+            owner_symbol,
+            property_symbol,
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)] // Reuse the proven outer assignment and validate this write.
+    fn plan_nested_function_expando(
+        &self,
+        statement: NodeRef,
+    ) -> Result<Option<FunctionExpandoAssignmentPlan>, AssignmentPlanError> {
+        self.preflight_program()?;
+        if self
+            .bound
+            .source_facts()
+            .is_none_or(|facts| !facts.is_javascript_file() || facts.is_declaration_file())
+        {
+            return Ok(None);
+        }
+
+        let statement_record = self.node(statement)?;
+        let NodeData::ExpressionStatement(statement_data) = &statement_record.data else {
+            return Ok(None);
+        };
+        if statement_record.parent != Some(self.bound.source_file().node)
+            || statement_record.flags.0 != 0
+            || statement_data.flow_node.is_some()
+        {
+            return Err(AssignmentInvariant::InvalidStatementShape(statement).into());
+        }
+        let expression = self.reference(statement_data.expression);
+        self.require_parent(expression, Some(statement.node))?;
+        let expression_record = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &expression_record.data else {
+            return Ok(None);
+        };
+        if expression_record.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.modifiers.is_some()
+            || binary.facts != 0
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryAssignment(expression),
+            ));
+        }
+        let operator = self.reference(binary.operator_token);
+        self.require_parent(operator, Some(expression.node))?;
+        let operator_record = self.node(operator)?;
+        if !matches!(operator_record.data, NodeData::Token(_)) || operator_record.flags.0 != 0 {
+            return Err(AssignmentInvariant::InvalidOperatorToken(operator).into());
+        }
+        if operator_record.kind != SyntaxKind::EqualsToken
+            || self.bound.symbol(expression).is_some()
+        {
+            return Ok(None);
+        }
+
+        let left = self.reference(binary.left);
+        let right = self.reference(binary.right);
+        self.require_parent(left, Some(expression.node))?;
+        self.require_parent(right, Some(expression.node))?;
+        let left_record = self.node(left)?;
+        let NodeData::PropertyAccessExpression(nested) = &left_record.data else {
+            return Ok(None);
+        };
+        if left_record.flags.0 != 0
+            || nested.flow_node.is_some()
+            || nested.question_dot_token.is_some()
+            || nested.facts != 0
+        {
+            return Err(AssignmentInvariant::InvalidStatementShape(left).into());
+        }
+        let parent = self.reference(nested.expression);
+        let nested_name = self.reference(nested.name);
+        self.require_parent(parent, Some(left.node))?;
+        self.require_parent(nested_name, Some(left.node))?;
+        let nested_name_record = self.node(nested_name)?;
+        let NodeData::Identifier(nested_identifier) = &nested_name_record.data else {
+            return Ok(None);
+        };
+        if nested_name_record.flags.0 != 0
+            || nested_identifier.flow_node.is_some()
+            || nested_identifier.text.is_empty()
+        {
+            return Err(AssignmentInvariant::InvalidIdentifierShape(nested_name).into());
+        }
+        let parent_record = self.node(parent)?;
+        let NodeData::PropertyAccessExpression(property_access) = &parent_record.data else {
+            return Ok(None);
+        };
+        if parent_record.flags.0 != 0
+            || property_access.flow_node.is_some()
+            || property_access.question_dot_token.is_some()
+            || property_access.facts != 0
+        {
+            return Err(AssignmentInvariant::InvalidStatementShape(parent).into());
+        }
+        let receiver = self.reference(property_access.expression);
+        let property_name = self.reference(property_access.name);
+        self.require_parent(receiver, Some(parent.node))?;
+        self.require_parent(property_name, Some(parent.node))?;
+        let receiver_record = self.node(receiver)?;
+        let NodeData::Identifier(receiver_name) = &receiver_record.data else {
+            return Ok(None);
+        };
+        let property_name_record = self.node(property_name)?;
+        let NodeData::Identifier(property_identifier) = &property_name_record.data else {
+            return Ok(None);
+        };
+        if receiver_record.flags.0 != 0
+            || receiver_name.flow_node.is_some()
+            || receiver_name.text.is_empty()
+            || property_name_record.flags.0 != 0
+            || property_identifier.flow_node.is_some()
+            || property_identifier.text.is_empty()
+        {
+            return Err(AssignmentInvariant::InvalidIdentifierShape(receiver).into());
+        }
+
+        let Some(owner_symbol) = self
+            .bound
+            .locals(self.bound.source_file())
+            .and_then(|locals| self.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&receiver_name.text))
+        else {
+            return Ok(None);
+        };
+        let owner = self
+            .store
+            .symbol(owner_symbol)
+            .ok_or(AssignmentInvariant::InvalidSymbol(owner_symbol))?;
+        if owner.flags() != SymbolFlags::FUNCTION {
+            return Ok(None);
+        }
+        let Some(property_symbol) = owner
+            .exports()
+            .and_then(|exports| self.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&property_identifier.text))
+        else {
+            return Ok(None);
+        };
+        let declaration = self
+            .store
+            .symbol(property_symbol)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .ok_or(AssignmentInvariant::MissingDeclarations(property_symbol))?;
+        let previous_statement = self
+            .node(declaration)?
+            .parent
+            .map(|node| self.reference(node))
+            .ok_or(AssignmentInvariant::InvalidStatementShape(declaration))?;
+        let Some(previous) = self.plan_function_expando(previous_statement)? else {
+            return Err(AssignmentInvariant::InvalidSymbolShape(property_symbol).into());
+        };
+        if previous.owner_symbol != owner_symbol
+            || previous.property_symbol != property_symbol
+            || self.node(previous_statement)?.range.end > statement_record.range.start
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::TargetNotPrior {
+                    node: parent,
+                    symbol: property_symbol,
+                },
+            ));
+        }
+        for (node, expected) in [(receiver, owner_symbol), (parent, property_symbol)] {
+            if let Some(cached) = self
+                .store
+                .symbol_node_links(node)
+                .and_then(|links| links.resolved_symbol)
+                && cached != expected
+            {
+                return Err(AssignmentInvariant::ResolvedSymbolMismatch {
+                    node,
+                    expected,
+                    actual: cached,
+                }
+                .into());
+            }
         }
 
         Ok(Some(FunctionExpandoAssignmentPlan {
@@ -4245,6 +4447,18 @@ mod tests {
             )
         }
 
+        fn nested_function_expando_plan(
+            &self,
+            index: usize,
+        ) -> Result<Option<FunctionExpandoAssignmentPlan>, AssignmentPlanError> {
+            plan_nested_function_expando_assignment(
+                &self.parsed.arena,
+                &self.bound,
+                &self.store,
+                self.expression_statement(index),
+            )
+        }
+
         fn object_expando_plan(
             &self,
             index: usize,
@@ -4743,6 +4957,98 @@ mod tests {
             )),
         );
         assert_eq!(observable_state(&poisoned.store), before);
+    }
+
+    #[test]
+    fn nested_function_expandos_reuse_the_earlier_assignment_symbol() {
+        let fixture = Fixture::javascript(concat!(
+            "function work() {} ",
+            "/** @type {{ ready: boolean }} */ ",
+            "work.value = { ready: true }; ",
+            "work.value.ready = false;",
+        ));
+        let statement = fixture.expression_statement(1);
+        let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+        let NodeData::PropertyAccessExpression(nested) =
+            &fixture.parsed.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected the nested function expando access")
+        };
+        let parent = NodeRef::new(fixture.parsed.arena.id(), fixture.file, nested.expression);
+        let NodeData::PropertyAccessExpression(property) =
+            &fixture.parsed.arena.get(parent.node).unwrap().data
+        else {
+            panic!("expected the binder-owned function expando")
+        };
+        let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, property.expression);
+        let owner = fixture.source_local("work");
+        let property = fixture
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("value"))
+            .unwrap();
+        let before = observable_state(&fixture.store);
+
+        assert!(fixture.bound.symbol(expression).is_none());
+        assert_eq!(
+            fixture.nested_function_expando_plan(1),
+            Ok(Some(FunctionExpandoAssignmentPlan {
+                expression,
+                left,
+                right,
+                receiver,
+                owner_symbol: owner,
+                property_symbol: property,
+            })),
+        );
+        assert_eq!(observable_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn nested_function_expandos_reject_poisoned_outer_property_cache() {
+        let mut fixture = Fixture::javascript(concat!(
+            "function work() {} ",
+            "/** @type {{ ready: boolean }} */ ",
+            "work.value = { ready: true }; ",
+            "work.value.ready = false;",
+        ));
+        let statement = fixture.expression_statement(1);
+        let (_, left, _) = assignment_parts(&fixture.parsed, statement);
+        let NodeData::PropertyAccessExpression(nested) =
+            &fixture.parsed.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected the nested function expando access")
+        };
+        let parent = NodeRef::new(fixture.parsed.arena.id(), fixture.file, nested.expression);
+        let owner = fixture.source_local("work");
+        let property = fixture
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("value"))
+            .unwrap();
+        assert!(fixture.store.set_symbol_node_links(
+            parent,
+            SymbolNodeLinks {
+                resolved_symbol: Some(owner),
+            },
+        ));
+        let before = observable_state(&fixture.store);
+
+        assert_eq!(
+            fixture.nested_function_expando_plan(1),
+            Err(AssignmentPlanError::Invariant(
+                AssignmentInvariant::ResolvedSymbolMismatch {
+                    node: parent,
+                    expected: property,
+                    actual: owner,
+                },
+            )),
+        );
+        assert_eq!(observable_state(&fixture.store), before);
     }
 
     #[test]

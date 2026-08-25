@@ -50,7 +50,8 @@
 //! and declared-discriminant flow and guard-return checks, and direct simple or
 //! arithmetic compound assignments to supported mutable declarations or
 //! binder-authenticated `CommonJS` exports, function or arrow expandos, and
-//! authenticated class or JavaScript function-alias prototype members.
+//! authenticated class or JavaScript function-alias prototype members,
+//! including writes through previously declared JavaScript function expandos.
 //! Option-gated unused-local, unused-parameter, and unused-import diagnostics
 //! run after complete source value and reference publication.
 //! The complete source tree and complete supported-statement plan are validated
@@ -1529,6 +1530,15 @@ struct PlannedPrototypeAssignment {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedNestedFunctionExpandoAssignment {
+    expression: NodeRef,
+    left: PlannedExpression,
+    owner_symbol: SemanticSymbolId,
+    property_symbol: SemanticSymbolId,
+    right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 struct PlannedImportedNamespaceAssignment {
     expression: NodeRef,
     left: NodeRef,
@@ -1744,6 +1754,7 @@ enum PlannedStatement {
     ArrowExpandoAssignment(PlannedArrowExpandoAssignment),
     ObjectExpandoAssignment(PlannedObjectExpandoAssignment),
     PrototypeAssignment(PlannedPrototypeAssignment),
+    NestedFunctionExpandoAssignment(PlannedNestedFunctionExpandoAssignment),
     ImportedNamespaceAssignment(PlannedImportedNamespaceAssignment),
     NamespaceAssignment(PlannedNamespaceAssignment),
     ControlIf(Box<PlannedTopLevelIf>),
@@ -3799,6 +3810,37 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 owner_symbol: assignment.owner_symbol,
                                 property_symbol: assignment.property_symbol,
                                 jsdoc_type,
+                                right,
+                            },
+                        ));
+                        continue;
+                    }
+                    if let Some(assignment) =
+                        super::assignment::plan_nested_function_expando_assignment(
+                            self.arena, self.bound, store, statement,
+                        )
+                        .map_err(Self::assignment_plan_error)?
+                    {
+                        if !self.hoisted_functions.contains(&assignment.owner_symbol) {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Assignment(
+                                    AssignmentUnsupported::TargetNotPrior {
+                                        node: assignment.receiver,
+                                        symbol: assignment.owner_symbol,
+                                    },
+                                ),
+                            ));
+                        }
+                        let left = self.plan_expression(assignment.left)?;
+                        self.primitive_binary_position_roots
+                            .insert(assignment.right);
+                        let right = self.plan_expression(assignment.right)?;
+                        statements.push(PlannedStatement::NestedFunctionExpandoAssignment(
+                            PlannedNestedFunctionExpandoAssignment {
+                                expression: assignment.expression,
+                                left,
+                                owner_symbol: assignment.owner_symbol,
+                                property_symbol: assignment.property_symbol,
                                 right,
                             },
                         ));
@@ -47033,6 +47075,90 @@ pub(super) fn check_source_file(
                 publish_expression_type(store, assignment.left, property_type)?;
                 publish_expression_type(store, assignment.expression, value.result)?;
             }
+            PlannedStatement::NestedFunctionExpandoAssignment(assignment) => {
+                let PlannedExpressionKind::Property(member) = &assignment.left.kind else {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.property_symbol),
+                    ));
+                };
+                let PlannedExpressionKind::Property(property) = &member.receiver.kind else {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.property_symbol),
+                    ));
+                };
+                let PlannedExpressionKind::Identifier(receiver) = &property.receiver.kind else {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.owner_symbol),
+                    ));
+                };
+                if receiver.value_symbol != assignment.owner_symbol
+                    || current_flow_types
+                        .get(&assignment.owner_symbol)
+                        .copied()
+                        .and_then(|type_| {
+                            matches!(
+                                validate_stored_source_callable(store, type_),
+                                StoredSourceCallableValidation::Valid(_)
+                            )
+                            .then_some(type_)
+                        })
+                        != store.source_callable_type_for_owner(assignment.owner_symbol)
+                {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.owner_symbol),
+                    ));
+                }
+                let target = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &assignment.left,
+                    None,
+                    &mut deferred,
+                )?;
+                let property_type = store
+                    .value_symbol_links(assignment.property_symbol)
+                    .and_then(|links| links.resolved_type)
+                    .ok_or(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.property_symbol),
+                    ))?;
+                if store
+                    .symbol_node_links(property.node)
+                    .and_then(|links| links.resolved_symbol)
+                    != Some(assignment.property_symbol)
+                    || store
+                        .type_node_links(property.node)
+                        .and_then(|links| links.resolved_type)
+                        != Some(property_type)
+                {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.property_symbol),
+                    ));
+                }
+                check_assignment_to_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &mut deferred,
+                    target.result,
+                    None,
+                    &assignment.right,
+                    assignment.left.node,
+                    Some(assignment.expression),
+                )?;
+            }
             PlannedStatement::ImportedNamespaceAssignment(assignment) => {
                 let resolved = resolved_imports
                     .get(&assignment.alias_symbol)
@@ -76838,6 +76964,86 @@ class Foo2 {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn nested_function_expando_assignments_preserve_object_property_types() {
+        for (index, (value, diagnostic)) in [("false", false), ("'wrong'", true)]
+            .into_iter()
+            .enumerate()
+        {
+            let text = format!(
+                "function work() {{}} /** @type {{{{ ready: boolean }}}} */ \
+                 work.value = {{ ready: true }}; work.value.ready = {value}; \
+                 const copied = work.value.ready;"
+            );
+            let source = parse_javascript_source_file(&text);
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let file = FileId::new(10_020 + u32::try_from(index).unwrap());
+            let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+            context.check_source_file(file).unwrap();
+
+            let boolean = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+            let (left, right) = assignment_parts(&source, file, 1);
+            let expression = NodeRef::new(
+                source.arena.id(),
+                file,
+                source.arena.get(left.node).unwrap().parent.unwrap(),
+            );
+            assert_eq!(resolved_node_type(&context, left), boolean);
+            assert_eq!(
+                resolved_node_type(&context, expression),
+                resolved_node_type(&context, right),
+            );
+            assert_eq!(
+                variable_value_type(&context, &source, file, "copied"),
+                boolean,
+            );
+            if diagnostic {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("expected one nested expando assignment diagnostic")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2322);
+                assert_eq!(
+                    node_text(&source, diagnostic.node.unwrap()),
+                    "work.value.ready"
+                );
+            } else {
+                assert!(context.diagnostics().is_empty());
+            }
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn nested_function_expando_assignments_reject_poisoned_property_types() {
+        let source = parse_javascript_source_file(concat!(
+            "function work() {} ",
+            "/** @type {{ ready: boolean }} */ ",
+            "work.value = { ready: true }; ",
+            "work.value.ready = false;",
+        ));
+        let file = FileId::new(10_022);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let (left, _) = assignment_parts(&source, file, 1);
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            left,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        mark_source_unchecked(&mut context, file);
+        let poisoned = observable_state(&context, file);
+
+        assert!(context.check_source_file(file).is_err());
+        assert_eq!(observable_state(&context, file), poisoned);
     }
 
     #[test]
