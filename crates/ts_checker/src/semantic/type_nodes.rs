@@ -14235,24 +14235,102 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let exports = module_record
             .exports()
             .and_then(|exports| self.store.symbol_table(exports))?;
-        if !module_record.flags().intersects(SymbolFlags::MODULE)
-            || exports
-                .get(InternalSymbolName::ExportEquals.as_ref())
-                .is_some()
-        {
+        if !module_record.flags().intersects(SymbolFlags::MODULE) {
             return None;
         }
+        let expected_owner = if let Some(export_equals) =
+            exports.get(InternalSymbolName::ExportEquals.as_ref())
+        {
+            let export_equals = self.store.get_merged_symbol(export_equals)?;
+            let assignment = self.store.symbol(export_equals)?;
+            let [assignment_declaration] = assignment.declarations()? else {
+                return None;
+            };
+            let assignment_declaration = *assignment_declaration;
+            let assignment_record = self.host.node(assignment_declaration)?;
+            let NodeData::ExportAssignment(export_assignment) = &assignment_record.data else {
+                return None;
+            };
+            let expression = NodeRef::new(
+                assignment_declaration.arena,
+                assignment_declaration.file,
+                export_assignment.expression,
+            );
+            let expression_record = self.host.node(expression)?;
+            let NodeData::Identifier(export_name) = &expression_record.data else {
+                return None;
+            };
+            let module_declaration = module_record.declarations()?.first().copied()?;
+            let module_declaration_record = self.host.node(module_declaration)?;
+            let NodeData::ModuleDeclaration(module_data) = &module_declaration_record.data else {
+                return None;
+            };
+            let local = bound
+                .locals(module_declaration)
+                .and_then(|locals| self.store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&export_name.text))
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+            let owner = self
+                .store
+                .symbol(local)
+                .map(|symbol| symbol.export_symbol().unwrap_or(local))
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+            let owner_record = self.store.symbol(owner)?;
+            if !assignment.flags().contains(SymbolFlags::ALIAS)
+                || assignment.flags().without(
+                    SymbolFlags::ALIAS | SymbolFlags::NAMESPACE_MODULE | SymbolFlags::TRANSIENT,
+                ) != SymbolFlags::NONE
+                || self.store.get_parent_of_symbol(export_equals) != Some(imported_module)
+                || assignment_record.kind != SyntaxKind::ExportAssignment
+                || assignment_record.flags.0 != 0
+                || assignment_record.parent != module_data.body
+                || !export_assignment.is_export_equals
+                || export_assignment.flow_node.is_some()
+                || export_assignment.symbol.is_some()
+                || export_assignment.type_.is_some()
+                || export_assignment.facts != 0
+                || export_assignment.modifiers.is_some()
+                || expression_record.kind != SyntaxKind::Identifier
+                || expression_record.flags.0 != 0
+                || expression_record.parent != Some(assignment_declaration.node)
+                || export_name.flow_node.is_some()
+                || bound
+                    .symbol(assignment_declaration)
+                    .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                    != Some(export_equals)
+                || module_declaration_record.kind != SyntaxKind::ModuleDeclaration
+                || module_declaration_record.parent != Some(bound.source_file().node)
+                || !owner_record.flags().intersects(SymbolFlags::NAMESPACE)
+            {
+                return None;
+            }
+            if let Some(links) = self.store.alias_symbol_links(export_equals)
+                && links != &super::AliasSymbolLinks::default()
+                && (links.immediate_target != Some(owner)
+                    || links.alias_target != super::AliasTargetState::Resolved(owner)
+                    || links.type_only_declaration.is_some())
+            {
+                return None;
+            }
+            owner
+        } else {
+            imported_module
+        };
         if let Some(links) = self.store.alias_symbol_links(alias)
             && links != &super::AliasSymbolLinks::default()
-            && (links.immediate_target != Some(imported_module)
-                || links.alias_target != super::AliasTargetState::Resolved(imported_module)
+            && (links.immediate_target != Some(expected_owner)
+                || links.alias_target != super::AliasTargetState::Resolved(expected_owner)
                 || links.type_only_declaration.is_some())
         {
             return None;
         }
 
-        let target = exports
-            .get_source(&member_name.text)
+        let target = self
+            .store
+            .symbol(expected_owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| self.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&member_name.text))
             .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
         let target_record = self.store.symbol(target)?;
         let allowed = SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT;
@@ -14260,7 +14338,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .flags()
             .intersects(SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE)
             && target_record.flags().without(allowed) == SymbolFlags::NONE
-            && self.store.get_parent_of_symbol(target) == Some(imported_module))
+            && self.store.get_parent_of_symbol(target) == Some(expected_owner))
         .then_some(target)
     }
 
@@ -34616,6 +34694,232 @@ mod tests {
             )) if node == validator && actual == alias
         ));
         assert_eq!(store_state(&store), poisoned);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The runtime import and export-assignment cache share one proof.
+    fn ambient_jsx_runtime_imports_authenticate_react_export_assignment_namespaces() {
+        let PropTypesInferPropsFixture {
+            library,
+            declarations,
+            library_file,
+            declaration_file,
+            files,
+            mut store,
+        } = prop_types_declaration_fixture(
+            parse_source_file("interface LibraryMarker {}"),
+            parse_source_file(concat!(
+                "declare module 'react' { ",
+                "export = React; ",
+                "namespace React { ",
+                "interface ReactElement<Props> { props: Props; } ",
+                "type ReactNode = string; ",
+                "} ",
+                "namespace Forged { ",
+                "interface ReactElement<Props> { forged: Props; } ",
+                "type ReactNode = number; ",
+                "} } ",
+                "declare module 'react/jsx-runtime' { ",
+                "import * as React from 'react'; ",
+                "export const element: React.ReactElement<string>; ",
+                "export const node: React.ReactNode; ",
+                "}",
+            )),
+            true,
+        );
+        let bound = files.get(&declaration_file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let declaration = |kind: SyntaxKind, expected: &str| {
+            declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind
+                        && declaration_name(&declarations.arena, record) == Some(expected))
+                    .then_some(NodeRef::new(
+                        declarations.arena.id(),
+                        declaration_file,
+                        node,
+                    ))
+                })
+                .unwrap()
+        };
+        let annotation = |expected: &str| {
+            let declaration = declaration(SyntaxKind::VariableDeclaration, expected);
+            let NodeData::VariableDeclaration(variable) =
+                &declarations.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!("the declaration was selected by its variable syntax")
+            };
+            NodeRef::new(declaration.arena, declaration.file, variable.type_.unwrap())
+        };
+        let binding = declarations
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NamespaceImport).then_some(NodeRef::new(
+                    declarations.arena.id(),
+                    declaration_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let assignment = declarations
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ExportAssignment).then_some(NodeRef::new(
+                    declarations.arena.id(),
+                    declaration_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let alias = bound.symbol(binding).unwrap();
+        let export_equals = bound.symbol(assignment).unwrap();
+        let element = annotation("element");
+        let node = annotation("node");
+        let element_target = bound
+            .symbol(declaration(
+                SyntaxKind::InterfaceDeclaration,
+                "ReactElement",
+            ))
+            .unwrap();
+        let node_target = bound
+            .symbol(declaration(SyntaxKind::TypeAliasDeclaration, "ReactNode"))
+            .unwrap();
+        let namespace = store.get_parent_of_symbol(element_target).unwrap();
+        let forged_element = declarations
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration
+                    && declaration_name(&declarations.arena, record) == Some("ReactElement"))
+                .then_some(NodeRef::new(
+                    declarations.arena.id(),
+                    declaration_file,
+                    node,
+                ))
+            })
+            .nth(1)
+            .and_then(|declaration| bound.symbol(declaration))
+            .unwrap();
+        let forged_namespace = store.get_parent_of_symbol(forged_element).unwrap();
+        assert!(store.alias_symbol_links(alias).is_none());
+        assert!(store.alias_symbol_links(export_equals).is_none());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let element_type = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(element)
+        .unwrap();
+        let node_type = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(node)
+        .unwrap();
+        for (reference, target) in [(element, element_target), (node, node_target)] {
+            assert_eq!(
+                store
+                    .symbol_node_links(reference)
+                    .and_then(|links| links.resolved_symbol),
+                Some(target),
+            );
+        }
+        assert!(store.alias_symbol_links(alias).is_none());
+        assert!(store.alias_symbol_links(export_equals).is_none());
+
+        let cold = store_state(&store);
+        for (reference, expected) in [(element, element_type), (node, node_type)] {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(reference),
+                Ok(expected),
+            );
+        }
+        assert_eq!(store_state(&store), cold);
+
+        for symbol in [export_equals, alias] {
+            assert!(store.set_alias_symbol_links(
+                symbol,
+                crate::semantic::AliasSymbolLinks {
+                    immediate_target: Some(namespace),
+                    alias_target: crate::semantic::AliasTargetState::Resolved(namespace),
+                    ..crate::semantic::AliasSymbolLinks::default()
+                },
+            ));
+        }
+        let warm = store_state(&store);
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(element),
+            Ok(element_type),
+        );
+        assert_eq!(store_state(&store), warm);
+
+        for poisoned_alias in [export_equals, alias] {
+            assert!(store.set_alias_symbol_links(
+                poisoned_alias,
+                crate::semantic::AliasSymbolLinks {
+                    immediate_target: Some(forged_namespace),
+                    alias_target: crate::semantic::AliasTargetState::Resolved(forged_namespace),
+                    ..crate::semantic::AliasSymbolLinks::default()
+                },
+            ));
+            let poisoned = store_state(&store);
+            let result = CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(element);
+            assert!(matches!(
+                result,
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::ImportAliasTypeReference { node, alias: actual }
+                )) if node == element && actual == alias
+            ));
+            assert_eq!(store_state(&store), poisoned);
+            assert!(store.set_alias_symbol_links(
+                poisoned_alias,
+                crate::semantic::AliasSymbolLinks {
+                    immediate_target: Some(namespace),
+                    alias_target: crate::semantic::AliasTargetState::Resolved(namespace),
+                    ..crate::semantic::AliasSymbolLinks::default()
+                },
+            ));
+        }
         assert!(diagnostics.is_empty());
     }
 
