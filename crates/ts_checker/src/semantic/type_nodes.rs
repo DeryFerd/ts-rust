@@ -3753,7 +3753,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && literal.call_signatures.is_empty())
     }
 
-    fn is_authenticated_bivariant_alias_type_parameter(
+    fn is_authenticated_alias_union_type_parameter(
         &self,
         node: NodeRef,
         symbol: SemanticSymbolId,
@@ -3829,7 +3829,52 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if body_record.kind == SyntaxKind::IndexedAccessType {
             return self.is_authenticated_bivariant_method_indexed_access(body);
         }
-        self.is_authenticated_bivariant_generic_union_alias(body, alias_symbol)
+        if self.is_authenticated_bivariant_generic_union_alias(body, alias_symbol)? {
+            return Ok(true);
+        }
+        if !self.generic_union_forwards_interface_parameters(body, alias_symbol)? {
+            return Ok(false);
+        }
+
+        let reference = preflight_node(self.store, self.host, node)?;
+        let NodeData::TypeReferenceNode(parameter_reference) = &reference.data else {
+            return Ok(false);
+        };
+        let Some(interface) = reference
+            .parent
+            .map(|parent| NodeRef::new(node.arena, node.file, parent))
+        else {
+            return Ok(false);
+        };
+        let interface_record = preflight_node(self.store, self.host, interface)?;
+        let NodeData::TypeReferenceNode(interface_reference) = &interface_record.data else {
+            return Ok(false);
+        };
+        let Some(arguments) = interface_reference.type_arguments.as_ref() else {
+            return Ok(false);
+        };
+        let interface_symbol = self.resolve_uncached_type_reference_symbol(interface)?;
+        let Some(owner) = self.store.symbol(interface_symbol) else {
+            return Ok(false);
+        };
+        Ok(reference.kind == SyntaxKind::TypeReference
+            && parameter_reference.type_arguments.is_none()
+            && interface_record.kind == SyntaxKind::TypeReference
+            && interface_record.parent == Some(body.node)
+            && arguments
+                .nodes
+                .iter()
+                .filter(|argument| **argument == node.node)
+                .count()
+                == 1
+            && owner.flags().contains(SymbolFlags::INTERFACE)
+            && !owner.flags().contains(SymbolFlags::CLASS)
+            && preflight_class_or_interface_reference(
+                self.store,
+                self.host,
+                interface_symbol,
+                owner.flags(),
+            )? == arguments.nodes.len())
     }
 
     fn is_authenticated_jsdoc_arrow_union_type_parameter(
@@ -8385,7 +8430,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !flags.contains(SymbolFlags::TYPE_ALIAS)
             && !flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
             && (!flags.contains(SymbolFlags::TYPE_PARAMETER)
-                || !self.is_authenticated_bivariant_alias_type_parameter(node, symbol)?
+                || !self.is_authenticated_alias_union_type_parameter(node, symbol)?
                     && !self
                         .is_authenticated_declared_signature_union_type_parameter(node, symbol)?
                     && !self.is_authenticated_jsdoc_arrow_union_type_parameter(node, symbol)?
