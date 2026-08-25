@@ -535,6 +535,110 @@ fn numeric_class_field_initializers_infer_number_and_avoid_ts2564() {
 }
 
 #[test]
+fn string_class_fields_preserve_inferred_and_readonly_types_across_source_replay() {
+    let parsed = parse_source_file(concat!(
+        "class Z { public x = \"\"; }\n",
+        "class Model {\n",
+        "  label: string = 'ready';\n",
+        "  readonly exact = 'fixed';\n",
+        "  static shared = 'shared';\n",
+        "  static readonly constant = 'constant';\n",
+        "}\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(101);
+    let mut context = checker_context_with_options(
+        &parsed,
+        file,
+        CanonicalModuleState::Script,
+        strict_property_options(),
+    );
+
+    context.check_source_file(file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    for (class_name, property_name, value, static_field, readonly) in [
+        ("Z", "x", "", false, false),
+        ("Model", "label", "ready", false, false),
+        ("Model", "exact", "fixed", false, true),
+        ("Model", "shared", "shared", true, false),
+        ("Model", "constant", "constant", true, true),
+    ] {
+        let owner = class_symbol(&parsed, file, &context, class_name);
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        let table = if static_field {
+            Some(members.static_members())
+        } else {
+            members.instance_members()
+        };
+        let symbol = table
+            .and_then(|table| context.store().symbol_table(table))
+            .and_then(|table| table.get_source(property_name))
+            .expect("the class member table retains the initialized string field");
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let expected = if readonly {
+            bootstrap.cached_string_literal_type(value).unwrap()
+        } else {
+            bootstrap.string_type
+        };
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type),
+            Some(expected),
+            "{class_name}.{property_name}",
+        );
+        let initializer = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::PropertyDeclaration(property) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(property.name)?.data else {
+                    return None;
+                };
+                (name.text == property_name)
+                    .then_some(property.initializer?)
+                    .map(|node| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let initializer_type = context
+            .store()
+            .type_node_links(initializer)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_payload(initializer_type)
+                .unwrap()
+                .flags(),
+            TypeFlags::STRING_LITERAL,
+            "{class_name}.{property_name}",
+        );
+    }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn annotated_numeric_class_fields_preserve_annotation_and_literal_caches() {
     let parsed = parse_source_file("class Model { value: number = 1; }");
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);

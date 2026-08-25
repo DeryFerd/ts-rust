@@ -29,7 +29,8 @@
 //! string parameter.
 //! A derived constructor may retain one public, interface-typed parameter
 //! property and forward one primitive interface property to its base.
-//! Numeric instance and static fields can retain a direct numeric initializer.
+//! Numeric and string instance and static fields retain direct literal
+//! initializers, including inferred readonly literal types.
 //! Private fields, empty methods, and paired accessors retain their class brand.
 //! Private fields also admit `null as any`; methods can return private members
 //! or evaluate one authenticated private tagged-template console call.
@@ -3872,9 +3873,7 @@ fn plan_property(
             let text = match &initializer_record.data {
                 NodeData::NumericLiteral(literal) => Some(literal.text.as_str()),
                 NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
-                NodeData::StringLiteral(literal) if merged_auto_accessor.is_some() => {
-                    Some(literal.text.as_str())
-                }
+                NodeData::StringLiteral(literal) => Some(literal.text.as_str()),
                 NodeData::AsExpression(_) if private => None,
                 _ => {
                     return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
@@ -3939,12 +3938,15 @@ fn plan_property(
                 }
                 NodeData::StringLiteral(literal) => {
                     if private
-                        || merged_auto_accessor.is_none()
-                        || side != ClassPropertySide::Instance
                         || initializer_record.kind != SyntaxKind::StringLiteral
                         || literal.token_flags.0 != 0
-                        || type_record.kind != SyntaxKind::StringKeyword
-                        || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
+                        || initializer_node != type_node
+                            && (type_record.kind != SyntaxKind::StringKeyword
+                                || type_record.flags.0 != 0
+                                || !matches!(type_record.data, NodeData::KeywordTypeNode(_)))
+                        || merged_auto_accessor.is_some()
+                            && (side != ClassPropertySide::Instance
+                                || initializer_node == type_node)
                     {
                         return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
                     }
@@ -6746,12 +6748,17 @@ fn resolved_property_value_type(
     if !property.readonly || property.initializer_node != Some(property.type_node) {
         return Ok(Some(planned_type));
     }
-    let number = property_initializer_number(property)
-        .ok_or_else(|| invariant(ClassInvariant::InvalidPlan(property.declaration)))?;
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(property.type_node)))?;
-    let Some(regular) = bootstrap.cached_number_literal_type(number) else {
+    let regular = if let Some(value) = property.initializer_string.as_deref() {
+        bootstrap.cached_string_literal_type(value)
+    } else if let Some(number) = property_initializer_number(property) {
+        bootstrap.cached_number_literal_type(number)
+    } else {
+        return Err(invariant(ClassInvariant::InvalidPlan(property.declaration)));
+    };
+    let Some(regular) = regular else {
         return Ok(None);
     };
     store
@@ -6868,15 +6875,16 @@ fn planned_property_type(
                 property.declaration,
             )));
         };
-        if !property.auto_accessor
-            || property.merged_interface_annotation.is_none()
+        if property.auto_accessor != property.merged_interface_annotation.is_some()
+            || property.auto_accessor && initializer == property.type_node
             || initializer_record.kind != SyntaxKind::StringLiteral
             || initializer_record.flags.0 != 0
             || initializer_record.parent != Some(property.declaration.node)
             || literal.token_flags.0 != 0
             || &literal.text != expected
-            || record.kind != SyntaxKind::StringKeyword
-            || !matches!(record.data, NodeData::KeywordTypeNode(_))
+            || initializer != property.type_node
+                && (record.kind != SyntaxKind::StringKeyword
+                    || !matches!(record.data, NodeData::KeywordTypeNode(_)))
         {
             return Err(unsupported(ClassUnsupported::PropertyInitializer(
                 property.declaration,
@@ -7760,7 +7768,7 @@ fn plan_accessor_type(
 
 /// Preflights the first exact class-member cut.
 ///
-/// Properties have a direct primitive annotation or a numeric initializer.
+/// Properties have a direct primitive annotation or a numeric or string initializer.
 /// Planning the full class first prevents partial property publication.
 fn plan_class_members(
     store: &CanonicalTypeMapperStore,
@@ -12932,7 +12940,7 @@ fn publish_class_property(
         } else if let Some(value) = property.initializer_string.as_deref() {
             let regular = store
                 .regular_string_literal_type(value.to_owned())
-                .expect("the class transaction prepared its string auto-accessor literal");
+                .expect("the class transaction prepared its string field literal");
             (
                 Some(
                     store
@@ -15020,17 +15028,24 @@ fn exact_stored_property(
         bootstrap.non_primitive_type,
     ]
     .contains(&property_type);
-    let readonly_number_literal = check_flags == CheckFlags::READONLY
+    let readonly_literal = check_flags == CheckFlags::READONLY
         && store.type_payload(property_type).is_some_and(|record| {
             let TypeData::Literal(literal) = record.data() else {
                 return false;
             };
-            let super::type_records::LiteralValue::Number(number) = &literal.value else {
-                return false;
+            let matches_literal = match &literal.value {
+                super::type_records::LiteralValue::Number(number) => {
+                    record.flags() == TypeFlags::NUMBER_LITERAL
+                        && bootstrap.cached_number_literal_type(*number) == Some(property_type)
+                }
+                super::type_records::LiteralValue::String(value) => {
+                    record.flags() == TypeFlags::STRING_LITERAL
+                        && bootstrap.cached_string_literal_type(value) == Some(property_type)
+                }
+                _ => false,
             };
-            record.flags() == TypeFlags::NUMBER_LITERAL
+            matches_literal
                 && literal.regular_type == property_type
-                && bootstrap.cached_number_literal_type(*number) == Some(property_type)
                 && store.fresh_type_of_literal_type(property_type).is_ok()
         });
     let arrow_callable = check_flags == CheckFlags::NONE
@@ -15153,42 +15168,6 @@ fn exact_stored_property(
                             .and_then(|members| members.get(record.name()))
                             == Some(property);
                 }
-                let annotation_valid = match store.source_node_kind(previous) {
-                    Some(SyntaxKind::Identifier) => private_name.is_none(),
-                    Some(SyntaxKind::PrivateIdentifier) => private_name.is_some(),
-                    Some(SyntaxKind::NumberKeyword) => {
-                        store.type_node_links(previous)
-                            == Some(&TypeNodeLinks {
-                                resolved_type: Some(bootstrap.number_type),
-                                ..TypeNodeLinks::default()
-                            })
-                            && store.source_type_node_result_is_exact(
-                                previous,
-                                bootstrap.number_type,
-                                &[],
-                            )
-                            && (private_name.is_none()
-                                || previous
-                                    .node
-                                    .index()
-                                    .checked_sub(1)
-                                    .and_then(|index| u32::try_from(index).ok())
-                                    .map(|index| {
-                                        NodeRef::new(
-                                            declaration.arena,
-                                            declaration.file,
-                                            ts_ast::NodeId::new(index),
-                                        )
-                                    })
-                                    .is_some_and(|name| {
-                                        store.source_node_kind(name)
-                                            == Some(SyntaxKind::PrivateIdentifier)
-                                            && store.source_node_parent(name)
-                                                == Some(SourceNodeParent::Parent(*declaration))
-                                    }))
-                    }
-                    _ => false,
-                };
                 let Some(fresh) = store
                     .type_node_links(initializer)
                     .and_then(|links| links.resolved_type)
@@ -15201,8 +15180,60 @@ fn exact_stored_property(
                 let TypeData::Literal(literal) = literal_record.data() else {
                     return false;
                 };
-                let super::type_records::LiteralValue::Number(number) = &literal.value else {
-                    return false;
+                let (initializer_kind, annotation_kind, primitive_type, literal_valid) =
+                    match &literal.value {
+                        super::type_records::LiteralValue::Number(number) => (
+                            SyntaxKind::NumericLiteral,
+                            SyntaxKind::NumberKeyword,
+                            bootstrap.number_type,
+                            literal_record.flags() == TypeFlags::NUMBER_LITERAL
+                                && bootstrap.cached_number_literal_type(*number)
+                                    == Some(literal.regular_type),
+                        ),
+                        super::type_records::LiteralValue::String(value) => (
+                            SyntaxKind::StringLiteral,
+                            SyntaxKind::StringKeyword,
+                            bootstrap.string_type,
+                            literal_record.flags() == TypeFlags::STRING_LITERAL
+                                && bootstrap.cached_string_literal_type(value)
+                                    == Some(literal.regular_type),
+                        ),
+                        _ => return false,
+                    };
+                let annotation_valid = match store.source_node_kind(previous) {
+                    Some(SyntaxKind::Identifier) => private_name.is_none(),
+                    Some(SyntaxKind::PrivateIdentifier) => {
+                        private_name.is_some() && initializer_kind == SyntaxKind::NumericLiteral
+                    }
+                    Some(kind) if kind == annotation_kind => {
+                        store.type_node_links(previous)
+                            == Some(&TypeNodeLinks {
+                                resolved_type: Some(primitive_type),
+                                ..TypeNodeLinks::default()
+                            })
+                            && store.source_type_node_result_is_exact(previous, primitive_type, &[])
+                            && (private_name.is_none()
+                                || initializer_kind == SyntaxKind::NumericLiteral
+                                    && previous
+                                        .node
+                                        .index()
+                                        .checked_sub(1)
+                                        .and_then(|index| u32::try_from(index).ok())
+                                        .map(|index| {
+                                            NodeRef::new(
+                                                declaration.arena,
+                                                declaration.file,
+                                                ts_ast::NodeId::new(index),
+                                            )
+                                        })
+                                        .is_some_and(|name| {
+                                            store.source_node_kind(name)
+                                                == Some(SyntaxKind::PrivateIdentifier)
+                                                && store.source_node_parent(name)
+                                                    == Some(SourceNodeParent::Parent(*declaration))
+                                        }))
+                    }
+                    _ => false,
                 };
                 let expected_property_type = if check_flags == CheckFlags::READONLY
                     && matches!(
@@ -15211,12 +15242,12 @@ fn exact_stored_property(
                     ) {
                     literal.regular_type
                 } else {
-                    bootstrap.number_type
+                    primitive_type
                 };
                 flags == SymbolFlags::PROPERTY
                     && matches!(check_flags, CheckFlags::NONE | CheckFlags::READONLY)
                     && property_type == expected_property_type
-                    && store.source_node_kind(initializer) == Some(SyntaxKind::NumericLiteral)
+                    && store.source_node_kind(initializer) == Some(initializer_kind)
                     && store.source_node_parent(initializer)
                         == Some(SourceNodeParent::Parent(*declaration))
                     && store.source_node_parent(previous)
@@ -15227,8 +15258,7 @@ fn exact_stored_property(
                             resolved_type: Some(fresh),
                             ..TypeNodeLinks::default()
                         })
-                    && literal_record.flags() == TypeFlags::NUMBER_LITERAL
-                    && bootstrap.cached_number_literal_type(*number) == Some(literal.regular_type)
+                    && literal_valid
                     && store.fresh_type_of_literal_type(literal.regular_type) == Ok(fresh)
                     && store.symbol(owner).is_some_and(|owner| {
                         [owner.members(), owner.exports()]
@@ -15264,7 +15294,7 @@ fn exact_stored_property(
                 resolved_type: Some(property_type),
                 ..ValueSymbolLinks::default()
             })
-        && (primitive || readonly_number_literal || arrow_callable))
+        && (primitive || readonly_literal || arrow_callable))
         .then_some(*declaration)
 }
 
@@ -21721,6 +21751,390 @@ mod tests {
             assert!(fixture.store.declared_type_links(owner).is_none());
             assert!(fixture.store.value_symbol_links(owner).is_none());
         }
+    }
+
+    #[test]
+    fn string_class_fields_preserve_literal_identity_and_replay_warm() {
+        for (source, annotated, readonly, static_field, value) in [
+            (
+                "class Model { public value = \"\"; }",
+                false,
+                false,
+                false,
+                "",
+            ),
+            (
+                "class Model { value = 'ready'; }",
+                false,
+                false,
+                false,
+                "ready",
+            ),
+            (
+                "class Model { value: string = 'ready'; }",
+                true,
+                false,
+                false,
+                "ready",
+            ),
+            (
+                "class Model { readonly value = 'ready'; }",
+                false,
+                true,
+                false,
+                "ready",
+            ),
+            (
+                "class Model { readonly value: string = 'ready'; }",
+                true,
+                true,
+                false,
+                "ready",
+            ),
+            (
+                "class Model { static value = 'ready'; }",
+                false,
+                false,
+                true,
+                "ready",
+            ),
+            (
+                "class Model { public static value: string = 'ready'; }",
+                true,
+                false,
+                true,
+                "ready",
+            ),
+            (
+                "class Model { static readonly value = 'ready'; }",
+                false,
+                true,
+                true,
+                "ready",
+            ),
+            (
+                "class Model { static readonly value: string = 'ready'; }",
+                true,
+                true,
+                true,
+                "ready",
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("a string field belongs to one direct class")
+            };
+            let property = class.class.properties[0].clone();
+            let initializer = property.initializer_node.unwrap();
+            assert_eq!(
+                property.initializer_string.as_deref(),
+                Some(value),
+                "{source}"
+            );
+            assert_eq!(property.type_node != initializer, annotated, "{source}");
+            assert_eq!(property.readonly, readonly, "{source}");
+            assert_eq!(
+                property.side == ClassPropertySide::Static,
+                static_field,
+                "{source}",
+            );
+            assert!(!property.auto_accessor, "{source}");
+            assert!(class.uninitialized_instance_properties().is_empty());
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+                "{source}",
+            );
+
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let regular = bootstrap.cached_string_literal_type(value).unwrap();
+            let fresh = fixture.store.fresh_type_of_literal_type(regular).unwrap();
+            let expected = if readonly && !annotated {
+                regular
+            } else {
+                bootstrap.string_type
+            };
+            assert_eq!(
+                fixture.store.type_node_links(initializer),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(fresh),
+                    ..TypeNodeLinks::default()
+                }),
+                "{source}",
+            );
+            if annotated {
+                assert_eq!(
+                    fixture.store.type_node_links(property.type_node),
+                    Some(&TypeNodeLinks {
+                        resolved_type: Some(bootstrap.string_type),
+                        ..TypeNodeLinks::default()
+                    }),
+                    "{source}",
+                );
+            }
+            assert_eq!(
+                fixture.store.value_symbol_links(property.symbol),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(expected),
+                    ..ValueSymbolLinks::default()
+                }),
+                "{source}",
+            );
+            assert_eq!(
+                fixture.store.symbol(property.symbol).unwrap().check_flags(),
+                if readonly {
+                    CheckFlags::READONLY
+                } else {
+                    CheckFlags::NONE
+                },
+                "{source}",
+            );
+            let owner_table = if static_field {
+                fixture.store.symbol(owner).and_then(Symbol::exports)
+            } else {
+                fixture.store.symbol(owner).and_then(Symbol::members)
+            };
+            assert_eq!(
+                owner_table
+                    .and_then(|table| fixture.store.symbol_table(table))
+                    .and_then(|table| table.get_source("value")),
+                Some(property.symbol),
+                "{source}",
+            );
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+                ClassHeritageMembersValidation::Valid,
+                "{source}",
+            );
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+                Ok(members),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn public_string_and_branded_private_fields_preserve_one_class_identity() {
+        let mut fixture = fixture(concat!(
+            "class Model { public label = 'ready'; #value = 1; ",
+            "static readonly kind = 'fixed'; static #count: number = 2; }",
+        ));
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("mixed public and private fields belong to one direct class")
+        };
+        let label = class.class.instance_properties[0].symbol;
+        let private = class.class.instance_properties[1].symbol;
+        let kind = class.class.static_properties[0].symbol;
+        let count = class.class.static_properties[1].symbol;
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(label)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.string_type),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(kind)
+                .and_then(|links| links.resolved_type),
+            bootstrap.cached_string_literal_type("fixed"),
+        );
+        assert_eq!(
+            authenticated_private_class_symbol_name(&fixture.store, owner, private),
+            Some("#value"),
+        );
+        assert_eq!(
+            authenticated_private_class_symbol_name(&fixture.store, owner, count),
+            Some("#count"),
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn string_class_fields_reject_poisoned_caches_and_forged_symbols() {
+        for (source, poison) in [
+            ("class Model { value: string = 'ready'; }", 0),
+            ("class Model { value: string = 'ready'; }", 1),
+            ("class Model { static readonly value = 'ready'; }", 2),
+            ("class Model { value = 'ready'; }", 3),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("a string field belongs to one direct class")
+            };
+            let property = class.class.properties[0].clone();
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            let expected = match poison {
+                0 | 1 => {
+                    let node = if poison == 0 {
+                        property.type_node
+                    } else {
+                        property.initializer_node.unwrap()
+                    };
+                    assert!(fixture.store.set_type_node_links(
+                        node,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyTypeCache(node))
+                }
+                2 => {
+                    assert!(fixture.store.set_value_symbol_links(
+                        property.symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyValueCache(property.symbol))
+                }
+                3 => {
+                    assert!(fixture.store.set_symbol_flags(
+                        property.symbol,
+                        SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL,
+                        CheckFlags::NONE,
+                    ));
+                    invariant(ClassInvariant::InvalidPropertySymbol(property.declaration))
+                }
+                _ => unreachable!("only the declared poison cases are visited"),
+            };
+            let poisoned = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(expected),
+                "{source}: {poison}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                poisoned,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn readonly_string_fields_reject_widened_cached_property_types() {
+        let mut fixture = fixture("class Model { readonly value = 'ready'; }");
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("a readonly string field belongs to one direct class")
+        };
+        let property = class.class.properties[0].clone();
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_value_symbol_links(
+            property.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Malformed,
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+                property.symbol,
+            ))),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
     }
 
     #[test]
