@@ -24078,7 +24078,7 @@ fn source_awaited_expression_type(
     else {
         return Ok(type_);
     };
-    if store.type_payload(type_).and_then(|record| record.symbol()) != Some(promise) {
+    if store.type_payload(type_).and_then(TypeRecord::symbol) != Some(promise) {
         return Ok(type_);
     }
 
