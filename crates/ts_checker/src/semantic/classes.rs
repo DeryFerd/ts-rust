@@ -6725,7 +6725,39 @@ fn property_initializer_fresh_literal_type(
         .intrinsic_bootstrap()
         .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(initializer)))?;
     let regular = if let Some(value) = property.initializer_string.as_deref() {
-        bootstrap.cached_string_literal_type(value)
+        let Some(regular) = bootstrap.cached_string_literal_type(value) else {
+            return Ok(None);
+        };
+        let record = store
+            .type_payload(regular)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyTypeCache(initializer)))?;
+        let TypeData::Literal(literal) = record.data() else {
+            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                initializer,
+            )));
+        };
+        if record.flags() != TypeFlags::STRING_LITERAL
+            || record.object_flags() != ObjectFlags::NONE
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || literal.regular_type != regular
+            || !matches!(
+                &literal.value,
+                super::type_records::LiteralValue::String(cached) if cached == value
+            )
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                initializer,
+            )));
+        }
+        // Bootstrap seeds the empty string before its fresh partner exists.
+        if value.is_empty()
+            && regular == bootstrap.empty_string_type
+            && literal.fresh_type.is_none()
+        {
+            return Ok(None);
+        }
+        Some(regular)
     } else if let Some(number) = property_initializer_number(property) {
         bootstrap.cached_number_literal_type(number)
     } else {
@@ -6761,6 +6793,11 @@ fn resolved_property_value_type(
     let Some(regular) = regular else {
         return Ok(None);
     };
+    if property.initializer_string.as_deref() == Some("")
+        && property_initializer_fresh_literal_type(store, property)?.is_none()
+    {
+        return Ok(None);
+    }
     store
         .fresh_type_of_literal_type(regular)
         .map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(property.type_node)))?;
@@ -21760,6 +21797,13 @@ mod tests {
                 "class Model { public value = \"\"; }",
                 false,
                 false,
+                false,
+                "",
+            ),
+            (
+                "class Model { readonly value = \"\"; }",
+                false,
+                true,
                 false,
                 "",
             ),
