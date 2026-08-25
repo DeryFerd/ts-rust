@@ -162,13 +162,14 @@ pub(super) struct SourceReturnBranchSyntax {
     pub(super) return_expression: NodeRef,
 }
 
-/// The exact final `if` and its unwrapped direct identifier condition.
+/// The exact final `if` and its authenticated identifier-based condition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceFinalIfSyntax {
     pub(super) statement: NodeRef,
     pub(super) condition: NodeRef,
     pub(super) condition_identifier: NodeRef,
     pub(super) typeof_condition: Option<SourceTypeofConditionSyntax>,
+    pub(super) equality_condition: Option<SourceEqualityConditionSyntax>,
     pub(super) then_branch: SourceReturnBranchSyntax,
     pub(super) else_branch: SourceReturnBranchSyntax,
 }
@@ -329,6 +330,19 @@ pub(super) struct SourceTypeofConditionSyntax {
     pub(super) type_of_on_left: bool,
 }
 
+/// Exact source nodes retained for one literal or discriminant comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceEqualityConditionSyntax {
+    pub(super) operand: NodeRef,
+    pub(super) identifier: NodeRef,
+    pub(super) discriminant: Option<NodeRef>,
+    pub(super) operator: NodeRef,
+    pub(super) value: NodeRef,
+    pub(super) comparison: SourceTypeofComparison,
+    pub(super) strict: bool,
+    pub(super) operand_on_left: bool,
+}
+
 /// Complete source-ordered syntax for the first closed function-body vertical.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceFunctionStatementsSyntax {
@@ -461,6 +475,7 @@ pub(super) struct SourceJoinedIfSyntax {
     pub(super) condition: NodeRef,
     pub(super) condition_identifier: NodeRef,
     pub(super) typeof_condition: Option<SourceTypeofConditionSyntax>,
+    pub(super) equality_condition: Option<SourceEqualityConditionSyntax>,
     pub(super) then_branch: SourceFallthroughBranchSyntax,
     pub(super) else_branch: SourceFallthroughBranchSyntax,
 }
@@ -469,6 +484,7 @@ pub(super) struct SourceJoinedIfSyntax {
 struct PlannedConditionSyntax {
     identifier: NodeRef,
     typeof_condition: Option<SourceTypeofConditionSyntax>,
+    equality_condition: Option<SourceEqualityConditionSyntax>,
 }
 
 /// Complete source-ordered syntax for the first post-`if` join vertical.
@@ -3388,7 +3404,10 @@ impl SyntaxPlanner<'_> {
         self.validate_container(statement, declaration)?;
         self.validate_block_scope_container(statement, declaration)?;
         let condition = self.plan_condition(control.condition, declaration)?;
-        if condition.identifier != control.condition || condition.typeof_condition.is_some() {
+        if condition.identifier != control.condition
+            || condition.typeof_condition.is_some()
+            || condition.equality_condition.is_some()
+        {
             return Err(self.unsupported(
                 control.condition,
                 self.node(control.condition)?.kind,
@@ -6394,6 +6413,7 @@ impl SyntaxPlanner<'_> {
             condition,
             condition_identifier: condition_syntax.identifier,
             typeof_condition: condition_syntax.typeof_condition,
+            equality_condition: condition_syntax.equality_condition,
             then_branch,
             else_branch,
         })
@@ -6405,7 +6425,23 @@ impl SyntaxPlanner<'_> {
         callable: NodeRef,
     ) -> Result<PlannedConditionSyntax, SourceFunctionStatementsError> {
         if self.node(condition)?.kind == SyntaxKind::BinaryExpression {
-            return self.plan_typeof_condition(condition, callable);
+            let record = self.node(condition)?;
+            let NodeData::BinaryExpression(binary) = &record.data else {
+                return Err(self.unsupported(
+                    condition,
+                    record.kind,
+                    SourceFunctionStatementsRole::Condition,
+                ));
+            };
+            let left = self.node(self.reference(binary.left))?.kind;
+            let right = self.node(self.reference(binary.right))?.kind;
+            return if matches!(left, SyntaxKind::TypeOfExpression)
+                || matches!(right, SyntaxKind::TypeOfExpression)
+            {
+                self.plan_typeof_condition(condition, callable)
+            } else {
+                self.plan_equality_condition(condition, callable)
+            };
         }
         let mut current = condition;
         let mut seen = HashSet::new();
@@ -6425,6 +6461,7 @@ impl SyntaxPlanner<'_> {
                     return Ok(PlannedConditionSyntax {
                         identifier: current,
                         typeof_condition: None,
+                        equality_condition: None,
                     });
                 }
                 NodeData::ParenthesizedExpression(parenthesized)
@@ -6654,6 +6691,214 @@ impl SyntaxPlanner<'_> {
                 comparison,
                 type_of_on_left,
             }),
+            equality_condition: None,
+        })
+    }
+
+    fn plan_equality_condition(
+        &self,
+        condition: NodeRef,
+        callable: NodeRef,
+    ) -> Result<PlannedConditionSyntax, SourceFunctionStatementsError> {
+        let record = self.node(condition)?;
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            return Err(self.unsupported(
+                condition,
+                record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        };
+        if record.kind != SyntaxKind::BinaryExpression
+            || record.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.facts != 0
+            || binary.modifiers.is_some()
+        {
+            return Err(self.unsupported(
+                condition,
+                record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+        self.validate_container(condition, callable)?;
+        self.validate_block_scope_container(condition, callable)?;
+
+        let left = self.reference(binary.left);
+        let operator = self.reference(binary.operator_token);
+        let right = self.reference(binary.right);
+        for node in [left, operator, right] {
+            self.validate_parent(
+                node,
+                Some(condition.node),
+                SourceFunctionStatementsRole::Condition,
+            )?;
+            self.validate_range(node, condition)?;
+            self.validate_container(node, callable)?;
+            self.validate_block_scope_container(node, callable)?;
+        }
+        self.validate_order(left, operator)?;
+        self.validate_order(operator, right)?;
+
+        let operator_record = self.node(operator)?;
+        if operator_record.flags.0 != 0 || !matches!(operator_record.data, NodeData::Token(_)) {
+            return Err(self.unsupported(
+                operator,
+                operator_record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+        let (comparison, strict) = match operator_record.kind {
+            SyntaxKind::EqualsEqualsEqualsToken => (SourceTypeofComparison::Equal, true),
+            SyntaxKind::ExclamationEqualsEqualsToken => (SourceTypeofComparison::NotEqual, true),
+            SyntaxKind::EqualsEqualsToken => (SourceTypeofComparison::Equal, false),
+            SyntaxKind::ExclamationEqualsToken => (SourceTypeofComparison::NotEqual, false),
+            _ => {
+                return Err(self.unsupported(
+                    operator,
+                    operator_record.kind,
+                    SourceFunctionStatementsRole::Condition,
+                ));
+            }
+        };
+
+        let left_value = self.equality_condition_value(left)?;
+        let right_value = self.equality_condition_value(right)?;
+        let (operand, value, operand_on_left) = match (left_value, right_value) {
+            (false, true) => (left, right, true),
+            (true, false) => (right, left, false),
+            _ => {
+                return Err(self.unsupported(
+                    condition,
+                    record.kind,
+                    SourceFunctionStatementsRole::Condition,
+                ));
+            }
+        };
+        if !strict
+            && !matches!(
+                self.node(value)?.kind,
+                SyntaxKind::NullKeyword | SyntaxKind::Identifier
+            )
+        {
+            return Err(self.unsupported(
+                operator,
+                operator_record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+
+        let operand_record = self.node(operand)?;
+        let (identifier, discriminant) = match &operand_record.data {
+            NodeData::Identifier(identifier)
+                if operand_record.kind == SyntaxKind::Identifier
+                    && operand_record.flags.0 == 0
+                    && identifier.flow_node.is_none()
+                    && !identifier.text.is_empty() =>
+            {
+                (operand, None)
+            }
+            NodeData::PropertyAccessExpression(access)
+                if operand_record.kind == SyntaxKind::PropertyAccessExpression
+                    && operand_record.flags.0 == 0
+                    && access.flow_node.is_none()
+                    && access.question_dot_token.is_none()
+                    && access.facts == 0 =>
+            {
+                let identifier = self.reference(access.expression);
+                let name = self.reference(access.name);
+                for node in [identifier, name] {
+                    self.validate_parent(
+                        node,
+                        Some(operand.node),
+                        SourceFunctionStatementsRole::Condition,
+                    )?;
+                    self.validate_range(node, operand)?;
+                    self.validate_container(node, callable)?;
+                    self.validate_block_scope_container(node, callable)?;
+                }
+                self.validate_order(identifier, name)?;
+                let identifier_record = self.node(identifier)?;
+                let name_record = self.node(name)?;
+                if !matches!(&identifier_record.data, NodeData::Identifier(identifier)
+                    if identifier_record.kind == SyntaxKind::Identifier
+                        && identifier_record.flags.0 == 0
+                        && identifier.flow_node.is_none()
+                        && !identifier.text.is_empty())
+                    || !matches!(&name_record.data, NodeData::Identifier(name)
+                        if name_record.kind == SyntaxKind::Identifier
+                            && name_record.flags.0 == 0
+                            && name.flow_node.is_none()
+                            && !name.text.is_empty())
+                {
+                    return Err(self.unsupported(
+                        operand,
+                        operand_record.kind,
+                        SourceFunctionStatementsRole::Condition,
+                    ));
+                }
+                (identifier, Some(operand))
+            }
+            _ => {
+                return Err(self.unsupported(
+                    operand,
+                    operand_record.kind,
+                    SourceFunctionStatementsRole::Condition,
+                ));
+            }
+        };
+
+        Ok(PlannedConditionSyntax {
+            identifier,
+            typeof_condition: None,
+            equality_condition: Some(SourceEqualityConditionSyntax {
+                operand,
+                identifier,
+                discriminant,
+                operator,
+                value,
+                comparison,
+                strict,
+                operand_on_left,
+            }),
+        })
+    }
+
+    fn equality_condition_value(
+        &self,
+        value: NodeRef,
+    ) -> Result<bool, SourceFunctionStatementsError> {
+        let record = self.node(value)?;
+        if record.flags.0 != 0 {
+            return Ok(false);
+        }
+        Ok(match &record.data {
+            NodeData::Identifier(identifier) => {
+                record.kind == SyntaxKind::Identifier
+                    && identifier.flow_node.is_none()
+                    && identifier.text == "undefined"
+            }
+            NodeData::KeywordExpression(keyword) => {
+                matches!(
+                    record.kind,
+                    SyntaxKind::NullKeyword | SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+                ) && keyword.flow_node.is_none()
+            }
+            NodeData::StringLiteral(literal) => {
+                record.kind == SyntaxKind::StringLiteral && literal.token_flags.0 == 0
+            }
+            NodeData::NoSubstitutionTemplateLiteral(literal) => {
+                record.kind == SyntaxKind::NoSubstitutionTemplateLiteral
+                    && literal.token_flags.0 == 0
+                    && literal.template_flags.0 == 0
+            }
+            NodeData::NumericLiteral(literal) => {
+                record.kind == SyntaxKind::NumericLiteral && literal.token_flags.0 == 0
+            }
+            NodeData::BigIntLiteral(literal) => {
+                record.kind == SyntaxKind::BigIntLiteral && literal.token_flags.0 == 0
+            }
+            _ => false,
         })
     }
 
@@ -7164,6 +7409,7 @@ impl SyntaxPlanner<'_> {
             condition,
             condition_identifier: condition_syntax.identifier,
             typeof_condition: condition_syntax.typeof_condition,
+            equality_condition: condition_syntax.equality_condition,
             then_branch,
             else_branch,
         })
@@ -10281,6 +10527,163 @@ mod joined_tests {
                     ),
                 )),
             ));
+        }
+    }
+
+    #[test]
+    fn joined_equality_syntax_authenticates_nullish_and_discriminant_operands() {
+        for (index, (parameter, condition, comparison, strict, operand_on_left, discriminant)) in [
+            (
+                "string | null | undefined",
+                "value !== null",
+                SourceTypeofComparison::NotEqual,
+                true,
+                true,
+                false,
+            ),
+            (
+                "string | null | undefined",
+                "null === value",
+                SourceTypeofComparison::Equal,
+                true,
+                false,
+                false,
+            ),
+            (
+                "string | null | undefined",
+                "value == null",
+                SourceTypeofComparison::Equal,
+                false,
+                true,
+                false,
+            ),
+            (
+                "string | null | undefined",
+                "undefined != value",
+                SourceTypeofComparison::NotEqual,
+                false,
+                false,
+                false,
+            ),
+            (
+                "Choice",
+                "value.kind === \"ready\"",
+                SourceTypeofComparison::Equal,
+                true,
+                true,
+                true,
+            ),
+            (
+                "Choice",
+                "false !== value.active",
+                SourceTypeofComparison::NotEqual,
+                true,
+                false,
+                true,
+            ),
+            (
+                "string",
+                "value === `ready`",
+                SourceTypeofComparison::Equal,
+                true,
+                true,
+                false,
+            ),
+            (
+                "number",
+                "1 !== value",
+                SourceTypeofComparison::NotEqual,
+                true,
+                false,
+                false,
+            ),
+            (
+                "bigint",
+                "value === 1n",
+                SourceTypeofComparison::Equal,
+                true,
+                true,
+                false,
+            ),
+            (
+                "boolean",
+                "value === true",
+                SourceTypeofComparison::Equal,
+                true,
+                true,
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = format!(
+                "type Choice = {{ kind: \"ready\"; active: true }} | {{ kind: \"waiting\"; active: false }};\nfunction narrowed(value: {parameter}): {parameter} {{\n  if ({condition}) {{\n    const selected: {parameter} = value;\n  }} else {{\n    const rejected: {parameter} = value;\n  }}\n  return value;\n}}\n"
+            );
+            let fixture =
+                JoinedFixture::new(&source, FileId::new(1_380 + u32::try_from(index).unwrap()));
+            let syntax = fixture.plan().unwrap();
+            let equality = syntax
+                .joined_if
+                .equality_condition
+                .expect("expected an authenticated equality condition");
+
+            assert!(syntax.joined_if.typeof_condition.is_none());
+            assert_eq!(equality.identifier, syntax.joined_if.condition_identifier);
+            assert_eq!(equality.comparison, comparison);
+            assert_eq!(equality.strict, strict);
+            assert_eq!(equality.operand_on_left, operand_on_left);
+            assert_eq!(equality.discriminant.is_some(), discriminant);
+            if discriminant {
+                assert_eq!(equality.discriminant, Some(equality.operand));
+            }
+
+            for branch in [&syntax.joined_if.then_branch, &syntax.joined_if.else_branch] {
+                let flow = fixture.bound.flow_at(branch.locals[0].name).unwrap();
+                let flow = fixture.bound.flow_graph().nodes().get(flow).unwrap();
+                assert_eq!(
+                    flow.payload,
+                    Some(FlowNodePayload::Ast(syntax.joined_if.condition)),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn joined_equality_syntax_rejects_loose_literals_and_unproven_operands() {
+        for (index, condition) in [
+            "value == \"ready\"",
+            "value != true",
+            "value.kind == \"ready\"",
+            "(value) === null",
+            "value?.kind === \"ready\"",
+            "value.other.kind === \"ready\"",
+            "value.kind() === \"ready\"",
+            "value === other",
+            "null === undefined",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = format!(
+                "function narrowed(value: string | null): string | null {{ if ({condition}) {{}} else {{}} return value; }}"
+            );
+            let fixture =
+                JoinedFixture::new(&source, FileId::new(1_390 + u32::try_from(index).unwrap()));
+            assert!(
+                matches!(
+                    fixture.plan(),
+                    Err(SourceJoinedFunctionStatementsError::Statements(
+                        SourceFunctionStatementsError::Unsupported(
+                            SourceFunctionStatementsUnsupported::Syntax {
+                                role: SourceFunctionStatementsRole::Condition,
+                                ..
+                            },
+                        ),
+                    )),
+                ),
+                "unexpectedly accepted {condition}",
+            );
         }
     }
 

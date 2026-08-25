@@ -39,10 +39,10 @@
 //! top-level literal addition chains, direct top-level and function-local
 //! conditional initializers, required own-property reads (including exact
 //! two-constituent declared unions), direct indexed reads over supported
-//! objects, arrays, and strings, strict direct-identifier `typeof` flow and
-//! guard-return checks, and direct simple or arithmetic compound assignments
-//! to supported mutable declarations or binder-authenticated `CommonJS`
-//! exports and function or arrow expandos.
+//! objects, arrays, and strings, direct-identifier `typeof`, nullable equality,
+//! and declared-discriminant flow and guard-return checks, and direct simple or
+//! arithmetic compound assignments to supported mutable declarations or
+//! binder-authenticated `CommonJS` exports and function or arrow expandos.
 //! Option-gated unused-local, unused-parameter, and unused-import diagnostics
 //! run after complete source value and reference publication.
 //! The complete source tree and complete supported-statement plan are validated
@@ -174,8 +174,8 @@ use super::{
         execute_top_level_enum, plan_local_const_enum, plan_local_enum, plan_top_level_enum,
     },
     source_flow::{
-        SourceFlowAssignment, SourceFlowCondition, SourceFlowError, SourceFlowFrame,
-        SourceFlowInvariant, SourceFlowParameterAssignment, SourceFlowPlan,
+        SourceEqualityCondition, SourceFlowAssignment, SourceFlowCondition, SourceFlowError,
+        SourceFlowFrame, SourceFlowInvariant, SourceFlowParameterAssignment, SourceFlowPlan,
         SourceTruthinessCondition, SourceTypeofComparison, SourceTypeofCondition, SourceTypeofTag,
         narrow_by_typeof, source_block_scoped_use_before_declaration,
         source_typeof_narrowing_type_is_supported,
@@ -223,17 +223,18 @@ use super::{
     },
     source_statements::{
         SourceConditionalEnumFunctionStatementsSyntax, SourceControlIfSyntax,
-        SourceControlLoopKind, SourceControlLoopSyntax, SourceFallthroughBranchSyntax,
-        SourceForInStatementSyntax, SourceForOfStatementSyntax, SourceFunctionStatementsError,
-        SourceFunctionStatementsInvariant, SourceFunctionStatementsSyntax,
-        SourceJoinedFunctionStatementsError, SourceJoinedFunctionStatementsInvariant,
-        SourceJoinedFunctionStatementsSyntax, SourceLinearFunctionStatementSyntax,
-        SourceLinearFunctionStatementsSyntax, SourceLocalDeclarationSyntax,
-        SourceLoopFunctionStatementSyntax, SourceLoopFunctionStatementsSyntax,
-        SourceReturnBranchSyntax, SourceSwitchFunctionStatementsSyntax,
-        SourceTypeofConditionSyntax, SourceTypeofSwitchFunctionStatementsSyntax,
-        SourceUnusedIterationDeclarationKind, SourceUnusedIterationStatementSyntax,
-        SourceVoidSwitchCallSyntax, SourceVoidSwitchFunctionStatementsSyntax,
+        SourceControlLoopKind, SourceControlLoopSyntax, SourceEqualityConditionSyntax,
+        SourceFallthroughBranchSyntax, SourceForInStatementSyntax, SourceForOfStatementSyntax,
+        SourceFunctionStatementsError, SourceFunctionStatementsInvariant,
+        SourceFunctionStatementsSyntax, SourceJoinedFunctionStatementsError,
+        SourceJoinedFunctionStatementsInvariant, SourceJoinedFunctionStatementsSyntax,
+        SourceLinearFunctionStatementSyntax, SourceLinearFunctionStatementsSyntax,
+        SourceLocalDeclarationSyntax, SourceLoopFunctionStatementSyntax,
+        SourceLoopFunctionStatementsSyntax, SourceReturnBranchSyntax,
+        SourceSwitchFunctionStatementsSyntax, SourceTypeofConditionSyntax,
+        SourceTypeofSwitchFunctionStatementsSyntax, SourceUnusedIterationDeclarationKind,
+        SourceUnusedIterationStatementSyntax, SourceVoidSwitchCallSyntax,
+        SourceVoidSwitchFunctionStatementsSyntax,
         plan_source_conditional_enum_function_statements_syntax, plan_source_control_if_syntax,
         plan_source_control_loop_syntax, plan_source_for_in_statement_syntax,
         plan_source_for_of_statement_syntax, plan_source_function_for_in_statement_syntax,
@@ -1261,6 +1262,7 @@ enum PlannedSourceCondition {
         symbol: SemanticSymbolId,
     },
     Typeof(Box<PlannedTypeofCondition>),
+    Equality(Box<PlannedEqualityCondition>),
 }
 
 #[derive(Clone, Debug)]
@@ -1275,11 +1277,26 @@ struct PlannedTypeofCondition {
     symbol: SemanticSymbolId,
 }
 
+#[derive(Clone, Debug)]
+struct PlannedEqualityCondition {
+    expression: NodeRef,
+    operand: PlannedExpression,
+    identifier: NodeRef,
+    operator: NodeRef,
+    value: PlannedExpression,
+    comparison: SourceTypeofComparison,
+    strict: bool,
+    operand_on_left: bool,
+    discriminant: Option<NodeRef>,
+    symbol: SemanticSymbolId,
+}
+
 impl PlannedSourceCondition {
     fn flow_point(&self) -> NodeRef {
         match self {
             Self::Truthiness { expression, .. } => expression.unparenthesized().node,
             Self::Typeof(condition) => condition.identifier.node,
+            Self::Equality(condition) => condition.identifier,
         }
     }
 
@@ -1296,6 +1313,14 @@ impl PlannedSourceCondition {
                 symbol: condition.symbol,
                 tag: condition.tag,
                 comparison: condition.comparison,
+            }),
+            Self::Equality(condition) => SourceFlowCondition::Equality(SourceEqualityCondition {
+                expression: condition.expression,
+                symbol: condition.symbol,
+                value: condition.value.node,
+                comparison: condition.comparison,
+                strict: condition.strict,
+                discriminant: condition.discriminant,
             }),
         }
     }
@@ -7847,7 +7872,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             type_of_on_left,
         };
         let PlannedSourceCondition::Typeof(condition) =
-            self.finish_source_condition(callable, expression, identifier, Some(syntax))?
+            self.finish_source_condition(callable, expression, identifier, Some(syntax), None)?
         else {
             return Err(Self::unsupported_function_body(callable));
         };
@@ -9393,6 +9418,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             final_if.condition,
             final_if.condition_identifier,
             final_if.typeof_condition,
+            final_if.equality_condition,
         )?;
 
         let then_branch = self.finish_return_branch(final_if.then_branch)?;
@@ -9441,7 +9467,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         expression: NodeRef,
         identifier: NodeRef,
         typeof_syntax: Option<SourceTypeofConditionSyntax>,
+        equality_syntax: Option<SourceEqualityConditionSyntax>,
     ) -> Result<PlannedSourceCondition, SourceCheckError> {
+        if typeof_syntax.is_some() && equality_syntax.is_some() {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(callable.declaration),
+            ));
+        }
+        if let Some(equality) = equality_syntax {
+            return self.finish_equality_condition(callable, expression, identifier, equality);
+        }
         let Some(typeof_syntax) = typeof_syntax else {
             let expression = self.plan_expression(expression)?;
             let symbol = match &expression.unparenthesized().kind {
@@ -9520,6 +9555,100 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         )))
     }
 
+    fn finish_equality_condition(
+        &mut self,
+        callable: &SourceCallablePlan,
+        expression: NodeRef,
+        identifier: NodeRef,
+        syntax: SourceEqualityConditionSyntax,
+    ) -> Result<PlannedSourceCondition, SourceCheckError> {
+        if syntax.identifier != identifier
+            || syntax.operand == syntax.value
+            || syntax
+                .discriminant
+                .is_some_and(|access| access != syntax.operand)
+        {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(callable.declaration),
+            ));
+        }
+        let operator_text = match (syntax.comparison, syntax.strict) {
+            (SourceTypeofComparison::Equal, true) => "===",
+            (SourceTypeofComparison::NotEqual, true) => "!==",
+            (SourceTypeofComparison::Equal, false) => "==",
+            (SourceTypeofComparison::NotEqual, false) => "!=",
+        };
+        if !self.source_spelling_matches(syntax.operator, operator_text) {
+            return Err(SourceCheckError::LogicalOperator(syntax.operator));
+        }
+
+        let operand = self.plan_expression(syntax.operand)?;
+        let symbol = match (&operand.kind, syntax.discriminant) {
+            (PlannedExpressionKind::Identifier(read), None)
+                if operand.node == identifier
+                    && read.kind == PlannedIdentifierReadKind::Variable =>
+            {
+                read.value_symbol
+            }
+            (PlannedExpressionKind::Property(property), Some(access))
+                if property.node == access =>
+            {
+                match &property.receiver.kind {
+                    PlannedExpressionKind::Identifier(read)
+                        if property.receiver.node == identifier
+                            && read.kind == PlannedIdentifierReadKind::Variable =>
+                    {
+                        read.value_symbol
+                    }
+                    _ => return Err(Self::unsupported_function_body(callable)),
+                }
+            }
+            _ => return Err(Self::unsupported_function_body(callable)),
+        };
+        let value = self.plan_expression(syntax.value)?;
+        if !matches!(
+            &value.kind,
+            PlannedExpressionKind::Null
+                | PlannedExpressionKind::GlobalUndefined
+                | PlannedExpressionKind::String(_)
+                | PlannedExpressionKind::Number { .. }
+                | PlannedExpressionKind::BigInt { .. }
+                | PlannedExpressionKind::Boolean(_)
+        ) || !syntax.strict
+            && !matches!(
+                &value.kind,
+                PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined
+            )
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let Some((store, _)) = self.semantic else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let boolean = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.boolean_type)
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        preflight_source_expression_cache(store, expression, boolean)?;
+
+        Ok(PlannedSourceCondition::Equality(Box::new(
+            PlannedEqualityCondition {
+                expression,
+                operand,
+                identifier,
+                operator: syntax.operator,
+                value,
+                comparison: syntax.comparison,
+                strict: syntax.strict,
+                operand_on_left: syntax.operand_on_left,
+                discriminant: syntax.discriminant,
+                symbol,
+            },
+        )))
+    }
+
     fn unsupported_function_body(callable: &SourceCallablePlan) -> SourceCheckError {
         SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
             SourceFunctionUnsupported::FunctionBody(callable.body),
@@ -9577,6 +9706,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             joined_if.condition,
             joined_if.condition_identifier,
             joined_if.typeof_condition,
+            joined_if.equality_condition,
         )?;
 
         let then_branch = self.finish_fallthrough_branch(joined_if.then_branch)?;
@@ -18836,6 +18966,19 @@ fn preflight_inferred_function_return_dependencies(
                             functions,
                         )
                     }
+                    PlannedSourceCondition::Equality(condition) => {
+                        expression_is_closed(
+                            &condition.operand,
+                            &function.callable.parameters,
+                            &locals,
+                            functions,
+                        ) && expression_is_closed(
+                            &condition.value,
+                            &function.callable.parameters,
+                            &locals,
+                            functions,
+                        )
+                    }
                 } && [&statements.then_branch, &statements.else_branch]
                     .into_iter()
                     .all(|branch| {
@@ -27056,6 +27199,20 @@ fn check_planned_source_condition(
             callable,
             condition,
         ),
+        PlannedSourceCondition::Equality(condition) => check_planned_equality_condition(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            frame,
+            preflighted_type_import_value_uses,
+            deferred,
+            callable,
+            condition,
+        ),
     }
 }
 
@@ -27321,6 +27478,128 @@ fn check_planned_typeof_return(
     }
     publish_expression_type(store, condition.expression, boolean_type)?;
     Ok(boolean_type)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_planned_equality_condition(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    frame: &mut SourceFlowFrame<'_, '_>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    condition: &PlannedEqualityCondition,
+) -> Result<(), SourceCheckError> {
+    let condition_flow = frame
+        .snapshot_at(store, global_types, condition.identifier)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    let current = condition_flow
+        .type_of(condition.symbol)
+        .ok_or(SourceCheckError::Variable(
+            VariableInvariant::MissingCurrentFlowType(condition.symbol),
+        ))?;
+    let operator = match (condition.comparison, condition.strict) {
+        (SourceTypeofComparison::Equal, true) => SyntaxKind::EqualsEqualsEqualsToken,
+        (SourceTypeofComparison::NotEqual, true) => SyntaxKind::ExclamationEqualsEqualsToken,
+        (SourceTypeofComparison::Equal, false) => SyntaxKind::EqualsEqualsToken,
+        (SourceTypeofComparison::NotEqual, false) => SyntaxKind::ExclamationEqualsToken,
+    };
+    if host
+        .node(condition.operator)
+        .is_none_or(|record| record.kind != operator)
+    {
+        return Err(SourceCheckError::LogicalOperator(condition.operator));
+    }
+
+    let expressions = if condition.operand_on_left {
+        [&condition.operand, &condition.value]
+    } else {
+        [&condition.value, &condition.operand]
+    };
+    let mut checked = Vec::with_capacity(expressions.len());
+    for expression in expressions {
+        let result = check_expression_type(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            condition_flow.types(),
+            preflighted_type_import_value_uses,
+            expression,
+            None,
+            deferred,
+        )?;
+        if expression.node == condition.operand.node {
+            let identifier_type = if condition.discriminant.is_some() {
+                store
+                    .type_node_links(condition.identifier)
+                    .and_then(|links| links.resolved_type)
+            } else {
+                Some(result.raw)
+            };
+            if identifier_type != Some(current)
+                || condition.discriminant.is_some_and(|access| {
+                    store
+                        .symbol_node_links(access)
+                        .and_then(|links| links.resolved_symbol)
+                        .is_none()
+                })
+            {
+                return Err(SourceCheckError::Function(
+                    SourceFunctionInvariant::Callable(callable.declaration),
+                ));
+            }
+        }
+        checked.push(result);
+    }
+
+    let [left, right] = checked.as_slice() else {
+        unreachable!("an authenticated equality condition has exactly two operands")
+    };
+    match check_primitive_binary(
+        store,
+        PrimitiveBinaryRequest {
+            expression: condition.expression,
+            left: expressions[0].node,
+            operator,
+            right: expressions[1].node,
+            left_type: left.result,
+            right_type: right.result,
+            left_recovery: left.primitive_binary_recovery,
+            right_recovery: right.primitive_binary_recovery,
+            bigint_exponentiation_target: PrimitiveBigIntExponentiationTarget::Unknown,
+        },
+    ) {
+        Ok(resolution) => {
+            for diagnostic in resolution.diagnostics {
+                merge_retry_diagnostic(diagnostics, diagnostic);
+            }
+        }
+        Err(PrimitiveBinaryError::Unsupported(PrimitiveBinaryUnsupported::Operand { .. })) => {}
+        Err(error) => {
+            return Err(primitive_binary_check_error(
+                host,
+                condition.expression,
+                &error,
+            ));
+        }
+    }
+
+    let boolean = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.boolean_type)
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    publish_expression_type(store, condition.expression, boolean)
 }
 
 fn source_truthiness_condition_type_is_supported(

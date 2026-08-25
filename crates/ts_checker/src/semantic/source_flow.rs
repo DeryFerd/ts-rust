@@ -1,12 +1,13 @@
 //! Invocation-local control-flow snapshots for source checking.
 //!
-//! This slice accepts the flow chains needed by direct identifier truthiness
-//! and strict `typeof` comparisons: function `START`, initialized local and
-//! authenticated parameter `ASSIGNMENT` nodes, approved `CALL` nodes,
-//! condition edges, unreachable nodes, ordered branch joins, and cyclic loop
-//! labels. Authenticated declaration-order queries also retain the exact
-//! block-scoped, class, and enum diagnostics. Other mutation expressions and
-//! switch-clause narrowing remain typed capability boundaries.
+//! This slice accepts the flow chains needed by direct identifier truthiness,
+//! strict `typeof` comparisons, nullable equality, and declared discriminants:
+//! function `START`, initialized local and authenticated parameter `ASSIGNMENT`
+//! nodes, approved `CALL` nodes, condition edges, unreachable nodes, ordered
+//! branch joins, and cyclic loop labels. Authenticated declaration-order queries
+//! also retain the exact block-scoped, class, and enum diagnostics. Other
+//! mutation expressions and switch-clause narrowing remain typed capability
+//! boundaries.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -21,10 +22,10 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
-    CanonicalTypeMapperStore, TypeId,
+    CanonicalTypeMapperStore, RelationUnavailable, TypeId,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     logical_operators::{LogicalBinaryError, TruthinessAssumption, narrow_by_truthiness},
-    type_records::{TypeData, TypeRecord},
+    type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -100,11 +101,23 @@ pub(super) struct SourceTypeofCondition {
     pub(super) comparison: SourceTypeofComparison,
 }
 
+/// One authenticated equality condition over a value or discriminant property.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceEqualityCondition {
+    pub(super) expression: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) value: NodeRef,
+    pub(super) comparison: SourceTypeofComparison,
+    pub(super) strict: bool,
+    pub(super) discriminant: Option<NodeRef>,
+}
+
 /// One cold-proven condition executable by the invocation-local flow frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceFlowCondition {
     Truthiness(SourceTruthinessCondition),
     Typeof(SourceTypeofCondition),
+    Equality(SourceEqualityCondition),
 }
 
 impl SourceFlowCondition {
@@ -112,6 +125,7 @@ impl SourceFlowCondition {
         match self {
             Self::Truthiness(condition) => condition.expression,
             Self::Typeof(condition) => condition.expression,
+            Self::Equality(condition) => condition.expression,
         }
     }
 
@@ -119,6 +133,7 @@ impl SourceFlowCondition {
         match self {
             Self::Truthiness(condition) => condition.symbol,
             Self::Typeof(condition) => condition.symbol,
+            Self::Equality(condition) => condition.symbol,
         }
     }
 }
@@ -213,6 +228,7 @@ pub(super) enum SourceFlowInvariant {
     AssignmentAlreadyCompleted(NodeRef),
     MissingCurrentType(SemanticSymbolId),
     TypeofNarrowing(SourceTypeofNarrowingError),
+    EqualityNarrowing(SourceEqualityNarrowingError),
     Cycle(FlowRef),
     DepthLimit(FlowRef),
 }
@@ -240,6 +256,18 @@ pub(super) enum SourceTypeofNarrowingError {
     InvalidUnion(TypeId),
     CyclicUnion(TypeId),
     UnsupportedType(TypeId),
+    Union(LiteralTypeCacheError),
+}
+
+/// Invalid equality operands or unavailable authenticated discriminant values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceEqualityNarrowingError {
+    MissingBootstrap,
+    InvalidType(TypeId),
+    MissingValue(NodeRef),
+    InvalidDiscriminant(NodeRef),
+    UnsupportedType(TypeId),
+    Relation(RelationUnavailable),
     Union(LiteralTypeCacheError),
 }
 
@@ -1128,6 +1156,53 @@ impl SourceFlowFrame<'_, '_> {
                             SourceFlowError::Invariant(SourceFlowInvariant::TypeofNarrowing(error))
                         }
                     })?,
+                    SourceFlowCondition::Equality(condition) => {
+                        let value = store
+                            .type_node_links(condition.value)
+                            .and_then(|links| links.resolved_type)
+                            .ok_or_else(|| {
+                                SourceFlowError::Invariant(SourceFlowInvariant::EqualityNarrowing(
+                                    SourceEqualityNarrowingError::MissingValue(condition.value),
+                                ))
+                            })?;
+                        let discriminant = condition
+                            .discriminant
+                            .map(|access| {
+                                store
+                                    .symbol_node_links(access)
+                                    .and_then(|links| links.resolved_symbol)
+                                    .and_then(|symbol| store.symbol(symbol))
+                                    .and_then(|symbol| symbol.name().as_utf8())
+                                    .map(str::to_owned)
+                                    .ok_or(SourceEqualityNarrowingError::InvalidDiscriminant(
+                                        access,
+                                    ))
+                            })
+                            .transpose()
+                            .map_err(|error| {
+                                SourceFlowError::Invariant(SourceFlowInvariant::EqualityNarrowing(
+                                    error,
+                                ))
+                            })?;
+                        narrow_by_equality(
+                            store,
+                            globals,
+                            current,
+                            value,
+                            condition.strict,
+                            assume_true
+                                == matches!(condition.comparison, SourceTypeofComparison::Equal),
+                            discriminant.as_deref(),
+                        )
+                        .map_err(|error| match error {
+                            SourceEqualityNarrowingError::Union(error) => {
+                                SourceFlowError::Join { flow, error }
+                            }
+                            error => SourceFlowError::Invariant(
+                                SourceFlowInvariant::EqualityNarrowing(error),
+                            ),
+                        })?
+                    }
                 };
                 Ok(prior.with_type(condition.symbol(), narrowed))
             }
@@ -1359,6 +1434,378 @@ pub(super) fn narrow_by_typeof(
     store
         .expression_union_type_with_global_types(globals, &retained, UnionReduction::Literal)
         .map_err(SourceTypeofNarrowingError::Union)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceEqualityValueKind {
+    Null,
+    Undefined,
+    Literal(TypeId),
+}
+
+/// Narrows exact nullable or literal comparisons without synthesizing facts.
+pub(super) fn narrow_by_equality(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    input: TypeId,
+    value: TypeId,
+    strict: bool,
+    require_match: bool,
+    discriminant: Option<&str>,
+) -> Result<TypeId, SourceEqualityNarrowingError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceEqualityNarrowingError::MissingBootstrap)?;
+    let (any, unknown, non_nullable, undefined, null, never, strict_null_checks) = (
+        bootstrap.any_type,
+        bootstrap.unknown_type,
+        bootstrap.unknown_empty_object_type,
+        bootstrap.undefined_type,
+        bootstrap.null_type,
+        bootstrap.never_type,
+        bootstrap.options.strict_null_checks,
+    );
+    let value_kind = source_equality_value_kind(store, value)?;
+    if !strict_null_checks
+        && matches!(
+            value_kind,
+            SourceEqualityValueKind::Null | SourceEqualityValueKind::Undefined
+        )
+    {
+        return Ok(input);
+    }
+    if !strict && matches!(value_kind, SourceEqualityValueKind::Literal(_)) {
+        return Err(SourceEqualityNarrowingError::UnsupportedType(value));
+    }
+
+    let mut leaves = Vec::new();
+    collect_source_equality_leaves(store, input, &mut leaves, &mut HashSet::new())?;
+    let mut retained = Vec::with_capacity(leaves.len());
+    for leaf in &leaves {
+        let flags = store
+            .type_payload(*leaf)
+            .map(TypeRecord::flags)
+            .ok_or(SourceEqualityNarrowingError::InvalidType(*leaf))?;
+        if flags.intersects(TypeFlags::NEVER) {
+            retained.push(*leaf);
+            continue;
+        }
+        if *leaf == any {
+            retained.push(*leaf);
+            continue;
+        }
+        if flags.intersects(TypeFlags::ANY) {
+            return Err(SourceEqualityNarrowingError::UnsupportedType(*leaf));
+        }
+
+        if let Some(name) = discriminant {
+            if !flags.intersects(TypeFlags::OBJECT) {
+                return Err(SourceEqualityNarrowingError::UnsupportedType(*leaf));
+            }
+            let property = store
+                .resolved_own_property(*leaf, name)
+                .map_err(SourceEqualityNarrowingError::Relation)?
+                .ok_or(SourceEqualityNarrowingError::UnsupportedType(*leaf))?;
+            let property_type = if property.optional && strict_null_checks {
+                store
+                    .expression_union_type_with_global_types(
+                        globals,
+                        &[property.type_, undefined],
+                        UnionReduction::Literal,
+                    )
+                    .map_err(SourceEqualityNarrowingError::Union)?
+            } else {
+                property.type_
+            };
+            let narrowed = narrow_by_equality(
+                store,
+                globals,
+                property_type,
+                value,
+                strict,
+                require_match,
+                None,
+            )?;
+            if narrowed != never {
+                retained.push(*leaf);
+            }
+            continue;
+        }
+
+        if *leaf == unknown {
+            match value_kind {
+                SourceEqualityValueKind::Null | SourceEqualityValueKind::Undefined => {
+                    if require_match {
+                        if strict {
+                            retained.push(if value_kind == SourceEqualityValueKind::Null {
+                                null
+                            } else {
+                                undefined
+                            });
+                        } else {
+                            retained.extend([null, undefined]);
+                        }
+                    } else if strict {
+                        retained.push(non_nullable);
+                        retained.push(if value_kind == SourceEqualityValueKind::Null {
+                            undefined
+                        } else {
+                            null
+                        });
+                    } else {
+                        retained.push(non_nullable);
+                    }
+                }
+                SourceEqualityValueKind::Literal(literal) if require_match => {
+                    retained.push(literal);
+                }
+                SourceEqualityValueKind::Literal(_) => retained.push(*leaf),
+            }
+            continue;
+        }
+        if *leaf == non_nullable {
+            match value_kind {
+                SourceEqualityValueKind::Null | SourceEqualityValueKind::Undefined => {
+                    if !require_match {
+                        retained.push(*leaf);
+                    }
+                }
+                SourceEqualityValueKind::Literal(literal) if require_match => {
+                    retained.push(literal);
+                }
+                SourceEqualityValueKind::Literal(_) => retained.push(*leaf),
+            }
+            continue;
+        }
+
+        let matched = match value_kind {
+            SourceEqualityValueKind::Null => {
+                if strict {
+                    flags.intersects(TypeFlags::NULL)
+                } else {
+                    flags.intersects(TypeFlags::NULL | TypeFlags::VOID_LIKE)
+                }
+            }
+            SourceEqualityValueKind::Undefined => {
+                if strict {
+                    flags.intersects(TypeFlags::VOID_LIKE)
+                } else {
+                    flags.intersects(TypeFlags::NULL | TypeFlags::VOID_LIKE)
+                }
+            }
+            SourceEqualityValueKind::Literal(literal) => {
+                source_equality_literal_matches(store, globals, *leaf, literal)?
+            }
+        };
+        if matches!(value_kind, SourceEqualityValueKind::Literal(_))
+            && !require_match
+            && matched
+            && !source_equality_is_unit_like(store, *leaf)?
+        {
+            retained.push(*leaf);
+            continue;
+        }
+        if matched != require_match {
+            continue;
+        }
+        let narrowed = match value_kind {
+            SourceEqualityValueKind::Undefined
+                if require_match && strict && flags.intersects(TypeFlags::VOID) =>
+            {
+                undefined
+            }
+            SourceEqualityValueKind::Literal(literal)
+                if require_match && source_equality_is_wide_primitive(flags) =>
+            {
+                literal
+            }
+            _ => *leaf,
+        };
+        if !retained.contains(&narrowed) {
+            retained.push(narrowed);
+        }
+    }
+
+    if retained == leaves {
+        return Ok(input);
+    }
+    match retained.as_slice() {
+        [] => Ok(never),
+        [only] => Ok(*only),
+        _ => store
+            .expression_union_type_with_global_types(globals, &retained, UnionReduction::Literal)
+            .map_err(SourceEqualityNarrowingError::Union),
+    }
+}
+
+fn source_equality_value_kind(
+    store: &CanonicalTypeMapperStore,
+    value: TypeId,
+) -> Result<SourceEqualityValueKind, SourceEqualityNarrowingError> {
+    let record = store
+        .type_payload(value)
+        .ok_or(SourceEqualityNarrowingError::InvalidType(value))?;
+    let flags = record.flags();
+    if flags.intersects(TypeFlags::NULL) {
+        return Ok(SourceEqualityValueKind::Null);
+    }
+    if flags.intersects(TypeFlags::VOID_LIKE) {
+        return Ok(SourceEqualityValueKind::Undefined);
+    }
+    let TypeData::Literal(literal) = record.data() else {
+        return Err(SourceEqualityNarrowingError::UnsupportedType(value));
+    };
+    if !flags.intersects(
+        TypeFlags::STRING_LITERAL
+            | TypeFlags::NUMBER_LITERAL
+            | TypeFlags::BOOLEAN_LITERAL
+            | TypeFlags::BIG_INT_LITERAL,
+    ) {
+        return Err(SourceEqualityNarrowingError::UnsupportedType(value));
+    }
+    let regular = store
+        .type_payload(literal.regular_type)
+        .ok_or(SourceEqualityNarrowingError::InvalidType(value))?;
+    if !matches!(regular.data(), TypeData::Literal(regular) if regular.value == literal.value) {
+        return Err(SourceEqualityNarrowingError::InvalidType(value));
+    }
+    Ok(SourceEqualityValueKind::Literal(literal.regular_type))
+}
+
+fn collect_source_equality_leaves(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    leaves: &mut Vec<TypeId>,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<(), SourceEqualityNarrowingError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(SourceEqualityNarrowingError::InvalidType(type_))?;
+    if !record.flags().intersects(TypeFlags::UNION) {
+        if matches!(record.data(), TypeData::Union(_)) {
+            return Err(SourceEqualityNarrowingError::InvalidType(type_));
+        }
+        leaves.push(type_);
+        return Ok(());
+    }
+    if !visiting.insert(type_) {
+        return Err(SourceEqualityNarrowingError::InvalidType(type_));
+    }
+    let TypeData::Union(union) = record.data() else {
+        return Err(SourceEqualityNarrowingError::InvalidType(type_));
+    };
+    for constituent in &union.union.types {
+        collect_source_equality_leaves(store, *constituent, leaves, visiting)?;
+    }
+    visiting.remove(&type_);
+    Ok(())
+}
+
+fn source_equality_is_wide_primitive(flags: TypeFlags) -> bool {
+    flags
+        .intersects(TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::BIG_INT | TypeFlags::BOOLEAN)
+        && !flags.intersects(
+            TypeFlags::STRING_LITERAL
+                | TypeFlags::NUMBER_LITERAL
+                | TypeFlags::BOOLEAN_LITERAL
+                | TypeFlags::BIG_INT_LITERAL,
+        )
+}
+
+fn source_equality_is_unit_like(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<bool, SourceEqualityNarrowingError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(SourceEqualityNarrowingError::InvalidType(type_))?;
+    match record.data() {
+        TypeData::Literal(_) => Ok(true),
+        TypeData::Intersection(intersection) => {
+            intersection
+                .intersection
+                .types
+                .iter()
+                .try_fold(false, |found, constituent| {
+                    store
+                        .type_payload(*constituent)
+                        .map(|record| found || matches!(record.data(), TypeData::Literal(_)))
+                        .ok_or(SourceEqualityNarrowingError::InvalidType(*constituent))
+                })
+        }
+        _ => Ok(false),
+    }
+}
+
+fn source_equality_literal_matches(
+    store: &CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    candidate: TypeId,
+    expected: TypeId,
+) -> Result<bool, SourceEqualityNarrowingError> {
+    let candidate_record = store
+        .type_payload(candidate)
+        .ok_or(SourceEqualityNarrowingError::InvalidType(candidate))?;
+    let expected_record = store
+        .type_payload(expected)
+        .ok_or(SourceEqualityNarrowingError::InvalidType(expected))?;
+    let expected_flags = expected_record.flags();
+    if let TypeData::Literal(actual) = candidate_record.data() {
+        let TypeData::Literal(wanted) = expected_record.data() else {
+            return Err(SourceEqualityNarrowingError::InvalidType(expected));
+        };
+        return Ok(actual.value == wanted.value);
+    }
+    let candidate_flags = candidate_record.flags();
+    if candidate_flags.intersects(TypeFlags::INTERSECTION) {
+        let tag = match expected_record.data() {
+            TypeData::Literal(literal) => match &literal.value {
+                LiteralValue::String(_) => SourceTypeofTag::String,
+                LiteralValue::Number(_) => SourceTypeofTag::Number,
+                LiteralValue::Boolean(_) => SourceTypeofTag::Boolean,
+                LiteralValue::BigInt(_) => SourceTypeofTag::BigInt,
+                LiteralValue::ComputedEnum => {
+                    return Err(SourceEqualityNarrowingError::UnsupportedType(expected));
+                }
+            },
+            _ => return Err(SourceEqualityNarrowingError::InvalidType(expected)),
+        };
+        let SourceTypeofLeafMatch::Exact(matches) =
+            source_typeof_branded_intersection_matches(store, globals, candidate, tag)
+                .map_err(|_| SourceEqualityNarrowingError::UnsupportedType(candidate))?
+        else {
+            return Err(SourceEqualityNarrowingError::UnsupportedType(candidate));
+        };
+        if !matches {
+            return Ok(false);
+        }
+        let TypeData::Intersection(intersection) = candidate_record.data() else {
+            return Err(SourceEqualityNarrowingError::InvalidType(candidate));
+        };
+        let primitive = intersection
+            .intersection
+            .types
+            .iter()
+            .find_map(|constituent| {
+                store
+                    .type_payload(*constituent)
+                    .and_then(|record| match record.data() {
+                        TypeData::Literal(literal) => Some(&literal.value),
+                        _ => None,
+                    })
+            });
+        return Ok(primitive.is_none_or(|actual| {
+            matches!(expected_record.data(), TypeData::Literal(wanted) if *actual == wanted.value)
+        }));
+    }
+    Ok(candidate_flags.intersects(TypeFlags::STRING_LIKE)
+        && expected_flags.intersects(TypeFlags::STRING_LITERAL)
+        || candidate_flags.intersects(TypeFlags::NUMBER_LIKE)
+            && expected_flags.intersects(TypeFlags::NUMBER_LITERAL)
+        || candidate_flags.intersects(TypeFlags::BOOLEAN_LIKE)
+            && expected_flags.intersects(TypeFlags::BOOLEAN_LITERAL)
+        || candidate_flags.intersects(TypeFlags::BIG_INT_LIKE)
+            && expected_flags.intersects(TypeFlags::BIG_INT_LITERAL))
 }
 
 fn append_narrowed_source_typeof_top(
@@ -2490,6 +2937,537 @@ mod tests {
                 Err(SourceTypeofNarrowingError::UnsupportedType(unsupported)),
             );
         }
+    }
+
+    #[test]
+    fn equality_narrowing_distinguishes_strict_and_loose_nullish_facts() {
+        let parsed =
+            parse_source_file("function narrow(value: unknown): unknown { return value; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_430);
+        let mut context = loop_context(&parsed, file);
+        let globals = context.global_types().clone();
+        let (any, unknown, non_nullable, undefined, null, string, never) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.any_type,
+                bootstrap.unknown_type,
+                bootstrap.unknown_empty_object_type,
+                bootstrap.undefined_type,
+                bootstrap.null_type,
+                bootstrap.string_type,
+                bootstrap.never_type,
+            )
+        };
+        let nullable = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[string, null, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let string_or_undefined = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[string, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let string_or_null = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[string, null],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let null_or_undefined = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[null, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let unknown_without_null = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[non_nullable, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let unknown_without_undefined = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[non_nullable, null],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+
+        for (input, value, strict, require_match, expected) in [
+            (nullable, null, true, true, null),
+            (nullable, null, true, false, string_or_undefined),
+            (nullable, undefined, true, true, undefined),
+            (nullable, undefined, true, false, string_or_null),
+            (nullable, null, false, true, null_or_undefined),
+            (nullable, null, false, false, string),
+            (nullable, undefined, false, true, null_or_undefined),
+            (nullable, undefined, false, false, string),
+            (unknown, null, true, true, null),
+            (unknown, null, true, false, unknown_without_null),
+            (unknown, undefined, true, true, undefined),
+            (unknown, undefined, true, false, unknown_without_undefined),
+            (unknown, null, false, true, null_or_undefined),
+            (unknown, null, false, false, non_nullable),
+            (non_nullable, null, true, true, never),
+            (non_nullable, null, true, false, non_nullable),
+            (any, null, true, true, any),
+            (any, undefined, false, false, any),
+        ] {
+            assert_eq!(
+                narrow_by_equality(
+                    context.store_mut_for_test(),
+                    &globals,
+                    input,
+                    value,
+                    strict,
+                    require_match,
+                    None,
+                ),
+                Ok(expected),
+            );
+            let warm = (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                narrow_by_equality(
+                    context.store_mut_for_test(),
+                    &globals,
+                    input,
+                    value,
+                    strict,
+                    require_match,
+                    None,
+                ),
+                Ok(expected),
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn equality_narrowing_filters_literals_without_removing_wide_primitives() {
+        let parsed =
+            parse_source_file("function narrow(value: unknown): unknown { return value; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_431);
+        let mut context = loop_context(&parsed, file);
+        let globals = context.global_types().clone();
+        let (unknown, string, number, boolean, regular_true, regular_false) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.unknown_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
+                bootstrap.regular_true_type,
+                bootstrap.regular_false_type,
+            )
+        };
+        let ready = context
+            .store_mut_for_test()
+            .regular_string_literal_type("ready".to_owned())
+            .unwrap();
+        let waiting = context
+            .store_mut_for_test()
+            .regular_string_literal_type("waiting".to_owned())
+            .unwrap();
+        let done = context
+            .store_mut_for_test()
+            .regular_string_literal_type("done".to_owned())
+            .unwrap();
+        let fresh_ready = context
+            .store_mut_for_test()
+            .fresh_type_of_literal_type(ready)
+            .unwrap();
+        let choices = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[ready, waiting, done],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let rejected = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[waiting, done],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let mixed = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[string, number],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+
+        for (input, value, require_match, expected) in [
+            (choices, fresh_ready, true, ready),
+            (choices, ready, false, rejected),
+            (string, ready, true, ready),
+            (string, ready, false, string),
+            (mixed, ready, true, ready),
+            (mixed, ready, false, mixed),
+            (unknown, ready, true, ready),
+            (unknown, ready, false, unknown),
+            (boolean, regular_true, true, regular_true),
+            (boolean, regular_true, false, regular_false),
+        ] {
+            assert_eq!(
+                narrow_by_equality(
+                    context.store_mut_for_test(),
+                    &globals,
+                    input,
+                    value,
+                    true,
+                    require_match,
+                    None,
+                ),
+                Ok(expected),
+            );
+            let warm = (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                narrow_by_equality(
+                    context.store_mut_for_test(),
+                    &globals,
+                    input,
+                    value,
+                    true,
+                    require_match,
+                    None,
+                ),
+                Ok(expected),
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+
+        assert_eq!(
+            narrow_by_equality(
+                context.store_mut_for_test(),
+                &globals,
+                choices,
+                ready,
+                false,
+                true,
+                None,
+            ),
+            Err(SourceEqualityNarrowingError::UnsupportedType(ready)),
+        );
+    }
+
+    #[test]
+    fn equality_narrowing_selects_authenticated_declared_union_members() {
+        let parsed = parse_source_file(concat!(
+            "type Choice = { kind: 'left'; value: string } | ",
+            "{ kind: 'right'; value: number };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_432);
+        let mut context = loop_context(&parsed, file);
+        let alias = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .and_then(|declaration| context.file(file).unwrap().1.symbol(declaration))
+            .unwrap();
+        let choice = context.get_declared_type_of_symbol(alias).unwrap();
+        let globals = context.global_types().clone();
+        let left = context
+            .store_mut_for_test()
+            .regular_string_literal_type("left".to_owned())
+            .unwrap();
+        let right = context
+            .store_mut_for_test()
+            .regular_string_literal_type("right".to_owned())
+            .unwrap();
+        let members = match context.store().type_payload(choice).unwrap().data() {
+            TypeData::Union(union) => union.union.types.clone(),
+            _ => panic!("expected a declared object union"),
+        };
+        let mut left_member = None;
+        let mut right_member = None;
+        for member in members {
+            let property = context
+                .store_mut_for_test()
+                .resolved_own_property(member, "kind")
+                .unwrap()
+                .unwrap();
+            if property.type_ == left {
+                left_member = Some(member);
+            } else if property.type_ == right {
+                right_member = Some(member);
+            }
+        }
+        let left_member = left_member.unwrap();
+        let right_member = right_member.unwrap();
+
+        for (value, require_match, expected) in [
+            (left, true, left_member),
+            (left, false, right_member),
+            (right, true, right_member),
+            (right, false, left_member),
+        ] {
+            assert_eq!(
+                narrow_by_equality(
+                    context.store_mut_for_test(),
+                    &globals,
+                    choice,
+                    value,
+                    true,
+                    require_match,
+                    Some("kind"),
+                ),
+                Ok(expected),
+            );
+            let warm = (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                narrow_by_equality(
+                    context.store_mut_for_test(),
+                    &globals,
+                    choice,
+                    value,
+                    true,
+                    require_match,
+                    Some("kind"),
+                ),
+                Ok(expected),
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn nullish_equality_conditions_narrow_final_and_joined_source_branches() {
+        let parsed = parse_source_file(concat!(
+            "function strict(value: string | null): string {\n",
+            "  if (value !== null) { return value; } else { return ''; }\n",
+            "}\n",
+            "function reversed(value: string | null): string {\n",
+            "  if (null === value) { return ''; } else { return value; }\n",
+            "}\n",
+            "function loose(value: string | null | undefined): string {\n",
+            "  if (value == null) { return ''; } else { return value; }\n",
+            "}\n",
+            "function joined(value: string | null | undefined): string | null | undefined {\n",
+            "  if (undefined != value) {\n",
+            "    const selected: string = value;\n",
+            "  } else {\n",
+            "    const rejected: null | undefined = value;\n",
+            "  }\n",
+            "  return value;\n",
+            "}\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_433);
+        let mut context = loop_context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let (string, boolean) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.boolean_type)
+        };
+        let return_reads = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::Identifier(identifier) = &record.data else {
+                    return None;
+                };
+                if identifier.text != "value" {
+                    return None;
+                }
+                let parent = parsed.arena.get(record.parent?)?;
+                matches!(&parent.data, NodeData::ReturnStatement(returned)
+                    if returned.expression == Some(node))
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .collect::<Vec<_>>();
+        let [strict, reversed, loose, _joined] = return_reads.as_slice() else {
+            panic!("expected one returned parameter in each function")
+        };
+        for node in [*strict, *reversed, *loose] {
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type),
+                Some(string),
+            );
+        }
+        for node in parsed.arena.iter().filter_map(|(node, record)| {
+            (record.kind == SyntaxKind::BinaryExpression).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        }) {
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type),
+                Some(boolean),
+            );
+        }
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn discriminated_equality_conditions_narrow_final_and_joined_source_branches() {
+        let parsed = parse_source_file(concat!(
+            "type Choice = { kind: 'left'; active: true; value: string } | ",
+            "{ kind: 'right'; active: false; value: number };\n",
+            "function choose(value: Choice): string | number {\n",
+            "  if (value.kind === 'left') {\n",
+            "    return value.value;\n",
+            "  } else {\n",
+            "    return value.value;\n",
+            "  }\n",
+            "}\n",
+            "function joined(value: Choice): Choice {\n",
+            "  if (false !== value.active) {\n",
+            "    const selected: string = value.value;\n",
+            "  } else {\n",
+            "    const rejected: number = value.value;\n",
+            "  }\n",
+            "  return value;\n",
+            "}\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_434);
+        let mut context = loop_context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let (string, number, boolean) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
+            )
+        };
+        let returns = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                if record.kind != SyntaxKind::PropertyAccessExpression {
+                    return None;
+                }
+                let parent = parsed.arena.get(record.parent?)?;
+                matches!(&parent.data, NodeData::ReturnStatement(returned)
+                    if returned.expression == Some(node))
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .collect::<Vec<_>>();
+        let [left, right] = returns.as_slice() else {
+            panic!("expected one property return from each discriminated branch")
+        };
+        for (node, expected) in [(*left, string), (*right, number)] {
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+            );
+        }
+        for node in parsed.arena.iter().filter_map(|(node, record)| {
+            (record.kind == SyntaxKind::BinaryExpression).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        }) {
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type),
+                Some(boolean),
+            );
+        }
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
     }
 
     #[test]
