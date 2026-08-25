@@ -405,7 +405,9 @@ fn prepare_expression(
     location: ExpressionLocation,
 ) -> Result<PreparedExpression, SourceCheckError> {
     let prepared = match &expression.kind {
-        PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined => {
+        PlannedExpressionKind::Null
+        | PlannedExpressionKind::GlobalUndefined
+        | PlannedExpressionKind::RegularExpression(_) => {
             PreparedExpression::Literal(LiteralTreatment::Identity)
         }
         PlannedExpressionKind::Identifier(read) => {

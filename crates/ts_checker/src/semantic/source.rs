@@ -709,6 +709,7 @@ impl LogicalBinaryPlan {
 pub(super) enum PlannedExpressionKind {
     Null,
     String(String),
+    RegularExpression(TypeId),
     Number {
         value: Number,
         unary_operand: Option<Number>,
@@ -2836,6 +2837,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         self.node(expression)?.kind,
                         SyntaxKind::Identifier
                             | SyntaxKind::StringLiteral
+                            | SyntaxKind::RegularExpressionLiteral
                             | SyntaxKind::PropertyAccessExpression
                             | SyntaxKind::NewExpression
                             | SyntaxKind::ParenthesizedExpression
@@ -12548,6 +12550,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     PlannedExpressionKind::String(value),
                 ))
             }
+            SyntaxKind::RegularExpressionLiteral => {
+                let type_ = self.plan_regular_expression_literal(expression)?;
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::RegularExpression(type_),
+                ))
+            }
             SyntaxKind::NoSubstitutionTemplateLiteral => {
                 let value = {
                     let node = self.node(expression)?;
@@ -14165,6 +14174,118 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
+    fn plan_regular_expression_literal(
+        &self,
+        literal: NodeRef,
+    ) -> Result<TypeId, SourceCheckError> {
+        let node = self.node(literal)?;
+        let NodeData::RegularExpressionLiteral(data) = &node.data else {
+            return Err(self.unsupported(
+                literal,
+                node.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        };
+        if node.flags.0 != 0 {
+            return Err(self.unsupported(
+                literal,
+                node.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+        if data.token_flags.0 != 0 {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::InvalidLiteralFlags(literal),
+            ));
+        }
+        if !data.text.starts_with('/') || !self.source_spelling_matches(literal, &data.text) {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::InvalidLiteralSpelling(literal),
+            ));
+        }
+
+        let unsupported = || {
+            self.unsupported(
+                literal,
+                SyntaxKind::RegularExpressionLiteral,
+                SourceSyntaxRole::VariableInitializer,
+            )
+        };
+        let (store, host) = self.semantic.ok_or_else(unsupported)?;
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        let globals = store
+            .symbol_table(bootstrap.globals)
+            .ok_or_else(unsupported)?;
+        let type_ = if let Some(raw_symbol) = globals.get_source("RegExp") {
+            let symbol = store
+                .get_merged_symbol(raw_symbol)
+                .ok_or_else(unsupported)?;
+            let owner = store.symbol(symbol).ok_or_else(unsupported)?;
+            if owner.name().as_utf8() != Some("RegExp")
+                || owner.parent().is_some()
+                || store.get_merged_symbol(symbol) != Some(symbol)
+            {
+                return Err(unsupported());
+            }
+            if !owner
+                .flags()
+                .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+            {
+                bootstrap.empty_object_type
+            } else {
+                let declarations = owner
+                    .declarations()
+                    .filter(|declarations| !declarations.is_empty())
+                    .ok_or_else(unsupported)?;
+                if !declarations.iter().all(|declaration| {
+                    host.symbol_matches(store, *declaration, symbol)
+                        && host.node(*declaration).is_some()
+                }) || !declarations.iter().any(|declaration| {
+                    matches!(
+                        host.node(*declaration).map(|node| (&node.kind, &node.data)),
+                        Some((SyntaxKind::ClassDeclaration, NodeData::ClassDeclaration(_)))
+                            | Some((
+                                SyntaxKind::InterfaceDeclaration,
+                                NodeData::InterfaceDeclaration(_)
+                            ))
+                    )
+                }) {
+                    return Err(unsupported());
+                }
+
+                let declared = store
+                    .declared_type_links(symbol)
+                    .and_then(|links| links.declared_type)
+                    .ok_or_else(unsupported)?;
+                if preflight_class_or_interface_reference(store, host, symbol, owner.flags())? != 0
+                {
+                    bootstrap.empty_object_type
+                } else {
+                    let record = store.type_payload(declared).ok_or_else(unsupported)?;
+                    if record.symbol() != Some(symbol)
+                        || !matches!(record.data(), TypeData::Interface(_))
+                    {
+                        return Err(unsupported());
+                    }
+                    declared
+                }
+            }
+        } else {
+            bootstrap.empty_object_type
+        };
+        if store.type_payload(type_).is_none() {
+            return Err(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::InvalidCachedLiteral(type_),
+            ));
+        }
+        preflight_source_expression_cache(store, literal, type_)?;
+        Ok(type_)
+    }
+
     fn plan_numeric_literal(&self, literal: NodeRef) -> Result<Number, SourceCheckError> {
         let node = self.node(literal)?;
         let NodeData::NumericLiteral(data) = &node.data else {
@@ -14919,6 +15040,7 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
                 && primitive_binary_operand_plan_is_supported(&logical.right)
         }
         PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::RegularExpression(_)
         | PlannedExpressionKind::Assertion { .. }
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
@@ -14950,6 +15072,7 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
             conditional_scalar_operand_plan_is_supported(&binary.right)
         }
         PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::RegularExpression(_)
         | PlannedExpressionKind::Assertion { .. }
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Property(_)
@@ -15217,6 +15340,7 @@ fn preflight_inferred_function_return_dependencies(
         match &expression.kind {
             PlannedExpressionKind::Null
             | PlannedExpressionKind::String(_)
+            | PlannedExpressionKind::RegularExpression(_)
             | PlannedExpressionKind::Number { .. }
             | PlannedExpressionKind::BigInt { .. }
             | PlannedExpressionKind::Boolean(_)
@@ -15752,7 +15876,9 @@ fn prepare_const_object_property(
         (PlannedExpressionKind::Object { .. }, PreparedExpression::Object(_))
         | (PlannedExpressionKind::Property(_), PreparedExpression::Property(_))
         | (
-            PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined,
+            PlannedExpressionKind::Null
+            | PlannedExpressionKind::GlobalUndefined
+            | PlannedExpressionKind::RegularExpression(_),
             PreparedExpression::Literal(_),
         ) => Ok(prepared.clone()),
         (
@@ -15798,6 +15924,30 @@ where
                 .ok_or(SourceCheckError::LiteralCache(
                     SourceLiteralCacheError::BootstrapUninitialized,
                 ))
+        }
+        (
+            PlannedExpressionKind::RegularExpression(planned),
+            PreparedExpression::Literal(LiteralTreatment::Identity),
+        ) => {
+            let regexp_type = global_types
+                .map(|global_types| global_types.regexp_type)
+                .ok_or(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        node: expression.node,
+                        kind: SyntaxKind::RegularExpressionLiteral,
+                        role: SourceSyntaxRole::VariableInitializer,
+                    },
+                ))?;
+            if *planned != regexp_type {
+                return Err(SourceCheckError::Assertion(
+                    SourceAssertionError::InvalidExpressionCache {
+                        node: expression.node,
+                        cached: Some(*planned),
+                        expected: regexp_type,
+                    },
+                ));
+            }
+            Ok(CheckedExpressionTypes::leaf(regexp_type, regexp_type))
         }
         (PlannedExpressionKind::Boolean(value), PreparedExpression::Literal(treatment)) => {
             let (regular, widened) = store
@@ -16963,6 +17113,7 @@ fn emit_uninitialized_variable_read_diagnostics(
         }
         PlannedExpressionKind::Null
         | PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::RegularExpression(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
@@ -19078,6 +19229,7 @@ fn syntactic_truthiness(
         }
         PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
+        | PlannedExpressionKind::RegularExpression(_)
         | PlannedExpressionKind::Arrow(_)
         | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::BigInt { .. } => PredicateSemantics::Always,
@@ -19151,6 +19303,7 @@ fn syntactic_nullishness(expression: &PlannedExpression) -> PredicateSemantics {
             syntactic_nullishness(&conditional.when_false),
         ),
         PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::RegularExpression(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
@@ -42820,6 +42973,242 @@ mod tests {
         assert_ne!(true_type, regular_true);
         assert_ne!(false_type, regular_false);
         assert_ne!(null_widening, null_type);
+    }
+
+    #[test]
+    fn regular_expression_literals_reuse_global_identity_across_expression_positions() {
+        let library = parsed("interface RegExp {} interface Array<T> {}");
+        let source = parsed(concat!(
+            "const direct = /regexp/g; ",
+            "const wrapped = ((/nested/i)); ",
+            "const asserted: any = (<any>/cast/g); ",
+            "const values: RegExp[] = [/one/, /two/g]; ",
+            "declare function accept(value: RegExp): RegExp; ",
+            "const result = accept(/argument/g); ",
+            "const frozen = { pattern: /readonly/g } as const; ",
+            "(<any>/statement/g); ",
+            "/standalone/;",
+        ));
+        let library_file = FileId::new(9_760);
+        let file = FileId::new(9_761);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+        let regexp = context.global_types().regexp_type;
+        let owner = global_symbol(&context, "RegExp");
+        assert_eq!(
+            context
+                .store()
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type),
+            Some(regexp),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let literals = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::RegularExpressionLiteral).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(literals.len(), 9);
+        for literal in literals {
+            assert_eq!(resolved_node_type(&context, literal), regexp);
+        }
+        for name in ["direct", "wrapped", "result"] {
+            assert_eq!(variable_value_type(&context, &source, file, name), regexp);
+        }
+
+        let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "asserted"),
+            any,
+        );
+        let assertions = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAssertionExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assertions.len(), 2);
+        for assertion in assertions {
+            assert_eq!(resolved_node_type(&context, assertion), any);
+            assert_eq!(
+                context.store().assertion_links(assertion),
+                Some(&AssertionLinks {
+                    expr_type: Some(regexp),
+                }),
+            );
+        }
+
+        for (node, record) in source.arena.iter() {
+            if record.kind != SyntaxKind::ParenthesizedExpression {
+                continue;
+            }
+            let wrapper = NodeRef::new(source.arena.id(), file, node);
+            let expected = if node_text(&source, wrapper).contains("<any>") {
+                any
+            } else {
+                regexp
+            };
+            assert_eq!(resolved_node_type(&context, wrapper), expected);
+        }
+
+        let values = variable_initializer(&source, file, "values");
+        for element in array_elements(&source, file, values) {
+            assert_eq!(resolved_node_type(&context, element), regexp);
+        }
+        for type_ in [
+            resolved_node_type(&context, values),
+            variable_value_type(&context, &source, file, "values"),
+        ] {
+            assert_eq!(
+                context
+                    .store()
+                    .canonical_array_reference(context.global_types(), type_)
+                    .unwrap()
+                    .unwrap()
+                    .element_type,
+                regexp,
+            );
+        }
+
+        let frozen = variable_initializer(&source, file, "frozen");
+        let NodeData::AsExpression(assertion) = &source.arena.get(frozen.node).unwrap().data else {
+            panic!("expected a const assertion")
+        };
+        let object = NodeRef::new(source.arena.id(), file, assertion.expression);
+        assert_eq!(object_property_type(&context, object, "pattern"), regexp);
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn regular_expression_literals_preserve_missing_and_malformed_global_fallbacks() {
+        for (index, declaration) in [
+            None,
+            Some("interface RegExp<T> {}"),
+            Some("type RegExp = string;"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed("const value = /fallback/g; (<any>/statement/g);");
+            let library = declaration.map(parsed);
+            let offset = u32::try_from(index).unwrap() * 2;
+            let file = FileId::new(9_762 + offset);
+            let library_file = FileId::new(9_763 + offset);
+            let mut files = vec![(file, &source)];
+            let mut default_library_files = Vec::new();
+            if let Some(library) = library.as_ref() {
+                files.push((library_file, library));
+                default_library_files.push(library_file);
+            }
+            let mut context = context_with_default_library_files(
+                &files,
+                &default_library_files,
+                CanonicalCheckerOptions::default(),
+            );
+            let fallback = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .empty_object_type;
+            assert_eq!(context.global_types().regexp_type, fallback);
+
+            context.check_source_file(file).unwrap();
+
+            assert_eq!(
+                variable_value_type(&context, &source, file, "value"),
+                fallback,
+            );
+            for (node, record) in source.arena.iter() {
+                if record.kind == SyntaxKind::RegularExpressionLiteral {
+                    assert_eq!(
+                        resolved_node_type(&context, NodeRef::new(source.arena.id(), file, node),),
+                        fallback,
+                    );
+                }
+            }
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn poisoned_regular_expression_cache_rejects_planning_before_publication() {
+        let library = parsed("interface RegExp {}");
+        let source = parsed("const first = /first/; const later = /poisoned/g;");
+        let library_file = FileId::new(9_768);
+        let file = FileId::new(9_769);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+        let first = variable_initializer(&source, file, "first");
+        let later = variable_initializer(&source, file, "later");
+        let first_symbol = variable_symbol(&context, &source, file, "first");
+        let later_symbol = variable_symbol(&context, &source, file, "later");
+        let expected = context.global_types().regexp_type;
+        let poison = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_ne!(poison, expected);
+        assert!(context.store_mut_for_test().set_type_node_links(
+            later,
+            TypeNodeLinks {
+                resolved_type: Some(poison),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let before = observable_state(&context, file);
+        let error = SourceCheckError::Assertion(SourceAssertionError::InvalidExpressionCache {
+            node: later,
+            cached: Some(poison),
+            expected,
+        });
+
+        for _ in 0..2 {
+            assert_eq!(context.check_source_file(file), Err(error));
+            assert_eq!(observable_state(&context, file), before);
+            assert!(context.store().type_node_links(first).is_none());
+            assert!(context.store().value_symbol_links(first_symbol).is_none());
+            assert!(context.store().value_symbol_links(later_symbol).is_none());
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(later, TypeNodeLinks::default())
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(resolved_node_type(&context, first), expected);
+        assert_eq!(resolved_node_type(&context, later), expected);
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]

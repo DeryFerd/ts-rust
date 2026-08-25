@@ -1107,6 +1107,7 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
         | SyntaxKind::TrueKeyword
         | SyntaxKind::FalseKeyword
         | SyntaxKind::StringLiteral
+        | SyntaxKind::RegularExpressionLiteral
         | SyntaxKind::NoSubstitutionTemplateLiteral
         | SyntaxKind::NumericLiteral
         | SyntaxKind::BigIntLiteral => true,
@@ -1521,6 +1522,7 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
     match &expression.kind {
         PlannedExpressionKind::Null
         | PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::RegularExpression(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
@@ -1590,6 +1592,7 @@ fn is_context_insensitive_primitive_binary_operand_plan(expression: &PlannedExpr
         }
         PlannedExpressionKind::Null
         | PlannedExpressionKind::GlobalUndefined
+        | PlannedExpressionKind::RegularExpression(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Assertion { .. }
         | PlannedExpressionKind::Array(_)
