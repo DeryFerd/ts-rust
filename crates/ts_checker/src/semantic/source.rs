@@ -47334,6 +47334,97 @@ mod tests {
     }
 
     #[test]
+    fn global_object_factory_generic_overloads_preserve_order_and_string_keys() {
+        let library = parsed(concat!(
+            "interface IArguments {} ",
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Object {} ",
+            "interface ObjectConstructor { ",
+            "keys(value: object): string[]; ",
+            "values<Value>(value: Value): Value[]; ",
+            "values(value: {}): any[]; ",
+            "entries<Value>(value: Value): [string, Value][]; ",
+            "entries(value: {}): [string, any][]; ",
+            "} declare var Object: ObjectConstructor; ",
+            "interface Function {} interface String {} interface Number {} ",
+            "interface Boolean {} interface RegExp {} interface ThisType<T> {}",
+        ));
+        let source = parsed(concat!(
+            "const keys = Object.keys({ value: 1 }); ",
+            "const values = Object.values<number>(1); ",
+            "const entries = Object.entries<number>(1);",
+        ));
+        let library_file = FileId::new(9_496);
+        let source_file = FileId::new(9_497);
+        let mut context = context_with_cross_file_global(
+            library_file,
+            &library,
+            source_file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::Script,
+            true,
+        );
+
+        context.check_source_file(source_file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        for (name, expected) in [
+            ("keys", "string[]"),
+            ("values", "number[]"),
+            ("entries", "[string, number][]"),
+        ] {
+            assert_eq!(
+                context
+                    .type_to_string(variable_value_type(&context, &source, source_file, name))
+                    .unwrap(),
+                expected,
+            );
+        }
+
+        let constructor = global_symbol(&context, "ObjectConstructor");
+        for name in ["values", "entries"] {
+            let method = context
+                .store()
+                .symbol(constructor)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source(name))
+                .unwrap();
+            let callable = context
+                .store()
+                .value_symbol_links(method)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let signatures = context
+                .store()
+                .type_payload(callable)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.signatures.as_deref())
+                .unwrap();
+            let [generic, fallback] = signatures else {
+                panic!("Object.{name} must retain its generic and fallback overloads")
+            };
+            let declarations = context
+                .store()
+                .symbol(method)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .unwrap();
+            let generic = context.store().signature(*generic).unwrap();
+            let fallback = context.store().signature(*fallback).unwrap();
+
+            assert_eq!(generic.declaration(), Some(declarations[0]));
+            assert_eq!(generic.type_parameters().len(), 1);
+            assert_eq!(fallback.declaration(), Some(declarations[1]));
+            assert!(fallback.type_parameters().is_empty());
+        }
+
+        let warm = observable_state(&context, source_file);
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(observable_state(&context, source_file), warm);
+    }
+
+    #[test]
     fn global_object_factory_argument_diagnostics_preserve_source_order() {
         let library = parsed(concat!(
             "interface Array<T> {} interface ReadonlyArray<T> {} ",

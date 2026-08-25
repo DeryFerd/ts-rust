@@ -1285,9 +1285,13 @@ fn resolve_published_global_object_constructor_method(
     let links = store
         .value_symbol_links(symbol)
         .ok_or(RelationUnavailable::UnresolvedPropertyType(symbol))?;
-    let type_ = links
-        .resolved_type
-        .ok_or(RelationUnavailable::UnresolvedPropertyType(symbol))?;
+    let Some(type_) = links.resolved_type else {
+        return if links == &ValueSymbolLinks::default() {
+            Err(RelationUnavailable::UnresolvedPropertyType(symbol).into())
+        } else {
+            Err(invalid())
+        };
+    };
     if links
         != &(ValueSymbolLinks {
             resolved_type: Some(type_),
