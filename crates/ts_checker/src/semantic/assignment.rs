@@ -41,7 +41,7 @@ pub(super) struct SimpleAssignmentPlan {
     pub target_type_node: Option<NodeRef>,
 }
 
-/// One binder-authenticated CommonJS export assignment.
+/// One binder-authenticated `CommonJS` export assignment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CommonJsAssignmentPlan {
     pub(super) expression: NodeRef,

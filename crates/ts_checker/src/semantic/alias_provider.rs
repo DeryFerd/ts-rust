@@ -1141,7 +1141,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         }
     }
 
-    /// Resolves the exact string argument of a source-owned JSDoc import type.
+    /// Resolves the exact string argument of a source-owned `JSDoc` import type.
     pub(super) fn resolve_jsdoc_import_type_module<MapperPayload>(
         &self,
         store: &CanonicalSemanticStore<MapperPayload>,

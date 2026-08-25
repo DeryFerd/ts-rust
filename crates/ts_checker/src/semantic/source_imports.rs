@@ -1,4 +1,4 @@
-//! Exact source planning for ESM imports, JSDoc imports, and named reexports.
+//! Exact source planning for ESM imports, `JSDoc` imports, and named reexports.
 //!
 //! This slice accepts leading, top-level side-effect imports, default imports,
 //! namespace imports, and named imports, including explicit named `default`
@@ -113,7 +113,7 @@ pub(super) struct SourceJsDocTypedefImportPlan {
     pub(super) imported_name: NodeRef,
 }
 
-/// One JSDoc typedef resolved through an authenticated CommonJS export.
+/// One `JSDoc` typedef resolved through an authenticated `CommonJS` export.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ResolvedSourceJsDocTypedefImport {
     pub(super) plan: SourceJsDocTypedefImportPlan,
@@ -778,7 +778,7 @@ pub(super) fn plan_source_jsdoc_typedef_import(
     })
 }
 
-/// Resolves a comment-only typedef through the exact promoted CommonJS export.
+/// Resolves a comment-only typedef through the exact promoted `CommonJS` export.
 pub(super) fn resolve_source_jsdoc_typedef_import(
     store: &CanonicalTypeMapperStore,
     alias_host: &ProductionAliasTargetHost<'_, '_, '_>,
@@ -5004,8 +5004,8 @@ fn materialize_imported_module_namespace(
                     .value_type,
                 None,
             ),
-            PlannedSourceImportValueTarget::ExportedObject { type_, .. } => (type_, None),
-            PlannedSourceImportValueTarget::PublishedObjectConst { type_, .. } => (type_, None),
+            PlannedSourceImportValueTarget::ExportedObject { type_, .. }
+            | PlannedSourceImportValueTarget::PublishedObjectConst { type_, .. } => (type_, None),
             PlannedSourceImportValueTarget::DeclarationNumericConst { literal, .. } => (
                 declaration_numeric_literal_type(store, member.value_symbol, &literal)?,
                 None,
