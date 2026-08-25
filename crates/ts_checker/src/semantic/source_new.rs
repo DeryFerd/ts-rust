@@ -550,10 +550,27 @@ pub(super) fn promise_executor_missing_argument_is_exact(
         && callee_record.kind == SyntaxKind::Identifier
         && callee_record.parent == Some(call.node)
         && identifier.text == "resolve"
-        && store
-            .symbol_node_links(callee)
-            .and_then(|links| links.resolved_symbol)
+        && bound
+            .locals(arrow)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
             == Some(parameter_symbol)
+        && store.symbol(parameter_symbol).is_some_and(|symbol| {
+            symbol.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                && symbol.check_flags() == CheckFlags::NONE
+                && symbol.name().as_utf8() == Some(identifier.text.as_str())
+                && symbol.declarations() == Some(&[parameter])
+                && symbol.value_declaration() == Some(parameter)
+                && symbol.members().is_none()
+                && symbol.exports().is_none()
+                && symbol.parent().is_none()
+                && symbol.export_symbol().is_none()
+        })
+        && store.symbol_node_links(callee).is_none_or(|links| {
+            links
+                .resolved_symbol
+                .is_none_or(|symbol| symbol == parameter_symbol)
+        })
         && host.node(annotation).map(|record| record.kind) == Some(SyntaxKind::FunctionType)
         && host.node(resolve_parameter).map(|record| record.kind) == Some(SyntaxKind::Parameter)
         && host.node(executor_annotation).map(|record| record.kind)
