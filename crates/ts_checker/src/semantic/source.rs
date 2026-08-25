@@ -3061,6 +3061,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             | SyntaxKind::NewExpression
                             | SyntaxKind::ParenthesizedExpression
                             | SyntaxKind::NonNullExpression
+                            | SyntaxKind::TypeAssertionExpression
+                            | SyntaxKind::AsExpression
+                            | SyntaxKind::SatisfiesExpression
                     ) {
                         let expression = self.plan_expression(expression)?;
                         statements.push(PlannedStatement::ExpressionValue(expression));
@@ -5370,6 +5373,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     current = parent;
                 }
                 (NodeData::AsExpression(assertion), SyntaxKind::AsExpression)
+                    if assertion.expression == current.node =>
+                {
+                    current = parent;
+                }
+                (NodeData::SatisfiesExpression(assertion), SyntaxKind::SatisfiesExpression)
+                    if assertion.expression == current.node =>
+                {
+                    current = parent;
+                }
+                (NodeData::NonNullExpression(assertion), SyntaxKind::NonNullExpression)
                     if assertion.expression == current.node =>
                 {
                     current = parent;
@@ -14394,9 +14407,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             SyntaxKind::BinaryExpression => self.plan_binary(expression),
             SyntaxKind::ConditionalExpression => self.plan_conditional(expression),
             SyntaxKind::PrefixUnaryExpression => self.plan_prefix_unary(expression),
-            SyntaxKind::TypeAssertionExpression | SyntaxKind::AsExpression => {
-                self.plan_assertion(expression)
-            }
+            SyntaxKind::TypeAssertionExpression
+            | SyntaxKind::AsExpression
+            | SyntaxKind::SatisfiesExpression => self.plan_assertion(expression),
             SyntaxKind::ArrayLiteralExpression => self.plan_array_literal(expression),
             SyntaxKind::ObjectLiteralExpression => self.plan_object_literal(expression),
             SyntaxKind::ArrowFunction => self.plan_nested_arrow_argument(expression),
@@ -14570,6 +14583,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 NodeData::ParenthesizedExpression(parenthesized)
                     if parenthesized.expression == root.node =>
                 {
+                    root = parent;
+                }
+                NodeData::AsExpression(assertion) if assertion.expression == root.node => {
+                    root = parent;
+                }
+                NodeData::TypeAssertion(assertion) if assertion.expression == root.node => {
+                    root = parent;
+                }
+                NodeData::SatisfiesExpression(assertion) if assertion.expression == root.node => {
+                    root = parent;
+                }
+                NodeData::NonNullExpression(assertion) if assertion.expression == root.node => {
                     root = parent;
                 }
                 _ => break,
@@ -15717,6 +15742,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 NodeData::TypeAssertion(assertion) if assertion.expression == current.node => {
                     current = parent;
                 }
+                NodeData::SatisfiesExpression(assertion)
+                    if assertion.expression == current.node =>
+                {
+                    current = parent;
+                }
+                NodeData::NonNullExpression(assertion) if assertion.expression == current.node => {
+                    current = parent;
+                }
                 NodeData::VariableDeclaration(variable)
                     if variable.initializer == Some(current.node) =>
                 {
@@ -15746,6 +15779,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 (NodeData::AsExpression(assertion), SyntaxKind::AsExpression) => {
                     (assertion.type_, assertion.expression)
                 }
+                (NodeData::SatisfiesExpression(assertion), SyntaxKind::SatisfiesExpression) => {
+                    (assertion.type_, assertion.expression)
+                }
                 _ => {
                     return Err(self.unsupported(
                         expression,
@@ -15773,7 +15809,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::AssertionOperand,
             ));
         }
-        let const_assertion = self.is_const_assertion_type(type_node)?;
+        let const_assertion = self.node(expression)?.kind != SyntaxKind::SatisfiesExpression
+            && self.is_const_assertion_type(type_node)?;
         let operand = self.plan_expression(operand)?;
         let supported_const_operand = matches!(
             &operand.unparenthesized().kind,
@@ -17003,7 +17040,8 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
         | PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::Call(_)
-        | PlannedExpressionKind::Element(_) => true,
+        | PlannedExpressionKind::Element(_)
+        | PlannedExpressionKind::Assertion { .. } => true,
         PlannedExpressionKind::Parenthesized(inner) => {
             primitive_binary_operand_plan_is_supported(inner)
         }
@@ -17019,7 +17057,6 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
         }
         PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::RegularExpression(_)
-        | PlannedExpressionKind::Assertion { .. }
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
         | PlannedExpressionKind::Property(_)
@@ -18689,6 +18726,62 @@ fn publish_expression_type(
     Ok(())
 }
 
+/// Locates the real `satisfies` token after authenticated source trivia.
+fn satisfies_keyword_range(
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    operand: NodeRef,
+    type_node: NodeRef,
+) -> Result<CanonicalCheckerDiagnosticRange, SourceCheckError> {
+    let invalid = || {
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+            node: expression,
+            kind: SyntaxKind::SatisfiesExpression,
+            role: SourceSyntaxRole::AssertionOperand,
+        })
+    };
+    let operand = host.node(operand).ok_or_else(&invalid)?;
+    let target = host.node(type_node).ok_or_else(&invalid)?;
+    let source = host
+        .source(expression)
+        .and_then(|(arena, _)| arena.source_text())
+        .ok_or_else(&invalid)?;
+    let mut start = usize::try_from(operand.range.end.get()).map_err(|_| invalid())?;
+    let limit = usize::try_from(target.range.start.get()).map_err(|_| invalid())?;
+
+    while start < limit {
+        let remaining = source.get(start..limit).ok_or_else(&invalid)?;
+        if let Some(character) = remaining.chars().next()
+            && character.is_whitespace()
+        {
+            start += character.len_utf8();
+            continue;
+        }
+        if let Some(comment) = remaining.strip_prefix("/*") {
+            let end = comment.find("*/").ok_or_else(&invalid)?;
+            start += 2 + end + 2;
+            continue;
+        }
+        if let Some(comment) = remaining.strip_prefix("//") {
+            let end = comment.find(['\n', '\r']).ok_or_else(&invalid)?;
+            start += 2 + end;
+            continue;
+        }
+        break;
+    }
+
+    let end = start.checked_add("satisfies".len()).ok_or_else(&invalid)?;
+    if end > limit || source.get(start..end) != Some("satisfies") {
+        return Err(invalid());
+    }
+    let start = ts_core::TextPos::new(u32::try_from(start).map_err(|_| invalid())?);
+    let end = ts_core::TextPos::new(u32::try_from(end).map_err(|_| invalid())?);
+    Ok(CanonicalCheckerDiagnosticRange::new(
+        expression,
+        TextRange::new(start, end),
+    ))
+}
+
 fn publish_parenthesized_jsx_expression_types(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -20235,6 +20328,84 @@ fn check_expression_type(
             operand,
             const_assertion,
         } => {
+            if host
+                .node(expression.node)
+                .is_some_and(|node| node.kind == SyntaxKind::SatisfiesExpression)
+            {
+                let mut satisfaction_diagnostics = CanonicalCheckerDiagnostics::default();
+                let target = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut satisfaction_diagnostics,
+                )?
+                .get_type_from_type_node(*type_node);
+                merge_retry_diagnostics(diagnostics, satisfaction_diagnostics);
+                let target = target?;
+                let operand_types = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    current_flow_types,
+                    preflighted_type_import_value_uses,
+                    operand,
+                    Some(target),
+                    deferred,
+                )?;
+                if store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| target == bootstrap.error_type)
+                {
+                    publish_expression_type(store, expression.node, target)?;
+                    return Ok(CheckedExpressionTypes::leaf(target, target));
+                }
+                publish_expression_type(store, expression.node, operand_types.raw)?;
+                if !source_type_is_assignable_to(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    operand_types.result,
+                    target,
+                )? {
+                    let keyword =
+                        satisfies_keyword_range(host, expression.node, operand.node, *type_node)?;
+                    let staged = super::object_diagnostics::diagnostics_for_failed_assignment(
+                        store,
+                        host,
+                        global_types,
+                        operand,
+                        &operand_types,
+                        target,
+                        expression.node,
+                        options,
+                        session,
+                    )?;
+                    for mut diagnostic in staged {
+                        if diagnostic.node == Some(expression.node) {
+                            diagnostic.range_override = Some(keyword);
+                            if diagnostic.diagnostic.code() == 2322 {
+                                diagnostic.diagnostic.message = message_by_code(1360)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(1360))?;
+                            }
+                        }
+                        merge_retry_diagnostic(diagnostics, diagnostic);
+                    }
+                }
+                return Ok(CheckedExpressionTypes::leaf(
+                    operand_types.raw,
+                    operand_types.result,
+                ));
+            }
+
             let operand_types = check_expression_type(
                 store,
                 host,
@@ -33011,13 +33182,25 @@ pub(super) fn check_source_file(
                             )
                         }
                         (PlannedVariableInitializer::Expression(initializer), None) => {
-                            let preserve_const_assertion = matches!(
-                                initializer.unparenthesized().kind,
-                                PlannedExpressionKind::Assertion {
-                                    const_assertion: true,
-                                    ..
+                            let preserve_const_assertion = {
+                                let mut expression = initializer.unparenthesized();
+                                loop {
+                                    match &expression.kind {
+                                        PlannedExpressionKind::Assertion {
+                                            const_assertion: true,
+                                            ..
+                                        } => break true,
+                                        PlannedExpressionKind::Assertion { operand, .. }
+                                            if host.node(expression.node).is_some_and(|node| {
+                                                node.kind == SyntaxKind::SatisfiesExpression
+                                            }) =>
+                                        {
+                                            expression = operand.unparenthesized();
+                                        }
+                                        _ => break false,
+                                    }
                                 }
-                            );
+                            };
                             let initializer = check_expression_type(
                                 store,
                                 host,
@@ -45906,6 +46089,213 @@ mod tests {
         assert!(diagnostic.related_information.is_empty());
         assert_eq!(node_text(&source, assertion), r#""x" as number"#);
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn satisfies_expressions_preserve_chained_assertion_types_and_warm_identity() {
+        let source = parsed(concat!(
+            "\"use strict\"; ",
+            "const first = (/* comment */ 10 satisfies number); ",
+            "const second = ((/* nested */ 10 satisfies number)); ",
+            "declare const maybe: string | undefined; ",
+            "const chained = ((maybe! as string) satisfies string) as string; ",
+            "const computed = (1 satisfies number) + ((<number>2) as number)!; ",
+            "first satisfies number; ",
+            "first as number; ",
+            "(<number>first)!;",
+        ));
+        let file = FileId::new(9_770);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        for (name, expected) in [
+            ("first", "10"),
+            ("second", "10"),
+            ("chained", "string"),
+            ("computed", "number"),
+        ] {
+            assert_eq!(
+                context
+                    .type_to_string(variable_value_type(&context, &source, file, name))
+                    .unwrap(),
+                expected,
+            );
+        }
+        let source_ref = context.source_file(file).unwrap();
+        let deferred = context
+            .store()
+            .source_file_links(source_ref)
+            .unwrap()
+            .deferred_nodes
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut satisfaction_count = 0;
+        let mut assertion_count = 0;
+        for (node, record) in source.arena.iter() {
+            let node = NodeRef::new(source.arena.id(), file, node);
+            match &record.data {
+                NodeData::SatisfiesExpression(satisfaction) => {
+                    satisfaction_count += 1;
+                    let operand = NodeRef::new(source.arena.id(), file, satisfaction.expression);
+                    assert_eq!(
+                        resolved_node_type(&context, node),
+                        resolved_node_type(&context, operand),
+                    );
+                    assert!(context.store().assertion_links(node).is_none());
+                    assert!(!deferred.contains(&node));
+                }
+                NodeData::TypeAssertion(_) | NodeData::AsExpression(_) => {
+                    assertion_count += 1;
+                    assert!(context.store().assertion_links(node).is_some());
+                    assert!(deferred.contains(&node));
+                }
+                NodeData::ParenthesizedExpression(_) | NodeData::NonNullExpression(_) => {
+                    assert!(
+                        context
+                            .store()
+                            .type_node_links(node)
+                            .and_then(|links| links.resolved_type)
+                            .is_some(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(satisfaction_count, 5);
+        assert_eq!(assertion_count, 6);
+        assert_eq!(deferred.len(), assertion_count);
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn satisfies_failures_report_ts1360_at_the_keyword_without_deferred_casts() {
+        let source = parsed(concat!(
+            "const first = 1 /* before */ satisfies /* after */ boolean; ",
+            "const second = ('wrong' as unknown as number) satisfies string;",
+        ));
+        let file = FileId::new(9_771);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, expected) in diagnostics
+            .iter()
+            .zip([["number", "boolean"], ["number", "string"]])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), 1360);
+            assert_eq!(diagnostic.diagnostic.arguments, expected);
+            let node = diagnostic.node.unwrap();
+            assert_eq!(
+                source.arena.get(node.node).unwrap().kind,
+                SyntaxKind::SatisfiesExpression,
+            );
+            let range = diagnostic.range_override.unwrap().range();
+            let start = usize::try_from(range.start.get()).unwrap();
+            let end = usize::try_from(range.end.get()).unwrap();
+            assert_eq!(
+                source.arena.source_text().unwrap().get(start..end),
+                Some("satisfies")
+            );
+            assert!(context.store().assertion_links(node).is_none());
+        }
+        let source_ref = context.source_file(file).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .source_file_links(source_ref)
+                .unwrap()
+                .deferred_nodes
+                .len(),
+            2,
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn satisfies_contextually_types_objects_and_keeps_precise_object_diagnostics() {
+        let source = parsed(concat!(
+            "interface Shape { value: 'ready' | 'done'; } ",
+            "const valid = { value: 'ready' } satisfies Shape; ",
+            "const frozen = { value: 'done' } as const satisfies Shape; ",
+            "const excess = { value: 'ready', extra: 1 } satisfies Shape; ",
+            "const missing = {} satisfies Shape;",
+        ));
+        let file = FileId::new(9_772);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let valid = variable_initializer(&source, file, "valid");
+        let NodeData::SatisfiesExpression(satisfaction) =
+            &source.arena.get(valid.node).unwrap().data
+        else {
+            panic!("the valid initializer must retain its satisfies expression")
+        };
+        let object = NodeRef::new(source.arena.id(), file, satisfaction.expression);
+        assert_eq!(
+            resolved_node_type(&context, valid),
+            resolved_node_type(&context, object)
+        );
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, object, "value"))
+                .unwrap(),
+            "\"ready\"",
+        );
+        let frozen = variable_initializer(&source, file, "frozen");
+        let NodeData::SatisfiesExpression(satisfaction) =
+            &source.arena.get(frozen.node).unwrap().data
+        else {
+            panic!("the frozen initializer must retain its satisfies expression")
+        };
+        let assertion = NodeRef::new(source.arena.id(), file, satisfaction.expression);
+        assert_eq!(
+            resolved_node_type(&context, frozen),
+            resolved_node_type(&context, assertion)
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "frozen"),
+            resolved_node_type(&context, assertion),
+        );
+        assert!(context.store().assertion_links(assertion).is_some());
+
+        let [excess, missing] = context.diagnostics().as_slice() else {
+            panic!("expected one excess-property and one missing-property diagnostic")
+        };
+        assert_eq!(excess.diagnostic.code(), 2353);
+        assert_eq!(node_text(&source, excess.node.unwrap()), "extra");
+        assert_eq!(missing.diagnostic.code(), 2741);
+        let range = missing.range_override.unwrap().range();
+        let start = usize::try_from(range.start.get()).unwrap();
+        let end = usize::try_from(range.end.get()).unwrap();
+        assert_eq!(
+            source.arena.source_text().unwrap().get(start..end),
+            Some("satisfies")
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
