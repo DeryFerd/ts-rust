@@ -1918,6 +1918,7 @@ fn validate_shape(
         direct.target,
         array_targets,
         &mut active,
+        0,
         &mut validated,
     )?;
     let base_types = store
@@ -1981,6 +1982,7 @@ fn validate_declared_target(
     target: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
     active: &mut Vec<TypeId>,
+    heritage_start: usize,
     validated: &mut HashSet<TypeId>,
 ) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
     if store
@@ -2030,11 +2032,18 @@ fn validate_declared_target(
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
     for base in base_types {
         if let Ok(reference) = validate_direct_generic_reference(store, base) {
-            if active.contains(&reference.target) {
+            if active[heritage_start..].contains(&reference.target) {
                 return Err(GenericInterfaceMemberError::InvalidTarget(target));
             }
             member_type_requires_instantiation(store, base, &mapper_parameters, array_targets)?;
-            validate_declared_target(store, reference.target, array_targets, active, validated)?;
+            validate_declared_target(
+                store,
+                reference.target,
+                array_targets,
+                active,
+                heritage_start,
+                validated,
+            )?;
         } else if !matches!(
             validate_resolved_declared_property_object(store, base),
             DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
@@ -3151,11 +3160,13 @@ fn validate_nested_reference_targets(
                     visited_types,
                 )?;
             } else if let Ok(reference) = validate_direct_generic_reference(store, type_) {
+                let heritage_start = active_targets.len();
                 validate_declared_target(
                     store,
                     reference.target,
                     array_targets,
                     active_targets,
+                    heritage_start,
                     validated_targets,
                 )?;
                 for argument in reference.type_arguments {
