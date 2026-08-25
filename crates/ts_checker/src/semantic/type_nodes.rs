@@ -13980,6 +13980,42 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 return self.get_return_type_of_source_callable_signature(signature, declaration);
             }
             SyntaxKind::FunctionType => {
+                if let Some(annotation) = self
+                    .store
+                    .function_signature_return_annotation(signature)
+                    .map(|(annotation, _)| annotation)
+                    .filter(|annotation| {
+                        self.store.source_node_kind(*annotation) == Some(SyntaxKind::TypePredicate)
+                    })
+                {
+                    let planned = source_callables::plan_callable_type_predicate(
+                        self.store, self.host, annotation,
+                    )
+                    .map_err(|error| match error {
+                        SourceCallableError::DeclaredType(error) => error,
+                        SourceCallableError::LiteralCache(error) => type_construction_error(error),
+                        SourceCallableError::Unsupported(_) | SourceCallableError::Invariant(_) => {
+                            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                                signature,
+                            ))
+                        }
+                    })?;
+                    let record = self.store.signature(signature).ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                            signature,
+                        ))
+                    })?;
+                    if !source_callables::valid_planned_callable_type_predicate(
+                        self.store,
+                        record,
+                        Some(annotation),
+                        Some(planned),
+                    ) {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                        ));
+                    }
+                }
                 self.require_type_reference_alias_root_capability(declaration)?;
             }
             _ => {
