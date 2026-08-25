@@ -8772,12 +8772,10 @@ mod tests {
 
     #[test]
     fn unsupported_declared_call_members_reject_before_signature_publication() {
-        // The pinned oracle accepts each family below. This provider's first
-        // production cut intentionally rejects them as one atomic boundary.
+        // Generic and rest signatures have authenticated providers. Only
+        // unsupported member shapes must reject before signature publication.
         for (index, member) in [
-            "<T>(value: T): T;",
             "(value?: number): string;",
-            "(...values: number[]): string;",
             "new (value: number): string; (value: number): string;",
             "value: number; (value: number): string;",
         ]
