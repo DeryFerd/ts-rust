@@ -1934,11 +1934,21 @@ fn display_declared_construct_signatures(
             let declaration = signature_record
                 .declaration()
                 .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-            if !matches!(
-                host.node(declaration).map(|node| &node.data),
-                Some(NodeData::ConstructSignatureDeclaration(_))
-            ) || !host.symbol_matches(store, declaration, construct_symbol)
-            {
+            let exact_declaration = match host.node(declaration).map(|node| &node.data) {
+                Some(NodeData::ConstructSignatureDeclaration(_)) => {
+                    host.symbol_matches(store, declaration, construct_symbol)
+                }
+                Some(NodeData::ConstructorTypeNode(_)) => {
+                    declaration == *owner_declaration
+                        && host.symbol_matches(store, declaration, owner)
+                        && store
+                            .symbol(construct_symbol)
+                            .and_then(ts_binder::semantic::Symbol::declarations)
+                            == Some(&[declaration])
+                }
+                _ => false,
+            };
+            if !exact_declaration {
                 return Err(TypeDisplayUnavailable::MalformedType(type_id));
             }
             if overloaded {
@@ -3196,7 +3206,10 @@ fn validate_property_object_alias(
         || owner_record.export_symbol().is_some()
         || owner_record.members() != object.structured.members
         || !matches!(owner_record.declarations(), Some([declaration])
-            if store.source_node_kind(*declaration) == Some(SyntaxKind::TypeLiteral))
+        if matches!(
+            store.source_node_kind(*declaration),
+            Some(SyntaxKind::TypeLiteral | SyntaxKind::ConstructorType)
+        ))
     {
         return Err(TypeDisplayUnavailable::Alias { type_id, alias });
     }

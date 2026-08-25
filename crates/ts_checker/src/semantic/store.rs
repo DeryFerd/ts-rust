@@ -1117,9 +1117,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                                 Some(SyntaxKind::CallSignature) => {
                                     record.flags().contains(SignatureFlags::CONSTRUCT)
                                 }
-                                Some(SyntaxKind::ConstructSignature) => {
-                                    !record.flags().contains(SignatureFlags::CONSTRUCT)
-                                }
+                                Some(
+                                    SyntaxKind::ConstructSignature | SyntaxKind::ConstructorType,
+                                ) => !record.flags().contains(SignatureFlags::CONSTRUCT),
                                 _ => true,
                             }
                         })
@@ -1977,7 +1977,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     fn node_is_declared_callable_signature(&self, node: NodeRef) -> bool {
         matches!(
             self.source_node_kind(node),
-            Some(SyntaxKind::CallSignature | SyntaxKind::ConstructSignature)
+            Some(
+                SyntaxKind::CallSignature
+                    | SyntaxKind::ConstructSignature
+                    | SyntaxKind::ConstructorType
+            )
         )
     }
 

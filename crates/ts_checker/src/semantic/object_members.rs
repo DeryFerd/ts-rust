@@ -505,7 +505,10 @@ pub(super) fn validate_stored_declared_call_set(
                     && owner_record.parent().is_none()
                     && owner_record.export_symbol().is_none()
                     && store.get_merged_symbol(owner) == Some(owner)
-                    && store.source_node_kind(*declaration) == Some(SyntaxKind::TypeLiteral)
+                    && matches!(
+                        store.source_node_kind(*declaration),
+                        Some(SyntaxKind::TypeLiteral | SyntaxKind::ConstructorType)
+                    )
                     && store.type_node_links(*declaration).is_some_and(|links| {
                         links.resolved_type == Some(type_) && links.outer_type_parameters.is_none()
                     })
@@ -722,7 +725,11 @@ pub(super) fn validate_stored_declared_call_set(
             || symbol_record.value_declaration().is_some()
             || symbol_record.members().is_some()
             || symbol_record.exports().is_some()
-            || symbol_record.parent() != Some(owner)
+            || if store.source_node_kind(owner_declaration) == Some(SyntaxKind::ConstructorType) {
+                symbol_record.parent().is_some()
+            } else {
+                symbol_record.parent() != Some(owner)
+            }
             || symbol_record.export_symbol().is_some()
             || store.get_merged_symbol(symbol) != Some(symbol)
         {
@@ -793,14 +800,21 @@ pub(super) fn validate_stored_declared_call_set(
         };
         if !seen_signatures.insert(signature)
             || store.declared_call_set_type_for_signature(signature) != Some(provider)
-            || store.source_node_kind(declaration)
-                != Some(if construct {
-                    SyntaxKind::ConstructSignature
-                } else {
-                    SyntaxKind::CallSignature
-                })
-            || store.source_node_parent(declaration)
-                != Some(SourceNodeParent::Parent(provider_declaration))
+            || if construct
+                && store.source_node_kind(provider_declaration) == Some(SyntaxKind::ConstructorType)
+            {
+                declaration != provider_declaration
+                    || store.source_node_kind(declaration) != Some(SyntaxKind::ConstructorType)
+            } else {
+                store.source_node_kind(declaration)
+                    != Some(if construct {
+                        SyntaxKind::ConstructSignature
+                    } else {
+                        SyntaxKind::CallSignature
+                    })
+                    || store.source_node_parent(declaration)
+                        != Some(SourceNodeParent::Parent(provider_declaration))
+            }
             || store.signature_links(declaration)
                 != Some(&SignatureLinks {
                     resolved_signature: ResolvedSignatureState::Resolved(signature),
