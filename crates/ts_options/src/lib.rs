@@ -1546,29 +1546,55 @@ const fn default_module_resolution(module: ModuleKind) -> ModuleResolutionKind {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Preserve upstream compiler-option diagnostic order.
 fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>) {
-    if options.check_js == Some(true) && options.allow_js == Some(false) {
-        diagnostics.push(diagnostic(5052, ["checkJs", "allowJs"]));
-    }
+    validate_strict_options(options, diagnostics);
+    validate_isolated_declaration_options(options, diagnostics);
+
     if options.no_emit == Some(true) && options.emit_declaration_only == Some(true) {
         diagnostics.push(diagnostic(5053, ["emitDeclarationOnly", "noEmit"]));
     }
     if options.source_map == Some(true) && options.inline_source_map == Some(true) {
         diagnostics.push(diagnostic(5053, ["sourceMap", "inlineSourceMap"]));
     }
-    if options.inline_sources == Some(true)
-        && options.source_map != Some(true)
-        && options.inline_source_map != Some(true)
-    {
-        diagnostics.push(diagnostic(5051, ["inlineSources"]));
-    }
     if options.inline_source_map == Some(true) && options.map_root.is_some() {
         diagnostics.push(diagnostic(5053, ["mapRoot", "inlineSourceMap"]));
     }
+
+    validate_composite_options(options, diagnostics);
+    validate_declaration_and_source_map_options(options, diagnostics);
+
     if options.no_lib == Some(true) && options.lib.is_some() {
         diagnostics.push(diagnostic(5053, ["lib", "noLib"]));
     }
-    validate_project_and_strict_options(options, diagnostics);
+
+    if options.preserve_const_enums == Some(false)
+        && (options.isolated_modules == Some(true) || options.verbatim_module_syntax == Some(true))
+    {
+        diagnostics.push(diagnostic(
+            5091,
+            [if options.verbatim_module_syntax == Some(true) {
+                "verbatimModuleSyntax"
+            } else {
+                "isolatedModules"
+            }],
+        ));
+    }
+
+    if options.check_js == Some(true) && options.allow_js == Some(false) {
+        diagnostics.push(diagnostic(5052, ["checkJs", "allowJs"]));
+    }
+    if options.emit_decorator_metadata == Some(true)
+        && options.experimental_decorators != Some(true)
+    {
+        diagnostics.push(diagnostic(
+            5052,
+            ["emitDecoratorMetadata", "experimentalDecorators"],
+        ));
+    }
+
+    validate_jsx_options(options, diagnostics);
+
     if options.allow_importing_ts_extensions == Some(true)
         && options.no_emit != Some(true)
         && options.emit_declaration_only != Some(true)
@@ -1599,7 +1625,21 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
         diagnostics.push(diagnostic(6082, ["outFile"]));
     }
 
-    validate_jsx_options(options, diagnostics);
+    if options.module_resolution == Some(ModuleResolutionKind::Bundler)
+        && options.module.is_some_and(|module| {
+            !matches!(
+                module,
+                ModuleKind::CommonJs
+                    | ModuleKind::Es2015
+                    | ModuleKind::Es2020
+                    | ModuleKind::Es2022
+                    | ModuleKind::EsNext
+                    | ModuleKind::Preserve
+            )
+        })
+    {
+        diagnostics.push(diagnostic(5095, ["bundler"]));
+    }
 
     let (Some(module), Some(resolution)) = (options.module, options.module_resolution) else {
         return;
@@ -1636,19 +1676,67 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
     }
 }
 
-fn validate_project_and_strict_options(
+fn validate_isolated_declaration_options(
     options: &PartialOptions,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if options.composite == Some(true) {
-        if options.declaration == Some(false) {
-            diagnostics.push(diagnostic(6304, []));
+    if options.isolated_declarations != Some(true) {
+        return;
+    }
+
+    let allow_js = options.allow_js.unwrap_or(options.check_js == Some(true));
+    if allow_js {
+        diagnostics.push(diagnostic(5053, ["allowJs", "isolatedDeclarations"]));
+    }
+    if !options_emit_declarations(options) {
+        diagnostics.push(diagnostic(
+            5069,
+            ["isolatedDeclarations", "declaration", "composite"],
+        ));
+    }
+}
+
+fn validate_declaration_and_source_map_options(
+    options: &PartialOptions,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if options.source_map != Some(true) && options.inline_source_map != Some(true) {
+        if options.inline_sources == Some(true) {
+            diagnostics.push(diagnostic(5051, ["inlineSources"]));
         }
-        if options.incremental == Some(false) {
-            diagnostics.push(diagnostic(6379, []));
+        if options.source_root.is_some() {
+            diagnostics.push(diagnostic(5051, ["sourceRoot"]));
         }
     }
 
+    if options.map_root.is_some()
+        && options.source_map != Some(true)
+        && options.declaration_map != Some(true)
+    {
+        diagnostics.push(diagnostic(5069, ["mapRoot", "sourceMap", "declarationMap"]));
+    }
+
+    if !options_emit_declarations(options) {
+        if options.declaration_dir.is_some() {
+            diagnostics.push(diagnostic(
+                5069,
+                ["declarationDir", "declaration", "composite"],
+            ));
+        }
+        if options.declaration_map == Some(true) {
+            diagnostics.push(diagnostic(
+                5069,
+                ["declarationMap", "declaration", "composite"],
+            ));
+        }
+    }
+}
+
+fn options_emit_declarations(options: &PartialOptions) -> bool {
+    options.declaration == Some(true) || options.composite == Some(true)
+}
+
+fn validate_strict_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>) {
     let strict_null_checks = options
         .strict_null_checks
         .unwrap_or(options.strict.unwrap_or(true));
@@ -1663,6 +1751,18 @@ fn validate_project_and_strict_options(
             5052,
             ["exactOptionalPropertyTypes", "strictNullChecks"],
         ));
+    }
+}
+
+fn validate_composite_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>) {
+    if options.composite != Some(true) {
+        return;
+    }
+    if options.declaration == Some(false) {
+        diagnostics.push(diagnostic(6304, []));
+    }
+    if options.incremental == Some(false) {
+        diagnostics.push(diagnostic(6379, []));
     }
 }
 
@@ -2463,8 +2563,10 @@ mod tests {
 
     #[test]
     fn parses_emit_decorator_metadata() {
-        let result =
-            parse_compiler_options(&object([("emitDecoratorMetadata", JsonValue::Bool(true))]));
+        let result = parse_compiler_options(&object([
+            ("emitDecoratorMetadata", JsonValue::Bool(true)),
+            ("experimentalDecorators", JsonValue::Bool(true)),
+        ]));
         assert!(result.is_ok(), "{:?}", result.diagnostics);
         assert!(result.options.emit_decorator_metadata);
     }
@@ -3547,6 +3649,185 @@ mod tests {
     }
 
     #[test]
+    fn validates_isolated_declaration_conflicts_in_upstream_order() {
+        let missing =
+            parse_compiler_options(&object([("isolatedDeclarations", JsonValue::Bool(true))]));
+        assert_eq!(missing.diagnostics.len(), 1);
+        assert_eq!(missing.diagnostics[0].code(), 5069);
+        assert_eq!(
+            missing.diagnostics[0].render().unwrap(),
+            "Option 'isolatedDeclarations' cannot be specified without specifying option 'declaration' or option 'composite'.",
+        );
+
+        let javascript = parse_compiler_options(&object([
+            ("allowJs", JsonValue::Bool(true)),
+            ("declaration", JsonValue::Bool(true)),
+            ("isolatedDeclarations", JsonValue::Bool(true)),
+        ]));
+        assert_eq!(javascript.diagnostics.len(), 1);
+        assert_eq!(javascript.diagnostics[0].code(), 5053);
+        assert_eq!(
+            javascript.diagnostics[0].render().unwrap(),
+            "Option 'allowJs' cannot be specified with option 'isolatedDeclarations'.",
+        );
+
+        let implied_javascript = parse_compiler_options(&object([
+            ("checkJs", JsonValue::Bool(true)),
+            ("isolatedDeclarations", JsonValue::Bool(true)),
+        ]));
+        assert_eq!(
+            implied_javascript
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [5053, 5069],
+        );
+
+        for declaration in ["declaration", "composite"] {
+            let valid = parse_compiler_options(&object([
+                (declaration, JsonValue::Bool(true)),
+                ("isolatedDeclarations", JsonValue::Bool(true)),
+            ]));
+            assert!(valid.is_ok(), "{declaration}: {:?}", valid.diagnostics);
+        }
+    }
+
+    #[test]
+    fn validates_declaration_map_and_directory_requirements() {
+        let missing = parse_compiler_options(&object([
+            ("declarationDir", JsonValue::String("types".into())),
+            ("declarationMap", JsonValue::Bool(true)),
+        ]));
+        assert_eq!(
+            missing
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [5069, 5069],
+        );
+        assert_eq!(
+            missing.diagnostics[0].render().unwrap(),
+            "Option 'declarationDir' cannot be specified without specifying option 'declaration' or option 'composite'.",
+        );
+        assert_eq!(
+            missing.diagnostics[1].render().unwrap(),
+            "Option 'declarationMap' cannot be specified without specifying option 'declaration' or option 'composite'.",
+        );
+
+        let composite = parse_compiler_options(&object([
+            ("composite", JsonValue::Bool(true)),
+            ("declarationDir", JsonValue::String("types".into())),
+            ("declarationMap", JsonValue::Bool(true)),
+        ]));
+        assert!(composite.is_ok(), "{:?}", composite.diagnostics);
+    }
+
+    #[test]
+    fn validates_source_map_roots_in_upstream_order() {
+        let inline_map_root = parse_compiler_options(&object([
+            ("inlineSourceMap", JsonValue::Bool(true)),
+            ("mapRoot", JsonValue::String("local".into())),
+        ]));
+        assert_eq!(
+            inline_map_root
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [5053, 5069],
+        );
+        assert_eq!(
+            inline_map_root.diagnostics[1].render().unwrap(),
+            "Option 'mapRoot' cannot be specified without specifying option 'sourceMap' or option 'declarationMap'.",
+        );
+
+        let source_root =
+            parse_compiler_options(&object([("sourceRoot", JsonValue::String("local".into()))]));
+        assert_eq!(source_root.diagnostics.len(), 1);
+        assert_eq!(source_root.diagnostics[0].code(), 5051);
+
+        let inline_source_root = parse_compiler_options(&object([
+            ("inlineSourceMap", JsonValue::Bool(true)),
+            ("sourceRoot", JsonValue::String("local".into())),
+        ]));
+        assert!(
+            inline_source_root.is_ok(),
+            "{:?}",
+            inline_source_root.diagnostics,
+        );
+    }
+
+    #[test]
+    fn validates_explicit_const_enum_preservation_under_isolation() {
+        for (option, expected) in [
+            ("isolatedModules", "isolatedModules"),
+            ("verbatimModuleSyntax", "verbatimModuleSyntax"),
+        ] {
+            let invalid = parse_compiler_options(&object([
+                (option, JsonValue::Bool(true)),
+                ("preserveConstEnums", JsonValue::Bool(false)),
+            ]));
+            assert_eq!(invalid.diagnostics.len(), 1);
+            assert_eq!(invalid.diagnostics[0].code(), 5091);
+            assert_eq!(
+                invalid.diagnostics[0].render().unwrap(),
+                format!(
+                    "Option 'preserveConstEnums' cannot be disabled when '{expected}' is enabled."
+                ),
+            );
+
+            let implicit = parse_compiler_options(&object([(option, JsonValue::Bool(true))]));
+            assert!(implicit.is_ok(), "{option}: {:?}", implicit.diagnostics);
+        }
+
+        let both = parse_compiler_options(&object([
+            ("isolatedModules", JsonValue::Bool(true)),
+            ("preserveConstEnums", JsonValue::Bool(false)),
+            ("verbatimModuleSyntax", JsonValue::Bool(true)),
+        ]));
+        assert_eq!(both.diagnostics[0].arguments, ["verbatimModuleSyntax"]);
+    }
+
+    #[test]
+    fn validates_decorator_metadata_and_bundler_module_compatibility() {
+        let metadata =
+            parse_compiler_options(&object([("emitDecoratorMetadata", JsonValue::Bool(true))]));
+        assert_eq!(metadata.diagnostics.len(), 1);
+        assert_eq!(metadata.diagnostics[0].code(), 5052);
+        assert_eq!(
+            metadata.diagnostics[0].render().unwrap(),
+            "Option 'emitDecoratorMetadata' cannot be specified without specifying option 'experimentalDecorators'.",
+        );
+
+        let incompatible = parse_compiler_options(&object([
+            ("module", JsonValue::String("NodeNext".into())),
+            ("moduleResolution", JsonValue::String("bundler".into())),
+        ]));
+        assert_eq!(
+            incompatible
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [5095, 5109],
+        );
+        assert_eq!(
+            incompatible.diagnostics[0].render().unwrap(),
+            "Option 'bundler' can only be used when 'module' is set to 'preserve', 'commonjs', or 'es2015' or later.",
+        );
+
+        for module in ["commonjs", "es2015", "esnext", "preserve"] {
+            let valid = parse_compiler_options(&object([
+                ("module", JsonValue::String(module.into())),
+                ("moduleResolution", JsonValue::String("bundler".into())),
+            ]));
+            assert!(valid.is_ok(), "{module}: {:?}", valid.diagnostics);
+        }
+    }
+
+    #[test]
     fn parses_and_normalizes_emit_path_options() {
         let config = parse_config_text(
             "/repo/tsconfig.json",
@@ -3554,6 +3835,7 @@ mod tests {
                 "compilerOptions": {
                     "outDir": "dist",
                     "rootDir": "src",
+                    "declaration": true,
                     "declarationDir": "types",
                     "declarationMap": true,
                     "inlineSourceMap": true,
@@ -3588,6 +3870,7 @@ mod tests {
                 "compilerOptions": {
                     "composite": true,
                     "isolatedDeclarations": true,
+                    "sourceMap": true,
                     "mapRoot": "maps",
                     "sourceRoot": "sources"
                 }

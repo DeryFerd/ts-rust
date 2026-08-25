@@ -2200,10 +2200,13 @@ impl Program {
             .rsplit_once('/')
             .map_or(".", |(directory, _)| directory);
         let mut options_result = parse_project_options(&config);
+        let config_source = file_system.read_file(&config.path).ok();
         config_diagnostics.extend(options_result.diagnostics.iter().map(|diagnostic| {
             ProgramDiagnostic {
                 file_name: Some(config.path.clone()),
-                range: None,
+                range: config_source.as_deref().and_then(|source| {
+                    compiler_option_diagnostic_range(&config.path, source, diagnostic)
+                }),
                 code: Some(diagnostic.code()),
                 category: diagnostic.category(),
                 message: diagnostic
@@ -8765,6 +8768,35 @@ fn compiler_option_key_range(
     primary: &str,
     fallback: Option<&str>,
 ) -> Option<TextRange> {
+    compiler_option_range(file_name, source, primary, fallback, false)
+}
+
+fn compiler_option_diagnostic_range(
+    file_name: &str,
+    source: &str,
+    diagnostic: &Diagnostic,
+) -> Option<TextRange> {
+    let (primary, fallback, value) = match diagnostic.code() {
+        5095 | 5109 => ("moduleResolution", None, true),
+        5110 => ("module", None, true),
+        5096 => ("allowImportingTsExtensions", None, true),
+        5051 | 5052 | 5053 | 5069 | 5089 | 5091 | 5098 | 6082 => (
+            diagnostic.arguments.first()?.as_str(),
+            diagnostic.arguments.get(1).map(String::as_str),
+            false,
+        ),
+        _ => return None,
+    };
+    compiler_option_range(file_name, source, primary, fallback, value)
+}
+
+fn compiler_option_range(
+    file_name: &str,
+    source: &str,
+    primary: &str,
+    fallback: Option<&str>,
+    on_value: bool,
+) -> Option<TextRange> {
     let parsed = ts_config::parse_jsonc(file_name, source).value?;
     let root = parsed.as_object()?;
     let options = root.get("compilerOptions")?.as_object()?;
@@ -8809,6 +8841,12 @@ fn compiler_option_key_range(
                 } else if options_depth == Some(object_depth)
                     && selected.is_some_and(|selected| value.eq_ignore_ascii_case(selected))
                 {
+                    if on_value {
+                        if scanner.scan().kind != SyntaxKind::ColonToken {
+                            return None;
+                        }
+                        return Some(scanner.scan().range);
+                    }
                     return Some(token.range);
                 }
             }
@@ -15265,6 +15303,82 @@ export function create() { return new M.Value(); }"#,
             [5069]
         );
         assert!(program.emit().files.is_empty());
+    }
+
+    #[test]
+    fn declaration_directory_diagnostic_retains_exact_config_key_range() {
+        let fs = MemoryFileSystem::new(true);
+        let config = concat!(
+            "{\n",
+            "  \"files\": [\"index.ts\"],\n",
+            "  \"compilerOptions\": { \"declarationDir\": \"out\", \"noLib\": true }\n",
+            "}\n",
+        );
+        fs.write_file("/project/tsconfig.json", config).unwrap();
+        fs.write_file("/project/index.ts", "export {};").unwrap();
+
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected one declaration-directory diagnostic: {:?}",
+                program.diagnostics()
+            )
+        };
+        assert_eq!(diagnostic.code, Some(5069));
+        assert_eq!(
+            diagnostic.file_name.as_deref(),
+            Some("/project/tsconfig.json")
+        );
+        assert_eq!(
+            diagnostic.message,
+            "Option 'declarationDir' cannot be specified without specifying option 'declaration' or option 'composite'.",
+        );
+        let range = diagnostic.range.unwrap();
+        assert_eq!(
+            &config[usize::try_from(range.start.get()).unwrap()
+                ..usize::try_from(range.end.get()).unwrap()],
+            "\"declarationDir\"",
+        );
+    }
+
+    #[test]
+    fn incompatible_bundler_diagnostics_retain_config_value_ranges_and_order() {
+        let fs = MemoryFileSystem::new(true);
+        let config = concat!(
+            "{\n",
+            "  \"files\": [\"index.ts\"],\n",
+            "  \"compilerOptions\": {\n",
+            "    \"module\": \"nodenext\",\n",
+            "    \"moduleResolution\": \"bundler\",\n",
+            "    \"noEmit\": true,\n",
+            "    \"noLib\": true\n",
+            "  }\n",
+            "}\n",
+        );
+        fs.write_file("/project/tsconfig.json", config).unwrap();
+        fs.write_file("/project/index.ts", "export {};").unwrap();
+
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [5095, 5109],
+        );
+        for diagnostic in program.diagnostics() {
+            assert_eq!(
+                diagnostic.file_name.as_deref(),
+                Some("/project/tsconfig.json")
+            );
+            let range = diagnostic.range.unwrap();
+            assert_eq!(
+                &config[usize::try_from(range.start.get()).unwrap()
+                    ..usize::try_from(range.end.get()).unwrap()],
+                "\"bundler\"",
+            );
+        }
     }
 
     #[test]
