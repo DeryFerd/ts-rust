@@ -4339,6 +4339,15 @@ impl Program {
             .get(&(containing, "tslib".to_owned()))
             .and_then(|file_name| self.source_file(file_name))
         else {
+            let message = message_by_code(2354).expect("TS2354 must be in the diagnostic catalog");
+            for (statement, _) in requirements {
+                diagnostics.push(self.canonical_program_diagnostic(
+                    Some(statement),
+                    None,
+                    &Diagnostic::with_arguments(message, ["tslib"]),
+                    std::iter::empty(),
+                )?);
+            }
             return Ok(());
         };
         let Some((_, bound)) = context.file(target.id) else {

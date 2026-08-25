@@ -34,6 +34,52 @@ fn helper_filesystem(exports: &str) -> MemoryFileSystem {
 }
 
 #[test]
+fn missing_commonjs_helper_package_reports_exact_ts2354_at_the_import() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/dependency.ts",
+            "export const value: number = 1; export { value as default };\n",
+        )
+        .unwrap();
+    let source = concat!(
+        "import selected from './dependency';\n",
+        "export const message = selected;\n",
+    );
+    filesystem.write_file("/project/main.ts", source).unwrap();
+
+    let program = Program::try_new_with_canonical_checker(
+        &filesystem,
+        "/project",
+        &["main.ts".to_owned()],
+        helper_options(),
+    )
+    .unwrap();
+
+    let [diagnostic] = program.diagnostics() else {
+        panic!(
+            "expected exactly one missing tslib diagnostic: {:?}",
+            program.diagnostics(),
+        )
+    };
+    assert_eq!(diagnostic.file_name.as_deref(), Some("/project/main.ts"));
+    assert_eq!(diagnostic.code, Some(2354));
+    assert_eq!(
+        diagnostic.message,
+        "This syntax requires an imported helper but module 'tslib' cannot be found.",
+    );
+    let range = diagnostic.range.unwrap();
+    let start = usize::try_from(range.start.get()).unwrap();
+    let end = usize::try_from(range.end.get()).unwrap();
+    assert_eq!(&source[start..end], "import selected from './dependency';");
+    assert!(
+        program
+            .source_file("/project/node_modules/tslib/tslib.d.ts")
+            .is_none()
+    );
+}
+
+#[test]
 fn missing_commonjs_import_helpers_report_exact_ordered_ts2343_diagnostics() {
     let filesystem = helper_filesystem("export declare const notAHelper: any;\n");
     filesystem
