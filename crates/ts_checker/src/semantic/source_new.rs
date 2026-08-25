@@ -48,7 +48,7 @@ use super::{
     source_imports::SourceImportBindingPlan,
     store::{CachedSignatureLookup, SourceNodeParent},
     type_nodes::{CanonicalTypeQuery, normalize_numeric_separators},
-    type_records::{TypeCacheState, type_list_key},
+    type_records::{StructuredTypeData, TypeCacheState, type_list_key},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -4390,6 +4390,27 @@ fn resolved_global_object_constructor(
             };
             signature
         };
+    validate_global_object_constructor_signature(
+        store,
+        plan.constructor,
+        plan.resolved_symbol,
+        global,
+        value_type,
+        signature,
+    )
+    .map(Some)
+}
+
+fn validate_global_object_constructor_signature(
+    store: &CanonicalTypeMapperStore,
+    constructor: NodeRef,
+    resolved_symbol: SemanticSymbolId,
+    global: &SourceGlobalObjectConstructorPlan,
+    value_type: TypeId,
+    signature: SignatureId,
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidConstructorCache(constructor));
+    let value = store.type_payload(value_type).ok_or_else(invalid)?;
     let record = store.signature(signature).ok_or_else(invalid)?;
     let allowed_flags = SignatureFlags::CONSTRUCT | SignatureFlags::HAS_LITERAL_TYPES;
     if value.flags() != TypeFlags::OBJECT
@@ -4430,7 +4451,7 @@ fn resolved_global_object_constructor(
             .map_err(|()| invalid())?
             .is_some_and(|cached| cached != global.object_type)
         || store
-            .declared_type_links(plan.resolved_symbol)
+            .declared_type_links(resolved_symbol)
             .and_then(|links| links.declared_type)
             != Some(global.object_type)
     {
@@ -4439,11 +4460,93 @@ fn resolved_global_object_constructor(
         )));
     }
 
-    Ok(Some(CheckedSourceDefaultNew {
+    Ok(CheckedSourceDefaultNew {
         value_type,
         instance_type: global.object_type,
         signature,
-    }))
+    })
+}
+
+/// Validates a source-published global constructor before its interface is expanded.
+pub(super) fn authenticated_lazy_global_object_constructor_return(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    signature: SignatureId,
+) -> Option<TypeId> {
+    let declaration = store.signature(signature)?.declaration()?;
+    let SourceNodeParent::Parent(owner_declaration) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    let bound = host.bound_file(owner_declaration)?;
+    let facts = bound.source_facts()?;
+    if !facts.is_default_library()
+        || !facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+    {
+        return None;
+    }
+    let owner = bound
+        .symbol(owner_declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))?;
+    let owner_name = store.symbol(owner)?.name().as_utf8()?;
+    let instance_name = match owner_name {
+        "ObjectConstructor" => "Object",
+        "BooleanConstructor" => "Boolean",
+        _ => return None,
+    };
+    let globals = store.symbol_table(store.intrinsic_bootstrap()?.globals)?;
+    if globals
+        .get_source(owner_name)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        != Some(owner)
+    {
+        return None;
+    }
+    let instance = globals
+        .get_source(instance_name)
+        .and_then(|symbol| store.get_merged_symbol(symbol))?;
+    let value_declaration = store.symbol(instance)?.value_declaration()?;
+    let global = plan_global_object_constructor(store, host, value_declaration, instance).ok()?;
+    let value_type = store.declared_type_links(owner)?.declared_type?;
+    let value = store.type_payload(value_type)?;
+    let TypeData::Interface(interface) = value.data() else {
+        return None;
+    };
+    if global.owner != owner
+        || global.declaration != declaration
+        || value.object_flags() != ObjectFlags::INTERFACE
+        || interface.declared_members_resolved
+        || interface.declared_members.is_some()
+        || interface.declared_call_signatures.is_some()
+        || interface.declared_construct_signatures.is_some()
+        || interface.declared_index_infos.is_some()
+        || interface.reference.object.structured != StructuredTypeData::default()
+        || store.type_has_declared_call_set_provenance(value_type)
+        || store
+            .declared_call_set_type_for_signature(signature)
+            .is_some()
+        || store
+            .callable_signature_parameter_types(signature)
+            .is_some()
+        || exact_type_cache(store, global.annotation).ok()? != Some(value_type)
+        || exact_class_value_type(store, instance).ok()? != Some(value_type)
+        || exact_type_cache(store, global.return_annotation).ok()? != Some(global.object_type)
+        || store.function_signature_return_annotation(signature)
+            != Some((global.return_annotation, false))
+    {
+        return None;
+    }
+    validate_global_object_constructor_signature(
+        store,
+        value_declaration,
+        instance,
+        &global,
+        value_type,
+        signature,
+    )
+    .ok()
+    .map(|checked| checked.instance_type)
 }
 
 fn resolved_global_date_constructor(
@@ -5877,6 +5980,27 @@ mod tests {
             store.checker_link_allocated_lengths(),
         );
 
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Ok(object_type)
+        );
+        let TypeData::Interface(interface) =
+            context.store().type_payload(value_type).unwrap().data()
+        else {
+            panic!("ObjectConstructor must remain an interface after its return query")
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(interface.reference.object.structured.signatures.is_none());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+
         context.recheck_source_file(source_file).unwrap();
 
         assert_eq!(
@@ -6240,6 +6364,27 @@ mod tests {
                 store.checker_link_allocated_lengths(),
             );
 
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Ok(expected_instance),
+            );
+            let TypeData::Interface(interface) =
+                context.store().type_payload(value).unwrap().data()
+            else {
+                panic!("BooleanConstructor must remain an interface after its return query")
+            };
+            assert!(!interface.declared_members_resolved);
+            assert!(interface.reference.object.structured.signatures.is_none());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+
             context.recheck_source_file(source_file).unwrap();
 
             assert_eq!(
@@ -6250,6 +6395,298 @@ mod tests {
                     context.store().checker_link_allocated_lengths(),
                 ),
                 warm,
+            );
+        }
+    }
+
+    #[test]
+    fn global_boolean_constructor_and_filter_reuse_the_same_authenticated_signature() {
+        let library = parse_source_file(concat!(
+            "interface Array<Value> { ",
+            "filter<Narrowed extends Value>(predicate: ",
+            "(value: Value, index: number, array: Value[]) => value is Narrowed, ",
+            "thisArg?: any): Narrowed[]; ",
+            "filter(predicate: ",
+            "(value: Value, index: number, array: Value[]) => unknown, ",
+            "thisArg?: any): Value[]; ",
+            "} ",
+            "interface ReadonlyArray<Value> {} ",
+            "interface Boolean { valueOf(): boolean; } ",
+            "interface BooleanConstructor { ",
+            "new(value?: any): Boolean; ",
+            "<Value>(value?: Value): boolean; ",
+            "readonly prototype: Boolean; ",
+            "} ",
+            "declare var Boolean: BooleanConstructor;",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+
+        for (index, source_text) in [
+            concat!(
+                "declare const values: any[]; ",
+                "const wrapped = new Boolean(true); ",
+                "const filtered: any[] = values.filter(Boolean);",
+            ),
+            concat!(
+                "declare const values: any[]; ",
+                "const filtered: any[] = values.filter(Boolean); ",
+                "const wrapped = new Boolean(true);",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parse_source_file(source_text);
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let library_file = FileId::new(1_860 + u32::try_from(index).unwrap() * 2);
+            let source_file = FileId::new(1_861 + u32::try_from(index).unwrap() * 2);
+            let mut context =
+                global_object_constructor_context(&library, &source, library_file, source_file);
+            let (construction, _) = variable_new(&source, source_file, "wrapped");
+
+            context.check_source_file(source_file).unwrap();
+
+            let store = context.store();
+            let globals = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap();
+            let owner = globals
+                .get_source("BooleanConstructor")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let owner_type = store
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let construction_signature = store
+                .signature_links(construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(store, owner_type)
+            else {
+                panic!("BooleanConstructor must publish authenticated call and construct sets")
+            };
+            assert_eq!(projection.call_signatures.len(), 1);
+            assert_eq!(
+                projection.construct_signatures.as_ref(),
+                &[construction_signature],
+            );
+            assert_eq!(
+                store.declared_call_set_type_for_signature(construction_signature),
+                Some(owner_type),
+            );
+            let expected_instance = context.global_types().boolean_type;
+            let warm = (
+                store.type_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                context.get_return_type_of_signature(construction_signature),
+                Ok(expected_instance),
+            );
+            assert!(context.diagnostics().is_empty());
+            context.recheck_source_file(source_file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{source_text}",
+            );
+        }
+    }
+
+    #[test]
+    fn lazy_boolean_constructor_upgrades_without_replacing_or_trusting_a_poisoned_signature() {
+        let library = global_boolean_constructor_library();
+
+        for (index, poison) in [false, true].into_iter().enumerate() {
+            let source = parse_source_file("const result = new Boolean(true);");
+            let library_file = FileId::new(1_868 + u32::try_from(index).unwrap() * 2);
+            let source_file = FileId::new(1_869 + u32::try_from(index).unwrap() * 2);
+            let mut context =
+                global_object_constructor_context(&library, &source, library_file, source_file);
+            let (construction, _) = variable_new(&source, source_file, "result");
+
+            context.check_source_file(source_file).unwrap();
+
+            let owner = context
+                .store()
+                .symbol_table(context.store().intrinsic_bootstrap().unwrap().globals)
+                .and_then(|globals| globals.get_source("BooleanConstructor"))
+                .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                .unwrap();
+            let signature = context
+                .store()
+                .signature_links(construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let instance = context.global_types().boolean_type;
+
+            if poison {
+                let incorrect = context.store().intrinsic_bootstrap().unwrap().string_type;
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_resolved_return_type(signature, Some(incorrect))
+                );
+                let poisoned = (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                );
+                assert!(context.get_declared_type_of_symbol(owner).is_err());
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().signature_len(),
+                        context.store().symbol_len(),
+                        context.store().checker_link_allocated_lengths(),
+                    ),
+                    poisoned,
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_resolved_return_type(signature, Some(instance))
+                );
+            }
+
+            let constructor = context.get_declared_type_of_symbol(owner).unwrap();
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(context.store(), constructor)
+            else {
+                panic!("BooleanConstructor must publish an authenticated callable set")
+            };
+            assert_eq!(projection.call_signatures.len(), 1);
+            assert_eq!(projection.construct_signatures.as_ref(), &[signature]);
+            assert_eq!(
+                context
+                    .store()
+                    .declared_call_set_type_for_signature(signature),
+                Some(constructor),
+            );
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Ok(instance)
+            );
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(context.get_declared_type_of_symbol(owner), Ok(constructor));
+            context.recheck_source_file(source_file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn lazy_global_wrapper_constructor_returns_reject_poisoned_signatures() {
+        for (index, (name, library_text)) in [
+            (
+                "Object",
+                concat!(
+                    "interface Object {} ",
+                    "interface ObjectConstructor { ",
+                    "new(value?: any): Object; ",
+                    "readonly prototype: Object; ",
+                    "} declare var Object: ObjectConstructor;",
+                ),
+            ),
+            (
+                "Boolean",
+                concat!(
+                    "interface Boolean { valueOf(): boolean; } ",
+                    "interface BooleanConstructor { ",
+                    "new(value?: any): Boolean; ",
+                    "<Value>(value?: Value): boolean; ",
+                    "readonly prototype: Boolean; ",
+                    "} declare var Boolean: BooleanConstructor;",
+                ),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let library = parse_source_file(library_text);
+            let source = parse_source_file(&format!("const result = new {name}();"));
+            let library_file = FileId::new(1_864 + u32::try_from(index).unwrap() * 2);
+            let source_file = FileId::new(1_865 + u32::try_from(index).unwrap() * 2);
+            let mut context =
+                global_object_constructor_context(&library, &source, library_file, source_file);
+            let (construction, _) = variable_new(&source, source_file, "result");
+
+            context.check_source_file(source_file).unwrap();
+
+            let signature = context
+                .store()
+                .signature_links(construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let expected = context
+                .store()
+                .signature(signature)
+                .and_then(Signature::resolved_return_type)
+                .unwrap();
+            let poison = context.store().intrinsic_bootstrap().unwrap().string_type;
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_resolved_return_type(signature, Some(poison))
+            );
+            let poisoned = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                context.get_return_type_of_signature(signature),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    super::super::type_nodes::TypeNodeUnavailable::InvalidFunctionSignature(actual)
+                )) if actual == signature
+            ));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                poisoned,
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_resolved_return_type(signature, Some(expected))
+            );
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Ok(expected)
             );
         }
     }

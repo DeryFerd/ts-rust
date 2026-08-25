@@ -19022,14 +19022,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
             kind @ (SyntaxKind::CallSignature | SyntaxKind::ConstructSignature) => {
                 self.reject_type_reference_alias_capabilities()?;
-                let owner = self
-                    .store
-                    .declared_call_set_type_for_signature(signature)
-                    .ok_or_else(|| {
-                        type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
-                            signature,
+                let Some(owner) = self.store.declared_call_set_type_for_signature(signature) else {
+                    return if kind == SyntaxKind::ConstructSignature {
+                        super::source_new::authenticated_lazy_global_object_constructor_return(
+                            self.store, self.host, signature,
+                        )
+                        .ok_or_else(|| {
+                            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                                signature,
+                            ))
+                        })
+                    } else {
+                        Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidFunctionSignature(signature),
                         ))
-                    })?;
+                    };
+                };
                 let StoredCallableSetValidation::Valid { projection, .. } =
                     validate_stored_callable_set(self.store, owner)
                 else {

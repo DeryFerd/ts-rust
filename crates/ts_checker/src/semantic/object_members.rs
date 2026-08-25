@@ -11009,15 +11009,155 @@ fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyOb
                 .value_symbol_links(property.symbol)
                 .is_none_or(|links| links == &ValueSymbolLinks::default())
     }) && plan.call_signatures.iter().all(|signature| {
-        store
-            .signature_links(signature.declaration)
-            .is_none_or(|links| links == &SignatureLinks::default())
-            && signature.parameters.iter().all(|parameter| {
-                store
-                    .value_symbol_links(parameter.symbol)
-                    .is_none_or(|links| links == &ValueSymbolLinks::default())
-            })
+        authenticated_lazy_global_constructor_signature(store, plan, signature).is_some()
+            || store
+                .signature_links(signature.declaration)
+                .is_none_or(|links| links == &SignatureLinks::default())
+                && signature.parameters.iter().all(|parameter| {
+                    store
+                        .value_symbol_links(parameter.symbol)
+                        .is_none_or(|links| links == &ValueSymbolLinks::default())
+                })
     })
+}
+
+/// Recognizes the exact partial Object/Boolean constructor published by source construction.
+fn authenticated_lazy_global_constructor_signature(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    planned: &PlannedCallSignature,
+) -> Option<SignatureId> {
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let globals = store.symbol_table(bootstrap.globals)?;
+    let owner = store.symbol(plan.symbol)?;
+    let (instance_name, constructor_name) = match owner.name().as_utf8()? {
+        "ObjectConstructor" => ("Object", "ObjectConstructor"),
+        "BooleanConstructor" => ("Boolean", "BooleanConstructor"),
+        _ => return None,
+    };
+    let instance = globals
+        .get_source(instance_name)
+        .and_then(|symbol| store.get_merged_symbol(symbol))?;
+    let instance_record = store.symbol(instance)?;
+    let instance_type = store.declared_type_links(instance)?.declared_type?;
+    let value_type = store.declared_type_links(plan.symbol)?.declared_type?;
+    let value_record = store.type_payload(value_type)?;
+    let TypeData::Interface(interface) = value_record.data() else {
+        return None;
+    };
+    let [parameter] = planned.parameters.as_slice() else {
+        return None;
+    };
+    let links = store.signature_links(planned.declaration)?;
+    let signature = links.resolved_signature.signature()?;
+    let record = store.signature(signature)?;
+    let parameter_record = store.symbol(parameter.symbol)?;
+    let parameter_declaration = parameter_record.value_declaration()?;
+    let value_declaration = instance_record.value_declaration()?;
+    let value_annotation = store.source_direct_type_annotation(value_declaration)?;
+    let SourceNodeParent::Parent(owner_declaration) =
+        store.source_node_parent(planned.declaration)?
+    else {
+        return None;
+    };
+
+    (plan.kind == PropertyObjectKind::Interface
+        && plan.heritage.is_none()
+        && planned.flags == SignatureFlags::CONSTRUCT
+        && planned.type_parameters.is_empty()
+        && !planned.implicit_any_return
+        && !planned.return_null_literal_identity
+        && planned.min_argument_count() == 0
+        && parameter.optional
+        && !parameter.implicit_any_rest
+        && globals
+            .get_source(constructor_name)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            == Some(plan.symbol)
+        && owner.flags() == SymbolFlags::INTERFACE
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.parent().is_none()
+        && owner.declarations().is_some_and(|declarations| {
+            declarations.contains(&owner_declaration)
+                && plan.declarations.contains(&owner_declaration)
+        })
+        && owner
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+            == Some(planned.symbol)
+        && instance_record
+            .flags()
+            .contains(SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        && instance_record.name().as_utf8() == Some(instance_name)
+        && instance_record.parent().is_none()
+        && store.get_merged_symbol(instance) == Some(instance)
+        && store.value_symbol_links(instance)
+            == Some(&ValueSymbolLinks {
+                resolved_type: Some(value_type),
+                ..ValueSymbolLinks::default()
+            })
+        && store
+            .type_node_links(value_annotation)
+            .and_then(|links| links.resolved_type)
+            == Some(value_type)
+        && value_record.flags() == TypeFlags::OBJECT
+        && value_record.object_flags() == ObjectFlags::INTERFACE
+        && value_record.symbol() == Some(plan.symbol)
+        && value_record.alias().is_none()
+        && valid_unresolved_interface_members(interface)
+        && !store.type_has_declared_call_set_provenance(value_type)
+        && store
+            .declared_call_set_type_for_signature(signature)
+            .is_none()
+        && links
+            == &(SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            })
+        && record.flags() == SignatureFlags::CONSTRUCT
+        && record.declaration() == Some(planned.declaration)
+        && record.parameters() == [parameter.symbol]
+        && record.min_argument_count() == 0
+        && record.resolved_min_argument_count() == -1
+        && record.resolved_return_type() == Some(instance_type)
+        && record.type_parameters().is_empty()
+        && record.this_parameter().is_none()
+        && record.resolved_type_predicate().is_none()
+        && record.target().is_none()
+        && record.mapper().is_none()
+        && record.isolated_signature_type().is_none()
+        && record.composite().is_none()
+        && !store.signature_has_circular_return_type(signature)
+        && store
+            .callable_signature_parameter_types(signature)
+            .is_none()
+        && store.function_signature_return_annotation(signature)
+            == Some((planned.return_identity_node, false))
+        && valid_planned_signature_return(store, planned, instance_type)
+        && planned_call_parameter_type(store, parameter) == Some(bootstrap.any_type)
+        && parameter_record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        && parameter_record.check_flags() == CheckFlags::NONE
+        && parameter_record.declarations() == Some(&[parameter_declaration])
+        && parameter_record.parent().is_none()
+        && parameter_record.members().is_none()
+        && parameter_record.exports().is_none()
+        && parameter_record.export_symbol().is_none()
+        && store.get_merged_symbol(parameter.symbol) == Some(parameter.symbol)
+        && store.source_node_kind(parameter_declaration) == Some(SyntaxKind::Parameter)
+        && store.source_node_parent(parameter_declaration)
+            == Some(SourceNodeParent::Parent(planned.declaration))
+        && declared_signature_parameter_is_optional(
+            store,
+            parameter_declaration,
+            bootstrap.any_type,
+        ) == Some(true)
+        && store.value_symbol_links(parameter.symbol)
+            == Some(&ValueSymbolLinks {
+                resolved_type: Some(bootstrap.any_type),
+                ..ValueSymbolLinks::default()
+            }))
+    .then_some(signature)
 }
 
 fn resolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyObjectPlan) -> bool {
@@ -11953,6 +12093,37 @@ pub(super) fn publish_declared_members(
     if !valid_indexes {
         return Err(invalid_cache(plan, type_));
     }
+    let existing_signatures = plan
+        .call_signatures
+        .iter()
+        .map(|planned| {
+            store
+                .signature_links(planned.declaration)
+                .filter(|links| *links != &SignatureLinks::default())
+                .map(|_| {
+                    authenticated_lazy_global_constructor_signature(store, plan, planned)
+                        .ok_or_else(|| invalid_cache(plan, type_))
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if plan
+        .call_signatures
+        .iter()
+        .zip(call_types)
+        .zip(&existing_signatures)
+        .any(|((planned, resolved), existing)| {
+            existing.is_some_and(|signature| {
+                store.signature(signature).is_none_or(|record| {
+                    record.resolved_return_type() != Some(resolved.return_type)
+                        || record.parameters().len() != resolved.parameter_types.len()
+                        || planned.parameters.len() != resolved.parameter_types.len()
+                })
+            })
+        })
+    {
+        return Err(invalid_cache(plan, type_));
+    }
     let call_type_parameters = plan
         .call_signatures
         .iter()
@@ -11974,10 +12145,15 @@ pub(super) fn publish_declared_members(
     let annotated_signature_count = plan
         .call_signatures
         .iter()
-        .filter(|signature| !signature.implicit_any_return)
+        .zip(&existing_signatures)
+        .filter(|(signature, existing)| !signature.implicit_any_return && existing.is_none())
+        .count();
+    let cold_signature_count = existing_signatures
+        .iter()
+        .filter(|signature| signature.is_none())
         .count();
     if !store.try_reserve_index_infos(plan.indexes.len())
-        || !store.try_reserve_signatures(plan.call_signatures.len())
+        || !store.try_reserve_signatures(cold_signature_count)
         || !store.try_reserve_value_symbol_links(missing_accessor_links)
         || !store.try_reserve_function_signature_return_annotations(annotated_signature_count)
         || !store.try_reserve_callable_signature_parameter_types(plan.call_signatures.len())
@@ -12033,31 +12209,39 @@ pub(super) fn publish_declared_members(
         .iter()
         .zip(call_types)
         .zip(call_type_parameters)
-        .map(|((planned, resolved), type_parameters)| {
-            store
-                .alloc_signature(
-                    planned.flags,
-                    Some(planned.declaration),
-                    type_parameters,
-                    None,
-                    planned
-                        .parameters
-                        .iter()
-                        .map(|parameter| parameter.symbol)
-                        .collect(),
-                    Some(resolved.return_type),
-                    None,
-                    i32::try_from(planned.min_argument_count())
-                        .expect("the call-signature plan validated its minimum arity"),
-                )
-                .expect("the declared-call plan and reservation validated every identity")
+        .zip(&existing_signatures)
+        .map(|(((planned, resolved), type_parameters), existing)| {
+            existing.unwrap_or_else(|| {
+                store
+                    .alloc_signature(
+                        planned.flags,
+                        Some(planned.declaration),
+                        type_parameters,
+                        None,
+                        planned
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.symbol)
+                            .collect(),
+                        Some(resolved.return_type),
+                        None,
+                        i32::try_from(planned.min_argument_count())
+                            .expect("the call-signature plan validated its minimum arity"),
+                    )
+                    .expect("the declared-call plan and reservation validated every identity")
+            })
         })
         .collect::<Vec<_>>();
     if !signatures.is_empty() {
         assert!(store.set_declared_call_set_provenance(type_, &signatures));
     }
-    for (planned, signature) in plan.call_signatures.iter().zip(&signatures) {
-        if !planned.implicit_any_return {
+    for ((planned, signature), existing) in plan
+        .call_signatures
+        .iter()
+        .zip(&signatures)
+        .zip(&existing_signatures)
+    {
+        if !planned.implicit_any_return && existing.is_none() {
             assert!(store.set_function_signature_return_annotation(
                 *signature,
                 planned.return_identity_node,
