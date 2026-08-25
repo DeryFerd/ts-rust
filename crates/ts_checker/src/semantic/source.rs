@@ -31188,6 +31188,97 @@ mod tests {
     }
 
     #[test]
+    fn javascript_class_expandos_are_typed_unsupported_before_class_publication() {
+        for (index, source_text) in [
+            "class C { static blah1 = 123; } C.blah2 = 456;",
+            concat!(
+                "class C { static blah1 = 123; } ",
+                "C.blah2 = 456; ",
+                "class D extends C { static { ",
+                "console.log(super.blah1); console.log(super.blah2); ",
+                "} }",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parse_javascript_source_file(source_text);
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let file = FileId::new(8_570 + u32::try_from(index).unwrap());
+            let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+            let owner = global_symbol(&context, "C");
+            let expando = context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source("blah2"))
+                .expect("the JavaScript binder must retain the class expando");
+            assert_eq!(
+                context.store().symbol(expando).unwrap().flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT,
+            );
+            let assignment = context
+                .store()
+                .symbol(expando)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .unwrap();
+            let cold = observable_state(&context, file);
+
+            for _ in 0..2 {
+                assert!(matches!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(node)))
+                        if node == assignment
+                ));
+                assert_eq!(observable_state(&context, file), cold);
+                assert!(context.store().declared_type_links(owner).is_none());
+                assert!(context.store().value_symbol_links(owner).is_none());
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn javascript_class_expandos_do_not_hide_poisoned_static_field_caches() {
+        let source = parse_javascript_source_file("class C { static blah1 = 123; } C.blah2 = 456;");
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_572);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+        let owner = global_symbol(&context, "C");
+        let initializer = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::PropertyDeclaration(property) = &record.data else {
+                    return None;
+                };
+                property
+                    .initializer
+                    .map(|node| NodeRef::new(source.arena.id(), file, node))
+            })
+            .expect("the static field must retain its numeric initializer");
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            initializer,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Class(initializer)),
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(context.store().declared_type_links(owner).is_none());
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
     fn constructor_factory_field_initialization_reports_exact_related_property() {
         let source = parsed(concat!(
             "class Base {}\n",

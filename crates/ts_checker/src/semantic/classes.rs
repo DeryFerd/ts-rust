@@ -3397,6 +3397,146 @@ fn plan_class_owner_declarations(
     Ok((declaration, exports))
 }
 
+/// Distinguishes real JavaScript class expandos from malformed static tables.
+fn authenticated_javascript_class_expando(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    static_members: SymbolTableId,
+    declared_names: &HashSet<String>,
+) -> Option<NodeRef> {
+    let bound = host.bound_file(declaration)?;
+    if !bound
+        .source_facts()
+        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
+        || store.declared_type_links(owner).is_some()
+        || store
+            .value_symbol_links(owner)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return None;
+    }
+
+    let owner_record = store.symbol(owner)?;
+    let owner_name = owner_record.name().as_utf8()?;
+    let class_record = host.node(declaration)?;
+    let table = store.symbol_table(static_members)?;
+    let mut first_assignment = None;
+
+    for (name, symbol) in table.iter() {
+        let name = name.as_utf8()?;
+        if name == PROTOTYPE_NAME || declared_names.contains(name) {
+            continue;
+        }
+
+        let record = store.symbol(symbol)?;
+        let declarations = record.declarations()?;
+        if declarations.is_empty()
+            || record.flags() != (SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT)
+            || record.check_flags() != CheckFlags::NONE
+            || record.name().as_utf8() != Some(name)
+            || record
+                .value_declaration()
+                .is_none_or(|value| !declarations.contains(&value))
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent() != Some(owner)
+            || record.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || store
+                .value_symbol_links(symbol)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+        {
+            return None;
+        }
+
+        for &assignment in declarations {
+            if !assignment.is_for(declaration.arena, declaration.file)
+                || bound.symbol(assignment) != Some(symbol)
+            {
+                return None;
+            }
+            let assignment_record = host.node(assignment)?;
+            let NodeData::BinaryExpression(binary) = &assignment_record.data else {
+                return None;
+            };
+            let statement =
+                NodeRef::new(assignment.arena, assignment.file, assignment_record.parent?);
+            let statement_record = host.node(statement)?;
+            let NodeData::ExpressionStatement(expression) = &statement_record.data else {
+                return None;
+            };
+            let left = NodeRef::new(assignment.arena, assignment.file, binary.left);
+            let left_record = host.node(left)?;
+            let NodeData::PropertyAccessExpression(access) = &left_record.data else {
+                return None;
+            };
+            let receiver = NodeRef::new(left.arena, left.file, access.expression);
+            let receiver_record = host.node(receiver)?;
+            let NodeData::Identifier(receiver_name) = &receiver_record.data else {
+                return None;
+            };
+            let property_name = NodeRef::new(left.arena, left.file, access.name);
+            let property_record = host.node(property_name)?;
+            let NodeData::Identifier(property_identifier) = &property_record.data else {
+                return None;
+            };
+            let operator = NodeRef::new(assignment.arena, assignment.file, binary.operator_token);
+            let operator_record = host.node(operator)?;
+            let right = NodeRef::new(assignment.arena, assignment.file, binary.right);
+            let right_record = host.node(right)?;
+            let NodeData::NumericLiteral(literal) = &right_record.data else {
+                return None;
+            };
+
+            if assignment_record.kind != SyntaxKind::BinaryExpression
+                || assignment_record.flags.0 != 0
+                || assignment_record.range.start < class_record.range.end
+                || binary.facts != 0
+                || binary.symbol.is_some()
+                || binary.type_.is_some()
+                || binary.modifiers.is_some()
+                || statement_record.kind != SyntaxKind::ExpressionStatement
+                || statement_record.flags.0 != 0
+                || statement_record.parent != Some(bound.source_file().node)
+                || expression.expression != assignment.node
+                || expression.flow_node.is_some()
+                || left_record.kind != SyntaxKind::PropertyAccessExpression
+                || left_record.flags.0 != 0
+                || left_record.parent != Some(assignment.node)
+                || access.flow_node.is_some()
+                || access.question_dot_token.is_some()
+                || access.facts != 0
+                || receiver_record.kind != SyntaxKind::Identifier
+                || receiver_record.flags.0 != 0
+                || receiver_record.parent != Some(left.node)
+                || receiver_name.flow_node.is_some()
+                || receiver_name.text != owner_name
+                || property_record.kind != SyntaxKind::Identifier
+                || property_record.flags.0 != 0
+                || property_record.parent != Some(left.node)
+                || property_identifier.flow_node.is_some()
+                || property_identifier.text != name
+                || operator_record.kind != SyntaxKind::EqualsToken
+                || operator_record.flags.0 != 0
+                || operator_record.parent != Some(assignment.node)
+                || !matches!(operator_record.data, NodeData::Token(_))
+                || right_record.kind != SyntaxKind::NumericLiteral
+                || right_record.flags.0 != 0
+                || right_record.parent != Some(assignment.node)
+                || literal.token_flags.0 != 0
+                || ts_jsnum::from_string(&literal.text).is_nan()
+            {
+                return None;
+            }
+            first_assignment.get_or_insert(assignment);
+        }
+    }
+
+    first_assignment
+}
+
 /// Produces the opaque syntax/binder proof consumed by the class shell
 /// executor and the root annotation adapter.
 fn plan_class_declaration(
@@ -3757,11 +3897,36 @@ fn plan_class_declaration(
         .and_then(|count| count.checked_add(namespace_exports.len()))
         .and_then(|count| count.checked_add(1))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(declaration)))?;
-    if static_table.len() != expected_static_members
-        || namespace_exports
-            .iter()
-            .any(|export| !static_names.insert(export.name.clone()))
+    if namespace_exports
+        .iter()
+        .any(|export| !static_names.insert(export.name.clone()))
     {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    }
+    if static_table.len() != expected_static_members {
+        if static_table.len() > expected_static_members
+            && let Some(expando) = authenticated_javascript_class_expando(
+                store,
+                host,
+                symbol,
+                declaration,
+                static_members,
+                &static_names,
+            )
+        {
+            for property in &properties {
+                let type_ = planned_property_type(store, host, property)?;
+                validate_property_cache_state(store, property, type_)?;
+            }
+            for method in &methods {
+                let type_ = method_return_type(store, host, method)?;
+                validate_method_cache_state(store, method, type_)?;
+            }
+            return Err(unsupported(ClassUnsupported::Member {
+                node: expando,
+                kind: SyntaxKind::BinaryExpression,
+            }));
+        }
         return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
     }
 
