@@ -2897,6 +2897,130 @@ fn validate_unbranded_signature_record(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Generic syntax and cached constraints share one authenticated display proof.
+fn append_function_type_parameters(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    owner: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+    result: &mut String,
+) -> Result<(), TypeDisplayUnavailable> {
+    if single_callable_family(store, owner) != Some(CallableFamily::FunctionType) {
+        return Ok(());
+    }
+    let StoredSingleCallableValidation::Valid {
+        family: CallableFamily::FunctionType,
+        callable,
+        ..
+    } = validate_stored_single_callable(store, owner)
+    else {
+        return Err(TypeDisplayUnavailable::MalformedType(owner));
+    };
+    let signature = store
+        .signature(callable.signature)
+        .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    if signature.type_parameters().is_empty() {
+        return Ok(());
+    }
+    let host = host.ok_or(TypeDisplayUnavailable::FunctionType {
+        type_id: owner,
+        reason: FunctionTypeDisplayUnavailable::SourceContext,
+    })?;
+    let function = signature
+        .declaration()
+        .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    let function_record = host
+        .node(function)
+        .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    let NodeData::FunctionTypeNode(function_data) = &function_record.data else {
+        return Err(TypeDisplayUnavailable::MalformedType(owner));
+    };
+    let declarations = function_data
+        .type_parameters
+        .as_ref()
+        .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    if function_record.kind != SyntaxKind::FunctionType
+        || declarations.nodes.len() != signature.type_parameters().len()
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(owner));
+    }
+
+    result.push('<');
+    state.add(2);
+    for (index, (declaration, parameter)) in declarations
+        .nodes
+        .iter()
+        .zip(signature.type_parameters())
+        .enumerate()
+    {
+        let declaration = NodeRef::new(function.arena, function.file, *declaration);
+        let declaration_record = host
+            .node(declaration)
+            .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+        let NodeData::TypeParameterDeclaration(parameter_data) = &declaration_record.data else {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        };
+        let symbol = cached_ordinary_type_parameter_owner(store, *parameter)
+            .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+        if declaration_record.kind != SyntaxKind::TypeParameter
+            || declaration_record.parent != Some(function.node)
+            || !host.symbol_matches(store, declaration, symbol)
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        }
+        if index != 0 {
+            result.push_str(", ");
+            state.add(2);
+        }
+        result.push_str(&display_type_worker(
+            store,
+            Some(host),
+            global_types,
+            *parameter,
+            flags,
+            state,
+            visiting,
+        )?);
+        if let Some(annotation) = parameter_data.constraint {
+            let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+            let Some(TypeData::TypeParameter(parameter_type)) =
+                store.type_payload(*parameter).map(TypeRecord::data)
+            else {
+                return Err(TypeDisplayUnavailable::MalformedType(owner));
+            };
+            let constraint = parameter_type
+                .constraint
+                .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+            if host
+                .node(annotation)
+                .is_none_or(|annotation_record| annotation_record.parent != Some(declaration.node))
+                || store
+                    .type_node_links(annotation)
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|cached| cached != constraint)
+            {
+                return Err(TypeDisplayUnavailable::MalformedType(owner));
+            }
+            result.push_str(" extends ");
+            state.add(9);
+            result.push_str(&display_type_worker(
+                store,
+                Some(host),
+                global_types,
+                constraint,
+                flags,
+                state,
+                visiting,
+            )?);
+        }
+    }
+    result.push('>');
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn display_single_call_signature(
     store: &CanonicalTypeMapperStore,
@@ -2910,7 +3034,18 @@ fn display_single_call_signature(
     // Pinned `signatureToSignatureDeclarationHelper`: three units is the
     // minimum signature contribution, independent of the emitted punctuation.
     state.add(3);
-    let mut result = String::from("(");
+    let mut result = String::new();
+    append_function_type_parameters(
+        store,
+        host,
+        global_types,
+        projection.owner,
+        flags,
+        state,
+        visiting,
+        &mut result,
+    )?;
+    result.push('(');
     for (index, parameter) in projection.parameters.iter().enumerate() {
         if index != 0 {
             result.push_str(", ");
@@ -8576,6 +8711,115 @@ mod tests {
                 .is_some_and(|record| record.flags().intersects(TypeFlags::UNION)),
             "display must use this optional value union together with syntactic `?`",
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One union covers lazy returns, warm identity, and poisoned constraints.
+    fn generic_function_type_unions_preserve_authenticated_parameter_constraints() {
+        let parsed = parse_source_file(concat!(
+            "declare const value: ",
+            "(<T extends number>(a: T) => void) | (<T>(a: string) => void);",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(214);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let annotation = variable_type_node(&parsed, file, "value");
+        let union = context.get_type_from_type_node(annotation).unwrap();
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().relation_state_snapshot(),
+        );
+
+        assert!(matches!(
+            context.type_to_string(union),
+            Err(TypeDisplayUnavailable::FunctionType {
+                reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
+                ..
+            })
+        ));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            before,
+        );
+
+        resolve_all_function_returns(&mut context, &parsed, file);
+        let expected = "(<T extends number>(a: T) => void) | (<T>(a: string) => void)";
+        assert_eq!(context.type_to_string(union).unwrap(), expected);
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().relation_state_snapshot(),
+        );
+        assert_eq!(context.type_to_string(union).unwrap(), expected);
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            warm,
+        );
+
+        let function = function_type_nodes(&parsed, file)[0];
+        let signature = function_signature(&context, function).unwrap();
+        let [parameter] = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+        else {
+            panic!("the constrained function must retain exactly one generic parameter")
+        };
+        let parameter = *parameter;
+        let (constraint, target, mapper, default) =
+            match context.store().type_payload(parameter).unwrap().data() {
+                TypeData::TypeParameter(data) => (
+                    data.constraint,
+                    data.target,
+                    data.mapper,
+                    data.resolved_default_type,
+                ),
+                _ => unreachable!(),
+            };
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_parameter_resolution(
+            parameter,
+            Some(string),
+            target,
+            mapper,
+            default,
+        ));
+        let poisoned = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().relation_state_snapshot(),
+        );
+        assert!(context.type_to_string(union).is_err());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            poisoned,
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_parameter_resolution(parameter, constraint, target, mapper, default,)
+        );
+        assert_eq!(context.type_to_string(union).unwrap(), expected);
     }
 
     #[test]
