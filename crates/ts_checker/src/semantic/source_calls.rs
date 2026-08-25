@@ -1989,12 +1989,77 @@ fn check_authenticated_array_callback_call(
         }
         _ => return Err(SourceCheckError::Call(plan.node)),
     };
-    if preflight_call_publication(store, plan.node, return_type)?
-        .is_some_and(|existing| existing != signature.signature)
-    {
-        return Err(SourceCheckError::Call(plan.node));
-    }
-    publish_call_links(store, plan.node, signature.signature, return_type)?;
+    let existing_signature = preflight_call_publication(store, plan.node, return_type)?;
+    let call_signature = if template_return == return_type {
+        if existing_signature.is_some_and(|existing| existing != signature.signature) {
+            return Err(SourceCheckError::Call(plan.node));
+        }
+        signature.signature
+    } else {
+        let mut mapper_sources = vec![source_element];
+        let mut mapper_targets = vec![array.element_type];
+        if let Some(parameter) = generic_parameter {
+            let inferred = if method_name == "map" {
+                callback_return
+            } else {
+                callback_predicate
+            }
+            .ok_or(SourceCheckError::Call(plan.node))?;
+            mapper_sources.push(parameter);
+            mapper_targets.push(inferred);
+        }
+
+        if let Some(existing) = existing_signature {
+            let instantiated = store
+                .signature(existing)
+                .ok_or(SourceCheckError::Call(plan.node))?;
+            let original = store
+                .signature(signature.signature)
+                .ok_or(SourceCheckError::Call(plan.node))?;
+            let mapper = instantiated
+                .mapper()
+                .ok_or(SourceCheckError::Call(plan.node))?;
+            if instantiated.target() != Some(signature.signature)
+                || instantiated.resolved_return_type() != Some(return_type)
+                || !instantiated.type_parameters().is_empty()
+                || instantiated.flags() != original.flags() & SignatureFlags::PROPAGATING_FLAGS
+                || instantiated.declaration() != original.declaration()
+                || instantiated.min_argument_count() != original.min_argument_count()
+                || instantiated.parameters().len() != original.parameters().len()
+                || store.type_mapper_has_exact_endpoints(mapper, &mapper_sources, &mapper_targets)
+                    != Some(true)
+                || instantiated
+                    .parameters()
+                    .iter()
+                    .copied()
+                    .zip(original.parameters().iter().copied())
+                    .any(|(parameter, target)| {
+                        parameter != target
+                            && store.value_symbol_links(parameter).is_none_or(|links| {
+                                links.target != Some(target) || links.mapper != Some(mapper)
+                            })
+                    })
+            {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            existing
+        } else {
+            if !store.try_reserve_mappers(1) {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            let mapper = store
+                .new_type_mapper(mapper_sources, mapper_targets)
+                .ok_or(SourceCheckError::Call(plan.node))?;
+            let instantiated = store
+                .instantiate_signature_ex(signature.signature, mapper, true)
+                .map_err(|_| SourceCheckError::Call(plan.node))?;
+            if !store.set_signature_resolved_return_type(instantiated, Some(return_type)) {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            instantiated
+        }
+    };
+    publish_call_links(store, plan.node, call_signature, return_type)?;
     Ok(Some(CheckedSourceCall { return_type }))
 }
 
@@ -8324,6 +8389,25 @@ mod tests {
                 assert_eq!(array.element_type, expected);
                 assert!(!array.readonly);
             }
+
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                call_publication_state(&context, *mapped),
+                call_publication_state(&context, *filtered),
+            );
+            context.recheck_source_file(source_file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    call_publication_state(&context, *mapped),
+                    call_publication_state(&context, *filtered),
+                ),
+                warm,
+            );
         }
     }
 
