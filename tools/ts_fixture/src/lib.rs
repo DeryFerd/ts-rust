@@ -4480,6 +4480,12 @@ fn compile_case_variant(
             None,
         ),
     };
+    let diagnostic_source_text = |file_name: &str| {
+        program
+            .source_file(file_name)
+            .map(|source_file| SourceText::from(source_file.source_text.clone()))
+            .or_else(|| file_system.read_file(file_name).ok().map(SourceText::from))
+    };
     // The Go harness baselines pre-emit program/syntactic/semantic/global and
     // declaration diagnostics. Emit-result diagnostics are not part of that
     // stream, so use Program's aggregate as the closest available Rust API.
@@ -4491,8 +4497,7 @@ fn compile_case_variant(
             source_text: diagnostic
                 .file_name
                 .as_deref()
-                .and_then(|file_name| program.source_file(file_name))
-                .map(|source_file| SourceText::from(source_file.source_text.clone())),
+                .and_then(&diagnostic_source_text),
             range: diagnostic.range,
             code: diagnostic.code,
             category: Some(match diagnostic.category {
@@ -4516,10 +4521,7 @@ fn compile_case_variant(
                             source_text: related
                                 .file_name
                                 .as_deref()
-                                .and_then(|file_name| program.source_file(file_name))
-                                .map(|source_file| {
-                                    SourceText::from(source_file.source_text.clone())
-                                }),
+                                .and_then(&diagnostic_source_text),
                             range: related.range,
                             code: related.code,
                             category: Some(match related.category {
@@ -6300,6 +6302,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn canonical_config_diagnostics_retain_virtual_config_source_locations() {
+        let case = Case::parse(
+            "commonSourceDirectory_dts.ts",
+            concat!(
+                "// @target: es2015\n",
+                "// @moduleResolution: bundler\n",
+                "// @filename: /app/src/index.ts\n",
+                "export const value: number = 1;\n",
+                "// @filename: /app/tsconfig.json\n",
+                "{\n",
+                "    \"compilerOptions\": {\n",
+                "        \"outDir\": \"bin\"\n",
+                "    }\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        let mut variant = expand_option_matrix(&case).remove(0);
+        let compilation =
+            super::compile_case_variant(&case, &mut variant, FixtureChecker::Canonical, false)
+                .unwrap();
+
+        let [diagnostic] = compilation.diagnostics.as_slice() else {
+            panic!(
+                "expected one config diagnostic: {:?}",
+                compilation.diagnostics
+            )
+        };
+        assert_eq!(diagnostic.code, Some(5011));
+        assert_eq!(diagnostic.file_name.as_deref(), Some("/app/tsconfig.json"));
+        let source = diagnostic.source_text.as_ref().unwrap().as_scannable_str();
+        let range = diagnostic.range.unwrap();
+        assert_eq!(
+            &source[range.start.get() as usize..range.end.get() as usize],
+            "\"outDir\""
+        );
+        assert!(
+            compilation
+                .diagnostic_text
+                .starts_with("/app/tsconfig.json(3,9): error TS5011:"),
+            "{}",
+            compilation.diagnostic_text
+        );
+
+        let artifact = render_error_baseline(&case, &compilation.diagnostics);
+        assert!(
+            artifact.unsupported_details.is_empty(),
+            "{:?}",
+            artifact.unsupported_details
+        );
     }
 
     #[test]
