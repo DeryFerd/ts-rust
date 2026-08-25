@@ -45156,6 +45156,100 @@ mod tests {
     }
 
     #[test]
+    fn constructor_parameter_properties_preserve_base_members_and_derived_identity() {
+        let source = parsed(concat!(
+            "interface Options { value: string; } ",
+            "class ReadonlyValue { constructor(readonly label: string) {} } ",
+            "class Base { constructor(public value: string) {} } ",
+            "class Derived extends Base { ",
+            "constructor(public options: Options) { super(options.value); } ",
+            "}",
+        ));
+        let file = FileId::new(9_880);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                strict_property_initialization: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let base = global_symbol(&context, "Base");
+        let derived = global_symbol(&context, "Derived");
+        let base_members = context.get_nongeneric_class_members(base).unwrap();
+        let derived_members = context.get_nongeneric_class_members(derived).unwrap();
+        let [base_property] = base_members.declared_instance_properties() else {
+            panic!("the public constructor parameter must publish one base property")
+        };
+        let base_property = *base_property;
+        let signature = context
+            .store()
+            .signature(base_members.default_construct_signature())
+            .unwrap();
+        let [base_parameter] = signature.parameters() else {
+            panic!("the base constructor retains one distinct local parameter")
+        };
+        let base_parameter = *base_parameter;
+        assert_ne!(base_property, base_parameter);
+        assert_eq!(signature.min_argument_count(), 1);
+        for symbol in [base_property, base_parameter] {
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(string),
+            );
+        }
+        assert_eq!(
+            derived_members
+                .instance_properties()
+                .iter()
+                .map(|symbol| {
+                    context
+                        .store()
+                        .symbol(*symbol)
+                        .and_then(|symbol| symbol.name().as_utf8())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>(),
+            ["options", "value"],
+        );
+
+        let readonly = global_symbol(&context, "ReadonlyValue");
+        let readonly_members = context.get_nongeneric_class_members(readonly).unwrap();
+        let [readonly_property] = readonly_members.declared_instance_properties() else {
+            panic!("the readonly constructor parameter must publish one property")
+        };
+        assert_eq!(
+            context
+                .store()
+                .symbol(*readonly_property)
+                .unwrap()
+                .check_flags(),
+            CheckFlags::READONLY,
+        );
+        for members in [&base_members, &derived_members, &readonly_members] {
+            assert_eq!(
+                validate_class_heritage_members(context.store(), members.shells().instance_type()),
+                ClassHeritageMembersValidation::Valid,
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn derived_constructor_parameter_property_preserves_source_and_signature_identities() {
         for (index, annotation) in ["number", "string"].into_iter().enumerate() {
             let text = format!(

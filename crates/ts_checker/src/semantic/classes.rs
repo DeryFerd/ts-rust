@@ -24,10 +24,11 @@
 //! Direct classes can also retain one string-to-number index signature.
 //! Annotated fields admit one authenticated ambient-function decorator.
 //! One direct getter/setter pair can expose an annotated numeric property.
-//! A constructor may retain one string or number parameter. Exported ambient
-//! declaration-file classes may also retain generic parameters and bodyless
-//! constructors. Decorated parameters remain restricted to one authenticated
-//! string parameter.
+//! A constructor may retain one string or number parameter, including one
+//! authenticated public or readonly parameter property with separate member
+//! and constructor-local symbols. Exported ambient declaration-file classes
+//! may also retain generic parameters and bodyless constructors. Decorated
+//! parameters remain restricted to one authenticated string parameter.
 //! A derived constructor may retain one public, interface-typed parameter
 //! property and forward one primitive interface property to its base.
 //! Numeric and string instance and static fields retain direct literal
@@ -132,6 +133,13 @@ struct ClassConstructorParameterPlan {
     type_node: NodeRef,
     type_: TypeId,
     decorator: Option<ClassConstructorParameterDecoratorPlan>,
+    property: Option<ClassConstructorPrimitiveParameterPropertyPlan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClassConstructorPrimitiveParameterPropertyPlan {
+    symbol: SemanticSymbolId,
+    readonly: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,6 +309,7 @@ pub(super) struct ClassPropertyPlan {
     definite: bool,
     readonly: bool,
     ambient_private_modifier: Option<NodeRef>,
+    parameter_property: bool,
 }
 
 impl ClassPropertyPlan {
@@ -1410,33 +1419,64 @@ fn authenticate_constructor_parameter_decorator(
     Ok(symbol)
 }
 
+#[allow(clippy::too_many_lines)] // The local and optional property share one binder/cache proof.
 fn plan_constructor_parameter(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
     constructor: NodeRef,
     parameter: NodeRef,
+    instance_members: Option<SymbolTableId>,
 ) -> Result<ClassConstructorParameterPlan, ClassError> {
     let reject = || accessor_member_error(constructor, SyntaxKind::Constructor);
     let record = preflight_node(store, host, parameter)?;
     let NodeData::ParameterDeclaration(data) = &record.data else {
         return Err(reject());
     };
-    let decorator = match data.modifiers.as_ref() {
-        None => None,
-        Some(modifiers) => {
-            let [decorator] = modifiers.list.nodes.as_slice() else {
-                return Err(reject());
-            };
-            let decorator = NodeRef::new(parameter.arena, parameter.file, *decorator);
-            if preflight_node(store, host, decorator)?.kind != SyntaxKind::Decorator
-                || modifiers.flags.0 != 0
+    let modifiers = data
+        .modifiers
+        .as_ref()
+        .map(|modifiers| {
+            if modifiers.flags.0 != 0
                 || modifiers.list.has_trailing_comma
                 || modifiers.list.range.start != record.range.start
             {
                 return Err(reject());
             }
-            Some(decorator)
-        }
+            modifiers
+                .list
+                .nodes
+                .iter()
+                .map(|modifier| {
+                    let modifier = NodeRef::new(parameter.arena, parameter.file, *modifier);
+                    let modifier_record = preflight_node(store, host, modifier)?;
+                    if modifier_record.flags.0 != 0
+                        || modifier_record.parent != Some(parameter.node)
+                        || modifier_record.range.start < modifiers.list.range.start
+                        || modifier_record.range.end > modifiers.list.range.end
+                        || !matches!(
+                            modifier_record.data,
+                            NodeData::Token(_) | NodeData::Decorator(_)
+                        )
+                    {
+                        return Err(reject());
+                    }
+                    Ok((modifier, modifier_record.kind))
+                })
+                .collect::<Result<Vec<_>, ClassError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let (decorator, property_readonly) = match modifiers.as_slice() {
+        [] => (None, None),
+        [(decorator, SyntaxKind::Decorator)] => (Some(*decorator), None),
+        [(_, SyntaxKind::PublicKeyword)] => (None, Some(false)),
+        [(_, SyntaxKind::ReadonlyKeyword)] => (None, Some(true)),
+        [
+            (_, SyntaxKind::PublicKeyword),
+            (_, SyntaxKind::ReadonlyKeyword),
+        ] => (None, Some(true)),
+        _ => return Err(reject()),
     };
     if record.kind != SyntaxKind::Parameter
         || record.flags.0 != 0
@@ -1484,15 +1524,19 @@ fn plan_constructor_parameter(
     {
         return Err(reject());
     }
-    let symbol = bound_symbol(store, host, parameter)
+    let bound = host
+        .bound_file(constructor)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let locals = bound
+        .locals(constructor)
+        .and_then(|locals| store.symbol_table(locals))
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let symbol = locals
+        .get_source(&identifier.text)
         .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
     let symbol_record = store
         .symbol(symbol)
         .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
-    let locals = host
-        .bound_file(constructor)
-        .and_then(|bound| bound.locals(constructor))
-        .and_then(|locals| store.symbol_table(locals));
     if symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
         || symbol_record.check_flags() != CheckFlags::NONE
         || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
@@ -1502,10 +1546,50 @@ fn plan_constructor_parameter(
         || symbol_record.exports().is_some()
         || symbol_record.parent().is_some()
         || symbol_record.export_symbol().is_some()
-        || locals.is_none_or(|locals| {
-            locals.len() != 1 || locals.get_source(&identifier.text) != Some(symbol)
-        })
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || locals.len() != 1
+        || locals.get_source(&identifier.text) != Some(symbol)
     {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(parameter)));
+    }
+    let property = property_readonly
+        .map(|readonly| {
+            let property = bound_symbol(store, host, parameter)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+            let property_record = store
+                .symbol(property)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+            let expected_check_flags = if readonly {
+                CheckFlags::READONLY
+            } else {
+                CheckFlags::NONE
+            };
+            if property == symbol
+                || property_record.flags() != SymbolFlags::PROPERTY
+                || property_record.check_flags() != CheckFlags::NONE
+                    && property_record.check_flags() != expected_check_flags
+                || property_record.name().as_utf8() != Some(identifier.text.as_str())
+                || property_record.declarations() != Some(&[parameter])
+                || property_record.value_declaration() != Some(parameter)
+                || property_record.members().is_some()
+                || property_record.exports().is_some()
+                || property_record.parent() != Some(owner)
+                || property_record.export_symbol().is_some()
+                || store.get_merged_symbol(property) != Some(property)
+                || instance_members
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get_source(&identifier.text))
+                    != Some(property)
+            {
+                return Err(invariant(ClassInvariant::InvalidPropertySymbol(parameter)));
+            }
+            Ok(ClassConstructorPrimitiveParameterPropertyPlan {
+                symbol: property,
+                readonly,
+            })
+        })
+        .transpose()?;
+    if property.is_none() && bound_symbol(store, host, parameter) != Some(symbol) {
         return Err(invariant(ClassInvariant::InvalidPropertySymbol(parameter)));
     }
     let type_ = primitive_keyword_type(store, type_node, type_record.kind)?;
@@ -1532,6 +1616,7 @@ fn plan_constructor_parameter(
         type_node,
         type_,
         decorator,
+        property,
     })
 }
 
@@ -1576,8 +1661,10 @@ fn plan_constructor(
             plan_constructor_parameter(
                 store,
                 host,
+                owner,
                 declaration,
                 NodeRef::new(declaration.arena, declaration.file, parameter),
+                instance_members,
             )
         })
         .transpose()?;
@@ -4133,6 +4220,7 @@ fn plan_property(
         definite,
         readonly,
         ambient_private_modifier: None,
+        parameter_property: false,
     })
 }
 
@@ -4260,6 +4348,7 @@ fn plan_ambient_private_implicit_any_property(
         definite: false,
         readonly: false,
         ambient_private_modifier: Some(modifier),
+        parameter_property: false,
     })
 }
 
@@ -5878,6 +5967,52 @@ fn plan_class_declaration(
             } else {
                 plan_constructor(store, host, symbol, member, instance_members, ambient)?
             };
+            if let Some(parameter) = planned.parameter
+                && let Some(parameter_property) = parameter.property
+            {
+                let parameter_record = preflight_node(store, host, parameter.declaration)?;
+                let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
+                    return Err(invariant(ClassInvariant::InvalidProperty(
+                        parameter.declaration,
+                    )));
+                };
+                let name = NodeRef::new(
+                    parameter.declaration.arena,
+                    parameter.declaration.file,
+                    data.name,
+                );
+                let name_record = preflight_node(store, host, name)?;
+                let NodeData::Identifier(identifier) = &name_record.data else {
+                    return Err(invariant(ClassInvariant::InvalidName(name)));
+                };
+                let property = ClassPropertyPlan {
+                    declaration: parameter.declaration,
+                    symbol: parameter_property.symbol,
+                    name_node: name,
+                    type_node: parameter.type_node,
+                    initializer_node: None,
+                    initializer_text: None,
+                    initializer_string: None,
+                    initializer_parameter_name: None,
+                    initializer_assertion: None,
+                    merged_interface_annotation: None,
+                    auto_accessor: false,
+                    name: identifier.text.clone(),
+                    side: ClassPropertySide::Instance,
+                    optional: false,
+                    definite: false,
+                    readonly: parameter_property.readonly,
+                    ambient_private_modifier: None,
+                    parameter_property: true,
+                };
+                if !instance_names.insert(property.name.clone()) {
+                    return Err(unsupported(ClassUnsupported::DuplicateProperty(
+                        parameter.declaration,
+                    )));
+                }
+                properties.push(property.clone());
+                instance_properties.push(property);
+            }
             if let Some(parameter) = planned.parameter_property {
                 let name = store
                     .symbol(parameter.property_symbol)
@@ -7539,6 +7674,7 @@ fn uninitialized_instance_properties(
         if property.side != ClassPropertySide::Instance
             || property.optional
             || property.definite
+            || property.parameter_property
             || property.initializer_node.is_some()
         {
             continue;
@@ -14876,6 +15012,7 @@ fn exact_stored_merged_auto_accessor(
     .then_some(class_property)
 }
 
+#[allow(clippy::too_many_lines)] // Revalidates modifier, annotation, local, and member identities.
 fn exact_stored_constructor_parameter_property(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
@@ -14886,7 +15023,6 @@ fn exact_stored_constructor_parameter_property(
 ) -> Option<NodeRef> {
     let record = store.symbol(property)?;
     let annotation = store.source_direct_type_annotation(declaration)?;
-    let interface = store.symbol_node_links(annotation)?.resolved_symbol?;
     let SourceNodeParent::Parent(constructor) = store.source_node_parent(declaration)? else {
         return None;
     };
@@ -14899,8 +15035,59 @@ fn exact_stored_constructor_parameter_property(
     };
     let local = *local;
     let local_record = store.symbol(local)?;
+    let mut public_modifier = false;
+    let mut readonly_modifier = false;
+    for index in 0..declaration.node.index() {
+        let modifier = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            ts_ast::NodeId::new(u32::try_from(index).ok()?),
+        );
+        if store.source_node_parent(modifier) != Some(SourceNodeParent::Parent(declaration)) {
+            continue;
+        }
+        match store.source_node_kind(modifier) {
+            Some(SyntaxKind::PublicKeyword) if !public_modifier && !readonly_modifier => {
+                public_modifier = true;
+            }
+            Some(SyntaxKind::ReadonlyKeyword) if !readonly_modifier => {
+                readonly_modifier = true;
+            }
+            Some(SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword)
+            | Some(SyntaxKind::PublicKeyword | SyntaxKind::ReadonlyKeyword) => return None,
+            _ => {}
+        }
+    }
+    if !public_modifier && !readonly_modifier {
+        return None;
+    }
+    let expected_check_flags = if readonly_modifier {
+        CheckFlags::READONLY
+    } else {
+        CheckFlags::NONE
+    };
+    let annotation_valid = match store.source_node_kind(annotation) {
+        Some(SyntaxKind::StringKeyword) => store.intrinsic_bootstrap()?.string_type == type_,
+        Some(SyntaxKind::NumberKeyword) => store.intrinsic_bootstrap()?.number_type == type_,
+        Some(SyntaxKind::TypeReference) if public_modifier && !readonly_modifier => {
+            let interface = store.symbol_node_links(annotation)?.resolved_symbol?;
+            store.symbol_node_links(annotation)
+                == Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(interface),
+                })
+                && store
+                    .declared_type_links(interface)
+                    .and_then(|links| links.declared_type)
+                    == Some(type_)
+                && validate_resolved_declared_property_object(store, type_)
+                    == DeclaredPropertyObjectValidation::Valid(
+                        DeclaredPropertyObjectProof::Interface,
+                    )
+        }
+        _ => false,
+    };
     (record.flags() == SymbolFlags::PROPERTY
-        && record.check_flags() == CheckFlags::NONE
+        && record.check_flags() == expected_check_flags
         && record.declarations() == Some(&[declaration])
         && record.value_declaration() == Some(declaration)
         && record.members().is_none()
@@ -14912,23 +15099,13 @@ fn exact_stored_constructor_parameter_property(
         && store.source_node_kind(constructor) == Some(SyntaxKind::Constructor)
         && store.source_node_parent(constructor)
             == Some(SourceNodeParent::Parent(owner_declaration))
-        && store.source_node_kind(annotation) == Some(SyntaxKind::TypeReference)
         && store.source_node_parent(annotation) == Some(SourceNodeParent::Parent(declaration))
-        && store.symbol_node_links(annotation)
-            == Some(&SymbolNodeLinks {
-                resolved_symbol: Some(interface),
-            })
+        && annotation_valid
         && store.type_node_links(annotation)
             == Some(&TypeNodeLinks {
                 resolved_type: Some(type_),
                 ..TypeNodeLinks::default()
             })
-        && store
-            .declared_type_links(interface)
-            .and_then(|links| links.declared_type)
-            == Some(type_)
-        && validate_resolved_declared_property_object(store, type_)
-            == DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
         && local != property
         && local_record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
         && local_record.check_flags() == CheckFlags::NONE
@@ -17777,6 +17954,240 @@ mod tests {
     }
 
     #[test]
+    fn primitive_constructor_parameter_properties_preserve_distinct_member_symbols() {
+        for (source, readonly, numeric) in [
+            (
+                "class Model { constructor(public value: number) {} }",
+                false,
+                true,
+            ),
+            (
+                "class Model { constructor(readonly value: string) {} }",
+                true,
+                false,
+            ),
+            (
+                "class Model { constructor(public readonly value: number) {} }",
+                true,
+                true,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("a primitive parameter property belongs to one direct class")
+            };
+            let constructor = class.class.constructor.unwrap();
+            let parameter = constructor.parameter.unwrap();
+            let property = parameter.property.unwrap();
+            assert_ne!(parameter.symbol, property.symbol, "{source}");
+            assert_eq!(bound.symbol(parameter.declaration), Some(property.symbol));
+            assert_eq!(property.readonly, readonly, "{source}");
+            assert!(class.uninitialized_instance_properties().is_empty());
+
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let expected = if numeric {
+                bootstrap.number_type
+            } else {
+                bootstrap.string_type
+            };
+            assert_eq!(members.instance_properties(), &[property.symbol]);
+            for symbol in [parameter.symbol, property.symbol] {
+                assert_eq!(
+                    fixture.store.value_symbol_links(symbol),
+                    Some(&ValueSymbolLinks {
+                        resolved_type: Some(expected),
+                        ..ValueSymbolLinks::default()
+                    }),
+                    "{source}",
+                );
+            }
+            assert_eq!(
+                fixture.store.symbol(property.symbol).unwrap().check_flags(),
+                if readonly {
+                    CheckFlags::READONLY
+                } else {
+                    CheckFlags::NONE
+                },
+                "{source}",
+            );
+            assert_eq!(
+                fixture.store.type_node_links(parameter.type_node),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    ..TypeNodeLinks::default()
+                }),
+            );
+            let signature = fixture
+                .store
+                .signature(members.default_construct_signature())
+                .unwrap();
+            assert_eq!(signature.parameters(), &[parameter.symbol]);
+            assert_eq!(signature.min_argument_count(), 1);
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+                ClassHeritageMembersValidation::Valid,
+            );
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+                Ok(members),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_constructor_parameter_property_poison_rejects_before_publication() {
+        for poison in 0..3 {
+            let mut fixture = fixture("class Model { constructor(public value: number) {} }");
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("a primitive parameter property belongs to one direct class")
+            };
+            let parameter = class.class.constructor.unwrap().parameter.unwrap();
+            let property = parameter.property.unwrap();
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            let expected = match poison {
+                0 => {
+                    assert!(fixture.store.set_value_symbol_links(
+                        parameter.symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyValueCache(parameter.symbol))
+                }
+                1 => {
+                    assert!(fixture.store.set_value_symbol_links(
+                        property.symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyValueCache(property.symbol))
+                }
+                2 => {
+                    assert!(fixture.store.set_type_node_links(
+                        parameter.type_node,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyTypeCache(
+                        parameter.type_node,
+                    ))
+                }
+                _ => unreachable!("only the three authenticated cache poison cases are visited"),
+            };
+            let poisoned = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(expected),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                poisoned,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn protected_base_constructors_preserve_inherited_visibility_and_signature_identity() {
+        let mut fixture = fixture(concat!(
+            "class Base { protected constructor() {} } ",
+            "class Derived extends Base {}",
+        ));
+        let base_symbol = class_symbol(&fixture, "Base");
+        let derived_symbol = class_symbol(&fixture, "Derived");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan =
+            plan_nongeneric_class_member_query(&fixture.store, &host, derived_symbol).unwrap();
+        let ClassMemberQueryPlan::Derived { class, base } = &plan else {
+            panic!("the derived class must retain its protected base constructor")
+        };
+        let constructor = base.class.constructor.unwrap();
+        assert!(class.class.constructor.is_none());
+        assert_eq!(
+            plan.constructor_visibility(),
+            ClassConstructorVisibility::Protected
+        );
+        assert_eq!(
+            plan.constructor_declaration(),
+            Some(constructor.declaration)
+        );
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+        let signature = fixture
+            .store
+            .signature(members.default_construct_signature())
+            .unwrap();
+        assert_eq!(signature.declaration(), Some(constructor.declaration));
+        assert!(signature.parameters().is_empty());
+        assert_eq!(signature.min_argument_count(), 0);
+        assert_eq!(members.base().unwrap().symbol(), base_symbol);
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
     fn derived_interface_parameter_properties_preserve_distinct_symbols_while_cold() {
         let fixture = fixture(concat!(
             "interface Options { value: number; } ",
@@ -18019,7 +18430,8 @@ mod tests {
     fn unsupported_decorated_constructor_parameters_leave_class_state_cold() {
         for source in [
             "class Model { constructor(value: boolean) {} }",
-            "class Model { constructor(public value: number) {} }",
+            "class Model { constructor(private value: number) {} }",
+            "class Model { constructor(protected value: number) {} }",
             "class Model { constructor(@missing value: string) {} }",
             concat!(
                 "declare function dec(target: any, key: string | symbol | undefined, ",
