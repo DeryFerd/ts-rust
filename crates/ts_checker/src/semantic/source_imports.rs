@@ -14,9 +14,9 @@
 //! classes and generic constructors from declaration files, authenticated
 //! `CommonJS` variables and named assignments, explicit and implicit ambient
 //! `export const` declarations in retained declaration files, annotated
-//! `FunctionDeclaration`s, already-published inferred object constants, and
-//! narrowly authenticated cold async-arrow object constants with canonical
-//! fresh-to-widened provenance. Declaration-file bodies are never source
+//! `FunctionDeclaration`s, regular and const enums, already-published inferred
+//! or const-asserted object constants, and narrowly authenticated cold
+//! async-arrow object constants. Declaration-file bodies are never source
 //! checked by this leaf; imported annotations and authenticated ambient class
 //! members are queried lazily.
 //!
@@ -65,6 +65,7 @@ use super::{
         JsDocImportType, PlannedJsDocType, plan_javascript_source_jsdoc,
         preflight_planned_jsdoc_type, resolve_planned_jsdoc_type,
     },
+    object_members::{self, PropertyObjectPlan, PropertyObjectState},
     source_arrows::{
         SourceArrowBodyPlan, SourceArrowError, plan_async_arrow_await_statement,
         plan_source_arrow_value,
@@ -247,12 +248,22 @@ enum PreparedSourceImportTarget {
     ConstEnum {
         declared_type: TypeId,
     },
+    RegularEnum {
+        declared_type: TypeId,
+    },
     ExportedObject {
         expression: NodeRef,
     },
     PublishedObjectConst {
         expression: NodeRef,
         expression_type: TypeId,
+    },
+    PublishedSpreadObject {
+        object: Box<PropertyObjectPlan>,
+    },
+    PublishedConstAssertedObject {
+        assertion: NodeRef,
+        object: Box<PropertyObjectPlan>,
     },
     JavaScriptAnnotatedConst {
         annotation: Option<PlannedJsDocType>,
@@ -302,6 +313,9 @@ enum PlannedSourceImportValueTarget {
     ConstEnum {
         declaration: NodeRef,
     },
+    RegularEnum {
+        declaration: NodeRef,
+    },
     ExportedObject {
         declaration: NodeRef,
         expression: NodeRef,
@@ -311,6 +325,17 @@ enum PlannedSourceImportValueTarget {
         declaration: NodeRef,
         expression: NodeRef,
         expression_type: TypeId,
+        type_: TypeId,
+    },
+    PublishedSpreadObject {
+        declaration: NodeRef,
+        object: Box<PropertyObjectPlan>,
+        type_: TypeId,
+    },
+    PublishedConstAssertedObject {
+        declaration: NodeRef,
+        assertion: NodeRef,
+        object: Box<PropertyObjectPlan>,
         type_: TypeId,
     },
     JavaScriptAnnotatedConst {
@@ -2759,8 +2784,11 @@ pub(super) fn prepare_source_import_value(
         | PlannedSourceImportValueTarget::DeclarationNumericConst { declaration, .. }
         | PlannedSourceImportValueTarget::DeclarationBooleanConst { declaration, .. }
         | PlannedSourceImportValueTarget::ConstEnum { declaration }
+        | PlannedSourceImportValueTarget::RegularEnum { declaration }
         | PlannedSourceImportValueTarget::ExportedObject { declaration, .. }
         | PlannedSourceImportValueTarget::PublishedObjectConst { declaration, .. }
+        | PlannedSourceImportValueTarget::PublishedSpreadObject { declaration, .. }
+        | PlannedSourceImportValueTarget::PublishedConstAssertedObject { declaration, .. }
         | PlannedSourceImportValueTarget::JavaScriptAnnotatedConst { declaration, .. }
         | PlannedSourceImportValueTarget::CommonJsNamedExport { declaration, .. }
         | PlannedSourceImportValueTarget::ModuleNamespace { declaration, .. } => *declaration,
@@ -2909,6 +2937,16 @@ pub(super) fn prepare_source_import_value(
                 },
             )
         }
+        PlannedSourceImportValueTarget::RegularEnum { .. } => {
+            let enumeration = enums::get_enum_semantics(store, declared_host, target)
+                .map_err(DeclaredTypeError::from)?;
+            (
+                enumeration.value_type,
+                PreparedSourceImportTarget::RegularEnum {
+                    declared_type: enumeration.declared_type,
+                },
+            )
+        }
         PlannedSourceImportValueTarget::ExportedObject {
             expression, type_, ..
         } => (
@@ -2926,6 +2964,19 @@ pub(super) fn prepare_source_import_value(
                 expression,
                 expression_type,
             },
+        ),
+        PlannedSourceImportValueTarget::PublishedSpreadObject { object, type_, .. } => (
+            type_,
+            PreparedSourceImportTarget::PublishedSpreadObject { object },
+        ),
+        PlannedSourceImportValueTarget::PublishedConstAssertedObject {
+            assertion,
+            object,
+            type_,
+            ..
+        } => (
+            type_,
+            PreparedSourceImportTarget::PublishedConstAssertedObject { assertion, object },
         ),
         PlannedSourceImportValueTarget::JavaScriptAnnotatedConst {
             declaration,
@@ -3910,8 +3961,8 @@ fn plan_direct_import_value_target(
     if flags == SymbolFlags::CLASS {
         return plan_direct_ambient_class_target(store, host, alias, target);
     }
-    if flags == SymbolFlags::CONST_ENUM {
-        return plan_direct_const_enum_target(store, host, alias, target);
+    if matches!(flags, SymbolFlags::CONST_ENUM | SymbolFlags::REGULAR_ENUM) {
+        return plan_direct_enum_target(store, host, alias, target);
     }
     if flags == SymbolFlags::PROPERTY
         || flags == SymbolFlags::PROPERTY | SymbolFlags::NAMESPACE_MODULE
@@ -4037,7 +4088,7 @@ fn imported_ambient_class_error(
     }
 }
 
-fn plan_direct_const_enum_target(
+fn plan_direct_enum_target(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     alias: SemanticSymbolId,
@@ -4082,8 +4133,10 @@ fn plan_direct_const_enum_target(
         declaration,
         SourceImportUnsupported::TargetDeclaration(name),
     )?;
-    if record.flags() != SymbolFlags::CONST_ENUM
-        || record.check_flags() != CheckFlags::NONE
+    if !matches!(
+        record.flags(),
+        SymbolFlags::CONST_ENUM | SymbolFlags::REGULAR_ENUM
+    ) || record.check_flags() != CheckFlags::NONE
         || record.value_declaration() != Some(declaration)
         || record.parent() != Some(module)
         || record.name().as_bytes() != name_text.as_bytes()
@@ -4106,7 +4159,11 @@ fn plan_direct_const_enum_target(
         )));
     }
     enums::preflight_enum(store, host, target).map_err(DeclaredTypeError::from)?;
-    Ok(PlannedSourceImportValueTarget::ConstEnum { declaration })
+    Ok(if record.flags() == SymbolFlags::CONST_ENUM {
+        PlannedSourceImportValueTarget::ConstEnum { declaration }
+    } else {
+        PlannedSourceImportValueTarget::RegularEnum { declaration }
+    })
 }
 
 fn authenticate_direct_exported_object_target(
@@ -5582,14 +5639,19 @@ fn materialize_imported_module_namespace(
                 )?;
                 (members.shells().value_type(), None)
             }
-            PlannedSourceImportValueTarget::ConstEnum { .. } => (
+            PlannedSourceImportValueTarget::ConstEnum { .. }
+            | PlannedSourceImportValueTarget::RegularEnum { .. } => (
                 enums::get_enum_semantics(store, host, member.value_symbol)
                     .map_err(DeclaredTypeError::from)?
                     .value_type,
                 None,
             ),
             PlannedSourceImportValueTarget::ExportedObject { type_, .. }
-            | PlannedSourceImportValueTarget::PublishedObjectConst { type_, .. } => (type_, None),
+            | PlannedSourceImportValueTarget::PublishedObjectConst { type_, .. }
+            | PlannedSourceImportValueTarget::PublishedSpreadObject { type_, .. }
+            | PlannedSourceImportValueTarget::PublishedConstAssertedObject { type_, .. } => {
+                (type_, None)
+            }
             PlannedSourceImportValueTarget::DeclarationNumericConst { literal, .. } => (
                 declaration_numeric_literal_type(store, member.value_symbol, &literal)?,
                 None,
@@ -5757,8 +5819,11 @@ fn preflight_imported_module_namespace_members(
             | PlannedSourceImportValueTarget::JavaScriptAnnotatedConst { .. }
             | PlannedSourceImportValueTarget::CommonJsNamedExport { .. }
             | PlannedSourceImportValueTarget::ExportedObject { .. }
-            | PlannedSourceImportValueTarget::PublishedObjectConst { .. } => {}
-            PlannedSourceImportValueTarget::ConstEnum { .. } => {
+            | PlannedSourceImportValueTarget::PublishedObjectConst { .. }
+            | PlannedSourceImportValueTarget::PublishedSpreadObject { .. }
+            | PlannedSourceImportValueTarget::PublishedConstAssertedObject { .. } => {}
+            PlannedSourceImportValueTarget::ConstEnum { .. }
+            | PlannedSourceImportValueTarget::RegularEnum { .. } => {
                 enums::preflight_enum(store, host, member.value_symbol)
                     .map_err(DeclaredTypeError::from)?;
             }
@@ -6924,6 +6989,20 @@ fn plan_direct_typescript_const_target(
                 ))
             })?;
         let expression_record = checked_node(arena, bound, store, expression)?;
+        if matches!(
+            expression_record.kind,
+            SyntaxKind::AsExpression | SyntaxKind::TypeAssertionExpression
+        ) {
+            return plan_published_const_asserted_object_target(
+                store,
+                host,
+                arena,
+                bound,
+                declaration,
+                target,
+                expression,
+            );
+        }
         let NodeData::ObjectLiteralExpression(object) = &expression_record.data else {
             return Err(unsupported(
                 SourceImportUnsupported::MissingTargetAnnotation(declaration),
@@ -6963,6 +7042,24 @@ fn plan_direct_typescript_const_target(
                     declaration,
                 ))
             })?;
+        if object.properties.nodes.iter().any(|property| {
+            arena
+                .get(*property)
+                .is_some_and(|record| record.kind == SyntaxKind::SpreadAssignment)
+        }) {
+            let plan = object_members::plan_object_literal(store, host, expression)
+                .map_err(|_| invariant(SourceImportInvariant::InvalidTargetLinks(target)))?;
+            if expression_type != type_
+                || !published_spread_object_is_exact(store, declaration, &plan, type_)
+            {
+                return Err(invariant(SourceImportInvariant::InvalidTargetLinks(target)));
+            }
+            return Ok(PlannedSourceImportValueTarget::PublishedSpreadObject {
+                declaration,
+                object: Box::new(plan),
+                type_,
+            });
+        }
         if !published_object_const_type_is_exact(store, global_types, expression_type, type_) {
             return Err(invariant(SourceImportInvariant::InvalidTargetLinks(target)));
         }
@@ -7015,6 +7112,192 @@ fn plan_direct_typescript_const_target(
         declaration,
         type_node,
     })
+}
+
+fn published_spread_object_is_exact(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    object: &PropertyObjectPlan,
+    type_: TypeId,
+) -> bool {
+    !object.const_context
+        && !object.spreads.is_empty()
+        && store.source_node_kind(object.node) == Some(SyntaxKind::ObjectLiteralExpression)
+        && store.source_node_parent(object.node) == Some(SourceNodeParent::Parent(declaration))
+        && store.type_node_links(object.node)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(type_),
+                ..TypeNodeLinks::default()
+            })
+        && matches!(
+            object_members::object_literal_state(store, object),
+            Ok(Some(PropertyObjectState::Resolved(resolved))) if resolved == type_
+        )
+}
+
+fn plan_published_const_asserted_object_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    declaration: NodeRef,
+    target: SemanticSymbolId,
+    assertion: NodeRef,
+) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
+    let record = checked_node(arena, bound, store, assertion)?;
+    let (operand, annotation) = match (&record.data, record.kind) {
+        (NodeData::AsExpression(assertion), SyntaxKind::AsExpression) => {
+            (assertion.expression, assertion.type_)
+        }
+        (NodeData::TypeAssertion(assertion), SyntaxKind::TypeAssertionExpression) => {
+            (assertion.expression, assertion.type_)
+        }
+        _ => {
+            return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+                assertion,
+            )));
+        }
+    };
+    if record.flags.0 != 0 || record.parent != Some(declaration.node) {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            assertion,
+        )));
+    }
+
+    let annotation = NodeRef::new(assertion.arena, assertion.file, annotation);
+    let annotation_record = checked_node(arena, bound, store, annotation)?;
+    let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            assertion,
+        )));
+    };
+    if annotation_record.kind != SyntaxKind::TypeReference
+        || annotation_record.flags.0 != 0
+        || annotation_record.parent != Some(assertion.node)
+        || reference.type_arguments.is_some()
+    {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            assertion,
+        )));
+    }
+    let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+    if exact_identifier(
+        arena,
+        bound,
+        store,
+        name,
+        annotation,
+        SourceImportUnsupported::TargetDeclaration(name),
+    )? != "const"
+    {
+        return Err(unsupported(
+            SourceImportUnsupported::MissingTargetAnnotation(declaration),
+        ));
+    }
+
+    let mut object = NodeRef::new(assertion.arena, assertion.file, operand);
+    let mut expected_parent = assertion;
+    loop {
+        let record = checked_node(arena, bound, store, object)?;
+        if record.flags.0 != 0 || record.parent != Some(expected_parent.node) {
+            return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+                object,
+            )));
+        }
+        match (&record.data, record.kind) {
+            (
+                NodeData::ParenthesizedExpression(parenthesized),
+                SyntaxKind::ParenthesizedExpression,
+            ) => {
+                expected_parent = object;
+                object = NodeRef::new(object.arena, object.file, parenthesized.expression);
+            }
+            (NodeData::ObjectLiteralExpression(literal), SyntaxKind::ObjectLiteralExpression)
+                if literal.symbol.is_none() && literal.facts == 0 =>
+            {
+                break;
+            }
+            _ => {
+                return Err(unsupported(
+                    SourceImportUnsupported::MissingTargetAnnotation(declaration),
+                ));
+            }
+        }
+    }
+
+    let type_ = store
+        .value_symbol_links(target)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(|| {
+            unsupported(SourceImportUnsupported::MissingTargetAnnotation(
+                declaration,
+            ))
+        })?;
+    let plan = object_members::plan_object_literal(store, host, object)
+        .map_err(|_| invariant(SourceImportInvariant::InvalidTargetLinks(target)))?;
+    if !plan.const_context
+        || !published_const_asserted_object_is_exact(store, declaration, assertion, &plan, type_)
+    {
+        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(target)));
+    }
+    Ok(
+        PlannedSourceImportValueTarget::PublishedConstAssertedObject {
+            declaration,
+            assertion,
+            object: Box::new(plan),
+            type_,
+        },
+    )
+}
+
+fn published_const_asserted_object_is_exact(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    assertion: NodeRef,
+    object: &PropertyObjectPlan,
+    type_: TypeId,
+) -> bool {
+    if !object.const_context
+        || !matches!(
+            store.source_node_kind(assertion),
+            Some(SyntaxKind::AsExpression | SyntaxKind::TypeAssertionExpression)
+        )
+        || store.source_node_parent(assertion) != Some(SourceNodeParent::Parent(declaration))
+        || store.type_node_links(assertion)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(type_),
+                ..TypeNodeLinks::default()
+            })
+        || store
+            .assertion_links(assertion)
+            .is_none_or(|links| links.expr_type != Some(type_))
+        || !matches!(
+            object_members::object_literal_state(store, object),
+            Ok(Some(PropertyObjectState::Resolved(resolved))) if resolved == type_
+        )
+    {
+        return false;
+    }
+
+    let mut operand = object.node;
+    loop {
+        let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(operand) else {
+            return false;
+        };
+        if parent == assertion {
+            return true;
+        }
+        if store.source_node_kind(parent) != Some(SyntaxKind::ParenthesizedExpression)
+            || store.type_node_links(parent)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(type_),
+                    ..TypeNodeLinks::default()
+                })
+        {
+            return false;
+        }
+        operand = parent;
+    }
 }
 
 fn published_object_const_type_is_exact(
@@ -7196,6 +7479,7 @@ fn prepare_value_links(
             && record.flags() != SymbolFlags::FUNCTION
             && record.flags() != SymbolFlags::CLASS
             && record.flags() != SymbolFlags::CONST_ENUM
+            && record.flags() != SymbolFlags::REGULAR_ENUM
             && record.flags() != SymbolFlags::PROPERTY
             && !record.flags().intersects(SymbolFlags::MODULE))
         || store.type_payload(type_).is_none()
@@ -7355,9 +7639,18 @@ fn validate_prepared_import_value(
                     .and_then(|structured| structured.signatures.as_deref())
                     == Some(&[*signature][..])
         }
-        PreparedSourceImportTarget::ConstEnum { declared_type } => {
+        PreparedSourceImportTarget::ConstEnum { declared_type }
+        | PreparedSourceImportTarget::RegularEnum { declared_type } => {
+            let expected_flags = if matches!(
+                &prepared.target,
+                PreparedSourceImportTarget::ConstEnum { .. }
+            ) {
+                SymbolFlags::CONST_ENUM
+            } else {
+                SymbolFlags::REGULAR_ENUM
+            };
             store.symbol(prepared.target_symbol).is_some_and(|target| {
-                target.flags() == SymbolFlags::CONST_ENUM
+                target.flags() == expected_flags
                     && target.value_declaration() == Some(prepared.target_declaration)
             }) && store
                 .declared_type_links(prepared.target_symbol)
@@ -7426,6 +7719,45 @@ fn validate_prepared_import_value(
                                         if source == *expression_type
                                 )
                     ))
+        }
+        PreparedSourceImportTarget::PublishedSpreadObject { object } => {
+            store.symbol(prepared.target_symbol).is_some_and(|target| {
+                target.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    && target.check_flags() == CheckFlags::NONE
+                    && target.declarations() == Some(&[prepared.target_declaration])
+                    && target.value_declaration() == Some(prepared.target_declaration)
+            }) && store.source_node_kind(prepared.target_declaration)
+                == Some(SyntaxKind::VariableDeclaration)
+                && store
+                    .value_symbol_links(prepared.target_symbol)
+                    .and_then(|links| links.resolved_type)
+                    == Some(prepared.type_)
+                && published_spread_object_is_exact(
+                    store,
+                    prepared.target_declaration,
+                    object,
+                    prepared.type_,
+                )
+        }
+        PreparedSourceImportTarget::PublishedConstAssertedObject { assertion, object } => {
+            store.symbol(prepared.target_symbol).is_some_and(|target| {
+                target.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    && target.check_flags() == CheckFlags::NONE
+                    && target.declarations() == Some(&[prepared.target_declaration])
+                    && target.value_declaration() == Some(prepared.target_declaration)
+            }) && store.source_node_kind(prepared.target_declaration)
+                == Some(SyntaxKind::VariableDeclaration)
+                && store
+                    .value_symbol_links(prepared.target_symbol)
+                    .and_then(|links| links.resolved_type)
+                    == Some(prepared.type_)
+                && published_const_asserted_object_is_exact(
+                    store,
+                    prepared.target_declaration,
+                    *assertion,
+                    object,
+                    prepared.type_,
+                )
         }
         PreparedSourceImportTarget::JavaScriptAnnotatedConst { annotation } => {
             let valid_target = store.symbol(prepared.target_symbol).is_some_and(|target| {
@@ -7676,8 +8008,8 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        AliasSymbolLinks, CanonicalTypeFormatFlags, IntrinsicBootstrapOptions, SymbolNodeLinks,
-        TypeAliasLinks,
+        AliasSymbolLinks, AssertionLinks, CanonicalCheckerContext, CanonicalTypeFormatFlags,
+        IntrinsicBootstrapOptions, SymbolNodeLinks, TypeAliasLinks,
         alias::CanonicalAliasTargetUnavailable,
         bootstrap::UnionReduction,
         formatter::type_to_string_with_host_global_types_and_flags,
@@ -7858,6 +8190,50 @@ mod tests {
             .collect::<Vec<_>>();
         specifiers.sort_unstable_by_key(|node| parsed.arena.get(*node).unwrap().range.start);
         specifiers
+    }
+
+    fn context_with_routes<'arena>(
+        files: &[(FileId, &'arena ParseResult)],
+        routes: &[Route],
+    ) -> CanonicalCheckerContext<'arena> {
+        let mut binder = CanonicalBinder::new();
+        for &(file, parsed) in files {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    facts(file, CanonicalModuleState::External),
+                )
+                .unwrap();
+        }
+        for &(file, parsed) in files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let entries = routes.iter().map(|route| {
+            let (file, source) = files[route.source];
+            let specifier = module_specifiers(source)[route.specifier];
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(source.arena.id(), file, specifier),
+                CanonicalResolvedModuleInput::new(
+                    files[route.target.expect("context routes must resolve")].0,
+                    CanonicalModuleResolutionMode::Esm,
+                    CanonicalModuleResolutionMode::Esm,
+                ),
+            )
+        });
+        CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new(entries),
+        )
+        .unwrap()
     }
 
     fn fixture(sources: &[&str], routes: &[Route]) -> Fixture {
@@ -11296,6 +11672,110 @@ mod tests {
     }
 
     #[test]
+    fn regular_enum_imports_preserve_value_and_declared_identities_cold_and_warm() {
+        let mut fixture = fixture(
+            &[
+                "import { Values } from './target'; const selected = Values;",
+                "export enum Values { First = 'first', Second = 'second' }",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let node = identifier_initializer(&fixture, 0, "Values");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            node,
+            "Values",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let target = resolved[0].target_symbol;
+        assert_eq!(
+            fixture.store.symbol(target).unwrap().flags(),
+            SymbolFlags::REGULAR_ENUM,
+        );
+        assert!(fixture.store.value_symbol_links(target).is_none());
+
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+
+        let PreparedSourceImportTarget::RegularEnum { declared_type } = &prepared.target else {
+            panic!("a regular enum must retain its own authenticated import target")
+        };
+        assert_eq!(
+            fixture
+                .store
+                .declared_type_links(target)
+                .and_then(|links| links.declared_type),
+            Some(*declared_type),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(target)
+                .and_then(|links| links.resolved_type),
+            Some(prepared.type_),
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .is_none()
+        );
+
+        let original_declared = fixture.store.declared_type_links(target).unwrap().clone();
+        let mut poisoned_declared = original_declared.clone();
+        poisoned_declared.declared_type =
+            Some(fixture.store.intrinsic_bootstrap().unwrap().number_type);
+        assert!(
+            fixture
+                .store
+                .set_declared_type_links(target, poisoned_declared)
+        );
+        let poisoned = store_state(&fixture.store);
+        assert!(matches!(
+            preflight_prepared_source_import_publications(
+                &fixture.store,
+                std::slice::from_ref(&prepared),
+            ),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::PreparedStateChanged(alias)
+            )) if alias == plan.bindings[0].alias_symbol
+        ));
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .set_declared_type_links(target, original_declared)
+        );
+
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let warm = (store_state(&fixture.store), fixture.store.symbol_len());
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared,
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.symbol_len()),
+            warm,
+        );
+    }
+
+    #[test]
     fn declaration_file_imports_and_default_reexports_preserve_const_enum_identity() {
         let mut fixture = fixture_with_declaration_files(
             &[
@@ -11889,6 +12369,293 @@ mod tests {
             prepared,
         );
         assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn exported_const_asserted_objects_preserve_nested_readonly_types_across_imports() {
+        for (index, provider_source) in [
+            "export const value = { nested: { label: 'ready' } } as const;",
+            "export const value = ({ nested: { label: 'ready' } }) as const;",
+            "export const value = <const>({ nested: { label: 'ready' } });",
+            concat!(
+                "const source = { nested: { label: 'ready' } } as const; ",
+                "export const value = { ...source } as const;",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let provider = parsed(provider_source);
+            let consumer = parsed(concat!(
+                "import { value } from './provider.js'; ",
+                "export const copied = { ...value } as const;",
+            ));
+            let offset = u32::try_from(index).unwrap() * 2;
+            let provider_file = FileId::new(9_700 + offset);
+            let consumer_file = FileId::new(9_701 + offset);
+            let mut context = context_with_routes(
+                &[(provider_file, &provider), (consumer_file, &consumer)],
+                &[Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(0),
+                }],
+            );
+
+            context.check_source_file(provider_file).unwrap();
+            context.check_source_file(consumer_file).unwrap();
+
+            let (_, bound) = context.file(consumer_file).unwrap();
+            let module = bound.symbol(bound.source_file()).unwrap();
+            let copied = context
+                .store()
+                .symbol(module)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source("copied"))
+                .unwrap();
+            let copied_type = context
+                .store()
+                .value_symbol_links(copied)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(
+                context.type_to_string(copied_type).unwrap(),
+                "{ readonly nested: { readonly label: \"ready\"; }; }",
+                "source: {provider_source}",
+            );
+            assert!(context.diagnostics().is_empty());
+
+            let warm = store_state(context.store());
+            context.recheck_source_file(consumer_file).unwrap();
+            assert_eq!(store_state(context.store()), warm);
+        }
+    }
+
+    #[test]
+    fn exported_object_spreads_preserve_synthetic_member_types_across_imports() {
+        let provider = parsed(concat!(
+            "const source = { first: 'ready', shared: 1 }; ",
+            "export const value = { ...source, shared: true };",
+        ));
+        let consumer = parsed(concat!(
+            "import { value } from './provider.js'; ",
+            "export const copied = { ...value, added: 2 };",
+        ));
+        let provider_file = FileId::new(9_730);
+        let consumer_file = FileId::new(9_731);
+        let mut context = context_with_routes(
+            &[(provider_file, &provider), (consumer_file, &consumer)],
+            &[Route {
+                source: 1,
+                specifier: 0,
+                target: Some(0),
+            }],
+        );
+
+        context.check_source_file(provider_file).unwrap();
+        context.check_source_file(consumer_file).unwrap();
+
+        let (_, bound) = context.file(consumer_file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let copied = context
+            .store()
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("copied"))
+            .unwrap();
+        let type_ = context
+            .store()
+            .value_symbol_links(copied)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(type_).unwrap(),
+            "{ first: string; shared: boolean; added: number; }",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = store_state(context.store());
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(store_state(context.store()), warm);
+    }
+
+    #[test]
+    fn const_asserted_object_imports_reject_poisoned_assertion_and_member_caches() {
+        for poison_assertion in [true, false] {
+            let provider = parsed("export const value = { label: 'ready' } as const;");
+            let consumer = parsed(concat!(
+                "import { value } from './provider.js'; ",
+                "export const copied = { ...value } as const;",
+            ));
+            let provider_file = FileId::new(9_710 + u32::from(poison_assertion) * 2);
+            let consumer_file = FileId::new(9_711 + u32::from(poison_assertion) * 2);
+            let mut context = context_with_routes(
+                &[(provider_file, &provider), (consumer_file, &consumer)],
+                &[Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(0),
+                }],
+            );
+            context.check_source_file(provider_file).unwrap();
+            context.check_source_file(consumer_file).unwrap();
+
+            let assertion = provider
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::AsExpression).then_some(NodeRef::new(
+                        provider.arena.id(),
+                        provider_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let object = match &provider.arena.get(assertion.node).unwrap().data {
+                NodeData::AsExpression(assertion) => {
+                    NodeRef::new(provider.arena.id(), provider_file, assertion.expression)
+                }
+                _ => unreachable!("the fixture retained an as-expression"),
+            };
+            let object_type = context
+                .store()
+                .type_node_links(object)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let property = context
+                .store()
+                .type_payload(object_type)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.properties.as_deref())
+                .and_then(|properties| properties.first())
+                .copied()
+                .unwrap();
+            let original_assertion = context.store().assertion_links(assertion).unwrap().clone();
+            let (_, consumer_bound) = context.file(consumer_file).unwrap();
+            let import = consumer
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ImportSpecifier).then_some(NodeRef::new(
+                        consumer.arena.id(),
+                        consumer_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let alias = consumer_bound.symbol(import).unwrap();
+            let alias_links = context.store().value_symbol_links(alias).cloned();
+            if poison_assertion {
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                assert!(context.store_mut_for_test().set_assertion_links(
+                    assertion,
+                    AssertionLinks {
+                        expr_type: Some(number),
+                    },
+                ));
+            } else {
+                assert!(context.store_mut_for_test().set_symbol_flags(
+                    property,
+                    SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+                    CheckFlags::NONE,
+                ));
+            }
+
+            let before = store_state(context.store());
+            assert!(context.recheck_source_file(consumer_file).is_err());
+            assert_eq!(store_state(context.store()), before);
+            assert_eq!(
+                context.store().value_symbol_links(alias),
+                alias_links.as_ref()
+            );
+
+            if poison_assertion {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_assertion_links(assertion, original_assertion)
+                );
+            } else {
+                assert!(context.store_mut_for_test().set_symbol_flags(
+                    property,
+                    SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+                    CheckFlags::READONLY,
+                ));
+            }
+            context.recheck_source_file(consumer_file).unwrap();
+        }
+    }
+
+    #[test]
+    fn nested_enum_const_objects_spread_across_the_upstream_three_module_fixture() {
+        let enumeration = parsed("export enum E {\n    A = 'a',\n    B = 'b',\n}\n");
+        let original = parsed(concat!(
+            "import { E } from './e.js'\n",
+            "export const A = {\n",
+            "    item: {\n",
+            "        a: E.A,\n",
+            "    },\n",
+            "} as const\n",
+        ));
+        let consumer = parsed(concat!(
+            "import { A } from './a.js'\n",
+            "export const B = { ...A } as const\n",
+        ));
+        let enumeration_file = FileId::new(9_720);
+        let original_file = FileId::new(9_721);
+        let consumer_file = FileId::new(9_722);
+        let mut context = context_with_routes(
+            &[
+                (enumeration_file, &enumeration),
+                (original_file, &original),
+                (consumer_file, &consumer),
+            ],
+            &[
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(0),
+                },
+                Route {
+                    source: 2,
+                    specifier: 0,
+                    target: Some(1),
+                },
+            ],
+        );
+
+        context.check_source_file(enumeration_file).unwrap();
+        context.check_source_file(original_file).unwrap();
+        context.check_source_file(consumer_file).unwrap();
+
+        for (file, expected) in [(original_file, "A"), (consumer_file, "B")] {
+            let (_, bound) = context.file(file).unwrap();
+            let module = bound.symbol(bound.source_file()).unwrap();
+            let exported = context
+                .store()
+                .symbol(module)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source(expected))
+                .unwrap();
+            let type_ = context
+                .store()
+                .value_symbol_links(exported)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(
+                context.type_to_string(type_).unwrap(),
+                "{ readonly item: { readonly a: E.A; }; }",
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = store_state(context.store());
+        context.recheck_source_file(original_file).unwrap();
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(store_state(context.store()), warm);
     }
 
     #[test]
