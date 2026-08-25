@@ -782,6 +782,7 @@ mod tests {
         let Command::Compile(options) = parse(&[
             "--allowArbitraryExtensions",
             "--allowImportingTsExtensions",
+            "--declaration",
             "--declarationMap",
             "--downlevelIteration",
             "--emitBOM",
@@ -808,6 +809,7 @@ mod tests {
 
         assert!(options.compiler_options.allow_arbitrary_extensions);
         assert!(options.compiler_options.allow_importing_ts_extensions);
+        assert!(options.compiler_options.declaration);
         assert!(options.compiler_options.declaration_map);
         assert!(options.compiler_options.downlevel_iteration);
         assert!(options.compiler_options.emit_bom);
@@ -836,6 +838,7 @@ mod tests {
         let Command::Compile(options) = parse(&[
             "--baseUrl",
             "src",
+            "--declaration",
             "--declarationDir",
             "types",
             "--customConditions",
@@ -854,6 +857,7 @@ mod tests {
             ".native,.ios",
             "--reactNamespace",
             "React",
+            "--sourceMap",
             "--sourceRoot",
             "sources",
             "--tsBuildInfoFile",
@@ -871,6 +875,7 @@ mod tests {
         };
 
         assert_eq!(options.compiler_options.base_url.as_deref(), Some("src"));
+        assert!(options.compiler_options.declaration);
         assert_eq!(
             options.compiler_options.declaration_dir.as_deref(),
             Some("types")
@@ -901,6 +906,7 @@ mod tests {
             options.compiler_options.react_namespace.as_deref(),
             Some("React")
         );
+        assert!(options.compiler_options.source_map);
         assert_eq!(
             options.compiler_options.source_root.as_deref(),
             Some("sources")
