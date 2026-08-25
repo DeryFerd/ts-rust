@@ -2547,6 +2547,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 statements.push(PlannedStatement::ClassGrammar(grammar));
                                 continue;
                             }
+                            if let Some(grammar) = self
+                                .plan_javascript_jsdoc_ambient_heritage_class(statement, symbol)?
+                            {
+                                statements.push(PlannedStatement::ClassGrammar(grammar));
+                                continue;
+                            }
                             return Err(Self::class_plan_error(statement, error));
                         }
                         Err(error) => return Err(Self::class_plan_error(statement, error)),
@@ -9186,6 +9192,307 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 },
             ],
         }))
+    }
+
+    fn plan_javascript_jsdoc_ambient_heritage_class(
+        &self,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<Option<ClassGrammarDiagnosticPlan>, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Ok(None);
+        };
+        if self
+            .bound
+            .source_facts()
+            .is_none_or(|facts| !facts.is_javascript_file() || facts.is_external_module())
+        {
+            return Ok(None);
+        }
+        let Some(annotation) = self
+            .javascript_jsdoc
+            .as_ref()
+            .and_then(|plan| plan.declaration(declaration))
+            .and_then(PlannedJavaScriptDeclaration::augments_type)
+        else {
+            return Ok(None);
+        };
+        let JsDocType::Named(expected) = annotation.type_() else {
+            return Ok(None);
+        };
+        let Some((expected_namespace, expected_member)) = expected.split_once('.') else {
+            return Ok(None);
+        };
+        if expected_member.is_empty() || expected_member.contains('.') {
+            return Ok(None);
+        }
+
+        let record = self.node(declaration)?;
+        let NodeData::ClassDeclaration(class) = &record.data else {
+            return Ok(None);
+        };
+        let Some(owner) = store.symbol(symbol) else {
+            return Ok(None);
+        };
+        let Some(name) = class.name.map(|name| self.reference(name)) else {
+            return Ok(None);
+        };
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(None);
+        };
+        let Some(exports) = owner
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+        else {
+            return Ok(None);
+        };
+        if record.kind != SyntaxKind::ClassDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(self.source.node_ref().node)
+            || class.flow_node.is_some()
+            || class.local_symbol.is_some()
+            || class.symbol.is_some()
+            || class.next_container.is_some()
+            || class.facts != 0
+            || class.modifiers.is_some()
+            || class.type_parameters.is_some()
+            || class.members.has_trailing_comma
+            || !class.members.nodes.is_empty()
+            || class.members.range.end != record.range.end
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || owner.flags() != SymbolFlags::CLASS
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration() != Some(declaration)
+            || owner.members().is_some()
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || exports.len() != 1
+            || exports.get_source("prototype").is_none()
+        {
+            return Ok(None);
+        }
+
+        let Some((namespace_node, namespace_name, actual_member)) =
+            self.javascript_jsdoc_ambient_heritage_names(declaration, class)?
+        else {
+            return Ok(None);
+        };
+        if namespace_name != expected_namespace
+            || !self.authenticate_javascript_jsdoc_ambient_namespace_classes(
+                namespace_node,
+                &namespace_name,
+                &actual_member,
+                expected_member,
+            )?
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(ClassGrammarDiagnosticPlan {
+            declaration,
+            symbol,
+            diagnostics: Vec::new(),
+        }))
+    }
+
+    fn javascript_jsdoc_ambient_heritage_names(
+        &self,
+        declaration: NodeRef,
+        class: &ts_ast::ClassDeclarationData,
+    ) -> Result<Option<(NodeRef, String, String)>, SourceCheckError> {
+        let Some(clauses) = class.heritage_clauses.as_ref() else {
+            return Ok(None);
+        };
+        let [clause] = clauses.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let clause = self.reference(*clause);
+        let clause_record = self.node(clause)?;
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return Ok(None);
+        };
+        let [base] = heritage.types.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let base = self.reference(*base);
+        let base_record = self.node(base)?;
+        let NodeData::ExpressionWithTypeArguments(expression) = &base_record.data else {
+            return Ok(None);
+        };
+        let property = self.reference(expression.expression);
+        let property_record = self.node(property)?;
+        let NodeData::PropertyAccessExpression(access) = &property_record.data else {
+            return Ok(None);
+        };
+        let namespace = self.reference(access.expression);
+        let namespace_record = self.node(namespace)?;
+        let NodeData::Identifier(namespace_name) = &namespace_record.data else {
+            return Ok(None);
+        };
+        let member = self.reference(access.name);
+        let member_record = self.node(member)?;
+        let NodeData::Identifier(member_name) = &member_record.data else {
+            return Ok(None);
+        };
+        if clauses.has_trailing_comma
+            || clause_record.kind != SyntaxKind::HeritageClause
+            || clause_record.flags.0 != 0
+            || clause_record.parent != Some(declaration.node)
+            || heritage.token != SyntaxKind::ExtendsKeyword
+            || heritage.facts != 0
+            || heritage.types.has_trailing_comma
+            || base_record.kind != SyntaxKind::ExpressionWithTypeArguments
+            || base_record.flags.0 != 0
+            || base_record.parent != Some(clause.node)
+            || base_record.range.start < heritage.types.range.start
+            || base_record.range.end > heritage.types.range.end
+            || expression.type_arguments.is_some()
+            || expression.facts != 0
+            || property_record.kind != SyntaxKind::PropertyAccessExpression
+            || property_record.flags.0 != 0
+            || property_record.parent != Some(base.node)
+            || access.flow_node.is_some()
+            || access.question_dot_token.is_some()
+            || access.facts != 0
+            || namespace_record.kind != SyntaxKind::Identifier
+            || namespace_record.flags.0 != 0
+            || namespace_record.parent != Some(property.node)
+            || namespace_name.flow_node.is_some()
+            || namespace_name.text.is_empty()
+            || member_record.kind != SyntaxKind::Identifier
+            || member_record.flags.0 != 0
+            || member_record.parent != Some(property.node)
+            || member_name.flow_node.is_some()
+            || member_name.text.is_empty()
+        {
+            return Ok(None);
+        }
+
+        Ok(Some((
+            namespace,
+            namespace_name.text.clone(),
+            member_name.text.clone(),
+        )))
+    }
+
+    fn authenticate_javascript_jsdoc_ambient_namespace_classes(
+        &self,
+        namespace_node: NodeRef,
+        namespace_name: &str,
+        actual_member: &str,
+        expected_member: &str,
+    ) -> Result<bool, SourceCheckError> {
+        let Some((store, host)) = self.semantic else {
+            return Ok(false);
+        };
+        let mut callback_host = host.name_resolver_host(store)?;
+        let resolved = CanonicalNameResolver::new(
+            self.arena,
+            self.bound,
+            store.symbol_store(),
+            &mut callback_host,
+        )
+        .map_err(DeclaredTypeError::from)?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(namespace_node)),
+            namespace_name,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?;
+        let Some(namespace) = resolved.and_then(|symbol| store.get_merged_symbol(symbol)) else {
+            return Ok(false);
+        };
+        let Some(owner) = store.symbol(namespace) else {
+            return Ok(false);
+        };
+        let Some([declaration]) = owner.declarations() else {
+            return Ok(false);
+        };
+        let declaration = *declaration;
+        let Some((arena, bound)) = host.source(declaration) else {
+            return Ok(false);
+        };
+        let Some(record) = arena.get(declaration.node) else {
+            return Ok(false);
+        };
+        let NodeData::ModuleDeclaration(module) = &record.data else {
+            return Ok(false);
+        };
+        let Some(facts) = bound.source_facts() else {
+            return Ok(false);
+        };
+        let Some(exports) = owner
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+        else {
+            return Ok(false);
+        };
+        if owner.flags() != SymbolFlags::VALUE_MODULE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some(namespace_name)
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || !facts.is_declaration_file()
+            || facts.is_external_module()
+            || declaration.is_for(self.arena.id(), self.bound.file_id())
+            || record.kind != SyntaxKind::ModuleDeclaration
+            || record.parent != Some(bound.source_file().node)
+            || bound
+                .symbol(declaration)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(namespace)
+        {
+            return Ok(false);
+        }
+        for name in [actual_member, expected_member] {
+            let Some(symbol) = exports
+                .get_source(name)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+            else {
+                return Ok(false);
+            };
+            let Some(member) = store.symbol(symbol) else {
+                return Ok(false);
+            };
+            let Some([member_declaration]) = member.declarations() else {
+                return Ok(false);
+            };
+            let Some(member_record) = arena.get(member_declaration.node) else {
+                return Ok(false);
+            };
+            let NodeData::ClassDeclaration(class) = &member_record.data else {
+                return Ok(false);
+            };
+            if member.flags() != SymbolFlags::CLASS
+                || member.check_flags() != CheckFlags::NONE
+                || member.parent() != Some(namespace)
+                || member.value_declaration() != Some(*member_declaration)
+                || member.export_symbol().is_some()
+                || member_declaration.file != declaration.file
+                || member_record.kind != SyntaxKind::ClassDeclaration
+                || member_record.parent != module.body
+                || class.heritage_clauses.is_some()
+                || class.type_parameters.is_some()
+                || !class.members.nodes.is_empty()
+                || bound
+                    .symbol(*member_declaration)
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    != Some(symbol)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn plan_exported_empty_class(
@@ -46984,6 +47291,126 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_jsdoc_ambient_class_heritage_reports_exact_ts8023_without_publication() {
+        let ambient = parse_source_file(concat!(
+            "declare namespace React {\n",
+            "    class Component {}\n",
+            "    class PureComponent {}\n",
+            "}\n",
+        ));
+        let text = concat!(
+            "/**\n",
+            " * @extends {React.Component}\n",
+            " */\n",
+            "class C extends React.PureComponent {}\n",
+            "/**\n",
+            " * @extends {React.Component}\n",
+            " */\n",
+            "class D extends React.Component {}",
+        );
+        let source = parse_javascript_source_file(text);
+        assert!(ambient.diagnostics.is_empty(), "{:?}", ambient.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+
+        let ambient_file = FileId::new(9_870);
+        let source_file = FileId::new(9_871);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &ambient.arena,
+                ambient.source_file,
+                ambient_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/react.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                source_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/main.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&ambient.arena, ambient_file)
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&source.arena, source_file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(ambient_file, &ambient.arena), (source_file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(source_file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one JSDoc superclass mismatch")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 8023);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "JSDoc '@extends Component' does not match the 'extends PureComponent' clause.",
+        );
+        assert_eq!(
+            diagnostic.diagnostic.arguments,
+            ["extends", "Component", "PureComponent"],
+        );
+        let start = text.find("React.Component").unwrap() + "React.".len();
+        let range = diagnostic.range_override.unwrap().range();
+        assert_eq!(range.start.get() as usize, start);
+        assert_eq!(range.end.get() as usize, start + "Component".len());
+
+        let (_, bound) = context.file(source_file).unwrap();
+        for (node, record) in source.arena.iter() {
+            if record.kind != SyntaxKind::ClassDeclaration {
+                continue;
+            }
+            let declaration = NodeRef::new(source.arena.id(), source_file, node);
+            let symbol = bound.symbol(declaration).unwrap();
+            assert!(context.store().value_symbol_links(symbol).is_none());
+            assert!(context.store().declared_type_links(symbol).is_none());
+        }
+
+        let warm = observable_state(&context, source_file);
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(observable_state(&context, source_file), warm);
+    }
+
+    #[test]
+    fn unresolved_jsdoc_ambient_class_heritage_remains_an_atomic_unsupported_boundary() {
+        let source = parse_javascript_source_file(concat!(
+            "/** @extends {Missing.Component} */\n",
+            "class C extends Missing.PureComponent {}",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(9_872);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+        let before = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Class(_)
+            ))
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
