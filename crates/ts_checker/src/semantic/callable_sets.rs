@@ -18,7 +18,10 @@ use super::{
         CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
         validate_stored_single_callable_provider,
     },
-    classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
+    classes::{
+        ClassHeritageMembersValidation, authenticated_class_constructor_value,
+        validate_class_heritage_members,
+    },
     declared::cached_ordinary_type_parameter_owner,
     instantiate::instantiated_member_type_matches,
     links::ValueSymbolLinks,
@@ -171,6 +174,10 @@ pub(super) fn validate_stored_callable_set(
         }
     }
 
+    if let Some(validation) = validate_stored_class_constructor_callable_set(store, type_) {
+        return validation;
+    }
+
     if let Some(validation) = validate_stored_default_library_method_callable_set(store, type_) {
         return validation;
     }
@@ -196,6 +203,70 @@ pub(super) fn validate_stored_callable_set(
     }
 
     validate_stored_intersection_callable_set(store, type_)
+}
+
+fn validate_stored_class_constructor_callable_set(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<StoredCallableSetValidation> {
+    let record = store.type_payload(type_)?;
+    if !matches!(record.data(), TypeData::Object(_)) {
+        return None;
+    }
+    let symbol = record.symbol()?;
+    if !store.symbol(symbol)?.flags().contains(SymbolFlags::CLASS) {
+        return None;
+    }
+
+    let family = CallableFamily::DeclaredCallSignatures;
+    let authenticated = (|| {
+        let (value, expected) = authenticated_class_constructor_value(store, symbol)?;
+        if value != type_ {
+            return None;
+        }
+        let projection =
+            validate_stored_callable_set_projection_with(store, type_, false, |signature| {
+                store
+                    .signature(signature)?
+                    .parameters()
+                    .iter()
+                    .map(|parameter| {
+                        let links = store.value_symbol_links(*parameter)?;
+                        let type_ = links.resolved_type?;
+                        (links
+                            == &(ValueSymbolLinks {
+                                resolved_type: Some(type_),
+                                ..ValueSymbolLinks::default()
+                            })
+                            && store.type_payload(type_).is_some())
+                        .then_some(type_)
+                    })
+                    .collect()
+            })?;
+        let [signature] = projection.construct_signatures.as_ref() else {
+            return None;
+        };
+        if !projection.call_signatures.is_empty() || *signature != expected {
+            return None;
+        }
+        let signature = store.signature(*signature)?;
+        let mut edges = signature
+            .parameters()
+            .iter()
+            .map(|parameter| store.value_symbol_links(*parameter)?.resolved_type)
+            .collect::<Option<Vec<_>>>()?;
+        edges.push(signature.resolved_return_type()?);
+        Some((projection, edges))
+    })();
+
+    Some(match authenticated {
+        Some((projection, edges)) => StoredCallableSetValidation::Valid {
+            family,
+            projection,
+            edges,
+        },
+        None => StoredCallableSetValidation::Malformed { family },
+    })
 }
 
 fn valid_untyped_javascript_source_signature(
@@ -2450,6 +2521,155 @@ mod tests {
             vec![second, first]
         );
         assert_eq!(projected.construct_signatures.as_ref(), &[construct]);
+    }
+
+    #[test]
+    fn class_constructor_providers_preserve_abstract_identity_and_canonical_unions() {
+        let parsed = parse_source_file(concat!(
+            "abstract class Abstract { value!: string; } ",
+            "class Concrete {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4_497);
+        let mut context =
+            source_callable_context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+
+        context.check_source_file(file).unwrap();
+
+        let mut values = Vec::new();
+        for (name, abstract_class) in [("Abstract", true), ("Concrete", false)] {
+            let store = context.store();
+            let owner = store
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                .and_then(|globals| globals.get_source(name))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let (value, signature) = authenticated_class_constructor_value(store, owner).unwrap();
+            let instance = store
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let StoredCallableSetValidation::Valid {
+                family,
+                projection,
+                edges,
+            } = validate_stored_callable_set(store, value)
+            else {
+                panic!("{name} must retain one authenticated constructor provider")
+            };
+            assert_eq!(family, CallableFamily::DeclaredCallSignatures);
+            assert_eq!(projection.owner, value);
+            assert!(projection.call_signatures.is_empty());
+            assert_eq!(projection.construct_signatures.as_ref(), &[signature]);
+            assert_eq!(edges, [instance]);
+            assert_eq!(
+                store.signature(signature).unwrap().flags(),
+                SignatureFlags::CONSTRUCT
+                    | if abstract_class {
+                        SignatureFlags::ABSTRACT
+                    } else {
+                        SignatureFlags::NONE
+                    },
+            );
+            values.push(value);
+        }
+
+        let union = context
+            .store_mut_for_test()
+            .literal_union_type(&values, None)
+            .unwrap();
+        let TypeData::Union(candidates) = context.store().type_payload(union).unwrap().data()
+        else {
+            panic!("class constructor values must retain their real canonical union")
+        };
+        assert_eq!(candidates.union.types.len(), 2);
+        assert!(
+            values
+                .iter()
+                .all(|value| candidates.union.types.contains(value))
+        );
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .literal_union_type(&values, None),
+            Ok(union),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn forged_class_constructor_providers_are_rejected_before_union_creation() {
+        for poison in 0..2 {
+            let parsed = parse_source_file("abstract class Model { value!: string; }");
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(4_498 + poison);
+            let mut context =
+                source_callable_context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+            context.check_source_file(file).unwrap();
+            let owner = {
+                let store = context.store();
+                store
+                    .intrinsic_bootstrap()
+                    .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                    .and_then(|globals| globals.get_source("Model"))
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap()
+            };
+            let (value, signature) =
+                authenticated_class_constructor_value(context.store(), owner).unwrap();
+            match poison {
+                0 => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_flags(signature, SignatureFlags::CONSTRUCT)
+                ),
+                1 => {
+                    let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_resolved_return_type(signature, Some(wrong))
+                    );
+                }
+                _ => unreachable!("only class constructor flags and return identity are poisoned"),
+            }
+            let state = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                validate_stored_callable_set(context.store(), value),
+                StoredCallableSetValidation::Malformed {
+                    family: CallableFamily::DeclaredCallSignatures,
+                }
+            ));
+            assert!(context.store().validate_union_constituent(value).is_err());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                state,
+                "poison case {poison}",
+            );
+        }
     }
 
     #[test]

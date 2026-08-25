@@ -4,13 +4,14 @@
 //! constructor branch of pinned TypeScript-Go `checkCallExpression`,
 //! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`.
 //! An admitted constructor belongs to one preceding local class, an imported
-//! exported ambient class, an earlier ambient variable, or an authenticated
-//! global `Object`, `Boolean`, `Array`, `Date`, or `Promise` constructor.
-//! Imported ambient classes retain primitive constructor arguments and
-//! canonical generic instantiations. Global arrays retain their real length
-//! and generic-item overloads, including authenticated empty object literals.
-//! Planning proves syntax, resolver routes, provider provenance, and cold/warm
-//! caches before source execution may publish class or expression state.
+//! exported ambient class, an earlier ambient variable, an authenticated class
+//! constructor union, or a global `Object`, `Boolean`, `Array`, `Date`, or
+//! `Promise` constructor. Imported ambient classes retain primitive constructor
+//! arguments and canonical generic instantiations. Global arrays retain their
+//! real length and generic-item overloads, including authenticated empty object
+//! literals. Planning proves syntax, resolver routes, provider provenance, and
+//! cold/warm caches before source execution may publish class or expression
+//! state.
 
 use std::collections::{HashMap, HashSet};
 
@@ -31,8 +32,8 @@ use super::{
     callables::CallableFamily,
     classes::{
         ClassConstructorVisibility, ClassMemberPlan, ClassMemberQueryPlan,
-        execute_nongeneric_class_member_query, plan_nongeneric_class_member_query,
-        preflight_nongeneric_class_member_query,
+        authenticated_class_constructor_value, execute_nongeneric_class_member_query,
+        plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
     },
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
     functions::plan_function_type,
@@ -172,6 +173,7 @@ enum SourceNewTarget {
     Class(Box<ClassMemberQueryPlan>),
     ImportedClass(Box<SourceImportBindingPlan>),
     Declared(SourceDeclaredConstructorPlan),
+    ClassUnion(SourceClassUnionConstructorPlan),
     GlobalObject(SourceGlobalObjectConstructorPlan),
     GlobalArray(SourceGlobalArrayConstructorPlan),
     GlobalDate(SourceGlobalDateConstructorPlan),
@@ -185,6 +187,12 @@ struct SourceDeclaredConstructorPlan {
     parameter: Option<SourceNewParameter>,
     signature_parameter: Option<SourceNewParameter>,
     min_argument_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceClassUnionConstructorPlan {
+    annotation: NodeRef,
+    classes: Vec<ClassMemberQueryPlan>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -381,6 +389,13 @@ impl SourceDefaultNewPlan {
         store: &CanonicalTypeMapperStore,
         host: &DeclaredTypeHost<'_>,
     ) -> Result<Option<(u32, String)>, SourceNewError> {
+        if let SourceNewTarget::ClassUnion(union) = &self.target {
+            return Ok(union
+                .classes
+                .iter()
+                .any(ClassMemberQueryPlan::is_abstract)
+                .then(|| (2511, String::new())));
+        }
         let imported_class;
         let class = match &self.target {
             SourceNewTarget::Class(class) => class.as_ref(),
@@ -1021,8 +1036,26 @@ pub(super) fn plan_direct_default_new(
             constructor,
             symbol,
             argument.as_ref(),
-        )?;
-        (SourceNewTarget::Declared(declared), declared.parameter)
+        );
+        match declared {
+            Ok(declared) => (SourceNewTarget::Declared(declared), declared.parameter),
+            Err(SourceNewError::Unsupported(SourceNewUnsupported::ConstructorClass { .. }))
+                if argument.is_none() =>
+            {
+                let union = plan_declared_class_union_constructor(
+                    arena,
+                    bound,
+                    store,
+                    host,
+                    prior_classes,
+                    node,
+                    constructor,
+                    symbol,
+                )?;
+                (SourceNewTarget::ClassUnion(union), None)
+            }
+            Err(error) => return Err(error),
+        }
     } else {
         return Err(unsupported(SourceNewUnsupported::ConstructorClass {
             node: constructor,
@@ -2531,6 +2564,329 @@ fn plan_declared_constructor(
     Err(unsupported(SourceNewUnsupported::Arguments(node)))
 }
 
+#[allow(clippy::too_many_arguments)] // The ambient declaration and union share one source proof.
+fn plan_declared_class_union_constructor(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    prior_classes: &HashMap<SemanticSymbolId, ClassMemberPlan>,
+    node: NodeRef,
+    constructor: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<SourceClassUnionConstructorPlan, SourceNewError> {
+    let reject = || {
+        unsupported(SourceNewUnsupported::ConstructorClass {
+            node: constructor,
+            symbol,
+        })
+    };
+    let owner = store.symbol(symbol).ok_or_else(reject)?;
+    let Some([declaration]) = owner.declarations() else {
+        return Err(reject());
+    };
+    let declaration = *declaration;
+    let declaration_record = arena.get(declaration.node).ok_or_else(reject)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Err(reject());
+    };
+    let list = declaration_record
+        .parent
+        .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+        .ok_or_else(reject)?;
+    let list_record = arena.get(list.node).ok_or_else(reject)?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return Err(reject());
+    };
+    let statement = list_record
+        .parent
+        .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+        .ok_or_else(reject)?;
+    let statement_record = arena.get(statement.node).ok_or_else(reject)?;
+    let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+        return Err(reject());
+    };
+    let Some(modifiers) = statement_data.modifiers.as_ref() else {
+        return Err(reject());
+    };
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return Err(reject());
+    };
+    let modifier = NodeRef::new(statement.arena, statement.file, *modifier);
+    let modifier_record = arena.get(modifier.node).ok_or_else(reject)?;
+    let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let name_record = arena.get(name.node).ok_or_else(reject)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(reject());
+    };
+    let annotation = variable
+        .type_
+        .map(|type_| NodeRef::new(declaration.arena, declaration.file, type_))
+        .ok_or_else(reject)?;
+    let annotation_record = arena.get(annotation.node).ok_or_else(reject)?;
+    let construction = arena.get(node.node).ok_or_else(reject)?;
+    if !declaration.is_for(node.arena, node.file)
+        || !matches!(
+            owner.flags(),
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE
+        )
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(identifier.text.as_str())
+        || owner.value_declaration() != Some(declaration)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || bound.symbol(declaration) != Some(symbol)
+        || declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || variable.initializer.is_some()
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+        || list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.parent != Some(statement.node)
+        || declarations.declarations.has_trailing_comma
+        || !declarations.declarations.nodes.contains(&declaration.node)
+        || statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || statement_record.parent != Some(bound.source_file().node)
+        || statement_record.range.end > construction.range.start
+        || statement_data.declaration_list != list.node
+        || statement_data.flow_node.is_some()
+        || statement_data.facts != 0
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifier_record.kind != SyntaxKind::DeclareKeyword
+        || modifier_record.flags.0 != 0
+        || modifier_record.parent != Some(statement.node)
+        || !matches!(modifier_record.data, NodeData::Token(_))
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || annotation_record.flags.0 != 0
+        || annotation_record.parent != Some(declaration.node)
+    {
+        return Err(reject());
+    }
+
+    let mut classes = Vec::new();
+    let mut aliases = HashSet::new();
+    collect_class_union_constructors(
+        arena,
+        bound,
+        store,
+        host,
+        prior_classes,
+        annotation,
+        &mut aliases,
+        &mut classes,
+    )
+    .map_err(|_| reject())?;
+    if classes.len() < 2 {
+        return Err(reject());
+    }
+    Ok(SourceClassUnionConstructorPlan {
+        annotation,
+        classes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // Every nested alias must preserve the same source ownership.
+fn collect_class_union_constructors(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    prior_classes: &HashMap<SemanticSymbolId, ClassMemberPlan>,
+    node: NodeRef,
+    aliases: &mut HashSet<SemanticSymbolId>,
+    classes: &mut Vec<ClassMemberQueryPlan>,
+) -> Result<(), SourceNewError> {
+    let reject = || unsupported(SourceNewUnsupported::Constructor(node));
+    let record = arena.get(node.node).ok_or_else(reject)?;
+    if record.flags.0 != 0 || !bound.contains(node) {
+        return Err(reject());
+    }
+    match &record.data {
+        NodeData::UnionTypeNode(union) if record.kind == SyntaxKind::UnionType => {
+            if union.types.nodes.len() < 2
+                || union.types.has_trailing_comma
+                || union.types.range != record.range
+            {
+                return Err(reject());
+            }
+            for child in &union.types.nodes {
+                let child = NodeRef::new(node.arena, node.file, *child);
+                if arena
+                    .get(child.node)
+                    .is_none_or(|child| child.parent != Some(node.node))
+                {
+                    return Err(reject());
+                }
+                collect_class_union_constructors(
+                    arena,
+                    bound,
+                    store,
+                    host,
+                    prior_classes,
+                    child,
+                    aliases,
+                    classes,
+                )?;
+            }
+        }
+        NodeData::TypeReferenceNode(reference)
+            if record.kind == SyntaxKind::TypeReference && reference.type_arguments.is_none() =>
+        {
+            let name = NodeRef::new(node.arena, node.file, reference.type_name);
+            let name_record = arena.get(name.node).ok_or_else(reject)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(reject());
+            };
+            if name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(node.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+            {
+                return Err(reject());
+            }
+            let mut callback_host = host.name_resolver_host(store)?;
+            let symbol =
+                CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+                    .map_err(|error| {
+                        invariant(SourceNewInvariant::NameResolution { node: name, error })
+                    })?
+                    .resolve(
+                        Some(CanonicalResolutionLocation::Bound(name)),
+                        &identifier.text,
+                        SymbolFlags::TYPE,
+                        None,
+                        false,
+                        false,
+                    )
+                    .map_err(|error| {
+                        invariant(SourceNewInvariant::NameResolution { node: name, error })
+                    })?
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .ok_or_else(reject)?;
+            let owner = store.symbol(symbol).ok_or_else(reject)?;
+            let Some([declaration]) = owner.declarations() else {
+                return Err(reject());
+            };
+            let declaration = *declaration;
+            let declaration_record = arena.get(declaration.node).ok_or_else(reject)?;
+            let NodeData::TypeAliasDeclaration(alias) = &declaration_record.data else {
+                return Err(reject());
+            };
+            if owner.flags() != SymbolFlags::TYPE_ALIAS
+                || owner.check_flags() != CheckFlags::NONE
+                || owner.name().as_utf8() != Some(identifier.text.as_str())
+                || owner.value_declaration().is_some()
+                || owner.members().is_some()
+                || owner.exports().is_some()
+                || owner.parent().is_some()
+                || owner.export_symbol().is_some()
+                || !declaration.is_for(node.arena, node.file)
+                || declaration_record.kind != SyntaxKind::TypeAliasDeclaration
+                || declaration_record.flags.0 != 0
+                || declaration_record.parent != Some(bound.source_file().node)
+                || declaration_record.range.end > record.range.start
+                || alias.type_parameters.is_some()
+                || !host.symbol_matches(store, declaration, symbol)
+                || !aliases.insert(symbol)
+            {
+                return Err(reject());
+            }
+            let value = NodeRef::new(declaration.arena, declaration.file, alias.type_);
+            if arena
+                .get(value.node)
+                .is_none_or(|value| value.parent != Some(declaration.node))
+            {
+                return Err(reject());
+            }
+            collect_class_union_constructors(
+                arena,
+                bound,
+                store,
+                host,
+                prior_classes,
+                value,
+                aliases,
+                classes,
+            )?;
+        }
+        NodeData::TypeQueryNode(query)
+            if record.kind == SyntaxKind::TypeQuery && query.type_arguments.is_none() =>
+        {
+            let name = NodeRef::new(node.arena, node.file, query.expr_name);
+            let name_record = arena.get(name.node).ok_or_else(reject)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(reject());
+            };
+            if name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(node.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+            {
+                return Err(reject());
+            }
+            let mut callback_host = host.name_resolver_host(store)?;
+            let symbol =
+                CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+                    .map_err(|error| {
+                        invariant(SourceNewInvariant::NameResolution { node: name, error })
+                    })?
+                    .resolve(
+                        Some(CanonicalResolutionLocation::Bound(name)),
+                        &identifier.text,
+                        SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+                        None,
+                        false,
+                        false,
+                    )
+                    .map_err(|error| {
+                        invariant(SourceNewInvariant::NameResolution { node: name, error })
+                    })?
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .ok_or_else(reject)?;
+            let class = prior_classes.get(&symbol).ok_or_else(reject)?;
+            let class = ClassMemberQueryPlan::Direct(class.clone());
+            if class.symbol() != symbol
+                || class.constructor_visibility() != ClassConstructorVisibility::Public
+                || class.constructor_parameter_symbol().is_some()
+                || class.constructor_minimum_argument_count() != 0
+                || classes.iter().any(|previous| previous.symbol() == symbol)
+            {
+                return Err(reject());
+            }
+            preflight_nongeneric_class_member_query(store, host, &class)?;
+            if exact_symbol_cache(store, name)
+                .map_err(|()| invariant(SourceNewInvariant::InvalidConstructorCache(name)))?
+                .is_some_and(|cached| cached != symbol)
+            {
+                return Err(invariant(SourceNewInvariant::InvalidConstructorCache(name)));
+            }
+            if let Some(cached) = exact_type_cache(store, node)
+                .map_err(|()| invariant(SourceNewInvariant::InvalidConstructorCache(node)))?
+                && authenticated_class_constructor_value(store, symbol)
+                    .is_none_or(|(value, _)| value != cached)
+            {
+                return Err(invariant(SourceNewInvariant::InvalidConstructorCache(node)));
+            }
+            classes.push(class);
+        }
+        _ => return Err(reject()),
+    }
+    Ok(())
+}
+
 fn plan_declared_constructor_object(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -2914,6 +3270,45 @@ pub(super) fn preflight_direct_default_new(
                 plan.argument.as_ref(),
             )?;
             if actual != *expected || expected.parameter != plan.parameter {
+                return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                )));
+            }
+        }
+        SourceNewTarget::ClassUnion(expected) => {
+            let (arena, bound) = host.source(plan.constructor).ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?;
+            let mut prior_classes = HashMap::new();
+            prior_classes
+                .try_reserve(expected.classes.len())
+                .map_err(|_| invariant(SourceNewInvariant::Capacity(plan.constructor)))?;
+            for class in &expected.classes {
+                let direct = class.direct_plan().ok_or_else(|| {
+                    invariant(SourceNewInvariant::InvalidClassPlan(class.declaration()))
+                })?;
+                if prior_classes
+                    .insert(class.symbol(), direct.clone())
+                    .is_some()
+                {
+                    return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                        plan.constructor,
+                    )));
+                }
+            }
+            let actual = plan_declared_class_union_constructor(
+                arena,
+                bound,
+                store,
+                host,
+                &prior_classes,
+                plan.node,
+                plan.constructor,
+                plan.resolved_symbol,
+            )?;
+            if actual != *expected || plan.argument.is_some() || plan.parameter.is_some() {
                 return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
                     plan.constructor,
                 )));
@@ -4129,6 +4524,13 @@ pub(super) fn check_direct_default_new(
                 ))
             })?
         }
+        SourceNewTarget::ClassUnion(union) => {
+            resolved_declared_class_union_constructor(store, plan, union)?.ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?
+        }
         SourceNewTarget::GlobalObject(global) => {
             resolved_global_object_constructor(store, plan, global)?.ok_or_else(|| {
                 invariant(SourceNewInvariant::InvalidConstructorCache(
@@ -4366,6 +4768,86 @@ fn resolved_declared_constructor(
         instance_type,
         signature,
     }))
+}
+
+fn resolved_declared_class_union_constructor(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceDefaultNewPlan,
+    union: &SourceClassUnionConstructorPlan,
+) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    let Some(value_type) = exact_type_cache(store, union.annotation).map_err(|()| invalid())?
+    else {
+        if exact_class_value_type(store, plan.resolved_symbol)?.is_some() {
+            return Err(invalid());
+        }
+        return Ok(None);
+    };
+    if exact_class_value_type(store, plan.resolved_symbol)?
+        .is_some_and(|cached| cached != value_type)
+        || store.validate_union_constituent(value_type).is_err()
+    {
+        return Err(invalid());
+    }
+    let Some(TypeData::Union(candidates)) =
+        store.type_payload(value_type).map(|record| record.data())
+    else {
+        return Err(invalid());
+    };
+    if candidates.union.types.len() != union.classes.len() {
+        return Err(invalid());
+    }
+
+    let mut selected = None;
+    for candidate in &candidates.union.types {
+        let owner = store
+            .type_payload(*candidate)
+            .and_then(|record| record.symbol())
+            .ok_or_else(invalid)?;
+        let class = union
+            .classes
+            .iter()
+            .find(|class| class.symbol() == owner)
+            .ok_or_else(invalid)?;
+        let (value, signature) =
+            authenticated_class_constructor_value(store, owner).ok_or_else(invalid)?;
+        let record = store.signature(signature).ok_or_else(invalid)?;
+        let expected_flags = SignatureFlags::CONSTRUCT
+            | if class.is_abstract() {
+                SignatureFlags::ABSTRACT
+            } else {
+                SignatureFlags::NONE
+            };
+        let instance_type = record.resolved_return_type().ok_or_else(invalid)?;
+        if value != *candidate
+            || record.flags() != expected_flags
+            || !record.parameters().is_empty()
+            || record.min_argument_count() != 0
+            || record.resolved_min_argument_count() != -1
+            || record.this_parameter().is_some()
+            || record.target().is_some()
+            || record.mapper().is_some()
+            || record.composite().is_some()
+            || store
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                != Some(instance_type)
+        {
+            return Err(invalid());
+        }
+        if selected.is_none() {
+            selected = Some(CheckedSourceDefaultNew {
+                value_type,
+                instance_type,
+                signature,
+            });
+        }
+    }
+    selected.map(Some).ok_or_else(invalid)
 }
 
 fn resolved_global_object_constructor(
@@ -5120,6 +5602,20 @@ fn preflight_default_new_cache(
         }
         SourceNewTarget::Declared(declared) => {
             let resolved = resolved_declared_constructor(store, plan, declared)?;
+            if constructor_type.is_some_and(|constructor| {
+                resolved.is_none_or(|resolved| constructor != resolved.value_type)
+            }) || result_type.is_some_and(|result| {
+                resolved.is_none_or(|resolved| result != resolved.instance_type)
+            }) || signature.is_some_and(|signature| {
+                resolved.is_none_or(|resolved| signature != resolved.signature)
+            }) {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+        }
+        SourceNewTarget::ClassUnion(union) => {
+            let resolved = resolved_declared_class_union_constructor(store, plan, union)?;
             if constructor_type.is_some_and(|constructor| {
                 resolved.is_none_or(|resolved| constructor != resolved.value_type)
             }) || result_type.is_some_and(|result| {
@@ -7960,6 +8456,273 @@ mod tests {
                 warm,
                 "{source}",
             );
+        }
+    }
+
+    #[test]
+    fn declared_class_constructor_unions_preserve_identity_abstract_diagnostics_and_warm_replay() {
+        for (source, abstract_union) in [
+            (
+                concat!(
+                    "class First {} class Second {} ",
+                    "declare const factory: typeof First | typeof Second; ",
+                    "const result = new factory();",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "class First {} class Second {} ",
+                    "type Factory = typeof First | typeof Second; ",
+                    "declare const factory: Factory; ",
+                    "const result = new factory();",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "abstract class First { value!: string; } ",
+                    "class Second {} ",
+                    "type Factory = typeof First | typeof Second; ",
+                    "declare const factory: Factory; ",
+                    "const result = new factory();",
+                ),
+                true,
+            ),
+            (
+                concat!(
+                    "abstract class First { value!: string; } ",
+                    "abstract class Second { other!: number; } ",
+                    "type Factory = typeof First | typeof Second; ",
+                    "declare const factory: Factory; ",
+                    "const result = new factory();",
+                ),
+                true,
+            ),
+            (
+                concat!(
+                    "abstract class Abstract { value!: string; } ",
+                    "class First {} class Second {} ",
+                    "type Concrete = typeof First | typeof Second; ",
+                    "type Factory = typeof Abstract | Concrete; ",
+                    "declare const factory: Factory; ",
+                    "const result = new factory();",
+                ),
+                true,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            let file = FileId::new(1_860);
+            let mut context = context(&parsed, file);
+            let (annotation, owner) = ambient_constructor(&parsed, file, &context, "factory");
+            let (construction, constructor) = variable_new(&parsed, file, "result");
+
+            context.check_source_file(file).unwrap();
+
+            let store = context.store();
+            let value = store
+                .type_node_links(annotation)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let TypeData::Union(candidates) = store.type_payload(value).unwrap().data() else {
+                panic!("{source} must retain the canonical constructor union")
+            };
+            assert!(candidates.union.types.len() >= 2, "{source}");
+            let signature = store
+                .signature_links(construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let result = store
+                .type_node_links(construction)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(
+                store
+                    .symbol_node_links(constructor)
+                    .and_then(|links| links.resolved_symbol),
+                Some(owner),
+                "{source}",
+            );
+            assert_eq!(
+                store
+                    .type_node_links(constructor)
+                    .and_then(|links| links.resolved_type),
+                Some(value),
+                "{source}",
+            );
+            assert_eq!(
+                store
+                    .signature(signature)
+                    .and_then(Signature::resolved_return_type),
+                Some(result),
+                "{source}",
+            );
+            assert!(candidates.union.types.iter().any(|candidate| {
+                store
+                    .type_payload(*candidate)
+                    .and_then(|record| record.symbol())
+                    .and_then(|symbol| authenticated_class_constructor_value(store, symbol))
+                    .is_some_and(|(_, actual)| actual == signature)
+            }));
+            if abstract_union {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("{source} must reject an abstract constructor constituent")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2511, "{source}");
+                assert!(diagnostic.diagnostic.arguments.is_empty(), "{source}");
+                assert_eq!(diagnostic.node, Some(construction), "{source}");
+            } else {
+                assert!(context.diagnostics().is_empty(), "{source}");
+            }
+            let warm = (
+                store.type_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+                context.diagnostics().clone(),
+            );
+
+            context.recheck_source_file(file).unwrap();
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().clone(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn abstract_class_union_instantiation_reports_only_abstract_constructor_unions() {
+        let parsed = parse_source_file(concat!(
+            "class ConcreteA {} class ConcreteB {} ",
+            "abstract class AbstractA { a: string; } ",
+            "abstract class AbstractB { b: string; } ",
+            "type Abstracts = typeof AbstractA | typeof AbstractB; ",
+            "type Concretes = typeof ConcreteA | typeof ConcreteB; ",
+            "type All = Concretes | Abstracts; ",
+            "declare const mixed: All; ",
+            "declare const abstractOnly: Abstracts; ",
+            "declare const concreteOnly: Concretes; ",
+            "new mixed(); new abstractOnly(); new concreteOnly();",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_863);
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let constructions = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(constructions.len(), 3);
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, construction) in diagnostics.iter().zip(&constructions) {
+            assert_eq!(diagnostic.diagnostic.code(), 2511);
+            assert!(diagnostic.diagnostic.arguments.is_empty());
+            assert_eq!(diagnostic.node, Some(*construction));
+        }
+        assert!(constructions.iter().all(|construction| {
+            context
+                .store()
+                .signature_links(*construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .is_some()
+        }));
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().clone(),
+        );
+
+        context.recheck_source_file(file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().clone(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn forged_class_union_constructor_signature_rejects_before_new_publication() {
+        for poison in 0..2 {
+            let parsed = parse_source_file(concat!(
+                "class First {} class Second {} ",
+                "type Factory = typeof First | typeof Second; ",
+                "declare const factory: Factory; ",
+                "const result = new factory();",
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(1_861 + poison);
+            let mut context = context(&parsed, file);
+            let (annotation, _) = ambient_constructor(&parsed, file, &context, "factory");
+            let (construction, constructor) = variable_new(&parsed, file, "result");
+            context.get_type_from_type_node(annotation).unwrap();
+            let class = class_symbol(&parsed, file, &context, "First");
+            let (_, signature) =
+                authenticated_class_constructor_value(context.store(), class).unwrap();
+            match poison {
+                0 => assert!(context.store_mut_for_test().set_signature_flags(
+                    signature,
+                    SignatureFlags::CONSTRUCT | SignatureFlags::ABSTRACT,
+                )),
+                1 => {
+                    let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_resolved_return_type(signature, Some(wrong))
+                    );
+                }
+                _ => unreachable!("only class constructor flags and return values are forged"),
+            }
+            let state = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                context.check_source_file(file).is_err(),
+                "poison case {poison}"
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                state,
+                "poison case {poison}",
+            );
+            assert!(context.store().type_node_links(construction).is_none());
+            assert!(context.store().signature_links(construction).is_none());
+            assert!(context.store().symbol_node_links(constructor).is_none());
+            assert!(context.diagnostics().is_empty());
         }
     }
 
