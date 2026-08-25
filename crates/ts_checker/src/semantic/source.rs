@@ -71486,6 +71486,102 @@ class Foo2 {
     }
 
     #[test]
+    fn callable_interface_members_preserve_implicit_constructor_diagnostic_gates() {
+        let source = parsed(concat!(
+            "interface i1 {} ",
+            "interface i2 { ",
+            "x: number; ",
+            "foo: (b: number) => string; ",
+            "[i: string]: any; ",
+            "new (i: i1); ",
+            "[i: number]: number; ",
+            "(a: number, b: number): number; ",
+            "fnfoo(b: number): string; ",
+            "}",
+        ));
+
+        for (index, no_implicit_any) in [false, true].into_iter().enumerate() {
+            let file = FileId::new(9_941 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    no_implicit_any,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let owner = global_symbol(&context, "i2");
+            let type_ = context
+                .store()
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let TypeData::Interface(interface) =
+                context.store().type_payload(type_).unwrap().data()
+            else {
+                panic!("the comments interface must retain its declared identity")
+            };
+            assert_eq!(
+                interface
+                    .reference
+                    .object
+                    .structured
+                    .properties
+                    .as_ref()
+                    .map(Vec::len),
+                Some(3),
+            );
+            assert_eq!(
+                interface.declared_index_infos.as_ref().map(Vec::len),
+                Some(2)
+            );
+            assert_eq!(
+                interface.declared_call_signatures.as_ref().map(Vec::len),
+                Some(1)
+            );
+            let [constructor] = interface.declared_construct_signatures.as_deref().unwrap() else {
+                panic!("the comments interface must retain one constructor")
+            };
+            let constructor = *constructor;
+            assert_eq!(
+                context
+                    .store()
+                    .signature(constructor)
+                    .and_then(super::super::signatures::Signature::resolved_return_type),
+                Some(context.store().intrinsic_bootstrap().unwrap().any_type),
+            );
+            assert!(matches!(
+                super::super::object_members::validate_stored_declared_call_set(
+                    context.store(),
+                    type_,
+                ),
+                super::super::object_members::StoredDeclaredCallSetValidation::Valid(_)
+            ));
+            if no_implicit_any {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("the implicit constructor return must report exactly one diagnostic")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 7013);
+                assert_eq!(node_text(&source, diagnostic.node.unwrap()), "new (i: i1);");
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    "Construct signature, which lacks return-type annotation, implicitly has an 'any' return type.",
+                );
+            } else {
+                assert!(context.diagnostics().is_empty());
+            }
+
+            let expected_diagnostics = context.diagnostics().clone();
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+            assert_eq!(context.diagnostics(), &expected_diagnostics);
+        }
+    }
+
+    #[test]
     fn invalid_interface_construct_signature_preserves_order_and_option_gates() {
         for (index, no_implicit_any) in [false, true].into_iter().enumerate() {
             let source = parsed("interface Invalid { new (public value); }");

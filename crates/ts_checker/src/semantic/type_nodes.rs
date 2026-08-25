@@ -18242,7 +18242,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         prepared,
                     )?);
                 }
-                let return_type = self.execute_type_node(signature.return_type, plan, prepared)?;
+                let return_type = if signature.implicit_any_return {
+                    self.store
+                        .intrinsic_bootstrap()
+                        .map(|bootstrap| bootstrap.any_type)
+                        .ok_or(DeclaredTypeError::Unavailable(
+                            DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                        ))?
+                } else {
+                    self.execute_type_node(signature.return_type, plan, prepared)?
+                };
                 call_types.push(object_members::ResolvedCallSignatureTypes {
                     parameter_types,
                     return_type,
@@ -18331,6 +18340,20 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
         })();
         assert!(self.resolving_property_interfaces.remove(&symbol));
+        if result.is_ok() && self.options.no_implicit_any {
+            for signature in interface
+                .call_signatures
+                .iter()
+                .filter(|signature| signature.implicit_any_return)
+            {
+                self.diagnostics.lookup_or_issue(
+                    Some(signature.declaration),
+                    Diagnostic::new(
+                        message_by_code(7013).expect("TS7013 is in the diagnostic catalog"),
+                    ),
+                );
+            }
+        }
         result
     }
 
