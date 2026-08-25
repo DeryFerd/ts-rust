@@ -12131,9 +12131,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let NodeData::Identifier(identifier) = &name_record.data else {
             return false;
         };
-        let root_element = matches!(
+        let root_dom_interface = matches!(
             identifier.text.as_str(),
-            "Element" | "HTMLElement" | "SVGElement"
+            "Document" | "Element" | "HTMLElement" | "SVGElement"
         );
         let intrinsic_element = (identifier.text.starts_with("HTML")
             || identifier.text.starts_with("SVG"))
@@ -12148,7 +12148,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || name_record.flags.0 != 0
             || name_record.parent != Some(node.node)
             || identifier.flow_node.is_some()
-            || !(root_element || intrinsic_element || native_event)
+            || !(root_dom_interface || intrinsic_element || native_event)
             || !self.global_symbol_has_name(symbol, &identifier.text)
         {
             return false;
@@ -12167,7 +12167,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || owner.exports().is_some()
             || owner.export_symbol().is_some()
             || self.store.get_merged_symbol(symbol) != Some(symbol)
-            || (root_element || native_event)
+            || (root_dom_interface || native_event)
                 && !owner
                     .flags()
                     .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
@@ -33927,13 +33927,17 @@ mod tests {
             "interface HTMLElement extends Element, DomExtra, DomMore {} ",
             "declare var HTMLElement: unknown; ",
             "interface SVGElement extends Element, DomExtra, DomMore {} ",
-            "declare var SVGElement: unknown;",
+            "declare var SVGElement: unknown; ",
+            "interface Document extends DomRoot, DomExtra, DomMore { self: this; } ",
+            "declare var Document: unknown;",
         ));
         let source = parse_source_file(concat!(
             "interface Box<Value> {} ",
             "type Root = Box<Element>; ",
             "type Html = Box<HTMLElement>; ",
-            "type Svg = Box<SVGElement>;",
+            "type Svg = Box<SVGElement>; ",
+            "type DomDocument = Box<Document>; ",
+            "interface AbstractView { document: Document; }",
         ));
 
         for is_default_library in [false, true] {
@@ -33944,6 +33948,7 @@ mod tests {
                 ("Root", "Element"),
                 ("Html", "HTMLElement"),
                 ("Svg", "SVGElement"),
+                ("DomDocument", "Document"),
             ]
             .map(|(alias, element)| {
                 let symbols = context.store().symbol_table(globals).unwrap();
@@ -33980,10 +33985,39 @@ mod tests {
                 resolved.push((alias, type_));
             }
 
+            let view = context
+                .store()
+                .symbol_table(globals)
+                .and_then(|symbols| symbols.get_source("AbstractView"))
+                .unwrap();
+            context.get_declared_type_of_symbol(view).unwrap();
+            let document = context
+                .store()
+                .symbol_table(globals)
+                .and_then(|symbols| symbols.get_source("Document"))
+                .and_then(|symbol| context.store().declared_type_links(symbol))
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let property = context
+                .store()
+                .symbol(view)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source("document"))
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(property)
+                    .and_then(|links| links.resolved_type),
+                Some(document),
+            );
+
             let warm = store_state(context.store());
             for (alias, expected) in resolved {
                 assert_eq!(context.get_declared_type_of_symbol(alias), Ok(expected));
             }
+            context.get_declared_type_of_symbol(view).unwrap();
             assert_eq!(store_state(context.store()), warm);
             assert!(context.diagnostics().is_empty());
         }
