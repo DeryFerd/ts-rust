@@ -512,7 +512,7 @@ fn assert_final_if_boundary_is_atomic(source: &str, file: FileId) {
 }
 
 #[test]
-fn missing_else_and_inferred_final_if_remain_explicit_atomic_boundaries() {
+fn missing_else_remains_an_explicit_atomic_boundary() {
     assert_final_if_boundary_is_atomic(
         concat!(
             "function missingElse(value: string | undefined): string {\n",
@@ -524,19 +524,50 @@ fn missing_else_and_inferred_final_if_remain_explicit_atomic_boundaries() {
         ),
         FileId::new(2),
     );
-    assert_final_if_boundary_is_atomic(
-        concat!(
-            "function inferred(value: object | undefined) {\n",
-            "  if (value) {\n",
-            "    const result: object = value;\n",
-            "    return result;\n",
-            "  } else {\n",
-            "    const result: undefined = value;\n",
-            "    return result;\n",
-            "  }\n",
-            "}\n",
+}
+
+#[test]
+fn inferred_final_if_preserves_joined_return_identity() {
+    let source = concat!(
+        "function inferred(value: object | undefined) {\n",
+        "  if (value) {\n",
+        "    const result: object = value;\n",
+        "    return result;\n",
+        "  } else {\n",
+        "    const result: undefined = value;\n",
+        "    return result;\n",
+        "  }\n",
+        "}\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3);
+    let declaration = function_declaration(&parsed, file);
+    let mut context = context(&parsed, file);
+    let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+
+    context.check_source_file(file).unwrap();
+
+    assert!(context.store().value_symbol_links(owner).is_some());
+    assert!(context.store().signature_links(declaration).is_some());
+    assert!(context.diagnostics().is_empty());
+    assert!(is_type_checked(&context, file));
+
+    let warm = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+        context.diagnostics().as_slice().to_vec(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.diagnostics().as_slice().to_vec(),
         ),
-        FileId::new(3),
+        warm,
     );
 }
 
