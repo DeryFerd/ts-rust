@@ -9404,6 +9404,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol))
             })?
             .flags();
+        if cached_type.is_some_and(|cached| {
+            self.is_default_library_dom_interface_argument(node, symbol)
+                && self
+                    .store
+                    .declared_type_links(symbol)
+                    .and_then(|links| links.declared_type)
+                    != Some(cached)
+        }) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
         if record_heritage
             && if array_heritage {
                 global_array_target != self.array_targets.map(CanonicalArrayTargets::array_type)
@@ -9536,6 +9548,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                     )
                                 })
                     });
+                if lazy_react_html_factory {
+                    let element_node = type_arguments[1];
+                    let element = self.resolve_uncached_type_reference_symbol(element_node)?;
+                    if !self.authenticated_react_html_factory_dom_heritage_globals(element) {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol },
+                        ));
+                    }
+                }
                 if flags.contains(SymbolFlags::INTERFACE)
                     && !flags.contains(SymbolFlags::CLASS)
                     && type_arguments.len() == local_count
@@ -12799,6 +12820,64 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     && base.type_arguments.is_empty()
                     && self.global_symbol_has_name(base.symbol, "HTMLElement")
         )
+    }
+
+    /// Rejects forged DOM heritage globals before a React factory publishes types.
+    fn authenticated_react_html_factory_dom_heritage_globals(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> bool {
+        if self.global_symbol_has_name(symbol, "HTMLElement") {
+            return true;
+        }
+        let Some(declarations) = self
+            .store
+            .symbol(symbol)
+            .and_then(ts_binder::semantic::Symbol::declarations)
+        else {
+            return false;
+        };
+        let mut interfaces = declarations.iter().filter_map(|declaration| {
+            self.host.node(*declaration).and_then(|record| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                Some((*declaration, interface))
+            })
+        });
+        let Some((declaration, interface)) = interfaces.next() else {
+            return false;
+        };
+        if interfaces.next().is_some() {
+            return false;
+        }
+        let Some(clauses) = interface.heritage_clauses.as_ref() else {
+            return false;
+        };
+        let Ok(heritage) = super::interface_heritage::plan_direct_interface_heritage(
+            self.store,
+            self.host,
+            declaration,
+            symbol,
+            clauses,
+        ) else {
+            return false;
+        };
+        heritage.bases.iter().all(|base| {
+            self.host
+                .node(base.expression)
+                .and_then(|record| match &record.data {
+                    NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
+                    _ => None,
+                })
+                .is_some_and(|name| {
+                    self.store
+                        .symbol(base.symbol)
+                        .and_then(|owner| owner.name().as_utf8())
+                        == Some(name)
+                        && self.global_symbol_has_name(base.symbol, name)
+                })
+        })
     }
 
     /// Authenticates DOM arguments on React's namespace-owned HTML factories.
@@ -22133,7 +22212,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         .map_err(|_| {
                             type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
                         })?;
-                        if cached_resolved_type.is_none() {
+                        if cached_resolved_type.is_none()
+                            || self
+                                .store
+                                .symbol(symbol)
+                                .and_then(|owner| owner.name().as_utf8())
+                                == Some("DetailedHTMLFactory")
+                        {
                             self.check_direct_generic_reference_constraints(
                                 node,
                                 &reference,
@@ -22543,6 +22628,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             element_constraint_symbol,
         ) {
             return true;
+        }
+        if !planner.is_react_webview_interface_argument(*element_node, element_symbol) {
+            return false;
         }
 
         let Some(owner) = self.store.symbol(element_symbol) else {
