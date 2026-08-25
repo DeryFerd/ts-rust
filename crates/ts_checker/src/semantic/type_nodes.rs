@@ -12212,7 +12212,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let intrinsic_element = (identifier.text.starts_with("HTML")
             || identifier.text.starts_with("SVG"))
             && identifier.text.ends_with("Element")
-            && self.is_react_intrinsic_dom_generic_argument(node);
+            && (self.is_react_intrinsic_dom_generic_argument(node)
+                || self.is_react_html_factory_dom_generic_argument(node));
         let native_event = identifier.text.ends_with("Event")
             && self.is_react_native_default_library_event_alias(node, &identifier.text);
         if reference_record.kind != SyntaxKind::TypeReference
@@ -12397,6 +12398,179 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .flags()
                 .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
                 == value_declaration.is_some()
+    }
+
+    /// Authenticates DOM arguments on React's namespace-owned HTML factories.
+    #[allow(clippy::too_many_lines)] // The factory, property, and namespace share one proof.
+    fn is_react_html_factory_dom_generic_argument(&self, node: NodeRef) -> bool {
+        let mut child = node;
+        let mut targets = Vec::with_capacity(2);
+        let mut factory = None;
+
+        for _ in 0..3 {
+            let Some(child_record) = self.host.node(child) else {
+                return false;
+            };
+            let Some(parent) = child_record.parent else {
+                return false;
+            };
+            let parent = NodeRef::new(child.arena, child.file, parent);
+            let Some(record) = self.host.node(parent) else {
+                return false;
+            };
+
+            match &record.data {
+                NodeData::TypeReferenceNode(reference)
+                    if record.kind == SyntaxKind::TypeReference =>
+                {
+                    let Some(arguments) = reference.type_arguments.as_ref() else {
+                        return false;
+                    };
+                    let name = NodeRef::new(parent.arena, parent.file, reference.type_name);
+                    let Some(name_record) = self.host.node(name) else {
+                        return false;
+                    };
+                    let NodeData::Identifier(identifier) = &name_record.data else {
+                        return false;
+                    };
+                    if factory.is_some()
+                        || record.flags.0 != 0
+                        || arguments.nodes.is_empty()
+                        || arguments.has_trailing_comma
+                        || arguments
+                            .nodes
+                            .iter()
+                            .filter(|argument| **argument == child.node)
+                            .count()
+                            != 1
+                        || name_record.kind != SyntaxKind::Identifier
+                        || name_record.flags.0 != 0
+                        || name_record.parent != Some(parent.node)
+                        || identifier.flow_node.is_some()
+                    {
+                        return false;
+                    }
+                    let Ok(symbol) = self.resolve_uncached_type_reference_symbol(parent) else {
+                        return false;
+                    };
+                    if identifier.text == "DetailedHTMLFactory" {
+                        if arguments.nodes.len() != 2 || targets.len() > 1 {
+                            return false;
+                        }
+                        factory = Some(symbol);
+                    } else if !targets.is_empty() || !identifier.text.ends_with("HTMLAttributes") {
+                        return false;
+                    }
+                    targets.push(symbol);
+                    child = parent;
+                }
+                NodeData::PropertyDeclaration(property)
+                    if record.kind == SyntaxKind::PropertyDeclaration =>
+                {
+                    let Some(factory) = factory else {
+                        return false;
+                    };
+                    let Some(interface) = record.parent else {
+                        return false;
+                    };
+                    let interface = NodeRef::new(parent.arena, parent.file, interface);
+                    let Some(interface_record) = self.host.node(interface) else {
+                        return false;
+                    };
+                    let NodeData::InterfaceDeclaration(declaration) = &interface_record.data else {
+                        return false;
+                    };
+                    let Some(bound) = self.host.bound_file(interface) else {
+                        return false;
+                    };
+                    let Some(facts) = bound.source_facts() else {
+                        return false;
+                    };
+                    let Some(owner) = bound
+                        .symbol(interface)
+                        .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                    else {
+                        return false;
+                    };
+                    let Some(owner_record) = self.store.symbol(owner) else {
+                        return false;
+                    };
+                    let Some(namespace) = self.store.get_parent_of_symbol(owner) else {
+                        return false;
+                    };
+                    let Some(namespace_record) = self.store.symbol(namespace) else {
+                        return false;
+                    };
+                    let Some(exports) = namespace_record
+                        .exports()
+                        .and_then(|exports| self.store.symbol_table(exports))
+                    else {
+                        return false;
+                    };
+                    let Some(property_symbol) = bound
+                        .symbol(parent)
+                        .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                    else {
+                        return false;
+                    };
+                    let Some(property_record) = self.store.symbol(property_symbol) else {
+                        return false;
+                    };
+
+                    return facts.is_declaration_file()
+                        && !facts.is_default_library()
+                        && record.flags.0 == 0
+                        && property.type_ == Some(child.node)
+                        && interface_record.kind == SyntaxKind::InterfaceDeclaration
+                        && interface_record.flags.0 == 0
+                        && declaration.type_parameters.is_none()
+                        && declaration
+                            .members
+                            .nodes
+                            .iter()
+                            .filter(|candidate| **candidate == parent.node)
+                            .count()
+                            == 1
+                        && owner_record.flags().without(SymbolFlags::TRANSIENT)
+                            == SymbolFlags::INTERFACE
+                        && owner_record.name().as_utf8() == Some("ReactHTML")
+                        && namespace_record.name().as_utf8() == Some("React")
+                        && namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+                        && namespace_record.check_flags() == ts_binder::CheckFlags::NONE
+                        && self.store.get_merged_symbol(namespace) == Some(namespace)
+                        && exports
+                            .get(owner_record.name())
+                            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                            == Some(owner)
+                        && exports
+                            .get_source("DetailedHTMLFactory")
+                            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                            == Some(factory)
+                        && targets.iter().all(|target| {
+                            self.store.symbol(*target).is_some_and(|target_record| {
+                                target_record.flags().without(SymbolFlags::TRANSIENT)
+                                    == SymbolFlags::INTERFACE
+                                    && self.store.get_parent_of_symbol(*target) == Some(namespace)
+                                    && exports
+                                        .get(target_record.name())
+                                        .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                                        == Some(*target)
+                            })
+                        })
+                        && property_record.flags() == SymbolFlags::PROPERTY
+                        && self.store.get_parent_of_symbol(property_symbol) == Some(owner)
+                        && owner_record
+                            .members()
+                            .and_then(|members| self.store.symbol_table(members))
+                            .and_then(|members| members.get(property_record.name()))
+                            == Some(property_symbol)
+                        && self.is_react_ambient_module_namespace(namespace, interface);
+                }
+                _ => return false,
+            }
+        }
+
+        false
     }
 
     /// Authenticates React's private `NativeFooEvent = FooEvent` module aliases.
@@ -34406,6 +34580,132 @@ mod tests {
             assert_eq!(store_state(context.store()), warm);
             assert!(context.diagnostics().is_empty());
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Factory arguments, lazy DOM methods, and poisoned exports share one proof.
+    fn react_html_factory_arguments_keep_default_library_element_methods_lazy() {
+        let library = parse_source_file(concat!(
+            "interface HTMLElement { self: this; } ",
+            "declare var HTMLElement: unknown; ",
+            "interface HTMLAnchorElement extends HTMLElement { ",
+            "addEventListener<Value extends string>(type: Value): void; ",
+            "} declare var HTMLAnchorElement: unknown;",
+        ));
+        let react = parse_source_file(concat!(
+            "declare module 'react' { ",
+            "export = React; namespace React { ",
+            "interface AnchorHTMLAttributes<Value> {} ",
+            "interface DetailedHTMLFactory<Props, Target> {} ",
+            "interface ReactHTML { ",
+            "a: DetailedHTMLFactory<AnchorHTMLAttributes<HTMLAnchorElement>, HTMLAnchorElement>; ",
+            "} } }",
+        ));
+        let (mut context, library_file, react_file) =
+            default_library_interface_context(&library, &react, true);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let react_bound = context.file(react_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&react.arena, &react_bound),
+            ],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+        let anchor = context
+            .store()
+            .symbol_table(globals)
+            .and_then(|symbols| symbols.get_source("HTMLAnchorElement"))
+            .unwrap();
+        let references = react_dom_type_references(&react, react_file, "HTMLAnchorElement");
+        assert_eq!(references.len(), 2);
+        let aliases = HashMap::new();
+        for reference in &references {
+            assert!(
+                TypeQueryPlanner::new(context.store(), &host, None, None, false, &aliases)
+                    .is_default_library_dom_interface_argument(*reference, anchor)
+            );
+        }
+
+        let annotation = react_dom_property_annotation(&react, react_file, "a");
+        let resolved = context.get_type_from_type_node(annotation).unwrap();
+        let reference = validate_direct_generic_reference(context.store(), resolved).unwrap();
+        let anchor_type = context
+            .store()
+            .declared_type_links(anchor)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        assert_eq!(reference.type_arguments[1], anchor_type);
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), reference.type_arguments[0])
+                .unwrap()
+                .type_arguments,
+            [anchor_type],
+        );
+        let TypeData::Interface(interface) =
+            context.store().type_payload(anchor_type).unwrap().data()
+        else {
+            panic!("the HTML factory must retain the declared DOM element identity")
+        };
+        assert!(!interface.declared_members_resolved);
+        let method = context
+            .store()
+            .symbol(anchor)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("addEventListener"))
+            .unwrap();
+        assert!(context.store().value_symbol_links(method).is_none());
+
+        let warm = store_state(context.store());
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(resolved));
+        assert_eq!(store_state(context.store()), warm);
+
+        let factory = context
+            .store()
+            .symbol_node_links(annotation)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        let namespace = context.store().get_parent_of_symbol(factory).unwrap();
+        let exports = context
+            .store()
+            .symbol(namespace)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let attributes = context
+            .store()
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("AnchorHTMLAttributes"))
+            .unwrap();
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("DetailedHTMLFactory"),
+                attributes,
+            ),
+            Some(Some(factory)),
+        );
+        for reference in &references {
+            assert!(
+                !TypeQueryPlanner::new(context.store(), &host, None, None, false, &aliases)
+                    .is_default_library_dom_interface_argument(*reference, anchor)
+            );
+        }
+        let poisoned = store_state(context.store());
+        assert!(context.get_type_from_type_node(annotation).is_err());
+        assert_eq!(store_state(context.store()), poisoned);
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("DetailedHTMLFactory"),
+                factory,
+            ),
+            Some(Some(attributes)),
+        );
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(resolved));
     }
 
     #[test]
