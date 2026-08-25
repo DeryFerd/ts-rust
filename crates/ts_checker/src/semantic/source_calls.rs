@@ -62,7 +62,8 @@ use super::{
         retry_source_generic_member_failure,
     },
     source_callables::{
-        CallableTypePredicatePlan, StoredSourceCallableValidation, plan_callable_type_predicate,
+        CallableTypePredicatePlan, StoredSourceCallableValidation,
+        constrained_string_rest_tuple_parameter, plan_callable_type_predicate,
         valid_fixed_generic_source_parameter_type, valid_planned_callable_type_predicate,
         valid_stored_callable_type_predicate, validate_stored_source_callable,
     },
@@ -2434,6 +2435,18 @@ pub(super) fn source_call_argument_contextual_type(
     };
     if !projection.construct_signatures.is_empty() || projection.call_signatures.is_empty() {
         return Ok(None);
+    }
+
+    if matches!(argument.kind, PlannedExpressionKind::Array(_))
+        && let [callable] = projection.call_signatures.as_ref()
+        && let Some(signature) = store.signature(callable.signature)
+        && let Some(parameter) = callable.parameters.get(argument_index).copied()
+        && constrained_string_rest_tuple_parameter(store, parameter, signature.type_parameters())
+            .is_some()
+    {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Call(plan.node),
+        ));
     }
 
     if matches!(argument.kind, PlannedExpressionKind::Template(_))
@@ -11603,6 +11616,45 @@ mod tests {
             short_rest_tuple_argument_detail(context.store(), node, source, target),
             Err(SourceCheckError::Call(node)),
         );
+    }
+
+    #[test]
+    fn constrained_rest_tuple_calls_fail_closed_before_call_publication() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parsed(concat!(
+            "function f<T extends [string]>(args: [...string[], ...T]) {} ",
+            "f([]);",
+        ));
+        let library_file = FileId::new(42_106);
+        let source_file = FileId::new(42_107);
+        let call_nodes = calls(&source, source_file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("expected one constrained rest-tuple call")
+        };
+        let call = *call;
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+
+        assert_eq!(
+            context.check_source_file(source_file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Call(call)
+            )),
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(context.store().type_node_links(call).is_none());
+        assert!(context.store().signature_links(call).is_none());
+
+        let owner = first_function_symbol(&source, &context, source_file);
+        let callable = context
+            .store()
+            .value_symbol_links(owner)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert!(matches!(
+            validate_stored_source_callable(context.store(), callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
     }
 
     #[test]
