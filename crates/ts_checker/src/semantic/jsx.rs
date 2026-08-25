@@ -3688,7 +3688,7 @@ fn jsx_child_is_assignable(
         return Ok(target == any || target == unknown);
     }
 
-    let relation = |store: &mut CanonicalTypeMapperStore| {
+    let relation = |store: &mut CanonicalTypeMapperStore, source| {
         if let Some(global_types) = global_types {
             store.is_type_assignable_to_with_global_types_and_strict_function_types(
                 source,
@@ -3700,7 +3700,7 @@ fn jsx_child_is_assignable(
             store.is_type_assignable_to(source, target)
         }
     };
-    let error = match relation(store) {
+    let error = match relation(store, source) {
         Ok(assignable) => return Ok(assignable),
         Err(error @ RelationUnavailable::UnresolvedStructuredMembers(unresolved))
             if unresolved == source =>
@@ -3736,8 +3736,21 @@ fn jsx_child_is_assignable(
         return Err(error.into());
     }
 
-    let plan = super::object_members::plan_interface(store, host, owner)
-        .map_err(|_| SourceCheckError::Property(location))?;
+    let plan = match super::object_members::plan_interface(store, host, owner) {
+        Ok(plan) => plan,
+        Err(_) => {
+            let base = resolve_generic_jsx_element_base(
+                store,
+                host,
+                owner,
+                location,
+                global_types,
+                options,
+                diagnostics,
+            )?;
+            return relation(store, base).map_err(Into::into);
+        }
+    };
     let mut bases = plan.heritage_base_symbols();
     let Some(base) = bases.next() else {
         return Err(error.into());
@@ -3764,7 +3777,69 @@ fn jsx_child_is_assignable(
         return Err(SourceCheckError::Property(location));
     }
 
-    relation(store).map_err(Into::into)
+    relation(store, source).map_err(Into::into)
+}
+
+fn resolve_generic_jsx_element_base(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    location: NodeRef,
+    global_types: Option<&CanonicalGlobalTypes>,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<TypeId, SourceCheckError> {
+    let invalid = || SourceCheckError::Property(location);
+    let record = store.symbol(owner).ok_or_else(invalid)?;
+    let Some([declaration]) = record.declarations() else {
+        return Err(invalid());
+    };
+    let declaration = *declaration;
+    let declaration_record = host.node(declaration).ok_or_else(invalid)?;
+    let NodeData::InterfaceDeclaration(interface) = &declaration_record.data else {
+        return Err(invalid());
+    };
+    let Some(clauses) = interface.heritage_clauses.as_ref() else {
+        return Err(invalid());
+    };
+    if declaration_record.kind != SyntaxKind::InterfaceDeclaration
+        || declaration_record.flags.0 != 0
+        || !host.symbol_matches(store, declaration, owner)
+        || interface.type_parameters.is_some()
+        || !interface.members.nodes.is_empty()
+    {
+        return Err(invalid());
+    }
+
+    let heritage = super::interface_heritage::plan_direct_interface_heritage(
+        store,
+        host,
+        declaration,
+        owner,
+        clauses,
+    )
+    .map_err(|_| invalid())?;
+    let [base] = heritage.bases.as_slice() else {
+        return Err(invalid());
+    };
+    if base.type_arguments.is_empty()
+        || base.kind != super::interface_heritage::DirectInterfaceBaseKind::Interface
+    {
+        return Err(invalid());
+    }
+
+    let mut query = if let Some(global_types) = global_types {
+        CanonicalTypeQuery::new_with_global_types(store, host, global_types, options, diagnostics)?
+    } else {
+        CanonicalTypeQuery::new(store, host, options, diagnostics)?
+    };
+    let target = query.get_declared_type_of_symbol(base.symbol)?;
+    let mut arguments = Vec::with_capacity(base.type_arguments.len());
+    for argument in &base.type_arguments {
+        arguments.push(query.get_type_from_type_node(*argument)?);
+    }
+    create_direct_generic_reference(store, target, &arguments, ObjectFlags::NONE)
+        .map_err(|_| invalid())
 }
 
 fn jsx_child_assignability_display(
@@ -8211,6 +8286,92 @@ mod runtime_tests {
                 fixture.context.store().signature_len(),
                 fixture.context.store().checker_link_allocated_lengths(),
                 fixture.context.diagnostics().as_slice().to_vec(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn legacy_react_fragments_accept_generic_jsx_element_heritage() {
+        let mut fixture = ReactFragmentFixture::with_library(
+            "const view = <><div></div></>;",
+            FileId::new(8_199),
+            CanonicalJsxRuntime::Classic,
+            concat!(
+                "declare namespace React { ",
+                "interface ReactElement<Props> { props: Props; } ",
+                "type ReactText = string | number; ",
+                "type ReactChild = ReactElement<any> | ReactText; ",
+                "type ReactNode = ReactChild | boolean | null | undefined; ",
+                "interface ComponentClass<P = {}, S = any> { ",
+                "new(props: P, context?: any): ReactElement<any>; } ",
+                "interface StatelessComponent<P = {}> { ",
+                "(props: P & { children?: ReactNode; }, context?: any): ",
+                "ReactElement<any> | null; } ",
+                "type ComponentType<P = {}> = ComponentClass<P> | StatelessComponent<P>; ",
+                "const Fragment: ComponentType; ",
+                "} ",
+                "declare namespace JSX { ",
+                "interface Element extends React.ReactElement<any> {} ",
+                "interface ElementChildrenAttribute { children: {}; } ",
+                "interface IntrinsicElements { div: {}; } }",
+            ),
+        );
+
+        fixture.context.check_source_file(fixture.file).unwrap();
+        assert!(fixture.context.diagnostics().is_empty());
+
+        let globals = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .globals;
+        let jsx = fixture
+            .context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("JSX"))
+            .unwrap();
+        let element = fixture
+            .context
+            .store()
+            .symbol(jsx)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("Element"))
+            .unwrap();
+        let element = fixture
+            .context
+            .store()
+            .declared_type_links(element)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let super::super::TypeData::Interface(interface) = fixture
+            .context
+            .store()
+            .type_payload(element)
+            .unwrap()
+            .data()
+        else {
+            panic!("JSX.Element must retain its authenticated interface shell")
+        };
+        assert!(!interface.base_types_resolved);
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().signature_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        fixture.context.recheck_source_file(fixture.file).unwrap();
+        assert!(fixture.context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
             ),
             warm,
         );
