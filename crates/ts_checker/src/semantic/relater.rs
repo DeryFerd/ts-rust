@@ -9624,15 +9624,10 @@ mod tests {
             "type OtherBrand = 'a' & { tag: 2 }; ",
             "type Shape = { tag: 1 };",
         ));
-        let [wide, same, narrow, other_literal, other_brand, shape] = [
-            "Wide",
-            "Same",
-            "Narrow",
-            "OtherLiteral",
-            "OtherBrand",
-            "Shape",
-        ]
-        .map(|name| query_type_alias(&mut fixture, name));
+        let [wide, same, narrow, other_literal, other_brand] =
+            ["Wide", "Same", "Narrow", "OtherLiteral", "OtherBrand"]
+                .map(|name| query_type_alias(&mut fixture, name));
+        let shape = query_declared_relation_alias(&mut fixture, "Shape");
         let literal = fixture
             .store
             .regular_string_literal_type("a".into())
