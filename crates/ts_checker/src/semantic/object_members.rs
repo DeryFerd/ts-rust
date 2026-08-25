@@ -8378,6 +8378,92 @@ pub(super) fn validate_resolved_declared_property_object(
     }
 }
 
+fn authenticated_merged_react_declared_property_interface(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+) -> bool {
+    let Some(interface) = store.symbol(owner) else {
+        return false;
+    };
+    let Some(declarations) = interface
+        .declarations()
+        .filter(|declarations| declarations.len() > 1)
+    else {
+        return false;
+    };
+    let Some(namespace) = store.get_parent_of_symbol(owner) else {
+        return false;
+    };
+    let Some(namespace_record) = store.symbol(namespace) else {
+        return false;
+    };
+    let Some(namespace_declarations) = namespace_record.declarations() else {
+        return false;
+    };
+    if interface.flags() != SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT
+        || interface.check_flags() != CheckFlags::NONE
+        || interface.value_declaration().is_some()
+        || interface.exports().is_some()
+        || interface.export_symbol().is_some()
+        || interface
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(namespace)
+        || store.get_merged_symbol(owner) != Some(owner)
+        || namespace_record.name().as_utf8() != Some("React")
+        || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+        || namespace_record.check_flags() != CheckFlags::NONE
+        || store.get_merged_symbol(namespace) != Some(namespace)
+        || namespace_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(interface.name()))
+            .and_then(|export| store.get_merged_symbol(export))
+            != Some(owner)
+    {
+        return false;
+    }
+
+    let mut seen_declarations = HashSet::with_capacity(declarations.len());
+    if !declarations.iter().all(|declaration| {
+        let Some(SourceNodeParent::Parent(block)) = store.source_node_parent(*declaration) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(module)) = store.source_node_parent(block) else {
+            return false;
+        };
+        seen_declarations.insert(*declaration)
+            && store.source_node_kind(*declaration) == Some(SyntaxKind::InterfaceDeclaration)
+            && store.source_node_kind(block) == Some(SyntaxKind::ModuleBlock)
+            && store.source_node_kind(module) == Some(SyntaxKind::ModuleDeclaration)
+            && namespace_declarations.contains(&module)
+    }) {
+        return false;
+    }
+
+    interface.members().is_none_or(|members| {
+        store.symbol_table(members).is_some_and(|members| {
+            members.iter().all(|(name, member)| {
+                store.symbol(member).is_some_and(|record| {
+                    record.name() == name
+                        && store.get_merged_symbol(member) == Some(member)
+                        && store.get_parent_of_symbol(member) == Some(owner)
+                        && record.declarations().is_some_and(|member_declarations| {
+                            !member_declarations.is_empty()
+                                && member_declarations.iter().all(|declaration| {
+                                    matches!(
+                                        store.source_node_parent(*declaration),
+                                        Some(SourceNodeParent::Parent(parent))
+                                            if declarations.contains(&parent)
+                                    )
+                                })
+                        })
+                })
+            })
+        })
+    })
+}
+
 fn authenticated_namespace_declared_property_interface(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -8411,7 +8497,8 @@ fn authenticated_namespace_declared_property_interface(
         && data.base_types_resolved
         && data.declared_members_resolved
         && data.resolved_base_types.is_none()
-        && interface.flags() == SymbolFlags::INTERFACE
+        && (interface.flags() == SymbolFlags::INTERFACE
+            || authenticated_merged_react_declared_property_interface(store, owner))
         && namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
         && namespace_record.check_flags() == CheckFlags::NONE
         && store.get_merged_symbol(namespace) == Some(namespace)
@@ -8471,7 +8558,9 @@ fn validate_resolved_declared_property_object_detailed(
             let Some(owner_record) = store.symbol(owner) else {
                 return Malformed;
             };
-            if owner_record.flags() != SymbolFlags::INTERFACE {
+            if owner_record.flags() != SymbolFlags::INTERFACE
+                && !authenticated_merged_react_declared_property_interface(store, owner)
+            {
                 return NotDeclared;
             }
             if valid_unresolved_jsx_element_interface(store, type_, record, interface)
@@ -9587,6 +9676,8 @@ fn validate_declared_property_owner(
     let declaration = declarations[0];
     if store.get_merged_symbol(owner) != Some(owner)
         || owner_record.flags() != expected_flags
+            && (proof != DeclaredPropertyObjectProof::Interface
+                || !authenticated_merged_react_declared_property_interface(store, owner))
         || owner_record.check_flags() != CheckFlags::NONE
         || !valid_name
         || owner_record.value_declaration().is_some()
@@ -21311,6 +21402,213 @@ mod generic_publication_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Merged React ownership, inherited members, replay, and export poison share one proof.
+    fn generic_react_class_attributes_accept_authenticated_transient_merged_bases() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface ClassAttributes<T> extends Attributes { ref: T; } ",
+                "interface Attributes { key: string; } ",
+                "interface Attributes { role: string; } ",
+                "}",
+            ),
+            3_917,
+        );
+        let namespace = fixture.store.get_parent_of_symbol(fixture.symbol).unwrap();
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let attributes = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("Attributes"))
+            .unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let base = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(attributes)
+        .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .symbol(attributes)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .map(<[NodeRef]>::len),
+            Some(2),
+        );
+        assert!(fixture.store.set_symbol_flags(
+            attributes,
+            SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+        assert!(authenticated_merged_react_declared_property_interface(
+            &fixture.store,
+            attributes,
+        ));
+        assert_eq!(
+            validate_resolved_declared_property_object(&fixture.store, base),
+            DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface),
+        );
+
+        let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+        let target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let parameter = validate_direct_generic_reference(&fixture.store, target)
+            .unwrap()
+            .type_arguments[0];
+        assert!(
+            fixture
+                .store
+                .set_interface_base_resolution(target, true, None, Some(vec![base]),)
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter],
+            ),
+            Ok(target),
+        );
+        let warm = state(&fixture.store, &plan, target);
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter],
+            ),
+            Ok(target),
+        );
+        assert_eq!(state(&fixture.store, &plan, target), warm);
+
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(exports, EscapedName::source("Attributes"), fixture.symbol,),
+            Some(Some(attributes)),
+        );
+        assert!(!authenticated_merged_react_declared_property_interface(
+            &fixture.store,
+            attributes,
+        ));
+        assert_eq!(
+            validate_resolved_declared_property_object(&fixture.store, base),
+            DeclaredPropertyObjectValidation::NotDeclared,
+        );
+        let poisoned = state(&fixture.store, &plan, target);
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter],
+            ),
+            Err(PropertyObjectError::InvalidCachedInterface {
+                symbol: fixture.symbol,
+                type_: target,
+            }),
+        );
+        assert_eq!(state(&fixture.store, &plan, target), poisoned);
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(exports, EscapedName::source("Attributes"), attributes),
+            Some(Some(fixture.symbol)),
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter],
+            ),
+            Ok(target),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn transient_declared_property_interfaces_require_merged_react_namespace_ownership() {
+        for (source, file) in [
+            (
+                "declare namespace React { interface Attributes { key: string; } }",
+                3_918,
+            ),
+            (
+                concat!(
+                    "declare namespace Other { ",
+                    "interface Attributes { key: string; } ",
+                    "interface Attributes { role: string; } ",
+                    "}",
+                ),
+                3_919,
+            ),
+            (
+                concat!(
+                    "interface Attributes { key: string; } ",
+                    "interface Attributes { role: string; }",
+                ),
+                3_920,
+            ),
+        ] {
+            let mut fixture = interface_fixture(source, file);
+            let host = host(&fixture.parsed, &fixture.bound);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let target = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(fixture.symbol)
+            .unwrap();
+            assert!(fixture.store.set_symbol_flags(
+                fixture.symbol,
+                SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
+                CheckFlags::NONE,
+            ));
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(!authenticated_merged_react_declared_property_interface(
+                &fixture.store,
+                fixture.symbol,
+            ));
+            assert_eq!(
+                validate_resolved_declared_property_object(&fixture.store, target),
+                DeclaredPropertyObjectValidation::NotDeclared,
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+                "{source}",
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Mixed React bases share ordered publication, replay, and cache poison.
     fn generic_react_html_attributes_preserve_mixed_base_order_and_cache_identity() {
         let mut fixture = interface_fixture(
@@ -23002,6 +23300,9 @@ mod generic_publication_tests {
             SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
         );
         assert_eq!(store.get_parent_of_symbol(symbol), Some(merged_namespace));
+        assert!(authenticated_merged_react_declared_property_interface(
+            &store, symbol,
+        ));
         let host = DeclaredTypeHost::new_after_global_merge(
             [
                 (&library.arena, &library_bound),
@@ -23061,6 +23362,9 @@ mod generic_publication_tests {
             relationships.1,
             Some(original_module),
             relationships.2,
+        ));
+        assert!(!authenticated_merged_react_declared_property_interface(
+            &store, symbol,
         ));
         let poisoned = (
             store.type_len(),
