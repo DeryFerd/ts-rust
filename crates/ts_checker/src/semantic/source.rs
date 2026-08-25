@@ -64241,17 +64241,17 @@ class Foo2 {
         );
         let declaration = variable_declaration(&importer, importer_file, "t");
         let (_, bound) = context.file(importer_file).unwrap();
-        let imported = bound.symbol(declaration).unwrap();
+        let required_alias = bound.symbol(declaration).unwrap();
         let target_symbol = context
             .store()
-            .alias_symbol_links(imported)
+            .alias_symbol_links(required_alias)
             .and_then(|links| links.alias_target.symbol())
             .unwrap();
         assert_eq!(
             context.store().symbol(target_symbol).unwrap().flags(),
             SymbolFlags::TYPE_ALIAS,
         );
-        assert!(context.store().value_symbol_links(imported).is_none());
+        assert!(context.store().value_symbol_links(required_alias).is_none());
         assert!(context.store().value_symbol_links(target_symbol).is_none());
 
         let warm = observable_state(&context, importer_file);
