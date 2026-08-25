@@ -34748,6 +34748,9 @@ mod tests {
                         ) || matches!(
                             &parent.data,
                             NodeData::ParameterDeclaration(parameter) if parameter.name == node
+                        ) || matches!(
+                            &parent.data,
+                            NodeData::BindingElement(element) if element.name == Some(node)
                         )
                     });
                 (!is_declaration_name).then(|| NodeRef::new(parsed.arena.id(), file, node))

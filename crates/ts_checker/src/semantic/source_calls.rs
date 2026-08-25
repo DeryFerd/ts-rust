@@ -4,9 +4,9 @@
 //! property calls and tagged templates, proven nested call callees, and
 //! immediately invoked anonymous or async callables.
 //! Arguments may contain scalar
-//! values, identifier and property reads, object and array literals, arrow
-//! functions, type assertions, nested direct calls, or recursively proven primitive
-//! expressions, optionally parenthesized.
+//! values, identifier and property reads, object and array literals, arrow or
+//! anonymous functions, type assertions, nested direct calls, or recursively
+//! proven primitive expressions, optionally parenthesized.
 //! The semantic kernel remains in `calls`; this module owns the AST proof,
 //! lazy-return/relation retries, call caches, and source diagnostics.
 
@@ -1206,6 +1206,11 @@ fn unparenthesized_arrow_argument_node(arena: &NodeArena, mut node: NodeRef) -> 
                 node = NodeRef::new(node.arena, node.file, parenthesized.expression);
             }
             (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction) => return Some(node),
+            (NodeData::FunctionExpression(_), SyntaxKind::FunctionExpression)
+                if is_supported_function_argument_syntax(arena, node) =>
+            {
+                return Some(node);
+            }
             _ => return None,
         }
     }
@@ -1246,6 +1251,13 @@ fn collect_array_argument_arrow_syntax(
         }
         (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction) => {
             if !is_supported_arrow_argument_syntax(arena, node) {
+                return false;
+            }
+            arrows.push(node);
+            true
+        }
+        (NodeData::FunctionExpression(_), SyntaxKind::FunctionExpression) => {
+            if !is_supported_function_argument_syntax(arena, node) {
                 return false;
             }
             arrows.push(node);
@@ -1354,6 +1366,7 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
             matches!(&record.data, NodeData::TaggedTemplateExpression(_))
         }
         SyntaxKind::ArrowFunction => is_supported_arrow_argument_syntax(arena, node),
+        SyntaxKind::FunctionExpression => is_supported_function_argument_syntax(arena, node),
         SyntaxKind::ObjectLiteralExpression => {
             matches!(&record.data, NodeData::ObjectLiteralExpression(_))
         }
@@ -1369,6 +1382,43 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_supported_function_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    let NodeData::FunctionExpression(function) = &record.data else {
+        return false;
+    };
+    let Some(body) = arena.get(function.body) else {
+        return false;
+    };
+
+    record.kind == SyntaxKind::FunctionExpression
+        && record.flags.0 == 0
+        && function.name.is_none()
+        && function.modifiers.is_none()
+        && function.asterisk_token.is_none()
+        && function.type_parameters.is_none()
+        && function.type_.is_none()
+        && function.parameters.nodes.is_empty()
+        && !function.parameters.has_trailing_comma
+        && function.parameters.range.start >= record.range.start
+        && function.parameters.range.end <= record.range.end
+        && function.full_signature.is_none()
+        && function.next_container.is_none()
+        && function.symbol.is_none()
+        && function.flow_node.is_none()
+        && function.end_flow_node.is_none()
+        && function.return_flow_node.is_none()
+        && function.facts == 0
+        && body.kind == SyntaxKind::Block
+        && matches!(&body.data, NodeData::Block(_))
+        && body.flags.0 == 0
+        && body.parent == Some(node.node)
+        && body.range.start >= function.parameters.range.end
+        && body.range.end <= record.range.end
 }
 
 fn is_supported_arrow_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
@@ -2271,8 +2321,10 @@ fn arrow_argument_diagnostic_range(
     let record = host
         .node(argument.node)
         .ok_or(SourceCheckError::Call(argument.node))?;
-    let NodeData::ArrowFunction(arrow) = &record.data else {
-        return Err(SourceCheckError::Call(argument.node));
+    let arrow = match (&record.data, record.kind) {
+        (NodeData::ArrowFunction(arrow), SyntaxKind::ArrowFunction) => arrow,
+        (NodeData::FunctionExpression(_), SyntaxKind::FunctionExpression) => return Ok(None),
+        _ => return Err(SourceCheckError::Call(argument.node)),
     };
     let body = NodeRef::new(argument.node.arena, argument.node.file, arrow.body);
     let body = host
@@ -4237,8 +4289,20 @@ mod tests {
         );
         assert!(syntax.arguments().is_empty());
 
+        let synchronous = parsed("function run() { (() => {})(); }");
+        let file = FileId::new(497);
+        let synchronous_context = context(&synchronous, file);
+        let synchronous_calls = calls(&synchronous, file);
+        let [call] = synchronous_calls.as_slice() else {
+            panic!("expected one immediately invoked synchronous arrow")
+        };
+        let syntax =
+            plan_direct_source_call_syntax(&synchronous.arena, synchronous_context.store(), *call)
+                .expect("an authenticated synchronous arrow IIFE must retain its callee");
+        assert_eq!(syntax.callee_form(), SourceCallCalleeForm::Identifier);
+        assert!(syntax.arguments().is_empty());
+
         for (index, source) in [
-            "function run() { (() => {})(); }",
             "function run() { (async () => {})(1); }",
             "function run() { (async (value: number) => {})(1); }",
         ]
@@ -4246,7 +4310,7 @@ mod tests {
         .enumerate()
         {
             let parsed = parsed(source);
-            let file = FileId::new(497 + u32::try_from(index).unwrap());
+            let file = FileId::new(498 + u32::try_from(index).unwrap());
             let context = context(&parsed, file);
             let rejected_calls = calls(&parsed, file);
             let [call] = rejected_calls.as_slice() else {
@@ -4284,6 +4348,128 @@ mod tests {
             assert!(context.store().type_node_links(call).is_none());
             assert!(context.store().signature_links(call).is_none());
         }
+    }
+
+    #[test]
+    fn call_plan_accepts_authenticated_anonymous_function_arguments_without_publication() {
+        let parsed = parsed(concat!(
+            "function take(value: any): void {} ",
+            "take(function () { return 127; }); ",
+            "take((function () { return 1; }));",
+        ));
+        let file = FileId::new(500);
+        let context = context(&parsed, file);
+
+        for call in calls(&parsed, file) {
+            let syntax = plan_direct_source_call_syntax(&parsed.arena, context.store(), call)
+                .expect("anonymous function arguments must pass call syntax validation");
+            let [argument] = syntax.arguments() else {
+                panic!("expected one anonymous function argument")
+            };
+            let function = match &parsed.arena.get(argument.node).unwrap().data {
+                NodeData::FunctionExpression(_) => *argument,
+                NodeData::ParenthesizedExpression(parenthesized) => {
+                    NodeRef::new(argument.arena, argument.file, parenthesized.expression)
+                }
+                _ => panic!("expected a direct or parenthesized anonymous function"),
+            };
+            assert_eq!(syntax.argument_arrow_nodes, vec![Some(function)]);
+            assert_eq!(syntax.array_argument_arrow_nodes, vec![vec![function]]);
+            assert!(context.store().type_node_links(call).is_none());
+            assert!(context.store().signature_links(call).is_none());
+        }
+    }
+
+    #[test]
+    fn anonymous_function_argument_validation_rejects_unsupported_shapes() {
+        for (index, source) in [
+            "function take(value: any): void {} take(function named() { return 1; });",
+            "function take(value: any): void {} take(function (value: number) { return value; });",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parsed(source);
+            let file = FileId::new(501 + u32::try_from(index).unwrap());
+            let call_nodes = calls(&parsed, file);
+            let [call] = call_nodes.as_slice() else {
+                panic!("expected one rejected anonymous function argument")
+            };
+            let store = CanonicalTypeMapperStore::new();
+
+            assert!(matches!(
+                plan_direct_source_call_syntax(&parsed.arena, &store, *call),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node)))
+                    if node == *call
+            ));
+            assert!(store.type_node_links(*call).is_none());
+            assert!(store.signature_links(*call).is_none());
+        }
+
+        let mut parsed = parsed(concat!(
+            "function take(value: any): void {} ",
+            "take(function () { return 1; });",
+        ));
+        let file = FileId::new(503);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("expected one anonymous function argument")
+        };
+        let function = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionExpression).then_some(node)
+            })
+            .expect("fixture must contain an anonymous function argument");
+        let NodeData::FunctionExpression(function) = &parsed.arena.get(function).unwrap().data
+        else {
+            unreachable!("the selected node is a function expression")
+        };
+        parsed.arena.get_mut(function.body).unwrap().parent = Some(call.node);
+        let store = CanonicalTypeMapperStore::new();
+
+        assert!(matches!(
+            plan_direct_source_call_syntax(&parsed.arena, &store, *call),
+            Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node)))
+                if node == *call
+        ));
+        assert!(store.type_node_links(*call).is_none());
+        assert!(store.signature_links(*call).is_none());
+    }
+
+    #[test]
+    fn anonymous_function_arguments_preserve_type_mismatch_diagnostics() {
+        let parsed = parsed(concat!(
+            "declare function take(value: number): void; ",
+            "take(function () { return 1; });",
+        ));
+        let file = FileId::new(504);
+        let mut context = context(&parsed, file);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("expected one anonymous function argument")
+        };
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one function argument type mismatch")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(diagnostic.range_override, None);
+        assert_eq!(
+            diagnostic
+                .node
+                .and_then(|node| parsed.arena.get(node.node))
+                .map(|record| record.kind),
+            Some(SyntaxKind::FunctionExpression),
+        );
+
+        let cold = call_publication_state(&context, *call);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(call_publication_state(&context, *call), cold);
     }
 
     #[test]
