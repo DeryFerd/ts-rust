@@ -5656,6 +5656,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Ok(());
         };
         let react_namespace = self.authenticated_react_interface_namespace(symbol)?;
+        if react_namespace.is_some()
+            && heritage.bases.iter().any(|base| {
+                base.type_arguments.is_empty()
+                    && self
+                        .store
+                        .symbol(base.symbol)
+                        .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::TRANSIENT))
+            })
+        {
+            return Ok(());
+        }
         let bases = heritage.bases.clone();
         self.plan.generic_interfaces.insert(symbol, planned);
         if !self.planning_interfaces.insert(symbol) {
