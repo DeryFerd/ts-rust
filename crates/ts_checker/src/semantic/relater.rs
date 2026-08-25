@@ -6969,21 +6969,21 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         target: TypeId,
     ) -> Result<Option<(ValidatedSingleCallable, ValidatedSingleCallable)>, RelationUnavailable>
     {
-        let source_callable = match validate_stored_single_callable(self, source) {
-            StoredSingleCallableValidation::Valid {
-                family: CallableFamily::FunctionType,
-                callable,
-                ..
-            } => callable,
-            _ => return Ok(None),
+        let StoredSingleCallableValidation::Valid {
+            family: CallableFamily::FunctionType,
+            callable: source_callable,
+            ..
+        } = validate_stored_single_callable(self, source)
+        else {
+            return Ok(None);
         };
-        let target_callable = match validate_stored_single_callable(self, target) {
-            StoredSingleCallableValidation::Valid {
-                family: CallableFamily::FunctionType,
-                callable,
-                ..
-            } => callable,
-            _ => return Ok(None),
+        let StoredSingleCallableValidation::Valid {
+            family: CallableFamily::FunctionType,
+            callable: target_callable,
+            ..
+        } = validate_stored_single_callable(self, target)
+        else {
+            return Ok(None);
         };
         let (Some(source_return), Some(target_return)) =
             (source_callable.return_type, target_callable.return_type)
