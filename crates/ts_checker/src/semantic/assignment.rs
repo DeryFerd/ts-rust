@@ -1956,11 +1956,11 @@ impl CommonJsAssignmentPlanner<'_> {
             .store
             .symbol(owner_symbol)
             .ok_or(AssignmentInvariant::InvalidSymbol(owner_symbol))?;
-        let Some(arrow) = owner.value_declaration() else {
+        let Some(initializer) = owner.value_declaration() else {
             return Ok(None);
         };
         if !matches!(
-            self.store.source_node_kind(arrow),
+            self.store.source_node_kind(initializer),
             Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression)
         ) {
             return Ok(None);
@@ -2011,16 +2011,16 @@ impl CommonJsAssignmentPlanner<'_> {
         if owner.flags() != SymbolFlags::FUNCTION
             || owner.check_flags() != CheckFlags::NONE
             || owner.name() != InternalSymbolName::Function.as_ref()
-            || owner.declarations() != Some(&[arrow])
+            || owner.declarations() != Some(&[initializer])
             || owner.members().is_some()
             || owner.parent().is_some()
             || owner.export_symbol().is_some()
             || self.store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
-            || self.bound.symbol(arrow) != Some(owner_symbol)
+            || self.bound.symbol(initializer) != Some(owner_symbol)
             || !super::source_callables::source_arrow_owner_expando_exports_are_valid(
                 self.store,
                 owner_symbol,
-                arrow,
+                initializer,
             )
             || owner
                 .exports()
@@ -2050,8 +2050,8 @@ impl CommonJsAssignmentPlanner<'_> {
             return Err(AssignmentInvariant::InvalidSymbolShape(variable_symbol).into());
         };
         if variable_data.type_.is_some()
-            || variable_data.initializer != Some(arrow.node)
-            || self.node(arrow)?.parent != Some(variable_declaration.node)
+            || variable_data.initializer != Some(initializer.node)
+            || self.node(initializer)?.parent != Some(variable_declaration.node)
         {
             return Err(AssignmentPlanError::Unsupported(
                 AssignmentUnsupported::NonOrdinaryVariable(variable_declaration),
@@ -4738,6 +4738,51 @@ mod tests {
                     receiver,
                     variable_symbol: fixture.bound.symbol(declaration).unwrap(),
                     owner_symbol: fixture.bound.symbol(function).unwrap(),
+                    property_symbol: fixture.bound.symbol(expression).unwrap(),
+                })),
+            );
+            assert_eq!(observable_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn plans_anonymous_function_expression_expandos_without_semantic_writes() {
+        for fixture in [
+            Fixture::new("const work = function () {}; work.items = []; export {};"),
+            Fixture::javascript("var work = function () {}; work.items = [];"),
+            Fixture::javascript("let work = function () {}; work.items = [];"),
+            Fixture::javascript("const work = function () {}; work.items = [];"),
+        ] {
+            let statement = fixture.expression_statement(0);
+            let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+            let NodeData::PropertyAccessExpression(access) =
+                &fixture.parsed.arena.get(left.node).unwrap().data
+            else {
+                panic!("expected work.items property access")
+            };
+            let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, access.expression);
+            let declaration = fixture.variable_declaration("work");
+            let NodeData::VariableDeclaration(variable) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected work variable declaration")
+            };
+            let initializer = NodeRef::new(
+                fixture.parsed.arena.id(),
+                fixture.file,
+                variable.initializer.unwrap(),
+            );
+            let before = observable_state(&fixture.store);
+
+            assert_eq!(
+                fixture.arrow_expando_plan(0),
+                Ok(Some(ArrowExpandoAssignmentPlan {
+                    expression,
+                    left,
+                    right,
+                    receiver,
+                    variable_symbol: fixture.bound.symbol(declaration).unwrap(),
+                    owner_symbol: fixture.bound.symbol(initializer).unwrap(),
                     property_symbol: fixture.bound.symbol(expression).unwrap(),
                 })),
             );

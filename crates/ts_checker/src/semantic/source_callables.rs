@@ -971,7 +971,7 @@ pub(super) fn source_function_owner_expando_exports_are_valid(
     })
 }
 
-/// Validates arrow/function-expression expando ownership without source arenas.
+/// Validates retained variable-callable expando ownership without source arenas.
 pub(super) fn source_arrow_owner_expando_exports_are_valid(
     store: &CanonicalTypeMapperStore,
     owner_symbol: SemanticSymbolId,

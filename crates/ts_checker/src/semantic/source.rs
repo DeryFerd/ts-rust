@@ -3785,22 +3785,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         self.primitive_binary_position_roots
                             .insert(assignment.right);
                         let right = self.plan_expression(assignment.right)?;
-                        let jsdoc_type = if is_javascript_file {
-                            leading_jsdoc_comment(self.arena, statement)
-                                .map_err(|_| {
-                                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
-                                        statement,
-                                    ))
-                                })?
-                                .and_then(|comment| {
-                                    comment
-                                        .type_tag()
-                                        .and_then(super::jsdoc::JsDocTag::type_expression)
-                                        .map(super::jsdoc::JsDocTypeExpression::planned)
-                                })
-                        } else {
-                            None
-                        };
+                        let jsdoc_type =
+                            self.plan_javascript_expando_annotation(statement, is_javascript_file)?;
                         statements.push(PlannedStatement::ArrowExpandoAssignment(
                             PlannedArrowExpandoAssignment {
                                 expression: assignment.expression,
@@ -3865,6 +3851,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         self.primitive_binary_position_roots
                             .insert(assignment.right);
                         let right = self.plan_expression(assignment.right)?;
+                        let jsdoc_type =
+                            self.plan_javascript_expando_annotation(statement, is_javascript_file)?;
                         statements.push(PlannedStatement::ArrowExpandoAssignment(
                             PlannedArrowExpandoAssignment {
                                 expression: assignment.expression,
@@ -3873,7 +3861,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 variable_symbol: assignment.variable_symbol,
                                 owner_symbol: assignment.owner_symbol,
                                 property_symbol: assignment.property_symbol,
-                                jsdoc_type: None,
+                                jsdoc_type,
                                 right,
                             },
                         ));
@@ -6897,6 +6885,27 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .source_text()
             .and_then(|source| source.as_bytes().get(position))
             == Some(&b';'))
+    }
+
+    fn plan_javascript_expando_annotation(
+        &self,
+        statement: NodeRef,
+        is_javascript_file: bool,
+    ) -> Result<Option<PlannedJsDocType>, SourceCheckError> {
+        if !is_javascript_file {
+            return Ok(None);
+        }
+
+        leading_jsdoc_comment(self.arena, statement)
+            .map_err(|_| SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(statement)))
+            .map(|comment| {
+                comment.and_then(|comment| {
+                    comment
+                        .type_tag()
+                        .and_then(super::jsdoc::JsDocTag::type_expression)
+                        .map(super::jsdoc::JsDocTypeExpression::planned)
+                })
+            })
     }
 
     fn assignment_plan_error(error: super::assignment::AssignmentPlanError) -> SourceCheckError {
@@ -77044,6 +77053,70 @@ class Foo2 {
 
         assert!(context.check_source_file(file).is_err());
         assert_eq!(observable_state(&context, file), poisoned);
+    }
+
+    #[test]
+    fn javascript_variable_callable_expandos_honor_jsdoc_property_annotations() {
+        for (index, (initializer, value, incompatible)) in [
+            ("() => {}", "'ready'", false),
+            ("() => {}", "1", true),
+            ("function () {}", "'ready'", false),
+            ("function () {}", "1", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = format!(
+                "const work = {initializer};\n\
+                 /** @type {{string}} */\n\
+                 work.value = {value};\n\
+                 const copied = work.value;",
+            );
+            let source = parse_javascript_source_file(&text);
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let file = FileId::new(8_470 + u32::try_from(index).unwrap());
+            let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+            context.check_source_file(file).unwrap();
+
+            let callable = variable_initializer(&source, file, "work");
+            let (_, bound) = context.file(file).unwrap();
+            let owner = bound.symbol(callable).unwrap();
+            let property = context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source("value"))
+                .unwrap();
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(property)
+                    .and_then(|links| links.resolved_type),
+                Some(string),
+            );
+            assert_eq!(
+                variable_value_type(&context, &source, file, "copied"),
+                string,
+            );
+
+            if incompatible {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("expected one annotated callable-property assignment diagnostic")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2322);
+                assert_eq!(diagnostic.diagnostic.arguments, ["number", "string"]);
+                assert_eq!(node_text(&source, diagnostic.node.unwrap()), "work.value");
+            } else {
+                assert!(context.diagnostics().is_empty());
+            }
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]

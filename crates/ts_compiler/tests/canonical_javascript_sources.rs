@@ -78,13 +78,20 @@ fn canonical_program_checks_javascript_arrow_expandos() {
 
 #[test]
 fn canonical_program_honors_javascript_function_expando_jsdoc_annotations() {
-    for (value, expected_diagnostic) in [("'ready'", None), ("1", Some(2322))] {
+    for (declaration, value, expected_diagnostic) in [
+        ("function work() {}", "'ready'", None),
+        ("function work() {}", "1", Some(2322)),
+        ("const work = () => {};", "'ready'", None),
+        ("const work = () => {};", "1", Some(2322)),
+        ("const work = function () {};", "'ready'", None),
+        ("const work = function () {};", "1", Some(2322)),
+    ] {
         let filesystem = MemoryFileSystem::new(true);
         filesystem
             .write_file(
                 "/project/input.js",
                 &format!(
-                    "function work() {{}}\n\
+                    "{declaration}\n\
                      /** @type {{string}} */\n\
                      work.value = {value};\n\
                      const copied = work.value;\n"
@@ -112,7 +119,7 @@ fn canonical_program_honors_javascript_function_expando_jsdoc_annotations() {
                 .into_iter()
                 .map(Some)
                 .collect::<Vec<_>>(),
-            "value: {value}",
+            "declaration: {declaration}, value: {value}",
         );
     }
 }
