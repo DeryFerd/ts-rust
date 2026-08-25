@@ -4007,8 +4007,25 @@ fn check_jsx_implicit_children(
     let type_ = if let [type_] = child_types.as_slice() {
         *type_
     } else {
-        let mut prepared = store.prepare_type_query_types(&[], &[], &[], 1, 0)?;
-        let element = store.literal_union_type_prepared(&child_types, None, &mut prepared)?;
+        let element = if let Some(global_types) = source.3 {
+            let mut prepared = store.prepare_type_query_types_with_global_types(
+                &[],
+                &[],
+                &[],
+                1,
+                0,
+                global_types,
+            )?;
+            store.literal_union_type_prepared_with_global_types(
+                global_types,
+                &child_types,
+                None,
+                &mut prepared,
+            )?
+        } else {
+            let mut prepared = store.prepare_type_query_types(&[], &[], &[], 1, 0)?;
+            store.literal_union_type_prepared(&child_types, None, &mut prepared)?
+        };
         automatic_jsx_children_array_type(store, source.2, element, node)?
     };
     Ok(Some(CheckedJsxChildren {
