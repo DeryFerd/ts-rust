@@ -11377,8 +11377,8 @@ mod joined_tests {
                         &fixture.store,
                         statement,
                     ),
-                    Err(SourceFunctionStatementsError::Unsupported(_))
-                        | Err(SourceFunctionStatementsError::Invariant(_)),
+                    Err(SourceFunctionStatementsError::Unsupported(_)
+                        | SourceFunctionStatementsError::Invariant(_)),
                 ),
                 "unexpectedly admitted unsupported unused-iteration shape: {source}",
             );
