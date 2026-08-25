@@ -51392,6 +51392,9 @@ mod tests {
             "Existing = 1, ",
             "Y = E1.Z, ",
             "Y1 = E1['Z'], ",
+            "Wrapped = ((E1.WrappedMissing)), ",
+            "Receiver = (E1).ReceiverMissing, ",
+            "Template = ((E1)[`TemplateMissing`]), ",
             "Valid = E1.Existing, ",
             "Unknown = missing, ",
             "}",
@@ -51407,20 +51410,40 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
-            [2474, 2339, 2474, 2339, 2474],
+            [
+                2474, 2339, 2474, 2339, 2474, 2339, 2474, 2339, 2474, 2339, 2474
+            ],
         );
         assert_eq!(
             diagnostics
                 .iter()
                 .map(|diagnostic| node_text(&source, diagnostic.node.unwrap()))
                 .collect::<Vec<_>>(),
-            ["E1.Z", "Z", "E1['Z']", "'Z'", "missing"],
+            [
+                "E1.Z",
+                "Z",
+                "E1['Z']",
+                "'Z'",
+                "((E1.WrappedMissing))",
+                "WrappedMissing",
+                "(E1).ReceiverMissing",
+                "ReceiverMissing",
+                "((E1)[`TemplateMissing`])",
+                "`TemplateMissing`",
+                "missing",
+            ],
         );
-        for diagnostic in [&diagnostics[1], &diagnostics[3]] {
-            assert_eq!(diagnostic.diagnostic.arguments, ["Z", "typeof E1"]);
+        for (diagnostic, member) in [
+            (&diagnostics[1], "Z"),
+            (&diagnostics[3], "Z"),
+            (&diagnostics[5], "WrappedMissing"),
+            (&diagnostics[7], "ReceiverMissing"),
+            (&diagnostics[9], "TemplateMissing"),
+        ] {
+            assert_eq!(diagnostic.diagnostic.arguments, [member, "typeof E1"]);
             assert_eq!(
                 diagnostic.diagnostic.render().unwrap(),
-                "Property 'Z' does not exist on type 'typeof E1'.",
+                format!("Property '{member}' does not exist on type 'typeof E1'."),
             );
             let node = diagnostic.node.unwrap();
             assert!(context.store().type_node_links(node).is_none());

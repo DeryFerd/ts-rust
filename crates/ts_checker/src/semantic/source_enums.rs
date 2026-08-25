@@ -249,6 +249,36 @@ fn range_contains(parent: &Node, child: &Node) -> bool {
         && child.range.end.get() <= parent.range.end.get()
 }
 
+fn unwrapped_const_enum_member_expression(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    mut expression: NodeRef,
+    mut parent: NodeRef,
+) -> Option<NodeRef> {
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(expression) {
+            return None;
+        }
+        let record = preflight_node(store, host, expression).ok()?;
+        let parent_record = preflight_node(store, host, parent).ok()?;
+        if record.parent != Some(parent.node)
+            || record.flags.0 != 0
+            || !range_contains(parent_record, record)
+        {
+            return None;
+        }
+        let NodeData::ParenthesizedExpression(parenthesized) = &record.data else {
+            return Some(expression);
+        };
+        if record.kind != SyntaxKind::ParenthesizedExpression {
+            return None;
+        }
+        parent = expression;
+        expression = NodeRef::new(expression.arena, expression.file, parenthesized.expression);
+    }
+}
+
 fn missing_const_enum_member_diagnostic(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -257,14 +287,12 @@ fn missing_const_enum_member_diagnostic(
     initializer: NodeRef,
     enum_name: &str,
 ) -> Option<SourceEnumMissingMemberDiagnostic> {
-    let initializer_record = host.node(initializer)?;
-    if initializer_record.parent != Some(member.node) || initializer_record.flags.0 != 0 {
-        return None;
-    }
+    let access_node = unwrapped_const_enum_member_expression(store, host, initializer, member)?;
+    let access_record = host.node(access_node)?;
 
-    let (receiver, name, member_name) = match &initializer_record.data {
+    let (receiver, name, member_name) = match &access_record.data {
         NodeData::PropertyAccessExpression(access)
-            if initializer_record.kind == SyntaxKind::PropertyAccessExpression
+            if access_record.kind == SyntaxKind::PropertyAccessExpression
                 && access.question_dot_token.is_none() =>
         {
             let receiver = NodeRef::new(initializer.arena, initializer.file, access.expression);
@@ -275,15 +303,15 @@ fn missing_const_enum_member_diagnostic(
             };
             if name_record.kind != SyntaxKind::Identifier
                 || name_record.flags.0 != 0
-                || name_record.parent != Some(initializer.node)
-                || !range_contains(initializer_record, name_record)
+                || name_record.parent != Some(access_node.node)
+                || !range_contains(access_record, name_record)
             {
                 return None;
             }
             (receiver, name, identifier.text.as_str())
         }
         NodeData::ElementAccessExpression(access)
-            if initializer_record.kind == SyntaxKind::ElementAccessExpression
+            if access_record.kind == SyntaxKind::ElementAccessExpression
                 && access.question_dot_token.is_none() =>
         {
             let receiver = NodeRef::new(initializer.arena, initializer.file, access.expression);
@@ -293,21 +321,34 @@ fn missing_const_enum_member_diagnostic(
                 access.argument_expression,
             );
             let name_record = host.node(name)?;
-            let NodeData::StringLiteral(literal) = &name_record.data else {
-                return None;
+            let member_name = match &name_record.data {
+                NodeData::StringLiteral(literal)
+                    if name_record.kind == SyntaxKind::StringLiteral
+                        && literal.token_flags.0 == 0 =>
+                {
+                    literal.text.as_str()
+                }
+                NodeData::NoSubstitutionTemplateLiteral(literal)
+                    if name_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral
+                        && literal.token_flags.0 == 0
+                        && literal.template_flags.0 == 0 =>
+                {
+                    literal.text.as_str()
+                }
+                _ => return None,
             };
-            if name_record.kind != SyntaxKind::StringLiteral
-                || name_record.flags.0 != 0
-                || name_record.parent != Some(initializer.node)
-                || !range_contains(initializer_record, name_record)
+            if name_record.flags.0 != 0
+                || name_record.parent != Some(access_node.node)
+                || !range_contains(access_record, name_record)
             {
                 return None;
             }
-            (receiver, name, literal.text.as_str())
+            (receiver, name, member_name)
         }
         _ => return None,
     };
 
+    let receiver = unwrapped_const_enum_member_expression(store, host, receiver, access_node)?;
     let receiver_record = host.node(receiver)?;
     let NodeData::Identifier(receiver_name) = &receiver_record.data else {
         return None;
@@ -318,8 +359,7 @@ fn missing_const_enum_member_diagnostic(
         .and_then(|exports| store.symbol_table(exports))?;
     if receiver_record.kind != SyntaxKind::Identifier
         || receiver_record.flags.0 != 0
-        || receiver_record.parent != Some(initializer.node)
-        || !range_contains(initializer_record, receiver_record)
+        || !range_contains(access_record, receiver_record)
         || receiver_name.text != enum_name
         || owner_record.flags() != SymbolFlags::CONST_ENUM
         || owner_record.name().as_utf8() != Some(enum_name)
@@ -1274,6 +1314,9 @@ mod tests {
                 "Existing = 1, ",
                 "Property = Invalid.Missing, ",
                 "Indexed = Invalid['Absent'], ",
+                "WrappedProperty = ((Invalid.Wrapped)), ",
+                "WrappedReceiver = (Invalid).Receiver, ",
+                "WrappedTemplate = ((Invalid)[`Template`]), ",
                 "Valid = Invalid.Existing, ",
                 "Unknown = missing, ",
                 "}",
@@ -1297,13 +1340,23 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
-            [2474, 2474, 2474],
+            [2474, 2474, 2474, 2474, 2474, 2474],
         );
-        let [property, indexed] = plan.missing_member_diagnostics.as_slice() else {
-            panic!("only missing properties and string indices require TS2339")
+        let [
+            property,
+            indexed,
+            wrapped_property,
+            wrapped_receiver,
+            wrapped_template,
+        ] = plan.missing_member_diagnostics.as_slice()
+        else {
+            panic!("missing wrapped properties and literal indexes must retain TS2339")
         };
         assert_eq!(property.arguments, ["Missing", "typeof Invalid"]);
         assert_eq!(indexed.arguments, ["Absent", "typeof Invalid"]);
+        assert_eq!(wrapped_property.arguments, ["Wrapped", "typeof Invalid"]);
+        assert_eq!(wrapped_receiver.arguments, ["Receiver", "typeof Invalid"]);
+        assert_eq!(wrapped_template.arguments, ["Template", "typeof Invalid"]);
         assert_eq!(
             fixture.parsed.arena.get(property.node.node).unwrap().kind,
             SyntaxKind::Identifier,
@@ -1311,6 +1364,33 @@ mod tests {
         assert_eq!(
             fixture.parsed.arena.get(indexed.node.node).unwrap().kind,
             SyntaxKind::StringLiteral,
+        );
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(wrapped_property.node.node)
+                .unwrap()
+                .kind,
+            SyntaxKind::Identifier,
+        );
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(wrapped_receiver.node.node)
+                .unwrap()
+                .kind,
+            SyntaxKind::Identifier,
+        );
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(wrapped_template.node.node)
+                .unwrap()
+                .kind,
+            SyntaxKind::NoSubstitutionTemplateLiteral,
         );
         assert_eq!(
             (
