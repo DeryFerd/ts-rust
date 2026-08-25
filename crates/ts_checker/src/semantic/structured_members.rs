@@ -1464,7 +1464,11 @@ fn valid_interface_method_signatures(
                 & !(SignatureFlags::HAS_REST_PARAMETER | SignatureFlags::HAS_LITERAL_TYPES).bits()
                 != 0
             || callable.declaration() != Some(declaration)
-            || !callable.type_parameters().is_empty()
+            || !super::callable_sets::valid_declared_method_type_parameters(
+                store,
+                callable,
+                declaration,
+            )
             || callable.this_parameter().is_some()
             || callable.resolved_min_argument_count() != -1
             || callable.resolved_type_predicate().is_some()
@@ -1578,22 +1582,119 @@ fn matching_interface_method_contract(
                 };
                 first_record.flags() == second_record.flags()
                     && first_record.min_argument_count() == second_record.min_argument_count()
-                    && first_record.resolved_return_type() == second_record.resolved_return_type()
+                    && first_record.type_parameters().len() == second_record.type_parameters().len()
+                    && match (
+                        first_record.resolved_return_type(),
+                        second_record.resolved_return_type(),
+                    ) {
+                        (Some(first), Some(second)) => matching_generic_method_type(
+                            store,
+                            first,
+                            second,
+                            first_record.type_parameters(),
+                            second_record.type_parameters(),
+                            &mut HashSet::new(),
+                        ),
+                        (None, None) => true,
+                        _ => false,
+                    }
                     && first_record.parameters().len() == second_record.parameters().len()
                     && first_record
                         .parameters()
                         .iter()
                         .zip(second_record.parameters())
                         .all(|(first, second)| {
-                            store
-                                .value_symbol_links(*first)
-                                .and_then(|links| links.resolved_type)
-                                == store
+                            match (
+                                store
+                                    .value_symbol_links(*first)
+                                    .and_then(|links| links.resolved_type),
+                                store
                                     .value_symbol_links(*second)
-                                    .and_then(|links| links.resolved_type)
+                                    .and_then(|links| links.resolved_type),
+                            ) {
+                                (Some(first), Some(second)) => matching_generic_method_type(
+                                    store,
+                                    first,
+                                    second,
+                                    first_record.type_parameters(),
+                                    second_record.type_parameters(),
+                                    &mut HashSet::new(),
+                                ),
+                                _ => false,
+                            }
                         })
             },
         )
+}
+
+fn matching_generic_method_type(
+    store: &CanonicalTypeMapperStore,
+    first: TypeId,
+    second: TypeId,
+    first_parameters: &[TypeId],
+    second_parameters: &[TypeId],
+    active: &mut HashSet<(TypeId, TypeId)>,
+) -> bool {
+    if first == second {
+        return true;
+    }
+    if let Some(index) = first_parameters
+        .iter()
+        .position(|parameter| *parameter == first)
+    {
+        return second_parameters.get(index).copied() == Some(second);
+    }
+    if !active.insert((first, second)) {
+        return true;
+    }
+    let matches = match (
+        store.type_payload(first).map(|record| record.data()),
+        store.type_payload(second).map(|record| record.data()),
+    ) {
+        (Some(TypeData::Union(first)), Some(TypeData::Union(second))) => {
+            first.union.types.len() == second.union.types.len()
+                && first.union.types.iter().all(|first| {
+                    second.union.types.iter().any(|second| {
+                        matching_generic_method_type(
+                            store,
+                            *first,
+                            *second,
+                            first_parameters,
+                            second_parameters,
+                            active,
+                        )
+                    })
+                })
+        }
+        (
+            Some(TypeData::TypeReference(_) | TypeData::Interface(_)),
+            Some(TypeData::TypeReference(_) | TypeData::Interface(_)),
+        ) => match (
+            super::reference_types::validate_direct_generic_reference(store, first),
+            super::reference_types::validate_direct_generic_reference(store, second),
+        ) {
+            (Ok(first), Ok(second)) => {
+                first.target == second.target
+                    && first.type_arguments.len() == second.type_arguments.len()
+                    && first.type_arguments.iter().zip(second.type_arguments).all(
+                        |(first, second)| {
+                            matching_generic_method_type(
+                                store,
+                                *first,
+                                second,
+                                first_parameters,
+                                second_parameters,
+                                active,
+                            )
+                        },
+                    )
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    active.remove(&(first, second));
+    matches
 }
 
 fn exact_property_table(

@@ -7,8 +7,8 @@
 //! sets are limited to pure nongeneric call or construct members. Construct
 //! signatures can also retain trailing optional `any` parameters.
 //! Named interface and type-literal methods retain their own binder symbols,
-//! annotated required or optional parameters, and an authenticated `any[]`
-//! rest parameter when present.
+//! authenticated method type parameters, annotated required or optional
+//! parameters, and authenticated array rest parameters when present.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,7 +21,10 @@ use ts_binder::{
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, SignatureId, TypeId,
     bootstrap::UnionReduction,
-    declared::{cached_ordinary_type_parameter_owner, preflight_node, type_list_key},
+    declared::{
+        cached_ordinary_type_parameter_owner, preflight_node, preflight_type_parameter_symbol,
+        type_list_key,
+    },
     global_types::preflight_generic_global_type_target,
     interface_heritage::{
         DirectInterfaceBaseKind, DirectInterfaceHeritageError, DirectInterfaceHeritagePlan,
@@ -162,14 +165,24 @@ pub(super) struct PlannedCallParameter {
     optional: bool,
 }
 
-/// One named, nongeneric method on an interface or type literal.
+/// One binder-owned type parameter declared directly on a method signature.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PlannedInterfaceMethodTypeParameter {
+    pub declaration: NodeRef,
+    pub symbol: SemanticSymbolId,
+    pub constraint: Option<NodeRef>,
+    pub default_type: Option<NodeRef>,
+}
+
+/// One named method on an interface or type literal.
 ///
 /// Overloads share the binder-owned method symbol but keep separate signature
-/// declarations and parameter lists.
+/// declarations, type parameters, and value parameter lists.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PlannedInterfaceMethod {
     pub declaration: NodeRef,
     pub symbol: SemanticSymbolId,
+    pub type_parameters: Vec<PlannedInterfaceMethodTypeParameter>,
     pub parameters: Vec<PlannedCallParameter>,
     pub return_type: NodeRef,
     pub flags: SignatureFlags,
@@ -340,9 +353,16 @@ impl PropertyObjectPlan {
             })
             .chain(self.methods.iter().flat_map(|method| {
                 method
-                    .parameters
+                    .type_parameters
                     .iter()
-                    .map(|parameter| parameter.type_node)
+                    .flat_map(|parameter| [parameter.constraint, parameter.default_type])
+                    .flatten()
+                    .chain(
+                        method
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.type_node),
+                    )
                     .chain(std::iter::once(method.return_type))
             }))
             .chain(self.accessors.iter().map(|accessor| accessor.type_node))
@@ -1960,6 +1980,7 @@ fn matching_planned_interface_method_contract(
                 return false;
             };
             first_method.flags == second_method.flags
+                && first_method.type_parameters.len() == second_method.type_parameters.len()
                 && first_method.parameters.len() == second_method.parameters.len()
                 && equivalent_merged_property_annotations(
                     store,
@@ -5468,7 +5489,6 @@ fn plan_interface_method(
         || method.next_container.is_some()
         || method.postfix_token.is_some()
         || method.symbol.is_some()
-        || method.type_parameters.is_some()
         || method.modifiers.is_some()
         || method.parameters.has_trailing_comma
         || method.parameters.range.start < record.range.start
@@ -5534,7 +5554,15 @@ fn plan_interface_method(
     let locals = bound
         .locals(declaration)
         .and_then(|locals| store.symbol_table(locals));
-    if method.parameters.nodes.is_empty() {
+    let type_parameters = plan_interface_method_type_parameters(
+        store,
+        host,
+        declaration,
+        method.type_parameters.as_ref(),
+        &method.parameters,
+        locals,
+    )?;
+    if method.parameters.nodes.is_empty() && type_parameters.is_empty() {
         if locals.is_some_and(|locals| !locals.is_empty()) {
             return Err(unsupported());
         }
@@ -5585,7 +5613,7 @@ fn plan_interface_method(
         }
         parameters.push(planned);
     }
-    if locals.is_some_and(|locals| locals.len() != parameters.len())
+    if locals.is_some_and(|locals| locals.len() != parameters.len() + type_parameters.len())
         || i32::try_from(parameters.len()).is_err()
     {
         return Err(unsupported());
@@ -5594,11 +5622,191 @@ fn plan_interface_method(
     Ok(PlannedInterfaceMethod {
         declaration,
         symbol,
+        type_parameters,
         parameters,
         return_type,
         flags,
         minimum_argument_count,
     })
+}
+
+#[allow(clippy::too_many_lines)] // Binder, syntax, constraints, and defaults share one proof.
+fn plan_interface_method_type_parameters(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameters: Option<&NodeList>,
+    value_parameters: &NodeList,
+    locals: Option<&ts_binder::semantic::SymbolTable>,
+) -> Result<Vec<PlannedInterfaceMethodTypeParameter>, PropertyObjectError> {
+    let unsupported = || PropertyObjectError::UnsupportedMember {
+        node: declaration,
+        kind: SyntaxKind::MethodSignature,
+    };
+    let Some(parameters) = parameters else {
+        return Ok(Vec::new());
+    };
+    let declaration_record = preflight_node(store, host, declaration).map_err(|_| unsupported())?;
+    if parameters.nodes.is_empty()
+        || parameters.has_trailing_comma
+        || parameters.range.start < declaration_record.range.start
+        || parameters.range.end > value_parameters.range.start
+        || parameters.range.start >= parameters.range.end
+        || locals.is_none()
+    {
+        return Err(unsupported());
+    }
+
+    let mut planned = Vec::with_capacity(parameters.nodes.len());
+    let mut symbols = HashSet::with_capacity(parameters.nodes.len());
+    let mut names = HashSet::with_capacity(parameters.nodes.len());
+    let mut checked = HashSet::with_capacity(parameters.nodes.len());
+    let mut previous_end = parameters.range.start;
+    let mut default_seen = false;
+    for parameter in &parameters.nodes {
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+        let record = preflight_node(store, host, parameter).map_err(|_| unsupported())?;
+        let NodeData::TypeParameterDeclaration(data) = &record.data else {
+            return Err(unsupported());
+        };
+        if record.kind != SyntaxKind::TypeParameter
+            || record.flags.0 != 0
+            || record.parent != Some(declaration.node)
+            || record.range.start < previous_end
+            || record.range.start < parameters.range.start
+            || record.range.end > parameters.range.end
+            || data.expression.is_some()
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+        {
+            return Err(unsupported());
+        }
+
+        let name = NodeRef::new(parameter.arena, parameter.file, data.name);
+        let name_record = preflight_node(store, host, name).map_err(|_| unsupported())?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(unsupported());
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(parameter.node)
+            || name_record.range.start < record.range.start
+            || name_record.range.end > record.range.end
+            || identifier.text.is_empty()
+            || identifier.flow_node.is_some()
+            || !names.insert(identifier.text.as_str())
+        {
+            return Err(unsupported());
+        }
+
+        let symbol = bound_symbol(store, host, parameter).ok_or_else(unsupported)?;
+        preflight_type_parameter_symbol(store, host, symbol, &mut checked)
+            .map_err(|_| unsupported())?;
+        let symbol_record = store.symbol(symbol).ok_or_else(unsupported)?;
+        if symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
+            || symbol_record.check_flags() != CheckFlags::NONE
+            || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+            || symbol_record.declarations() != Some(&[parameter])
+            || symbol_record.value_declaration().is_some()
+            || symbol_record.members().is_some()
+            || symbol_record.exports().is_some()
+            || symbol_record.parent().is_some()
+            || symbol_record.export_symbol().is_some()
+            || locals.and_then(|locals| locals.get(symbol_record.name())) != Some(symbol)
+            || !symbols.insert(symbol)
+        {
+            return Err(unsupported());
+        }
+
+        let constraint = data
+            .constraint
+            .map(|node| NodeRef::new(parameter.arena, parameter.file, node));
+        let default_type = data
+            .default_type
+            .map(|node| NodeRef::new(parameter.arena, parameter.file, node));
+        let mut previous_child_end = name_record.range.end;
+        for annotation in [constraint, default_type].into_iter().flatten() {
+            let annotation_record =
+                preflight_node(store, host, annotation).map_err(|_| unsupported())?;
+            if annotation_record.flags.0 != 0
+                || annotation_record.parent != Some(parameter.node)
+                || annotation_record.range.start < previous_child_end
+                || annotation_record.range.end > record.range.end
+            {
+                return Err(unsupported());
+            }
+            previous_child_end = annotation_record.range.end;
+        }
+        if default_seen && default_type.is_none() {
+            return Err(unsupported());
+        }
+        default_seen |= default_type.is_some();
+        planned.push(PlannedInterfaceMethodTypeParameter {
+            declaration: parameter,
+            symbol,
+            constraint,
+            default_type,
+        });
+        previous_end = record.range.end;
+    }
+    Ok(planned)
+}
+
+/// Returns every overload when `node` is a generic interface method return.
+///
+/// Source checking resolves generic interface members through their property
+/// annotations, so the first overload must also expose its sibling signatures.
+pub(super) fn plan_enclosing_generic_interface_methods(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Vec<PlannedInterfaceMethod>, PropertyObjectError> {
+    let Ok(record) = preflight_node(store, host, node) else {
+        return Ok(Vec::new());
+    };
+    let Some(parent) = record.parent else {
+        return Ok(Vec::new());
+    };
+    let declaration = NodeRef::new(node.arena, node.file, parent);
+    let Ok(method_record) = preflight_node(store, host, declaration) else {
+        return Ok(Vec::new());
+    };
+    let NodeData::MethodSignatureDeclaration(method) = &method_record.data else {
+        return Ok(Vec::new());
+    };
+    if method.type_ != Some(node.node) {
+        return Ok(Vec::new());
+    }
+    let Some(owner) = method_record.parent else {
+        return Ok(Vec::new());
+    };
+    let owner = NodeRef::new(node.arena, node.file, owner);
+    let Ok(owner_record) = preflight_node(store, host, owner) else {
+        return Ok(Vec::new());
+    };
+    let NodeData::InterfaceDeclaration(interface) = &owner_record.data else {
+        return Ok(Vec::new());
+    };
+    if interface.type_parameters.is_none() {
+        return Ok(Vec::new());
+    }
+    let Some(owner_symbol) = bound_symbol(store, host, owner) else {
+        return Err(PropertyObjectError::UnsupportedMember {
+            node: declaration,
+            kind: SyntaxKind::MethodSignature,
+        });
+    };
+    let method_symbol =
+        bound_symbol(store, host, declaration).ok_or(PropertyObjectError::UnsupportedMember {
+            node: declaration,
+            kind: SyntaxKind::MethodSignature,
+        })?;
+    let plan = plan_generic_interface(store, host, owner_symbol)?;
+    Ok(plan
+        .methods
+        .into_iter()
+        .filter(|method| method.symbol == method_symbol)
+        .collect())
 }
 
 fn plan_interface_method_parameter(
@@ -5698,12 +5906,10 @@ fn plan_interface_method_parameter(
         let element = NodeRef::new(type_node.arena, type_node.file, array.element_type);
         let element_record = preflight_node(store, host, element).map_err(|_| unsupported())?;
         if type_record.kind != SyntaxKind::ArrayType
-            || element_record.kind != SyntaxKind::AnyKeyword
             || element_record.flags.0 != 0
             || element_record.parent != Some(type_node.node)
             || element_record.range.start != type_record.range.start
             || element_record.range.end > type_record.range.end
-            || !matches!(element_record.data, NodeData::KeywordTypeNode(_))
         {
             return Err(unsupported());
         }
@@ -8722,10 +8928,11 @@ fn resolved_interface_method_value(
         let signature = *signature;
         let callable = store.signature(signature)?;
         let return_type = callable.resolved_return_type()?;
+        let type_parameters = resolved_interface_method_type_parameters(store, method)?;
         if method.declaration != *declaration
             || callable.flags() != method.flags
             || callable.declaration() != Some(method.declaration)
-            || !callable.type_parameters().is_empty()
+            || callable.type_parameters() != type_parameters.as_slice()
             || callable.this_parameter().is_some()
             || callable.parameters().len() != method.parameters.len()
             || usize::try_from(callable.min_argument_count()).ok()
@@ -8780,6 +8987,44 @@ fn resolved_interface_method_value(
     Some(type_)
 }
 
+fn resolved_interface_method_type_parameters(
+    store: &CanonicalTypeMapperStore,
+    method: &PlannedInterfaceMethod,
+) -> Option<Vec<TypeId>> {
+    let mut resolved = Vec::with_capacity(method.type_parameters.len());
+    let mut symbols = HashSet::with_capacity(method.type_parameters.len());
+    for parameter in &method.type_parameters {
+        let type_ = store.declared_type_links(parameter.symbol)?.declared_type?;
+        let record = store.type_payload(type_)?;
+        let TypeData::TypeParameter(data) = record.data() else {
+            return None;
+        };
+        let constraint = match parameter.constraint {
+            Some(node) => Some(cached_planned_type_identity(store, node)?),
+            None => None,
+        };
+        let default_type = match parameter.default_type {
+            Some(node) => Some(cached_planned_type_identity(store, node)?),
+            None => None,
+        };
+        if !symbols.insert(parameter.symbol)
+            || cached_ordinary_type_parameter_owner(store, type_) != Some(parameter.symbol)
+            || store.source_node_kind(parameter.declaration) != Some(SyntaxKind::TypeParameter)
+            || store.source_node_parent(parameter.declaration)
+                != Some(SourceNodeParent::Parent(method.declaration))
+            || data.is_this_type
+            || data.target.is_some()
+            || data.mapper.is_some()
+            || data.constraint != constraint
+            || data.resolved_default_type != default_type
+        {
+            return None;
+        }
+        resolved.push(type_);
+    }
+    Some(resolved)
+}
+
 /// Publishes one callable object per binder-owned declared method symbol.
 ///
 /// `resolved` and the returned values follow `plan.methods` in declaration
@@ -8792,6 +9037,7 @@ pub(super) fn publish_interface_method_values(
     struct PreparedMethodGroup {
         symbol: SemanticSymbolId,
         indexes: Vec<usize>,
+        type_parameters: Vec<Vec<TypeId>>,
         parameter_symbols: Vec<Vec<SemanticSymbolId>>,
         parameter_types: Vec<Vec<TypeId>>,
         signatures: Vec<SignatureId>,
@@ -8853,6 +9099,8 @@ pub(super) fn publish_interface_method_values(
         {
             return Err(invalid_cache(plan, owner_type));
         }
+        let type_parameters = resolved_interface_method_type_parameters(store, method)
+            .ok_or_else(|| invalid_cache(plan, owner_type))?;
         published.push(placeholder);
         let group_index = if let Some(group) = method_groups.get(&method.symbol).copied() {
             group
@@ -8862,6 +9110,7 @@ pub(super) fn publish_interface_method_values(
             prepared.push(PreparedMethodGroup {
                 symbol: method.symbol,
                 indexes: Vec::new(),
+                type_parameters: Vec::new(),
                 parameter_symbols: Vec::new(),
                 parameter_types: Vec::new(),
                 signatures: Vec::new(),
@@ -8872,6 +9121,10 @@ pub(super) fn publish_interface_method_values(
         let group = &mut prepared[group_index];
         group
             .indexes
+            .try_reserve(1)
+            .map_err(|_| PropertyObjectError::Capacity(plan.node))?;
+        group
+            .type_parameters
             .try_reserve(1)
             .map_err(|_| PropertyObjectError::Capacity(plan.node))?;
         group
@@ -8893,6 +9146,7 @@ pub(super) fn publish_interface_method_values(
         parameter_symbols.extend(method.parameters.iter().map(|parameter| parameter.symbol));
         parameter_types.extend_from_slice(&resolved_signature.parameter_types);
         group.indexes.push(index);
+        group.type_parameters.push(type_parameters);
         group.parameter_symbols.push(parameter_symbols);
         group.parameter_types.push(parameter_types);
     }
@@ -9021,9 +9275,10 @@ pub(super) fn publish_interface_method_values(
         let callable_type = store
             .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(group.symbol))
             .expect("the interface method transaction reserved its callable object");
-        for ((index, parameter_symbols), parameter_types) in group
+        for (((index, type_parameters), parameter_symbols), parameter_types) in group
             .indexes
             .iter()
+            .zip(group.type_parameters)
             .zip(group.parameter_symbols)
             .zip(group.parameter_types)
         {
@@ -9035,7 +9290,7 @@ pub(super) fn publish_interface_method_values(
                 .alloc_signature(
                     method.flags,
                     Some(method.declaration),
-                    Vec::new(),
+                    type_parameters,
                     None,
                     parameter_symbols,
                     Some(resolved_signature.return_type),
@@ -13337,6 +13592,395 @@ mod generic_publication_tests {
     }
 
     #[test]
+    fn generic_interface_method_plans_preserve_local_type_parameters_and_typed_rest_arrays() {
+        let fixture = interface_fixture(
+            concat!(
+                "interface Shape { ",
+                "map<Value extends string = string>(value: Value): Value; ",
+                "map<Other>(...values: Other[]): Other; ",
+                "}",
+            ),
+            3_890,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+
+        let [first, second] = plan.methods.as_slice() else {
+            panic!("the generic method symbol must preserve both declaration overloads")
+        };
+        assert_eq!(first.symbol, second.symbol);
+        let [value] = first.type_parameters.as_slice() else {
+            panic!("the first overload must retain its binder-owned type parameter")
+        };
+        assert!(value.constraint.is_some());
+        assert!(value.default_type.is_some());
+        assert_eq!(
+            fixture.store.symbol(value.symbol).unwrap().name().as_utf8(),
+            Some("Value"),
+        );
+        let [other] = second.type_parameters.as_slice() else {
+            panic!("the rest overload must retain an independent type parameter")
+        };
+        assert_ne!(value.symbol, other.symbol);
+        assert_eq!(second.flags, SignatureFlags::HAS_REST_PARAMETER);
+        assert_eq!(
+            fixture
+                .store
+                .source_node_kind(second.parameters[0].type_node),
+            Some(SyntaxKind::ArrayType),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn generic_interface_methods_accept_recursive_mapped_array_rest_annotations() {
+        let fixture = interface_fixture(
+            concat!(
+                "type PartialDeep<T> = { [K in keyof T]?: PartialDeep<T[K]> }; ",
+                "type Many<T> = T | readonly T[]; ",
+                "interface Collection<T> { ",
+                "sortBy(...iteratees: Many<PartialDeep<T>>[]): Collection<T>; ",
+                "}",
+            ),
+            3_891,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+
+        let [method] = plan.methods.as_slice() else {
+            panic!("the collection interface must retain its sort method")
+        };
+        assert_eq!(method.flags, SignatureFlags::HAS_REST_PARAMETER);
+        let [rest] = method.parameters.as_slice() else {
+            panic!("the sort method must retain its mapped-array rest parameter")
+        };
+        let NodeData::ArrayTypeNode(array) =
+            &fixture.parsed.arena.get(rest.type_node.node).unwrap().data
+        else {
+            panic!("the rest annotation must retain its original array syntax")
+        };
+        let element = NodeRef::new(
+            rest.type_node.arena,
+            rest.type_node.file,
+            array.element_type,
+        );
+        assert_eq!(
+            fixture.store.source_node_kind(element),
+            Some(SyntaxKind::TypeReference),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One fixture proves accessor and generic-method cache identity.
+    fn generic_method_signatures_publish_authenticated_type_parameters_cold_and_warm() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Shape { ",
+                "get current(): string; set current(value: string); ",
+                "map<Value extends string = string>(value: Value): Value; ",
+                "}",
+            ),
+            3_892,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        assert_eq!(plan.accessors.len(), 2);
+        let method = &plan.methods[0];
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let owner = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let callable = fixture
+            .store
+            .value_symbol_links(method.symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let [signature] = fixture
+            .store
+            .type_payload(callable)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .unwrap()
+        else {
+            panic!("the generic method must publish exactly one signature")
+        };
+        let signature = *signature;
+        let [parameter] = fixture
+            .store
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+        else {
+            panic!("the method signature must preserve its original generic parameter")
+        };
+        let parameter = *parameter;
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&fixture.store, parameter),
+            Some(method.type_parameters[0].symbol),
+        );
+        let TypeData::TypeParameter(data) = fixture.store.type_payload(parameter).unwrap().data()
+        else {
+            panic!("the generic signature parameter must retain a type-parameter payload")
+        };
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(data.constraint, Some(string));
+        assert_eq!(data.resolved_default_type, Some(string));
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(plan.properties[0].symbol)
+                .and_then(|links| links.resolved_type),
+            Some(string),
+        );
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([parameter].as_slice()),
+        );
+        assert_eq!(
+            fixture.store.interface_method_linked_type(signature),
+            Some(callable)
+        );
+        assert_eq!(
+            crate::semantic::structured_members::valid_interface_method_value(
+                &fixture.store,
+                method.symbol,
+                callable,
+            ),
+            Some(signature),
+        );
+        let crate::semantic::callable_sets::StoredCallableSetValidation::Valid {
+            projection, ..
+        } = crate::semantic::callable_sets::validate_stored_callable_set(&fixture.store, callable)
+        else {
+            panic!("the generic method must retain authenticated callable provenance")
+        };
+        assert!(projection.call_signatures[0].strict_variance_exempt);
+        assert_eq!(projection.call_signatures[0].parameters, vec![parameter]);
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(fixture.symbol),
+            Ok(owner),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Cold and warm union identities share one declared signature.
+    fn generic_method_unions_preserve_parameter_identity_and_replay_warm() {
+        let mut fixture = interface_fixture(
+            "interface Shape { map<Value>(value: Value | string): Value | string; }",
+            3_895,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let method = &plan.methods[0];
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let owner = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let callable = fixture
+            .store
+            .value_symbol_links(method.symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let [signature] = fixture
+            .store
+            .type_payload(callable)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .unwrap()
+        else {
+            panic!("the union method must retain its original generic signature")
+        };
+        let signature = *signature;
+        let record = fixture.store.signature(signature).unwrap();
+        let [parameter] = record.type_parameters() else {
+            panic!("the union method must retain its binder-owned type parameter")
+        };
+        let parameter = *parameter;
+        let union = record.resolved_return_type().unwrap();
+        let TypeData::Union(data) = fixture.store.type_payload(union).unwrap().data() else {
+            panic!("the method must retain its parameter-or-string union")
+        };
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(data.union.types.len(), 2);
+        assert!(data.union.types.contains(&parameter));
+        assert!(data.union.types.contains(&string));
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&fixture.store, parameter),
+            Some(method.type_parameters[0].symbol),
+        );
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([union].as_slice()),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(method.parameters[0].type_node)
+                .and_then(|links| links.resolved_type),
+            Some(union),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(method.return_type)
+                .and_then(|links| links.resolved_type),
+            Some(union),
+        );
+        assert!(matches!(
+            crate::semantic::callable_sets::validate_stored_callable_set(&fixture.store, callable,),
+            crate::semantic::callable_sets::StoredCallableSetValidation::Valid { .. }
+        ));
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_cache_len(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(fixture.symbol),
+            Ok(owner),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture
+                    .store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_cache_len(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn inherited_generic_methods_compare_their_type_parameters_by_position() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Base { map<Value>(value: Value): Value } ",
+                "interface Derived extends Base { map<Value>(value: Value): Value }",
+            ),
+            3_894,
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let derived = fixture
+            .store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source("Derived"))
+            .unwrap();
+        fixture.store.merge_global_symbol(globals, derived).unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(derived)
+        .unwrap();
+
+        let TypeData::Interface(interface) = fixture.store.type_payload(type_).unwrap().data()
+        else {
+            panic!("generic method inheritance must retain its interface payload")
+        };
+        assert_eq!(
+            interface
+                .reference
+                .object
+                .structured
+                .properties
+                .as_ref()
+                .map(Vec::len),
+            Some(1),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn interface_method_overloads_share_one_property_and_keep_each_signature() {
         let fixture = interface_fixture(
             "interface Shape { run(value: string): number; run(...args: any[]): void }",
@@ -14030,9 +14674,8 @@ mod generic_publication_tests {
     #[test]
     fn unsupported_interface_method_shapes_do_not_publish_semantic_state() {
         for (index, source) in [
-            "interface Shape { run(...args: number[]): void }",
+            "interface Shape { run(...args: number): void }",
             "interface Shape { run?(...args: any[]): void }",
-            "interface Shape { run<T>(...args: any[]): void }",
             "interface Shape { run(...args: any[]) }",
         ]
         .into_iter()
@@ -15083,6 +15726,398 @@ mod generic_publication_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Verify overloads, indexes, defaults, and fresh parameters together.
+    fn generic_method_overloads_and_indexes_instantiate_with_fresh_signature_parameters() {
+        let mut fixture = global_array_augmentation_fixture(
+            concat!(
+                "interface Array<T> { (): any[]; } ",
+                "interface Contract<Outer> { ",
+                "map<Value extends Outer = never>(value: Value): Outer; ",
+                "map<Value>(...values: Value[]): Outer; ",
+                "readonly [index: number]: Outer; ",
+                "}",
+            ),
+            3_893,
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let locals = fixture
+            .source_bound
+            .locals(fixture.source_bound.source_file())
+            .unwrap();
+        let contract = fixture
+            .store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source("Contract"))
+            .unwrap();
+        fixture
+            .store
+            .merge_global_symbol(globals, contract)
+            .unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&fixture.library.arena, &fixture.library_bound),
+                (&fixture.source.arena, &fixture.source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_generic_interface(&fixture.store, &host, contract).unwrap();
+        let [first, second] = plan.methods.as_slice() else {
+            panic!("the generic method must retain both overload declarations")
+        };
+        assert_eq!(plan.indexes.len(), 1);
+        let flags = fixture.store.symbol(contract).unwrap().flags();
+        let target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            contract,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let outer = CanonicalTypeQuery::new_with_global_types(
+            &mut fixture.store,
+            &host,
+            &fixture.global_types,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(first.return_type)
+        .unwrap();
+        assert!(fixture.store.publish_interface_no_base_resolution(target));
+        assert_eq!(
+            publish_generic_interface_declared_members(&mut fixture.store, &plan, target, &[outer],),
+            Ok(target),
+        );
+
+        let declared_callable = fixture
+            .store
+            .value_symbol_links(first.symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let original_signatures = fixture
+            .store
+            .type_payload(declared_callable)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .unwrap()
+            .to_vec();
+        assert_eq!(original_signatures.len(), 2);
+        for (signature, method) in original_signatures.iter().zip([first, second]) {
+            let record = fixture.store.signature(*signature).unwrap();
+            let [parameter] = record.type_parameters() else {
+                panic!("each declaration overload must retain its own type parameter")
+            };
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(&fixture.store, *parameter),
+                Some(method.type_parameters[0].symbol),
+            );
+            assert!(
+                fixture
+                    .store
+                    .callable_signature_parameter_types(*signature)
+                    .is_some()
+            );
+            assert_eq!(
+                fixture.store.interface_method_linked_type(*signature),
+                Some(declared_callable)
+            );
+        }
+
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let reference = fixture
+            .store
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let array_target = crate::semantic::instantiated_members::GenericInterfaceArrayTarget::new(
+            fixture.global_types.array_type,
+        );
+        let members = fixture
+            .store
+            .resolve_generic_interface_members(reference, Some(array_target))
+            .unwrap();
+        assert_eq!(members.properties().len(), 1);
+        let [index] = fixture
+            .store
+            .type_payload(reference)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.index_infos.as_deref())
+            .unwrap()
+        else {
+            panic!("the numeric index must survive receiver specialization")
+        };
+        assert_eq!(
+            fixture.store.index_info(*index).unwrap().value_type(),
+            string
+        );
+
+        let instantiated = fixture
+            .store
+            .resolve_generic_interface_property(reference, "map", Some(array_target))
+            .unwrap()
+            .unwrap()
+            .type_id();
+        let TypeData::Object(object) = fixture.store.type_payload(instantiated).unwrap().data()
+        else {
+            panic!("an instantiated generic method must retain its callable object")
+        };
+        let owner_mapper = object.mapper.unwrap();
+        let signatures = object.structured.signatures.as_deref().unwrap();
+        assert_eq!(signatures.len(), 2);
+        for (signature, original) in signatures.iter().zip(&original_signatures) {
+            let record = fixture.store.signature(*signature).unwrap();
+            let source = fixture.store.signature(*original).unwrap();
+            let [fresh] = record.type_parameters() else {
+                panic!("each receiver signature must own a fresh method type parameter")
+            };
+            let [original_parameter] = source.type_parameters() else {
+                panic!("each original signature must retain one method type parameter")
+            };
+            assert_ne!(fresh, original_parameter);
+            assert_eq!(record.target(), Some(*original));
+            assert_ne!(record.mapper(), Some(owner_mapper));
+            assert_eq!(record.resolved_return_type(), Some(string));
+            let TypeData::TypeParameter(data) = fixture.store.type_payload(*fresh).unwrap().data()
+            else {
+                panic!("fresh method parameters must retain their source parameter")
+            };
+            assert_eq!(data.target, Some(*original_parameter));
+            assert_eq!(data.mapper, record.mapper());
+        }
+        let defaulted = fixture
+            .store
+            .signature(signatures[0])
+            .unwrap()
+            .type_parameters()[0];
+        let TypeData::TypeParameter(defaulted) =
+            fixture.store.type_payload(defaulted).unwrap().data()
+        else {
+            panic!("the first receiver overload must preserve its default")
+        };
+        assert_eq!(
+            defaulted.resolved_default_type,
+            Some(fixture.store.intrinsic_bootstrap().unwrap().never_type),
+        );
+        assert_eq!(defaulted.constraint, Some(string));
+        let rest = fixture.store.signature(signatures[1]).unwrap();
+        assert_eq!(rest.flags(), SignatureFlags::HAS_REST_PARAMETER);
+        let rest_type = fixture
+            .store
+            .value_symbol_links(rest.parameters()[0])
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let array = fixture
+            .store
+            .canonical_array_reference(&fixture.global_types, rest_type)
+            .unwrap()
+            .unwrap();
+        assert_eq!(array.element_type, rest.type_parameters()[0]);
+        assert!(matches!(
+            crate::semantic::callable_sets::validate_stored_callable_set(
+                &fixture.store,
+                instantiated,
+            ),
+            crate::semantic::callable_sets::StoredCallableSetValidation::Valid { .. }
+        ));
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_len(),
+            fixture.store.index_info_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .resolve_generic_interface_property(reference, "map", Some(array_target))
+                .unwrap()
+                .unwrap()
+                .type_id(),
+            instantiated,
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.index_info_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Cold, warm, and poisoned union ownership share one receiver.
+    fn instantiated_generic_method_unions_authenticate_fresh_type_parameters() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Contract<Outer> { ",
+                "map<Value>(value: Value | Outer): Value | Outer; ",
+                "}",
+            ),
+            3_896,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let method = &plan.methods[0];
+        let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+        let target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let declared_union = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(method.return_type)
+        .unwrap();
+        assert!(fixture.store.publish_interface_no_base_resolution(target));
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[declared_union],
+            ),
+            Ok(target),
+        );
+
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let receiver = fixture
+            .store
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let callable = fixture
+            .store
+            .resolve_generic_interface_property(receiver, "map", None)
+            .unwrap()
+            .unwrap()
+            .type_id();
+        let [signature] = fixture
+            .store
+            .type_payload(callable)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .unwrap()
+        else {
+            panic!("the specialized method must retain one fresh generic signature")
+        };
+        let signature = *signature;
+        let record = fixture.store.signature(signature).unwrap();
+        let [fresh] = record.type_parameters() else {
+            panic!("the specialized union must retain its fresh method parameter")
+        };
+        let fresh = *fresh;
+        let union = record.resolved_return_type().unwrap();
+        let TypeData::Union(data) = fixture.store.type_payload(union).unwrap().data() else {
+            panic!("receiver specialization must preserve the method parameter union")
+        };
+        assert_eq!(data.union.types.len(), 2);
+        assert!(data.union.types.contains(&fresh));
+        assert!(data.union.types.contains(&string));
+        let value = record.parameters()[0];
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(value)
+                .and_then(|links| links.resolved_type),
+            Some(union),
+        );
+        assert_eq!(fixture.store.validate_union_constituent(fresh), Ok(()));
+        assert!(matches!(
+            crate::semantic::callable_sets::validate_stored_callable_set(&fixture.store, callable,),
+            crate::semantic::callable_sets::StoredCallableSetValidation::Valid { .. }
+        ));
+
+        let TypeData::TypeParameter(parameter) = fixture.store.type_payload(fresh).unwrap().data()
+        else {
+            panic!("the specialized signature must retain its fresh parameter metadata")
+        };
+        let (constraint, original, mapper, default_type) = (
+            parameter.constraint,
+            parameter.target,
+            parameter.mapper,
+            parameter.resolved_default_type,
+        );
+        assert!(fixture.store.set_type_parameter_resolution(
+            fresh,
+            constraint,
+            original,
+            None,
+            default_type,
+        ));
+        assert_eq!(
+            fixture.store.validate_union_constituent(fresh),
+            Err(
+                crate::semantic::bootstrap::LiteralTypeCacheError::UnsupportedUnionConstituent(
+                    fresh,
+                )
+            ),
+        );
+        assert!(fixture.store.set_type_parameter_resolution(
+            fresh,
+            constraint,
+            original,
+            mapper,
+            default_type,
+        ));
+        assert_eq!(fixture.store.validate_union_constituent(fresh), Ok(()));
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_cache_len(),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .resolve_generic_interface_property(receiver, "map", None)
+                .unwrap()
+                .unwrap()
+                .type_id(),
+            callable,
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture
+                    .store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_cache_len(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn generic_interface_plans_keep_forwarded_base_arguments_without_publication() {
         let mut fixture = interface_fixture(
             concat!(
@@ -15244,6 +16279,208 @@ mod generic_publication_tests {
             Ok(derived),
         );
         assert_eq!(state(&fixture.store, &derived_plan, derived), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Merged heritage, generic methods, and warm proxies share one graph.
+    fn reopened_generic_interfaces_preserve_generic_methods_and_inherited_member_proxies() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Derived<Outer> extends Base<Outer> { own: Outer } ",
+                "interface Derived<Outer> extends Base<Outer> { ",
+                "map<Value>(value: Value | Outer): Value | Outer; ",
+                "} ",
+                "interface Base<Outer> { inherited: Outer }",
+            ),
+            3_897,
+        );
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let base = fixture
+            .store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source("Base"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        fixture.store.merge_global_symbol(globals, base).unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let [method] = plan.methods.as_slice() else {
+            panic!("the reopened interface must retain its generic method")
+        };
+        assert_eq!(plan.declarations.len(), 2);
+        assert_eq!(plan.heritage.as_ref().unwrap().bases.len(), 1);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let derived = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let base_target = fixture
+            .store
+            .declared_type_links(base)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let base_parameter = validate_direct_generic_reference(&fixture.store, base_target)
+            .unwrap()
+            .type_arguments[0];
+        let derived_parameter = validate_direct_generic_reference(&fixture.store, derived)
+            .unwrap()
+            .type_arguments[0];
+        let base_plan = plan_generic_interface(&fixture.store, &host, base).unwrap();
+        assert!(
+            fixture
+                .store
+                .publish_interface_no_base_resolution(base_target)
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &base_plan,
+                base_target,
+                &[base_parameter],
+            ),
+            Ok(base_target),
+        );
+        let return_type = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(method.return_type)
+        .unwrap();
+        let declared_parameter = fixture
+            .store
+            .declared_type_links(method.type_parameters[0].symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Union(declared_union) =
+            fixture.store.type_payload(return_type).unwrap().data()
+        else {
+            panic!("the reopened method must preserve its merged interface parameter union")
+        };
+        assert_eq!(declared_union.union.types.len(), 2);
+        assert!(declared_union.union.types.contains(&declared_parameter));
+        assert!(declared_union.union.types.contains(&derived_parameter));
+        let property_types = [derived_parameter, return_type];
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                derived,
+                &property_types,
+            ),
+            Ok(derived),
+        );
+
+        let members = fixture
+            .store
+            .resolve_generic_interface_members(derived, None)
+            .unwrap();
+        assert_eq!(
+            members
+                .properties()
+                .iter()
+                .map(|property| fixture.store.symbol(*property).unwrap().name().as_utf8())
+                .collect::<Vec<_>>(),
+            [Some("own"), Some("map"), Some("inherited")],
+        );
+        let method_proxy = members.properties()[1];
+        assert_ne!(method_proxy, method.symbol);
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(method_proxy)
+                .and_then(|links| links.target),
+            Some(method.symbol),
+        );
+        let self_method = fixture
+            .store
+            .resolve_generic_interface_property(derived, "map", None)
+            .unwrap()
+            .unwrap()
+            .type_id();
+        let [self_signature] = fixture
+            .store
+            .type_payload(self_method)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .unwrap()
+        else {
+            panic!("the self receiver must retain one fresh generic method signature")
+        };
+        let self_signature = fixture.store.signature(*self_signature).unwrap();
+        let [self_parameter] = self_signature.type_parameters() else {
+            panic!("the self receiver must freshen its generic method parameter")
+        };
+        let self_return = self_signature.resolved_return_type().unwrap();
+        let TypeData::Union(self_union) = fixture.store.type_payload(self_return).unwrap().data()
+        else {
+            panic!("the self receiver must retain its fresh method parameter union")
+        };
+        assert!(self_union.union.types.contains(self_parameter));
+        assert!(self_union.union.types.contains(&derived_parameter));
+
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let receiver = fixture
+            .store
+            .create_direct_generic_reference_type(derived, &[string])
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .resolve_generic_interface_property(receiver, "inherited", None)
+                .unwrap()
+                .unwrap()
+                .type_id(),
+            string,
+        );
+        let callable = fixture
+            .store
+            .resolve_generic_interface_property(receiver, "map", None)
+            .unwrap()
+            .unwrap()
+            .type_id();
+        let [signature] = fixture
+            .store
+            .type_payload(callable)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .unwrap()
+        else {
+            panic!("the concrete receiver must retain one fresh generic method signature")
+        };
+        let signature = fixture.store.signature(*signature).unwrap();
+        let [parameter] = signature.type_parameters() else {
+            panic!("the concrete receiver must freshen its generic method parameter")
+        };
+        let resolved_return = signature.resolved_return_type().unwrap();
+        let TypeData::Union(resolved_union) =
+            fixture.store.type_payload(resolved_return).unwrap().data()
+        else {
+            panic!("the concrete receiver must preserve its specialized method parameter union")
+        };
+        assert!(resolved_union.union.types.contains(parameter));
+        assert!(resolved_union.union.types.contains(&string));
+
+        let warm = state(&fixture.store, &plan, derived);
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                derived,
+                &property_types,
+            ),
+            Ok(derived),
+        );
+        assert_eq!(state(&fixture.store, &plan, derived), warm);
         assert!(diagnostics.is_empty());
     }
 

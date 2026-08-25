@@ -22,6 +22,7 @@ use super::{
     declared::cached_ordinary_type_parameter_owner,
     instantiate::instantiated_member_type_matches,
     links::ValueSymbolLinks,
+    mapper::TypeMapperApplication,
     object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
     reference_types::validate_direct_generic_reference,
     signatures::SignatureFlags,
@@ -561,17 +562,30 @@ fn validate_stored_instantiated_interface_method_callable_set(
         let this_type = interface.this_type?;
         let receiver = store.map_type(mapper, this_type)?;
         let receiver_reference = validate_direct_generic_reference(store, receiver).ok()?;
-        let globals = store.intrinsic_bootstrap()?.globals;
-        let global_owner = store
-            .symbol_table(globals)?
-            .get(owner_record.name())
-            .and_then(|owner| store.get_merged_symbol(owner));
-        let array_targets = CanonicalArrayTargets::for_single_target_validation(owner_type);
-        if !matches!(
+        let array_targets = if matches!(
             owner_record.name().as_utf8(),
             Some("Array" | "ReadonlyArray")
-        ) || global_owner != Some(owner)
-            || parameters.is_empty()
+        ) {
+            let globals = store.intrinsic_bootstrap()?.globals;
+            let global_owner = store
+                .symbol_table(globals)?
+                .get(owner_record.name())
+                .and_then(|owner| store.get_merged_symbol(owner));
+            let targets = CanonicalArrayTargets::for_single_target_validation(owner_type);
+            if global_owner != Some(owner)
+                || store
+                    .canonical_array_reference_with_targets(targets, receiver)
+                    .ok()
+                    .flatten()
+                    .is_none_or(|reference| reference.base_type != receiver)
+            {
+                return None;
+            }
+            Some(targets)
+        } else {
+            None
+        };
+        if parameters.is_empty()
             || receiver_reference.target != owner_type
             || receiver_reference.type_arguments.len() != parameters.len()
             || interface.all_type_parameters.as_deref().is_none_or(|all| {
@@ -579,11 +593,6 @@ fn validate_stored_instantiated_interface_method_callable_set(
                     || &all[..parameters.len()] != parameters
                     || all.last().copied() != Some(this_type)
             })
-            || store
-                .canonical_array_reference_with_targets(array_targets, receiver)
-                .ok()
-                .flatten()
-                .is_none_or(|reference| reference.base_type != receiver)
         {
             return None;
         }
@@ -659,17 +668,23 @@ fn validate_stored_instantiated_interface_method_callable_set(
             let original_signature = store.signature(source_callable.signature)?;
             let return_type = callable.return_type?;
             let source_return = source_callable.return_type?;
+            let signature_mapper = validated_instantiated_method_mapper(
+                store,
+                original_signature,
+                signature,
+                mapper,
+                array_targets,
+            )?;
             if signature.flags() != (original_signature.flags() & SignatureFlags::PROPAGATING_FLAGS)
                 || signature.declaration() != Some(*declaration)
                 || original_signature.declaration() != Some(*declaration)
-                || !signature.type_parameters().is_empty()
                 || signature.this_parameter().is_some()
                 || signature.parameters().len() != original_signature.parameters().len()
                 || signature.min_argument_count() != original_signature.min_argument_count()
                 || signature.resolved_min_argument_count() != -1
                 || signature.resolved_type_predicate().is_some()
                 || signature.target() != Some(source_callable.signature)
-                || signature.mapper() != Some(mapper)
+                || signature.mapper() != Some(signature_mapper)
                 || signature.isolated_signature_type().is_some()
                 || signature.composite().is_some()
                 || store.signature_has_circular_return_type(callable.signature)
@@ -677,12 +692,13 @@ fn validate_stored_instantiated_interface_method_callable_set(
                     store,
                     source_return,
                     return_type,
-                    mapper,
+                    signature_mapper,
                     array_targets,
                 )
             {
                 return None;
             }
+            edges.extend(signature.type_parameters().iter().copied());
             edges.extend(callable.parameters.iter().copied());
             edges.extend(callable.rest_parameter);
             edges.push(return_type);
@@ -799,31 +815,37 @@ fn validate_stored_instantiated_type_literal_method_callable_set(
             let original_signature = store.signature(source_callable.signature)?;
             let return_type = callable.return_type?;
             let source_return = source_callable.return_type?;
+            let signature_mapper = validated_instantiated_method_mapper(
+                store,
+                original_signature,
+                signature,
+                mapper,
+                None,
+            )?;
             if signature.flags() != (original_signature.flags() & SignatureFlags::PROPAGATING_FLAGS)
                 || signature.declaration() != Some(*declaration)
                 || original_signature.declaration() != Some(*declaration)
-                || !signature.type_parameters().is_empty()
                 || signature.this_parameter().is_some()
                 || signature.parameters().len() != original_signature.parameters().len()
                 || signature.min_argument_count() != original_signature.min_argument_count()
                 || signature.resolved_min_argument_count() != -1
                 || signature.resolved_type_predicate().is_some()
                 || signature.target() != Some(source_callable.signature)
-                || signature.mapper() != Some(mapper)
+                || signature.mapper() != Some(signature_mapper)
                 || signature.isolated_signature_type().is_some()
                 || signature.composite().is_some()
                 || store.signature_has_circular_return_type(callable.signature)
-                || !instantiated_member_type_matches(
+                || !instantiated_method_type_matches(
                     store,
                     source_return,
                     return_type,
-                    mapper,
+                    signature_mapper,
                     None,
                 )
-                .unwrap_or(false)
             {
                 return None;
             }
+            edges.extend(signature.type_parameters().iter().copied());
             edges.extend(callable.parameters.iter().copied());
             edges.extend(callable.rest_parameter);
             edges.push(return_type);
@@ -932,14 +954,14 @@ fn validated_instantiated_method_parameter_types(
     signature: SignatureId,
     original: &ValidatedSingleCallable,
     mapper: super::TypeMapperId,
-    array_targets: CanonicalArrayTargets,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<Vec<TypeId>> {
     validated_instantiated_method_parameter_types_with_targets(
         store,
         signature,
         original,
         mapper,
-        Some(array_targets),
+        array_targets,
     )
 }
 
@@ -952,8 +974,15 @@ fn validated_instantiated_method_parameter_types_with_targets(
 ) -> Option<Vec<TypeId>> {
     let signature = store.signature(signature)?;
     let original_signature = store.signature(original.signature)?;
+    let signature_mapper = validated_instantiated_method_mapper(
+        store,
+        original_signature,
+        signature,
+        mapper,
+        array_targets,
+    )?;
     if signature.target() != Some(original.signature)
-        || signature.mapper() != Some(mapper)
+        || signature.mapper() != Some(signature_mapper)
         || signature.parameters().len() != original_signature.parameters().len()
     {
         return None;
@@ -1002,7 +1031,7 @@ fn validated_instantiated_method_parameter_types_with_targets(
                     == &(ValueSymbolLinks {
                         resolved_type: Some(type_),
                         target: Some(*original_parameter),
-                        mapper: Some(mapper),
+                        mapper: Some(signature_mapper),
                         name_type: store
                             .value_symbol_links(*original_parameter)
                             .and_then(|links| links.name_type),
@@ -1010,8 +1039,13 @@ fn validated_instantiated_method_parameter_types_with_targets(
                     })
         };
         if !valid_links
-            || !instantiated_member_type_matches(store, *template, type_, mapper, array_targets)
-                .unwrap_or(false)
+            || !instantiated_method_type_matches(
+                store,
+                *template,
+                type_,
+                signature_mapper,
+                array_targets,
+            )
         {
             return None;
         }
@@ -1020,15 +1054,185 @@ fn validated_instantiated_method_parameter_types_with_targets(
     Some(parameter_types)
 }
 
-fn instantiated_method_type_matches(
+/// Validates the fresh method parameters and mapper retained by an instantiated signature.
+pub(super) fn validated_instantiated_method_mapper(
+    store: &CanonicalTypeMapperStore,
+    original: &super::signatures::Signature,
+    instantiated: &super::signatures::Signature,
+    owner_mapper: super::TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<super::TypeMapperId> {
+    let mapper = instantiated.mapper()?;
+    if original.type_parameters().is_empty() {
+        return (instantiated.type_parameters().is_empty() && mapper == owner_mapper)
+            .then_some(mapper);
+    }
+    if instantiated.type_parameters().len() != original.type_parameters().len()
+        || store.mapper_payload(mapper).is_none()
+        || store.mapper_payload(owner_mapper).is_none()
+    {
+        return None;
+    }
+    let Some(TypeMapperApplication::Composite { first, second }) =
+        store.mapper_application(mapper, original.type_parameters()[0])
+    else {
+        return None;
+    };
+    if second != owner_mapper
+        || store.type_mapper_has_exact_endpoints(
+            first,
+            original.type_parameters(),
+            instantiated.type_parameters(),
+        ) != Some(true)
+    {
+        return None;
+    }
+
+    let mut unique = HashSet::with_capacity(instantiated.type_parameters().len());
+    for (&source, &fresh) in original
+        .type_parameters()
+        .iter()
+        .zip(instantiated.type_parameters())
+    {
+        let source_record = store.type_payload(source)?;
+        let fresh_record = store.type_payload(fresh)?;
+        let (TypeData::TypeParameter(source_data), TypeData::TypeParameter(fresh_data)) =
+            (source_record.data(), fresh_record.data())
+        else {
+            return None;
+        };
+        let constraint_matches = match (source_data.constraint, fresh_data.constraint) {
+            (None, None) => true,
+            (Some(source), Some(actual)) => {
+                instantiated_method_type_matches(store, source, actual, mapper, array_targets)
+            }
+            _ => false,
+        };
+        let default_matches = match (
+            source_data.resolved_default_type,
+            fresh_data.resolved_default_type,
+        ) {
+            (None, None) => true,
+            (Some(source), Some(actual)) => {
+                instantiated_method_type_matches(store, source, actual, mapper, array_targets)
+            }
+            _ => false,
+        };
+        if fresh == source
+            || !unique.insert(fresh)
+            || fresh_record.flags() != TypeFlags::TYPE_PARAMETER
+            || fresh_record.symbol() != source_record.symbol()
+            || fresh_record.alias().is_some()
+            || fresh_data.is_this_type
+            || fresh_data.target != Some(source)
+            || fresh_data.mapper != Some(mapper)
+            || mapped_method_type_parameter(store, mapper, source) != Some(fresh)
+            || !constraint_matches
+            || !default_matches
+        {
+            return None;
+        }
+    }
+    Some(mapper)
+}
+
+/// Compares signature types through composed method mappers without allocating.
+pub(super) fn instantiated_method_type_matches(
     store: &CanonicalTypeMapperStore,
     template: TypeId,
     actual: TypeId,
     mapper: super::TypeMapperId,
-    array_targets: CanonicalArrayTargets,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
-    instantiated_member_type_matches(store, template, actual, mapper, Some(array_targets))
+    if instantiated_member_type_matches(store, template, actual, mapper, array_targets)
         .unwrap_or(false)
+    {
+        return true;
+    }
+    if !matches!(
+        store.mapper_application(mapper, template),
+        Some(TypeMapperApplication::Composite { .. })
+    ) {
+        return false;
+    }
+    instantiated_composite_method_type_matches(store, template, actual, mapper, &mut HashSet::new())
+}
+
+fn instantiated_composite_method_type_matches(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    actual: TypeId,
+    mapper: super::TypeMapperId,
+    active: &mut HashSet<(TypeId, TypeId)>,
+) -> bool {
+    if !active.insert((template, actual)) {
+        return true;
+    }
+    let result = match (
+        store.type_payload(template).map(super::TypeRecord::data),
+        store.type_payload(actual).map(super::TypeRecord::data),
+    ) {
+        (Some(TypeData::TypeParameter(_)), Some(_)) => {
+            mapped_method_type_parameter(store, mapper, template) == Some(actual)
+        }
+        (Some(TypeData::Intrinsic(_) | TypeData::Literal(_)), Some(_)) => template == actual,
+        (Some(TypeData::Union(source)), Some(TypeData::Union(mapped))) => {
+            source.union.types.iter().all(|source| {
+                mapped.union.types.iter().any(|actual| {
+                    instantiated_composite_method_type_matches(
+                        store, *source, *actual, mapper, active,
+                    )
+                })
+            }) && mapped.union.types.iter().all(|actual| {
+                source.union.types.iter().any(|source| {
+                    instantiated_composite_method_type_matches(
+                        store, *source, *actual, mapper, active,
+                    )
+                })
+            })
+        }
+        (Some(TypeData::Union(source)), Some(_)) => source.union.types.iter().all(|source| {
+            instantiated_composite_method_type_matches(store, *source, actual, mapper, active)
+        }),
+        (
+            Some(TypeData::TypeReference(_) | TypeData::Interface(_)),
+            Some(TypeData::TypeReference(_) | TypeData::Interface(_)),
+        ) => match (
+            validate_direct_generic_reference(store, template),
+            validate_direct_generic_reference(store, actual),
+        ) {
+            (Ok(source), Ok(mapped)) => {
+                source.target == mapped.target
+                    && source.type_arguments.len() == mapped.type_arguments.len()
+                    && source.type_arguments.iter().zip(mapped.type_arguments).all(
+                        |(source, actual)| {
+                            instantiated_composite_method_type_matches(
+                                store, *source, actual, mapper, active,
+                            )
+                        },
+                    )
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    active.remove(&(template, actual));
+    result
+}
+
+fn mapped_method_type_parameter(
+    store: &CanonicalTypeMapperStore,
+    mapper: super::TypeMapperId,
+    type_: TypeId,
+) -> Option<TypeId> {
+    match store.mapper_application(mapper, type_)? {
+        TypeMapperApplication::Direct(mapped) => Some(mapped),
+        TypeMapperApplication::Merged { first, second }
+        | TypeMapperApplication::Composite { first, second } => {
+            let mapped = mapped_method_type_parameter(store, first, type_)?;
+            mapped_method_type_parameter(store, second, mapped)
+        }
+    }
 }
 
 pub(super) fn validate_stored_declared_method_callable_set(
@@ -1163,7 +1367,7 @@ pub(super) fn validate_stored_declared_method_callable_set(
                 )
                 || signature.declaration() != Some(*declaration)
                 || signature.flags() & !allowed_flags != SignatureFlags::NONE
-                || !signature.type_parameters().is_empty()
+                || !valid_declared_method_type_parameters(store, signature, *declaration)
                 || signature.this_parameter().is_some()
                 || signature.resolved_min_argument_count() != -1
                 || signature.resolved_type_predicate().is_some()
@@ -1185,6 +1389,15 @@ pub(super) fn validate_stored_declared_method_callable_set(
             if validated_method_annotation_type(store, annotation) != Some(return_type) {
                 return None;
             }
+            for type_parameter in signature.type_parameters() {
+                let TypeData::TypeParameter(data) = store.type_payload(*type_parameter)?.data()
+                else {
+                    return None;
+                };
+                edges.push(*type_parameter);
+                edges.extend(data.constraint);
+                edges.extend(data.resolved_default_type);
+            }
             edges.extend(callable.parameters.iter().copied());
             edges.extend(callable.rest_parameter);
             edges.push(return_type);
@@ -1201,6 +1414,86 @@ pub(super) fn validate_stored_declared_method_callable_set(
         },
         None => StoredCallableSetValidation::Malformed { family },
     })
+}
+
+pub(super) fn valid_declared_method_type_parameters(
+    store: &CanonicalTypeMapperStore,
+    signature: &super::signatures::Signature,
+    declaration: ts_ast::NodeRef,
+) -> bool {
+    if signature.type_parameters().is_empty() {
+        return true;
+    }
+    let mut declarations = Vec::with_capacity(signature.type_parameters().len());
+    for index in 0..declaration.node.index() {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let parameter = ts_ast::NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            ts_ast::NodeId::new(index),
+        );
+        if store.source_node_kind(parameter) == Some(SyntaxKind::TypeParameter)
+            && store.source_node_parent(parameter) == Some(SourceNodeParent::Parent(declaration))
+        {
+            declarations.push(parameter);
+        }
+    }
+    if declarations.len() != signature.type_parameters().len() {
+        return false;
+    }
+    let mut symbols = HashSet::with_capacity(signature.type_parameters().len());
+    let mut default_seen = false;
+    signature
+        .type_parameters()
+        .iter()
+        .copied()
+        .zip(declarations)
+        .all(|(type_, expected_declaration)| {
+            let Some(symbol) = cached_ordinary_type_parameter_owner(store, type_) else {
+                return false;
+            };
+            let Some(record) = store.symbol(symbol) else {
+                return false;
+            };
+            let Some([parameter]) = record.declarations() else {
+                return false;
+            };
+            let Some(TypeData::TypeParameter(data)) =
+                store.type_payload(type_).map(super::TypeRecord::data)
+            else {
+                return false;
+            };
+            if !symbols.insert(symbol)
+                || record.flags() != SymbolFlags::TYPE_PARAMETER
+                || record.check_flags() != CheckFlags::NONE
+                || record.value_declaration().is_some()
+                || record.members().is_some()
+                || record.exports().is_some()
+                || record.parent().is_some()
+                || record.export_symbol().is_some()
+                || store.get_merged_symbol(symbol) != Some(symbol)
+                || *parameter != expected_declaration
+                || store.source_node_kind(*parameter) != Some(SyntaxKind::TypeParameter)
+                || store.source_node_parent(*parameter)
+                    != Some(SourceNodeParent::Parent(declaration))
+                || data.is_this_type
+                || data.target.is_some()
+                || data.mapper.is_some()
+                || data
+                    .constraint
+                    .is_some_and(|constraint| store.type_payload(constraint).is_none())
+                || data
+                    .resolved_default_type
+                    .is_some_and(|default_type| store.type_payload(default_type).is_none())
+                || default_seen && data.resolved_default_type.is_none()
+            {
+                return false;
+            }
+            default_seen |= data.resolved_default_type.is_some();
+            true
+        })
 }
 
 fn validated_method_signature_parameter_types(
@@ -3263,6 +3556,126 @@ mod tests {
         assert_eq!(projection.call_signatures[0].parameters.len(), 1);
         assert!(projection.call_signatures[1].parameters.is_empty());
         assert_eq!(edges.len(), 3);
+    }
+
+    #[test]
+    fn method_type_parameter_mapping_preserves_merged_mapper_order() {
+        let mut store = initialized_store();
+        let source = store.alloc_type_parameter(None).unwrap();
+        let intermediate = store.alloc_type_parameter(None).unwrap();
+        let target = store.alloc_type_parameter(None).unwrap();
+        let first = store.new_simple_type_mapper(source, intermediate).unwrap();
+        let second = store.new_simple_type_mapper(intermediate, target).unwrap();
+        let merged = store.merge_type_mappers(Some(first), second).unwrap();
+
+        assert_eq!(
+            mapped_method_type_parameter(&store, merged, source),
+            Some(target)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source check covers defaults, variance, and cache poison.
+    fn generic_interface_methods_preserve_defaults_variance_and_authenticated_type_identity() {
+        let parsed = parse_source_file(concat!(
+            "interface Contract<Outer> { ",
+            "map<Value = never>(value: Value): Outer; ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4_485);
+        let mut context =
+            source_callable_context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+
+        context.check_source_file(file).unwrap();
+
+        let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+        let owner = context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("Contract"))
+            .unwrap();
+        let method = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("map"))
+            .unwrap();
+        let callable = context
+            .store()
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let StoredCallableSetValidation::Valid {
+            family, projection, ..
+        } = validate_stored_callable_set(context.store(), callable)
+        else {
+            panic!("a source generic interface method must retain callable authentication")
+        };
+        assert_eq!(family, CallableFamily::DeclaredCallSignatures);
+        let [projected] = projection.call_signatures.as_ref() else {
+            panic!("the method must expose exactly one generic signature")
+        };
+        assert!(projected.strict_variance_exempt);
+        let signature = projected.signature;
+        let [type_parameter] = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+        else {
+            panic!("the signature must retain its binder-owned method type parameter")
+        };
+        let type_parameter = *type_parameter;
+        assert_eq!(projected.parameters, vec![type_parameter]);
+        assert_eq!(
+            context
+                .store()
+                .callable_signature_parameter_types(signature),
+            Some([type_parameter].as_slice()),
+        );
+        assert_eq!(
+            context.store().interface_method_linked_type(signature),
+            Some(callable)
+        );
+        let TypeData::TypeParameter(data) =
+            context.store().type_payload(type_parameter).unwrap().data()
+        else {
+            panic!("the method type parameter must retain its canonical payload")
+        };
+        assert_eq!(
+            data.resolved_default_type,
+            Some(context.store().intrinsic_bootstrap().unwrap().never_type),
+        );
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_type_parameters(signature, vec![type_parameter, type_parameter],)
+        );
+        assert!(matches!(
+            validate_stored_callable_set(context.store(), callable),
+            StoredCallableSetValidation::Malformed {
+                family: CallableFamily::DeclaredCallSignatures,
+            }
+        ));
     }
 
     #[test]

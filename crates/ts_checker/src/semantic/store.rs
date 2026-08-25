@@ -1988,7 +1988,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 })
                 || signature.declaration() != Some(*method_declaration)
                 || signature.flags() & !allowed_flags != SignatureFlags::NONE
-                || !signature.type_parameters().is_empty()
+                || !super::callable_sets::valid_declared_method_type_parameters(
+                    self,
+                    signature,
+                    *method_declaration,
+                )
                 || signature.this_parameter().is_some()
                 || signature.resolved_min_argument_count() != -1
                 || signature.resolved_type_predicate().is_some()

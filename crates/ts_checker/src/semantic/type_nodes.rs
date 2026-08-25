@@ -3613,6 +3613,193 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         self.is_authenticated_bivariant_generic_union_alias(body, alias_symbol)
     }
 
+    #[allow(clippy::too_many_lines)] // Method, interface, and parameter ownership form one proof.
+    fn is_authenticated_method_union_type_parameter(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(parameter) = self.store.symbol(symbol) else {
+            return Ok(false);
+        };
+        let Some(declarations) = parameter
+            .declarations()
+            .filter(|declarations| !declarations.is_empty())
+        else {
+            return Ok(false);
+        };
+        let declaration = declarations[0];
+        let declaration_record = preflight_node(self.store, self.host, declaration)?;
+        let Some(parameter_owner) = declaration_record
+            .parent
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+        else {
+            return Ok(false);
+        };
+        let ordinary = parameter.flags() == SymbolFlags::TYPE_PARAMETER;
+        let merged = parameter.flags() == SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT;
+        if declaration_record.kind != SyntaxKind::TypeParameter
+            || !ordinary && !merged
+            || ordinary && declarations.len() != 1
+            || merged && declarations.len() < 2
+            || parameter.check_flags() != CheckFlags::NONE
+            || parameter.value_declaration().is_some()
+            || parameter.members().is_some()
+            || parameter.exports().is_some()
+            || parameter.export_symbol().is_some()
+            || self.store.get_merged_symbol(symbol) != Some(symbol)
+            || !self.host.symbol_matches(self.store, declaration, symbol)
+        {
+            return Ok(false);
+        }
+
+        let mut current = node;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            let Some(parent) = preflight_node(self.store, self.host, current)?.parent else {
+                return Ok(false);
+            };
+            let parent = NodeRef::new(current.arena, current.file, parent);
+            let record = preflight_node(self.store, self.host, parent)?;
+            let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+                current = parent;
+                continue;
+            };
+            let Some(owner) = record
+                .parent
+                .map(|owner| NodeRef::new(parent.arena, parent.file, owner))
+            else {
+                return Ok(false);
+            };
+            let owner_record = preflight_node(self.store, self.host, owner)?;
+            let NodeData::InterfaceDeclaration(interface) = &owner_record.data else {
+                return Ok(false);
+            };
+            let bound = match self.host.bound_file(parent) {
+                Some(bound) => bound,
+                None => return Ok(false),
+            };
+            let method_symbol = bound
+                .symbol(parent)
+                .and_then(|method| self.store.get_merged_symbol(method));
+            let owner_symbol = bound
+                .symbol(owner)
+                .and_then(|owner| self.store.get_merged_symbol(owner));
+            let (Some(method_symbol), Some(owner_symbol)) = (method_symbol, owner_symbol) else {
+                return Ok(false);
+            };
+            let Some(method_record) = self.store.symbol(method_symbol) else {
+                return Ok(false);
+            };
+            let Some(owner_symbol_record) = self.store.symbol(owner_symbol) else {
+                return Ok(false);
+            };
+            if record.kind != SyntaxKind::MethodSignature
+                || owner_record.kind != SyntaxKind::InterfaceDeclaration
+                || !self.host.symbol_matches(self.store, parent, method_symbol)
+                || !self.host.symbol_matches(self.store, owner, owner_symbol)
+                || self.store.get_parent_of_symbol(method_symbol) != Some(owner_symbol)
+                || method_record.flags() != SymbolFlags::METHOD
+                || method_record.check_flags() != CheckFlags::NONE
+                || method_record
+                    .declarations()
+                    .is_none_or(|declarations| !declarations.contains(&parent))
+                || method_record.value_declaration()
+                    != method_record
+                        .declarations()
+                        .and_then(|declarations| declarations.first().copied())
+                || method_record.members().is_some()
+                || method_record.exports().is_some()
+                || method_record.export_symbol().is_some()
+                || !owner_symbol_record.flags().contains(SymbolFlags::INTERFACE)
+                || owner_symbol_record.check_flags() != CheckFlags::NONE
+                || owner_symbol_record
+                    .declarations()
+                    .is_none_or(|declarations| !declarations.contains(&owner))
+                || owner_symbol_record
+                    .members()
+                    .and_then(|members| self.store.symbol_table(members))
+                    .and_then(|members| members.get(method_record.name()))
+                    .and_then(|method| self.store.get_merged_symbol(method))
+                    != Some(method_symbol)
+            {
+                return Ok(false);
+            }
+
+            if parameter_owner == parent {
+                return Ok(ordinary
+                    && method
+                        .type_parameters
+                        .as_ref()
+                        .is_some_and(|parameters| parameters.nodes.contains(&declaration.node))
+                    && parameter.parent().is_none()
+                    && bound
+                        .locals(parent)
+                        .and_then(|locals| self.store.symbol_table(locals))
+                        .and_then(|locals| locals.get(parameter.name()))
+                        == Some(symbol));
+            }
+            let Some(owner_declarations) = owner_symbol_record.declarations() else {
+                return Ok(false);
+            };
+            let mut seen = HashSet::with_capacity(declarations.len());
+            let mut local_declaration = None;
+            for candidate in declarations {
+                let candidate = *candidate;
+                let candidate_record = preflight_node(self.store, self.host, candidate)?;
+                let Some(candidate_owner) = candidate_record
+                    .parent
+                    .map(|parent| NodeRef::new(candidate.arena, candidate.file, parent))
+                else {
+                    return Ok(false);
+                };
+                let candidate_owner_record =
+                    preflight_node(self.store, self.host, candidate_owner)?;
+                let NodeData::InterfaceDeclaration(candidate_interface) =
+                    &candidate_owner_record.data
+                else {
+                    return Ok(false);
+                };
+                if !seen.insert(candidate)
+                    || candidate_record.kind != SyntaxKind::TypeParameter
+                    || candidate_owner_record.kind != SyntaxKind::InterfaceDeclaration
+                    || !owner_declarations.contains(&candidate_owner)
+                    || !self.host.symbol_matches(self.store, candidate, symbol)
+                    || !candidate_interface
+                        .type_parameters
+                        .as_ref()
+                        .is_some_and(|parameters| parameters.nodes.contains(&candidate.node))
+                {
+                    return Ok(false);
+                }
+                if candidate_owner == owner {
+                    local_declaration = Some(candidate);
+                }
+            }
+            return Ok(local_declaration.is_some_and(|declaration| {
+                interface
+                    .type_parameters
+                    .as_ref()
+                    .is_some_and(|parameters| parameters.nodes.contains(&declaration.node))
+            }) && declarations.len()
+                == owner_declarations
+                    .iter()
+                    .filter(|declaration| {
+                        self.store.source_node_kind(**declaration)
+                            == Some(SyntaxKind::InterfaceDeclaration)
+                    })
+                    .count()
+                && self.store.get_parent_of_symbol(symbol) == Some(owner_symbol)
+                && owner_symbol_record
+                    .members()
+                    .and_then(|members| self.store.symbol_table(members))
+                    .and_then(|members| members.get(parameter.name()))
+                    .and_then(|candidate| self.store.get_merged_symbol(candidate))
+                    == Some(symbol));
+        }
+        Ok(false)
+    }
+
     fn is_authenticated_bivariant_generic_union_alias(
         &self,
         node: NodeRef,
@@ -4129,6 +4316,30 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .map(|function| function.return_type)
             .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(node)))?;
         self.plan_type_node_in_context(return_type, None, false)
+    }
+
+    fn plan_interface_method_dependencies(
+        &mut self,
+        methods: &[object_members::PlannedInterfaceMethod],
+        root: NodeRef,
+    ) -> Result<(), DeclaredTypeError> {
+        for method in methods {
+            for parameter in &method.type_parameters {
+                for annotation in [parameter.constraint, parameter.default_type]
+                    .into_iter()
+                    .flatten()
+                {
+                    self.plan_type_node(annotation)?;
+                }
+            }
+            for parameter in &method.parameters {
+                self.plan_type_node(parameter.type_node)?;
+            }
+            if method.return_type != root {
+                self.plan_type_node(method.return_type)?;
+            }
+        }
+        Ok(())
     }
 
     fn plan_property_interface(
@@ -7248,7 +7459,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !flags.contains(SymbolFlags::TYPE_ALIAS)
             && !flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
             && (!flags.contains(SymbolFlags::TYPE_PARAMETER)
-                || !self.is_authenticated_bivariant_alias_type_parameter(node, symbol)?)
+                || !self.is_authenticated_bivariant_alias_type_parameter(node, symbol)?
+                    && !self.is_authenticated_method_union_type_parameter(node, symbol)?)
         {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedUnionConstituent(node),
@@ -13095,6 +13307,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if direct_alias.is_some() && !self.type_reference_alias_targets.is_empty() {
             self.reject_type_reference_alias_capabilities()?;
         }
+        let methods =
+            object_members::plan_enclosing_generic_interface_methods(self.store, self.host, node)
+                .map_err(property_object_error)?;
+        planner.plan_interface_method_dependencies(&methods, node)?;
         planner.plan_type_node(node)?;
         drop(planner.finish());
         Ok(())
@@ -13131,6 +13347,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if direct_alias.is_some() && !self.type_reference_alias_targets.is_empty() {
             self.reject_type_reference_alias_capabilities()?;
         }
+        let methods =
+            object_members::plan_enclosing_generic_interface_methods(self.store, self.host, node)
+                .map_err(property_object_error)?;
+        planner.plan_interface_method_dependencies(&methods, node)?;
         planner.plan_type_node(node)?;
         let plan = planner.finish();
         let mut prepared = self.prepare_literal_types(&plan)?;
@@ -13149,11 +13369,112 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.jsdoc_import_type_target
                 .is_some_and(|target| target.local_symbol == *alias && target.import_type == node)
         });
-        let result = match direct_function_alias.or(direct_import_alias) {
-            Some(alias) => self.execute_declared_type(alias, &plan, &mut prepared),
-            None => self.execute_type_node(node, &plan, &mut prepared),
-        };
+        let result = (|| {
+            self.execute_interface_method_type_parameters(&methods, &plan, &mut prepared)?;
+            for method in &methods {
+                for parameter in &method.parameters {
+                    self.execute_type_node(parameter.type_node, &plan, &mut prepared)?;
+                }
+                if method.return_type != node {
+                    self.execute_type_node(method.return_type, &plan, &mut prepared)?;
+                }
+            }
+            match direct_function_alias.or(direct_import_alias) {
+                Some(alias) => self.execute_declared_type(alias, &plan, &mut prepared),
+                None => self.execute_type_node(node, &plan, &mut prepared),
+            }
+        })();
         self.complete_type_query(result, &plan, &mut prepared)
+    }
+
+    fn execute_interface_method_type_parameters(
+        &mut self,
+        methods: &[object_members::PlannedInterfaceMethod],
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<(), DeclaredTypeError> {
+        if methods.is_empty() {
+            return Ok(());
+        }
+        let mut missing = HashSet::new();
+        for method in methods {
+            for parameter in &method.type_parameters {
+                if self
+                    .store
+                    .declared_type_links(parameter.symbol)
+                    .and_then(|links| links.declared_type)
+                    .is_none()
+                {
+                    missing.insert(parameter.symbol);
+                }
+            }
+        }
+        if !self.store.try_reserve_types(missing.len())
+            || !self.store.try_reserve_declared_type_links(missing.len())
+        {
+            return Err(Self::literal_cache_error(LiteralTypeCacheError::Capacity));
+        }
+        for method in methods {
+            for parameter in &method.type_parameters {
+                execute_type_parameter(self.store, parameter.symbol);
+            }
+        }
+
+        for method in methods {
+            for parameter in &method.type_parameters {
+                let type_ = self
+                    .store
+                    .declared_type_links(parameter.symbol)
+                    .and_then(|links| links.declared_type)
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(
+                            parameter.declaration,
+                        ))
+                    })?;
+                let constraint = parameter
+                    .constraint
+                    .map(|node| self.execute_type_node(node, plan, prepared))
+                    .transpose()?;
+                let default_type = parameter
+                    .default_type
+                    .map(|node| self.execute_type_node(node, plan, prepared))
+                    .transpose()?;
+                let Some(TypeData::TypeParameter(data)) =
+                    self.store.type_payload(type_).map(TypeRecord::data)
+                else {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
+                    ));
+                };
+                if data.target.is_some()
+                    || data.mapper.is_some()
+                    || data
+                        .constraint
+                        .is_some_and(|actual| Some(actual) != constraint)
+                    || data
+                        .resolved_default_type
+                        .is_some_and(|actual| Some(actual) != default_type)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
+                    ));
+                }
+                if (data.constraint != constraint || data.resolved_default_type != default_type)
+                    && !self.store.set_type_parameter_resolution(
+                        type_,
+                        constraint,
+                        None,
+                        None,
+                        default_type,
+                    )
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Proves the complete annotated type-node closure of one source callable
@@ -14679,6 +15000,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             unreachable!("the active-interface check and insertion are adjacent")
         }
         let result = (|| {
+            self.execute_interface_method_type_parameters(&interface.methods, plan, prepared)?;
             let mut types = Vec::with_capacity(interface.properties.len());
             for property in interface.property_type_nodes() {
                 types.push(self.execute_type_node(property, plan, prepared)?);
@@ -16522,6 +16844,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if matches!(state, PropertyObjectState::EmptyBootstrap(_)) {
             return Ok(state.type_id());
         }
+        self.execute_interface_method_type_parameters(&literal.methods, plan, prepared)?;
         let mut types = Vec::with_capacity(literal.properties.len());
         for property in literal.property_type_nodes() {
             types.push(self.execute_type_node(property, plan, prepared)?);

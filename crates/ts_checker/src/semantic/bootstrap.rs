@@ -45,8 +45,9 @@ use super::{
     functions::{self, PendingFunctionTypeProof},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     links::ValueSymbolLinks,
-    mapper::TypeMapper,
+    mapper::{TypeMapper, TypeMapperApplication},
     object_members,
+    reference_types::validate_direct_generic_reference,
     relation::RelationStateSnapshot,
     signatures::{IndexFlags, SignatureFlags, TypePredicateKind},
     store::{SemanticStore, SourceNodeParent},
@@ -2602,6 +2603,126 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .is_none_or(|base| base == expected_base)
     }
 
+    /// Authenticates a fresh method parameter against its source and receiver mapper.
+    #[allow(clippy::too_many_lines)] // Source, receiver, and fresh mapper form one identity proof.
+    fn instantiated_interface_method_type_parameter_owner(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        parameter: &super::type_records::TypeParameterData,
+    ) -> Option<SemanticSymbolId> {
+        let source = parameter.target?;
+        let mapper = parameter.mapper?;
+        let symbol = cached_ordinary_type_parameter_owner(self, source)?;
+        let source_record = self.type_payload(source)?;
+        let symbol_record = self.symbol(symbol)?;
+        let [declaration] = symbol_record.declarations()? else {
+            return None;
+        };
+        let SourceNodeParent::Parent(method_declaration) = self.source_node_parent(*declaration)?
+        else {
+            return None;
+        };
+        let signature_id = self
+            .signature_links(method_declaration)?
+            .resolved_signature
+            .signature()?;
+        let signature = self.signature(signature_id)?;
+        let callable = self.interface_method_linked_type(signature_id)?;
+        let method = self.type_payload(callable)?.symbol()?;
+        let (_, owner_type) = self.authenticated_interface_method_owner(method)?;
+        let TypeData::Interface(interface) = self.type_payload(owner_type)?.data() else {
+            return None;
+        };
+        let interface_parameters = interface.reference.resolved_type_arguments.as_deref()?;
+        let this_type = interface.this_type?;
+        let TypeMapperApplication::Composite {
+            first: fresh_mapper,
+            second: owner_mapper,
+        } = self.mapper_application(mapper, source)?
+        else {
+            return None;
+        };
+        let receiver = self.map_type(owner_mapper, this_type)?;
+        let receiver_reference = validate_direct_generic_reference(self, receiver).ok()?;
+        let mapper_sources = interface_parameters
+            .iter()
+            .copied()
+            .chain(std::iter::once(this_type))
+            .collect::<Vec<_>>();
+        let mapper_targets = receiver_reference
+            .type_arguments
+            .iter()
+            .copied()
+            .chain(std::iter::once(receiver))
+            .collect::<Vec<_>>();
+        let variable_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+        if record.flags() != TypeFlags::TYPE_PARAMETER
+            || record.object_flags() != ObjectFlags::NONE && record.object_flags() != variable_flags
+            || record.symbol() != Some(symbol)
+            || record.alias().is_some()
+            || parameter.is_this_type
+            || source_record.symbol() != Some(symbol)
+            || symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
+            || self.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
+            || self.source_node_kind(method_declaration) != Some(SyntaxKind::MethodSignature)
+            || signature.declaration() != Some(method_declaration)
+            || !signature.type_parameters().contains(&source)
+            || !super::callable_sets::valid_declared_method_type_parameters(
+                self,
+                signature,
+                method_declaration,
+            )
+            || interface_parameters.is_empty()
+            || receiver_reference.target != owner_type
+            || receiver_reference.type_arguments.len() != interface_parameters.len()
+            || interface
+                .all_type_parameters
+                .as_deref()
+                .is_none_or(|parameters| {
+                    parameters.len() != interface_parameters.len() + 1
+                        || !parameters.starts_with(interface_parameters)
+                        || parameters.last().copied() != Some(this_type)
+                })
+            || self.type_mapper_has_exact_endpoints(owner_mapper, &mapper_sources, &mapper_targets)
+                != Some(true)
+        {
+            return None;
+        }
+
+        let mut fresh_parameters = Vec::with_capacity(signature.type_parameters().len());
+        let mut seen = HashSet::with_capacity(signature.type_parameters().len());
+        for original in signature.type_parameters() {
+            let fresh = self.map_type(fresh_mapper, *original)?;
+            let fresh_record = self.type_payload(fresh)?;
+            let TypeData::TypeParameter(fresh_data) = fresh_record.data() else {
+                return None;
+            };
+            if fresh == *original
+                || !seen.insert(fresh)
+                || fresh_record.flags() != TypeFlags::TYPE_PARAMETER
+                || fresh_record.object_flags() != ObjectFlags::NONE
+                    && fresh_record.object_flags() != variable_flags
+                || fresh_record.symbol() != self.type_payload(*original)?.symbol()
+                || fresh_record.alias().is_some()
+                || fresh_data.is_this_type
+                || fresh_data.target != Some(*original)
+                || fresh_data.mapper != Some(mapper)
+            {
+                return None;
+            }
+            fresh_parameters.push(fresh);
+        }
+        (fresh_parameters.contains(&type_)
+            && self.type_mapper_has_exact_endpoints(
+                fresh_mapper,
+                signature.type_parameters(),
+                &fresh_parameters,
+            ) == Some(true))
+        .then_some(symbol)
+    }
+
     fn validate_supported_record_mapped_union_constituent(
         &self,
         type_: TypeId,
@@ -2806,7 +2927,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Ok(())
             }
             TypeData::TypeParameter(parameter) => {
-                let Some(symbol) = cached_ordinary_type_parameter_owner(self, type_) else {
+                let Some(symbol) =
+                    cached_ordinary_type_parameter_owner(self, type_).or_else(|| {
+                        self.instantiated_interface_method_type_parameter_owner(
+                            type_, record, parameter,
+                        )
+                    })
+                else {
                     return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
                 };
                 let Some(symbol_record) = self.symbol(symbol) else {
