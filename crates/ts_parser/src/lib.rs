@@ -7541,7 +7541,11 @@ impl<'a> Parser<'a> {
         if self.current.kind == SyntaxKind::OpenBraceToken {
             return self.parse_block();
         }
-        if self.current.kind == SyntaxKind::VarKeyword {
+        if matches!(
+            self.current.kind,
+            SyntaxKind::VarKeyword | SyntaxKind::ConstKeyword
+        ) || self.current.kind == SyntaxKind::LetKeyword && self.is_let_declaration()
+        {
             return self.parse_arrow_body_with_missing_open_brace();
         }
         let body = self.parse_binary_expression(2);
@@ -7563,13 +7567,18 @@ impl<'a> Parser<'a> {
     fn parse_arrow_body_with_missing_open_brace(&mut self) -> NodeId {
         self.error_current("Expected '{'.");
         let start = self.current.range.start;
-        let statement = self.parse_statement();
-        let statement_end = self.node_end(statement);
+        let statements = self.parse_statement_list(SyntaxKind::CloseBraceToken);
+        let statement_end = statements
+            .nodes
+            .last()
+            .map_or(start, |statement| self.node_end(*statement));
         let end = if self.current.kind == SyntaxKind::CloseBraceToken {
             self.consume().range.end
         } else {
-            statement_end
+            self.error_current("Expected '}'.");
+            self.current.range.start
         };
+        let children = statements.nodes.clone();
         self.alloc_node(
             SyntaxKind::Block,
             TextRange::new(start, end),
@@ -7580,12 +7589,12 @@ impl<'a> Parser<'a> {
                 next_container: None,
                 statements: NodeList {
                     range: TextRange::new(start, statement_end),
-                    nodes: vec![statement],
+                    nodes: statements.nodes,
                     has_trailing_comma: false,
                 },
                 facts: 0,
             })),
-            &[statement],
+            &children,
         )
     }
 
@@ -12580,6 +12589,115 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn missing_arrow_body_braces_preserve_lexical_declarations_and_exact_ranges() {
+        for keyword in ["var", "let", "const"] {
+            let source = format!(
+                "var value = () => {keyword} first = 1; const second = 2;}}; var after = 3;"
+            );
+            let result = parse_source_file(&source);
+            let start = u32::try_from(source.find(&format!("{keyword} first")).unwrap()).unwrap();
+            let end = start + u32::try_from(keyword.len()).unwrap();
+            assert_eq!(
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                        diagnostic.message.as_str(),
+                    ))
+                    .collect::<Vec<_>>(),
+                [(Some(1005), start, end, "'{' expected.")],
+                "{source}"
+            );
+
+            let statements = source_statements(&result);
+            assert_eq!(statements.len(), 2, "{source}");
+            let (list, _) = variable_list(&result, statements[0]);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected the arrow's variable declaration");
+            };
+            let NodeData::ArrowFunction(arrow) = &result
+                .arena
+                .get(declaration.initializer.unwrap())
+                .unwrap()
+                .data
+            else {
+                panic!("expected an arrow with a recovered block body");
+            };
+            let NodeData::Block(block) = &result.arena.get(arrow.body).unwrap().data else {
+                panic!("expected the recovered arrow block");
+            };
+            let names = block
+                .statements
+                .nodes
+                .iter()
+                .map(|statement| {
+                    let (list, _) = variable_list(&result, *statement);
+                    let declaration = declaration_nodes(&result, list)[0];
+                    let NodeData::VariableDeclaration(declaration) =
+                        &result.arena.get(declaration).unwrap().data
+                    else {
+                        panic!("expected a recovered lexical declaration");
+                    };
+                    identifier_text(&result, declaration.name)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["first", "second"], "{source}");
+        }
+    }
+
+    #[test]
+    fn missing_arrow_body_braces_report_the_unclosed_block_at_eof() {
+        let source = "var value = () => const first = 1;";
+        let result = parse_source_file(source);
+        let start = u32::try_from(source.find("const").unwrap()).unwrap();
+        let end = u32::try_from(source.len()).unwrap();
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.code,
+                    diagnostic.range.start.get(),
+                    diagnostic.range.end.get(),
+                    diagnostic.message.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (Some(1005), start, start + 5, "'{' expected."),
+                (Some(1005), end, end, "'}' expected."),
+            ]
+        );
+    }
+
+    #[test]
+    fn contextual_let_arrow_bodies_remain_identifier_expressions() {
+        let result = parse_source_file("var value = () => let;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let (list, _) = variable_list(&result, source_statements(&result)[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected the arrow's variable declaration");
+        };
+        let NodeData::ArrowFunction(arrow) = &result
+            .arena
+            .get(declaration.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected an arrow function");
+        };
+        assert_eq!(identifier_text(&result, arrow.body), "let");
     }
 
     #[test]
