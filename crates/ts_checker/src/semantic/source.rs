@@ -12,7 +12,8 @@
 //! imports in exact direct or union/parenthesized/array top-level variable
 //! annotations, comment-only `JSDoc` typedef imports from promoted `CommonJS`
 //! type exports,
-//! annotated top-level function declarations, exact direct non-exported
+//! annotated top-level function declarations with authenticated identifier
+//! and assertion predicates, exact direct non-exported
 //! ambient function declarations (including the existing generic callable
 //! closure), initialized identifier-named top-level variables (optionally
 //! exported), immutable `using` and `await using` resource declarations,
@@ -29,10 +30,10 @@
 //! top-level literal addition chains, direct top-level and function-local
 //! conditional initializers, required own-property reads (including exact
 //! two-constituent declared unions), direct indexed reads over supported
-//! objects, arrays, and strings, strict direct-identifier `typeof` flow checks,
-//! and direct simple or arithmetic compound assignments to supported mutable
-//! declarations or
-//! binder-authenticated `CommonJS` exports and function or arrow expandos.
+//! objects, arrays, and strings, strict direct-identifier `typeof` flow and
+//! guard-return checks, and direct simple or arithmetic compound assignments
+//! to supported mutable declarations or binder-authenticated `CommonJS`
+//! exports and function or arrow expandos.
 //! The complete source tree and complete supported-statement plan are validated
 //! before semantic execution begins. Execution may retain safe canonical memo
 //! caches while discovering a type-dependent capability boundary.
@@ -113,7 +114,7 @@ use super::{
         PrimitiveBinaryRequest, PrimitiveBinaryUnsupported, check_primitive_binary,
         compound_assignment_binary_operator,
     },
-    signatures::{ElementFlags, SignatureFlags},
+    signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
     source_arrows::{
         ResolvedSourceContextualArrowPlan, SourceArrowBodyPlan, SourceArrowError,
         SourceArrowInvariant, SourceArrowPlan, SourceArrowUnsupported, SourceContextualArrowError,
@@ -976,6 +977,10 @@ enum PlannedFunctionBody {
     Return {
         statement: NodeRef,
         expression: PlannedExpression,
+    },
+    TypeofReturn {
+        statement: NodeRef,
+        condition: Box<PlannedTypeofCondition>,
     },
     ReturnJsx {
         statement: NodeRef,
@@ -4530,6 +4535,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     unsupported.get_or_insert(node);
                 }
             }
+            NodeData::TypePredicateNode(predicate) if record.kind == SyntaxKind::TypePredicate => {
+                if let Some(narrowed) = predicate.type_ {
+                    let narrowed = self.reference(narrowed);
+                    if self.node(narrowed)?.parent == Some(node.node) {
+                        self.collect_type_import_annotation_graph(
+                            root,
+                            narrowed,
+                            visited,
+                            references,
+                            unsupported,
+                        )?;
+                    } else {
+                        unsupported.get_or_insert(node);
+                    }
+                }
+            }
             NodeData::UnionTypeNode(union) if record.kind == SyntaxKind::UnionType => {
                 if union.types.nodes.len() < 2 || union.types.has_trailing_comma {
                     unsupported.get_or_insert(node);
@@ -6867,6 +6888,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     expression,
                 });
             }
+            if (callable.return_type.is_inferred()
+                || callable
+                    .type_predicate
+                    .is_some_and(|predicate| predicate.kind == TypePredicateKind::Identifier))
+                && let Some(condition) = self.plan_typeof_return_condition(callable, expression)?
+            {
+                return Ok(PlannedFunctionBody::TypeofReturn {
+                    statement,
+                    condition: Box::new(condition),
+                });
+            }
             return Ok(PlannedFunctionBody::Return {
                 statement,
                 expression: self.plan_expression(expression)?,
@@ -6893,6 +6925,95 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         Ok(PlannedFunctionBody::Empty)
+    }
+
+    fn plan_typeof_return_condition(
+        &mut self,
+        callable: &SourceCallablePlan,
+        expression: NodeRef,
+    ) -> Result<Option<PlannedTypeofCondition>, SourceCheckError> {
+        let record = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            return Ok(None);
+        };
+        if record.kind != SyntaxKind::BinaryExpression
+            || record.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.facts != 0
+            || binary.modifiers.is_some()
+        {
+            return Ok(None);
+        }
+        let left = self.reference(binary.left);
+        let operator = self.reference(binary.operator_token);
+        let right = self.reference(binary.right);
+        let operator_record = self.node(operator)?;
+        if operator_record.flags.0 != 0 || !matches!(operator_record.data, NodeData::Token(_)) {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let comparison = match operator_record.kind {
+            SyntaxKind::EqualsEqualsEqualsToken => SourceTypeofComparison::Equal,
+            SyntaxKind::ExclamationEqualsEqualsToken => SourceTypeofComparison::NotEqual,
+            _ => return Ok(None),
+        };
+        let (type_of_expression, literal, type_of_on_left) =
+            match (self.node(left)?.kind, self.node(right)?.kind) {
+                (SyntaxKind::TypeOfExpression, SyntaxKind::StringLiteral) => (left, right, true),
+                (SyntaxKind::StringLiteral, SyntaxKind::TypeOfExpression) => (right, left, false),
+                _ => return Ok(None),
+            };
+        if self.node(left)?.parent != Some(expression.node)
+            || self.node(operator)?.parent != Some(expression.node)
+            || self.node(right)?.parent != Some(expression.node)
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let type_of_record = self.node(type_of_expression)?;
+        let NodeData::TypeOfExpression(type_of) = &type_of_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let identifier = self.reference(type_of.expression);
+        let identifier_record = self.node(identifier)?;
+        if type_of_record.flags.0 != 0
+            || identifier_record.parent != Some(type_of_expression.node)
+            || identifier_record.kind != SyntaxKind::Identifier
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let literal_record = self.node(literal)?;
+        let NodeData::StringLiteral(literal_data) = &literal_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if literal_record.flags.0 != 0 || literal_data.token_flags.0 != 0 {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let tag = match literal_data.text.as_str() {
+            "string" => SourceTypeofTag::String,
+            "number" => SourceTypeofTag::Number,
+            "boolean" => SourceTypeofTag::Boolean,
+            "bigint" => SourceTypeofTag::BigInt,
+            "symbol" => SourceTypeofTag::Symbol,
+            "undefined" => SourceTypeofTag::Undefined,
+            "object" => SourceTypeofTag::Object,
+            "function" => SourceTypeofTag::Function,
+            _ => return Ok(None),
+        };
+        let syntax = SourceTypeofConditionSyntax {
+            type_of_expression,
+            identifier,
+            operator,
+            literal,
+            tag,
+            comparison,
+            type_of_on_left,
+        };
+        let PlannedSourceCondition::Typeof(condition) =
+            self.finish_source_condition(callable, expression, identifier, Some(syntax))?
+        else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        Ok(Some(*condition))
     }
 
     #[allow(clippy::too_many_lines)] // Keep the local, assignment, and binder proofs together.
@@ -8600,6 +8721,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             if matches!(
                 node.kind,
                 SyntaxKind::AnyKeyword | SyntaxKind::VoidKeyword | SyntaxKind::UndefinedKeyword
+            ) {
+                return Ok(true);
+            }
+            if matches!(
+                &node.data,
+                NodeData::TypePredicateNode(predicate)
+                    if node.kind == SyntaxKind::TypePredicate
+                        && predicate.asserts_modifier.is_some()
             ) {
                 return Ok(true);
             }
@@ -15512,6 +15641,25 @@ fn preflight_inferred_function_return_dependencies(
                 &locals,
                 functions,
             ),
+            PlannedFunctionBody::TypeofReturn { condition, .. } => {
+                function
+                    .callable
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.symbol == condition.symbol)
+                    && expression_is_closed(
+                        &condition.identifier,
+                        &function.callable.parameters,
+                        &locals,
+                        functions,
+                    )
+                    && expression_is_closed(
+                        &condition.literal,
+                        &function.callable.parameters,
+                        &locals,
+                        functions,
+                    )
+            }
             PlannedFunctionBody::ConstantIf {
                 condition,
                 then_expression,
@@ -22346,6 +22494,96 @@ fn check_planned_typeof_condition(
     publish_expression_type(store, condition.expression, boolean_type)
 }
 
+#[allow(clippy::too_many_arguments)] // Reuses the source call's exact expression capabilities.
+fn check_planned_typeof_return(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    condition: &PlannedTypeofCondition,
+) -> Result<TypeId, SourceCheckError> {
+    let current =
+        current_flow_types
+            .get(&condition.symbol)
+            .copied()
+            .ok_or(SourceCheckError::Variable(
+                VariableInvariant::MissingCurrentFlowType(condition.symbol),
+            ))?;
+    let (typeof_type, boolean_type) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| (bootstrap.typeof_type, bootstrap.boolean_type))
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    let check_identifier = |store: &mut CanonicalTypeMapperStore,
+                            diagnostics: &mut CanonicalCheckerDiagnostics,
+                            session: &mut InstantiationSession,
+                            deferred: &mut Vec<DeferredAssertion>| {
+        let checked = check_expression_type(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            current_flow_types,
+            preflighted_type_import_value_uses,
+            &condition.identifier,
+            None,
+            deferred,
+        )?;
+        if checked.raw != current {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(callable.declaration),
+            ));
+        }
+        publish_expression_type(store, condition.type_of_expression, typeof_type)
+    };
+    if condition.type_of_on_left {
+        check_identifier(store, diagnostics, session, deferred)?;
+        check_expression_type(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            current_flow_types,
+            preflighted_type_import_value_uses,
+            &condition.literal,
+            None,
+            deferred,
+        )?;
+    } else {
+        check_expression_type(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            current_flow_types,
+            preflighted_type_import_value_uses,
+            &condition.literal,
+            None,
+            deferred,
+        )?;
+        check_identifier(store, diagnostics, session, deferred)?;
+    }
+    publish_expression_type(store, condition.expression, boolean_type)?;
+    Ok(boolean_type)
+}
+
 fn source_truthiness_condition_type_is_supported(
     store: &mut CanonicalTypeMapperStore,
     type_: TypeId,
@@ -26122,6 +26360,31 @@ pub(super) fn check_source_file(
                 continue;
             }
             PlannedFunctionBody::Return { expression, .. } => (Some(expression), body_flow_types),
+            PlannedFunctionBody::TypeofReturn { condition, .. } => {
+                let inferred = check_planned_typeof_return(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    &mut function_diagnostics,
+                    &body_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &mut deferred,
+                    &function.callable,
+                    condition,
+                )?;
+                publish_inferred_source_callable_return(
+                    store,
+                    &function.callable,
+                    materialized.signature,
+                    inferred,
+                )
+                .map_err(SourcePlanner::callable_plan_error)?;
+                inferred_function_diagnostics[index] = Some(function_diagnostics);
+                continue;
+            }
             PlannedFunctionBody::ReturnJsx { expression, .. } => {
                 let mut jsx_diagnostics = CanonicalCheckerDiagnostics::default();
                 let result = store.check_jsx_element_with_global_types(
@@ -27279,6 +27542,41 @@ pub(super) fn check_source_file(
                             *statement,
                             None,
                         )?;
+                    }
+                    PlannedFunctionBody::TypeofReturn {
+                        statement,
+                        condition,
+                    } => {
+                        let actual = check_planned_typeof_return(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &body_flow_types,
+                            &preflighted_type_import_value_uses,
+                            &mut deferred,
+                            &function.callable,
+                            condition,
+                        )?;
+                        let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
+                        let expected = CanonicalTypeQuery::new_with_global_types_and_session(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            &mut return_diagnostics,
+                        )?
+                        .get_type_from_type_node(return_type);
+                        merge_retry_diagnostics(diagnostics, return_diagnostics);
+                        if expected? != actual {
+                            return Err(SourceCheckError::Function(
+                                SourceFunctionInvariant::Callable(*statement),
+                            ));
+                        }
                     }
                     PlannedFunctionBody::ConstantIf {
                         condition,
@@ -48342,6 +48640,101 @@ class Foo2 {
         assert_eq!(context.diagnostics().len(), 1);
         assert_eq!(variable_value_type(&context, &source, file, "f"), target);
         assert_eq!(resolved_node_type(&context, arrow), callable);
+    }
+
+    #[test]
+    fn source_type_predicate_returns_publish_boolean_and_preserve_warm_identity() {
+        let source = parsed(concat!(
+            "export function isString(value: unknown) { ",
+            "return typeof value === \"string\"; } ",
+            "export function isExplicitString(value: unknown): value is string { ",
+            "return typeof value === \"string\"; } ",
+            "const accepted: boolean = isExplicitString('value');",
+        ));
+        let file = FileId::new(8_269);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let owner = function_symbol(&context, &source, file, "isExplicitString");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let record = context.store().signature(signature).unwrap();
+        let predicate = record
+            .resolved_type_predicate()
+            .and_then(|predicate| context.store().type_predicate(predicate))
+            .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(predicate.kind(), TypePredicateKind::Identifier);
+        assert_eq!(predicate.parameter_index(), 0);
+        assert_eq!(predicate.parameter_name(), "value");
+        assert_eq!(predicate.type_id(), Some(bootstrap.string_type));
+        assert_eq!(record.resolved_return_type(), Some(bootstrap.boolean_type));
+        assert_eq!(
+            variable_value_type(&context, &source, file, "accepted"),
+            bootstrap.boolean_type,
+        );
+        let inferred_owner = function_symbol(&context, &source, file, "isString");
+        let inferred_callable = context
+            .store()
+            .source_callable_type_for_owner(inferred_owner)
+            .unwrap();
+        let inferred_signature = context
+            .store()
+            .source_callable_provenance(inferred_callable)
+            .and_then(|provenance| context.store().signature(provenance.signature))
+            .unwrap();
+        assert_eq!(
+            inferred_signature.resolved_return_type(),
+            Some(bootstrap.boolean_type),
+        );
+        assert!(inferred_signature.resolved_type_predicate().is_none());
+        assert!(context.diagnostics().is_empty());
+
+        let warm = (
+            observable_state(&context, file),
+            context.store().type_predicate_len(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                observable_state(&context, file),
+                context.store().type_predicate_len()
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn source_type_predicate_return_mismatches_report_boolean_assignability() {
+        let source = parsed("function isString(value: unknown): value is string { return 1; }");
+        let file = FileId::new(8_271);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one boolean return-type mismatch")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'boolean'.",
+        );
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]

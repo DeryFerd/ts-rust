@@ -1,7 +1,8 @@
 //! Exact function-type signatures for the dependency-closed type-node cut.
 //!
 //! This module owns nongeneric function types, implicit `any[]` rest parameters,
-//! and authenticated generic function types with outer lexical constraints.
+//! authenticated identifier and assertion predicates, and generic function
+//! types with outer lexical constraints.
 //! The type-node planner/executor only supplies recursive annotation callbacks;
 //! binder proof, cache validation, shell publication, signatures, parameter
 //! value types, and lazy return-type validation stay here.
@@ -29,7 +30,11 @@ use super::{
         SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks, ValueSymbolLinks,
     },
     signatures::{ElementFlags, Signature, SignatureFlags},
-    source_callables::implicit_any_array_type,
+    source_callables::{
+        CallableTypePredicatePlan, SourceCallableError, implicit_any_array_type,
+        plan_callable_type_predicate, valid_planned_callable_type_predicate,
+        valid_stored_callable_type_predicate,
+    },
     store::SourceNodeParent,
     type_records::{ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -79,6 +84,7 @@ pub(super) struct FunctionTypePlan {
     pub(super) type_parameters: Vec<FunctionTypeParameterPlan>,
     pub(super) parameters: Vec<FunctionParameterPlan>,
     pub(super) return_type: NodeRef,
+    pub(super) type_predicate: Option<CallableTypePredicatePlan>,
     return_identity_node: NodeRef,
     return_null_literal_identity: bool,
     pub(super) flags: SignatureFlags,
@@ -628,6 +634,36 @@ pub(super) fn plan_function_type(
     let min_argument_count = i32::try_from(min_argument_count)
         .map_err(|_| invariant(FunctionTypeInvariant::Capacity(node)))?;
     let return_identity_node = peel_parenthesized_type(store, host, return_type)?;
+    let type_predicate =
+        if preflight_node(store, host, return_identity_node)?.kind == SyntaxKind::TypePredicate {
+            let predicate = plan_callable_type_predicate(store, host, return_identity_node)
+                .map_err(|error| match error {
+                    SourceCallableError::DeclaredType(error) => {
+                        FunctionTypeError::DeclaredType(error)
+                    }
+                    SourceCallableError::LiteralCache(error) => {
+                        FunctionTypeError::LiteralCache(error)
+                    }
+                    SourceCallableError::Unsupported(_) => FunctionTypeError::Unsupported(
+                        FunctionTypeUnsupported::GenericSignature(return_identity_node),
+                    ),
+                    SourceCallableError::Invariant(_) => {
+                        invariant(FunctionTypeInvariant::InvalidSyntax(return_identity_node))
+                    }
+                })?;
+            if predicate.owner != node
+                || parameters
+                    .get(usize::try_from(predicate.parameter_index).unwrap_or(usize::MAX))
+                    .is_none_or(|parameter| parameter.symbol != predicate.parameter_symbol)
+            {
+                return Err(invariant(FunctionTypeInvariant::InvalidSyntax(
+                    return_identity_node,
+                )));
+            }
+            Some(predicate)
+        } else {
+            None
+        };
     let type_parameters = plan_function_type_parameters(
         store,
         host,
@@ -668,6 +704,7 @@ pub(super) fn plan_function_type(
         type_parameters,
         parameters,
         return_type,
+        type_predicate,
         return_identity_node,
         return_null_literal_identity: is_null_literal_type(store, host, return_identity_node)?,
         flags,
@@ -2139,7 +2176,11 @@ pub(super) fn validate_stored_function_type(
         || signature_record.resolved_min_argument_count() != -1
         || signature_record.declaration() != Some(declaration)
         || signature_record.this_parameter().is_some()
-        || signature_record.resolved_type_predicate().is_some()
+        || !valid_stored_callable_type_predicate(
+            store,
+            signature_record,
+            Some(return_identity_node),
+        )
         || signature_record.target().is_some()
         || signature_record.mapper().is_some()
         || signature_record.isolated_signature_type().is_some()
@@ -2218,6 +2259,13 @@ pub(super) fn validate_stored_function_type(
         parameter_edges.push(return_type);
     } else if store.signature_has_circular_return_type(signature) {
         return StoredFunctionTypeValidation::Malformed;
+    }
+    if let Some(narrowed) = signature_record
+        .resolved_type_predicate()
+        .and_then(|predicate| store.type_predicate(predicate))
+        .and_then(super::signatures::TypePredicate::type_id)
+    {
+        parameter_edges.push(narrowed);
     }
     StoredFunctionTypeValidation::Valid(parameter_edges)
 }
@@ -2324,7 +2372,12 @@ fn validate_signature(
         .is_none()
         || record.parameters() != expected_parameters
         || record.this_parameter().is_some()
-        || record.resolved_type_predicate().is_some()
+        || !valid_planned_callable_type_predicate(
+            store,
+            record,
+            Some(plan.return_identity_node),
+            plan.type_predicate,
+        )
         || record.target().is_some()
         || record.mapper().is_some()
         || record.isolated_signature_type().is_some()

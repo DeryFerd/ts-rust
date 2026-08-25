@@ -60,6 +60,7 @@ use super::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
         resolve_nongeneric_keyof_type,
     },
+    links::{SymbolNodeLinks, TypeNodeLinks},
     mapped_types::{
         MappedTypeDeclarationPlan, MappedTypeError, MappedTypeKeys, MappedTypeModifiers,
         MappedTypeRequest, plan_mapped_type_declaration, plan_mapped_type_keys,
@@ -67,9 +68,10 @@ use super::{
     object_diagnostics,
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
     reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
-    signatures::{ElementFlags, Signature},
+    signatures::{ElementFlags, Signature, TypePredicateKind},
     source_callables::{
-        self, PendingSourceCallableParameterTypes, SourceCallableError, SourceCallableFamily,
+        self, CallableTypePredicatePlan, PendingSourceCallableParameterTypes, SourceCallableError,
+        SourceCallableFamily,
     },
     source_namespaces::authenticated_merged_namespace_interface,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
@@ -702,6 +704,7 @@ struct TypeQueryPlan {
     interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
     generic_interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
     functions: BTreeMap<NodeRef, FunctionTypePlan>,
+    type_predicates: BTreeMap<NodeRef, CallableTypePredicatePlan>,
     templates: BTreeMap<NodeRef, PlannedTemplateType>,
     tuples: BTreeMap<NodeRef, TupleTypeNodePlan>,
     unique_symbols: BTreeMap<NodeRef, PlannedUniqueSymbolType>,
@@ -1818,6 +1821,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             SyntaxKind::ArrayType => self.plan_array_type(node, alias_owner),
             SyntaxKind::TypeLiteral => self.plan_property_type_literal(node, alias_owner),
             SyntaxKind::FunctionType => self.plan_function_type(node, alias_owner),
+            SyntaxKind::TypePredicate if alias_owner.is_none() && !union_constituent => {
+                self.plan_type_predicate(node)
+            }
             SyntaxKind::IndexedAccessType => {
                 self.plan_concrete_indexed_access_type(node, alias_owner)
             }
@@ -3039,6 +3045,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     NodeRef::new(node.arena, node.file, array.element_type),
                     visited,
                 )?,
+            NodeData::TypePredicateNode(predicate) if record.kind == SyntaxKind::TypePredicate => {
+                match predicate.type_ {
+                    Some(narrowed) => self.type_node_contains_import_alias_reference(
+                        NodeRef::new(node.arena, node.file, narrowed),
+                        visited,
+                    )?,
+                    None => false,
+                }
+            }
             NodeData::TypeOperatorNode(operator)
                 if record.kind == SyntaxKind::TypeOperator
                     && matches!(
@@ -4338,6 +4353,34 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             if method.return_type != root {
                 self.plan_type_node(method.return_type)?;
             }
+        }
+        Ok(())
+    }
+
+    fn plan_type_predicate(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
+        let predicate = source_callables::plan_callable_type_predicate(self.store, self.host, node)
+            .map_err(|error| match error {
+                SourceCallableError::DeclaredType(error) => error,
+                SourceCallableError::LiteralCache(error) => type_construction_error(error),
+                SourceCallableError::Unsupported(_) => {
+                    type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                        node,
+                        kind: SyntaxKind::TypePredicate,
+                    })
+                }
+                SourceCallableError::Invariant(_) => {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(node))
+                }
+            })?;
+        if let Some(existing) = self.plan.type_predicates.insert(node, predicate)
+            && existing != predicate
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(node),
+            ));
+        }
+        if let Some(narrowed) = predicate.narrowed_type {
+            self.plan_type_node_in_context(narrowed, None, false)?;
         }
         Ok(())
     }
@@ -12575,6 +12618,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     visited,
                 )?,
             NodeData::ArrayTypeNode(_) => true,
+            NodeData::TypePredicateNode(predicate) if record.kind == SyntaxKind::TypePredicate => {
+                match predicate.type_ {
+                    Some(narrowed) => self.type_node_contains_builtin_array_reference(
+                        NodeRef::new(node.arena, node.file, narrowed),
+                        visited,
+                    )?,
+                    None => false,
+                }
+            }
             NodeData::TypeReferenceNode(_) => {
                 if self.builtin_array_reference_name(node)?.is_some() {
                     true
@@ -13216,6 +13268,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     return Err(unsupported());
                 }
                 self.collect_type_reference_alias_root_graph(child, visited, references)?;
+            }
+            NodeData::TypePredicateNode(predicate) if record.kind == SyntaxKind::TypePredicate => {
+                if let Some(narrowed) = predicate.type_ {
+                    let narrowed = NodeRef::new(node.arena, node.file, narrowed);
+                    if preflight_node(self.store, self.host, narrowed)?.parent != Some(node.node) {
+                        return Err(unsupported());
+                    }
+                    self.collect_type_reference_alias_root_graph(narrowed, visited, references)?;
+                }
             }
             NodeData::UnionTypeNode(union) if record.kind == SyntaxKind::UnionType => {
                 if union.types.nodes.len() < 2 || union.types.has_trailing_comma {
@@ -15545,6 +15606,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::ArrayType => self.execute_array_type(node, plan, prepared),
             SyntaxKind::TypeLiteral => self.execute_property_type_literal(node, plan, prepared),
             SyntaxKind::FunctionType => self.execute_function_type(node, plan, prepared),
+            SyntaxKind::TypePredicate => self.execute_type_predicate(node, plan, prepared),
             SyntaxKind::IndexedAccessType => {
                 if plan.mapped_indexed_accesses.contains_key(&node) {
                     self.execute_mapped_indexed_access_type(node, plan, prepared)
@@ -15595,6 +15657,121 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
         }
+    }
+
+    fn execute_type_predicate(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(node));
+        let predicate = plan
+            .type_predicates
+            .get(&node)
+            .copied()
+            .ok_or_else(invalid)?;
+        let signature = self
+            .store
+            .signature_links(predicate.owner)
+            .and_then(|links| links.resolved_signature.signature())
+            .ok_or_else(invalid)?;
+        let signature_record = self.store.signature(signature).ok_or_else(invalid)?;
+        let Ok(parameter_index) = usize::try_from(predicate.parameter_index) else {
+            return Err(invalid());
+        };
+        if signature_record.declaration() != Some(predicate.owner)
+            || signature_record.parameters().get(parameter_index).copied()
+                != Some(predicate.parameter_symbol)
+            || self.store.function_signature_return_annotation(signature) != Some((node, false))
+        {
+            return Err(invalid());
+        }
+        let bootstrap = self.store.intrinsic_bootstrap().ok_or_else(invalid)?;
+        let expected_return = match predicate.kind {
+            TypePredicateKind::Identifier => bootstrap.boolean_type,
+            TypePredicateKind::AssertsIdentifier => bootstrap.void_type,
+            TypePredicateKind::This | TypePredicateKind::AssertsThis => return Err(invalid()),
+        };
+        let narrowed = predicate
+            .narrowed_type
+            .map(|narrowed| self.execute_type_node(narrowed, plan, prepared))
+            .transpose()?;
+        let parameter_name = self
+            .store
+            .symbol(predicate.parameter_symbol)
+            .and_then(|symbol| symbol.name().as_utf8())
+            .map(str::to_owned)
+            .ok_or_else(invalid)?;
+        let expected_type_links = TypeNodeLinks {
+            resolved_type: Some(expected_return),
+            outer_type_parameters: None,
+        };
+        let expected_symbol_links = SymbolNodeLinks {
+            resolved_symbol: Some(predicate.parameter_symbol),
+        };
+        let type_links = self.store.type_node_links(node);
+        let symbol_links = self.store.symbol_node_links(predicate.parameter_name);
+        if type_links.is_some_and(|links| {
+            links != &TypeNodeLinks::default() && links != &expected_type_links
+        }) || symbol_links.is_some_and(|links| {
+            links != &SymbolNodeLinks::default() && links != &expected_symbol_links
+        }) {
+            return Err(invalid());
+        }
+
+        if let Some(existing) = self
+            .store
+            .signature(signature)
+            .and_then(Signature::resolved_type_predicate)
+        {
+            let record = self.store.type_predicate(existing).ok_or_else(invalid)?;
+            return if record.kind() == predicate.kind
+                && record.parameter_index() == predicate.parameter_index
+                && record.parameter_name() == parameter_name
+                && record.type_id() == narrowed
+                && type_links == Some(&expected_type_links)
+                && symbol_links == Some(&expected_symbol_links)
+            {
+                Ok(expected_return)
+            } else {
+                Err(invalid())
+            };
+        }
+
+        let type_links_cold = type_links.is_none_or(|links| links == &TypeNodeLinks::default());
+        let symbol_links_cold =
+            symbol_links.is_none_or(|links| links == &SymbolNodeLinks::default());
+        let missing_type_links = usize::from(type_links.is_none());
+        let missing_symbol_links = usize::from(symbol_links.is_none());
+        if !type_links_cold
+            || !symbol_links_cold
+            || !self.store.try_reserve_type_node_links(missing_type_links)
+            || !self
+                .store
+                .try_reserve_symbol_node_links(missing_symbol_links)
+        {
+            return Err(invalid());
+        }
+        let identity = self
+            .store
+            .alloc_type_predicate(
+                predicate.kind,
+                predicate.parameter_index,
+                parameter_name,
+                narrowed,
+            )
+            .ok_or_else(invalid)?;
+        assert!(
+            self.store
+                .set_symbol_node_links(predicate.parameter_name, expected_symbol_links)
+        );
+        assert!(self.store.set_type_node_links(node, expected_type_links));
+        assert!(
+            self.store
+                .set_signature_resolved_type_predicate(signature, Some(identity))
+        );
+        Ok(expected_return)
     }
 
     fn execute_jsdoc_import_type(
@@ -36728,6 +36905,173 @@ mod tests {
         assert!(fixture.store.type_node_links(function).is_none());
         assert!(fixture.store.signature_links(function).is_none());
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn function_type_predicates_publish_exact_narrowing_and_replay_warm() {
+        for (source, alias, kind, parameter_index, narrowed_name) in [
+            (
+                "type Guard = (value: unknown) => value is string;",
+                "Guard",
+                TypePredicateKind::Identifier,
+                0,
+                Some("string"),
+            ),
+            (
+                "type Assertion = (value: unknown) => asserts value is string;",
+                "Assertion",
+                TypePredicateKind::AssertsIdentifier,
+                0,
+                Some("string"),
+            ),
+            (
+                "type Truth = (value: unknown) => asserts value;",
+                "Truth",
+                TypePredicateKind::AssertsIdentifier,
+                0,
+                None,
+            ),
+            (
+                "type FindGuard = (value: any, index: number) => value is number;",
+                "FindGuard",
+                TypePredicateKind::Identifier,
+                0,
+                Some("number"),
+            ),
+            (
+                "type IndexedGuard = (index: number, value: unknown) => value is string;",
+                "IndexedGuard",
+                TypePredicateKind::Identifier,
+                1,
+                Some("string"),
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let function = function_type_node(&fixture, alias);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let type_ = query_node(&mut fixture, function, &mut diagnostics).unwrap();
+            let signature = function_signature(&fixture.store, function);
+            assert!(
+                fixture
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_type_predicate()
+                    .is_none()
+            );
+
+            let (boolean, void, string, number) = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.boolean_type,
+                    bootstrap.void_type,
+                    bootstrap.string_type,
+                    bootstrap.number_type,
+                )
+            };
+            let expected_return = if kind == TypePredicateKind::Identifier {
+                boolean
+            } else {
+                void
+            };
+            let narrowed = match narrowed_name {
+                Some("string") => Some(string),
+                Some("number") => Some(number),
+                None => None,
+                _ => unreachable!("the fixture only narrows string or number"),
+            };
+            assert_eq!(
+                query_signature_return(&mut fixture, signature, &mut diagnostics),
+                Ok(expected_return),
+            );
+            let predicate = fixture
+                .store
+                .signature(signature)
+                .and_then(Signature::resolved_type_predicate)
+                .and_then(|predicate| fixture.store.type_predicate(predicate))
+                .unwrap();
+            assert_eq!(predicate.kind(), kind);
+            assert_eq!(predicate.parameter_index(), parameter_index);
+            assert_eq!(predicate.parameter_name(), "value");
+            assert_eq!(predicate.type_id(), narrowed);
+            assert!(matches!(
+                functions::validate_stored_function_type(&fixture.store, type_),
+                functions::StoredFunctionTypeValidation::Valid(_)
+            ));
+            assert!(diagnostics.is_empty());
+
+            let warm = (
+                function_store_state(&fixture.store),
+                fixture.store.type_predicate_len(),
+            );
+            assert_eq!(
+                query_node(&mut fixture, function, &mut diagnostics),
+                Ok(type_)
+            );
+            assert_eq!(
+                query_signature_return(&mut fixture, signature, &mut diagnostics),
+                Ok(expected_return),
+            );
+            assert_eq!(
+                (
+                    function_store_state(&fixture.store),
+                    fixture.store.type_predicate_len(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn function_type_predicates_reject_forged_parameter_and_narrowing_caches() {
+        let mut fixture = fixture("type Guard = (value: unknown) => value is string;");
+        let function = function_type_node(&fixture, "Guard");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = query_node(&mut fixture, function, &mut diagnostics).unwrap();
+        let signature = function_signature(&fixture.store, function);
+        query_signature_return(&mut fixture, signature, &mut diagnostics).unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let forged = fixture
+            .store
+            .alloc_type_predicate(TypePredicateKind::Identifier, 0, "value", Some(number))
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_type_predicate(signature, Some(forged))
+        );
+        let before = (
+            function_store_state(&fixture.store),
+            fixture.store.type_predicate_len(),
+        );
+
+        assert!(matches!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(cached),
+            )) if cached == signature
+        ));
+        assert_eq!(
+            (
+                function_store_state(&fixture.store),
+                fixture.store.type_predicate_len(),
+            ),
+            before,
+        );
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let wrong_parameter = fixture
+            .store
+            .alloc_type_predicate(TypePredicateKind::Identifier, 0, "other", Some(string))
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_type_predicate(signature, Some(wrong_parameter))
+        );
+        assert!(matches!(
+            functions::validate_stored_function_type(&fixture.store, type_),
+            functions::StoredFunctionTypeValidation::Malformed
+        ));
     }
 
     #[test]

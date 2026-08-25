@@ -4,9 +4,9 @@
 //! function-body semantics. It proves one retained `FunctionDeclaration`,
 //! anonymous `FunctionExpression`, or `ArrowFunction` and its binder-owned
 //! FUNCTION symbol, publishes the callable shell/signature/parameter types,
-//! including implicit `any` on ordinary function declarations and implicit
-//! `any[]` rest parameters, and validates
-//! the resulting store shape.
+//! including authenticated identifier and assertion predicates, implicit `any`
+//! on ordinary function declarations, and implicit `any[]` rest parameters,
+//! and validates the resulting store shape.
 //! Source values never borrow `FunctionType` `TypeNode` or `__call` provenance.
 
 use std::collections::HashSet;
@@ -40,7 +40,7 @@ use super::{
         SignatureLinks, SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks,
     },
     reference_types::validate_direct_generic_reference,
-    signatures::{Signature, SignatureFlags},
+    signatures::{Signature, SignatureFlags, TypePredicateKind},
     store::{
         PreparedSourceGenericCallablePublication, ResolvedSourceCallableTypeParameter,
         SemanticStore, SourceCallableProvenance, SourceCallableReturnProvenance,
@@ -148,6 +148,18 @@ pub(super) struct SourceCallableTypeParameterPlan {
     pub(super) symbol: SemanticSymbolId,
     pub(super) constraint: Option<NodeRef>,
     pub(super) default_type: Option<NodeRef>,
+}
+
+/// Exact syntax and parameter ownership for one identifier type predicate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CallableTypePredicatePlan {
+    pub(super) node: NodeRef,
+    pub(super) owner: NodeRef,
+    pub(super) parameter_name: NodeRef,
+    pub(super) parameter_symbol: SemanticSymbolId,
+    pub(super) parameter_index: i32,
+    pub(super) narrowed_type: Option<NodeRef>,
+    pub(super) kind: TypePredicateKind,
 }
 
 /// Opaque exact-AST capability carried from source planning into the store's
@@ -281,6 +293,7 @@ pub(super) struct SourceCallablePlan {
     generic_return_type_parameter_index: Option<usize>,
     pub(super) parameters: Vec<SourceCallableParameterPlan>,
     pub(super) return_type: SourceCallableReturnPlan,
+    pub(super) type_predicate: Option<CallableTypePredicatePlan>,
     pub(super) body_mode: SourceCallableBodyMode,
     /// True only for an authenticated zero-parameter async JSX function.
     pub(super) is_async: bool,
@@ -1813,6 +1826,263 @@ fn validate_global_wrapper_annotation(
     Ok(())
 }
 
+/// Validates predicate syntax against its exact function-owned parameter.
+pub(super) fn plan_callable_type_predicate(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<CallableTypePredicatePlan, SourceCallableError> {
+    let invalid = || invariant(SourceCallableInvariant::InvalidSyntax(node));
+    let record = preflight_node(store, host, node)?;
+    let NodeData::TypePredicateNode(predicate) = &record.data else {
+        return Err(invalid());
+    };
+    if record.kind != SyntaxKind::TypePredicate || record.flags.0 != 0 {
+        return Err(invalid());
+    }
+
+    let mut current = node;
+    let owner = loop {
+        let parent = preflight_node(store, host, current)?
+            .parent
+            .map(|parent| NodeRef::new(node.arena, node.file, parent))
+            .ok_or_else(invalid)?;
+        let parent_record = preflight_node(store, host, parent)?;
+        if let NodeData::ParenthesizedTypeNode(parenthesized) = &parent_record.data {
+            if parent_record.kind != SyntaxKind::ParenthesizedType
+                || parenthesized.type_ != current.node
+            {
+                return Err(invalid());
+            }
+            current = parent;
+            continue;
+        }
+        break parent;
+    };
+    let owner_record = preflight_node(store, host, owner)?;
+    let (parameters, return_type) = match &owner_record.data {
+        NodeData::FunctionDeclaration(function)
+            if owner_record.kind == SyntaxKind::FunctionDeclaration =>
+        {
+            (&function.parameters, function.type_)
+        }
+        NodeData::ArrowFunction(arrow) if owner_record.kind == SyntaxKind::ArrowFunction => {
+            (&arrow.parameters, arrow.type_)
+        }
+        NodeData::FunctionTypeNode(function) if owner_record.kind == SyntaxKind::FunctionType => {
+            (&function.parameters, function.type_)
+        }
+        _ => return Err(invalid()),
+    };
+    if return_type != Some(current.node) {
+        return Err(invalid());
+    }
+
+    let parameter_name = NodeRef::new(node.arena, node.file, predicate.parameter_name);
+    let name_record = preflight_node(store, host, parameter_name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::TypePredicate(node),
+        ));
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(node.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(invalid());
+    }
+
+    let asserts = predicate
+        .asserts_modifier
+        .map(|modifier| NodeRef::new(node.arena, node.file, modifier));
+    if let Some(asserts) = asserts {
+        let modifier = preflight_node(store, host, asserts)?;
+        if modifier.kind != SyntaxKind::AssertsKeyword
+            || modifier.flags.0 != 0
+            || modifier.parent != Some(node.node)
+            || modifier.range.end > name_record.range.start
+        {
+            return Err(invalid());
+        }
+    }
+    let narrowed_type = predicate
+        .type_
+        .map(|narrowed| NodeRef::new(node.arena, node.file, narrowed));
+    if asserts.is_none() && narrowed_type.is_none() {
+        return Err(invalid());
+    }
+    if let Some(narrowed_type) = narrowed_type {
+        let narrowed = preflight_node(store, host, narrowed_type)?;
+        if narrowed.parent != Some(node.node) || narrowed.range.start < name_record.range.end {
+            return Err(invalid());
+        }
+    }
+
+    let bound = host.bound_file(owner).ok_or_else(invalid)?;
+    let mut selected = None;
+    for (index, parameter) in parameters.nodes.iter().copied().enumerate() {
+        let declaration = NodeRef::new(owner.arena, owner.file, parameter);
+        let declaration_record = preflight_node(store, host, declaration)?;
+        let NodeData::ParameterDeclaration(parameter) = &declaration_record.data else {
+            return Err(invalid());
+        };
+        let name = NodeRef::new(owner.arena, owner.file, parameter.name);
+        let name_record = preflight_node(store, host, name)?;
+        let NodeData::Identifier(name) = &name_record.data else {
+            continue;
+        };
+        if name.text != identifier.text {
+            continue;
+        }
+        if parameter.dot_dot_dot_token.is_some() {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::TypePredicate(node),
+            ));
+        }
+        let symbol = bound.symbol(declaration).ok_or_else(invalid)?;
+        let symbol_record = store.symbol(symbol).ok_or_else(invalid)?;
+        if store.get_merged_symbol(symbol) != Some(symbol)
+            || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || symbol_record.check_flags() != CheckFlags::NONE
+            || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+            || symbol_record.declarations() != Some(&[declaration])
+            || declaration_record.parent != Some(owner.node)
+            || selected.replace((index, symbol)).is_some()
+        {
+            return Err(invalid());
+        }
+    }
+    let Some((index, parameter_symbol)) = selected else {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::TypePredicate(node),
+        ));
+    };
+    let parameter_index = i32::try_from(index).map_err(|_| invalid())?;
+    let kind = if asserts.is_some() {
+        TypePredicateKind::AssertsIdentifier
+    } else {
+        TypePredicateKind::Identifier
+    };
+    let expected_symbol = SymbolNodeLinks {
+        resolved_symbol: Some(parameter_symbol),
+    };
+    if store
+        .symbol_node_links(parameter_name)
+        .is_some_and(|links| links != &SymbolNodeLinks::default() && links != &expected_symbol)
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+            parameter_name,
+        )));
+    }
+
+    Ok(CallableTypePredicatePlan {
+        node,
+        owner,
+        parameter_name,
+        parameter_symbol,
+        parameter_index,
+        narrowed_type,
+        kind,
+    })
+}
+
+/// Checks the exact published predicate metadata without requiring AST access.
+pub(super) fn valid_stored_callable_type_predicate(
+    store: &CanonicalTypeMapperStore,
+    signature: &Signature,
+    annotation: Option<NodeRef>,
+) -> bool {
+    let predicate_annotation =
+        annotation.filter(|node| store.source_node_kind(*node) == Some(SyntaxKind::TypePredicate));
+    match (predicate_annotation, signature.resolved_type_predicate()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(_), None) => signature.resolved_return_type().is_none(),
+        (Some(annotation), Some(predicate)) => {
+            let Some(predicate) = store.type_predicate(predicate) else {
+                return false;
+            };
+            let Some(bootstrap) = store.intrinsic_bootstrap() else {
+                return false;
+            };
+            let expected_return = match predicate.kind() {
+                TypePredicateKind::Identifier if predicate.type_id().is_some() => {
+                    bootstrap.boolean_type
+                }
+                TypePredicateKind::AssertsIdentifier => bootstrap.void_type,
+                _ => return false,
+            };
+            let Ok(index) = usize::try_from(predicate.parameter_index()) else {
+                return false;
+            };
+            let Some(parameter) = signature.parameters().get(index).copied() else {
+                return false;
+            };
+            let Some(parameter_record) = store.symbol(parameter) else {
+                return false;
+            };
+            parameter_record.name().as_utf8() == Some(predicate.parameter_name())
+                && predicate
+                    .type_id()
+                    .is_none_or(|type_| store.type_payload(type_).is_some())
+                && signature
+                    .resolved_return_type()
+                    .is_none_or(|type_| type_ == expected_return)
+                && store.type_node_links(annotation)
+                    == Some(&TypeNodeLinks {
+                        resolved_type: Some(expected_return),
+                        outer_type_parameters: None,
+                    })
+        }
+    }
+}
+
+/// Matches published predicate metadata against the complete planned AST.
+pub(super) fn valid_planned_callable_type_predicate(
+    store: &CanonicalTypeMapperStore,
+    signature: &Signature,
+    annotation: Option<NodeRef>,
+    planned: Option<CallableTypePredicatePlan>,
+) -> bool {
+    if !valid_stored_callable_type_predicate(store, signature, annotation) {
+        return false;
+    }
+    match (planned, signature.resolved_type_predicate()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(planned), None) => {
+            annotation == Some(planned.node)
+                && signature.resolved_return_type().is_none()
+                && store
+                    .type_node_links(planned.node)
+                    .is_none_or(|links| links == &TypeNodeLinks::default())
+                && store
+                    .symbol_node_links(planned.parameter_name)
+                    .is_none_or(|links| links == &SymbolNodeLinks::default())
+        }
+        (Some(planned), Some(predicate)) => {
+            let Some(record) = store.type_predicate(predicate) else {
+                return false;
+            };
+            let narrowed = planned
+                .narrowed_type
+                .map(|node| cached_annotation_identity(store, node, false));
+            annotation == Some(planned.node)
+                && signature.declaration() == Some(planned.owner)
+                && record.kind() == planned.kind
+                && record.parameter_index() == planned.parameter_index
+                && record.type_id() == narrowed.flatten()
+                && narrowed.is_none_or(|narrowed| narrowed.is_some())
+                && store.symbol_node_links(planned.parameter_name)
+                    == Some(&SymbolNodeLinks {
+                        resolved_symbol: Some(planned.parameter_symbol),
+                    })
+        }
+    }
+}
+
 /// Plans one exact source callable without publishing semantic records.
 pub(super) fn plan_source_callable(
     store: &CanonicalTypeMapperStore,
@@ -2476,6 +2746,7 @@ fn plan_source_callable_with_owner_shape(
         });
     }
 
+    let mut type_predicate = None;
     let (return_type, return_end) = if let Some(return_id) = view.return_type {
         let type_node = NodeRef::new(declaration.arena, declaration.file, return_id);
         let return_record = preflight_node(store, host, type_node)?;
@@ -2489,9 +2760,25 @@ fn plan_source_callable_with_owner_shape(
         }
         let identity_node = peel_parenthesized_type(store, host, type_node)?;
         if preflight_node(store, host, identity_node)?.kind == SyntaxKind::TypePredicate {
-            return Err(SourceCallableError::Unsupported(
-                SourceCallableUnsupported::TypePredicate(type_node),
-            ));
+            if view.family != SourceCallableFamily::FunctionDeclaration
+                || !type_parameters.is_empty()
+                || matches!(owner_shape, SourceCallableOwnerShape::AmbientOverload(_))
+            {
+                return Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::TypePredicate(type_node),
+                ));
+            }
+            let predicate = plan_callable_type_predicate(store, host, identity_node)?;
+            if predicate.owner != declaration
+                || parameters
+                    .get(usize::try_from(predicate.parameter_index).unwrap_or(usize::MAX))
+                    .is_none_or(|parameter| parameter.symbol != predicate.parameter_symbol)
+            {
+                return Err(invariant(SourceCallableInvariant::InvalidSyntax(
+                    identity_node,
+                )));
+            }
+            type_predicate = Some(predicate);
         }
         (
             SourceCallableReturnPlan::Annotated {
@@ -2622,6 +2909,7 @@ fn plan_source_callable_with_owner_shape(
         generic_return_type_parameter_index: None,
         parameters,
         return_type,
+        type_predicate,
         body_mode,
         is_async,
         body,
@@ -8222,7 +8510,11 @@ pub(super) fn validate_stored_source_callable(
         || signature_record.resolved_min_argument_count() != -1
         || signature_record.declaration() != Some(declaration)
         || signature_record.this_parameter().is_some()
-        || signature_record.resolved_type_predicate().is_some()
+        || !valid_stored_callable_type_predicate(
+            store,
+            signature_record,
+            return_annotation.map(|(annotation, _)| annotation),
+        )
         || signature_record.target().is_some()
         || signature_record.mapper().is_some()
         || signature_record.isolated_signature_type().is_some()
@@ -8402,6 +8694,13 @@ pub(super) fn validate_stored_source_callable(
         edges.push(return_type);
     } else if store.signature_has_circular_return_type(signature) {
         return StoredSourceCallableValidation::Malformed;
+    }
+    if let Some(narrowed) = signature_record
+        .resolved_type_predicate()
+        .and_then(|predicate| store.type_predicate(predicate))
+        .and_then(super::signatures::TypePredicate::type_id)
+    {
+        edges.push(narrowed);
     }
     StoredSourceCallableValidation::Valid(edges)
 }
@@ -9007,7 +9306,14 @@ fn validate_signature(
             != Some(expected_type_parameters.as_slice())
         || record.parameters() != expected_parameters
         || record.this_parameter().is_some()
-        || record.resolved_type_predicate().is_some()
+        || !valid_planned_callable_type_predicate(
+            store,
+            record,
+            plan.return_type
+                .annotation_identity()
+                .map(|(annotation, _)| annotation),
+            plan.type_predicate,
+        )
         || record.target().is_some()
         || record.mapper().is_some()
         || record.isolated_signature_type().is_some()
@@ -9976,6 +10282,208 @@ mod tests {
             Err(SourceCallableError::Invariant(
                 SourceCallableInvariant::InvalidOwnerSymbol(declaration),
             )),
+        );
+    }
+
+    #[test]
+    fn source_type_predicates_publish_exact_signature_metadata_cold_and_warm() {
+        for (index, (source, expected_kind, expected_parameter, has_narrowed_type)) in [
+            (
+                "declare function isString(value: unknown): value is string;",
+                TypePredicateKind::Identifier,
+                0,
+                true,
+            ),
+            (
+                "declare function assertString(value: unknown): asserts value is string;",
+                TypePredicateKind::AssertsIdentifier,
+                0,
+                true,
+            ),
+            (
+                "declare function assertTruth(value: unknown): asserts value;",
+                TypePredicateKind::AssertsIdentifier,
+                0,
+                false,
+            ),
+            (
+                "declare function selectString(first: number, value: unknown): value is string;",
+                TypePredicateKind::Identifier,
+                1,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture =
+                QueryFixture::new(source, FileId::new(9_850 + u32::try_from(index).unwrap()));
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap();
+            let signature = fixture
+                .store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert!(
+                fixture
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_type_predicate()
+                    .is_none()
+            );
+
+            let expected_return = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                if expected_kind == TypePredicateKind::Identifier {
+                    bootstrap.boolean_type
+                } else {
+                    bootstrap.void_type
+                }
+            };
+            assert_eq!(
+                fixture.query_return(signature, &mut diagnostics),
+                Ok(expected_return),
+            );
+            let predicate = fixture
+                .store
+                .signature(signature)
+                .and_then(Signature::resolved_type_predicate)
+                .and_then(|predicate| fixture.store.type_predicate(predicate))
+                .unwrap();
+            assert_eq!(predicate.kind(), expected_kind);
+            assert_eq!(predicate.parameter_index(), expected_parameter);
+            assert_eq!(predicate.parameter_name(), "value");
+            assert_eq!(
+                predicate.type_id(),
+                has_narrowed_type
+                    .then_some(fixture.store.intrinsic_bootstrap().unwrap().string_type),
+            );
+            assert!(matches!(
+                validate_stored_source_callable(&fixture.store, callable),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+            assert!(diagnostics.is_empty());
+
+            let warm = (
+                generic_transaction_state(&fixture.store),
+                fixture.store.type_predicate_len(),
+            );
+            assert_eq!(
+                fixture.query_return(signature, &mut diagnostics),
+                Ok(expected_return),
+            );
+            assert_eq!(
+                fixture.query_callable(declaration, owner, &mut diagnostics),
+                Ok(callable),
+            );
+            assert_eq!(
+                (
+                    generic_transaction_state(&fixture.store),
+                    fixture.store.type_predicate_len(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn source_type_predicates_reject_foreign_parameters_and_forged_narrowing() {
+        let mut invalid = QueryFixture::new(
+            "declare function isString(value: unknown): other is string;",
+            FileId::new(9_854),
+        );
+        let declaration = invalid
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    invalid.parsed.arena.id(),
+                    invalid.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = invalid.bound.symbol(declaration).unwrap();
+        let before = generic_transaction_state(&invalid.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(
+            invalid
+                .query_callable(declaration, owner, &mut diagnostics)
+                .is_err()
+        );
+        assert_eq!(generic_transaction_state(&invalid.store), before);
+
+        let mut forged = QueryFixture::new(
+            "declare function isString(value: unknown): value is string;",
+            FileId::new(9_855),
+        );
+        let declaration = forged
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    forged.parsed.arena.id(),
+                    forged.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = forged.bound.symbol(declaration).unwrap();
+        let callable = forged
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = forged
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        forged.query_return(signature, &mut diagnostics).unwrap();
+        let number = forged.store.intrinsic_bootstrap().unwrap().number_type;
+        let wrong = forged
+            .store
+            .alloc_type_predicate(TypePredicateKind::Identifier, 0, "value", Some(number))
+            .unwrap();
+        assert!(
+            forged
+                .store
+                .set_signature_resolved_type_predicate(signature, Some(wrong))
+        );
+        let before = (
+            generic_transaction_state(&forged.store),
+            forged.store.type_predicate_len(),
+        );
+
+        assert!(matches!(
+            forged.query_return(signature, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(cached),
+            )) if cached == signature
+        ));
+        assert_eq!(
+            (
+                generic_transaction_state(&forged.store),
+                forged.store.type_predicate_len(),
+            ),
+            before,
         );
     }
 
