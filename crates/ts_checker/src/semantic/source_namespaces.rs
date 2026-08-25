@@ -1863,7 +1863,11 @@ fn namespace_generic_annotation_requires_deferral(
     namespace: SemanticSymbolId,
     annotation: NodeRef,
 ) -> Result<bool, SourceCheckError> {
-    if authenticated_react_mixin_statics_annotation(arena, bound, store, namespace, annotation) {
+    if authenticated_react_mixin_statics_annotation(arena, bound, store, namespace, annotation)
+        || authenticated_react_mixin_display_name_annotation(
+            arena, bound, store, namespace, annotation,
+        )
+    {
         return Ok(true);
     }
     let mut pending = vec![annotation];
@@ -1942,6 +1946,115 @@ fn namespace_generic_annotation_requires_deferral(
         record.for_each_child(|nested| pending.push(child(node, nested)));
     }
     Ok(false)
+}
+
+/// Keeps only React Mixin's authenticated optional string display name cold.
+fn authenticated_react_mixin_display_name_annotation(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    annotation: NodeRef,
+) -> bool {
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let Some(namespace_owner) = store.symbol(namespace) else {
+        return false;
+    };
+    let Some(annotation_record) = arena.get(annotation.node) else {
+        return false;
+    };
+    let Some(property) = annotation_record
+        .parent
+        .map(|parent| child(annotation, parent))
+    else {
+        return false;
+    };
+    let Some(property_record) = arena.get(property.node) else {
+        return false;
+    };
+    let NodeData::PropertyDeclaration(property_data) = &property_record.data else {
+        return false;
+    };
+    let name = child(property, property_data.name);
+    let Some(name_record) = arena.get(name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return false;
+    };
+    let Some(interface) = property_record.parent.map(|parent| child(property, parent)) else {
+        return false;
+    };
+    let Some(interface_symbol) = bound
+        .symbol(interface)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(interface_owner) = store.symbol(interface_symbol) else {
+        return false;
+    };
+    let Some(property_symbol) = bound
+        .symbol(property)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(property_owner) = store.symbol(property_symbol) else {
+        return false;
+    };
+    let Some(string) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.string_type)
+    else {
+        return false;
+    };
+
+    facts.is_declaration_file()
+        && !facts.is_default_library()
+        && namespace_owner.name().as_utf8() == Some("React")
+        && namespace_owner.flags().intersects(SymbolFlags::NAMESPACE)
+        && namespace_owner.check_flags() == CheckFlags::NONE
+        && store.get_merged_symbol(namespace) == Some(namespace)
+        && interface_owner.name().as_utf8() == Some("Mixin")
+        && interface_owner.flags().without(SymbolFlags::TRANSIENT) == SymbolFlags::INTERFACE
+        && interface_owner.check_flags() == CheckFlags::NONE
+        && store.get_parent_of_symbol(interface_symbol) == Some(namespace)
+        && namespace_owner
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("Mixin"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            == Some(interface_symbol)
+        && annotation_record.kind == SyntaxKind::StringKeyword
+        && annotation_record.flags.0 == 0
+        && annotation_record.parent == Some(property.node)
+        && property_record.kind == SyntaxKind::PropertyDeclaration
+        && property_record.flags.0 == 0
+        && property_record.parent == Some(interface.node)
+        && property_data.type_ == Some(annotation.node)
+        && property_data.postfix_token.is_some()
+        && property_data.initializer.is_none()
+        && name_record.kind == SyntaxKind::Identifier
+        && name_record.flags.0 == 0
+        && name_record.parent == Some(property.node)
+        && identifier.flow_node.is_none()
+        && identifier.text == "displayName"
+        && property_owner.name().as_utf8() == Some("displayName")
+        && property_owner.flags() == SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL
+        && property_owner.check_flags() == CheckFlags::NONE
+        && store.get_parent_of_symbol(property_symbol) == Some(interface_symbol)
+        && interface_owner
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("displayName"))
+            == Some(property_symbol)
+        && store.type_node_links(annotation).is_none_or(|links| {
+            links.outer_type_parameters.is_none()
+                && links.resolved_type.is_none_or(|cached| cached == string)
+        })
 }
 
 /// Keeps only React Mixin's optional `{ [key: string]: any }` statics property cold.
@@ -14918,6 +15031,7 @@ mod tests {
                 "interface Mixin<P, S> extends ComponentLifecycle<P, S> { ",
                 "mixins?: Array<Mixin<P, S>>; ",
                 "statics?: { [key: string]: any; }; ",
+                "displayName?: string; ",
                 "getDefaultProps?(): P; getInitialState?(): S; ",
                 "} }",
             ),
@@ -14937,12 +15051,136 @@ mod tests {
         };
         let mixins = generic.properties[0].annotation;
         let statics = generic.properties[1].annotation;
+        let display_name = generic.properties[2].annotation;
 
         assert!(annotations.contains(&mixins));
         assert!(generic.annotation_is_deferred(mixins));
         assert!(annotations.contains(&statics));
         assert!(generic.annotation_is_deferred(statics));
+        assert!(annotations.contains(&display_name));
+        assert!(generic.annotation_is_deferred(display_name));
         assert_eq!(generic.methods.len(), 2);
+    }
+
+    #[test]
+    fn react_mixin_display_name_rejects_forged_exports_and_cached_types() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface Mixin<P, S> { displayName?: string; } ",
+                "interface Other<P, S> {} ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface {
+                symbol: mixin,
+                generic: Some(generic),
+                ..
+            },
+            SourceNamespaceMemberPlan::Interface { symbol: other, .. },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("React must retain the generic Mixin and its unrelated sibling")
+        };
+        let mixin = *mixin;
+        let other = *other;
+        let annotation = generic.properties[0].annotation;
+        let exports = fixture
+            .context
+            .store()
+            .symbol(namespace.symbol)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let number = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+
+        assert!(generic.annotation_is_deferred(annotation));
+        assert!(
+            fixture
+                .context
+                .store()
+                .type_node_links(annotation)
+                .is_none()
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert!(
+            fixture
+                .context
+                .store()
+                .type_node_links(annotation)
+                .is_none()
+        );
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("Mixin"),
+                other,
+            ),
+            Some(Some(mixin)),
+        );
+        {
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+            assert!(!authenticated_react_mixin_display_name_annotation(
+                arena,
+                bound,
+                fixture.context.store(),
+                namespace.symbol,
+                annotation,
+            ));
+        }
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("Mixin"),
+                mixin,
+            ),
+            Some(Some(other)),
+        );
+
+        assert!(fixture.context.store_mut_for_test().set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).is_err());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
     }
 
     #[test]
