@@ -22100,6 +22100,23 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         for argument in &reference.type_arguments {
                             type_arguments.push(self.execute_type_node(*argument, plan, prepared)?);
                         }
+                        if let Some(cached) = cached_resolved_type {
+                            let cached_reference = validate_direct_generic_reference(
+                                self.store, cached,
+                            )
+                            .map_err(|_| {
+                                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(
+                                    node,
+                                ))
+                            })?;
+                            if cached_reference.target != declared_type
+                                || cached_reference.type_arguments != type_arguments
+                            {
+                                return Err(type_node_unavailable(
+                                    TypeNodeUnavailable::InvalidTypeReference(node),
+                                ));
+                            }
+                        }
                         let constraints = self.resolve_direct_generic_reference_constraints(
                             node,
                             &reference,
@@ -22123,6 +22140,27 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                                 &type_arguments,
                                 &constraints,
                             )?;
+                        } else if !constraints.is_empty()
+                            && self
+                                .store
+                                .symbol(symbol)
+                                .and_then(|owner| owner.name().as_utf8())
+                                == Some("DetailedHTMLFactory")
+                            && self
+                                .store
+                                .get_parent_of_symbol(symbol)
+                                .and_then(|namespace| self.store.symbol(namespace))
+                                .and_then(|namespace| namespace.name().as_utf8())
+                                == Some("React")
+                            && !self.authenticated_react_html_factory_constraints(
+                                &reference,
+                                &type_arguments,
+                                &constraints,
+                            )
+                        {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::InvalidTypeReference(node),
+                            ));
                         }
                         instantiated
                     } else {
