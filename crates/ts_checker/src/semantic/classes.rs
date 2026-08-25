@@ -20,6 +20,7 @@
 //! Invalid method overload chains preserve their merged binder symbols and
 //! report exact implementation-name, missing-body, and duplicate-body errors.
 //! Abstract methods retain exact invalid-class and implemented-method errors.
+//! Invalid class-field variance modifiers retain their exact TS1274 spans.
 //! Direct classes can also retain one string-to-number index signature.
 //! Annotated fields admit one authenticated ambient-function decorator.
 //! One direct getter/setter pair can expose an annotated numeric property.
@@ -10987,6 +10988,130 @@ fn plan_abstract_class_method_diagnostics(
     Some(diagnostics)
 }
 
+fn plan_class_field_variance_modifier_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    members: &ts_ast::NodeList,
+) -> Option<Vec<ClassGrammarDiagnostic>> {
+    if members.nodes.is_empty() || members.nodes.len() > 2 {
+        return None;
+    }
+    let table = store
+        .symbol(owner)
+        .and_then(Symbol::members)
+        .and_then(|members| store.symbol_table(members))?;
+    if table.len() != members.nodes.len() {
+        return None;
+    }
+    let source = host
+        .source(declaration)
+        .and_then(|(arena, _)| arena.source_text())?;
+    let mut diagnostics = Vec::new();
+    diagnostics.try_reserve_exact(members.nodes.len()).ok()?;
+    let mut names = HashSet::new();
+    names.try_reserve(members.nodes.len()).ok()?;
+    let mut previous_end = members.range.start;
+
+    for member in &members.nodes {
+        let member = NodeRef::new(declaration.arena, declaration.file, *member);
+        let record = preflight_node(store, host, member).ok()?;
+        let NodeData::PropertyDeclaration(property) = &record.data else {
+            return None;
+        };
+        let modifiers = property.modifiers.as_ref()?;
+        let [modifier] = modifiers.list.nodes.as_slice() else {
+            return None;
+        };
+        let modifier = NodeRef::new(member.arena, member.file, *modifier);
+        let modifier_record = preflight_node(store, host, modifier).ok()?;
+        let modifier_text = match modifier_record.kind {
+            SyntaxKind::InKeyword => "in",
+            SyntaxKind::OutKeyword => "out",
+            _ => return None,
+        };
+        let (name, name_text) = accessor_name(store, host, member, property.name).ok()?;
+        let name_record = preflight_node(store, host, name).ok()?;
+        let initializer = NodeRef::new(member.arena, member.file, property.initializer?);
+        let initializer_record = preflight_node(store, host, initializer).ok()?;
+        let NodeData::NumericLiteral(literal) = &initializer_record.data else {
+            return None;
+        };
+        if record.kind != SyntaxKind::PropertyDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(declaration.node)
+            || record.range.start < previous_end
+            || record.range.end > members.range.end
+            || property.postfix_token.is_some()
+            || property.symbol.is_some()
+            || property.type_.is_some()
+            || property.facts != 0
+            || modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifiers.list.range.start != record.range.start
+            || modifiers.list.range.end > name_record.range.start
+            || modifier_record.flags.0 != 0
+            || modifier_record.parent != Some(member.node)
+            || !matches!(modifier_record.data, NodeData::Token(_))
+            || modifier_record.range.start != record.range.start
+            || modifier_record.range.end > modifiers.list.range.end
+            || source.get(
+                usize::try_from(modifier_record.range.start.get()).ok()?
+                    ..usize::try_from(modifier_record.range.end.get()).ok()?,
+            ) != Some(modifier_text)
+            || name_record.range.start < modifiers.list.range.end
+            || name_record.range.end > initializer_record.range.start
+            || initializer_record.kind != SyntaxKind::NumericLiteral
+            || initializer_record.flags.0 != 0
+            || initializer_record.parent != Some(member.node)
+            || initializer_record.range.end > record.range.end
+            || literal.token_flags.0 != 0
+            || ts_jsnum::from_string(&literal.text).is_nan()
+            || source.get(
+                usize::try_from(initializer_record.range.start.get()).ok()?
+                    ..usize::try_from(initializer_record.range.end.get()).ok()?,
+            ) != Some(literal.text.as_str())
+            || !names.insert(name_text.clone())
+        {
+            return None;
+        }
+        previous_end = record.range.end;
+
+        let symbol = bound_symbol(store, host, member)?;
+        let symbol_record = store.symbol(symbol)?;
+        if symbol_record.flags() != SymbolFlags::PROPERTY
+            || symbol_record.check_flags() != CheckFlags::NONE
+            || symbol_record.name().as_utf8() != Some(name_text.as_str())
+            || symbol_record.declarations() != Some(&[member])
+            || symbol_record.value_declaration() != Some(member)
+            || symbol_record.members().is_some()
+            || symbol_record.exports().is_some()
+            || symbol_record.parent() != Some(owner)
+            || symbol_record.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || table.get_source(&name_text) != Some(symbol)
+            || store
+                .value_symbol_links(symbol)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || store
+                .type_node_links(initializer)
+                .is_some_and(|links| links != &TypeNodeLinks::default())
+        {
+            return None;
+        }
+
+        diagnostics.push(ClassGrammarDiagnostic {
+            node: modifier,
+            range_override: None,
+            code: 1274,
+            arguments: vec![modifier_text.to_owned()],
+        });
+    }
+
+    Some(diagnostics)
+}
+
 /// Authenticates supported class grammar failures without publishing class types.
 pub(super) fn plan_class_grammar_diagnostics(
     store: &CanonicalTypeMapperStore,
@@ -11118,6 +11243,24 @@ pub(super) fn plan_class_grammar_diagnostics(
         && class.heritage_clauses.is_none()
         && let Some(diagnostics) =
             plan_class_method_overload_diagnostics(store, host, symbol, declaration, &class.members)
+    {
+        return Some(ClassGrammarDiagnosticPlan {
+            declaration,
+            symbol,
+            diagnostics,
+        });
+    }
+
+    if !ambient
+        && class.heritage_clauses.is_none()
+        && export_table.len() == 1
+        && let Some(diagnostics) = plan_class_field_variance_modifier_diagnostics(
+            store,
+            host,
+            symbol,
+            declaration,
+            &class.members,
+        )
     {
         return Some(ClassGrammarDiagnosticPlan {
             declaration,
@@ -19695,6 +19838,174 @@ mod tests {
                 warm,
                 "{source}",
             );
+        }
+    }
+
+    #[test]
+    fn class_field_variance_modifiers_preserve_exact_spans_and_cold_state() {
+        let cases: &[(&str, &[&str])] = &[
+            ("class C { in x = 1; out y = 2; }", &["in", "out"]),
+            ("class C { out value = 1; }", &["out"]),
+        ];
+
+        for (source, expected) in cases {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "C");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            let grammar = plan_class_grammar_diagnostics(&fixture.store, &host, owner)
+                .expect("invalid class-field variance modifiers retain checker diagnostics");
+
+            assert_eq!(grammar.diagnostics.len(), expected.len(), "{source}");
+            for (diagnostic, expected) in grammar.diagnostics.iter().zip(*expected) {
+                assert_eq!(diagnostic.code, 1274, "{source}");
+                assert_eq!(diagnostic.arguments, [*expected], "{source}");
+                assert!(diagnostic.range_override.is_none());
+                let range = fixture
+                    .parsed
+                    .arena
+                    .get(diagnostic.node.node)
+                    .unwrap()
+                    .range;
+                assert_eq!(
+                    &source[range.start.get() as usize..range.end.get() as usize],
+                    *expected,
+                    "{source}",
+                );
+            }
+            assert_eq!(
+                plan_class_grammar_diagnostics(&fixture.store, &host, owner),
+                Some(grammar),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn class_field_variance_modifiers_reject_private_and_unrelated_shapes() {
+        for source in [
+            "class C { public in x = 1; }",
+            "class C { in #value = 1; }",
+            "class C { in x = 'ready'; }",
+            "class C { in x = 1; y = 2; }",
+            "class C { in x = 1; out y = 2; out z = 3; }",
+            "class C { in = 1; out = 2; }",
+        ] {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "C");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                plan_class_grammar_diagnostics(&fixture.store, &host, owner).is_none(),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn class_field_variance_modifiers_reject_forged_symbols_and_poisoned_caches() {
+        for poison in 0..3 {
+            let mut fixture = fixture("class C { in x = 1; out y = 2; }");
+            let owner = class_symbol(&fixture, "C");
+            let declaration = class_node(&fixture, "C");
+            let NodeData::ClassDeclaration(class) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("the fixture retains its class declaration")
+            };
+            let field = NodeRef::new(declaration.arena, declaration.file, class.members.nodes[0]);
+            let NodeData::PropertyDeclaration(property) =
+                &fixture.parsed.arena.get(field.node).unwrap().data
+            else {
+                panic!("the fixture retains its variance-modified field")
+            };
+            let initializer = NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                property.initializer.unwrap(),
+            );
+            let bound = &fixture.files[&fixture.file];
+            let symbol = bound.symbol(field).unwrap();
+            match poison {
+                0 => assert!(fixture.store.set_symbol_flags(
+                    symbol,
+                    SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL,
+                    CheckFlags::NONE,
+                )),
+                1 => {
+                    let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                    assert!(fixture.store.set_value_symbol_links(
+                        symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(number),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                2 => {
+                    let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+                    assert!(fixture.store.set_type_node_links(
+                        initializer,
+                        TypeNodeLinks {
+                            resolved_type: Some(string),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                _ => unreachable!("only authenticated variance poison cases are visited"),
+            }
+            let host = host(&fixture.parsed.arena, bound);
+            let poisoned = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                plan_class_grammar_diagnostics(&fixture.store, &host, owner).is_none(),
+                "poison case {poison}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                poisoned,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
         }
     }
 

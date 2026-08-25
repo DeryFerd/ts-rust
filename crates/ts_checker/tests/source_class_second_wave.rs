@@ -413,6 +413,10 @@ fn unsupported_class_grammar_reports_exact_modifier_accessor_and_heritage_errors
             &[(1028, "public")],
         ),
         (
+            "class Model { in input = 1; out output = 2; }",
+            &[(1274, "in"), (1274, "out")],
+        ),
+        (
             "class Model { set value(input = 0) {} static set value(input = 0) {} }",
             &[(1052, "value"), (1052, "value")],
         ),
