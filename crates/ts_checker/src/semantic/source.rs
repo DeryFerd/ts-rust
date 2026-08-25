@@ -63121,6 +63121,114 @@ class Foo2 {
     }
 
     #[test]
+    fn parenthesized_object_property_functions_preserve_inferred_returns_and_owner_identity() {
+        let source = parsed(concat!(
+            "const value = { ",
+            "first: (function () { return 42; }), ",
+            "second: ((function () { return 'ready'; })), ",
+            "}; ",
+            "const numberResult = value.first(); ",
+            "const stringResult = value.second();",
+        ));
+        let file = FileId::new(9_980);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let object = variable_initializer(&source, file, "value");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let (_, bound) = context.file(file).unwrap();
+        for (name, expected) in [("first", number), ("second", string)] {
+            let mut expression = object_property_initializer(&source, file, object, name);
+            while let NodeData::ParenthesizedExpression(parenthesized) =
+                &source.arena.get(expression.node).unwrap().data
+            {
+                expression =
+                    NodeRef::new(expression.arena, expression.file, parenthesized.expression);
+            }
+            let owner = bound.symbol(expression).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_eq!(object_property_type(&context, object, name), callable);
+            assert_eq!(resolved_node_type(&context, expression), callable);
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(expected),
+            );
+        }
+        assert_eq!(
+            variable_value_type(&context, &source, file, "numberResult"),
+            number
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "stringResult"),
+            string
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn parenthesized_object_property_functions_reject_unsupported_function_shapes() {
+        for (index, initializer) in [
+            "(function named() { return 1; })",
+            "(function (value: number) { return value; })",
+            "(function (): number { return 1; })",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = format!("const value = {{ method: {initializer} }};");
+            let source = parsed(&text);
+            let file = FileId::new(9_981 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let function = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                    node,
+                    kind: SyntaxKind::FunctionExpression,
+                    role: SourceSyntaxRole::VariableInitializer,
+                })) if node == function
+            ));
+            let (_, bound) = context.file(file).unwrap();
+            let owner = bound.symbol(function).unwrap();
+            assert!(
+                context
+                    .store()
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn anonymous_function_expression_callbacks_retain_their_inferred_signatures() {
         let source = parsed(concat!(
             "function accept(callback: () => number): void {} ",
