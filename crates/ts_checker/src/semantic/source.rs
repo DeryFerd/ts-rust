@@ -15920,14 +15920,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         let initializer = self.plan_expression(initializer);
-        if let Some(circular) = circular {
-            if !self.prior_variables.remove(&circular.symbol)
-                || !self.readable_variables.remove(&circular.symbol)
-            {
-                return Err(SourceCheckError::Variable(
-                    VariableInvariant::InvalidSymbolShape(circular.symbol),
-                ));
-            }
+        if let Some(circular) = circular
+            && (!self.prior_variables.remove(&circular.symbol)
+                || !self.readable_variables.remove(&circular.symbol))
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(circular.symbol),
+            ));
         }
         let initializer = initializer?;
         let mut elements = Vec::with_capacity(bindings.len());
