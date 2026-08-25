@@ -19402,6 +19402,7 @@ fn check_expression_type(
             };
             validate_conditional_scalar_expectation(
                 store,
+                global_types,
                 &conditional.condition,
                 condition.result,
                 conditional.condition_expectation,
@@ -19501,6 +19502,7 @@ fn check_expression_type(
             };
             validate_conditional_scalar_expectation(
                 store,
+                global_types,
                 &conditional.when_true,
                 when_true.result,
                 conditional.when_true_expectation,
@@ -19545,6 +19547,7 @@ fn check_expression_type(
             };
             validate_conditional_scalar_expectation(
                 store,
+                global_types,
                 &conditional.when_false,
                 when_false.result,
                 conditional.when_false_expectation,
@@ -21195,11 +21198,12 @@ fn check_uncached_conditional_scalar(
 
 fn validate_conditional_scalar_expectation(
     store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
     expression: &PlannedExpression,
     type_: TypeId,
     expectation: ConditionalScalarExpectation,
 ) -> Result<(), SourceCheckError> {
-    store.validate_union_constituent(type_)?;
+    store.validate_union_constituent_with_global_types(global_types, type_)?;
     match expectation {
         ConditionalScalarExpectation::Exact {
             type_: expected, ..
