@@ -3472,9 +3472,14 @@ fn check_react_jsx_fragment_children(
             };
             *attributes
         }
-        StoredCallableSetValidation::NotCallable => {
-            authenticated_fragment_component_attributes(store, host, fragment, plan.opening)?
-        }
+        StoredCallableSetValidation::NotCallable => authenticated_fragment_component_attributes(
+            store,
+            host,
+            fragment,
+            plan.opening,
+            options,
+            diagnostics,
+        )?,
         StoredCallableSetValidation::Pending { .. }
         | StoredCallableSetValidation::Malformed { .. }
         | StoredCallableSetValidation::Valid { .. } => {
@@ -4622,8 +4627,14 @@ fn resolve_component_tag(
                     .and_then(|record| record.name().as_utf8())
                     == Some("Fragment") =>
         {
-            let attributes =
-                authenticated_fragment_component_attributes(store, host, symbol, tag.node)?;
+            let attributes = authenticated_fragment_component_attributes(
+                store,
+                host,
+                symbol,
+                tag.node,
+                options,
+                diagnostics,
+            )?;
             let signature =
                 intrinsic_signature(store, opening, attributes, namespace.element_type)?;
             return Ok((attributes, signature));
@@ -4767,35 +4778,37 @@ fn resolve_namespace_component_type(
         return Err(SourceCheckError::Property(annotation));
     }
 
-    let type_ = if let NodeData::TypeReferenceNode(reference) = &annotation_record.data
-        && record.name().as_utf8() == Some("Fragment")
+    let is_fragment = record.name().as_utf8() == Some("Fragment");
+    let legacy_component = if let NodeData::TypeReferenceNode(reference) = &annotation_record.data
+        && is_fragment
+    {
+        let name = child_ref(annotation, reference.type_name);
+        host.node(name).is_some_and(|record| {
+            matches!(
+                &record.data,
+                NodeData::Identifier(identifier) if identifier.text == "ComponentType"
+            )
+        })
+    } else {
+        false
+    };
+    let type_ = if legacy_component {
+        resolve_legacy_react_fragment_component(
+            store,
+            host,
+            member,
+            annotation,
+            options,
+            diagnostics,
+        )?
+    } else if let NodeData::TypeReferenceNode(reference) = &annotation_record.data
+        && is_fragment
     {
         let name = child_ref(annotation, reference.type_name);
         let name_record = host.node(name).ok_or(SourceCheckError::Property(name))?;
         let NodeData::Identifier(identifier) = &name_record.data else {
             return Err(SourceCheckError::Property(name));
         };
-        if identifier.text == "ComponentType" {
-            if annotation_record.kind != SyntaxKind::TypeReference
-                || reference.type_arguments.is_some()
-                || name_record.kind != SyntaxKind::Identifier
-                || name_record.flags.0 != 0
-                || name_record.parent != Some(annotation.node)
-                || identifier.flow_node.is_some()
-            {
-                return Err(SourceCheckError::Property(annotation));
-            }
-            validate_legacy_react_fragment_component_type(
-                store,
-                host,
-                member.namespace,
-                annotation,
-                name,
-            )?;
-            return Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Property(annotation),
-            ));
-        }
         let arguments = reference
             .type_arguments
             .as_ref()
@@ -5064,11 +5077,191 @@ fn validate_legacy_react_fragment_component_type(
     Ok(())
 }
 
+/// Authenticates React 16's `ComponentType<P = {}>` and selects its real SFC branch.
+#[allow(clippy::too_many_lines)] // Alias, defaults, namespace exports, and generic references share one proof.
+fn resolve_legacy_react_fragment_component(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    member: &JsxNamespaceMemberPlan,
+    annotation: NodeRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<TypeId, SourceCheckError> {
+    let invalid = || SourceCheckError::Property(annotation);
+    let record = host.node(annotation).ok_or_else(invalid)?;
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return Err(invalid());
+    };
+    let name = child_ref(annotation, reference.type_name);
+    validate_legacy_react_fragment_component_type(store, host, member.namespace, annotation, name)?;
+    let name_record = host.node(name).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    let namespace = store.symbol(member.namespace).ok_or_else(invalid)?;
+    let exports = namespace
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or_else(invalid)?;
+    let alias = exports
+        .get_source("ComponentType")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let alias_record = store.symbol(alias).ok_or_else(invalid)?;
+    let Some([declaration]) = alias_record.declarations() else {
+        return Err(invalid());
+    };
+    let declaration = *declaration;
+    let declaration_record = host.node(declaration).ok_or_else(invalid)?;
+    let NodeData::TypeAliasDeclaration(alias_data) = &declaration_record.data else {
+        return Err(invalid());
+    };
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let parameters = alias_data.type_parameters.as_ref().ok_or_else(invalid)?;
+    let [parameter_id] = parameters.nodes.as_slice() else {
+        return Err(invalid());
+    };
+    let parameter = child_ref(declaration, *parameter_id);
+    let parameter_record = host.node(parameter).ok_or_else(invalid)?;
+    let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Err(invalid());
+    };
+    let parameter_name = child_ref(parameter, parameter_data.name);
+    let parameter_name_record = host.node(parameter_name).ok_or_else(invalid)?;
+    let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+        return Err(invalid());
+    };
+    let default = parameter_data
+        .default_type
+        .map(|default| child_ref(parameter, default))
+        .ok_or_else(invalid)?;
+    let default_record = host.node(default).ok_or_else(invalid)?;
+    let NodeData::TypeLiteralNode(default_literal) = &default_record.data else {
+        return Err(invalid());
+    };
+    let body = child_ref(declaration, alias_data.type_);
+    let body_record = host.node(body).ok_or_else(invalid)?;
+    let NodeData::UnionTypeNode(union) = &body_record.data else {
+        return Err(invalid());
+    };
+    let [class_id, stateless_id] = union.types.nodes.as_slice() else {
+        return Err(invalid());
+    };
+    let parameter_symbol = bound
+        .symbol(parameter)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::TypeReference
+        || reference.type_arguments.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(annotation.node)
+        || identifier.flow_node.is_some()
+        || identifier.text != "ComponentType"
+        || !namespace.flags().intersects(SymbolFlags::NAMESPACE)
+        || namespace.name().as_utf8() != Some("React")
+        || !alias_record.flags().contains(SymbolFlags::TYPE_ALIAS)
+        || alias_record.check_flags() != CheckFlags::NONE
+        || alias_record.name().as_utf8() != Some("ComponentType")
+        || store.get_parent_of_symbol(alias) != Some(member.namespace)
+        || !host.symbol_matches(store, declaration, alias)
+        || declaration_record.kind != SyntaxKind::TypeAliasDeclaration
+        || declaration_record.flags.0 != 0
+        || parameters.has_trailing_comma
+        || parameter_record.kind != SyntaxKind::TypeParameter
+        || parameter_record.parent != Some(declaration.node)
+        || parameter_data.constraint.is_some()
+        || parameter_name_record.kind != SyntaxKind::Identifier
+        || parameter_name_record.parent != Some(parameter.node)
+        || parameter_identifier.text != "P"
+        || default_record.kind != SyntaxKind::TypeLiteral
+        || default_record.parent != Some(parameter.node)
+        || !default_literal.members.nodes.is_empty()
+        || body_record.kind != SyntaxKind::UnionType
+        || body_record.parent != Some(declaration.node)
+        || union.types.has_trailing_comma
+    {
+        return Err(invalid());
+    }
+
+    let mut stateless = None;
+    for (node, expected) in [
+        (*class_id, "ComponentClass"),
+        (*stateless_id, "StatelessComponent"),
+    ] {
+        let reference_node = child_ref(body, node);
+        let reference_record = host.node(reference_node).ok_or_else(invalid)?;
+        let NodeData::TypeReferenceNode(component) = &reference_record.data else {
+            return Err(invalid());
+        };
+        let component_name = child_ref(reference_node, component.type_name);
+        let component_name_record = host.node(component_name).ok_or_else(invalid)?;
+        let NodeData::Identifier(component_identifier) = &component_name_record.data else {
+            return Err(invalid());
+        };
+        let arguments = component.type_arguments.as_ref().ok_or_else(invalid)?;
+        let [argument_id] = arguments.nodes.as_slice() else {
+            return Err(invalid());
+        };
+        let argument = child_ref(reference_node, *argument_id);
+        let argument_record = host.node(argument).ok_or_else(invalid)?;
+        let NodeData::TypeReferenceNode(argument_reference) = &argument_record.data else {
+            return Err(invalid());
+        };
+        let argument_name = child_ref(argument, argument_reference.type_name);
+        let argument_name_record = host.node(argument_name).ok_or_else(invalid)?;
+        let NodeData::Identifier(argument_identifier) = &argument_name_record.data else {
+            return Err(invalid());
+        };
+        let symbol = exports
+            .get_source(expected)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        let owner = store.symbol(symbol).ok_or_else(invalid)?;
+        if reference_record.kind != SyntaxKind::TypeReference
+            || reference_record.parent != Some(body.node)
+            || component_name_record.kind != SyntaxKind::Identifier
+            || component_name_record.parent != Some(reference_node.node)
+            || component_identifier.text != expected
+            || arguments.has_trailing_comma
+            || argument_record.kind != SyntaxKind::TypeReference
+            || argument_record.parent != Some(reference_node.node)
+            || argument_reference.type_arguments.is_some()
+            || argument_name_record.kind != SyntaxKind::Identifier
+            || argument_name_record.parent != Some(argument.node)
+            || argument_identifier.text != "P"
+            || bound
+                .locals(declaration)
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source("P"))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(parameter_symbol)
+            || !owner.flags().contains(SymbolFlags::INTERFACE)
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some(expected)
+            || store.get_parent_of_symbol(symbol) != Some(member.namespace)
+        {
+            return Err(invalid());
+        }
+        if expected == "StatelessComponent" {
+            stateless = Some(symbol);
+        }
+    }
+
+    let props = CanonicalTypeQuery::new(store, host, options, diagnostics)?
+        .get_type_from_type_node(default)?;
+    let target = store.get_declared_type_of_symbol(host, stateless.ok_or_else(invalid)?)?;
+    create_direct_generic_reference(store, target, &[props], ObjectFlags::FROM_TYPE_NODE)
+        .map_err(|_| invalid())
+}
+
 fn authenticated_fragment_component_attributes(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
     location: NodeRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<TypeId, SourceCheckError> {
     let component = store
         .value_symbol_links(symbol)
@@ -5083,10 +5276,11 @@ fn authenticated_fragment_component_attributes(
         .type_payload(reference.target)
         .and_then(super::type_records::TypeRecord::symbol)
         .ok_or(SourceCheckError::Property(location))?;
-    if store
+    let target_name = store
         .symbol(target)
         .and_then(|record| record.name().as_utf8())
-        != Some("ExoticComponent")
+        .ok_or(SourceCheckError::Property(location))?;
+    if !matches!(target_name, "ExoticComponent" | "StatelessComponent")
         || store
             .symbol(symbol)
             .and_then(|record| record.name().as_utf8())
@@ -5102,7 +5296,166 @@ fn authenticated_fragment_component_attributes(
     {
         return Err(SourceCheckError::Property(location));
     }
+    if target_name == "StatelessComponent" {
+        return legacy_react_fragment_attributes(
+            store,
+            host,
+            symbol,
+            target,
+            location,
+            options,
+            diagnostics,
+        );
+    }
     Ok(*attributes)
+}
+
+/// Selects the authenticated `{ children?: ReactNode }` half of React 16 SFC props.
+#[allow(clippy::too_many_lines)] // Signature, generic parameter, and children property form one proof.
+fn legacy_react_fragment_attributes(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    fragment: SemanticSymbolId,
+    target: SemanticSymbolId,
+    location: NodeRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<TypeId, SourceCheckError> {
+    let invalid = || SourceCheckError::Property(location);
+    let namespace = store.get_parent_of_symbol(fragment).ok_or_else(invalid)?;
+    let owner = store.symbol(target).ok_or_else(invalid)?;
+    let call = owner
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get(InternalSymbolName::Call.as_ref()))
+        .and_then(|call| store.get_merged_symbol(call))
+        .ok_or_else(invalid)?;
+    let record = store.symbol(call).ok_or_else(invalid)?;
+    let Some([declaration]) = record.declarations() else {
+        return Err(invalid());
+    };
+    let declaration = *declaration;
+    let declaration_record = host.node(declaration).ok_or_else(invalid)?;
+    let NodeData::CallSignatureDeclaration(signature) = &declaration_record.data else {
+        return Err(invalid());
+    };
+    let [props, context] = signature.parameters.nodes.as_slice() else {
+        return Err(invalid());
+    };
+    let props = child_ref(declaration, *props);
+    let props_record = host.node(props).ok_or_else(invalid)?;
+    let NodeData::ParameterDeclaration(parameter) = &props_record.data else {
+        return Err(invalid());
+    };
+    let context = child_ref(declaration, *context);
+    let context_record = host.node(context).ok_or_else(invalid)?;
+    let NodeData::ParameterDeclaration(context_parameter) = &context_record.data else {
+        return Err(invalid());
+    };
+    let annotation = parameter
+        .type_
+        .map(|annotation| child_ref(props, annotation))
+        .ok_or_else(invalid)?;
+    let annotation_record = host.node(annotation).ok_or_else(invalid)?;
+    let NodeData::IntersectionTypeNode(intersection) = &annotation_record.data else {
+        return Err(invalid());
+    };
+    let [parameter_type, attributes] = intersection.types.nodes.as_slice() else {
+        return Err(invalid());
+    };
+    let parameter_type = child_ref(annotation, *parameter_type);
+    let parameter_record = host.node(parameter_type).ok_or_else(invalid)?;
+    let NodeData::TypeReferenceNode(parameter_reference) = &parameter_record.data else {
+        return Err(invalid());
+    };
+    let parameter_name = child_ref(parameter_type, parameter_reference.type_name);
+    let parameter_name_record = host.node(parameter_name).ok_or_else(invalid)?;
+    let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+        return Err(invalid());
+    };
+    let attributes = child_ref(annotation, *attributes);
+    let attributes_record = host.node(attributes).ok_or_else(invalid)?;
+    let NodeData::TypeLiteralNode(literal) = &attributes_record.data else {
+        return Err(invalid());
+    };
+    let [property] = literal.members.nodes.as_slice() else {
+        return Err(invalid());
+    };
+    let property = child_ref(attributes, *property);
+    let property_record = host.node(property).ok_or_else(invalid)?;
+    let NodeData::PropertySignatureDeclaration(children) = &property_record.data else {
+        return Err(invalid());
+    };
+    let name = child_ref(property, children.name);
+    let name_record = host.node(name).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    let child_type = child_ref(property, children.type_);
+    let child_record = host.node(child_type).ok_or_else(invalid)?;
+    let NodeData::TypeReferenceNode(child_reference) = &child_record.data else {
+        return Err(invalid());
+    };
+    let child_name = child_ref(child_type, child_reference.type_name);
+    let child_name_record = host.node(child_name).ok_or_else(invalid)?;
+    let NodeData::Identifier(child_identifier) = &child_name_record.data else {
+        return Err(invalid());
+    };
+    let react_node = store
+        .symbol(namespace)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source("ReactNode"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    if owner.name().as_utf8() != Some("StatelessComponent")
+        || store.get_parent_of_symbol(target) != Some(namespace)
+        || record.flags() != SymbolFlags::SIGNATURE
+        || record.check_flags() != CheckFlags::NONE
+        || store.get_parent_of_symbol(call) != Some(target)
+        || !host.symbol_matches(store, declaration, call)
+        || declaration_record.kind != SyntaxKind::CallSignature
+        || props_record.kind != SyntaxKind::Parameter
+        || props_record.parent != Some(declaration.node)
+        || parameter.question_token.is_some()
+        || context_record.kind != SyntaxKind::Parameter
+        || context_record.parent != Some(declaration.node)
+        || context_parameter.question_token.is_none()
+        || annotation_record.kind != SyntaxKind::IntersectionType
+        || annotation_record.parent != Some(props.node)
+        || intersection.types.has_trailing_comma
+        || parameter_record.kind != SyntaxKind::TypeReference
+        || parameter_record.parent != Some(annotation.node)
+        || parameter_reference.type_arguments.is_some()
+        || parameter_name_record.kind != SyntaxKind::Identifier
+        || parameter_name_record.parent != Some(parameter_type.node)
+        || parameter_identifier.text != "P"
+        || attributes_record.kind != SyntaxKind::TypeLiteral
+        || attributes_record.parent != Some(annotation.node)
+        || literal.members.has_trailing_comma
+        || property_record.kind != SyntaxKind::PropertySignature
+        || property_record.parent != Some(attributes.node)
+        || children.postfix_token.is_none()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(property.node)
+        || identifier.text != "children"
+        || child_record.kind != SyntaxKind::TypeReference
+        || child_record.parent != Some(property.node)
+        || child_reference.type_arguments.is_some()
+        || child_name_record.kind != SyntaxKind::Identifier
+        || child_name_record.parent != Some(child_type.node)
+        || child_identifier.text != "ReactNode"
+        || store
+            .symbol(react_node)
+            .is_none_or(|record| !record.flags().contains(SymbolFlags::TYPE_ALIAS))
+        || store.get_parent_of_symbol(react_node) != Some(namespace)
+    {
+        return Err(invalid());
+    }
+
+    CanonicalTypeQuery::new(store, host, options, diagnostics)?
+        .get_type_from_type_node(attributes)
+        .map_err(Into::into)
 }
 
 fn publish_namespace_component_tag_links(
@@ -7578,9 +7931,10 @@ mod runtime_tests {
 
     const LEGACY_REACT_FRAGMENT_COMPONENT_DECLARATIONS: &str = concat!(
         "type ComponentType<P = {}> = ComponentClass<P> | StatelessComponent<P>; ",
-        "interface ComponentClass<P = {}> { new(props: P): ReactElement; } ",
+        "interface ComponentClass<P = {}, S = any> { ",
+        "new(props: P, context?: any): ReactElement; } ",
         "interface StatelessComponent<P = {}> { ",
-        "(props: P & { children?: ReactNode; }): ReactElement; ",
+        "(props: P & { children?: ReactNode; }, context?: any): ReactElement | null; ",
         "} ",
         "const Fragment: ComponentType; ",
     );
@@ -7618,8 +7972,16 @@ mod runtime_tests {
                 "} }",
             ]
             .concat();
-            let library: &'static ParseResult =
-                Box::leak(Box::new(parse_source_file(&library_source)));
+            Self::with_library(source, file, runtime, &library_source)
+        }
+
+        fn with_library(
+            source: &str,
+            file: FileId,
+            runtime: CanonicalJsxRuntime,
+            library: &str,
+        ) -> Self {
+            let library: &'static ParseResult = Box::leak(Box::new(parse_source_file(library)));
             let parsed: &'static ParseResult = Box::leak(Box::new(parse_jsx_source_file(source)));
             assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -7675,6 +8037,112 @@ mod runtime_tests {
                 .get(range.start.get() as usize..range.end.get() as usize)
                 .unwrap()
         }
+    }
+
+    #[test]
+    fn legacy_react_component_type_fragments_preserve_children_and_warm_identity() {
+        let mut fixture = ReactFragmentFixture::with_library(
+            concat!(
+                "const invalidChild = () => 'invalid'; ",
+                "const valid = <><div /></>; ",
+                "const invalid = <>{invalidChild}</>; ",
+                "const explicit = <React.Fragment><div /></React.Fragment>;",
+            ),
+            FileId::new(8_197),
+            CanonicalJsxRuntime::Classic,
+            concat!(
+                "declare namespace React { ",
+                "interface ReactElement { marker: string; } ",
+                "type ReactNode = ReactElement | string | number | boolean | null | undefined; ",
+                "interface ComponentClass<P = {}, S = any> { ",
+                "new(props: P, context?: any): ReactElement; } ",
+                "interface StatelessComponent<P = {}> { ",
+                "(props: P & { children?: ReactNode }, context?: any): ReactElement | null; } ",
+                "type ComponentType<P = {}> = ComponentClass<P> | StatelessComponent<P>; ",
+                "const Fragment: ComponentType; ",
+                "} ",
+                "declare namespace JSX { ",
+                "interface Element extends React.ReactElement {} ",
+                "interface ElementChildrenAttribute { children: {}; } ",
+                "interface IntrinsicElements { div: {}; } }",
+            ),
+        );
+
+        fixture.context.check_source_file(fixture.file).unwrap();
+
+        let [diagnostic] = fixture.context.diagnostics().as_slice() else {
+            panic!("only the callable legacy fragment child must report TS2322")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert!(
+            diagnostic
+                .diagnostic
+                .render()
+                .unwrap()
+                .contains("ReactNode")
+        );
+
+        let globals = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .globals;
+        let namespace = fixture
+            .context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("React"))
+            .unwrap();
+        let fragment = fixture
+            .context
+            .store()
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("Fragment"))
+            .unwrap();
+        let component = fixture
+            .context
+            .store()
+            .value_symbol_links(fragment)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let reference = validate_direct_generic_reference(fixture.context.store(), component)
+            .expect("legacy Fragment must retain its authenticated callable branch");
+        let owner = fixture
+            .context
+            .store()
+            .type_payload(reference.target)
+            .and_then(|record| record.symbol())
+            .unwrap();
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol(owner)
+                .and_then(|record| record.name().as_utf8()),
+            Some("StatelessComponent"),
+        );
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().signature_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+            fixture.context.diagnostics().as_slice().to_vec(),
+        );
+        fixture.context.recheck_source_file(fixture.file).unwrap();
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+                fixture.context.diagnostics().as_slice().to_vec(),
+            ),
+            warm,
+        );
     }
 
     #[test]
@@ -8006,7 +8474,7 @@ mod runtime_tests {
     }
 
     #[test]
-    fn legacy_react_fragment_component_types_are_authenticated_capability_boundaries() {
+    fn legacy_react_fragment_component_types_are_authenticated_and_resolved() {
         let mut fixture = ReactFragmentFixture::with_fragment_declaration(
             "const view = <><div /></>;",
             FileId::new(8_197),
@@ -8044,19 +8512,39 @@ mod runtime_tests {
         };
         let annotation = child_ref(declaration, variable.type_.unwrap());
 
-        assert_eq!(
-            fixture.context.check_source_file(fixture.file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Property(annotation),
-            )),
-        );
+        fixture.context.check_source_file(fixture.file).unwrap();
+
+        assert!(fixture.context.diagnostics().is_empty());
         assert!(fixture.context.store().type_alias_links(alias).is_none());
-        assert!(
+        let component = fixture
+            .context
+            .store()
+            .value_symbol_links(fragment)
+            .and_then(|links| links.resolved_type)
+            .expect("the authenticated fragment must publish its callable branch");
+        assert_eq!(
             fixture
                 .context
                 .store()
-                .value_symbol_links(fragment)
-                .is_none()
+                .type_node_links(annotation)
+                .and_then(|links| links.resolved_type),
+            Some(component),
+        );
+        let reference = validate_direct_generic_reference(fixture.context.store(), component)
+            .expect("React.Fragment must retain an authenticated generic reference");
+        let owner = fixture
+            .context
+            .store()
+            .type_payload(reference.target)
+            .and_then(|record| record.symbol())
+            .unwrap();
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol(owner)
+                .and_then(|record| record.name().as_utf8()),
+            Some("StatelessComponent"),
         );
     }
 
