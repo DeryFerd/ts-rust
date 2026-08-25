@@ -3610,6 +3610,62 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         })
     }
 
+    fn subtype_reduction_unit_property(
+        &self,
+        type_: TypeId,
+        expected_name: Option<&EscapedName>,
+    ) -> Result<Option<(EscapedName, TypeId)>, LiteralTypeCacheError> {
+        let record = self
+            .type_payload(type_)
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+        if !record.flags().intersects(TypeFlags::OBJECT)
+            || !record.object_flags().contains(ObjectFlags::OBJECT_LITERAL)
+                && !matches!(
+                    object_members::validate_resolved_declared_property_object(self, type_),
+                    object_members::DeclaredPropertyObjectValidation::Valid(_)
+                )
+        {
+            return Ok(None);
+        }
+
+        let properties = record
+            .data()
+            .structured()
+            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?
+            .properties
+            .as_deref()
+            .unwrap_or_default();
+        for property in properties {
+            let symbol = self
+                .symbol(*property)
+                .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+            if expected_name.is_some_and(|name| symbol.name() != name.as_ref()) {
+                continue;
+            }
+            let property_type = self
+                .value_symbol_links(*property)
+                .and_then(|links| links.resolved_type)
+                .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+            let property_record = self
+                .type_payload(property_type)
+                .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+            if !property_record.flags().intersects(TypeFlags::UNIT) {
+                if expected_name.is_some() {
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            self.validate_union_constituent(property_type)?;
+            let regular = match property_record.data() {
+                TypeData::Literal(literal) => literal.regular_type,
+                _ => property_type,
+            };
+            return Ok(Some((symbol.name().to_owned(), regular)));
+        }
+        Ok(None)
+    }
+
     fn remove_union_subtypes(
         &mut self,
         types: &mut Vec<TypeId>,
@@ -3619,11 +3675,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         // This is the dependency-closed `removeSubtypes` prefix for expression
         // unions. The validator admits primitives, literals, recursively
         // canonical unions, and fresh property objects, so the upstream type
-        // parameter, discriminant fast path, and class-derivation branches are
-        // unreachable here. Global-aware calls additionally admit canonical
-        // arrays. The one mixed relation independent of generic Array members
-        // is Array -> regularized empty object; every nonempty mixed surface
-        // remains typed unavailable rather than becoming a negative answer.
+        // parameter and class-derivation branches are unreachable here. The
+        // unit-property shortcut is limited to authenticated fresh and
+        // declared property objects. Global-aware calls additionally admit
+        // canonical arrays. The one mixed relation independent of generic
+        // Array members is Array -> regularized empty object; every nonempty
+        // mixed surface remains typed unavailable rather than becoming a
+        // negative answer.
         if types.len() < 2 {
             return Ok(());
         }
@@ -3660,6 +3718,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 continue;
             }
 
+            let discriminant = self.subtype_reduction_unit_property(source, None)?;
             let candidates = types.clone();
             for target in candidates {
                 if source == target {
@@ -3675,6 +3734,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 comparison_count = comparison_count
                     .checked_add(1)
                     .ok_or(LiteralTypeCacheError::Capacity)?;
+                if let Some((name, source_type)) = &discriminant
+                    && self
+                        .subtype_reduction_unit_property(target, Some(name))?
+                        .is_some_and(|(_, target_type)| *source_type != target_type)
+                {
+                    continue;
+                }
                 if (source == empty_object_type || source == unknown_empty_object_type)
                     && self.is_authenticated_symbol_owned_empty_anonymous_object(target)
                 {
@@ -7791,6 +7857,112 @@ mod tests {
             record(store, retained)
                 .object_flags()
                 .contains(ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL)
+        );
+    }
+
+    #[test]
+    fn object_subtype_reduction_skips_incompatible_authenticated_unit_properties() {
+        let parsed = parse_source_file(concat!(
+            "interface First { kind: 'first'; value: number } ",
+            "interface Second { kind: 'second'; value: number } ",
+            "declare const declaredSecond: Second; ",
+            "const first: First = { kind: 'first', value: 1 }; ",
+            "const second: Second = { kind: 'second', value: 2 }; ",
+            "const matching: First = { kind: 'first', value: 3 }; ",
+            "const declared: any = declaredSecond;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(150);
+        let mut context = checker_context(file, &parsed);
+        context.check_source_file(file).unwrap();
+
+        let first = checked_expression_type(&context, variable_initializer(&parsed, file, "first"));
+        let second =
+            checked_expression_type(&context, variable_initializer(&parsed, file, "second"));
+        let matching =
+            checked_expression_type(&context, variable_initializer(&parsed, file, "matching"));
+        let declared =
+            checked_expression_type(&context, variable_initializer(&parsed, file, "declared"));
+        let store = context.store_mut_for_test();
+
+        let pristine_relations = store.relation_state_snapshot();
+        let fresh_union = store
+            .expression_union_type(&[first, second], UnionReduction::Subtype)
+            .unwrap();
+        let mut expected = [first, second];
+        expected.sort_unstable();
+        assert_eq!(union_types(store, fresh_union), expected.as_slice());
+        assert_eq!(store.relation_state_snapshot(), pristine_relations);
+
+        let mixed_union = store
+            .expression_union_type(&[first, declared], UnionReduction::Subtype)
+            .unwrap();
+        let mut expected = [first, declared];
+        expected.sort_unstable();
+        assert_eq!(union_types(store, mixed_union), expected.as_slice());
+        assert_eq!(store.relation_state_snapshot(), pristine_relations);
+
+        let warm = (
+            store.type_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            store.expression_union_type(&[declared, first], UnionReduction::Subtype),
+            Ok(mixed_union),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                store.relation_state_snapshot(),
+            ),
+            warm,
+        );
+
+        let reduced = store
+            .expression_union_type(&[first, matching, second], UnionReduction::Subtype)
+            .unwrap();
+        let mut expected = [first, second];
+        expected.sort_unstable();
+        assert_eq!(union_types(store, reduced), expected.as_slice());
+        assert_eq!(
+            store.relation_state_snapshot().strict_subtype.entries,
+            pristine_relations.strict_subtype.entries + 1,
+        );
+
+        let property = record(store, declared)
+            .data()
+            .structured()
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| properties.first())
+            .copied()
+            .unwrap();
+        let expected_links = store.value_symbol_links(property).unwrap().clone();
+        let mut poisoned_links = expected_links.clone();
+        poisoned_links.write_type = Some(store.intrinsic_bootstrap().unwrap().number_type);
+        assert!(store.set_value_symbol_links(property, poisoned_links));
+        let poisoned = (
+            store.type_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            store.expression_union_type(&[first, declared], UnionReduction::Subtype),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(declared)),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                store.relation_state_snapshot(),
+            ),
+            poisoned,
+        );
+        assert!(store.set_value_symbol_links(property, expected_links));
+        assert_eq!(
+            store.expression_union_type(&[declared, first], UnionReduction::Subtype),
+            Ok(mixed_union),
         );
     }
 
