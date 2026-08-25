@@ -1317,6 +1317,7 @@ pub(super) fn exact_global_date_initializer(
         && signature_record.parameters().is_empty()
         && signature_record.min_argument_count() == 0
         && signature_record.resolved_return_type() == Some(expected_type)
+        && authenticated_global_date_constructor_return(store, signature) == Some(expected_type)
 }
 
 fn plan_imported_class_type_arguments(
@@ -6483,7 +6484,9 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks, SourceCheckError,
-        UnsupportedSourceSyntax, production::GlobalMergeCompletion,
+        UnsupportedSourceSyntax,
+        classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
+        production::GlobalMergeCompletion,
     };
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -8397,6 +8400,135 @@ mod tests {
             assert!(context.store().declared_type_links(owner).is_none());
             assert!(context.store().type_node_links(initializer).is_none());
             assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn published_constructor_date_defaults_reject_poisoned_provider_reference_symbols() {
+        let library = global_date_constructor_library();
+        let source = parse_source_file(concat!(
+            "class Model { ",
+            "constructor(readonly timestamp = new Date()) {} ",
+            "}",
+        ));
+        let library_file = FileId::new(1_877);
+        let source_file = FileId::new(1_878);
+        let mut context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+        let model = class_symbol(&source, source_file, &context, "Model");
+        let initializer = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        context.check_source_file(source_file).unwrap();
+
+        let (date, owner, annotation, return_annotation, date_type, model_type) = {
+            let store = context.store();
+            let globals = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap();
+            let date = globals
+                .get_source("Date")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let owner = globals
+                .get_source("DateConstructor")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let annotation = store
+                .symbol(date)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .and_then(|declaration| store.source_direct_type_annotation(declaration))
+                .unwrap();
+            let signature = store
+                .signature_links(initializer)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let return_annotation = store
+                .function_signature_return_annotation(signature)
+                .map(|(annotation, _)| annotation)
+                .unwrap();
+            let date_type = store
+                .declared_type_links(date)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let model_type = store
+                .declared_type_links(model)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            (
+                date,
+                owner,
+                annotation,
+                return_annotation,
+                date_type,
+                model_type,
+            )
+        };
+
+        assert!(exact_global_date_initializer(
+            context.store(),
+            initializer,
+            date_type,
+        ));
+        assert_eq!(
+            validate_class_heritage_members(context.store(), model_type),
+            ClassHeritageMembersValidation::Valid,
+        );
+
+        for (node, expected, poison) in
+            [(annotation, owner, date), (return_annotation, date, owner)]
+        {
+            assert!(context.store_mut_for_test().set_symbol_node_links(
+                node,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(poison),
+                },
+            ));
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(!exact_global_date_initializer(
+                context.store(),
+                initializer,
+                date_type,
+            ));
+            assert_eq!(
+                validate_class_heritage_members(context.store(), model_type),
+                ClassHeritageMembersValidation::Malformed,
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+
+            assert!(context.store_mut_for_test().set_symbol_node_links(
+                node,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(expected),
+                },
+            ));
+            assert_eq!(
+                validate_class_heritage_members(context.store(), model_type),
+                ClassHeritageMembersValidation::Valid,
+            );
         }
     }
 
