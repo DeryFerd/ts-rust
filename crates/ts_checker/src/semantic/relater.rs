@@ -4385,6 +4385,30 @@ impl<'store> RelaterSession<'store> {
             self.validated_class_method_callable(symbol)?;
             return Ok(record);
         }
+        if matches!(origin, ObjectPropertyOrigin::Declared) && record.flags() == SymbolFlags::METHOD
+        {
+            let links = self
+                .store
+                .value_symbol_links(symbol)
+                .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
+            let type_ = links
+                .resolved_type
+                .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
+            return if links
+                == &(ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+                && super::structured_members::valid_interface_method_value(
+                    self.store, symbol, type_,
+                )
+                .is_some()
+            {
+                Ok(record)
+            } else {
+                Err(RelationUnavailable::UnsupportedProperty(symbol))
+            };
+        }
         let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
         let allowed_checks = CheckFlags::READONLY.bits();
         if !record.flags().contains(SymbolFlags::PROPERTY)
