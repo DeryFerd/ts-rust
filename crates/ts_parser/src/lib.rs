@@ -1211,43 +1211,34 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn attach_javascript_jsdoc_arrow_signature(
-        &mut self,
+    fn javascript_jsdoc_arrow_parameters(
+        &self,
         statement: NodeId,
-        signature: JavaScriptJsDocCallableSignature,
-    ) {
-        let Some(NodeData::VariableStatement(statement_data)) =
-            self.arena.get(statement).map(|node| &node.data)
-        else {
-            return;
+        signature: &JavaScriptJsDocCallableSignature,
+    ) -> Option<(NodeId, Vec<NodeId>)> {
+        let NodeData::VariableStatement(statement_data) = &self.arena.get(statement)?.data else {
+            return None;
         };
-        let Some(NodeData::VariableDeclarationList(declarations)) = self
-            .arena
-            .get(statement_data.declaration_list)
-            .map(|node| &node.data)
+        let NodeData::VariableDeclarationList(declarations) =
+            &self.arena.get(statement_data.declaration_list)?.data
         else {
-            return;
+            return None;
         };
         let [declaration] = declarations.declarations.nodes.as_slice() else {
-            return;
+            return None;
         };
-        let Some(NodeData::VariableDeclaration(variable)) =
-            self.arena.get(*declaration).map(|node| &node.data)
-        else {
-            return;
+        let NodeData::VariableDeclaration(variable) = &self.arena.get(*declaration)?.data else {
+            return None;
         };
-        let Some(arrow) = variable.initializer else {
-            return;
-        };
-        let Some(NodeData::ArrowFunction(function)) = self.arena.get(arrow).map(|node| &node.data)
-        else {
-            return;
+        let arrow = variable.initializer?;
+        let NodeData::ArrowFunction(function) = &self.arena.get(arrow)?.data else {
+            return None;
         };
         if function.type_parameters.is_some()
             || function.type_.is_some()
             || function.parameters.nodes.len() != signature.parameters.len()
         {
-            return;
+            return None;
         }
         let parameters = function.parameters.nodes.clone();
         if parameters
@@ -1267,8 +1258,21 @@ impl<'a> Parser<'a> {
                 parameter.type_.is_some() || name.text != annotation.name
             })
         {
-            return;
+            return None;
         }
+        Some((arrow, parameters))
+    }
+
+    fn attach_javascript_jsdoc_arrow_signature(
+        &mut self,
+        statement: NodeId,
+        signature: JavaScriptJsDocCallableSignature,
+    ) {
+        let Some((arrow, parameters)) =
+            self.javascript_jsdoc_arrow_parameters(statement, &signature)
+        else {
+            return;
+        };
 
         let mut annotations = Vec::with_capacity(signature.parameters.len());
         for annotation in &signature.parameters {
