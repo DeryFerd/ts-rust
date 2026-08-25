@@ -2,8 +2,9 @@
 //!
 //! This is the first exact branch of pinned `inferTypes` used by generic call
 //! resolution. When the target is the inference context's type parameter,
-//! upstream records the source type itself as a covariant candidate. The
-//! bounded Rust branch accepts primitive, literal, unique-symbol, anonymous
+//! upstream records the source type itself as a covariant or authenticated
+//! contravariant candidate. The bounded Rust branch accepts primitive,
+//! literal, unique-symbol, anonymous
 //! primitive-union, and exact resolved nongeneric declared-property-object
 //! candidates, authenticated template-literal patterns, fixed tuples, and
 //! canonical Array/ReadonlyArray references when the caller retains the
@@ -175,6 +176,80 @@ pub(super) fn infer_naked_type_parameter_candidates_with_array_targets(
         is_strict_subtype,
         is_subtype,
     )
+}
+
+/// Combines exact covariant and contravariant candidates for one type parameter.
+///
+/// Pinned TypeScript inference prefers a usable covariant result when it fits
+/// a contravariant candidate. Covariant `never` and `any` instead yield to an
+/// available contravariant result, while a sole `never` candidate remains exact.
+#[allow(clippy::too_many_arguments)] // Keep relation capabilities and array provenance explicit.
+pub(super) fn infer_naked_type_parameter_variance_candidates(
+    store: &mut CanonicalTypeMapperStore,
+    covariant: &[TypeId],
+    contravariant: &[TypeId],
+    treatment: InferenceLiteralTreatment,
+    array_targets: Option<CanonicalArrayTargets>,
+    mut is_assignable: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    mut is_strict_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    mut is_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<Option<TypeId>, NakedTypeCandidateError> {
+    for candidate in covariant.iter().chain(contravariant) {
+        validate_inference_leaf_with_optional_array_targets(store, *candidate, array_targets)?;
+    }
+
+    let covariant = infer_naked_type_parameter_candidates_with_optional_array_targets(
+        store,
+        covariant,
+        treatment,
+        array_targets,
+        |store, source, target| is_strict_subtype(store, source, target),
+        |store, source, target| is_subtype(store, source, target),
+    )?;
+
+    let mut contravariant_result = None;
+    for candidate in contravariant {
+        if contravariant_result.is_none_or(|current| current == *candidate) {
+            contravariant_result = Some(*candidate);
+            continue;
+        }
+        let current = contravariant_result.expect("the first candidate initialized the result");
+        if is_subtype(store, *candidate, current)? {
+            contravariant_result = Some(*candidate);
+        }
+    }
+
+    match (covariant, contravariant_result) {
+        (None, None) => Ok(None),
+        (Some(candidate), None) | (None, Some(candidate)) => Ok(Some(candidate)),
+        (Some(covariant), Some(contravariant_result)) => {
+            let flags = store
+                .type_payload(covariant)
+                .ok_or(NakedTypeInferenceError::InvalidCandidate(covariant))?
+                .flags();
+            if flags.intersects(TypeFlags::NEVER | TypeFlags::ANY) {
+                return Ok(Some(contravariant_result));
+            }
+            for candidate in contravariant {
+                if is_assignable(store, covariant, *candidate)? {
+                    return Ok(Some(covariant));
+                }
+            }
+            Ok(Some(contravariant_result))
+        }
+    }
 }
 
 fn infer_naked_type_parameter_candidates_with_optional_array_targets(
@@ -757,6 +832,23 @@ mod tests {
         )
     }
 
+    fn infer_variance(
+        store: &mut CanonicalTypeMapperStore,
+        covariant: &[TypeId],
+        contravariant: &[TypeId],
+    ) -> Result<Option<TypeId>, NakedTypeCandidateError> {
+        infer_naked_type_parameter_variance_candidates(
+            store,
+            covariant,
+            contravariant,
+            InferenceLiteralTreatment::Preserve,
+            None,
+            CanonicalTypeMapperStore::is_type_assignable_to,
+            CanonicalTypeMapperStore::is_type_strict_subtype_of,
+            CanonicalTypeMapperStore::is_type_subtype_of,
+        )
+    }
+
     #[test]
     fn naked_inference_preserves_fresh_literal_identity() {
         let mut store = initialized_store();
@@ -788,6 +880,102 @@ mod tests {
         assert_eq!(
             infer_naked_type_parameter(&store, duplicate),
             Err(NakedTypeInferenceError::InvalidCandidate(duplicate)),
+        );
+    }
+
+    #[test]
+    fn mixed_variance_prefers_contravariant_types_over_never_and_any() {
+        let mut store = initialized_store();
+        let (never, any, string) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.never_type,
+                bootstrap.any_type,
+                bootstrap.string_type,
+            )
+        };
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+
+        assert_eq!(
+            infer_variance(&mut store, &[never], &[string]),
+            Ok(Some(string))
+        );
+        assert_eq!(
+            infer_variance(&mut store, &[any], &[string]),
+            Ok(Some(string))
+        );
+        assert_eq!(infer_variance(&mut store, &[never], &[]), Ok(Some(never)));
+        assert_eq!(infer_variance(&mut store, &[], &[string]), Ok(Some(string)));
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn mixed_variance_keeps_compatible_covariance_and_selects_common_subtypes() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let literal = store.regular_string_literal_type("value".into()).unwrap();
+
+        assert_eq!(
+            infer_variance(&mut store, &[literal], &[string]),
+            Ok(Some(literal)),
+        );
+        assert_eq!(
+            infer_variance(&mut store, &[number], &[string]),
+            Ok(Some(string)),
+        );
+        for candidates in [[string, literal], [literal, string]] {
+            assert_eq!(
+                infer_variance(&mut store, &[], &candidates),
+                Ok(Some(literal)),
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_variance_rejects_invalid_candidates_before_union_publication() {
+        let mut store = initialized_store();
+        let first = store.regular_string_literal_type("first".into()).unwrap();
+        let second = store.regular_string_literal_type("second".into()).unwrap();
+        let invalid = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+
+        assert_eq!(
+            infer_variance(&mut store, &[first, second], &[invalid]),
+            Err(NakedTypeCandidateError::Candidate(
+                NakedTypeInferenceError::UnsupportedCandidate(invalid),
+            )),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            before,
         );
     }
 

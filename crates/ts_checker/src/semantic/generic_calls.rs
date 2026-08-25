@@ -32,7 +32,8 @@ use super::{
     inference::{
         InferenceLiteralTreatment, NakedTypeCandidateError, NakedTypeInferenceError,
         infer_naked_type_parameter, infer_naked_type_parameter_candidates,
-        infer_naked_type_parameter_candidates_with_array_targets, validate_inference_leaf,
+        infer_naked_type_parameter_candidates_with_array_targets,
+        infer_naked_type_parameter_variance_candidates, validate_inference_leaf,
         validate_inference_leaf_with_array_targets,
     },
     instantiate::{
@@ -90,11 +91,6 @@ pub(super) enum GenericCallVectorUnsupported {
     InstantiationType {
         signature: SignatureId,
         type_: TypeId,
-    },
-    ContravariantInterfaceTypeArgument {
-        signature: SignatureId,
-        type_: TypeId,
-        index: usize,
     },
     TypeParameterDependency {
         type_parameter: TypeId,
@@ -1535,7 +1531,7 @@ fn validate_generic_interface_reference(
             );
         }
         let allowed = VarianceFlags::VARIANCE_MASK | VarianceFlags::ALLOWS_STRUCTURAL_FALLBACK;
-        for (index, variance) in variances.iter().copied().enumerate() {
+        for variance in variances.iter().copied() {
             let kind = variance & VarianceFlags::VARIANCE_MASK;
             if variance.bits() & !allowed.bits() != 0
                 || !matches!(
@@ -1552,16 +1548,6 @@ fn validate_generic_interface_reference(
                     type_,
                 }
                 .into());
-            }
-            if kind == VarianceFlags::CONTRAVARIANT {
-                return Err(
-                    GenericCallVectorUnsupported::ContravariantInterfaceTypeArgument {
-                        signature,
-                        type_,
-                        index,
-                    }
-                    .into(),
-                );
             }
         }
     }
@@ -2014,6 +2000,7 @@ fn infer_generic_call_type_arguments(
         .map(|parameter| parameter.type_)
         .collect::<Vec<_>>();
     let mut buckets = vec![Vec::new(); type_parameters.len()];
+    let mut contravariant_buckets = vec![Vec::new(); type_parameters.len()];
     let fixed_parameter_count =
         shape.parameter_templates.len() - usize::from(shape.rest_element_template.is_some());
     for (index, argument) in arguments.iter().copied().enumerate() {
@@ -2048,8 +2035,10 @@ fn infer_generic_call_type_arguments(
             parameter,
             &type_parameters,
             &mut buckets,
+            &mut contravariant_buckets,
             shape.signature,
             &mut Vec::new(),
+            false,
         )?;
     }
 
@@ -2082,22 +2071,35 @@ fn infer_generic_call_type_arguments(
         } else {
             InferenceLiteralTreatment::Widen
         };
-        let candidate = match shape.array_targets {
-            Some(array_targets) => infer_naked_type_parameter_candidates_with_array_targets(
+        let candidate = if !contravariant_buckets[index].is_empty() {
+            infer_naked_type_parameter_variance_candidates(
                 store,
                 &buckets[index],
+                &contravariant_buckets[index],
                 treatment,
-                array_targets,
+                shape.array_targets,
+                |store, source, target| is_assignable(store, source, target),
                 |store, source, target| is_strict_subtype(store, source, target),
                 |store, source, target| is_subtype(store, source, target),
-            )?,
-            None => infer_naked_type_parameter_candidates(
-                store,
-                &buckets[index],
-                treatment,
-                |store, source, target| is_strict_subtype(store, source, target),
-                |store, source, target| is_subtype(store, source, target),
-            )?,
+            )?
+        } else {
+            match shape.array_targets {
+                Some(array_targets) => infer_naked_type_parameter_candidates_with_array_targets(
+                    store,
+                    &buckets[index],
+                    treatment,
+                    array_targets,
+                    |store, source, target| is_strict_subtype(store, source, target),
+                    |store, source, target| is_subtype(store, source, target),
+                )?,
+                None => infer_naked_type_parameter_candidates(
+                    store,
+                    &buckets[index],
+                    treatment,
+                    |store, source, target| is_strict_subtype(store, source, target),
+                    |store, source, target| is_subtype(store, source, target),
+                )?,
+            }
         };
         let mut argument = match candidate {
             Some(candidate) => candidate,
@@ -2135,8 +2137,10 @@ fn collect_generic_call_inferences(
     target: TypeId,
     type_parameters: &[TypeId],
     buckets: &mut [Vec<TypeId>],
+    contravariant_buckets: &mut [Vec<TypeId>],
     signature: SignatureId,
     active_targets: &mut Vec<TypeId>,
+    contravariant: bool,
 ) -> Result<(), GenericCallVectorError> {
     if let Some(index) = type_parameters
         .iter()
@@ -2149,8 +2153,13 @@ fn collect_generic_call_inferences(
             None => validate_inference_leaf(store, source),
         }
         .map_err(|error| GenericCallVectorError::Inference(error.into()))?;
-        if !buckets[index].contains(&source) {
-            buckets[index].push(source);
+        let bucket = if contravariant {
+            &mut contravariant_buckets[index]
+        } else {
+            &mut buckets[index]
+        };
+        if !bucket.contains(&source) {
+            bucket.push(source);
         }
         return Ok(());
     }
@@ -2191,8 +2200,10 @@ fn collect_generic_call_inferences(
                 target_reference.element_type,
                 type_parameters,
                 buckets,
+                contravariant_buckets,
                 signature,
                 active_targets,
+                contravariant,
             );
             active_targets.pop();
             return result;
@@ -2224,12 +2235,28 @@ fn collect_generic_call_inferences(
         }
         .into());
     }
+    let owner = store
+        .type_payload(target_reference.target)
+        .and_then(super::type_records::TypeRecord::symbol)
+        .ok_or(GenericCallVectorInvariant::InvalidInterfaceReference {
+            signature,
+            type_: target,
+        })?;
+    let variances = store
+        .variance_links(owner)
+        .and_then(|links| links.variances.as_deref());
     active_targets.push(target);
     let result = source_reference
         .type_arguments
         .into_iter()
         .zip(target_reference.type_arguments)
-        .try_for_each(|(source, target)| {
+        .enumerate()
+        .try_for_each(|(index, (source, target))| {
+            let argument_contravariant = variances
+                .and_then(|variances| variances.get(index))
+                .is_some_and(|variance| {
+                    *variance & VarianceFlags::VARIANCE_MASK == VarianceFlags::CONTRAVARIANT
+                });
             collect_generic_call_inferences(
                 store,
                 array_targets,
@@ -2237,8 +2264,10 @@ fn collect_generic_call_inferences(
                 target,
                 type_parameters,
                 buckets,
+                contravariant_buckets,
                 signature,
                 active_targets,
+                contravariant != argument_contravariant,
             )
         });
     active_targets.pop();
@@ -5091,6 +5120,12 @@ mod tests {
         let Some(target_record) = store.type_payload(target) else {
             return false;
         };
+        if source_record
+            .flags()
+            .intersects(TypeFlags::NEVER | TypeFlags::ANY)
+        {
+            return true;
+        }
         if let (TypeData::Literal(source), TypeData::Literal(target)) =
             (source_record.data(), target_record.data())
             && source.regular_type == target.regular_type
@@ -5778,14 +5813,182 @@ mod tests {
     }
 
     #[test]
-    fn generic_interface_variance_rejects_unsupported_and_malformed_caches() {
-        for (variances, contravariant) in [
-            (vec![VarianceFlags::CONTRAVARIANT], true),
-            (Vec::new(), false),
-            (
-                vec![VarianceFlags::INDEPENDENT | VarianceFlags::COVARIANT],
+    fn contravariant_generic_interface_inference_reuses_checked_signature() {
+        let mut store = initialized_store();
+        let target = canonical_interface_target(&mut store, "Consumer");
+        let owner = store.type_payload(target).unwrap().symbol().unwrap();
+        assert!(store.set_variance_links(
+            owner,
+            VarianceLinks {
+                variances: Some(vec![VarianceFlags::CONTRAVARIANT]),
+            },
+        ));
+        let (callable, parameter) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| canonical_interface_reference(store, target, type_parameter),
+            |_, type_parameter| type_parameter,
+        );
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let argument = canonical_interface_reference(&mut store, target, string);
+
+        let first = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, None, &[argument]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(first.projection.type_parameters, [parameter]);
+        assert_eq!(first.projection.instantiation.type_arguments, [string]);
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &callable,
+                &first,
+                &first.projection.instantiation,
+            ),
+            string,
+        );
+        let warm = vector_cache_graph_counts(&store);
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &callable,
+                vector_request(callable.owner, None, &[argument]),
+            ),
+            Ok(first),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), warm);
+    }
+
+    #[test]
+    fn nested_contravariant_interface_arguments_restore_covariant_inference() {
+        let mut store = initialized_store();
+        let target = canonical_interface_target(&mut store, "Consumer");
+        let owner = store.type_payload(target).unwrap().symbol().unwrap();
+        assert!(store.set_variance_links(
+            owner,
+            VarianceLinks {
+                variances: Some(vec![VarianceFlags::CONTRAVARIANT]),
+            },
+        ));
+        let (callable, parameter) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| {
+                let inner = canonical_interface_reference(store, target, type_parameter);
+                canonical_interface_reference(store, target, inner)
+            },
+            |_, type_parameter| type_parameter,
+        );
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let inner = canonical_interface_reference(&mut store, target, string);
+        let argument = canonical_interface_reference(&mut store, target, inner);
+        let mut covariant = vec![Vec::new()];
+        let mut contravariant = vec![Vec::new()];
+        let before = vector_cache_graph_counts(&store);
+
+        assert_eq!(
+            collect_generic_call_inferences(
+                &store,
+                None,
+                argument,
+                callable.parameters[0],
+                &[parameter],
+                &mut covariant,
+                &mut contravariant,
+                callable.signature,
+                &mut Vec::new(),
                 false,
             ),
+            Ok(()),
+        );
+        assert_eq!(covariant, [vec![string]]);
+        assert_eq!(contravariant, [Vec::<TypeId>::new()]);
+        assert_eq!(vector_cache_graph_counts(&store), before);
+    }
+
+    #[test]
+    fn mixed_variance_call_prefers_contravariant_inference_over_never_and_any() {
+        let mut store = initialized_store();
+        let target = canonical_interface_target(&mut store, "Consumer");
+        let owner = store.type_payload(target).unwrap().symbol().unwrap();
+        assert!(store.set_variance_links(
+            owner,
+            VarianceLinks {
+                variances: Some(vec![VarianceFlags::CONTRAVARIANT]),
+            },
+        ));
+        let (mut callable, parameters) = vector_callable(
+            &mut store,
+            &["T"],
+            &[None],
+            &[None],
+            &[0, 0],
+            |_, parameters| parameters[0],
+        );
+        let consumer = canonical_interface_reference(&mut store, target, parameters[0]);
+        let symbol = store.signature(callable.signature).unwrap().parameters()[1];
+        assert!(store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(consumer),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        callable.parameters[1] = consumer;
+        let (never, any, string) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.never_type,
+                bootstrap.any_type,
+                bootstrap.string_type,
+            )
+        };
+        let argument = canonical_interface_reference(&mut store, target, string);
+
+        let resolution = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, None, &[never, argument]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolution.applicability,
+            GenericCallVectorApplicability::Applicable,
+        );
+        assert_eq!(resolution.projection.instantiation.type_arguments, [string]);
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &callable,
+                &resolution,
+                &resolution.projection.instantiation,
+            ),
+            string,
+        );
+        let warm = vector_cache_graph_counts(&store);
+        for source in [never, any] {
+            let replay = project_vector(
+                &mut store,
+                &callable,
+                vector_request(callable.owner, None, &[source, argument]),
+            )
+            .unwrap();
+            assert_eq!(replay, resolution);
+            assert_eq!(vector_cache_graph_counts(&store), warm);
+        }
+    }
+
+    #[test]
+    fn generic_interface_variance_rejects_malformed_caches() {
+        for variances in [
+            Vec::new(),
+            vec![VarianceFlags::INDEPENDENT | VarianceFlags::COVARIANT],
         ] {
             let mut store = initialized_store();
             let target = canonical_interface_target(&mut store, "Box");
@@ -5808,22 +6011,12 @@ mod tests {
                 },
             ));
             let before = vector_cache_graph_counts(&store);
-            let expected = if contravariant {
-                GenericCallVectorError::Unsupported(
-                    GenericCallVectorUnsupported::ContravariantInterfaceTypeArgument {
-                        signature: callable.signature,
-                        type_: callable.parameters[0],
-                        index: 0,
-                    },
-                )
-            } else {
-                GenericCallVectorError::Invariant(
-                    GenericCallVectorInvariant::InvalidInterfaceVariance {
-                        signature: callable.signature,
-                        type_: callable.parameters[0],
-                    },
-                )
-            };
+            let expected = GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidInterfaceVariance {
+                    signature: callable.signature,
+                    type_: callable.parameters[0],
+                },
+            );
 
             assert_eq!(
                 project_vector(
