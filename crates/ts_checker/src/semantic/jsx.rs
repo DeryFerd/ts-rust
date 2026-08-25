@@ -28,8 +28,11 @@ use super::{
     array_types::CanonicalArrayTargets,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     formatter::{
-        CanonicalTypeFormatFlags, get_type_names_for_assignability_error,
-        type_to_string_with_host_and_flags,
+        AssignabilityErrorDisplay, CanonicalTypeFormatFlags,
+        get_type_names_for_assignability_error,
+        get_type_names_for_assignability_error_with_host_and_flags,
+        get_type_names_for_assignability_error_with_host_global_types_and_flags,
+        type_to_string_with_host_and_flags, type_to_string_with_host_global_types_and_flags,
     },
     indexed_access_types::template_pattern_index_matches_name,
     instantiate::{InstantiationLimits, InstantiationSession},
@@ -3459,14 +3462,14 @@ fn check_react_jsx_fragment_children(
         return Ok(true);
     }
 
-    let actual = format_attribute_object(store, host, &[], Some(children))?;
+    let actual = format_attribute_object(store, host, source.3, &[], Some(children))?;
     let expected_object = type_to_string_with_host_and_flags(
         store,
         host,
         attributes,
         CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
     )?;
-    let display = get_type_names_for_assignability_error(store, children.type_, expected)?;
+    let display = jsx_child_assignability_display(store, host, source.3, children.type_, expected)?;
     let property_detail = Diagnostic::with_arguments(
         message_by_code(2326).ok_or(SourceCheckError::MissingDiagnostic(2326))?,
         [property_name],
@@ -3638,13 +3641,63 @@ fn jsx_child_is_assignable(
         return Err(error.into());
     }
 
-    let resolved = CanonicalTypeQuery::new(store, host, options, diagnostics)?
-        .get_declared_type_of_symbol(owner)?;
+    let plan = super::object_members::plan_interface(store, host, owner)
+        .map_err(|_| SourceCheckError::Property(location))?;
+    let mut bases = plan.heritage_base_symbols();
+    let Some(base) = bases.next() else {
+        return Err(error.into());
+    };
+    if bases.next().is_some() || !plan.properties.is_empty() {
+        return Err(error.into());
+    }
+    let base_type = if let Some(global_types) = global_types {
+        CanonicalTypeQuery::new_with_global_types(store, host, global_types, options, diagnostics)?
+            .get_declared_type_of_symbol(base)?
+    } else {
+        CanonicalTypeQuery::new(store, host, options, diagnostics)?
+            .get_declared_type_of_symbol(base)?
+    };
+    let resolved = super::structured_members::resolve_direct_interface_members(
+        store,
+        &plan,
+        source,
+        &[],
+        &[base_type],
+    )
+    .map_err(|_| SourceCheckError::Property(location))?;
     if resolved != source {
         return Err(SourceCheckError::Property(location));
     }
 
     relation(store).map_err(Into::into)
+}
+
+fn jsx_child_assignability_display(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    source: TypeId,
+    target: TypeId,
+) -> Result<AssignabilityErrorDisplay, SourceCheckError> {
+    if let Some(global_types) = global_types {
+        get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            source,
+            target,
+            CanonicalTypeFormatFlags::NONE,
+        )
+    } else {
+        get_type_names_for_assignability_error_with_host_and_flags(
+            store,
+            host,
+            source,
+            target,
+            CanonicalTypeFormatFlags::NONE,
+        )
+    }
+    .map_err(Into::into)
 }
 
 #[allow(clippy::too_many_arguments)] // Contextual children retain their owner and expected props.
@@ -3748,7 +3801,8 @@ fn check_jsx_implicit_children(
                 diagnostics,
             )?
         {
-            let display = get_type_names_for_assignability_error(store, type_, expected)?;
+            let display =
+                jsx_child_assignability_display(store, source.2, source.3, type_, expected)?;
             add_diagnostic(diagnostics, node, 2322, [display.source, display.target])?;
             individual_errors = true;
         }
@@ -5705,7 +5759,7 @@ fn check_attribute_assignability(
             let diagnostic = Diagnostic::with_arguments(
                 message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
                 [
-                    format_attribute_object(store, host, attributes, children)?,
+                    format_attribute_object(store, host, global_types, attributes, children)?,
                     target,
                 ],
             )
@@ -5758,8 +5812,13 @@ fn check_attribute_assignability(
                 diagnostics,
             )?
         {
-            let display =
-                get_type_names_for_assignability_error(store, children.type_, expected_type)?;
+            let display = jsx_child_assignability_display(
+                store,
+                host,
+                global_types,
+                children.type_,
+                expected_type,
+            )?;
             let explicit_fragment = tag.namespace_member.as_ref().is_some_and(|member| {
                 store
                     .symbol(member.member)
@@ -5817,7 +5876,8 @@ fn check_attribute_assignability(
                 .as_utf8()
                 .ok_or(SourceCheckError::Property(opening))?;
             if !present.contains(name) {
-                let source = format_attribute_object(store, host, attributes, children)?;
+                let source =
+                    format_attribute_object(store, host, global_types, attributes, children)?;
                 let target = type_to_string_with_host_and_flags(
                     store,
                     host,
@@ -6562,12 +6622,31 @@ fn matching_attribute_index_value_type(
 fn format_attribute_object(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     attributes: &[CheckedJsxAttribute],
     children: Option<CheckedJsxChildren>,
 ) -> Result<String, SourceCheckError> {
     if attributes.is_empty() && children.is_none() {
         return Ok("{}".to_owned());
     }
+    let format_type = |type_: TypeId| {
+        if let Some(global_types) = global_types {
+            type_to_string_with_host_global_types_and_flags(
+                store,
+                host,
+                global_types,
+                type_,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            )
+        } else {
+            type_to_string_with_host_and_flags(
+                store,
+                host,
+                type_,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            )
+        }
+    };
     let mut names = attributes
         .iter()
         .map(|attribute| -> Result<String, SourceCheckError> {
@@ -6576,27 +6655,14 @@ fn format_attribute_object(
             } else {
                 attribute.plan.name.clone()
             };
-            Ok(format!(
-                "{name}: {};",
-                type_to_string_with_host_and_flags(
-                    store,
-                    host,
-                    attribute.type_,
-                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
-                )?
-            ))
+            Ok(format!("{name}: {};", format_type(attribute.type_)?))
         })
         .collect::<Result<Vec<_>, _>>()?;
     if let Some(children) = children {
         names.push(format!(
             "{}: {};",
             checked_jsx_children_name(store, children)?,
-            type_to_string_with_host_and_flags(
-                store,
-                host,
-                children.type_,
-                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
-            )?
+            format_type(children.type_)?
         ));
     }
     Ok(format!("{{ {} }}", names.join(" ")))
