@@ -170,7 +170,7 @@ use super::{
         PreparedContextualSourceCallable, SourceCallableBodyMode, SourceCallableError,
         SourceCallableFamily, SourceCallableParameterPlan, SourceCallablePlan,
         SourceCallableReturnPlan, StoredSourceCallableValidation,
-        authenticated_typed_function_array_parameter_bindings,
+        authenticated_function_array_parameter_bindings,
         materialize_anonymous_source_function_expression, materialize_global_wrapper_method,
         plan_callable_type_predicate, plan_javascript_duplicate_function_implementation,
         plan_source_callable, publish_array_filter_predicate_source_callable,
@@ -9942,7 +9942,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         };
         if callable.family == SourceCallableFamily::FunctionDeclaration {
-            return authenticated_typed_function_array_parameter_bindings(
+            return authenticated_function_array_parameter_bindings(
                 store,
                 host,
                 callable.declaration,
@@ -23496,7 +23496,7 @@ fn preflight_inferred_function_return_dependencies(
         }
         let mut locals = HashSet::new();
         for parameter in &function.callable.parameters {
-            if let Some(bindings) = authenticated_typed_function_array_parameter_bindings(
+            if let Some(bindings) = authenticated_function_array_parameter_bindings(
                 store,
                 host,
                 function.callable.declaration,
@@ -23511,7 +23511,21 @@ fn preflight_inferred_function_return_dependencies(
                 &function.callable.parameters,
                 &locals,
                 functions,
-            )
+            ) || function.callable.family == SourceCallableFamily::FunctionDeclaration
+                && initializer.parameter.is_implicit_any()
+                && initializer.parameter.initializer == Some(initializer.expression.node)
+                && authenticated_function_array_parameter_bindings(
+                    store,
+                    host,
+                    function.callable.declaration,
+                    initializer.parameter.declaration,
+                )
+                .is_some()
+                && matches!(
+                    &initializer.expression.kind,
+                    PlannedExpressionKind::Identifier(read)
+                        if read.kind == PlannedIdentifierReadKind::Variable
+                )
         });
         let body_supported = match &function.body {
             PlannedFunctionBody::Ambient => !function.callable.return_type.is_inferred(),
@@ -30439,6 +30453,12 @@ fn issue_implicit_any_parameter_diagnostics(
         let name_record = host.node(name).ok_or(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingNode(name),
         ))?;
+        if name_record.kind == SyntaxKind::ArrayBindingPattern
+            && parameter.initializer.is_some()
+            && callable.family == SourceCallableFamily::FunctionDeclaration
+        {
+            continue;
+        }
         let NodeData::Identifier(identifier) = &name_record.data else {
             return Err(callable_parameter_execution_error(
                 callable,
@@ -30755,12 +30775,24 @@ fn check_callable_parameter_initializers(
     let mut flow_types = outer_flow_types.clone();
     let mut initializer_index = 0usize;
     for parameter in &callable.parameters {
+        let initialized_array_binding = callable.family
+            == SourceCallableFamily::FunctionDeclaration
+            && parameter.is_implicit_any()
+            && parameter.initializer.is_some()
+            && authenticated_function_array_parameter_bindings(
+                store,
+                host,
+                callable.declaration,
+                parameter.declaration,
+            )
+            .is_some();
         let body_type = store
             .value_symbol_links(parameter.symbol)
             .and_then(|links| links.resolved_type)
             .ok_or(SourceCheckError::Variable(
                 VariableInvariant::MissingCurrentFlowType(parameter.symbol),
             ))?;
+        let mut binding_receiver = body_type;
         if let Some(initializer) = parameter.initializer {
             let planned = initializers.get(initializer_index).ok_or_else(|| {
                 callable_parameter_execution_error(callable, parameter.declaration)
@@ -30771,28 +30803,46 @@ fn check_callable_parameter_initializers(
                     parameter.declaration,
                 ));
             }
-            let assignment = check_planned_assignment(
-                store,
-                host,
-                global_types,
-                source,
-                options,
-                session,
-                diagnostics,
-                &flow_types,
-                preflighted_type_import_value_uses,
-                deferred,
-                parameter.type_node,
-                &[],
-                &planned.expression,
-                parameter.declaration,
-                None,
-            )?;
-            if assignment.declared_type != body_type {
-                return Err(callable_parameter_execution_error(
-                    callable,
+            if initialized_array_binding {
+                binding_receiver = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &flow_types,
+                    preflighted_type_import_value_uses,
+                    &planned.expression,
+                    None,
+                    deferred,
+                )?
+                .result;
+            } else {
+                let assignment = check_planned_assignment(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &flow_types,
+                    preflighted_type_import_value_uses,
+                    deferred,
+                    parameter.type_node,
+                    &[],
+                    &planned.expression,
                     parameter.declaration,
-                ));
+                    None,
+                )?;
+                if assignment.declared_type != body_type {
+                    return Err(callable_parameter_execution_error(
+                        callable,
+                        parameter.declaration,
+                    ));
+                }
             }
             initializer_index += 1;
         }
@@ -30804,7 +30854,7 @@ fn check_callable_parameter_initializers(
         if callable.family != SourceCallableFamily::FunctionDeclaration {
             continue;
         }
-        let Some(bindings) = authenticated_typed_function_array_parameter_bindings(
+        let Some(bindings) = authenticated_function_array_parameter_bindings(
             store,
             host,
             callable.declaration,
@@ -30820,7 +30870,7 @@ fn check_callable_parameter_initializers(
                 global_types,
                 options,
                 declaration,
-                body_type,
+                binding_receiver,
             )
             .map_err(|error| SourcePlanner::element_plan_error(declaration, error))?;
             if let Some(diagnostic) = checked.diagnostic {
@@ -87052,6 +87102,128 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn initialized_array_parameters_preserve_the_one_lexical_source_diagnostic() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "var results: string[]; ",
+            "{ let [, second, , fourth] = results; ",
+            "let observed = { fourth, second }; } ",
+            "function select([, first, , last, ,] = results) {}",
+        ));
+        let library_file = FileId::new(10_056);
+        let file = FileId::new(10_057);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected only the lexical block's uninitialized source diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2454);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "results");
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for name in ["second", "fourth", "first", "last"] {
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, name),
+                string,
+                "{name}",
+            );
+        }
+        let owner = function_symbol(&context, &source, file, "select");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .min_argument_count(),
+            0,
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn initialized_array_parameters_reject_poisoned_binding_types_without_publication() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "var results: string[]; ",
+            "function select([, value,] = results) {}",
+        ));
+        let library_file = FileId::new(10_058);
+        let file = FileId::new(10_059);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let declaration = function_declaration(&source, file, "select");
+        let NodeData::FunctionDeclaration(function) =
+            &source.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected the initialized array-binding function")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, function.parameters.nodes[0]);
+        let binding = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BindingElement).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(binding).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        mark_source_unchecked(&mut context, file);
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(parameter),
+            )),
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
