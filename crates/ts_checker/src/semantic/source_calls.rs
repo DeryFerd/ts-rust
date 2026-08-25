@@ -9327,6 +9327,14 @@ mod tests {
             .collect::<Vec<_>>()
             .try_into()
             .expect("the fixture must retain six callback types");
+        for (_, node) in &nodes {
+            let signature = context
+                .store()
+                .signature_links(*node)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            context.get_return_type_of_signature(signature).unwrap();
+        }
         let primitive = context.store().intrinsic_bootstrap().unwrap().string_type;
         let cache_state = |store: &CanonicalTypeMapperStore| {
             (
