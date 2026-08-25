@@ -2,7 +2,8 @@
 //!
 //! This module admits one or two interface bases, including merged
 //! declarations, authenticated namespace exports, forwarded generic type
-//! parameters, concrete generic instantiations, bounded base chains, and
+//! parameters with bounded trailing primitive arguments, concrete generic
+//! instantiations, bounded base chains, and
 //! merged default-library DOM interface/value identities.
 //! Authenticated React node arrays retain their default-library `Array<T>`
 //! heritage without expanding recursive members.
@@ -62,6 +63,7 @@ enum HeritageTypeParameterAnnotations {
 }
 
 const MAX_INTERFACE_HERITAGE_DEPTH: usize = 16;
+const MAX_TRAILING_PRIMITIVE_HERITAGE_ARGUMENTS: usize = 3;
 
 pub(super) fn plan_direct_interface_heritage(
     store: &CanonicalTypeMapperStore,
@@ -439,7 +441,8 @@ fn plan_forwarded_interface_type_arguments(
         || parameters.has_trailing_comma
         || arguments.has_trailing_comma
         || arguments.nodes.is_empty()
-        || arguments.nodes.len() > parameters.nodes.len()
+        || arguments.nodes.len()
+            > parameters.nodes.len() + MAX_TRAILING_PRIMITIVE_HERITAGE_ARGUMENTS
     {
         return Err(unsupported());
     }
@@ -526,15 +529,12 @@ fn plan_forwarded_interface_type_arguments(
     let mut planned = Vec::with_capacity(arguments.nodes.len());
     let mut previous_end = expression_record.range.end;
     let mut previous_parameter = None;
+    let mut trailing_primitive_count = 0;
     for argument in &arguments.nodes {
         let argument = NodeRef::new(node.arena, node.file, *argument);
         let argument_record = preflight_node(store, host, argument)
             .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
-        let NodeData::TypeReferenceNode(reference) = &argument_record.data else {
-            return Err(unsupported());
-        };
-        if argument_record.kind != SyntaxKind::TypeReference
-            || argument_record.flags.0 != 0
+        if argument_record.flags.0 != 0
             || argument_record.parent != Some(node.node)
             || argument_record.range.start < previous_end
             || argument_record.range.start <= arguments.range.start
@@ -542,6 +542,24 @@ fn plan_forwarded_interface_type_arguments(
             || planned.contains(&argument)
         {
             return Err(DirectInterfaceHeritageError::Invalid);
+        }
+        if matches!(argument_record.data, NodeData::KeywordTypeNode(_)) {
+            if previous_parameter.is_none()
+                || trailing_primitive_count >= MAX_TRAILING_PRIMITIVE_HERITAGE_ARGUMENTS
+            {
+                return Err(unsupported());
+            }
+            authenticate_concrete_interface_type_argument(store, host, argument, 0)?;
+            trailing_primitive_count += 1;
+            previous_end = argument_record.range.end;
+            planned.push(argument);
+            continue;
+        }
+        let NodeData::TypeReferenceNode(reference) = &argument_record.data else {
+            return Err(unsupported());
+        };
+        if argument_record.kind != SyntaxKind::TypeReference || trailing_primitive_count != 0 {
+            return Err(unsupported());
         }
         if reference.type_arguments.is_some() {
             return Err(unsupported());
@@ -3096,6 +3114,78 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_generic_interface_bases_preserve_bounded_trailing_primitive_arguments() {
+        for (index, (source, expected)) in [
+            (
+                concat!(
+                    "interface Derived<Value> extends Base<Value, string> {}\n",
+                    "interface Base<First, Second> {}\n",
+                ),
+                vec![SyntaxKind::TypeReference, SyntaxKind::StringKeyword],
+            ),
+            (
+                concat!(
+                    "interface Derived<First, Second> ",
+                    "extends Base<First, Second, string, number, never> {}\n",
+                    "interface Base<A, B, C, D, E> {}\n",
+                ),
+                vec![
+                    SyntaxKind::TypeReference,
+                    SyntaxKind::TypeReference,
+                    SyntaxKind::StringKeyword,
+                    SyntaxKind::NumberKeyword,
+                    SyntaxKind::NeverKeyword,
+                ],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{index}: {:?}",
+                parsed.diagnostics,
+            );
+            let file = FileId::new(8_482 + u32::try_from(index).unwrap());
+            let context = checker_context(&parsed, file);
+            let cold = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            let planned = heritage_plan(&parsed, file, &context, "Derived").unwrap();
+            let [base] = planned.bases.as_slice() else {
+                panic!("{index}: transformed heritage must retain one authenticated base")
+            };
+            assert_eq!(base.kind, DirectInterfaceBaseKind::Interface);
+            assert_eq!(
+                base.type_arguments
+                    .iter()
+                    .map(|argument| parsed.arena.get(argument.node).unwrap().kind)
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+            assert_eq!(
+                heritage_plan(&parsed, file, &context, "Derived").unwrap(),
+                planned,
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                cold,
+                "{index}: transformed heritage planning published checker state",
+            );
+        }
+    }
+
+    #[test]
     fn forwarded_generic_interface_bases_reject_unverified_substitutions() {
         for (index, source) in [
             concat!(
@@ -3117,6 +3207,19 @@ mod tests {
             concat!(
                 "interface Derived<Value> extends Base<Value, Value> {}\n",
                 "interface Base<Left, Right> { left: Left; right: Right }\n",
+            ),
+            concat!(
+                "interface Derived<Value> extends Base<string, Value> {}\n",
+                "interface Base<First, Second> {}\n",
+            ),
+            concat!(
+                "interface Derived<First, Second> extends Base<First, string, Second> {}\n",
+                "interface Base<A, B, C> {}\n",
+            ),
+            concat!(
+                "interface Derived<Value> ",
+                "extends Base<Value, string, number, boolean, never> {}\n",
+                "interface Base<A, B, C, D, E> {}\n",
             ),
         ]
         .into_iter()
