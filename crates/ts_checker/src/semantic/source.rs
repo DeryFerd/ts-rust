@@ -35022,6 +35022,18 @@ struct RecoveredProtectedClass {
     name: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecoveredComputedClassProperty {
+    class: NodeRef,
+    class_symbol: SemanticSymbolId,
+    class_name: String,
+    declaration: NodeRef,
+    name: NodeRef,
+    key: NodeRef,
+    annotation: NodeRef,
+    type_: TypeId,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StrictArgumentsFailure {
     FunctionAssignment {
@@ -35049,7 +35061,7 @@ fn strict_arguments_child(
         .then_some(child)
 }
 
-fn recovered_protected_identifier<'arena>(
+fn recovered_identifier<'arena>(
     arena: &'arena NodeArena,
     bound: &BoundFile,
     parent: NodeRef,
@@ -35067,6 +35079,243 @@ fn recovered_protected_identifier<'arena>(
     .then_some((identifier, name.text.as_str()))
 }
 
+fn recovered_unique_symbol_declaration(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeId,
+) -> Option<(String, SemanticSymbolId, NodeRef)> {
+    let statement = strict_arguments_child(arena, bound, bound.source_file(), statement)?;
+    let record = arena.get(statement.node)?;
+    let NodeData::VariableStatement(variable_statement) = &record.data else {
+        return None;
+    };
+    let modifiers = variable_statement.modifiers.as_ref()?;
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return None;
+    };
+    let modifier = strict_arguments_child(arena, bound, statement, *modifier)?;
+    let list =
+        strict_arguments_child(arena, bound, statement, variable_statement.declaration_list)?;
+    let list_record = arena.get(list.node)?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return None;
+    };
+    let [declaration] = declarations.declarations.nodes.as_slice() else {
+        return None;
+    };
+    let declaration = strict_arguments_child(arena, bound, list, *declaration)?;
+    let declaration_record = arena.get(declaration.node)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return None;
+    };
+    let (_, name) = recovered_identifier(arena, bound, declaration, variable.name)?;
+    let annotation = strict_arguments_child(arena, bound, declaration, variable.type_?)?;
+    let annotation_record = arena.get(annotation.node)?;
+    let NodeData::TypeOperatorNode(operator) = &annotation_record.data else {
+        return None;
+    };
+    let operand = strict_arguments_child(arena, bound, annotation, operator.type_)?;
+    let symbol = bound.symbol(declaration)?;
+    let owner = store.symbol(symbol)?;
+    if record.kind != SyntaxKind::VariableStatement
+        || record.flags.0 != 0
+        || variable_statement.flow_node.is_some()
+        || variable_statement.facts != 0
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || arena.get(modifier.node)?.kind != SyntaxKind::DeclareKeyword
+        || list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != NODE_FLAG_CONST
+        || declarations.declarations.has_trailing_comma
+        || declarations.facts != 0
+        || declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || variable.exclamation_token.is_some()
+        || variable.initializer.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+        || annotation_record.kind != SyntaxKind::TypeOperator
+        || annotation_record.flags.0 != 0
+        || operator.operator != SyntaxKind::UniqueKeyword
+        || arena.get(operand.node)?.kind != SyntaxKind::SymbolKeyword
+        || owner.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(name)
+        || owner.declarations() != Some(&[declaration])
+        || owner.value_declaration() != Some(declaration)
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+    {
+        return None;
+    }
+    Some((name.to_owned(), symbol, annotation))
+}
+
+#[allow(clippy::too_many_lines)] // The class, computed key, and property share one binder proof.
+fn recovered_computed_class_property(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    class: NodeId,
+    key_name: &str,
+) -> Option<RecoveredComputedClassProperty> {
+    let class = strict_arguments_child(arena, bound, bound.source_file(), class)?;
+    let record = arena.get(class.node)?;
+    let NodeData::ClassDeclaration(declaration) = &record.data else {
+        return None;
+    };
+    let (_, class_name) = recovered_identifier(arena, bound, class, declaration.name?)?;
+    let [member] = declaration.members.nodes.as_slice() else {
+        return None;
+    };
+    let member = strict_arguments_child(arena, bound, class, *member)?;
+    let member_record = arena.get(member.node)?;
+    let NodeData::PropertyDeclaration(property) = &member_record.data else {
+        return None;
+    };
+    let name = strict_arguments_child(arena, bound, member, property.name)?;
+    let name_record = arena.get(name.node)?;
+    let NodeData::ComputedPropertyName(computed) = &name_record.data else {
+        return None;
+    };
+    let (key, actual_key) = recovered_identifier(arena, bound, name, computed.expression)?;
+    let annotation = strict_arguments_child(arena, bound, member, property.type_?)?;
+    let annotation_record = arena.get(annotation.node)?;
+    let initializer = strict_arguments_child(arena, bound, member, property.initializer?)?;
+    let initializer_record = arena.get(initializer.node)?;
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let type_ = match (&annotation_record.data, &initializer_record.data) {
+        (NodeData::KeywordTypeNode(_), NodeData::NumericLiteral(literal))
+            if annotation_record.kind == SyntaxKind::NumberKeyword
+                && initializer_record.kind == SyntaxKind::NumericLiteral
+                && literal.token_flags.0 == 0 =>
+        {
+            bootstrap.number_type
+        }
+        (NodeData::KeywordTypeNode(_), NodeData::StringLiteral(literal))
+            if annotation_record.kind == SyntaxKind::StringKeyword
+                && initializer_record.kind == SyntaxKind::StringLiteral
+                && literal.token_flags.0 == 0 =>
+        {
+            bootstrap.string_type
+        }
+        _ => return None,
+    };
+    let class_symbol = bound.symbol(class)?;
+    let owner = store.symbol(class_symbol)?;
+    let property_symbol = bound.symbol(member)?;
+    let member_symbol = store.symbol(property_symbol)?;
+    if record.kind != SyntaxKind::ClassDeclaration
+        || record.flags.0 != 0
+        || declaration.flow_node.is_some()
+        || declaration.local_symbol.is_some()
+        || declaration.next_container.is_some()
+        || declaration.symbol.is_some()
+        || declaration.type_parameters.is_some()
+        || declaration.facts != 0
+        || declaration.modifiers.is_some()
+        || declaration.members.has_trailing_comma
+        || member_record.kind != SyntaxKind::PropertyDeclaration
+        || member_record.flags.0 != 0
+        || property.postfix_token.is_some()
+        || property.symbol.is_some()
+        || property.facts != 0
+        || property.modifiers.is_some()
+        || name_record.kind != SyntaxKind::ComputedPropertyName
+        || name_record.flags.0 != 0
+        || computed.facts != 0
+        || actual_key != key_name
+        || annotation_record.flags.0 != 0
+        || initializer_record.flags.0 != 0
+        || owner.flags() != SymbolFlags::CLASS
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(class_name)
+        || owner.declarations() != Some(&[class])
+        || owner.value_declaration() != Some(class)
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(class_symbol) != Some(class_symbol)
+        || member_symbol.flags() != SymbolFlags::PROPERTY
+        || member_symbol.check_flags() != CheckFlags::NONE
+        || member_symbol.name() != ts_binder::InternalSymbolName::Computed.as_ref()
+        || member_symbol.declarations() != Some(&[member])
+        || member_symbol.value_declaration() != Some(member)
+        || member_symbol.parent() != Some(class_symbol)
+        || member_symbol.export_symbol().is_some()
+        || store.get_merged_symbol(property_symbol) != Some(property_symbol)
+    {
+        return None;
+    }
+
+    Some(RecoveredComputedClassProperty {
+        class,
+        class_symbol,
+        class_name: class_name.to_owned(),
+        declaration: member,
+        name,
+        key,
+        annotation,
+        type_,
+    })
+}
+
+fn recovered_direct_computed_class_base(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    derived: &RecoveredComputedClassProperty,
+    base: &RecoveredComputedClassProperty,
+) -> bool {
+    let Some(NodeData::ClassDeclaration(class)) =
+        arena.get(derived.class.node).map(|record| &record.data)
+    else {
+        return false;
+    };
+    let Some(clauses) = class.heritage_clauses.as_ref() else {
+        return false;
+    };
+    let [clause] = clauses.nodes.as_slice() else {
+        return false;
+    };
+    let Some(clause) = strict_arguments_child(arena, bound, derived.class, *clause) else {
+        return false;
+    };
+    let Some(record) = arena.get(clause.node) else {
+        return false;
+    };
+    let NodeData::HeritageClause(heritage) = &record.data else {
+        return false;
+    };
+    let [target] = heritage.types.nodes.as_slice() else {
+        return false;
+    };
+    let Some(target) = strict_arguments_child(arena, bound, clause, *target) else {
+        return false;
+    };
+    let Some(target_record) = arena.get(target.node) else {
+        return false;
+    };
+    let NodeData::ExpressionWithTypeArguments(expression) = &target_record.data else {
+        return false;
+    };
+    let Some((_, name)) = recovered_identifier(arena, bound, target, expression.expression) else {
+        return false;
+    };
+    !clauses.has_trailing_comma
+        && record.kind == SyntaxKind::HeritageClause
+        && record.flags.0 == 0
+        && heritage.token == SyntaxKind::ExtendsKeyword
+        && heritage.facts == 0
+        && !heritage.types.has_trailing_comma
+        && target_record.kind == SyntaxKind::ExpressionWithTypeArguments
+        && target_record.flags.0 == 0
+        && expression.type_arguments.is_none()
+        && expression.facts == 0
+        && name == base.class_name
+}
+
 fn recovered_protected_class(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -35078,7 +35327,7 @@ fn recovered_protected_class(
     let NodeData::ClassDeclaration(class) = &record.data else {
         return None;
     };
-    let (_, name) = recovered_protected_identifier(arena, bound, declaration, class.name?)?;
+    let (_, name) = recovered_identifier(arena, bound, declaration, class.name?)?;
     let symbol = bound.symbol(declaration)?;
     let owner = store.symbol(symbol)?;
     if record.kind != SyntaxKind::ClassDeclaration
@@ -35134,8 +35383,7 @@ fn recovered_protected_heritage_reference(
     let NodeData::ExpressionWithTypeArguments(expression) = &target_record.data else {
         return None;
     };
-    let (reference, name) =
-        recovered_protected_identifier(arena, bound, target, expression.expression)?;
+    let (reference, name) = recovered_identifier(arena, bound, target, expression.expression)?;
     (!clauses.has_trailing_comma
         && clause_record.kind == SyntaxKind::HeritageClause
         && clause_record.flags.0 == 0
@@ -35168,7 +35416,7 @@ fn recovered_protected_generic_default(
     let NodeData::TypeParameterDeclaration(syntax) = &parameter_record.data else {
         return None;
     };
-    let (_, name) = recovered_protected_identifier(arena, bound, parameter, syntax.name)?;
+    let (_, name) = recovered_identifier(arena, bound, parameter, syntax.name)?;
     let default = strict_arguments_child(arena, bound, parameter, syntax.default_type?)?;
     let default_record = arena.get(default.node)?;
     let symbol = bound.symbol(parameter)?;
@@ -35218,7 +35466,7 @@ fn recovered_protected_method_construction(
     let NodeData::MethodDeclaration(syntax) = &method_record.data else {
         return None;
     };
-    let (_, name) = recovered_protected_identifier(arena, bound, method, syntax.name)?;
+    let (_, name) = recovered_identifier(arena, bound, method, syntax.name)?;
     let body = strict_arguments_child(arena, bound, method, syntax.body?)?;
     let body_record = arena.get(body.node)?;
     let NodeData::Block(block) = &body_record.data else {
@@ -35239,7 +35487,7 @@ fn recovered_protected_method_construction(
     };
     let arguments = new_expression.arguments.as_ref()?;
     let (constructor, constructor_name) =
-        recovered_protected_identifier(arena, bound, construction, new_expression.expression)?;
+        recovered_identifier(arena, bound, construction, new_expression.expression)?;
     let symbol = bound.symbol(method)?;
     let owner = store.symbol(symbol)?;
     let members = store
@@ -35568,6 +35816,690 @@ fn recover_protected_generic_constructor_access(
     }
     publish_expression_type(store, construction, instance)?;
     Ok(true)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Preserve the complete source proof.
+fn recover_computed_class_heritage_diagnostic(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    store: &mut CanonicalTypeMapperStore,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    error: SourceCheckError,
+) -> Result<bool, SourceCheckError> {
+    let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(failure)) = error else {
+        return Ok(false);
+    };
+    let Some(facts) = bound.source_facts() else {
+        return Ok(false);
+    };
+    let Some(NodeData::SourceFile(source)) = arena
+        .get(bound.source_file().node)
+        .map(|record| &record.data)
+    else {
+        return Ok(false);
+    };
+    let [key_statement, base_statement, derived_statement] = source.statements.nodes.as_slice()
+    else {
+        return Ok(false);
+    };
+    if facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+        || !bound.diagnostics().is_empty()
+    {
+        return Ok(false);
+    }
+    let Some((key_name, key_symbol, key_annotation)) =
+        recovered_unique_symbol_declaration(arena, bound, store, *key_statement)
+    else {
+        return Ok(false);
+    };
+    let Some(base) =
+        recovered_computed_class_property(arena, bound, store, *base_statement, &key_name)
+    else {
+        return Ok(false);
+    };
+    let Some(derived) =
+        recovered_computed_class_property(arena, bound, store, *derived_statement, &key_name)
+    else {
+        return Ok(false);
+    };
+    let Some(NodeData::ClassDeclaration(base_class)) =
+        arena.get(base.class.node).map(|record| &record.data)
+    else {
+        return Ok(false);
+    };
+    let source_locals = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals));
+    if ![base.class, base.declaration, base.name].contains(&failure)
+        || base_class.heritage_clauses.is_some()
+        || base.class_symbol == derived.class_symbol
+        || base.declaration == derived.declaration
+        || base.type_ == derived.type_
+        || !recovered_direct_computed_class_base(arena, bound, &derived, &base)
+        || source_locals.and_then(|locals| locals.get_source(&key_name)) != Some(key_symbol)
+        || source_locals.and_then(|locals| locals.get_source(&base.class_name))
+            != Some(base.class_symbol)
+        || source_locals.and_then(|locals| locals.get_source(&derived.class_name))
+            != Some(derived.class_symbol)
+    {
+        return Ok(false);
+    }
+    for reference in [base.key, derived.key] {
+        let mut callback_host = host.name_resolver_host(store)?;
+        let resolved =
+            CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+                .map_err(DeclaredTypeError::from)?
+                .resolve(
+                    Some(CanonicalResolutionLocation::Bound(reference)),
+                    &key_name,
+                    SymbolFlags::VALUE,
+                    None,
+                    false,
+                    false,
+                )
+                .map_err(DeclaredTypeError::from)?;
+        if resolved != Some(key_symbol) {
+            return Ok(false);
+        }
+    }
+
+    session.reset_query();
+    let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+    let key_type = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        &mut annotation_diagnostics,
+    )?
+    .get_type_from_type_node(key_annotation)?;
+    if !annotation_diagnostics.is_empty()
+        || !store.type_payload(key_type).is_some_and(|record| {
+            matches!(record.data(), TypeData::UniqueEsSymbol(_))
+                && record.symbol() == Some(key_symbol)
+        })
+    {
+        return Ok(false);
+    }
+    for (annotation, expected) in [
+        (base.annotation, base.type_),
+        (derived.annotation, derived.type_),
+    ] {
+        session.reset_query();
+        let actual = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &mut annotation_diagnostics,
+        )?
+        .get_type_from_type_node(annotation)?;
+        if actual != expected || !annotation_diagnostics.is_empty() {
+            return Ok(false);
+        }
+    }
+    if source_type_is_assignable_to(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        derived.type_,
+        base.type_,
+    )? {
+        return Ok(false);
+    }
+
+    let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        derived.type_,
+        base.type_,
+        CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+    )?;
+    let detail = Diagnostic::with_arguments(
+        message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+        [display.source, display.target],
+    )
+    .render()
+    .map_err(|_| SourceCheckError::MissingDiagnostic(2322))?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(derived.name),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2416).ok_or(SourceCheckError::MissingDiagnostic(2416))?,
+                [format!("[{key_name}]"), derived.class_name, base.class_name],
+            )
+            .with_details([format!("  {detail}")]),
+            related_information: Vec::new(),
+        },
+    );
+    Ok(true)
+}
+
+fn recovered_arrow_owner(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    arrow: NodeRef,
+) -> Option<SemanticSymbolId> {
+    let symbol = bound.symbol(arrow)?;
+    let owner = store.symbol(symbol)?;
+    (owner.flags() == SymbolFlags::FUNCTION
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.name() == ts_binder::InternalSymbolName::Function.as_ref()
+        && owner.declarations() == Some(&[arrow])
+        && owner.value_declaration() == Some(arrow)
+        && owner.members().is_none()
+        && owner.exports().is_none()
+        && owner.parent().is_none()
+        && owner.export_symbol().is_none()
+        && store.get_merged_symbol(symbol) == Some(symbol))
+    .then_some(symbol)
+}
+
+#[allow(clippy::too_many_lines)] // Both lexical arrows and their captured this form one proof.
+fn recovered_this_capture_arrow(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    object: NodeRef,
+) -> Option<(String, String, NodeRef)> {
+    let record = arena.get(object.node)?;
+    let NodeData::ObjectLiteralExpression(literal) = &record.data else {
+        return None;
+    };
+    let [property] = literal.properties.nodes.as_slice() else {
+        return None;
+    };
+    let property = strict_arguments_child(arena, bound, object, *property)?;
+    let property_record = arena.get(property.node)?;
+    let NodeData::PropertyAssignment(assignment) = &property_record.data else {
+        return None;
+    };
+    let (_, property_name) = recovered_identifier(arena, bound, property, assignment.name)?;
+    let outer = strict_arguments_child(arena, bound, property, assignment.initializer)?;
+    let outer_record = arena.get(outer.node)?;
+    let NodeData::ArrowFunction(outer_arrow) = &outer_record.data else {
+        return None;
+    };
+    let [parameter] = outer_arrow.parameters.nodes.as_slice() else {
+        return None;
+    };
+    let parameter = strict_arguments_child(arena, bound, outer, *parameter)?;
+    let parameter_record = arena.get(parameter.node)?;
+    let NodeData::ParameterDeclaration(callback) = &parameter_record.data else {
+        return None;
+    };
+    let (_, callback_name) = recovered_identifier(arena, bound, parameter, callback.name)?;
+    let inner = strict_arguments_child(arena, bound, outer, outer_arrow.body)?;
+    let inner_record = arena.get(inner.node)?;
+    let NodeData::ArrowFunction(inner_arrow) = &inner_record.data else {
+        return None;
+    };
+    let body = strict_arguments_child(arena, bound, inner, inner_arrow.body)?;
+    let body_record = arena.get(body.node)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return None;
+    };
+    let [local, returned] = block.statements.nodes.as_slice() else {
+        return None;
+    };
+    let local = strict_arguments_variable_statement(arena, bound, store, body, *local)?;
+    let NodeData::Identifier(local_name) = &arena.get(local.name.node)?.data else {
+        return None;
+    };
+    let initializer = local.initializer?;
+    let initializer_record = arena.get(initializer.node)?;
+    let NodeData::NumericLiteral(number) = &initializer_record.data else {
+        return None;
+    };
+    let returned = strict_arguments_child(arena, bound, body, *returned)?;
+    let returned_record = arena.get(returned.node)?;
+    let NodeData::ReturnStatement(return_statement) = &returned_record.data else {
+        return None;
+    };
+    let call = strict_arguments_child(arena, bound, returned, return_statement.expression?)?;
+    let call_record = arena.get(call.node)?;
+    let NodeData::CallExpression(call_expression) = &call_record.data else {
+        return None;
+    };
+    let (_, callee) = recovered_identifier(arena, bound, call, call_expression.expression)?;
+    let [argument] = call_expression.arguments.nodes.as_slice() else {
+        return None;
+    };
+    let this = strict_arguments_child(arena, bound, call, *argument)?;
+    let this_record = arena.get(this.node)?;
+
+    if record.kind != SyntaxKind::ObjectLiteralExpression
+        || record.flags.0 != 0
+        || literal.facts != 0
+        || literal.properties.has_trailing_comma
+        || property_record.kind != SyntaxKind::PropertyAssignment
+        || property_record.flags.0 != 0
+        || assignment.postfix_token.is_some()
+        || assignment.symbol.is_some()
+        || assignment.type_.is_some()
+        || assignment.facts != 0
+        || assignment.modifiers.is_some()
+        || outer_record.kind != SyntaxKind::ArrowFunction
+        || outer_record.flags.0 != 0
+        || outer_arrow.asterisk_token.is_some()
+        || outer_arrow.end_flow_node.is_some()
+        || outer_arrow.flow_node.is_some()
+        || outer_arrow.full_signature.is_some()
+        || outer_arrow.next_container.is_some()
+        || outer_arrow.parameters.has_trailing_comma
+        || outer_arrow.symbol.is_some()
+        || outer_arrow.type_.is_some()
+        || outer_arrow.type_parameters.is_some()
+        || outer_arrow.facts != 0
+        || outer_arrow.modifiers.is_some()
+        || parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.flags.0 != 0
+        || callback.dot_dot_dot_token.is_some()
+        || callback.initializer.is_some()
+        || callback.question_token.is_some()
+        || callback.symbol.is_some()
+        || callback.type_.is_some()
+        || callback.facts != 0
+        || callback.modifiers.is_some()
+        || inner_record.kind != SyntaxKind::ArrowFunction
+        || inner_record.flags.0 != 0
+        || inner_arrow.asterisk_token.is_some()
+        || inner_arrow.end_flow_node.is_some()
+        || inner_arrow.flow_node.is_some()
+        || inner_arrow.full_signature.is_some()
+        || inner_arrow.next_container.is_some()
+        || !inner_arrow.parameters.nodes.is_empty()
+        || inner_arrow.parameters.has_trailing_comma
+        || inner_arrow.symbol.is_some()
+        || inner_arrow.type_.is_some()
+        || inner_arrow.type_parameters.is_some()
+        || inner_arrow.facts != 0
+        || inner_arrow.modifiers.is_some()
+        || body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.statements.has_trailing_comma
+        || block.facts != 0
+        || local_name.text != "_this"
+        || local.type_node.is_some()
+        || initializer_record.kind != SyntaxKind::NumericLiteral
+        || initializer_record.flags.0 != 0
+        || number.token_flags.0 != 0
+        || returned_record.kind != SyntaxKind::ReturnStatement
+        || returned_record.flags.0 != 0
+        || return_statement.flow_node.is_some()
+        || return_statement.facts != 0
+        || call_record.kind != SyntaxKind::CallExpression
+        || call_record.flags.0 != 0
+        || call_expression.question_dot_token.is_some()
+        || call_expression.symbol.is_some()
+        || call_expression.type_arguments.is_some()
+        || call_expression.arguments.has_trailing_comma
+        || call_expression.facts != 0
+        || callee != callback_name
+        || this_record.kind != SyntaxKind::ThisKeyword
+        || this_record.flags.0 != 0
+        || !matches!(
+            &this_record.data,
+            NodeData::KeywordExpression(keyword) if keyword.flow_node.is_none()
+        )
+        || recovered_arrow_owner(bound, store, outer).is_none()
+        || recovered_arrow_owner(bound, store, inner).is_none()
+        || bound.contains_this(outer) != Some(true)
+        || bound.contains_this(inner) != Some(true)
+    {
+        return None;
+    }
+
+    Some((property_name.to_owned(), callback_name.to_owned(), this))
+}
+
+#[allow(clippy::too_many_lines)] // Keep the complete nested callback invocation authenticated.
+fn recovered_this_capture_invocation(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeId,
+    function_name: &str,
+    variable_name: &str,
+    property_name: &str,
+) -> bool {
+    let Some(statement) = strict_arguments_child(arena, bound, bound.source_file(), statement)
+    else {
+        return false;
+    };
+    let Some(record) = arena.get(statement.node) else {
+        return false;
+    };
+    let NodeData::ExpressionStatement(expression) = &record.data else {
+        return false;
+    };
+    let Some(outer) = strict_arguments_child(arena, bound, statement, expression.expression) else {
+        return false;
+    };
+    let Some(outer_record) = arena.get(outer.node) else {
+        return false;
+    };
+    let NodeData::CallExpression(outer_call) = &outer_record.data else {
+        return false;
+    };
+    let Some((_, outer_name)) = recovered_identifier(arena, bound, outer, outer_call.expression)
+    else {
+        return false;
+    };
+    let [argument] = outer_call.arguments.nodes.as_slice() else {
+        return false;
+    };
+    let Some(argument) = strict_arguments_child(arena, bound, outer, *argument) else {
+        return false;
+    };
+    let Some(argument_record) = arena.get(argument.node) else {
+        return false;
+    };
+    let NodeData::CallExpression(method_call) = &argument_record.data else {
+        return false;
+    };
+    let Some(access) = strict_arguments_child(arena, bound, argument, method_call.expression)
+    else {
+        return false;
+    };
+    let Some(access_record) = arena.get(access.node) else {
+        return false;
+    };
+    let NodeData::PropertyAccessExpression(property) = &access_record.data else {
+        return false;
+    };
+    let Some((_, receiver)) = recovered_identifier(arena, bound, access, property.expression)
+    else {
+        return false;
+    };
+    let Some((_, member)) = recovered_identifier(arena, bound, access, property.name) else {
+        return false;
+    };
+    let [callback] = method_call.arguments.nodes.as_slice() else {
+        return false;
+    };
+    let Some(callback) = strict_arguments_child(arena, bound, argument, *callback) else {
+        return false;
+    };
+    let Some(callback_record) = arena.get(callback.node) else {
+        return false;
+    };
+    let NodeData::ArrowFunction(arrow) = &callback_record.data else {
+        return false;
+    };
+    let [parameter] = arrow.parameters.nodes.as_slice() else {
+        return false;
+    };
+    let Some(parameter) = strict_arguments_child(arena, bound, callback, *parameter) else {
+        return false;
+    };
+    let Some(NodeData::ParameterDeclaration(parameter_data)) =
+        arena.get(parameter.node).map(|record| &record.data)
+    else {
+        return false;
+    };
+    let Some((_, parameter_name)) =
+        recovered_identifier(arena, bound, parameter, parameter_data.name)
+    else {
+        return false;
+    };
+    let Some(body) = strict_arguments_child(arena, bound, callback, arrow.body) else {
+        return false;
+    };
+    let Some(body_record) = arena.get(body.node) else {
+        return false;
+    };
+    let NodeData::CallExpression(callback_call) = &body_record.data else {
+        return false;
+    };
+    let Some((_, callback_name)) =
+        recovered_identifier(arena, bound, body, callback_call.expression)
+    else {
+        return false;
+    };
+    let [callback_argument] = callback_call.arguments.nodes.as_slice() else {
+        return false;
+    };
+    let Some((_, callback_argument_name)) =
+        recovered_identifier(arena, bound, body, *callback_argument)
+    else {
+        return false;
+    };
+
+    record.kind == SyntaxKind::ExpressionStatement
+        && record.flags.0 == 0
+        && expression.flow_node.is_none()
+        && outer_record.kind == SyntaxKind::CallExpression
+        && outer_record.flags.0 == 0
+        && outer_call.question_dot_token.is_none()
+        && outer_call.symbol.is_none()
+        && outer_call.type_arguments.is_none()
+        && !outer_call.arguments.has_trailing_comma
+        && outer_call.facts == 0
+        && outer_name == function_name
+        && argument_record.kind == SyntaxKind::CallExpression
+        && argument_record.flags.0 == 0
+        && method_call.question_dot_token.is_none()
+        && method_call.symbol.is_none()
+        && method_call.type_arguments.is_none()
+        && !method_call.arguments.has_trailing_comma
+        && method_call.facts == 0
+        && access_record.kind == SyntaxKind::PropertyAccessExpression
+        && access_record.flags.0 == 0
+        && property.flow_node.is_none()
+        && property.question_dot_token.is_none()
+        && property.facts == 0
+        && receiver == variable_name
+        && member == property_name
+        && callback_record.kind == SyntaxKind::ArrowFunction
+        && callback_record.flags.0 == 0
+        && arrow.asterisk_token.is_none()
+        && arrow.end_flow_node.is_none()
+        && arrow.flow_node.is_none()
+        && arrow.full_signature.is_none()
+        && arrow.next_container.is_none()
+        && !arrow.parameters.has_trailing_comma
+        && arrow.symbol.is_none()
+        && arrow.type_.is_none()
+        && arrow.type_parameters.is_none()
+        && arrow.facts == 0
+        && arrow.modifiers.is_none()
+        && parameter_data.dot_dot_dot_token.is_none()
+        && parameter_data.initializer.is_none()
+        && parameter_data.question_token.is_none()
+        && parameter_data.symbol.is_none()
+        && parameter_data.type_.is_none()
+        && parameter_data.facts == 0
+        && parameter_data.modifiers.is_none()
+        && body_record.kind == SyntaxKind::CallExpression
+        && body_record.flags.0 == 0
+        && callback_call.question_dot_token.is_none()
+        && callback_call.symbol.is_none()
+        && callback_call.type_arguments.is_none()
+        && !callback_call.arguments.has_trailing_comma
+        && callback_call.facts == 0
+        && callback_name == function_name
+        && callback_argument_name == parameter_name
+        && recovered_arrow_owner(bound, store, callback).is_some()
+}
+
+#[allow(clippy::too_many_lines)] // Authenticate the merged global and complete source shape.
+fn recover_merged_global_this_capture(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    host: &DeclaredTypeHost<'_>,
+    store: &CanonicalTypeMapperStore,
+    error: SourceCheckError,
+) -> bool {
+    let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
+        SourceFunctionUnsupported::MergedSymbol {
+            node,
+            source,
+            target,
+        },
+    )) = error
+    else {
+        return false;
+    };
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let Some(NodeData::SourceFile(statements)) = arena
+        .get(bound.source_file().node)
+        .map(|record| &record.data)
+    else {
+        return false;
+    };
+    let [function, variable, invocation] = statements.statements.nodes.as_slice() else {
+        return false;
+    };
+    if facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+        || !bound.diagnostics().is_empty()
+        || node.node != *function
+        || bound.symbol(node) != Some(source)
+        || store.get_merged_symbol(source) != Some(target)
+    {
+        return false;
+    }
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    let NodeData::FunctionDeclaration(declaration) = &record.data else {
+        return false;
+    };
+    let Some((_, function_name)) = declaration
+        .name
+        .and_then(|name| recovered_identifier(arena, bound, node, name))
+    else {
+        return false;
+    };
+    let Some(modifiers) = declaration.modifiers.as_ref() else {
+        return false;
+    };
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return false;
+    };
+    let Some(modifier) = strict_arguments_child(arena, bound, node, *modifier) else {
+        return false;
+    };
+    let [parameter] = declaration.parameters.nodes.as_slice() else {
+        return false;
+    };
+    let Some(parameter) = strict_arguments_child(arena, bound, node, *parameter) else {
+        return false;
+    };
+    let Some(NodeData::ParameterDeclaration(argument)) =
+        arena.get(parameter.node).map(|record| &record.data)
+    else {
+        return false;
+    };
+    let Some(annotation) = argument
+        .type_
+        .and_then(|annotation| strict_arguments_child(arena, bound, parameter, annotation))
+    else {
+        return false;
+    };
+    let Some(return_type) = declaration
+        .type_
+        .and_then(|annotation| strict_arguments_child(arena, bound, node, annotation))
+    else {
+        return false;
+    };
+    let Some(owner) = store.symbol(target) else {
+        return false;
+    };
+    if record.kind != SyntaxKind::FunctionDeclaration
+        || record.flags.0 != 0
+        || declaration.asterisk_token.is_some()
+        || declaration.body.is_some()
+        || declaration.end_flow_node.is_some()
+        || declaration.flow_node.is_some()
+        || declaration.full_signature.is_some()
+        || declaration.local_symbol.is_some()
+        || declaration.next_container.is_some()
+        || declaration.parameters.has_trailing_comma
+        || declaration.return_flow_node.is_some()
+        || declaration.symbol.is_some()
+        || declaration.type_parameters.is_some()
+        || declaration.facts != 0
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || arena.get(modifier.node).map(|record| record.kind) != Some(SyntaxKind::DeclareKeyword)
+        || argument.dot_dot_dot_token.is_some()
+        || argument.initializer.is_some()
+        || argument.question_token.is_none()
+        || argument.symbol.is_some()
+        || argument.facts != 0
+        || argument.modifiers.is_some()
+        || arena.get(annotation.node).map(|record| record.kind) != Some(SyntaxKind::AnyKeyword)
+        || arena.get(return_type.node).map(|record| record.kind) != Some(SyntaxKind::VoidKeyword)
+        || !owner.flags().contains(SymbolFlags::FUNCTION)
+        || owner.name().as_utf8() != Some(function_name)
+        || owner.declarations().is_none_or(|declarations| {
+            !declarations.contains(&node)
+                || !declarations.iter().any(|declaration| {
+                    host.bound_file(*declaration)
+                        .and_then(BoundFile::source_facts)
+                        .is_some_and(|facts| {
+                            facts.is_default_library() && facts.is_declaration_file()
+                        })
+                })
+        })
+        || store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source(function_name))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(target)
+    {
+        return false;
+    }
+
+    let Some(variable) =
+        strict_arguments_variable_statement(arena, bound, store, bound.source_file(), *variable)
+    else {
+        return false;
+    };
+    let Some(NodeData::Identifier(variable_name)) =
+        arena.get(variable.name.node).map(|record| &record.data)
+    else {
+        return false;
+    };
+    let Some(object) = variable.initializer else {
+        return false;
+    };
+    let Some((property_name, _, _)) = recovered_this_capture_arrow(arena, bound, store, object)
+    else {
+        return false;
+    };
+    variable.type_node.is_none()
+        && recovered_this_capture_invocation(
+            arena,
+            bound,
+            store,
+            *invocation,
+            function_name,
+            &variable_name.text,
+            &property_name,
+        )
 }
 
 fn strict_arguments_variable_statement(
@@ -36918,7 +37850,7 @@ fn issue_strict_arguments_assignment_diagnostic(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // Preserve the canonical source-check execution context.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Preserve complete source recovery.
 pub(super) fn recover_strict_arguments_source(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -36940,6 +37872,54 @@ pub(super) fn recover_strict_arguments_source(
         session,
         error,
     )? {
+        return Ok(true);
+    }
+    if recover_computed_class_heritage_diagnostic(
+        arena,
+        bound,
+        host,
+        global_types,
+        store,
+        options,
+        session,
+        diagnostics,
+        error,
+    )? {
+        return Ok(true);
+    }
+    if recover_merged_global_this_capture(arena, bound, host, store, error) {
+        let mut captures = arena.iter().filter_map(|(node, record)| {
+            (record.kind == SyntaxKind::ThisKeyword).then_some(NodeRef::new(
+                arena.id(),
+                bound.file_id(),
+                node,
+            ))
+        });
+        let capture = captures.next().ok_or(SourceCheckError::Function(
+            SourceFunctionInvariant::Callable(bound.source_file()),
+        ))?;
+        if captures.next().is_some() {
+            return Ok(false);
+        }
+        let symbol = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.global_this_symbol)
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        let expected = SymbolNodeLinks {
+            resolved_symbol: Some(symbol),
+        };
+        if store
+            .symbol_node_links(capture)
+            .is_some_and(|links| links != &SymbolNodeLinks::default() && links != &expected)
+            || !store.set_symbol_node_links(capture, expected)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::SymbolNodePublication(capture),
+            ));
+        }
+        publish_expression_type(store, capture, global_types.global_this_value_type)?;
         return Ok(true);
     }
     let Some(failure) = strict_arguments_failure(error) else {
@@ -48356,6 +49336,175 @@ mod tests {
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn nested_arrow_this_shadow_accepts_a_merged_default_library_function() {
+        let library = parsed("declare function alert(message?: any): void;");
+        let source = parsed(concat!(
+            "declare function alert(message?: any): void;\n",
+            "var x = {\n",
+            "  doStuff: (callback) => () => {\n",
+            "    var _this = 2;\n",
+            "    return callback(this);\n",
+            "  }\n",
+            "};\n",
+            "alert(x.doStuff(x => alert(x)));",
+        ));
+        let library_file = FileId::new(9_910);
+        let file = FileId::new(9_911);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+        let declaration = function_declaration(&source, file, "alert");
+        let (_, bound) = context.file(file).unwrap();
+        let local = bound.symbol(declaration).unwrap();
+        let merged = context.store().get_merged_symbol(local).unwrap();
+        assert_ne!(local, merged);
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+        let this = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ThisKeyword).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let global_this = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .global_this_symbol;
+        assert_eq!(
+            resolved_node_type(&context, this),
+            context.global_types().global_this_value_type,
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(this)
+                .and_then(|links| links.resolved_symbol),
+            Some(global_this),
+        );
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn nested_arrow_this_shadow_recovery_rejects_unrelated_body_statements() {
+        let library = parsed("declare function alert(message?: any): void;");
+        let source = parsed(concat!(
+            "declare function alert(message?: any): void; ",
+            "var x = { doStuff: (callback) => () => { ",
+            "var _this = 2; const unrelated = 1; return callback(this); ",
+            "} }; ",
+            "alert(x.doStuff(x => alert(x)));",
+        ));
+        let library_file = FileId::new(9_915);
+        let file = FileId::new(9_916);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::MergedSymbol { .. }),
+            )),
+        ));
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn unique_symbol_class_overrides_report_exact_ts2416_and_nested_assignment_detail() {
+        let source = parsed(concat!(
+            "declare const s: unique symbol;\n",
+            "class A {\n",
+            "  [s]: number = 1;\n",
+            "}\n",
+            "class B extends A {\n",
+            "  [s]: string = \"x\";\n",
+            "}",
+        ));
+        let file = FileId::new(9_912);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let annotation = variable_type_node(&source, file, "s");
+        let key = variable_symbol(&context, &source, file, "s");
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one unique-symbol property override diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2416);
+        assert_eq!(diagnostic.diagnostic.arguments, ["[s]", "B", "A"]);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "[s]");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            concat!(
+                "Property '[s]' in type 'B' is not assignable to the same property in base type 'A'.\n",
+                "  Type 'string' is not assignable to type 'number'.",
+            ),
+        );
+        let unique = resolved_node_type(&context, annotation);
+        assert!(matches!(
+            context.store().type_payload(unique).unwrap().data(),
+            TypeData::UniqueEsSymbol(_),
+        ));
+        assert_eq!(
+            context.store().type_payload(unique).unwrap().symbol(),
+            Some(key)
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn computed_class_override_recovery_rejects_matching_and_unrelated_shapes() {
+        for (index, text) in [
+            concat!(
+                "declare const s: unique symbol; ",
+                "class A { [s]: number = 1; } ",
+                "class B extends A { [s]: number = 2; }",
+            ),
+            concat!(
+                "declare const s: unique symbol; ",
+                "class A { [s]: number = 1; } ",
+                "class B extends A { [s]: string = 'x'; } ",
+                "const unrelated = 1;",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_913 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(_)
+                )),
+            ));
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
         }
     }
 
