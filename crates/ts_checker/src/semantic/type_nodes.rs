@@ -88,6 +88,7 @@ const NODE_FLAG_JSDOC: u32 = 1 << 22;
 const NODE_FLAG_HAS_ERROR: u32 = 1 << 15;
 const NODE_FLAG_LET: u32 = 1 << 0;
 const NODE_FLAG_CONST: u32 = 1 << 1;
+const MAX_GENERIC_INTERFACE_EXCLUSION_CONSTITUENTS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct CanonicalTypeQueryOptions {
@@ -21898,7 +21899,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
             return Ok(instantiation);
         }
-        let instantiation = if matches!(
+        let instantiation = if let Some(filtered) = self
+            .try_exclude_discriminated_generic_interface_union(
+                symbol,
+                &metadata,
+                declared_type,
+                &type_parameters,
+                &type_arguments,
+                plan,
+            )? {
+            filtered
+        } else if matches!(
             self.store.type_payload(declared_type).map(TypeRecord::data),
             Some(TypeData::Conditional(_))
         ) {
@@ -22051,6 +22062,192 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         Ok(instantiation)
+    }
+
+    /// Filters exact generic interface references without demanding inherited members.
+    #[allow(clippy::too_many_lines)] // Authenticate the conditional, union, and each discriminator before publication.
+    fn try_exclude_discriminated_generic_interface_union(
+        &mut self,
+        alias: SemanticSymbolId,
+        metadata: &TypeAliasPlan,
+        declared_type: TypeId,
+        parameters: &[TypeId],
+        arguments: &[TypeId],
+        plan: &TypeQueryPlan,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        let [check_parameter, excluded_parameter] = parameters else {
+            return Ok(None);
+        };
+        let [checked, excluded] = arguments else {
+            return Ok(None);
+        };
+        let Some(TypeData::Conditional(conditional)) =
+            self.store.type_payload(declared_type).map(TypeRecord::data)
+        else {
+            return Ok(None);
+        };
+        let Some(root) = self.store.conditional_root(conditional.root) else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(alias),
+            ));
+        };
+        let Some(branches) = plan.conditionals.get(&metadata.type_node) else {
+            return Ok(None);
+        };
+        if metadata.name_text != "Exclude"
+            || root.node() != metadata.type_node
+            || root.check_type() != *check_parameter
+            || root.extends_type() != *excluded_parameter
+            || root.outer_type_parameters() != Some(parameters)
+            || !root.is_distributive()
+            || root
+                .infer_type_parameters()
+                .is_some_and(|inferred| !inferred.is_empty())
+            || !branches.infer_parameters.is_empty()
+            || self.store.source_node_kind(branches.true_type) != Some(SyntaxKind::NeverKeyword)
+            || plan
+                .references
+                .get(&branches.false_type)
+                .map(|reference| reference.symbol)
+                != cached_ordinary_type_parameter_owner(self.store, *check_parameter)
+        {
+            return Ok(None);
+        }
+
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                alias,
+            ))
+        };
+        let source = self.store.type_payload(*checked).ok_or_else(&invalid)?;
+        let TypeData::Union(union) = source.data() else {
+            return Ok(None);
+        };
+        if !(2..=MAX_GENERIC_INTERFACE_EXCLUSION_CONSTITUENTS).contains(&union.union.types.len()) {
+            return Ok(None);
+        }
+        let constituents = union.union.types.clone();
+        let expected_alias = source
+            .alias()
+            .map(|identity| {
+                self.store
+                    .type_alias(identity)
+                    .and_then(super::type_records::TypeAlias::symbol)
+                    .ok_or_else(&invalid)
+            })
+            .transpose()?;
+        self.store
+            .validate_cached_union_result_with_pending_functions(
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+                *checked,
+                expected_alias,
+                &plan.pending_function_proofs,
+            )
+            .map_err(Self::literal_cache_error)?;
+
+        let Ok(excluded_reference) = validate_direct_generic_reference(self.store, *excluded)
+        else {
+            return Ok(None);
+        };
+        let Some(excluded_discriminant) =
+            self.planned_generic_interface_discriminant(excluded_reference.target, plan)
+        else {
+            return Ok(None);
+        };
+        let mut remaining = Vec::with_capacity(constituents.len());
+        let mut removed = false;
+        for constituent in constituents {
+            let Ok(reference) = validate_direct_generic_reference(self.store, constituent) else {
+                return Ok(None);
+            };
+            if reference.type_arguments != excluded_reference.type_arguments {
+                return Ok(None);
+            }
+            if reference.target == excluded_reference.target {
+                removed = true;
+                continue;
+            }
+            if self
+                .planned_generic_interface_discriminant(reference.target, plan)
+                .is_none_or(|discriminant| discriminant == excluded_discriminant)
+            {
+                return Ok(None);
+            }
+            remaining.push(constituent);
+        }
+        if !removed {
+            return Ok(None);
+        }
+        match remaining.as_slice() {
+            [] => self
+                .store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| Some(bootstrap.never_type))
+                .ok_or(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                )),
+            [remaining] => Ok(Some(*remaining)),
+            _ => {
+                let result = if let Some(global_types) = self.global_types.as_ref() {
+                    self.store.expression_union_type_with_global_types(
+                        global_types,
+                        &remaining,
+                        UnionReduction::Literal,
+                    )
+                } else {
+                    let mut prepared = self
+                        .store
+                        .prepare_type_query_types(&[], &[], &[], 1, 0)
+                        .map_err(Self::literal_cache_error)?;
+                    self.store
+                        .literal_union_type_prepared(&remaining, None, &mut prepared)
+                };
+                result.map(Some).map_err(Self::literal_cache_error)
+            }
+        }
+    }
+
+    fn planned_generic_interface_discriminant(
+        &self,
+        target: TypeId,
+        plan: &TypeQueryPlan,
+    ) -> Option<String> {
+        let record = self.store.type_payload(target)?;
+        if !matches!(record.data(), TypeData::Interface(_))
+            || !record.object_flags().contains(ObjectFlags::INTERFACE)
+            || record.object_flags().contains(ObjectFlags::CLASS)
+        {
+            return None;
+        }
+        let owner = record.symbol()?;
+        let interface = plan.generic_interfaces.get(&owner)?;
+        let mut properties = interface
+            .properties
+            .iter()
+            .filter(|property| property.name == "type" && !property.optional);
+        let property = properties.next()?;
+        if interface.symbol != owner || properties.next().is_some() {
+            return None;
+        }
+        let annotation = preflight_node(self.store, self.host, property.type_node).ok()?;
+        let NodeData::LiteralTypeNode(literal) = &annotation.data else {
+            return None;
+        };
+        let literal = NodeRef::new(
+            property.type_node.arena,
+            property.type_node.file,
+            literal.literal,
+        );
+        let literal_record = preflight_node(self.store, self.host, literal).ok()?;
+        let NodeData::StringLiteral(value) = &literal_record.data else {
+            return None;
+        };
+        (annotation.kind == SyntaxKind::LiteralType
+            && literal_record.kind == SyntaxKind::StringLiteral
+            && literal_record.parent == Some(property.type_node.node))
+        .then(|| value.text.clone())
     }
 
     #[allow(clippy::too_many_arguments)] // Alias identity, owner proof, and execution plan must stay coupled.
@@ -23360,6 +23557,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         type_,
                         mapped_parameters,
                     ) =>
+            {
+                Ok(())
+            }
+            TypeData::TypeReference(_)
+                if self.alias_type_contains_forwarded_interface_reference(
+                    type_,
+                    mapped_parameters,
+                ) =>
             {
                 Ok(())
             }
@@ -25817,6 +26022,83 @@ mod tests {
         let warm = union_state(&fixture.store);
         assert_eq!(
             query_node(&mut fixture, value, &mut diagnostics),
+            Ok(resolved),
+        );
+        assert_eq!(union_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn excluded_generic_interface_unions_keep_discriminants_and_inherited_members_lazy() {
+        let mut fixture = global_array_fixture(concat!(
+            "type Exclude<Check, Removed> = Check extends Removed ? never : Check; ",
+            "type Tree<Value> = Top<Value> | Virtual<Value> | Line<Value> | Blank<Value>; ",
+            "type SubTree<Value> = Exclude<Tree<Value>, Top<Value>>; ",
+            "interface NodeBase<Value> { subs: SubTree<Value>[]; } ",
+            "interface Top<Value> extends NodeBase<Value> { type: 'top'; } ",
+            "interface Virtual<Value> extends NodeBase<Value> { type: 'virtual'; } ",
+            "interface Line<Value> extends NodeBase<Value> { type: 'line'; } ",
+            "interface Blank<Value> extends NodeBase<Value> { type: 'blank'; } ",
+            "let value: SubTree<string>;",
+        ));
+        let globals = initialize_fixture_global_types(&mut fixture);
+        let subtree = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "SubTree");
+        let excluded = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Top");
+        let retained = [
+            named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Virtual"),
+            named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Line"),
+            named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Blank"),
+        ];
+        let concrete = variable_type_node(&fixture, "value");
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let declared =
+            query_global_declared(&mut fixture, &globals, subtree, &mut diagnostics).unwrap();
+        let [parameter] = fixture
+            .store
+            .type_alias_links(subtree)
+            .and_then(|links| links.type_parameters.as_deref())
+            .unwrap()
+        else {
+            panic!("the filtered union alias must preserve its source parameter")
+        };
+        let parameter = *parameter;
+        assert_eq!(union_types(&fixture.store, declared).len(), retained.len());
+        for constituent in union_types(&fixture.store, declared) {
+            let reference = validate_direct_generic_reference(&fixture.store, *constituent)
+                .expect("filtered union constituents must remain canonical interface references");
+            let owner = fixture
+                .store
+                .type_payload(reference.target)
+                .and_then(TypeRecord::symbol)
+                .unwrap();
+            assert!(retained.contains(&owner));
+            assert_ne!(owner, excluded);
+            assert_eq!(reference.type_arguments.as_slice(), &[parameter]);
+            let TypeData::Interface(target) =
+                fixture.store.type_payload(reference.target).unwrap().data()
+            else {
+                unreachable!()
+            };
+            assert!(!target.declared_members_resolved);
+        }
+
+        let resolved = query_global_node(&mut fixture, &globals, concrete, &mut diagnostics)
+            .expect("concrete filtered unions must substitute each retained interface argument");
+        for constituent in union_types(&fixture.store, resolved) {
+            let reference = validate_direct_generic_reference(&fixture.store, *constituent)
+                .expect("concrete filtered unions must retain canonical interface references");
+            assert_eq!(reference.type_arguments.as_slice(), &[string]);
+        }
+
+        let warm = union_state(&fixture.store);
+        assert_eq!(
+            query_global_declared(&mut fixture, &globals, subtree, &mut diagnostics),
+            Ok(declared),
+        );
+        assert_eq!(
+            query_global_node(&mut fixture, &globals, concrete, &mut diagnostics),
             Ok(resolved),
         );
         assert_eq!(union_state(&fixture.store), warm);

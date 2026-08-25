@@ -61263,11 +61263,14 @@ class Foo2 {
         let source = parsed(concat!(
             "interface Array<Value> {} ",
             "interface ReadonlyArray<Value> {} ",
+            "type Exclude<Check, Removed> = Check extends Removed ? never : Check; ",
             "type Tree<Value> = Top<Value> | Virtual<Value>; ",
-            "interface NodeBase<Value> { subs: Tree<Value>[]; } ",
+            "type SubTree<Value> = Exclude<Tree<Value>, Top<Value>>; ",
+            "interface NodeBase<Value> { subs: SubTree<Value>[]; } ",
             "interface Top<Value> extends NodeBase<Value> { type: 'top'; } ",
             "interface Virtual<Value> extends NodeBase<Value> { type: 'virtual'; } ",
-            "let value: Tree<string>;",
+            "let value: Tree<string>; ",
+            "let subtree: SubTree<string>;",
         ));
         let file = FileId::new(8_687);
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
@@ -61279,6 +61282,7 @@ class Foo2 {
             panic!("the recursive tree alias must retain its generic interface union")
         };
         let constituents = union.union.types.clone();
+        let subtree = variable_value_type(&context, &source, file, "subtree");
         assert_eq!(constituents.len(), 2);
         let globals = context.global_types().clone();
         let array_target = super::super::instantiated_members::GenericInterfaceArrayTarget::new(
@@ -61309,7 +61313,7 @@ class Foo2 {
                 .canonical_array_reference(&globals, inherited)
                 .unwrap()
                 .unwrap();
-            assert_eq!(array.element_type, tree);
+            assert_eq!(array.element_type, subtree);
         }
         assert!(context.diagnostics().is_empty());
 
