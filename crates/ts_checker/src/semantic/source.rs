@@ -17012,6 +17012,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         if redeclared {
             self.redeclared_top_level_variables.insert(variable_symbol);
+            self.assignable_uninitialized_variables
+                .remove(&variable_symbol);
         }
         if evolving_array && !self.evolving_array_variables.insert(variable_symbol) {
             return Err(SourceCheckError::Variable(
