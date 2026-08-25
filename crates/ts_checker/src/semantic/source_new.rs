@@ -205,6 +205,40 @@ struct SourceGlobalDateConstructorPlan {
     return_annotation: NodeRef,
 }
 
+/// Authenticated zero-argument global Date construction retained by a class parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceGlobalDateInitializerPlan {
+    node: NodeRef,
+    constructor: NodeRef,
+    symbol: SemanticSymbolId,
+    global: SourceGlobalDateConstructorPlan,
+}
+
+impl SourceGlobalDateInitializerPlan {
+    pub(super) const fn node(self) -> NodeRef {
+        self.node
+    }
+
+    pub(super) const fn symbol(self) -> SemanticSymbolId {
+        self.symbol
+    }
+
+    fn construction(self) -> SourceDefaultNewPlan {
+        SourceDefaultNewPlan {
+            node: self.node,
+            constructor: self.constructor,
+            resolved_symbol: self.symbol,
+            target: SourceNewTarget::GlobalDate(self.global),
+            function_return: false,
+            type_arguments: Vec::new(),
+            argument: None,
+            additional_arguments: Vec::new(),
+            parameter: None,
+            executor: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SourceGlobalPromiseConstructorPlan {
     annotation: NodeRef,
@@ -1015,6 +1049,191 @@ pub(super) fn plan_direct_default_new(
     };
     preflight_default_new_cache(store, host, &plan)?;
     Ok(plan)
+}
+
+/// Retains the normal global Date constructor proof without publishing its cold type.
+pub(super) fn plan_global_date_initializer(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<SourceGlobalDateInitializerPlan, SourceNewError> {
+    let (arena, bound) = host
+        .source(node)
+        .ok_or_else(|| invariant(SourceNewInvariant::MissingNode(node)))?;
+    let plan = plan_direct_default_new(
+        arena,
+        bound,
+        store,
+        host,
+        &HashMap::new(),
+        &HashMap::new(),
+        node,
+        false,
+    )?;
+    let SourceNewTarget::GlobalDate(global) = plan.target else {
+        return Err(unsupported(SourceNewUnsupported::Constructor(
+            plan.constructor,
+        )));
+    };
+    Ok(SourceGlobalDateInitializerPlan {
+        node,
+        constructor: plan.constructor,
+        symbol: plan.resolved_symbol,
+        global,
+    })
+}
+
+/// Publishes an authenticated Date default before its owning class can publish.
+pub(super) fn materialize_global_date_initializer(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    initializer: SourceGlobalDateInitializerPlan,
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    let plan = initializer.construction();
+    preflight_direct_default_new(store, host, &plan)?;
+    materialize_global_date_constructor(store, host, &plan, &initializer.global)?;
+
+    let missing_types = usize::from(store.type_node_links(plan.constructor).is_none())
+        + usize::from(store.type_node_links(plan.node).is_none());
+    if !store.try_reserve_symbol_node_links(usize::from(
+        store.symbol_node_links(plan.constructor).is_none(),
+    )) || !store.try_reserve_type_node_links(missing_types)
+        || !store
+            .try_reserve_signature_links(usize::from(store.signature_links(plan.node).is_none()))
+    {
+        return Err(invariant(SourceNewInvariant::Capacity(plan.node)));
+    }
+    if store.symbol_node_links(plan.constructor).is_none() {
+        assert!(store.ensure_symbol_node_links(plan.constructor));
+    }
+    if store.type_node_links(plan.constructor).is_none() {
+        assert!(store.ensure_type_node_links(plan.constructor));
+    }
+    if store.signature_links(plan.node).is_none() {
+        assert!(store.ensure_signature_links(plan.node));
+    }
+    if store.type_node_links(plan.node).is_none() {
+        assert!(store.ensure_type_node_links(plan.node));
+    }
+    check_direct_default_new(store, host, &plan)
+}
+
+/// Validates the completed global Date expression using only stored source provenance.
+pub(super) fn exact_global_date_initializer(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    expected_type: TypeId,
+) -> bool {
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    let Some(globals) = store.symbol_table(bootstrap.globals) else {
+        return false;
+    };
+    let Some(symbol) = globals
+        .get_source("Date")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(owner) = globals
+        .get_source("DateConstructor")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(constructor_index) = node
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let constructor = NodeRef::new(
+        node.arena,
+        node.file,
+        ts_ast::NodeId::new(constructor_index),
+    );
+    let Some(value_type) = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+    else {
+        return false;
+    };
+    let Some(signature) = store
+        .signature_links(node)
+        .and_then(|links| links.resolved_signature.signature())
+    else {
+        return false;
+    };
+    let Some(signature_record) = store.signature(signature) else {
+        return false;
+    };
+    let Some(declaration) = signature_record.declaration() else {
+        return false;
+    };
+    let Some(constructor_signature) = store
+        .symbol(owner)
+        .and_then(|owner| owner.members())
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+    else {
+        return false;
+    };
+    let Some((return_annotation, false)) = store.function_signature_return_annotation(signature)
+    else {
+        return false;
+    };
+    store.source_node_kind(node) == Some(SyntaxKind::NewExpression)
+        && store.source_node_kind(constructor) == Some(SyntaxKind::Identifier)
+        && store.source_node_parent(constructor)
+            == Some(super::store::SourceNodeParent::Parent(node))
+        && store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            == Some(expected_type)
+        && store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            == Some(value_type)
+        && store
+            .symbol(constructor_signature)
+            .and_then(|symbol| symbol.declarations())
+            .is_some_and(|declarations| declarations.contains(&declaration))
+        && store.signature_links(declaration)
+            == Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            })
+        && store.type_node_links(return_annotation)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(expected_type),
+                ..TypeNodeLinks::default()
+            })
+        && store.symbol_node_links(constructor)
+            == Some(&SymbolNodeLinks {
+                resolved_symbol: Some(symbol),
+            })
+        && store.type_node_links(constructor)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(value_type),
+                ..TypeNodeLinks::default()
+            })
+        && store.type_node_links(node)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(expected_type),
+                ..TypeNodeLinks::default()
+            })
+        && store.signature_links(node)
+            == Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            })
+        && signature_record.flags() == SignatureFlags::CONSTRUCT
+        && signature_record.parameters().is_empty()
+        && signature_record.min_argument_count() == 0
+        && signature_record.resolved_return_type() == Some(expected_type)
 }
 
 fn plan_imported_class_type_arguments(
@@ -2413,6 +2632,25 @@ fn constructor_parameter(
     let NodeData::Identifier(identifier) = &name_record.data else {
         return Err(invalid());
     };
+    if parameter_data.type_.is_none() {
+        let initializer = parameter_data
+            .initializer
+            .map(|node| NodeRef::new(parameter.arena, parameter.file, node))
+            .ok_or_else(invalid)?;
+        let planned = plan_global_date_initializer(store, host, initializer)?;
+        if parameter_record.kind != SyntaxKind::Parameter
+            || parameter_record.parent != Some(declaration.node)
+            || host
+                .node(initializer)
+                .is_none_or(|record| record.parent != Some(parameter.node))
+            || class.constructor_minimum_argument_count() != 0
+            || planned.node() != initializer
+            || class.constructor_parameter_symbol().is_none()
+        {
+            return Err(invalid());
+        }
+        return Ok(None);
+    }
     let type_node = parameter_data
         .type_
         .map(|node| NodeRef::new(parameter.arena, parameter.file, node))
@@ -4886,7 +5124,7 @@ fn validate_selected_default_signature(
             .intersects(SignatureFlags::ABSTRACT)
         || signature_record.declaration() != class.constructor_declaration()
         || signature_record.type_parameters() != type_parameters
-        || signature_record.parameters() != parameter.map(|parameter| parameter.symbol).as_slice()
+        || signature_record.parameters() != class.constructor_parameter_symbol().as_slice()
         || signature_record.this_parameter().is_some()
         || signature_record.min_argument_count() != class.constructor_minimum_argument_count()
         || signature_record.resolved_min_argument_count() != -1
@@ -5598,6 +5836,64 @@ mod tests {
                 context.store().type_len(),
                 context.store().signature_len(),
                 context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn readonly_date_parameter_defaults_allow_omitted_class_constructor_arguments() {
+        let library = global_date_constructor_library();
+        let source = parse_source_file(concat!(
+            "class Model { constructor(readonly timestamp = new Date()) {} } ",
+            "const value = new Model();",
+        ));
+        let library_file = FileId::new(1_846);
+        let source_file = FileId::new(1_847);
+        let mut context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+        let (construction, _) = variable_new(&source, source_file, "value");
+
+        context.check_source_file(source_file).unwrap();
+
+        let store = context.store();
+        let class = store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Model"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .unwrap();
+        let class_type = store
+            .declared_type_links(class)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let signature = store
+            .signature_links(construction)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        assert_eq!(store.signature(signature).unwrap().parameters().len(), 1);
+        assert_eq!(store.signature(signature).unwrap().min_argument_count(), 0);
+        assert_eq!(
+            store.type_node_links(construction),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(class_type),
+                ..TypeNodeLinks::default()
+            }),
+        );
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        context.recheck_source_file(source_file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
                 context.store().checker_link_allocated_lengths(),
             ),
             warm,

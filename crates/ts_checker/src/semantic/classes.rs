@@ -27,7 +27,9 @@
 //! A constructor may retain one string or number parameter, including one
 //! authenticated public or readonly parameter property with separate member
 //! and constructor-local symbols. Parameter properties may retain one matching
-//! string or number default and a zero-minimum construct signature. Exported
+//! string or number default and a zero-minimum construct signature. Readonly
+//! parameter properties may also infer the real global `Date` type
+//! from an authenticated zero-argument `new Date()` default. Exported
 //! ambient declaration-file classes
 //! may also retain generic parameters and bodyless constructors. Decorated
 //! parameters remain restricted to one authenticated string parameter.
@@ -36,7 +38,8 @@
 //! A derived constructor may retain one public, interface-typed parameter
 //! property and forward one primitive interface property to its base.
 //! A parameterless derived constructor may forward to an authenticated
-//! parameterless public or protected base constructor with `super()`.
+//! parameterless public or protected base constructor with `super()`, after
+//! any authenticated string-literal directive prologue.
 //! Numeric and string instance and static fields retain direct literal
 //! initializers, including inferred readonly literal types.
 //! Private fields, empty methods, and paired accessors retain their class brand.
@@ -89,6 +92,10 @@ use super::{
     signatures::SignatureFlags,
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     source_calls::{SourceCallCalleeForm, plan_direct_source_call_syntax},
+    source_new::{
+        SourceGlobalDateInitializerPlan, SourceNewError, exact_global_date_initializer,
+        materialize_global_date_initializer, plan_global_date_initializer,
+    },
     store::{DirectClassHeritageProvenance, SourceNodeParent},
     type_records::{
         ConstrainedTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState, TypeData,
@@ -123,6 +130,7 @@ struct ClassConstructorPlan {
     visibility: ClassConstructorVisibility,
     parameter: Option<ClassConstructorParameterPlan>,
     parameter_property: Option<ClassConstructorParameterPropertyPlan>,
+    inferred_date_parameter: Option<ClassConstructorDateParameterPropertyPlan>,
     super_call: Option<NodeRef>,
 }
 
@@ -132,7 +140,10 @@ impl ClassConstructorPlan {
             Some(parameter) => Some(parameter.symbol),
             None => match self.parameter_property {
                 Some(parameter) => Some(parameter.local_symbol),
-                None => None,
+                None => match self.inferred_date_parameter {
+                    Some(parameter) => Some(parameter.local_symbol),
+                    None => None,
+                },
             },
         }
     }
@@ -144,6 +155,16 @@ impl ClassConstructorPlan {
             None => match self.parameter_property {
                 Some(_) => 1,
                 None => 0,
+            },
+        }
+    }
+
+    const fn retained_parameter_property(self) -> Option<(NodeRef, SemanticSymbolId)> {
+        match self.parameter_property {
+            Some(parameter) => Some((parameter.declaration, parameter.property_symbol)),
+            None => match self.inferred_date_parameter {
+                Some(parameter) => Some((parameter.declaration, parameter.property_symbol)),
+                None => None,
             },
         }
     }
@@ -164,6 +185,14 @@ struct ClassConstructorParameterPlan {
 struct ClassConstructorPrimitiveParameterPropertyPlan {
     symbol: SemanticSymbolId,
     readonly: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClassConstructorDateParameterPropertyPlan {
+    declaration: NodeRef,
+    property_symbol: SemanticSymbolId,
+    local_symbol: SemanticSymbolId,
+    initializer: SourceGlobalDateInitializerPlan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1709,6 +1738,190 @@ fn plan_constructor_parameter(
     })
 }
 
+fn constructor_date_initializer_error(
+    error: SourceNewError,
+    constructor: NodeRef,
+    initializer: NodeRef,
+) -> ClassError {
+    match error {
+        SourceNewError::Unsupported(_) => {
+            accessor_member_error(constructor, SyntaxKind::Constructor)
+        }
+        SourceNewError::Invariant(_) => {
+            invariant(ClassInvariant::InvalidPropertyTypeCache(initializer))
+        }
+        SourceNewError::DeclaredType(error) => error.into(),
+        SourceNewError::Class(error) => error,
+    }
+}
+
+#[allow(clippy::too_many_lines)] // The inferred Date, readonly property, and local share one proof.
+fn plan_constructor_date_parameter_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    constructor: NodeRef,
+    parameter: NodeRef,
+    instance_members: Option<SymbolTableId>,
+) -> Result<ClassConstructorDateParameterPropertyPlan, ClassError> {
+    let reject = || accessor_member_error(constructor, SyntaxKind::Constructor);
+    let record = preflight_node(store, host, parameter)?;
+    let NodeData::ParameterDeclaration(data) = &record.data else {
+        return Err(reject());
+    };
+    let Some(modifiers) = data.modifiers.as_ref() else {
+        return Err(reject());
+    };
+    if record.kind != SyntaxKind::Parameter
+        || record.flags.0 != 0
+        || record.parent != Some(constructor.node)
+        || data.dot_dot_dot_token.is_some()
+        || data.question_token.is_some()
+        || data.symbol.is_some()
+        || data.type_.is_some()
+        || data.facts != 0
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifiers.list.range.start != record.range.start
+        || !matches!(modifiers.list.nodes.len(), 1 | 2)
+    {
+        return Err(reject());
+    }
+    for (index, modifier) in modifiers.list.nodes.iter().enumerate() {
+        let modifier = NodeRef::new(parameter.arena, parameter.file, *modifier);
+        let modifier_record = preflight_node(store, host, modifier)?;
+        let expected = if modifiers.list.nodes.len() == 2 && index == 0 {
+            SyntaxKind::PublicKeyword
+        } else {
+            SyntaxKind::ReadonlyKeyword
+        };
+        if modifier_record.kind != expected
+            || modifier_record.flags.0 != 0
+            || modifier_record.parent != Some(parameter.node)
+            || modifier_record.range.start < modifiers.list.range.start
+            || modifier_record.range.end > modifiers.list.range.end
+            || !matches!(modifier_record.data, NodeData::Token(_))
+        {
+            return Err(reject());
+        }
+    }
+
+    let name = NodeRef::new(parameter.arena, parameter.file, data.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(reject());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(parameter.node)
+        || name_record.range.start < modifiers.list.range.end
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || identifier.text == "this"
+    {
+        return Err(reject());
+    }
+
+    let initializer = data
+        .initializer
+        .map(|initializer| NodeRef::new(parameter.arena, parameter.file, initializer))
+        .ok_or_else(reject)?;
+    let initializer_record = preflight_node(store, host, initializer)?;
+    let NodeData::NewExpression(expression) = &initializer_record.data else {
+        return Err(reject());
+    };
+    if initializer_record.kind != SyntaxKind::NewExpression
+        || initializer_record.flags.0 != 0
+        || initializer_record.parent != Some(parameter.node)
+        || initializer_record.range.start < name_record.range.end
+        || initializer_record.range.end != record.range.end
+        || expression
+            .arguments
+            .as_ref()
+            .is_none_or(|arguments| arguments.has_trailing_comma || !arguments.nodes.is_empty())
+    {
+        return Err(reject());
+    }
+    let initializer = plan_global_date_initializer(store, host, initializer)
+        .map_err(|error| constructor_date_initializer_error(error, constructor, initializer))?;
+
+    let bound = host
+        .bound_file(constructor)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let locals = bound
+        .locals(constructor)
+        .and_then(|locals| store.symbol_table(locals))
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let local_symbol = locals
+        .get_source(&identifier.text)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let local = store
+        .symbol(local_symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let property_symbol = bound_symbol(store, host, parameter)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let property = store
+        .symbol(property_symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    if local_symbol == property_symbol
+        || local.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || local.check_flags() != CheckFlags::NONE
+        || local.name().as_utf8() != Some(identifier.text.as_str())
+        || local.declarations() != Some(&[parameter])
+        || local.value_declaration() != Some(parameter)
+        || local.members().is_some()
+        || local.exports().is_some()
+        || local.parent().is_some()
+        || local.export_symbol().is_some()
+        || store.get_merged_symbol(local_symbol) != Some(local_symbol)
+        || locals.len() != 1
+        || property.flags() != SymbolFlags::PROPERTY
+        || !matches!(
+            property.check_flags(),
+            CheckFlags::NONE | CheckFlags::READONLY
+        )
+        || property.name().as_utf8() != Some(identifier.text.as_str())
+        || property.declarations() != Some(&[parameter])
+        || property.value_declaration() != Some(parameter)
+        || property.members().is_some()
+        || property.exports().is_some()
+        || property.parent() != Some(owner)
+        || property.export_symbol().is_some()
+        || store.get_merged_symbol(property_symbol) != Some(property_symbol)
+        || instance_members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(&identifier.text))
+            != Some(property_symbol)
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(parameter)));
+    }
+
+    let date_type = store
+        .declared_type_links(initializer.symbol())
+        .and_then(|links| links.declared_type);
+    for symbol in [local_symbol, property_symbol] {
+        if store.value_symbol_links(symbol).is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && date_type.is_none_or(|type_| {
+                    links
+                        != &(ValueSymbolLinks {
+                            resolved_type: Some(type_),
+                            ..ValueSymbolLinks::default()
+                        })
+                })
+        }) {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+        }
+    }
+
+    Ok(ClassConstructorDateParameterPropertyPlan {
+        declaration: parameter,
+        property_symbol,
+        local_symbol,
+        initializer,
+    })
+}
+
 fn javascript_constructor_boolean_assignment(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1972,6 +2185,75 @@ fn plan_javascript_constructor_boolean_property(
     }))
 }
 
+fn validate_constructor_directive_prologue(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    constructor: NodeRef,
+    body: NodeRef,
+    statements: &[ts_ast::NodeId],
+) -> Result<(), ClassError> {
+    let reject = || accessor_member_error(constructor, SyntaxKind::Constructor);
+    let body_record = preflight_node(store, host, body)?;
+    let mut previous_end = body_record.range.start;
+    for &statement in statements {
+        let statement = NodeRef::new(body.arena, body.file, statement);
+        let statement_record = preflight_node(store, host, statement)?;
+        let NodeData::ExpressionStatement(expression) = &statement_record.data else {
+            return Err(reject());
+        };
+        let literal = NodeRef::new(statement.arena, statement.file, expression.expression);
+        let literal_record = preflight_node(store, host, literal)?;
+        let NodeData::StringLiteral(value) = &literal_record.data else {
+            return Err(reject());
+        };
+        let spelling_matches = host
+            .source(literal)
+            .and_then(|(arena, _)| arena.source_text())
+            .is_none_or(|source| {
+                source
+                    .get(
+                        literal_record.range.start.get() as usize
+                            ..literal_record.range.end.get() as usize,
+                    )
+                    .is_some_and(|spelling| {
+                        spelling
+                            .strip_prefix('"')
+                            .and_then(|text| text.strip_suffix('"'))
+                            .or_else(|| {
+                                spelling
+                                    .strip_prefix('\'')
+                                    .and_then(|text| text.strip_suffix('\''))
+                            })
+                            == Some(value.text.as_str())
+                    })
+            });
+        if statement_record.kind != SyntaxKind::ExpressionStatement
+            || statement_record.flags.0 != 0
+            || statement_record.parent != Some(body.node)
+            || statement_record.range.start < previous_end
+            || statement_record.range.end > body_record.range.end
+            || expression.flow_node.is_some()
+            || literal_record.kind != SyntaxKind::StringLiteral
+            || literal_record.flags.0 != 0
+            || literal_record.parent != Some(statement.node)
+            || literal_record.range.start < statement_record.range.start
+            || literal_record.range.end > statement_record.range.end
+            || value.token_flags.0 != 0
+            || !spelling_matches
+        {
+            return Err(reject());
+        }
+        if store
+            .type_node_links(literal)
+            .is_some_and(|links| links != &TypeNodeLinks::default())
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(literal)));
+        }
+        previous_end = statement_record.range.end;
+    }
+    Ok(())
+}
+
 fn plan_constructor(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2004,23 +2286,45 @@ fn plan_constructor(
             kind: SyntaxKind::Constructor,
         }));
     }
-    let parameter = constructor
-        .parameters
-        .nodes
-        .first()
-        .copied()
-        .map(|parameter| {
-            plan_constructor_parameter(
-                store,
-                host,
-                owner,
-                declaration,
-                NodeRef::new(declaration.arena, declaration.file, parameter),
-                instance_members,
-            )
-        })
-        .transpose()?;
-    if ambient && parameter.is_some_and(|parameter| parameter.initializer.is_some()) {
+    let (parameter, inferred_date_parameter) = match constructor.parameters.nodes.first().copied() {
+        None => (None, None),
+        Some(parameter) => {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, parameter);
+            let parameter_record = preflight_node(store, host, parameter)?;
+            if matches!(
+                &parameter_record.data,
+                NodeData::ParameterDeclaration(parameter) if parameter.type_.is_none()
+            ) {
+                (
+                    None,
+                    Some(plan_constructor_date_parameter_property(
+                        store,
+                        host,
+                        owner,
+                        declaration,
+                        parameter,
+                        instance_members,
+                    )?),
+                )
+            } else {
+                (
+                    Some(plan_constructor_parameter(
+                        store,
+                        host,
+                        owner,
+                        declaration,
+                        parameter,
+                        instance_members,
+                    )?),
+                    None,
+                )
+            }
+        }
+    };
+    if ambient
+        && (parameter.is_some_and(|parameter| parameter.initializer.is_some())
+            || inferred_date_parameter.is_some())
+    {
         return Err(unsupported(ClassUnsupported::Member {
             node: declaration,
             kind: SyntaxKind::Constructor,
@@ -2054,10 +2358,13 @@ fn plan_constructor(
                 )?
                 .is_none()
             {
-                return Err(unsupported(ClassUnsupported::Member {
-                    node: declaration,
-                    kind: SyntaxKind::Constructor,
-                }));
+                validate_constructor_directive_prologue(
+                    store,
+                    host,
+                    declaration,
+                    body,
+                    &block.statements.nodes,
+                )?;
             }
         }
         _ => {
@@ -2075,7 +2382,9 @@ fn plan_constructor(
         constructor.parameters.range.start,
         constructor.modifiers.as_ref(),
     )?;
-    if parameter.is_some() && visibility != ClassConstructorVisibility::Public {
+    if (parameter.is_some() || inferred_date_parameter.is_some())
+        && visibility != ClassConstructorVisibility::Public
+    {
         return Err(unsupported(ClassUnsupported::Member {
             node: declaration,
             kind: SyntaxKind::Constructor,
@@ -2124,7 +2433,9 @@ fn plan_constructor(
                 signature,
                 instance_type,
                 Some(declaration),
-                parameter.map(|parameter| parameter.symbol),
+                parameter
+                    .map(|parameter| parameter.symbol)
+                    .or_else(|| inferred_date_parameter.map(|parameter| parameter.local_symbol)),
             )
         {
             return Err(invariant(ClassInvariant::InvalidConstructSignature(owner)));
@@ -2137,6 +2448,7 @@ fn plan_constructor(
         visibility,
         parameter,
         parameter_property: None,
+        inferred_date_parameter,
         super_call: None,
     })
 }
@@ -2287,7 +2599,9 @@ fn plan_zero_argument_derived_constructor(
     if base.class.ambient
         || base.constructor_visibility() == ClassConstructorVisibility::Private
         || base.class.constructor.is_some_and(|constructor| {
-            constructor.parameter.is_some() || constructor.parameter_property.is_some()
+            constructor.parameter.is_some()
+                || constructor.parameter_property.is_some()
+                || constructor.inferred_date_parameter.is_some()
         })
     {
         return Err(reject());
@@ -2346,7 +2660,7 @@ fn plan_zero_argument_derived_constructor(
     let NodeData::Block(block) = &body_record.data else {
         return Err(reject());
     };
-    let [statement] = block.statements.nodes.as_slice() else {
+    let Some((statement, prologue)) = block.statements.nodes.split_last() else {
         return Err(reject());
     };
     if body_record.kind != SyntaxKind::Block
@@ -2361,6 +2675,7 @@ fn plan_zero_argument_derived_constructor(
     {
         return Err(reject());
     }
+    validate_constructor_directive_prologue(store, host, declaration, body, prologue)?;
     let statement = NodeRef::new(body.arena, body.file, *statement);
     let statement_record = preflight_node(store, host, statement)?;
     let NodeData::ExpressionStatement(expression) = &statement_record.data else {
@@ -2451,6 +2766,7 @@ fn plan_zero_argument_derived_constructor(
         visibility: ClassConstructorVisibility::Public,
         parameter: None,
         parameter_property: None,
+        inferred_date_parameter: None,
         super_call: Some(call),
     })
 }
@@ -2876,6 +3192,7 @@ fn plan_derived_constructor(
         visibility: ClassConstructorVisibility::Public,
         parameter: None,
         parameter_property: Some(parameter_property),
+        inferred_date_parameter: None,
         super_call: None,
     })
 }
@@ -6637,6 +6954,19 @@ fn plan_class_declaration(
                     )));
                 }
             }
+            if let Some(parameter) = planned.inferred_date_parameter {
+                let name = store
+                    .symbol(parameter.property_symbol)
+                    .and_then(|property| property.name().as_utf8())
+                    .ok_or_else(|| {
+                        invariant(ClassInvariant::InvalidPropertySymbol(parameter.declaration))
+                    })?;
+                if !instance_names.insert(name.to_owned()) {
+                    return Err(unsupported(ClassUnsupported::DuplicateProperty(
+                        parameter.declaration,
+                    )));
+                }
+            }
             if let Some(property) = plan_javascript_constructor_boolean_property(
                 store,
                 host,
@@ -6846,6 +7176,12 @@ fn plan_class_declaration(
             count.checked_add(usize::from(
                 constructor.is_some_and(|constructor| constructor.parameter_property.is_some()),
             ))
+        })
+        .and_then(|count| {
+            count
+                .checked_add(usize::from(constructor.is_some_and(|constructor| {
+                    constructor.inferred_date_parameter.is_some()
+                })))
         })
         .and_then(|count| count.checked_add(usize::from(accessor.is_some())))
         .and_then(|count| count.checked_add(usize::from(index.is_some())))
@@ -8703,7 +9039,7 @@ pub(super) fn plan_nongeneric_class_member_query(
             .iter()
             .any(|method| method.rest_parameter.is_some() || !method.parameters.is_empty())
         || base_plan.class.constructor.is_some_and(|constructor| {
-            constructor.parameter.is_some()
+            (constructor.parameter.is_some() || constructor.inferred_date_parameter.is_some())
                 && class
                     .constructor
                     .is_none_or(|derived| derived.parameter_property.is_none())
@@ -13630,7 +13966,7 @@ fn planned_class_member_entries(
     properties: &[ClassPropertyPlan],
     methods: &[ClassMethodPlan],
     accessor: Option<&ClassAccessorPlan>,
-    parameter: Option<ClassConstructorParameterPropertyPlan>,
+    parameter: Option<(NodeRef, SemanticSymbolId)>,
 ) -> Vec<(EscapedName, SemanticSymbolId)> {
     let mut entries = properties
         .iter()
@@ -13667,15 +14003,15 @@ fn planned_class_member_entries(
                 accessor.symbol,
             )
         }))
-        .chain(parameter.into_iter().map(|parameter| {
+        .chain(parameter.into_iter().map(|(declaration, symbol)| {
             (
-                parameter.declaration,
+                declaration,
                 store
-                    .symbol(parameter.property_symbol)
+                    .symbol(symbol)
                     .expect("an authenticated constructor property retains its symbol")
                     .name()
                     .to_owned(),
-                parameter.property_symbol,
+                symbol,
             )
         }))
         .collect::<Vec<_>>();
@@ -13712,7 +14048,7 @@ fn exact_member_table(
     properties: &[ClassPropertyPlan],
     methods: &[ClassMethodPlan],
     accessor: Option<&ClassAccessorPlan>,
-    parameter: Option<ClassConstructorParameterPropertyPlan>,
+    parameter: Option<(NodeRef, SemanticSymbolId)>,
 ) -> bool {
     let entries = planned_class_member_entries(store, properties, methods, accessor, parameter);
     match (table, entries.is_empty()) {
@@ -13800,6 +14136,11 @@ fn stored_constructor_parameter_annotation(
         declaration.file,
         ts_ast::NodeId::new(initializer_index),
     );
+    if store.source_node_kind(initializer) == Some(SyntaxKind::NewExpression)
+        && store.source_node_parent(initializer) == Some(SourceNodeParent::Parent(declaration))
+    {
+        return Some((initializer, Some(initializer)));
+    }
     let annotation_index = initializer
         .node
         .index()
@@ -13827,6 +14168,9 @@ fn exact_stored_constructor_parameter_initializer(
     initializer: NodeRef,
     expected_type: TypeId,
 ) -> bool {
+    if annotation == initializer {
+        return exact_global_date_initializer(store, initializer, expected_type);
+    }
     let Some(bootstrap) = store.intrinsic_bootstrap() else {
         return false;
     };
@@ -14039,7 +14383,7 @@ fn completed_class_members(
         plan.class.accessor.as_ref(),
         plan.class
             .constructor
-            .and_then(|constructor| constructor.parameter_property),
+            .and_then(ClassConstructorPlan::retained_parameter_property),
     )
     .into_iter()
     .map(|(_, symbol)| symbol)
@@ -14066,7 +14410,7 @@ fn completed_class_members(
             plan.class.accessor.as_ref(),
             plan.class
                 .constructor
-                .and_then(|constructor| constructor.parameter_property),
+                .and_then(ClassConstructorPlan::retained_parameter_property),
         )
     {
         return None;
@@ -14109,8 +14453,7 @@ fn completed_class_members(
             plan.constructor_declaration(),
             plan.class
                 .constructor
-                .and_then(|constructor| constructor.parameter)
-                .map(|parameter| parameter.symbol),
+                .and_then(ClassConstructorPlan::signature_parameter),
         )
         || plan.class.constructor.is_some_and(|constructor| {
             store.signature_links(constructor.declaration)
@@ -14172,6 +14515,33 @@ fn completed_class_members(
                                 || symbol.check_flags() != CheckFlags::NONE
                         })
                 })
+        })
+    {
+        return None;
+    }
+    if plan
+        .class
+        .constructor
+        .and_then(|constructor| constructor.inferred_date_parameter)
+        .is_some_and(|parameter| {
+            let date_type = store
+                .declared_type_links(parameter.initializer.symbol())
+                .and_then(|links| links.declared_type);
+            date_type.is_none_or(|date_type| {
+                !exact_global_date_initializer(store, parameter.initializer.node(), date_type)
+                    || [parameter.local_symbol, parameter.property_symbol]
+                        .into_iter()
+                        .any(|symbol| {
+                            store.value_symbol_links(symbol)
+                                != Some(&ValueSymbolLinks {
+                                    resolved_type: Some(date_type),
+                                    ..ValueSymbolLinks::default()
+                                })
+                        })
+                    || store
+                        .symbol(parameter.property_symbol)
+                        .is_none_or(|property| property.check_flags() != CheckFlags::READONLY)
+            })
         })
     {
         return None;
@@ -14245,7 +14615,7 @@ fn prepare_derived_member_surfaces(
         plan.class.accessor.as_ref(),
         plan.class
             .constructor
-            .and_then(|constructor| constructor.parameter_property),
+            .and_then(ClassConstructorPlan::retained_parameter_property),
     );
     let inherited_instance_entries = planned_class_member_entries(
         store,
@@ -14255,7 +14625,7 @@ fn prepare_derived_member_surfaces(
         base_plan
             .class
             .constructor
-            .and_then(|constructor| constructor.parameter_property),
+            .and_then(ClassConstructorPlan::retained_parameter_property),
     );
     let own_static_entries = planned_static_class_member_entries(store, &plan.class);
     let inherited_static_entries = planned_static_class_member_entries(store, &base_plan.class);
@@ -15502,6 +15872,26 @@ pub(super) fn execute_nongeneric_class_members(
     if let Some(members) = validated_nongeneric_class_member_state(store, host, plan)? {
         return Ok(members);
     }
+    let inferred_date_parameter = plan
+        .class
+        .constructor
+        .and_then(|constructor| constructor.inferred_date_parameter);
+    let inferred_date_type = inferred_date_parameter
+        .map(|parameter| {
+            materialize_global_date_initializer(store, host, parameter.initializer)
+                .map(|checked| checked.instance_type)
+                .map_err(|error| {
+                    constructor_date_initializer_error(
+                        error,
+                        plan.class
+                            .constructor
+                            .expect("the inferred Date parameter retains its constructor")
+                            .declaration,
+                        parameter.initializer.node(),
+                    )
+                })
+        })
+        .transpose()?;
     let base_constructor = planned_class_base_constructor(store, &plan.class)?;
     let shell = shell_state(store, host, &plan.class)?;
     let cold_instance = shell.instance.is_none();
@@ -15537,7 +15927,7 @@ pub(super) fn execute_nongeneric_class_members(
         plan.class.accessor.as_ref(),
         plan.class
             .constructor
-            .and_then(|constructor| constructor.parameter_property),
+            .and_then(ClassConstructorPlan::retained_parameter_property),
     );
     let planned_static_entries = planned_static_class_member_entries(store, &plan.class);
     let prepared_instance_members = if planned_instance_entries.is_empty() {
@@ -15582,15 +15972,16 @@ pub(super) fn execute_nongeneric_class_members(
         .try_reserve_exact(usize::from(
             plan.class
                 .constructor
-                .is_some_and(|constructor| constructor.parameter.is_some()),
+                .and_then(ClassConstructorPlan::signature_parameter)
+                .is_some(),
         ))
         .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     if let Some(parameter) = plan
         .class
         .constructor
-        .and_then(|constructor| constructor.parameter)
+        .and_then(ClassConstructorPlan::signature_parameter)
     {
-        constructor_parameters.push(parameter.symbol);
+        constructor_parameters.push(parameter);
     }
     declared_index_infos
         .try_reserve_exact(usize::from(plan.class.index.is_some()))
@@ -15764,6 +16155,12 @@ pub(super) fn execute_nongeneric_class_members(
             .and_then(|constructor| constructor.parameter)
             .is_some_and(|parameter| store.value_symbol_links(parameter.symbol).is_none()),
     );
+    let missing_inferred_constructor_value_links = inferred_date_parameter.map_or(0, |parameter| {
+        [parameter.local_symbol, parameter.property_symbol]
+            .into_iter()
+            .filter(|symbol| store.value_symbol_links(*symbol).is_none())
+            .count()
+    });
     let missing_constructor_signature_links = usize::from(
         plan.class
             .constructor
@@ -15800,6 +16197,7 @@ pub(super) fn execute_nongeneric_class_members(
         .and_then(|count| count.checked_add(missing_method_parameter_value_links))
         .and_then(|count| count.checked_add(missing_accessor_value_links))
         .and_then(|count| count.checked_add(missing_constructor_parameter_value_links))
+        .and_then(|count| count.checked_add(missing_inferred_constructor_value_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let signature_count = plan
         .class
@@ -15894,6 +16292,20 @@ pub(super) fn execute_nongeneric_class_members(
                     ..ValueSymbolLinks::default()
                 },
             ));
+        }
+        if let Some(parameter) = constructor.inferred_date_parameter {
+            let date_type = inferred_date_type
+                .expect("the authenticated Date initializer was published before its class");
+            for symbol in [parameter.local_symbol, parameter.property_symbol] {
+                assert!(store.set_value_symbol_links(
+                    symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(date_type),
+                        ..ValueSymbolLinks::default()
+                    },
+                ));
+            }
+            assert!(store.set_source_property_readonly(parameter.property_symbol, true));
         }
     }
 
@@ -17256,6 +17668,10 @@ fn exact_stored_constructor_parameter_property(
     let annotation_valid = match store.source_node_kind(annotation) {
         Some(SyntaxKind::StringKeyword) => store.intrinsic_bootstrap()?.string_type == type_,
         Some(SyntaxKind::NumberKeyword) => store.intrinsic_bootstrap()?.number_type == type_,
+        Some(SyntaxKind::NewExpression) if readonly_modifier => {
+            initializer == Some(annotation)
+                && exact_global_date_initializer(store, annotation, type_)
+        }
         Some(SyntaxKind::TypeReference) if public_modifier && !readonly_modifier => {
             let interface = store.symbol_node_links(annotation)?.resolved_symbol?;
             store.symbol_node_links(annotation)
@@ -18749,6 +19165,15 @@ fn stored_class_constructor(
             let type_ = match store.source_node_kind(annotation) {
                 Some(SyntaxKind::StringKeyword) => bootstrap.string_type,
                 Some(SyntaxKind::NumberKeyword) => bootstrap.number_type,
+                Some(SyntaxKind::NewExpression) => {
+                    let type_ = store.type_node_links(annotation)?.resolved_type?;
+                    if initializer != Some(annotation)
+                        || !exact_global_date_initializer(store, annotation, type_)
+                    {
+                        return None;
+                    }
+                    type_
+                }
                 Some(SyntaxKind::TypeReference) => {
                     let interface = store.symbol_node_links(annotation)?.resolved_symbol?;
                     let type_ = store.declared_type_links(interface)?.declared_type?;
@@ -19612,6 +20037,17 @@ mod tests {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         fixture_from_parsed(parsed)
+    }
+
+    fn date_constructor_fixture(source: &str) -> Fixture {
+        fixture(&format!(
+            "{}{source}",
+            concat!(
+                "interface Date {} ",
+                "interface DateConstructor { new(): Date; readonly prototype: Date; } ",
+                "declare var Date: DateConstructor; ",
+            ),
+        ))
     }
 
     fn recovered_fixture(source: &str, expected: &[u32]) -> Fixture {
@@ -20875,6 +21311,248 @@ mod tests {
                 warm,
                 "{source}",
             );
+        }
+    }
+
+    #[test]
+    fn readonly_constructor_date_defaults_preserve_real_types_and_signature_identity() {
+        for modifiers in ["readonly", "public readonly"] {
+            let mut fixture = date_constructor_fixture(&format!(
+                "class Model {{ constructor({modifiers} timestamp = new Date()) {{}} }}",
+            ));
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("the inferred Date parameter belongs to one direct class")
+            };
+            let constructor = class.class.constructor.unwrap();
+            let parameter = constructor.inferred_date_parameter.unwrap();
+            let date = parameter.initializer.symbol();
+            assert_ne!(parameter.local_symbol, parameter.property_symbol);
+            assert_eq!(
+                bound.symbol(parameter.declaration),
+                Some(parameter.property_symbol)
+            );
+            assert_eq!(constructor.minimum_argument_count(), 0);
+            assert!(fixture.store.declared_type_links(date).is_none());
+            assert!(
+                fixture
+                    .store
+                    .type_node_links(parameter.initializer.node())
+                    .is_none()
+            );
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Ok(plan.clone()),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+            let date_type = fixture
+                .store
+                .declared_type_links(date)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            assert_eq!(members.instance_properties(), &[parameter.property_symbol]);
+            for symbol in [parameter.local_symbol, parameter.property_symbol] {
+                assert_eq!(
+                    fixture.store.value_symbol_links(symbol),
+                    Some(&ValueSymbolLinks {
+                        resolved_type: Some(date_type),
+                        ..ValueSymbolLinks::default()
+                    }),
+                );
+            }
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol(parameter.property_symbol)
+                    .unwrap()
+                    .check_flags(),
+                CheckFlags::READONLY,
+            );
+            assert!(exact_global_date_initializer(
+                &fixture.store,
+                parameter.initializer.node(),
+                date_type,
+            ));
+            let signature = fixture
+                .store
+                .signature(members.default_construct_signature())
+                .unwrap();
+            assert_eq!(signature.declaration(), Some(constructor.declaration));
+            assert_eq!(signature.parameters(), &[parameter.local_symbol]);
+            assert_eq!(signature.min_argument_count(), 0);
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+                ClassHeritageMembersValidation::Valid,
+            );
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+                Ok(members),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_constructor_date_default_poison_rejects_before_class_publication() {
+        for poison in 0..4 {
+            let mut fixture = date_constructor_fixture(
+                "class Model { constructor(readonly timestamp = new Date()) {} }",
+            );
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("the inferred Date parameter belongs to one direct class")
+            };
+            let parameter = class
+                .class
+                .constructor
+                .unwrap()
+                .inferred_date_parameter
+                .unwrap();
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            let expected = match poison {
+                0 => {
+                    assert!(fixture.store.set_type_node_links(
+                        parameter.initializer.node(),
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyTypeCache(
+                        parameter.initializer.node(),
+                    ))
+                }
+                1 | 2 => {
+                    let symbol = if poison == 1 {
+                        parameter.local_symbol
+                    } else {
+                        parameter.property_symbol
+                    };
+                    assert!(fixture.store.set_value_symbol_links(
+                        symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyValueCache(symbol))
+                }
+                3 => {
+                    let signature = fixture.store.intrinsic_bootstrap().unwrap().any_signature;
+                    assert!(fixture.store.set_signature_links(
+                        parameter.initializer.node(),
+                        SignatureLinks {
+                            resolved_signature: ResolvedSignatureState::Resolved(signature),
+                            ..SignatureLinks::default()
+                        },
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyTypeCache(
+                        parameter.initializer.node(),
+                    ))
+                }
+                _ => unreachable!("Date defaults retain four poisoned-cache cases"),
+            };
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(expected),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+            assert!(
+                fixture
+                    .store
+                    .declared_type_links(parameter.initializer.symbol())
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn inferred_constructor_defaults_reject_non_readonly_or_non_date_shapes() {
+        for source in [
+            "class Model { constructor(timestamp = new Date()) {} }",
+            "class Model { constructor(public timestamp = new Date()) {} }",
+            "class Model { constructor(readonly timestamp = new Date(1)) {} }",
+            "class Model { constructor(readonly timestamp = new Date) {} }",
+            "class Model { constructor(readonly timestamp = Date()) {} }",
+            "class Model { constructor(readonly timestamp = new Other()) {} }",
+        ] {
+            let fixture = date_constructor_fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                matches!(
+                    plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                    Err(ClassError::Unsupported(_)),
+                ),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
         }
     }
 
