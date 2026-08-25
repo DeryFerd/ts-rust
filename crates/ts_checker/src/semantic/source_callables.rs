@@ -8110,7 +8110,7 @@ fn stored_promise_executor_contextual_target_is_exact(
         && store.source_node_kind(construction) == Some(SyntaxKind::ConstructSignature)
         && store
             .symbol(owner)
-            .and_then(|owner| owner.members())
+            .and_then(ts_binder::semantic::Symbol::members)
             .and_then(|members| store.symbol_table(members))
             .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
             .and_then(|constructor| store.symbol(constructor))
