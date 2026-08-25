@@ -11011,6 +11011,12 @@ mod runtime_tests {
                 .insert_symbol(globals, EscapedName::source("JSX"), namespace),
             Some(None),
         );
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("Existing"), existing),
+            Some(None),
+        );
         let primitive = fixture.expression("primitive");
         let direct = fixture.expression("direct");
         let nested = fixture.expression("nested");
