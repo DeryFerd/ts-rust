@@ -12157,6 +12157,7 @@ mod runtime_tests {
                 "interface ClassAttributes<T> extends Attributes {} ",
                 "interface DOMAttributes<T> {} ",
                 "interface HTMLAttributes<T> extends DOMAttributes<T> { className?: string; } ",
+                "interface HTMLAttributes<T> extends DOMAttributes<T> {} ",
                 "type DetailedHTMLProps<E extends HTMLAttributes<T>, T> = ClassAttributes<T> & E; ",
                 "} ",
                 "declare namespace JSX { ",
