@@ -3572,12 +3572,7 @@ fn resolve_expected_jsx_child_type(
     if record.flags().intersects(TypeFlags::ANY_OR_UNKNOWN) {
         return Ok(None);
     }
-    if let Some(property) = record
-        .data()
-        .structured()
-        .and_then(|structured| structured.members)
-        .and_then(|members| store.symbol_table(members))
-        .and_then(|members| members.get_source(name))
+    if let Some(property) = jsx_expected_attribute_property(store, expected, name, location)?
         && let Some(type_) = store
             .value_symbol_links(property)
             .and_then(|links| links.resolved_type)
@@ -5451,14 +5446,14 @@ fn widened_jsx_attribute_type(
     let record = store
         .type_payload(value)
         .ok_or(SourceCheckError::Property(attribute.node))?;
-    let expected = store
-        .type_payload(expected_attributes)
-        .and_then(|expected| expected.data().structured())
-        .and_then(|expected| expected.members)
-        .and_then(|members| store.symbol_table(members))
-        .and_then(|members| members.get_source(&attribute.name))
-        .and_then(|symbol| store.value_symbol_links(symbol))
-        .and_then(|links| links.resolved_type);
+    let expected = jsx_expected_attribute_property(
+        store,
+        expected_attributes,
+        &attribute.name,
+        attribute.node,
+    )?
+    .and_then(|symbol| store.value_symbol_links(symbol))
+    .and_then(|links| links.resolved_type);
     if expected.is_some_and(|expected| {
         store
             .type_payload(expected)
@@ -5932,8 +5927,16 @@ fn check_attribute_assignability(
         .data()
         .structured()
         .ok_or_else(|| unsupported(opening, SyntaxKind::JsxAttributes))?;
-    let expected_members = structured.members;
-    let required = structured.properties.clone().unwrap_or_default();
+    let intersection = materialized_jsx_attribute_intersection(store, expected, opening)?;
+    let expected_members = intersection
+        .as_ref()
+        .map_or(structured.members, |intersection| {
+            Some(intersection.members)
+        });
+    let required = intersection.map_or_else(
+        || structured.properties.clone().unwrap_or_default(),
+        |intersection| intersection.properties,
+    );
     let index_infos = structured.index_infos.clone().unwrap_or_default();
     let children_name = children
         .map(|children| checked_jsx_children_name(store, children).map(str::to_owned))
@@ -6154,6 +6157,48 @@ fn check_attribute_assignability(
         return Err(SourceCheckError::Property(opening));
     }
     Ok(())
+}
+
+fn materialized_jsx_attribute_intersection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    location: NodeRef,
+) -> Result<Option<super::intersection_types::IntersectionTypeProjection>, SourceCheckError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(SourceCheckError::Property(location))?;
+    if !matches!(
+        record.data(),
+        super::TypeData::Intersection(intersection)
+            if intersection.intersection.property_cache.is_some()
+    ) {
+        return Ok(None);
+    }
+    store
+        .validate_intersection_type(type_)
+        .map(Some)
+        .map_err(|_| SourceCheckError::Property(location))
+}
+
+fn jsx_expected_attribute_property(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    name: &str,
+    location: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+    let intersection = materialized_jsx_attribute_intersection(store, type_, location)?;
+    let members = intersection.map_or_else(
+        || {
+            store
+                .type_payload(type_)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.members)
+        },
+        |intersection| Some(intersection.members),
+    );
+    Ok(members
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(name)))
 }
 
 fn deferred_react_attribute_type(
