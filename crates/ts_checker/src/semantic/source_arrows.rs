@@ -68,6 +68,7 @@ pub(super) struct SourceContextualParameterPlan {
     pub(super) declaration: NodeRef,
     pub(super) name: NodeRef,
     pub(super) symbol: SemanticSymbolId,
+    pub(super) annotation: Option<NodeRef>,
     pub(super) optional: bool,
     pub(super) rest: bool,
     pub(super) request: SourceContextualParameterRequest,
@@ -125,6 +126,7 @@ pub(super) struct SourceContextualSignatureShape {
 /// in whether TS7006 is reported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceContextualParameterOrigin {
+    ExplicitAnnotation { type_node: NodeRef },
     ContextualPosition { index: usize },
     ImplicitAny { missing_position: usize },
     ContextualEmptyRestTail { start: usize },
@@ -1167,19 +1169,20 @@ pub(super) fn plan_contextual_source_arrow(
                 SourceContextualArrowUnsupported::InitializedParameter(parameter),
             ));
         }
-        if let Some(type_id) = data.type_ {
-            let annotation = NodeRef::new(parameter.arena, parameter.file, type_id);
-            preflight_contextual_child(
-                store,
-                host,
-                parameter,
-                annotation,
-                SourceContextualArrowInvariant::InvalidParameter(annotation),
-            )?;
-            return Err(contextual_unsupported(
-                SourceContextualArrowUnsupported::AnnotatedParameter(annotation),
-            ));
-        }
+        let annotation = data
+            .type_
+            .map(|type_id| {
+                let annotation = NodeRef::new(parameter.arena, parameter.file, type_id);
+                preflight_contextual_child(
+                    store,
+                    host,
+                    parameter,
+                    annotation,
+                    SourceContextualArrowInvariant::InvalidParameter(annotation),
+                )
+                .map(|_| annotation)
+            })
+            .transpose()?;
 
         let name = NodeRef::new(parameter.arena, parameter.file, data.name);
         let name_record = preflight_node(store, host, name)?;
@@ -1246,6 +1249,25 @@ pub(super) fn plan_contextual_source_arrow(
         } else {
             false
         };
+        if let Some(annotation) = annotation {
+            let annotation_record = preflight_node(store, host, annotation)?;
+            if annotation_record.range.start < name_record.range.end
+                || annotation_record.range.end != parameter_record.range.end
+                || data.question_token.is_some_and(|token| {
+                    host.node(NodeRef::new(parameter.arena, parameter.file, token))
+                        .is_none_or(|record| record.range.end > annotation_record.range.start)
+                })
+            {
+                return Err(contextual_invariant(
+                    SourceContextualArrowInvariant::InvalidParameter(annotation),
+                ));
+            }
+            if rest {
+                return Err(contextual_unsupported(
+                    SourceContextualArrowUnsupported::AnnotatedParameter(annotation),
+                ));
+            }
+        }
         if rest && optional {
             return Err(contextual_unsupported(
                 SourceContextualArrowUnsupported::OptionalRestParameter(parameter),
@@ -1307,6 +1329,7 @@ pub(super) fn plan_contextual_source_arrow(
             declaration: parameter,
             name,
             symbol,
+            annotation,
             optional,
             rest,
             request: if rest {
@@ -1468,28 +1491,32 @@ pub(super) fn resolve_contextual_arrow_parameter_origins(
 
     let mut parameters = Vec::with_capacity(plan.parameters.len());
     for parameter in &plan.parameters {
-        let origin = match parameter.request {
-            SourceContextualParameterRequest::Position { index }
-                if index < contextual.parameter_count =>
-            {
-                SourceContextualParameterOrigin::ContextualPosition { index }
-            }
-            SourceContextualParameterRequest::Position { index } => {
-                SourceContextualParameterOrigin::ImplicitAny {
-                    missing_position: index,
+        let origin = if let Some(type_node) = parameter.annotation {
+            SourceContextualParameterOrigin::ExplicitAnnotation { type_node }
+        } else {
+            match parameter.request {
+                SourceContextualParameterRequest::Position { index }
+                    if index < contextual.parameter_count =>
+                {
+                    SourceContextualParameterOrigin::ContextualPosition { index }
                 }
-            }
-            SourceContextualParameterRequest::RestTail { start }
-                if start < contextual.parameter_count =>
-            {
-                return Err(contextual_unsupported(
-                    SourceContextualArrowUnsupported::ContextualNonEmptyRestTail(
-                        parameter.declaration,
-                    ),
-                ));
-            }
-            SourceContextualParameterRequest::RestTail { start } => {
-                SourceContextualParameterOrigin::ContextualEmptyRestTail { start }
+                SourceContextualParameterRequest::Position { index } => {
+                    SourceContextualParameterOrigin::ImplicitAny {
+                        missing_position: index,
+                    }
+                }
+                SourceContextualParameterRequest::RestTail { start }
+                    if start < contextual.parameter_count =>
+                {
+                    return Err(contextual_unsupported(
+                        SourceContextualArrowUnsupported::ContextualNonEmptyRestTail(
+                            parameter.declaration,
+                        ),
+                    ));
+                }
+                SourceContextualParameterRequest::RestTail { start } => {
+                    SourceContextualParameterOrigin::ContextualEmptyRestTail { start }
+                }
             }
         };
         parameters.push(ResolvedSourceContextualParameter {
@@ -3848,6 +3875,59 @@ mod tests {
     }
 
     #[test]
+    fn annotated_contextual_parameters_preserve_explicit_and_inferred_origins() {
+        let fixture = Fixture::new(concat!(
+            "const callback: (first: number, second: string) => string = ",
+            "(first: number, second) => second;",
+        ));
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let plan = fixture.contextual_plan(0).unwrap();
+        let [annotated, contextual] = plan.parameters.as_slice() else {
+            panic!("expected one annotated and one contextual parameter")
+        };
+        let annotation = annotated.annotation.unwrap();
+        assert_eq!(
+            fixture.parsed.arena.get(annotation.node).unwrap().kind,
+            SyntaxKind::NumberKeyword,
+        );
+        assert!(contextual.annotation.is_none());
+
+        let resolved = resolve_contextual_arrow_parameter_origins(
+            &plan,
+            SourceContextualSignatureShape {
+                call_signature_count: 1,
+                type_parameter_count: 0,
+                parameter_count: 2,
+                has_effective_rest: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.parameters[0].origin,
+            SourceContextualParameterOrigin::ExplicitAnnotation {
+                type_node: annotation,
+            },
+        );
+        assert_eq!(
+            resolved.parameters[1].origin,
+            SourceContextualParameterOrigin::ContextualPosition { index: 1 },
+        );
+        assert!(resolved.implicit_any_diagnostic_nodes(true).is_empty());
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
     fn contextual_shape_resolution_has_explicit_safety_boundaries() {
         let fixture = Fixture::new("const f: () => void = (a?, ...b) => {};");
         let plan = fixture.contextual_plan(0).unwrap();
@@ -3904,9 +3984,9 @@ mod tests {
             ))
         ));
 
-        let annotated_parameter = Fixture::new("const f: (a: number) => void = (a: number) => {};");
+        let annotated_rest = Fixture::new("const f: () => void = (...values: []) => {};");
         assert!(matches!(
-            annotated_parameter.contextual_plan(0),
+            annotated_rest.contextual_plan(0),
             Err(SourceContextualArrowError::Unsupported(
                 SourceContextualArrowUnsupported::AnnotatedParameter(_)
             ))

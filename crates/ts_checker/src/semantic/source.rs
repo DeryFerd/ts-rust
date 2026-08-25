@@ -14478,6 +14478,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     plan_contextual_source_arrow(store, host, declaration, self.array_targets)
                         .map_err(Self::contextual_arrow_plan_error)?;
                 preflight_contextual_source_publication(store, &arrow, None)?;
+                for annotation in arrow
+                    .parameters
+                    .iter()
+                    .filter_map(|parameter| parameter.annotation)
+                {
+                    self.plan_type_import_annotation_root(annotation)?;
+                }
                 (
                     arrow.variable_symbol,
                     PlannedVariableStatement::ContextualArrow(Box::new(arrow)),
@@ -33395,6 +33402,7 @@ fn materialize_contextual_source_arrow(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     arrow: &PlannedContextualArrow,
 ) -> Result<(TypeId, TypeId), SourceCheckError> {
@@ -33440,6 +33448,28 @@ fn materialize_contextual_source_arrow(
     let mut prepared_parameters = Vec::with_capacity(parameters.len());
     for parameter in &parameters {
         let base = match parameter.origin {
+            SourceContextualParameterOrigin::ExplicitAnnotation { type_node } => {
+                session.reset_query();
+                let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+                let annotation = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut annotation_diagnostics,
+                )?
+                .with_type_reference_alias_targets(
+                    type_import_capabilities
+                        .get(&type_node)
+                        .map_or(&[], Vec::as_slice)
+                        .iter()
+                        .copied(),
+                )?
+                .get_type_from_type_node(type_node);
+                merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+                annotation?
+            }
             SourceContextualParameterOrigin::ContextualPosition { index } => target_callable
                 .parameters
                 .get(index)
@@ -36840,6 +36870,30 @@ pub(super) fn check_source_file(
             &mut type_import_preflight_diagnostics,
         )?
         .preflight_type_from_type_node(arrow.source.contextual_type.type_node)?;
+        for annotation in arrow
+            .source
+            .parameters
+            .iter()
+            .filter_map(|parameter| parameter.annotation)
+        {
+            session.reset_query();
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                &mut type_import_preflight_diagnostics,
+            )?
+            .with_type_reference_alias_targets(
+                type_import_capabilities
+                    .get(&annotation)
+                    .map_or(&[], Vec::as_slice)
+                    .iter()
+                    .copied(),
+            )?
+            .preflight_type_from_type_node(annotation)?;
+        }
     }
     for read in &ambient_namespace_reads {
         if read.same_file {
@@ -39312,6 +39366,7 @@ pub(super) fn check_source_file(
                     diagnostics,
                     &current_flow_types,
                     &preflighted_type_import_value_uses,
+                    &type_import_capabilities,
                     &mut deferred,
                     arrow,
                 )?;
@@ -69009,6 +69064,194 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn contextual_arrows_support_mixed_explicit_parameter_annotations() {
+        let source = parsed(concat!(
+            "const explicit: (value: number) => number = ",
+            "(value: number) => value; ",
+            "const mixed: (first: number, second: string) => string = ",
+            "(first: number, second) => second; ",
+            "const exact: (value: 'ready') => 'ready' = ",
+            "(value: 'ready') => value; ",
+            "const copied = mixed(1, 'copied'); ",
+            "const literal = exact('ready');",
+        ));
+        let file = FileId::new(9_984);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for (name, expected) in [
+            ("explicit", vec![bootstrap.number_type]),
+            ("mixed", vec![bootstrap.number_type, bootstrap.string_type]),
+        ] {
+            let arrow = variable_initializer(&source, file, name);
+            let (_, bound) = context.file(file).unwrap();
+            let owner = bound.symbol(arrow).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                context
+                    .store()
+                    .callable_signature_parameter_types(signature),
+                Some(expected.as_slice()),
+            );
+        }
+        assert_eq!(
+            variable_value_type(&context, &source, file, "copied"),
+            bootstrap.string_type,
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "literal"))
+                .unwrap(),
+            "\"ready\"",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn contextual_arrow_annotations_preserve_fixed_generic_interface_arguments() {
+        let source = parsed(concat!(
+            "interface Box<Value> { value: Value } ",
+            "declare const input: Box<string>; ",
+            "const project: (entry: Box<string>) => { value: string } = ",
+            "(entry: Box<string>) => ({ value: entry.value }); ",
+            "const result = project(input); ",
+            "const value = result.value;",
+        ));
+        let file = FileId::new(9_985);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let arrow = variable_initializer(&source, file, "project");
+        let NodeData::ArrowFunction(syntax) = &source.arena.get(arrow.node).unwrap().data else {
+            panic!("expected the fixed generic contextual arrow")
+        };
+        let [parameter] = syntax.parameters.nodes.as_slice() else {
+            panic!("expected one fixed generic parameter")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, *parameter);
+        let (_, bound) = context.file(file).unwrap();
+        let parameter_symbol = bound.symbol(parameter).unwrap();
+        let parameter_type = context
+            .store()
+            .value_symbol_links(parameter_symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(parameter_type).unwrap(),
+            "Box<string>"
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "value"),
+            context.store().intrinsic_bootstrap().unwrap().string_type,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn explicit_contextual_parameter_mismatches_preserve_arrow_diagnostics() {
+        let source = parsed("const wrong: (value: number) => number = (value: string) => 1;");
+        let file = FileId::new(9_986);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one explicit contextual parameter mismatch")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            node_text(&source, diagnostic.node.unwrap()),
+            "(value: string) => 1",
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn poisoned_contextual_parameter_annotations_fail_before_prior_publication() {
+        let source = parsed(concat!(
+            "const ready: () => number = () => 1; ",
+            "const blocked: (value: number) => number = (value: number) => value;",
+        ));
+        let file = FileId::new(9_987);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let ready = variable_initializer(&source, file, "ready");
+        let blocked = variable_initializer(&source, file, "blocked");
+        let NodeData::ArrowFunction(arrow) = &source.arena.get(blocked.node).unwrap().data else {
+            panic!("expected the annotated contextual arrow")
+        };
+        let [parameter] = arrow.parameters.nodes.as_slice() else {
+            panic!("expected one annotated contextual parameter")
+        };
+        let NodeData::ParameterDeclaration(parameter) = &source.arena.get(*parameter).unwrap().data
+        else {
+            panic!("expected the contextual parameter declaration")
+        };
+        let annotation = NodeRef::new(source.arena.id(), file, parameter.type_.unwrap());
+        let (_, bound) = context.file(file).unwrap();
+        let ready_owner = bound.symbol(ready).unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+
+        assert!(context.check_source_file(file).is_err());
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(
+            context
+                .store()
+                .source_callable_type_for_owner(ready_owner)
+                .is_none()
+        );
     }
 
     #[test]
