@@ -12131,6 +12131,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let NodeData::Identifier(identifier) = &name_record.data else {
             return false;
         };
+        let root_element = matches!(
+            identifier.text.as_str(),
+            "Element" | "HTMLElement" | "SVGElement"
+        );
         let intrinsic_element = (identifier.text.starts_with("HTML")
             || identifier.text.starts_with("SVG"))
             && identifier.text.ends_with("Element")
@@ -12144,7 +12148,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || name_record.flags.0 != 0
             || name_record.parent != Some(node.node)
             || identifier.flow_node.is_some()
-            || !(intrinsic_element || native_event)
+            || !(root_element || intrinsic_element || native_event)
             || !self.global_symbol_has_name(symbol, &identifier.text)
         {
             return false;
@@ -12163,7 +12167,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || owner.exports().is_some()
             || owner.export_symbol().is_some()
             || self.store.get_merged_symbol(symbol) != Some(symbol)
-            || native_event
+            || (root_element || native_event)
                 && !owner
                     .flags()
                     .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
@@ -33911,6 +33915,78 @@ mod tests {
             warm,
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn default_library_dom_root_arguments_keep_multibase_heritage_cold() {
+        let library = parse_source_file(concat!(
+            "interface DomRoot {} interface DomExtra {} interface DomMore {} ",
+            "interface Element extends DomRoot, DomExtra, DomMore { ",
+            "self: this; native(value: string): void; } ",
+            "declare var Element: unknown; ",
+            "interface HTMLElement extends Element, DomExtra, DomMore {} ",
+            "declare var HTMLElement: unknown; ",
+            "interface SVGElement extends Element, DomExtra, DomMore {} ",
+            "declare var SVGElement: unknown;",
+        ));
+        let source = parse_source_file(concat!(
+            "interface Box<Value> {} ",
+            "type Root = Box<Element>; ",
+            "type Html = Box<HTMLElement>; ",
+            "type Svg = Box<SVGElement>;",
+        ));
+
+        for is_default_library in [false, true] {
+            let (mut context, _, _) =
+                default_library_interface_context(&library, &source, is_default_library);
+            let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+            let aliases = [
+                ("Root", "Element"),
+                ("Html", "HTMLElement"),
+                ("Svg", "SVGElement"),
+            ]
+            .map(|(alias, element)| {
+                let symbols = context.store().symbol_table(globals).unwrap();
+                (
+                    symbols.get_source(alias).unwrap(),
+                    symbols.get_source(element).unwrap(),
+                )
+            });
+
+            if !is_default_library {
+                let before = store_state(context.store());
+                assert!(context.get_declared_type_of_symbol(aliases[0].0).is_err());
+                assert_eq!(store_state(context.store()), before);
+                continue;
+            }
+
+            let mut resolved = Vec::new();
+            for (alias, element) in aliases {
+                let type_ = context.get_declared_type_of_symbol(alias).unwrap();
+                let reference = validate_direct_generic_reference(context.store(), type_).unwrap();
+                let expected = context
+                    .store()
+                    .declared_type_links(element)
+                    .and_then(|links| links.declared_type)
+                    .unwrap();
+                assert_eq!(reference.type_arguments, [expected]);
+                let TypeData::Interface(interface) =
+                    context.store().type_payload(expected).unwrap().data()
+                else {
+                    panic!("DOM roots must retain their authenticated interface identity")
+                };
+                assert!(!interface.base_types_resolved);
+                assert!(!interface.declared_members_resolved);
+                resolved.push((alias, type_));
+            }
+
+            let warm = store_state(context.store());
+            for (alias, expected) in resolved {
+                assert_eq!(context.get_declared_type_of_symbol(alias), Ok(expected));
+            }
+            assert_eq!(store_state(context.store()), warm);
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
