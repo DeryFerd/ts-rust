@@ -4785,18 +4785,19 @@ pub(super) fn plan_generic_interface(
                     PropertyObjectError::UnsupportedMember { node, kind }
                 }
             })?;
-            if !matches!(
-                planned.bases.as_slice(),
-                [base]
-                    if base.kind == DirectInterfaceBaseKind::Interface
-                        && !base.type_arguments.is_empty()
-            ) {
+            if planned.bases.is_empty()
+                || planned.bases.len() > 2
+                || planned
+                    .bases
+                    .iter()
+                    .any(|base| base.kind != DirectInterfaceBaseKind::Interface)
+            {
                 return Err(PropertyObjectError::UnsupportedMember {
                     node: planned.clause,
                     kind: SyntaxKind::HeritageClause,
                 });
             }
-            merge_interface_heritage(store, host, &mut heritage, planned, 1)?;
+            merge_interface_heritage(store, host, &mut heritage, planned, 2)?;
         }
 
         let mut current_parameters = Vec::with_capacity(parameters.nodes.len());
@@ -8353,6 +8354,7 @@ fn validate_interface_record(
 /// The proof is semantic-only so cache validators can use it without retaining
 /// an AST host. Source provenance is still checked through registered node
 /// facts and the exact owner/property symbol edges published by the binder.
+/// Namespace-owned interfaces additionally require their exact export edge.
 pub(super) fn validate_resolved_declared_property_object(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -8360,6 +8362,11 @@ pub(super) fn validate_resolved_declared_property_object(
     match validate_resolved_declared_property_object_detailed(store, type_) {
         DetailedDeclaredPropertyObjectValidation::Valid(proof) => {
             DeclaredPropertyObjectValidation::Valid(proof)
+        }
+        DetailedDeclaredPropertyObjectValidation::TraversableBoundary(
+            DeclaredPropertyObjectProof::Interface,
+        ) if authenticated_namespace_declared_property_interface(store, type_) => {
+            DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
         }
         DetailedDeclaredPropertyObjectValidation::TraversableBoundary(_)
         | DetailedDeclaredPropertyObjectValidation::NotDeclared => {
@@ -8369,6 +8376,63 @@ pub(super) fn validate_resolved_declared_property_object(
             DeclaredPropertyObjectValidation::Malformed
         }
     }
+}
+
+fn authenticated_namespace_declared_property_interface(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let Some(owner) = record.symbol() else {
+        return false;
+    };
+    let Some(interface) = store.symbol(owner) else {
+        return false;
+    };
+    let Some(namespace) = store.get_parent_of_symbol(owner) else {
+        return false;
+    };
+    let Some(namespace_record) = store.symbol(namespace) else {
+        return false;
+    };
+    let Some(namespace_declarations) = namespace_record.declarations() else {
+        return false;
+    };
+    let Some(declarations) = interface.declarations() else {
+        return false;
+    };
+    let TypeData::Interface(data) = record.data() else {
+        return false;
+    };
+
+    record.object_flags() == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+        && data.base_types_resolved
+        && data.declared_members_resolved
+        && data.resolved_base_types.is_none()
+        && interface.flags() == SymbolFlags::INTERFACE
+        && namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+        && namespace_record.check_flags() == CheckFlags::NONE
+        && store.get_merged_symbol(namespace) == Some(namespace)
+        && namespace_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(interface.name()))
+            .and_then(|export| store.get_merged_symbol(export))
+            == Some(owner)
+        && declarations.iter().all(|declaration| {
+            let Some(SourceNodeParent::Parent(block)) = store.source_node_parent(*declaration)
+            else {
+                return false;
+            };
+            let Some(SourceNodeParent::Parent(module)) = store.source_node_parent(block) else {
+                return false;
+            };
+            store.source_node_kind(block) == Some(SyntaxKind::ModuleBlock)
+                && store.source_node_kind(module) == Some(SyntaxKind::ModuleDeclaration)
+                && namespace_declarations.contains(&module)
+        })
 }
 
 fn validate_resolved_declared_property_object_detailed(
@@ -11978,52 +12042,77 @@ fn valid_generic_publication_target(
         interface.resolved_base_types.as_deref(),
     ) {
         (None, None) => {}
-        (Some(heritage), Some([base])) => {
-            let [planned] = heritage.bases.as_slice() else {
-                return false;
-            };
-            let Ok(base_reference) = validate_direct_generic_reference(store, *base) else {
-                return false;
-            };
-            let arguments_match = if base_reference.type_arguments == reference.type_arguments {
-                true
-            } else {
-                let mut previous_position = None;
-                planned.type_arguments.len() == base_reference.type_arguments.len()
-                    && planned
-                        .type_arguments
-                        .iter()
-                        .zip(&base_reference.type_arguments)
-                        .all(|(annotation, argument)| {
-                            if cached_planned_type_identity(store, *annotation) != Some(*argument) {
-                                return false;
-                            }
-                            let Some(position) = reference
-                                .type_arguments
-                                .iter()
-                                .position(|parameter| parameter == argument)
-                            else {
-                                return true;
-                            };
-                            if previous_position.is_some_and(|previous| position <= previous) {
-                                return false;
-                            }
-                            previous_position = Some(position);
-                            cached_ordinary_type_parameter_owner(store, *argument)
-                                .and_then(|parameter| store.get_parent_of_symbol(parameter))
-                                == Some(plan.symbol)
-                        })
-            };
-            if planned.kind != DirectInterfaceBaseKind::Interface
-                || planned.type_arguments.is_empty()
-                || !arguments_match
-                || store
-                    .type_payload(base_reference.target)
-                    .and_then(TypeRecord::symbol)
-                    .and_then(|symbol| store.get_merged_symbol(symbol))
-                    != Some(planned.symbol)
+        (Some(heritage), Some(bases)) => {
+            if heritage.bases.is_empty()
+                || heritage.bases.len() > 2
+                || heritage.bases.len() != bases.len()
             {
                 return false;
+            }
+            for (planned, base) in heritage.bases.iter().zip(bases) {
+                if planned.kind != DirectInterfaceBaseKind::Interface {
+                    return false;
+                }
+                if planned.type_arguments.is_empty() {
+                    if !matches!(
+                        validate_resolved_declared_property_object(store, *base),
+                        DeclaredPropertyObjectValidation::Valid(
+                            DeclaredPropertyObjectProof::Interface,
+                        )
+                    ) || store
+                        .type_payload(*base)
+                        .and_then(TypeRecord::symbol)
+                        .and_then(|symbol| store.get_merged_symbol(symbol))
+                        != Some(planned.symbol)
+                    {
+                        return false;
+                    }
+                    continue;
+                }
+
+                let Ok(base_reference) = validate_direct_generic_reference(store, *base) else {
+                    return false;
+                };
+                let arguments_match = if base_reference.type_arguments == reference.type_arguments {
+                    true
+                } else {
+                    let mut previous_position = None;
+                    planned.type_arguments.len() == base_reference.type_arguments.len()
+                        && planned
+                            .type_arguments
+                            .iter()
+                            .zip(&base_reference.type_arguments)
+                            .all(|(annotation, argument)| {
+                                if cached_planned_type_identity(store, *annotation)
+                                    != Some(*argument)
+                                {
+                                    return false;
+                                }
+                                let Some(position) = reference
+                                    .type_arguments
+                                    .iter()
+                                    .position(|parameter| parameter == argument)
+                                else {
+                                    return true;
+                                };
+                                if previous_position.is_some_and(|previous| position <= previous) {
+                                    return false;
+                                }
+                                previous_position = Some(position);
+                                cached_ordinary_type_parameter_owner(store, *argument)
+                                    .and_then(|parameter| store.get_parent_of_symbol(parameter))
+                                    == Some(plan.symbol)
+                            })
+                };
+                if !arguments_match
+                    || store
+                        .type_payload(base_reference.target)
+                        .and_then(TypeRecord::symbol)
+                        .and_then(|symbol| store.get_merged_symbol(symbol))
+                        != Some(planned.symbol)
+                {
+                    return false;
+                }
             }
         }
         _ => return false,
@@ -12370,13 +12459,23 @@ fn valid_generic_structured_members(
             let Some(record) = store.type_payload(*base) else {
                 return false;
             };
-            let Ok(reference) = validate_direct_generic_reference(store, *base) else {
-                return false;
+            let owner = if planned.type_arguments.is_empty() {
+                if !matches!(
+                    validate_resolved_declared_property_object(store, *base),
+                    DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface,)
+                ) {
+                    return false;
+                }
+                record.symbol()
+            } else {
+                let Ok(reference) = validate_direct_generic_reference(store, *base) else {
+                    return false;
+                };
+                store
+                    .type_payload(reference.target)
+                    .and_then(TypeRecord::symbol)
             };
-            if store
-                .type_payload(reference.target)
-                .and_then(TypeRecord::symbol)
-                != Some(planned.symbol)
+            if owner.and_then(|symbol| store.get_merged_symbol(symbol)) != Some(planned.symbol)
                 || !record
                     .object_flags()
                     .contains(ObjectFlags::MEMBERS_RESOLVED)
@@ -21036,6 +21135,395 @@ mod generic_publication_tests {
                 .unwrap()
                 .type_id(),
             string,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One namespace proves inherited ordering, warm identity, and cache poison.
+    fn generic_react_class_attributes_inherit_authenticated_nongeneric_members() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface ClassAttributes<T> extends Attributes { ref: T; } ",
+                "interface Attributes { key: string; } ",
+                "}",
+            ),
+            3_914,
+        );
+        let namespace = fixture.store.get_parent_of_symbol(fixture.symbol).unwrap();
+        let attributes = fixture
+            .store
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("Attributes"))
+            .unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let [base] = plan.heritage.as_ref().unwrap().bases.as_slice() else {
+            panic!("ClassAttributes must retain its one nongeneric Attributes base")
+        };
+        assert_eq!(base.symbol, attributes);
+        assert!(base.type_arguments.is_empty());
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let base_type = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(attributes)
+        .unwrap();
+        assert_eq!(
+            validate_resolved_declared_property_object(&fixture.store, base_type),
+            DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface),
+        );
+        let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+        let target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let parameter = validate_direct_generic_reference(&fixture.store, target)
+            .unwrap()
+            .type_arguments[0];
+        assert!(fixture.store.set_interface_base_resolution(
+            target,
+            true,
+            None,
+            Some(vec![base_type]),
+        ));
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter],
+            ),
+            Ok(target),
+        );
+
+        let (string, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let receiver = fixture
+            .store
+            .create_direct_generic_reference_type(target, &[number])
+            .unwrap();
+        let members = fixture
+            .store
+            .resolve_generic_interface_members(receiver, None)
+            .unwrap();
+        assert_eq!(
+            members
+                .properties()
+                .iter()
+                .map(|property| fixture.store.symbol(*property).unwrap().name().as_utf8())
+                .collect::<Vec<_>>(),
+            [Some("ref"), Some("key")],
+        );
+        for (name, expected) in [("ref", number), ("key", string)] {
+            assert_eq!(
+                fixture
+                    .store
+                    .resolve_generic_interface_property(receiver, name, None)
+                    .unwrap()
+                    .unwrap()
+                    .type_id(),
+                expected,
+            );
+        }
+
+        let warm = state(&fixture.store, &plan, target);
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter],
+            ),
+            Ok(target),
+        );
+        assert_eq!(state(&fixture.store, &plan, target), warm);
+
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(exports, EscapedName::source("Attributes"), fixture.symbol,),
+            Some(Some(attributes)),
+        );
+        assert_eq!(
+            validate_resolved_declared_property_object(&fixture.store, base_type),
+            DeclaredPropertyObjectValidation::NotDeclared,
+        );
+        let poisoned = state(&fixture.store, &plan, target);
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter],
+            ),
+            Err(PropertyObjectError::InvalidCachedInterface {
+                symbol: fixture.symbol,
+                type_: target,
+            }),
+        );
+        assert_eq!(state(&fixture.store, &plan, target), poisoned);
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(exports, EscapedName::source("Attributes"), attributes),
+            Some(Some(fixture.symbol)),
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter],
+            ),
+            Ok(target),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Mixed React bases share ordered publication, replay, and cache poison.
+    fn generic_react_html_attributes_preserve_mixed_base_order_and_cache_identity() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface HTMLAttributes<T> extends AriaAttributes, DOMAttributes<T> ",
+                "{ id: T; } ",
+                "interface HTMLAttributes<T> { title: boolean; } ",
+                "interface AriaAttributes { label: string; shared: string; } ",
+                "interface DOMAttributes<T> { target: T; shared: string; } ",
+                "}",
+            ),
+            3_915,
+        );
+        let namespace = fixture.store.get_parent_of_symbol(fixture.symbol).unwrap();
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let aria = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("AriaAttributes"))
+            .unwrap();
+        let dom = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("DOMAttributes"))
+            .unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        assert_eq!(plan.declarations.len(), 2);
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "title"],
+        );
+        assert_eq!(
+            plan.heritage
+                .as_ref()
+                .unwrap()
+                .bases
+                .iter()
+                .map(|base| (base.symbol, base.type_arguments.len()))
+                .collect::<Vec<_>>(),
+            [(aria, 0), (dom, 1)],
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let aria_type = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(aria)
+        .unwrap();
+        let dom_plan = plan_generic_interface(&fixture.store, &host, dom).unwrap();
+        let dom_flags = fixture.store.symbol(dom).unwrap().flags();
+        let dom_target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            dom,
+            dom_flags,
+        )
+        .unwrap()
+        .unwrap();
+        let dom_parameter = validate_direct_generic_reference(&fixture.store, dom_target)
+            .unwrap()
+            .type_arguments[0];
+        let (string, number, boolean) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
+            )
+        };
+        assert!(
+            fixture
+                .store
+                .publish_interface_no_base_resolution(dom_target)
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &dom_plan,
+                dom_target,
+                &[dom_parameter, string],
+            ),
+            Ok(dom_target),
+        );
+
+        let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+        let target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let parameter = validate_direct_generic_reference(&fixture.store, target)
+            .unwrap()
+            .type_arguments[0];
+        let dom_reference = fixture
+            .store
+            .create_direct_generic_reference_type(dom_target, &[parameter])
+            .unwrap();
+        assert!(fixture.store.set_interface_base_resolution(
+            target,
+            true,
+            None,
+            Some(vec![dom_reference, aria_type]),
+        ));
+        let poisoned = state(&fixture.store, &plan, target);
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter, boolean],
+            ),
+            Err(PropertyObjectError::InvalidCachedInterface {
+                symbol: fixture.symbol,
+                type_: target,
+            }),
+        );
+        assert_eq!(state(&fixture.store, &plan, target), poisoned);
+
+        assert!(fixture.store.set_interface_base_resolution(
+            target,
+            true,
+            None,
+            Some(vec![aria_type, dom_reference]),
+        ));
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter, boolean],
+            ),
+            Ok(target),
+        );
+        let receiver = fixture
+            .store
+            .create_direct_generic_reference_type(target, &[number])
+            .unwrap();
+        let members = fixture
+            .store
+            .resolve_generic_interface_members(receiver, None)
+            .unwrap();
+        assert_eq!(
+            members
+                .properties()
+                .iter()
+                .map(|property| fixture.store.symbol(*property).unwrap().name().as_utf8())
+                .collect::<Vec<_>>(),
+            [
+                Some("id"),
+                Some("title"),
+                Some("label"),
+                Some("shared"),
+                Some("target"),
+            ],
+        );
+        assert_eq!(
+            fixture.store.get_parent_of_symbol(members.properties()[3]),
+            Some(aria),
+        );
+        for (name, expected) in [
+            ("id", number),
+            ("title", boolean),
+            ("label", string),
+            ("shared", string),
+            ("target", number),
+        ] {
+            assert_eq!(
+                fixture
+                    .store
+                    .resolve_generic_interface_property(receiver, name, None)
+                    .unwrap()
+                    .unwrap()
+                    .type_id(),
+                expected,
+                "{name}",
+            );
+        }
+
+        let warm = (
+            state(&fixture.store, &plan, target),
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.symbol_len(),
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[parameter, boolean],
+            ),
+            Ok(target),
+        );
+        assert_eq!(
+            (
+                state(&fixture.store, &plan, target),
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.symbol_len(),
+            ),
+            warm,
         );
         assert!(diagnostics.is_empty());
     }
