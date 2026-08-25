@@ -487,6 +487,7 @@ fn plan_contextual_target_syntax_shape(
             | SyntaxKind::LiteralType
             | SyntaxKind::TypeLiteral
             | SyntaxKind::TypeReference
+            | SyntaxKind::FunctionType
             | SyntaxKind::ParenthesizedType
             | SyntaxKind::UnionType
     ) {
@@ -3422,6 +3423,51 @@ mod tests {
                 cold,
             );
         }
+    }
+
+    #[test]
+    fn contextual_arrows_preserve_higher_order_callable_returns_without_publication() {
+        let fixture = Fixture::new(concat!(
+            "const forward: (callback: (value: number) => string) => ",
+            "(value: number) => string = callback => callback;",
+        ));
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let plan = fixture.contextual_plan(0).unwrap();
+
+        let NodeData::FunctionTypeNode(target) = &fixture
+            .parsed
+            .arena
+            .get(plan.contextual_type.type_node.node)
+            .unwrap()
+            .data
+        else {
+            panic!("expected the higher-order contextual function target")
+        };
+        let return_type = target.type_.unwrap();
+        assert_eq!(
+            fixture.parsed.arena.get(return_type).unwrap().kind,
+            SyntaxKind::FunctionType,
+        );
+        assert_eq!(plan.contextual_signature_shape.parameter_count, 1);
+        assert!(matches!(
+            plan.return_origin,
+            SourceContextualReturnOrigin::InferredConciseExpression { expression }
+                if fixture.parsed.arena.get(expression.node).unwrap().kind
+                    == SyntaxKind::Identifier
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]

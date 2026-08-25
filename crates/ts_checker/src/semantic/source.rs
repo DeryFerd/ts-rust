@@ -69067,6 +69067,84 @@ class Foo2 {
     }
 
     #[test]
+    fn contextual_callable_returns_preserve_identity_diagnostics_and_warm_caches() {
+        let source = parsed(concat!(
+            "declare function format(value: number): string; ",
+            "const forward: (callback: (value: number) => string) => ",
+            "(value: number) => string = callback => callback; ",
+            "const selected = forward(format); ",
+            "const direct = selected(1); ",
+            "const chained = forward(format)(2); ",
+            "const rejected = selected('wrong');",
+        ));
+        let file = FileId::new(9_988);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let arrow = variable_initializer(&source, file, "forward");
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(arrow).unwrap();
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let target = variable_value_type(&context, &source, file, "forward");
+        let StoredSingleCallableValidation::Valid {
+            callable: target, ..
+        } = validate_stored_single_callable(context.store(), target)
+        else {
+            panic!("expected the higher-order contextual target to remain callable")
+        };
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            target.parameters.first().copied(),
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "selected"),
+            target.return_type.unwrap(),
+        );
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "direct"),
+            string,
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "chained"),
+            string,
+        );
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one returned-callback argument mismatch")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "'wrong'");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Argument of type 'string' is not assignable to parameter of type 'number'.",
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn contextual_arrows_support_mixed_explicit_parameter_annotations() {
         let source = parsed(concat!(
             "const explicit: (value: number) => number = ",
