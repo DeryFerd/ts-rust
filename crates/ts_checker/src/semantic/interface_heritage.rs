@@ -726,6 +726,13 @@ fn authenticate_react_forwarded_interface_argument(
         .map_err(|_| unsupported())?
         .and_then(|symbol| store.get_merged_symbol(symbol))
         .ok_or_else(unsupported)?;
+    if store
+        .symbol(symbol)
+        .and_then(|symbol| symbol.name().as_utf8())
+        != Some(identifier.text.as_str())
+    {
+        return Err(unsupported());
+    }
 
     let Some(arguments) = reference.type_arguments.as_ref() else {
         return if owner_parameters.contains(&symbol)

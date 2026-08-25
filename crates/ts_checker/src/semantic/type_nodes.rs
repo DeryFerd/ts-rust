@@ -12558,6 +12558,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             self.store.symbol(*target).is_some_and(|target_record| {
                                 target_record.flags().without(SymbolFlags::TRANSIENT)
                                     == SymbolFlags::INTERFACE
+                                    && target_record.check_flags() == CheckFlags::NONE
                                     && self.store.get_parent_of_symbol(*target) == Some(namespace)
                                     && exports
                                         .get(target_record.name())
@@ -12566,6 +12567,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             })
                         })
                         && property_record.flags() == SymbolFlags::PROPERTY
+                        && property_record.check_flags() == CheckFlags::NONE
                         && self.store.get_parent_of_symbol(property_symbol) == Some(owner)
                         && owner_record
                             .members()
@@ -12816,6 +12818,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         .and_then(|export| self.store.get_merged_symbol(export));
                     if namespace_record.name().as_utf8() != Some("React")
                         || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+                        || self
+                            .store
+                            .symbol(target)
+                            .and_then(|symbol| symbol.name().as_utf8())
+                            != Some(member_identifier.text.as_str())
+                        || self.store.get_parent_of_symbol(target) != Some(namespace)
                         || exported != Some(target)
                     {
                         return false;
@@ -34688,6 +34696,34 @@ mod tests {
             .symbol_table(exports)
             .and_then(|exports| exports.get_source("AnchorHTMLAttributes"))
             .unwrap();
+        let react_html = context
+            .store()
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("ReactHTML"))
+            .unwrap();
+        let factory_property = context
+            .store()
+            .symbol(react_html)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("a"))
+            .unwrap();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_source_property_readonly(factory_property, true)
+        );
+        for reference in &references {
+            assert!(
+                !TypeQueryPlanner::new(context.store(), &host, None, None, false, &aliases)
+                    .is_default_library_dom_interface_argument(*reference, anchor)
+            );
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_source_property_readonly(factory_property, false)
+        );
         assert_eq!(
             context.store_mut_for_test().insert_symbol(
                 exports,
@@ -35549,6 +35585,28 @@ mod tests {
                     .is_default_library_dom_interface_argument(reference, div)
             );
         }
+        assert_eq!(
+            store.insert_symbol(
+                react_exports,
+                EscapedName::source("DetailedHTMLProps"),
+                class_attributes,
+            ),
+            Some(Some(detailed_html_props)),
+        );
+        for reference in react_dom_type_references(&react, react_file, "HTMLDivElement") {
+            assert!(
+                !TypeQueryPlanner::new(&store, &host, None, None, false, &aliases)
+                    .is_default_library_dom_interface_argument(reference, div)
+            );
+        }
+        assert_eq!(
+            store.insert_symbol(
+                react_exports,
+                EscapedName::source("DetailedHTMLProps"),
+                detailed_html_props,
+            ),
+            Some(Some(class_attributes)),
+        );
 
         let div_annotation = react_dom_property_annotation(&react, react_file, "div");
         let heading_annotation = react_dom_property_annotation(&react, react_file, "h1");
