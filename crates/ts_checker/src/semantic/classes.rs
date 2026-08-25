@@ -11473,7 +11473,9 @@ fn exact_stored_method_return_type(
     if bodyless && store.source_direct_type_annotation(declaration) != Some(last) {
         return false;
     }
-    let previous = if !bodyless {
+    let previous = if bodyless {
+        last
+    } else {
         let Some(previous_index) = last
             .node
             .index()
@@ -11487,8 +11489,6 @@ fn exact_stored_method_return_type(
             declaration.file,
             ts_ast::NodeId::new(previous_index),
         )
-    } else {
-        last
     };
     if store.source_node_parent(previous) != Some(SourceNodeParent::Parent(declaration)) {
         return false;
