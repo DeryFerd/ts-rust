@@ -455,10 +455,12 @@ pub(super) struct SourceLoopFunctionStatementsSyntax {
     pub(super) statements: Vec<SourceLoopFunctionStatementSyntax>,
 }
 
-/// One binder-owned shorthand property in a leading switch discriminant binding.
+/// One binder-owned shorthand, renamed, or static-computed switch binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceSwitchObjectBindingElementSyntax {
     pub(super) element: NodeRef,
+    pub(super) property: NodeRef,
+    pub(super) computed_key: Option<NodeRef>,
     pub(super) name: NodeRef,
     pub(super) symbol: SemanticSymbolId,
 }
@@ -5426,7 +5428,6 @@ impl SyntaxPlanner<'_> {
             || binding.flow_node.is_some()
             || binding.initializer.is_some()
             || binding.local_symbol.is_some()
-            || binding.property_name.is_some()
             || binding.symbol.is_some()
             || binding.facts != 0
         {
@@ -5473,6 +5474,104 @@ impl SyntaxPlanner<'_> {
         self.validate_container(name, callable)?;
         self.validate_block_scope_container(name, scope)?;
 
+        let property = binding
+            .property_name
+            .map_or(name, |property| self.reference(property));
+        let computed_key = if property == name {
+            None
+        } else {
+            if self.node(pattern)?.kind != SyntaxKind::ObjectBindingPattern {
+                return Err(self.unsupported(
+                    property,
+                    self.node(property)?.kind,
+                    SourceFunctionStatementsRole::LocalName,
+                ));
+            }
+            let record = self.node(property)?;
+            self.validate_parent(
+                property,
+                Some(element.node),
+                SourceFunctionStatementsRole::LocalName,
+            )?;
+            self.validate_range(property, element)?;
+            self.validate_order(property, name)?;
+            self.validate_container(property, callable)?;
+            self.validate_block_scope_container(property, scope)?;
+            if record.flags.0 != 0 {
+                return Err(self.unsupported(
+                    property,
+                    record.kind,
+                    SourceFunctionStatementsRole::LocalName,
+                ));
+            }
+            match &record.data {
+                NodeData::Identifier(property_name)
+                    if record.kind == SyntaxKind::Identifier
+                        && property_name.flow_node.is_none()
+                        && !property_name.text.is_empty() =>
+                {
+                    None
+                }
+                NodeData::StringLiteral(literal)
+                    if record.kind == SyntaxKind::StringLiteral && literal.token_flags.0 == 0 =>
+                {
+                    None
+                }
+                NodeData::NumericLiteral(literal)
+                    if record.kind == SyntaxKind::NumericLiteral && literal.token_flags.0 == 0 =>
+                {
+                    None
+                }
+                NodeData::ComputedPropertyName(computed)
+                    if record.kind == SyntaxKind::ComputedPropertyName && computed.facts == 0 =>
+                {
+                    let key = self.reference(computed.expression);
+                    self.validate_parent(
+                        key,
+                        Some(property.node),
+                        SourceFunctionStatementsRole::LocalName,
+                    )?;
+                    self.validate_range(key, property)?;
+                    self.validate_container(key, callable)?;
+                    self.validate_block_scope_container(key, scope)?;
+                    let key_record = self.node(key)?;
+                    let valid = match &key_record.data {
+                        NodeData::StringLiteral(literal)
+                            if key_record.kind == SyntaxKind::StringLiteral =>
+                        {
+                            literal.token_flags.0 == 0
+                        }
+                        NodeData::NumericLiteral(literal)
+                            if key_record.kind == SyntaxKind::NumericLiteral =>
+                        {
+                            literal.token_flags.0 == 0
+                        }
+                        NodeData::NoSubstitutionTemplateLiteral(literal)
+                            if key_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral =>
+                        {
+                            literal.token_flags.0 == 0 && literal.template_flags.0 == 0
+                        }
+                        _ => false,
+                    };
+                    if key_record.flags.0 != 0 || !valid {
+                        return Err(self.unsupported(
+                            key,
+                            key_record.kind,
+                            SourceFunctionStatementsRole::LocalName,
+                        ));
+                    }
+                    Some(key)
+                }
+                _ => {
+                    return Err(self.unsupported(
+                        property,
+                        record.kind,
+                        SourceFunctionStatementsRole::LocalName,
+                    ));
+                }
+            }
+        };
+
         let symbol = plan_top_level_variable(
             self.bound,
             self.store,
@@ -5498,6 +5597,8 @@ impl SyntaxPlanner<'_> {
         }
         Ok(SourceSwitchObjectBindingElementSyntax {
             element,
+            property,
+            computed_key,
             name,
             symbol,
         })
@@ -11912,11 +12013,72 @@ mod joined_tests {
     }
 
     #[test]
+    fn function_switch_authenticates_renamed_and_static_computed_binding_properties() {
+        for (index, (pattern, computed_count)) in [
+            ("{ kind: tag, values: items }", 0_usize),
+            ("{ 'kind': tag, values: items }", 0),
+            ("{ ['kind']: tag, [`values`]: items }", 2),
+            ("{ [0]: tag, ['values']: items }", 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = format!(
+                "function choose(input: any): number {{ \
+                 const {pattern} = input; \
+                 switch (tag) {{ \
+                 case 'first': return items[0]; \
+                 default: const [missing] = items; return items; \
+                 }} }}",
+            );
+            let fixture =
+                JoinedFixture::new(&source, FileId::new(1_350 + u32::try_from(index).unwrap()));
+            let callable = fixture.callable();
+            let syntax = plan_source_switch_function_statements_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                &callable,
+            )
+            .unwrap_or_else(|error| panic!("{pattern}: {error:?}"));
+            let leading = syntax.leading.as_ref().unwrap();
+            assert_eq!(leading.elements.len(), 2, "{pattern}");
+            assert_eq!(
+                leading
+                    .elements
+                    .iter()
+                    .filter(|element| element.computed_key.is_some())
+                    .count(),
+                computed_count,
+                "{pattern}",
+            );
+            for element in &leading.elements {
+                assert_eq!(fixture.bound.symbol(element.element), Some(element.symbol));
+                assert_eq!(
+                    fixture
+                        .parsed
+                        .arena
+                        .get(element.property.node)
+                        .unwrap()
+                        .parent,
+                    Some(element.element.node),
+                );
+                if let Some(key) = element.computed_key {
+                    assert_eq!(
+                        fixture.parsed.arena.get(key.node).unwrap().parent,
+                        Some(element.property.node),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn function_switch_rejects_unproven_correlated_binding_shapes() {
         for (index, source) in [
             concat!(
                 "function choose(input: any): number { ",
-                "const { kind: tag, values } = input; ",
+                "const { [input]: tag, values } = input; ",
                 "switch (tag) { default: return 1; } }",
             ),
             concat!(

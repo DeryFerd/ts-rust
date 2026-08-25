@@ -1238,6 +1238,7 @@ struct PlannedSwitchObjectBinding {
 struct PlannedSwitchObjectBindingElement {
     symbol: SemanticSymbolId,
     property_name: String,
+    computed_key: Option<PlannedExpression>,
 }
 
 #[derive(Clone, Debug)]
@@ -10111,13 +10112,50 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let initializer = self.plan_expression(syntax.initializer)?;
         let mut elements = Vec::with_capacity(syntax.elements.len());
         for element in syntax.elements {
-            let record = self.node(element.name)?;
-            let NodeData::Identifier(identifier) = &record.data else {
-                return Err(SourceCheckError::Variable(
-                    VariableInvariant::InvalidBindingPattern(element.name),
-                ));
+            let computed_key = element
+                .computed_key
+                .map(|key| self.plan_expression(key))
+                .transpose()?;
+            let record = self.node(element.property)?;
+            let property_name = match &record.data {
+                NodeData::Identifier(identifier) if record.kind == SyntaxKind::Identifier => {
+                    identifier.text.clone()
+                }
+                NodeData::StringLiteral(literal) if record.kind == SyntaxKind::StringLiteral => {
+                    literal.text.clone()
+                }
+                NodeData::NumericLiteral(literal) if record.kind == SyntaxKind::NumericLiteral => {
+                    literal.text.clone()
+                }
+                NodeData::ComputedPropertyName(_)
+                    if record.kind == SyntaxKind::ComputedPropertyName =>
+                {
+                    let Some(key) = computed_key.as_ref() else {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidBindingPattern(element.property),
+                        ));
+                    };
+                    match &key.kind {
+                        PlannedExpressionKind::String(value) => value.clone(),
+                        PlannedExpressionKind::Number { value, .. } => value.to_string(),
+                        _ => {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidBindingPattern(key.node),
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::InvalidBindingPattern(element.property),
+                    ));
+                }
             };
-            let property_name = identifier.text.clone();
+            if property_name.is_empty() {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidBindingPattern(element.property),
+                ));
+            }
             if !self.prior_variables.insert(element.symbol)
                 || !self.readable_variables.insert(element.symbol)
             {
@@ -10128,6 +10166,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             elements.push(PlannedSwitchObjectBindingElement {
                 symbol: element.symbol,
                 property_name,
+                computed_key,
             });
         }
         Ok(PlannedSwitchObjectBinding {
@@ -14734,19 +14773,32 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
 
         let key_record = self.node(element.key)?;
-        let NodeData::CallExpression(call) = &key_record.data else {
-            return Err(self.unsupported(
-                element.key,
-                key_record.kind,
-                SourceSyntaxRole::VariableName,
-            ));
+        let valid_key = match &key_record.data {
+            NodeData::CallExpression(call) if key_record.kind == SyntaxKind::CallExpression => {
+                call.arguments.nodes.is_empty()
+                    && !call.arguments.has_trailing_comma
+                    && call.type_arguments.is_none()
+                    && self.node(self.reference(call.expression))?.kind == SyntaxKind::Identifier
+            }
+            NodeData::Identifier(identifier) if key_record.kind == SyntaxKind::Identifier => {
+                identifier.flow_node.is_none() && !identifier.text.is_empty()
+            }
+            NodeData::StringLiteral(literal) if key_record.kind == SyntaxKind::StringLiteral => {
+                literal.token_flags.0 == 0
+            }
+            NodeData::NumericLiteral(literal) if key_record.kind == SyntaxKind::NumericLiteral => {
+                literal.token_flags.0 == 0
+            }
+            NodeData::NoSubstitutionTemplateLiteral(literal)
+                if key_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral =>
+            {
+                literal.token_flags.0 == 0 && literal.template_flags.0 == 0
+            }
+            _ => false,
         };
-        if key_record.kind != SyntaxKind::CallExpression
+        if key_record.flags.0 != 0
             || key_record.parent != Some(element.computed_name.node)
-            || !call.arguments.nodes.is_empty()
-            || call.arguments.has_trailing_comma
-            || call.type_arguments.is_some()
-            || self.node(self.reference(call.expression))?.kind != SyntaxKind::Identifier
+            || !valid_key
         {
             return Err(self.unsupported(
                 element.key,
@@ -14766,7 +14818,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         if initializer_record.kind != SyntaxKind::ObjectLiteralExpression
             || initializer_record.parent != Some(declaration.node)
             || initializer_record.flags.0 != 0
-            || !object.properties.nodes.is_empty()
             || object.properties.has_trailing_comma
             || object.symbol.is_some()
             || object.facts != 0
@@ -14780,19 +14831,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
 
         let key = self.plan_expression(element.key)?;
-        if !matches!(
-            &key.kind,
-            PlannedExpressionKind::Call(call)
-                if call.arguments.is_empty()
+        let valid_key = match &key.kind {
+            PlannedExpressionKind::Call(call) => {
+                call.arguments.is_empty()
                     && matches!(call.callee.kind, PlannedExpressionKind::Identifier(_))
-        ) {
-            return Err(SourceCheckError::Call(element.key));
+            }
+            PlannedExpressionKind::Identifier(read) => {
+                read.kind == PlannedIdentifierReadKind::Variable
+            }
+            PlannedExpressionKind::String(_) | PlannedExpressionKind::Number { .. } => true,
+            _ => false,
+        };
+        if !valid_key {
+            return Err(self.unsupported(
+                element.key,
+                self.node(element.key)?.kind,
+                SourceSyntaxRole::VariableName,
+            ));
         }
         let initializer = self.plan_expression(initializer)?;
-        if !matches!(
-            &initializer.kind,
-            PlannedExpressionKind::Object { properties, .. } if properties.is_empty()
-        ) {
+        if !matches!(&initializer.kind, PlannedExpressionKind::Object { .. }) {
             return Err(SourceCheckError::ObjectLiteral(
                 SourceObjectLiteralError::InvalidCache {
                     node: initializer.node,
@@ -20874,6 +20932,18 @@ fn preflight_inferred_function_return_dependencies(
                         &locals,
                         functions,
                     ) {
+                        return false;
+                    }
+                    if binding.elements.iter().any(|element| {
+                        element.computed_key.as_ref().is_some_and(|key| {
+                            !expression_is_closed(
+                                key,
+                                &function.callable.parameters,
+                                &locals,
+                                functions,
+                            )
+                        })
+                    }) {
                         return false;
                     }
                     locals.extend(binding.elements.iter().map(|element| element.symbol));
@@ -27571,6 +27641,29 @@ fn check_planned_switch_function_statements(
         };
         let mut properties = Vec::with_capacity(binding.elements.len());
         for element in &binding.elements {
+            if let Some(key) = &element.computed_key {
+                let checked = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &switch_flow_types,
+                    preflighted_type_import_value_uses,
+                    key,
+                    None,
+                    deferred,
+                )?;
+                if literal_computed_property_name(store, checked.result).as_deref()
+                    != Some(element.property_name.as_str())
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::InvalidBindingPattern(key.node),
+                    ));
+                }
+            }
             let mut types = Vec::with_capacity(constituents.len());
             for constituent in &constituents {
                 let property = store
@@ -27920,6 +28013,20 @@ fn check_planned_switch_function_statements(
         return_types.push(checked);
     }
     Ok(return_types)
+}
+
+fn literal_computed_property_name(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<String> {
+    let TypeData::Literal(literal) = store.type_payload(type_)?.data() else {
+        return None;
+    };
+    match &literal.value {
+        LiteralValue::String(value) => Some(value.clone()),
+        LiteralValue::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn switch_union_type(
@@ -40248,19 +40355,72 @@ pub(super) fn check_source_file(
                     None,
                     &mut deferred,
                 )?;
-                let checked = check_computed_binding_element(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    variable.element.element,
-                    initializer.result,
-                    key.result,
-                )
-                .map_err(|error| {
-                    SourcePlanner::element_plan_error(variable.element.element, error)
-                })?;
-                if let Some(diagnostic) = checked.diagnostic {
+                let (binding_type, diagnostic) = if let Some(name) =
+                    literal_computed_property_name(store, key.result)
+                {
+                    if let Some(property) =
+                        store.resolved_own_property(initializer.result, &name)?
+                    {
+                        let type_ = if property.optional && options.intrinsic.strict_null_checks {
+                            let undefined = store
+                                .intrinsic_bootstrap()
+                                .ok_or(SourceCheckError::LiteralCache(
+                                    SourceLiteralCacheError::BootstrapUninitialized,
+                                ))?
+                                .undefined_or_missing_type;
+                            store.expression_union_type_with_global_types(
+                                global_types,
+                                &[property.type_, undefined],
+                                UnionReduction::Literal,
+                            )?
+                        } else {
+                            property.type_
+                        };
+                        (type_, None)
+                    } else {
+                        let receiver = type_to_string_with_host_global_types_and_flags(
+                            store,
+                            host,
+                            global_types,
+                            initializer.result,
+                            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                        )?;
+                        let error = store
+                            .intrinsic_bootstrap()
+                            .ok_or(SourceCheckError::LiteralCache(
+                                SourceLiteralCacheError::BootstrapUninitialized,
+                            ))?
+                            .error_type;
+                        (
+                            error,
+                            Some(CanonicalCheckerDiagnostic {
+                                node: Some(variable.element.key),
+                                range_override: None,
+                                diagnostic: Diagnostic::with_arguments(
+                                    message_by_code(2339)
+                                        .ok_or(SourceCheckError::MissingDiagnostic(2339))?,
+                                    [name, receiver],
+                                ),
+                                related_information: Vec::new(),
+                            }),
+                        )
+                    }
+                } else {
+                    let checked = check_computed_binding_element(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        variable.element.element,
+                        initializer.result,
+                        key.result,
+                    )
+                    .map_err(|error| {
+                        SourcePlanner::element_plan_error(variable.element.element, error)
+                    })?;
+                    (checked.type_, checked.diagnostic)
+                };
+                if let Some(diagnostic) = diagnostic {
                     merge_retry_diagnostic(diagnostics, diagnostic);
                 }
                 stage_value_type(
@@ -40268,10 +40428,10 @@ pub(super) fn check_source_file(
                     &mut staged_value_types,
                     &mut value_order,
                     variable.element.symbol,
-                    checked.type_,
+                    binding_type,
                 )?;
                 if top_level_declared_types
-                    .insert(variable.element.symbol, checked.type_)
+                    .insert(variable.element.symbol, binding_type)
                     .is_some()
                 {
                     return Err(SourceCheckError::Variable(
@@ -40286,7 +40446,7 @@ pub(super) fn check_source_file(
                     ));
                 }
                 if current_flow_types
-                    .insert(variable.element.symbol, checked.type_)
+                    .insert(variable.element.symbol, binding_type)
                     .is_some()
                 {
                     return Err(SourceCheckError::Variable(
@@ -64633,6 +64793,78 @@ class Foo2 {
     }
 
     #[test]
+    fn renamed_and_computed_switch_bindings_preserve_correlation_and_never_diagnostics() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        for (index, pattern) in [
+            "{ kind: tag, a: values }",
+            "{ ['kind']: tag, [`a`]: values }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = format!(
+                "type X = {{ kind: 'a'; a: [1] }} | {{ kind: 'b'; a: [] }}; \
+                 function foo(input: X): 1 {{ \
+                 const {pattern} = input; \
+                 switch (tag) {{ \
+                 case 'a': return values[0]; \
+                 case 'b': return 1; \
+                 default: const [missing] = values; return values; \
+                 }} }}",
+            );
+            let source = parsed(&text);
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(8_430 + offset);
+            let file = FileId::new(8_431 + offset);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("{pattern}: expected one exhaustive-default array diagnostic")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2488, "{pattern}");
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), "[missing]");
+            let never = context.store().intrinsic_bootstrap().unwrap().never_type;
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, "missing"),
+                never,
+            );
+            let values = object_binding_value_type(&context, &source, file, "values");
+            assert!(matches!(
+                context.store().type_payload(values).unwrap().data(),
+                TypeData::Union(_)
+            ));
+            for (node, record) in source.arena.iter() {
+                if record.kind != SyntaxKind::ComputedPropertyName {
+                    continue;
+                }
+                let NodeData::ComputedPropertyName(computed) = &record.data else {
+                    unreachable!("the syntax kind identifies a computed property")
+                };
+                let key = NodeRef::new(source.arena.id(), file, computed.expression);
+                let key_type = resolved_node_type(&context, key);
+                assert!(
+                    context
+                        .store()
+                        .type_payload(key_type)
+                        .unwrap()
+                        .flags()
+                        .intersects(TypeFlags::STRING_LITERAL),
+                );
+                assert_eq!(source.arena.get(key.node).unwrap().parent, Some(node),);
+            }
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm, "{pattern}");
+        }
+    }
+
+    #[test]
     fn grouped_switch_checks_cases_and_returns_without_admitting_missing_defaults() {
         let source = parsed(concat!(
             "function checked(level: string): string { ",
@@ -68882,6 +69114,61 @@ class Foo2 {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn computed_object_bindings_distinguish_literal_keys_from_broad_identifier_and_call_keys() {
+        let source = parsed(concat!(
+            "let broad = 'bar'; ",
+            "let { [broad]: dynamic } = { bar: 'dynamic' }; ",
+            "let { ['bar']: exact } = { bar: 'exact' }; ",
+            "let { [`bar`]: template } = { bar: 'template' }; ",
+            "let { [1]: numeric } = { 1: 'numeric' }; ",
+            "const fixed = 'bar'; ",
+            "let { [fixed]: constant } = { bar: 'constant' }; ",
+            "let getKey = () => 'bar'; ",
+            "let { [getKey()]: called } = { bar: 'called' }; ",
+            "const observed = exact;",
+        ));
+        let file = FileId::new(8_320);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        for (diagnostic, key) in diagnostics.iter().zip(["broad", "getKey()"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2537);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), key);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type '{ bar: string; }' has no matching index signature for type 'string'.",
+            );
+        }
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for name in ["exact", "template", "numeric", "constant"] {
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, name),
+                bootstrap.string_type,
+                "{name}",
+            );
+        }
+        for name in ["dynamic", "called"] {
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, name),
+                bootstrap.error_type,
+                "{name}",
+            );
+        }
+        assert_eq!(
+            variable_value_type(&context, &source, file, "observed"),
+            bootstrap.string_type,
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
