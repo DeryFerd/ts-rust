@@ -855,8 +855,6 @@ mod tests {
             "bundler",
             "--moduleSuffixes",
             ".native,.ios",
-            "--reactNamespace",
-            "React",
             "--sourceMap",
             "--sourceRoot",
             "sources",
@@ -902,10 +900,6 @@ mod tests {
             options.compiler_options.module_suffixes,
             Some(vec![".native".to_owned(), ".ios".to_owned()])
         );
-        assert_eq!(
-            options.compiler_options.react_namespace.as_deref(),
-            Some("React")
-        );
         assert!(options.compiler_options.source_map);
         assert_eq!(
             options.compiler_options.source_root.as_deref(),
@@ -926,6 +920,16 @@ mod tests {
         assert_eq!(
             options.compiler_options.type_roots,
             Some(vec!["./types".to_owned(), "./vendor/types".to_owned()])
+        );
+
+        let Command::Compile(legacy_jsx) =
+            parse(&["--reactNamespace", "React", "main.ts"]).unwrap()
+        else {
+            panic!("expected legacy JSX compile command");
+        };
+        assert_eq!(
+            legacy_jsx.compiler_options.react_namespace.as_deref(),
+            Some("React")
         );
     }
 
