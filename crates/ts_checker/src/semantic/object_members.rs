@@ -2907,7 +2907,7 @@ fn authenticated_default_library_builtin_symbol_method(
                     locals.len() == 1 && locals.get_source("hint") == Some(planned.symbol)
                 })
         }
-        ("String", []) => locals.is_none_or(|locals| locals.is_empty()),
+        ("String", []) => locals.is_none_or(ts_binder::semantic::SymbolTable::is_empty),
         _ => false,
     };
     let valid_return = match (owner_name, &return_record.data) {
@@ -13454,9 +13454,9 @@ fn validate_union_spread_donor(
         object_constituents += 1;
         for property in properties {
             if let Some(index) = positions.get(&property.name).copied() {
-                let (existing, types, present) = &mut entries[index];
-                if !types.contains(&property.type_) {
-                    types.push(property.type_);
+                let (existing, property_types, present) = &mut entries[index];
+                if !property_types.contains(&property.type_) {
+                    property_types.push(property.type_);
                 }
                 existing.readonly &= property.readonly;
                 existing.optional |= property.optional;
@@ -13472,8 +13472,8 @@ fn validate_union_spread_donor(
         return SpreadDonorValidation::Unsupported;
     }
     let mut properties = Vec::with_capacity(entries.len());
-    for (mut property, types, present) in entries {
-        let Some(type_) = spread_union_property_type(store, global_types, &types) else {
+    for (mut property, property_types, present) in entries {
+        let Some(type_) = spread_union_property_type(store, global_types, &property_types) else {
             return SpreadDonorValidation::Malformed;
         };
         property.type_ = type_;
