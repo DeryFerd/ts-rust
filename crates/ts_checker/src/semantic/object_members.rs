@@ -6766,11 +6766,16 @@ fn validate_resolved_declared_property_object_detailed(
                 return TraversableBoundary(DeclaredPropertyObjectProof::Interface);
             }
             if record.object_flags() == ObjectFlags::INTERFACE | ObjectFlags::REFERENCE
-                && owner_record.name().as_utf8() == Some("Element")
-                && store
-                    .get_parent_of_symbol(owner)
-                    .and_then(|namespace| store.symbol(namespace))
-                    .is_some_and(|namespace| namespace.name().as_utf8() == Some("JSX"))
+                && matches!(
+                    (
+                        owner_record.name().as_utf8(),
+                        store
+                            .get_parent_of_symbol(owner)
+                            .and_then(|namespace| store.symbol(namespace))
+                            .and_then(|namespace| namespace.name().as_utf8()),
+                    ),
+                    (Some("Element"), Some("JSX")) | (Some("ReactNodeArray"), Some("React"))
+                )
                 && interface.base_types_resolved
                 && interface.resolved_base_types.is_none()
                 && store.direct_interface_heritage_provenance(type_).is_none()
