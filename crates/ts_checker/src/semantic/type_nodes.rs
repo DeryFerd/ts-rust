@@ -2571,8 +2571,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             mapped.constraint().file,
             operator.type_,
         );
-        Ok(mapped.modifiers_source() == Some(target)
-            && self.resolve_uncached_type_reference_symbol(target)? == parameter.symbol)
+        if mapped.modifiers_source() != Some(target)
+            || self.resolve_uncached_type_reference_symbol(target)? != parameter.symbol
+        {
+            return Ok(false);
+        }
+        if self.resolve_uncached_type_reference_symbol(template)? == alias {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported {
+                    node: template,
+                    symbol: alias,
+                },
+            ));
+        }
+        Ok(true)
     }
 
     fn plan_recursive_mapped_template(
@@ -28689,6 +28701,84 @@ mod tests {
             Ok(resolved),
         );
         assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn recursive_homomorphic_mapped_aliases_fail_before_publishing_incomplete_identity() {
+        let mut fixture = fixture(concat!(
+            "type PartialDeep<T> = { [K in keyof T]?: PartialDeep<T[K]> }; ",
+            "type Many<T> = T | readonly T[]; ",
+            "interface Collection<T> { ",
+            "sortBy(...iteratees: Many<PartialDeep<T>>[]): Collection<T>; ",
+            "}",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "PartialDeep");
+        let mapped = alias_parts(&fixture, "PartialDeep").2;
+        let NodeData::MappedTypeNode(mapped_data) =
+            &fixture.parsed.arena.get(mapped.node).unwrap().data
+        else {
+            panic!("PartialDeep must retain its mapped declaration")
+        };
+        let recursive = NodeRef::new(
+            mapped.arena,
+            mapped.file,
+            mapped_data
+                .type_
+                .expect("PartialDeep must retain its recursive mapped template"),
+        );
+        let before = store_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for _ in 0..2 {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::GenericReferenceUnsupported {
+                        node: recursive,
+                        symbol: alias,
+                    },
+                )),
+            );
+            assert_eq!(store_state(&fixture.store), before);
+            assert!(fixture.store.type_alias_links(alias).is_none());
+            assert!(fixture.store.type_resolution_is_empty());
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn recursive_homomorphic_mapped_aliases_still_reject_poisoned_error_identities() {
+        let mut fixture = fixture("type PartialDeep<T> = { [K in keyof T]?: PartialDeep<T[K]> };");
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "PartialDeep");
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        assert!(fixture.store.set_type_alias_links(
+            alias,
+            TypeAliasLinks {
+                declared_type: Some(error_type),
+                ..TypeAliasLinks::default()
+            },
+        ));
+        let poisoned = store_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(alias),
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), poisoned);
         assert!(diagnostics.is_empty());
     }
 
