@@ -3962,7 +3962,7 @@ mod tests {
                 ))
             })
             .unwrap();
-        let imported = alias(&bound_files, declaration);
+        let import_alias = alias(&bound_files, declaration);
         let module = source_module(&bound_files, target_file);
         let export = store
             .symbol(module)
@@ -3982,13 +3982,13 @@ mod tests {
 
         assert_eq!(
             CanonicalAliasResolver::new(&mut store, &mut host)
-                .get_immediate_aliased_symbol(imported)
+                .get_immediate_aliased_symbol(import_alias)
                 .unwrap(),
             Some(export),
         );
         assert_eq!(
             CanonicalAliasResolver::new(&mut store, &mut host)
-                .resolve_alias(imported)
+                .resolve_alias(import_alias)
                 .unwrap()
                 .target,
             AliasTargetState::Resolved(target_symbol),
@@ -3998,15 +3998,15 @@ mod tests {
             SymbolFlags::TYPE_ALIAS,
         );
 
-        let warm = store.alias_symbol_links(imported).cloned();
+        let warm = store.alias_symbol_links(import_alias).cloned();
         assert_eq!(
             CanonicalAliasResolver::new(&mut store, &mut host)
-                .resolve_alias(imported)
+                .resolve_alias(import_alias)
                 .unwrap()
                 .target,
             AliasTargetState::Resolved(target_symbol),
         );
-        assert_eq!(store.alias_symbol_links(imported).cloned(), warm);
+        assert_eq!(store.alias_symbol_links(import_alias).cloned(), warm);
     }
 
     #[test]
