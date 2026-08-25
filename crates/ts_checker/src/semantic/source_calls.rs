@@ -1,7 +1,8 @@
 //! Exact source integration for identifier, nested, or authenticated property calls.
 //!
 //! This admits `identifier(arguments)`, an authenticated property call,
-//! or an already proven call expression used as another call's callee.
+//! an already proven call expression, or one exact parenthesized async-arrow
+//! invocation as the callee.
 //! Arguments may contain scalar
 //! values, identifier and property reads, object and array literals, arrow
 //! functions, type assertions, nested direct calls, or recursively proven primitive
@@ -76,6 +77,8 @@ pub(super) enum SourceCallCalleeForm {
     /// An identifier or nested call planned through the ordinary expression path.
     Identifier,
     RequiredOwnProperty,
+    /// One authenticated zero-argument parenthesized async arrow.
+    ParenthesizedAsyncArrow,
 }
 
 /// Exact parser-owned type-argument list syntax retained for checker recovery.
@@ -622,6 +625,60 @@ pub(super) fn plan_direct_source_call_syntax(
                     name,
                 )
             }
+            (
+                SyntaxKind::ParenthesizedExpression,
+                NodeData::ParenthesizedExpression(parenthesized),
+            ) => {
+                let arrow = NodeRef::new(node.arena, node.file, parenthesized.expression);
+                let Some(arrow_record) = arena.get(arrow.node) else {
+                    return Err(SourceCheckError::Call(node));
+                };
+                let NodeData::ArrowFunction(function) = &arrow_record.data else {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Call(node),
+                    ));
+                };
+                let Some(modifiers) = function.modifiers.as_ref() else {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Call(node),
+                    ));
+                };
+                let [modifier] = modifiers.list.nodes.as_slice() else {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Call(node),
+                    ));
+                };
+                let Some(modifier_record) = arena.get(*modifier) else {
+                    return Err(SourceCheckError::Call(node));
+                };
+                if callee_record.flags.0 != 0
+                    || arrow_record.kind != SyntaxKind::ArrowFunction
+                    || arrow_record.flags.0 != 0
+                    || arrow_record.parent != Some(actual_callee.node)
+                    || !function.parameters.nodes.is_empty()
+                    || function.parameters.has_trailing_comma
+                    || function.type_parameters.is_some()
+                    || function.type_.is_some()
+                    || modifiers.flags.0 != 0
+                    || modifiers.list.has_trailing_comma
+                    || modifier_record.kind != SyntaxKind::AsyncKeyword
+                    || modifier_record.flags.0 != 0
+                    || modifier_record.parent != Some(arrow.node)
+                    || !matches!(modifier_record.data, NodeData::Token(_))
+                    || !call.arguments.nodes.is_empty()
+                    || call.arguments.has_trailing_comma
+                    || call.type_arguments.is_some()
+                {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Call(node),
+                    ));
+                }
+                (
+                    actual_callee,
+                    SourceCallCalleeForm::ParenthesizedAsyncArrow,
+                    actual_callee,
+                )
+            }
             _ => {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::Call(node),
@@ -981,6 +1038,10 @@ pub(super) fn finish_direct_source_call_plan(
         (PlannedExpressionKind::Property(property), SourceCallCalleeForm::RequiredOwnProperty) => {
             property.is_call_callee_for(syntax.node, syntax.callee_diagnostic_node)
         }
+        (
+            PlannedExpressionKind::Parenthesized(expression),
+            SourceCallCalleeForm::ParenthesizedAsyncArrow,
+        ) => matches!(&expression.kind, PlannedExpressionKind::Arrow(_)),
         _ => false,
     };
     if callee.node != syntax.callee
@@ -3953,6 +4014,50 @@ mod tests {
                 TextPos::new(u32::try_from(trailing_end).unwrap()),
             ))
         );
+    }
+
+    #[test]
+    fn immediate_async_arrow_calls_require_exact_parenthesized_zero_argument_syntax() {
+        let accepted = parsed("function run() { (async () => {})(); }");
+        let file = FileId::new(496);
+        let context = context(&accepted, file);
+        let accepted_calls = calls(&accepted, file);
+        let [call] = accepted_calls.as_slice() else {
+            panic!("expected one immediately invoked async arrow")
+        };
+        let syntax = plan_direct_source_call_syntax(&accepted.arena, context.store(), *call)
+            .expect("an authenticated async arrow IIFE must retain its callee");
+        assert_eq!(
+            syntax.callee_form(),
+            SourceCallCalleeForm::ParenthesizedAsyncArrow
+        );
+        assert!(syntax.arguments().is_empty());
+
+        for (index, source) in [
+            "function run() { (() => {})(); }",
+            "function run() { (async () => {})(1); }",
+            "function run() { (async (value: number) => {})(1); }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parsed(source);
+            let file = FileId::new(497 + u32::try_from(index).unwrap());
+            let context = context(&parsed, file);
+            let rejected_calls = calls(&parsed, file);
+            let [call] = rejected_calls.as_slice() else {
+                panic!("expected one rejected immediate call: {source}")
+            };
+            assert!(
+                matches!(
+                    plan_direct_source_call_syntax(&parsed.arena, context.store(), *call),
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Call(_)
+                    ))
+                ),
+                "{source}",
+            );
+        }
     }
 
     #[test]

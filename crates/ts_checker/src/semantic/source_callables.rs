@@ -295,7 +295,7 @@ pub(super) struct SourceCallablePlan {
     pub(super) return_type: SourceCallableReturnPlan,
     pub(super) type_predicate: Option<CallableTypePredicatePlan>,
     pub(super) body_mode: SourceCallableBodyMode,
-    /// True only for an authenticated zero-parameter async JSX function.
+    /// True only for an authenticated async arrow or zero-parameter JSX function.
     pub(super) is_async: bool,
     /// The actual body for `Present`, or the declaration diagnostic anchor for
     /// `AmbientDeclaration`.
@@ -5669,8 +5669,7 @@ fn validate_modifiers(
             },
         );
     };
-    if view.family != SourceCallableFamily::FunctionDeclaration
-        || modifiers.flags.0 != 0
+    if modifiers.flags.0 != 0
         || modifiers.list.has_trailing_comma
         || modifiers.list.range.start != declaration_range.start
     {
@@ -5705,6 +5704,16 @@ fn validate_modifiers(
     match modifier_kinds.as_slice() {
         [SyntaxKind::AsyncKeyword]
             if !is_declaration_file
+                && view.family == SourceCallableFamily::ArrowFunction
+                && view.parameters.nodes.is_empty()
+                && !view.parameters.has_trailing_comma
+                && view.type_parameters.is_none()
+                && view.return_type.is_none() =>
+        {
+            Ok(SourceCallableBodyMode::Present)
+        }
+        [SyntaxKind::AsyncKeyword]
+            if !is_declaration_file
                 && valid_async_jsx_source_function(store, host, declaration, view)? =>
         {
             Ok(SourceCallableBodyMode::Present)
@@ -5716,13 +5725,21 @@ fn validate_modifiers(
                 modifiers.list.nodes[0],
             )),
         )),
-        [SyntaxKind::DeclareKeyword] | [SyntaxKind::ExportKeyword, SyntaxKind::DeclareKeyword] => {
+        [SyntaxKind::DeclareKeyword] | [SyntaxKind::ExportKeyword, SyntaxKind::DeclareKeyword]
+            if view.family == SourceCallableFamily::FunctionDeclaration =>
+        {
             Ok(SourceCallableBodyMode::AmbientDeclaration)
         }
-        [SyntaxKind::ExportKeyword] if is_declaration_file && view.body.is_none() => {
+        [SyntaxKind::ExportKeyword]
+            if view.family == SourceCallableFamily::FunctionDeclaration
+                && is_declaration_file
+                && view.body.is_none() =>
+        {
             Ok(SourceCallableBodyMode::AmbientDeclaration)
         }
-        [SyntaxKind::ExportKeyword] => Ok(SourceCallableBodyMode::Present),
+        [SyntaxKind::ExportKeyword] if view.family == SourceCallableFamily::FunctionDeclaration => {
+            Ok(SourceCallableBodyMode::Present)
+        }
         _ => Err(SourceCallableError::Unsupported(
             SourceCallableUnsupported::Modifiers(declaration),
         )),
@@ -13791,6 +13808,117 @@ mod tests {
             );
             assert_eq!(publication_state(&fixture.store), before);
         }
+    }
+
+    #[test]
+    fn async_arrows_require_authenticated_zero_parameter_inferred_shapes() {
+        for (index, source) in [
+            "const value = async () => {};",
+            "const value = async () => 1;",
+            "const value = { f: async () => { await dependency.f(); } };",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                QueryFixture::new(source, FileId::new(1_280 + u32::try_from(index).unwrap()));
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let before = publication_state(&fixture.store);
+
+            let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            assert!(plan.is_async);
+            assert!(plan.parameters.is_empty());
+            assert!(plan.return_type.is_inferred());
+            assert_eq!(plan.family, SourceCallableFamily::ArrowFunction);
+            assert_eq!(publication_state(&fixture.store), before);
+        }
+
+        for (index, source) in [
+            "const value = async (input: number) => input;",
+            "const value = async (): any => 1;",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                QueryFixture::new(source, FileId::new(1_283 + u32::try_from(index).unwrap()));
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    plan_source_callable(&fixture.store, &host, declaration, owner, None),
+                    Err(SourceCallableError::Unsupported(
+                        SourceCallableUnsupported::Async(_)
+                    ))
+                ),
+                "{source}",
+            );
+        }
+
+        let fixture = QueryFixture::with_source_facts(
+            "const value = async () => {};",
+            FileId::new(1_285),
+            true,
+            CanonicalModuleState::Script,
+        );
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan_source_callable(&fixture.store, &host, declaration, owner, None),
+            Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::Async(_)
+            ))
+        ));
     }
 
     #[test]

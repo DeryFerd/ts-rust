@@ -1436,10 +1436,9 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
                 ),
                 _ => return,
             };
-        if let Some(function) = self.directly_invoked_function_target(expression) {
-            let kind = self
-                .unsupported_direct_function_call_kind(function)
-                .expect("direct function call target has an unsupported boundary kind");
+        if let Some(function) = self.directly_invoked_function_target(expression)
+            && let Some(kind) = self.unsupported_direct_function_call_kind(function)
+        {
             self.mark_unsupported(function, kind);
             return;
         }
@@ -2570,6 +2569,9 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
         &self,
         function: NodeId,
     ) -> Option<UnsupportedFlowKind> {
+        if self.supported_async_arrow_invocation(function) {
+            return None;
+        }
         self.is_directly_invoked_function(function).then(|| {
             if self.is_immediately_invoked_function(function) {
                 UnsupportedFlowKind::ImmediatelyInvokedFunction
@@ -2577,6 +2579,151 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
                 UnsupportedFlowKind::DirectFunctionCall
             }
         })
+    }
+
+    #[allow(clippy::too_many_lines)] // Authenticate the complete async IIFE and throwing body.
+    fn supported_async_arrow_invocation(&self, function: NodeId) -> bool {
+        let Some(function_record) = self.ast.get(function) else {
+            return false;
+        };
+        let NodeData::ArrowFunction(arrow) = &function_record.data else {
+            return false;
+        };
+        let Some(modifiers) = arrow.modifiers.as_ref() else {
+            return false;
+        };
+        let [modifier] = modifiers.list.nodes.as_slice() else {
+            return false;
+        };
+        let Some(modifier_record) = self.ast.get(*modifier) else {
+            return false;
+        };
+        let Some(parenthesized) = function_record.parent else {
+            return false;
+        };
+        let Some(parenthesized_record) = self.ast.get(parenthesized) else {
+            return false;
+        };
+        let NodeData::ParenthesizedExpression(parenthesized_expression) =
+            &parenthesized_record.data
+        else {
+            return false;
+        };
+        let Some(call) = parenthesized_record.parent else {
+            return false;
+        };
+        let Some(call_record) = self.ast.get(call) else {
+            return false;
+        };
+        let NodeData::CallExpression(invocation) = &call_record.data else {
+            return false;
+        };
+        let Some(body_record) = self.ast.get(arrow.body) else {
+            return false;
+        };
+        let NodeData::Block(body) = &body_record.data else {
+            return false;
+        };
+        let [await_statement, throw_statement] = body.statements.nodes.as_slice() else {
+            return false;
+        };
+        let Some(await_statement_record) = self.ast.get(*await_statement) else {
+            return false;
+        };
+        let NodeData::ExpressionStatement(await_statement_data) = &await_statement_record.data
+        else {
+            return false;
+        };
+        let Some(await_record) = self.ast.get(await_statement_data.expression) else {
+            return false;
+        };
+        let NodeData::AwaitExpression(awaited) = &await_record.data else {
+            return false;
+        };
+        let Some(operand) = self.ast.get(awaited.expression) else {
+            return false;
+        };
+        let NodeData::NumericLiteral(number) = &operand.data else {
+            return false;
+        };
+        let Some(throw_record) = self.ast.get(*throw_statement) else {
+            return false;
+        };
+        let NodeData::ThrowStatement(thrown) = &throw_record.data else {
+            return false;
+        };
+        let Some(construction) = self.ast.get(thrown.expression) else {
+            return false;
+        };
+        let NodeData::NewExpression(new_expression) = &construction.data else {
+            return false;
+        };
+        let Some(arguments) = new_expression.arguments.as_ref() else {
+            return false;
+        };
+        let Some(name) = self.ast.get(new_expression.expression) else {
+            return false;
+        };
+        let NodeData::Identifier(identifier) = &name.data else {
+            return false;
+        };
+
+        function_record.kind == SyntaxKind::ArrowFunction
+            && function_record.flags.0 == 0
+            && arrow.parameters.nodes.is_empty()
+            && !arrow.parameters.has_trailing_comma
+            && arrow.type_parameters.is_none()
+            && arrow.type_.is_none()
+            && modifiers.flags.0 == 0
+            && !modifiers.list.has_trailing_comma
+            && modifier_record.kind == SyntaxKind::AsyncKeyword
+            && modifier_record.flags.0 == 0
+            && modifier_record.parent == Some(function)
+            && matches!(modifier_record.data, NodeData::Token(_))
+            && parenthesized_record.kind == SyntaxKind::ParenthesizedExpression
+            && parenthesized_record.flags.0 == 0
+            && parenthesized_expression.expression == function
+            && call_record.kind == SyntaxKind::CallExpression
+            && call_record.flags.0 == 0
+            && invocation.expression == parenthesized
+            && invocation.arguments.nodes.is_empty()
+            && !invocation.arguments.has_trailing_comma
+            && invocation.type_arguments.is_none()
+            && invocation.question_dot_token.is_none()
+            && invocation.symbol.is_none()
+            && invocation.facts == 0
+            && body_record.kind == SyntaxKind::Block
+            && body_record.flags.0 == 0
+            && body_record.parent == Some(function)
+            && !body.statements.has_trailing_comma
+            && await_statement_record.kind == SyntaxKind::ExpressionStatement
+            && await_statement_record.flags.0 == 0
+            && await_statement_record.parent == Some(arrow.body)
+            && await_statement_data.flow_node.is_none()
+            && await_record.kind == SyntaxKind::AwaitExpression
+            && await_record.flags.0 == 0
+            && await_record.parent == Some(*await_statement)
+            && operand.kind == SyntaxKind::NumericLiteral
+            && operand.flags.0 == 0
+            && operand.parent == Some(await_statement_data.expression)
+            && number.token_flags.0 == 0
+            && throw_record.kind == SyntaxKind::ThrowStatement
+            && throw_record.flags.0 == 0
+            && throw_record.parent == Some(arrow.body)
+            && thrown.flow_node.is_none()
+            && thrown.facts == 0
+            && construction.kind == SyntaxKind::NewExpression
+            && construction.flags.0 == 0
+            && construction.parent == Some(*throw_statement)
+            && arguments.nodes.is_empty()
+            && !arguments.has_trailing_comma
+            && new_expression.type_arguments.is_none()
+            && new_expression.facts == 0
+            && name.kind == SyntaxKind::Identifier
+            && name.flags.0 == 0
+            && name.parent == Some(thrown.expression)
+            && identifier.text == "Error"
+            && identifier.flow_node.is_none()
     }
 
     fn is_immediately_invoked_function(&self, function: NodeId) -> bool {
@@ -2697,6 +2844,38 @@ mod tests {
                 Some(identifier.text.as_str())
             })
             .collect()
+    }
+
+    #[test]
+    fn exact_async_arrow_iife_keeps_outer_and_arrow_flow_complete() {
+        let parsed = parse_source_file(concat!(
+            "function run() {\n",
+            "  (async () => {\n",
+            "    await 10\n",
+            "    throw new Error();\n",
+            "  })();\n",
+            "  var value = 1;\n",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(150);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .expect("program-bound source has a flow graph");
+
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+        for kind in [SyntaxKind::FunctionDeclaration, SyntaxKind::ArrowFunction] {
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            assert_eq!(graph.container_is_complete(declaration), Some(true));
+            assert!(graph.container_start(declaration).is_some());
+        }
     }
 
     #[test]

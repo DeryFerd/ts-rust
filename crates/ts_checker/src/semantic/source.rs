@@ -114,6 +114,7 @@ use super::{
         PrimitiveBinaryRequest, PrimitiveBinaryUnsupported, check_primitive_binary,
         compound_assignment_binary_operator,
     },
+    reference_types::validate_direct_generic_reference,
     signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
     source_arrows::{
         ResolvedSourceContextualArrowPlan, SourceArrowBodyPlan, SourceArrowError,
@@ -121,8 +122,9 @@ use super::{
         SourceContextualArrowInvariant, SourceContextualArrowPlan,
         SourceContextualArrowUnsupported, SourceContextualParameterOrigin,
         SourceContextualSignatureShape, plan_array_arrow_identifier_statement,
-        plan_contextual_source_arrow, plan_jsdoc_contextual_source_arrow, plan_source_arrow,
-        plan_source_arrow_value, resolve_contextual_arrow_parameter_origins,
+        plan_async_arrow_await_statement, plan_contextual_source_arrow,
+        plan_jsdoc_contextual_source_arrow, plan_source_arrow, plan_source_arrow_value,
+        resolve_contextual_arrow_parameter_origins,
     },
     source_callables::{
         ContextualSourceCallableParameter, PreparedContextualDirectCallSourceCallable,
@@ -931,6 +933,7 @@ enum PlannedFunctionModifierMode {
 struct PlannedArrow {
     source: SourceArrowPlan,
     parameter_initializers: Vec<PlannedParameterInitializer>,
+    expression_statement: Option<PlannedArrowExpressionStatement>,
     body: PlannedArrowBody,
 }
 
@@ -938,8 +941,15 @@ struct PlannedArrow {
 pub(super) struct PlannedArrowExpression {
     callable: SourceCallablePlan,
     parameter_initializers: Vec<PlannedParameterInitializer>,
-    expression_statement: Option<PlannedExpression>,
+    expression_statement: Option<PlannedArrowExpressionStatement>,
     body: PlannedArrowBody,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedArrowExpressionStatement {
+    expression: PlannedExpression,
+    await_expression: Option<NodeRef>,
+    throw_expression: Option<NodeRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -4694,6 +4704,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             NodeData::PropertyAccessExpression(_) => {
                 callee_node.kind == SyntaxKind::PropertyAccessExpression
             }
+            NodeData::ParenthesizedExpression(_) => {
+                let Some((store, _)) = self.semantic else {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Call(expression),
+                    ));
+                };
+                plan_direct_source_call_syntax(self.arena, store, expression)?.callee_form()
+                    == SourceCallCalleeForm::ParenthesizedAsyncArrow
+            }
             _ => false,
         };
         if !supported_callee
@@ -7669,9 +7688,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 symbol: local.symbol,
             })
             .collect::<Vec<_>>();
+        // Parenthesized async IIFEs do not create binder CALL flow nodes.
         let calls = statements.iter().filter_map(|statement| match statement {
             PlannedLinearFunctionStatement::Expression { expression, .. }
-                if matches!(expression.kind, PlannedExpressionKind::Call(_)) =>
+                if matches!(
+                    &expression.kind,
+                    PlannedExpressionKind::Call(call)
+                        if !matches!(
+                            &call.callee.unparenthesized().kind,
+                            PlannedExpressionKind::Arrow(_)
+                        )
+                ) =>
             {
                 Some(expression.node)
             }
@@ -8656,6 +8683,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     ) -> Result<PlannedArrow, SourceCheckError> {
         let parameter_initializers =
             self.plan_parameter_initializers_and_enter_scope(&source.callable)?;
+        let awaited_statement = match self.semantic {
+            Some((store, host)) => plan_async_arrow_await_statement(store, host, &source.callable)
+                .map_err(Self::arrow_plan_error)?,
+            None => None,
+        };
+        let expression_statement = awaited_statement
+            .map(|statement| {
+                self.plan_expression(statement.expression)
+                    .map(|expression| PlannedArrowExpressionStatement {
+                        expression,
+                        await_expression: Some(statement.await_expression),
+                        throw_expression: statement.throw_expression,
+                    })
+            })
+            .transpose();
         let body = match source.body {
             SourceArrowBodyPlan::EmptyBlock { block } => {
                 match self.function_empty_body_return_supported(source.callable.return_type) {
@@ -8679,6 +8721,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(PlannedArrow {
             source,
             parameter_initializers,
+            expression_statement: expression_statement?,
             body: body?,
         })
     }
@@ -11666,6 +11709,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                     break;
                 }
+                NodeData::CallExpression(call)
+                    if record.kind == SyntaxKind::CallExpression
+                        && call.expression == argument.node
+                        && call.arguments.nodes.is_empty() =>
+                {
+                    let syntax = plan_direct_source_call_syntax(self.arena, store, parent)?;
+                    if syntax.callee() != argument
+                        || syntax.callee_form() != SourceCallCalleeForm::ParenthesizedAsyncArrow
+                    {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ));
+                    }
+                    break;
+                }
                 NodeData::PropertyAssignment(property)
                     if record.kind == SyntaxKind::PropertyAssignment
                         && property.initializer == argument.node =>
@@ -11836,8 +11894,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let (callable, body) =
             plan_source_arrow_value(store, host, declaration, self.array_targets)
                 .map_err(Self::arrow_plan_error)?;
-        let expression_statement = plan_array_arrow_identifier_statement(store, host, &callable)
-            .map_err(Self::arrow_plan_error)?;
+        let expression_statement = match plan_async_arrow_await_statement(store, host, &callable)
+            .map_err(Self::arrow_plan_error)?
+        {
+            Some(statement) => Some((
+                statement.expression,
+                Some(statement.await_expression),
+                statement.throw_expression,
+            )),
+            None => plan_array_arrow_identifier_statement(store, host, &callable)
+                .map_err(Self::arrow_plan_error)?
+                .map(|(_, _, expression)| (expression, None, None)),
+        };
         let is_javascript = self
             .bound
             .source_facts()
@@ -11887,7 +11955,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             let body_prior_variables = self.prior_variables.clone();
             let body_readable_variables = self.readable_variables.clone();
             let expression_statement = expression_statement
-                .map(|(_, _, expression)| self.plan_expression(expression))
+                .map(|(expression, await_expression, throw_expression)| {
+                    self.plan_expression(expression).map(|expression| {
+                        PlannedArrowExpressionStatement {
+                            expression,
+                            await_expression,
+                            throw_expression,
+                        }
+                    })
+                })
                 .transpose();
             let body = match body {
                 SourceArrowBodyPlan::EmptyBlock { block } => {
@@ -12878,7 +12954,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 self.primitive_binary_position_roots
                     .extend(argument_nodes.iter().copied());
                 let callee = match syntax.callee_form() {
-                    SourceCallCalleeForm::Identifier => self.plan_expression(callee_node)?,
+                    SourceCallCalleeForm::Identifier
+                    | SourceCallCalleeForm::ParenthesizedAsyncArrow => {
+                        self.plan_expression(callee_node)?
+                    }
                     SourceCallCalleeForm::RequiredOwnProperty => {
                         let Some((store, _)) = self.semantic else {
                             return Err(SourceCheckError::Unsupported(
@@ -18520,7 +18599,7 @@ fn check_planned_arrow_argument(
         &arrow.parameter_initializers,
     )?;
     if let Some(statement) = &arrow.expression_statement {
-        check_expression_type(
+        let checked = check_expression_type(
             store,
             host,
             global_types,
@@ -18530,33 +18609,72 @@ fn check_planned_arrow_argument(
             diagnostics,
             &flow_types,
             preflighted_type_import_value_uses,
-            statement,
+            &statement.expression,
             None,
             deferred,
         )?;
+        if let Some(await_expression) = statement.await_expression {
+            let awaited = source_awaited_expression_type(store, await_expression, checked.result)?;
+            preflight_source_expression_cache(store, await_expression, awaited)?;
+            publish_expression_type(store, await_expression, awaited)?;
+        }
     }
 
     if arrow.callable.return_type.is_inferred() {
-        let expression = match &arrow.body {
-            PlannedArrowBody::Empty => None,
-            PlannedArrowBody::Return { expression, .. } => Some(expression),
-            PlannedArrowBody::ReturnJsx { .. } => return Err(SourceCheckError::Arrow(expression)),
-        };
-        publish_checked_source_callable_return(
-            store,
-            host,
-            global_types,
-            source,
-            options,
-            session,
-            diagnostics,
-            &flow_types,
-            preflighted_type_import_value_uses,
-            deferred,
-            &arrow.callable,
-            materialized.signature,
-            expression,
-        )?;
+        if arrow
+            .expression_statement
+            .as_ref()
+            .and_then(|statement| statement.throw_expression)
+            .is_some()
+        {
+            if !arrow.callable.is_async || !matches!(arrow.body, PlannedArrowBody::Empty) {
+                return Err(SourceCheckError::Arrow(expression));
+            }
+            let never = store
+                .intrinsic_bootstrap()
+                .ok_or(DerivedTypeError::BootstrapUninitialized)?
+                .never_type;
+            let inferred = source_callable_inferred_return_type(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                &arrow.callable,
+                never,
+            )?;
+            publish_inferred_source_callable_return(
+                store,
+                &arrow.callable,
+                materialized.signature,
+                inferred,
+            )
+            .map_err(SourcePlanner::callable_plan_error)?;
+        } else {
+            let expression = match &arrow.body {
+                PlannedArrowBody::Empty => None,
+                PlannedArrowBody::Return { expression, .. } => Some(expression),
+                PlannedArrowBody::ReturnJsx { .. } => {
+                    return Err(SourceCheckError::Arrow(expression));
+                }
+            };
+            publish_checked_source_callable_return(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                &flow_types,
+                preflighted_type_import_value_uses,
+                deferred,
+                &arrow.callable,
+                materialized.signature,
+                expression,
+            )?;
+        }
     } else {
         let return_type = arrow
             .callable
@@ -23902,8 +24020,74 @@ fn publish_checked_source_callable_return(
                 .void_type
         }
     };
+    let inferred = source_callable_inferred_return_type(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        callable,
+        inferred,
+    )?;
     publish_inferred_source_callable_return(store, callable, signature, inferred)
         .map_err(SourcePlanner::callable_plan_error)
+}
+
+#[allow(clippy::too_many_arguments)] // Promise inference uses the active canonical query state.
+fn source_callable_inferred_return_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    callable: &SourceCallablePlan,
+    inferred: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    if !callable.is_async {
+        return Ok(inferred);
+    }
+
+    let inferred = source_awaited_expression_type(store, callable.declaration, inferred)?;
+    session.reset_query();
+    let mut promise_diagnostics = CanonicalCheckerDiagnostics::default();
+    let promise = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        &mut promise_diagnostics,
+    )?
+    .get_global_promise_type(inferred);
+    merge_retry_diagnostics(diagnostics, promise_diagnostics);
+    promise.map_err(Into::into)
+}
+
+fn source_awaited_expression_type(
+    store: &CanonicalTypeMapperStore,
+    expression: NodeRef,
+    type_: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let Some(promise) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("Promise"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(type_);
+    };
+    if store.type_payload(type_).and_then(|record| record.symbol()) != Some(promise) {
+        return Ok(type_);
+    }
+
+    let reference = validate_direct_generic_reference(store, type_)
+        .map_err(|_| SourceCheckError::Arrow(expression))?;
+    let [awaited] = reference.type_arguments.as_slice() else {
+        return Err(SourceCheckError::Arrow(expression));
+    };
+    Ok(*awaited)
 }
 
 fn captured_callable_flow_types(
@@ -27851,6 +28035,31 @@ pub(super) fn check_source_file(
                         &callable,
                         &arrow.parameter_initializers,
                     )?;
+                    if let Some(statement) = &arrow.expression_statement {
+                        let checked = check_expression_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &body_flow_types,
+                            &preflighted_type_import_value_uses,
+                            &statement.expression,
+                            None,
+                            &mut deferred,
+                        )?;
+                        if let Some(await_expression) = statement.await_expression {
+                            let awaited = source_awaited_expression_type(
+                                store,
+                                await_expression,
+                                checked.result,
+                            )?;
+                            preflight_source_expression_cache(store, await_expression, awaited)?;
+                            publish_expression_type(store, await_expression, awaited)?;
+                        }
+                    }
                     match &arrow.body {
                         PlannedArrowBody::ReturnJsx {
                             expression,
@@ -27876,6 +28085,16 @@ pub(super) fn check_source_file(
                             )?;
                             let inferred =
                                 store.get_widened_type_with_global_types(result, global_types)?;
+                            let inferred = source_callable_inferred_return_type(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                session,
+                                diagnostics,
+                                &callable,
+                                inferred,
+                            )?;
                             publish_inferred_source_callable_return(
                                 store,
                                 &callable,
@@ -47467,6 +47686,301 @@ class Foo2 {
         let warm = observable_state(&context, file);
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn async_arrows_preserve_canonical_promise_identity_and_warm_replay() {
+        let library = parsed("interface Promise<T> {}");
+        let source = parsed(concat!(
+            "const empty = async () => {}; ",
+            "const value = async () => 1; ",
+            "const forwarded = async () => value(); ",
+            "const object = { f: async () => { await value(); } };",
+        ));
+        let library_file = FileId::new(9_350);
+        let file = FileId::new(9_351);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let empty = variable_value_type(&context, &source, file, "empty");
+        let value = variable_value_type(&context, &source, file, "value");
+        let forwarded = variable_value_type(&context, &source, file, "forwarded");
+        let object = variable_initializer(&source, file, "object");
+        let nested = object_property_type(&context, object, "f");
+        assert_eq!(
+            context.type_to_string(empty).unwrap(),
+            "() => Promise<void>"
+        );
+        assert_eq!(
+            context.type_to_string(value).unwrap(),
+            "() => Promise<number>"
+        );
+        assert_eq!(
+            context.type_to_string(forwarded).unwrap(),
+            "() => Promise<number>",
+        );
+        assert_eq!(
+            context.type_to_string(nested).unwrap(),
+            "() => Promise<void>"
+        );
+
+        let return_type = |callable| {
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            context
+                .store()
+                .signature(signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type)
+                .unwrap()
+        };
+        assert_eq!(return_type(empty), return_type(nested));
+        assert_eq!(return_type(value), return_type(forwarded));
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), return_type(empty))
+                .unwrap()
+                .type_arguments,
+            [context.store().intrinsic_bootstrap().unwrap().void_type],
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn circular_async_object_imports_materialize_exact_promise_void_callables() {
+        let library = parsed("interface Promise<T> {}");
+        let first = parsed(concat!(
+            "import { b } from './b'; ",
+            "export const a = { f: async () => { await b.f(); } };",
+        ));
+        let second = parsed(concat!(
+            "import { a } from './a'; ",
+            "export const b = { f: async () => { await a.f(); } };",
+        ));
+        let library_file = FileId::new(9_352);
+        let first_file = FileId::new(9_353);
+        let second_file = FileId::new(9_354);
+        let files = [
+            (library_file, &library),
+            (first_file, &first),
+            (second_file, &second),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for &(file, parsed) in &files {
+            let facts = if file == library_file {
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    true,
+                    CanonicalModuleState::Script,
+                )
+            } else {
+                source_facts_with_module_state(file, CanonicalModuleState::External)
+            };
+            binder
+                .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+                .unwrap();
+        }
+        for &(file, parsed) in &files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let routes = [
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(
+                    first.arena.id(),
+                    first_file,
+                    source_module_specifiers(&first)[0],
+                ),
+                CanonicalResolvedModuleInput::new(
+                    second_file,
+                    CanonicalModuleResolutionMode::Esm,
+                    CanonicalModuleResolutionMode::Esm,
+                ),
+            ),
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(
+                    second.arena.id(),
+                    second_file,
+                    source_module_specifiers(&second)[0],
+                ),
+                CanonicalResolvedModuleInput::new(
+                    first_file,
+                    CanonicalModuleResolutionMode::Esm,
+                    CanonicalModuleResolutionMode::Esm,
+                ),
+            ),
+        ];
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new(routes),
+        )
+        .unwrap();
+
+        context.check_source_file(first_file).unwrap();
+        assert!(!is_type_checked(&context, second_file));
+        context.check_source_file(second_file).unwrap();
+
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        let mut returns = Vec::new();
+        for (file, source, name) in [(first_file, &first, "a"), (second_file, &second, "b")] {
+            let object = variable_initializer(source, file, name);
+            let arrow = object_property_initializer(source, file, object, "f");
+            let callable = object_property_type(&context, object, "f");
+            assert_eq!(
+                context.type_to_string(callable).unwrap(),
+                "() => Promise<void>"
+            );
+            assert_eq!(resolved_node_type(&context, arrow), callable);
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            returns.push(
+                context
+                    .store()
+                    .signature(signature)
+                    .and_then(super::super::signatures::Signature::resolved_return_type)
+                    .unwrap(),
+            );
+            let awaited = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::AwaitExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            assert_eq!(resolved_node_type(&context, awaited), void);
+        }
+        assert_eq!(returns[0], returns[1]);
+        assert!(context.diagnostics().is_empty());
+
+        let first_warm = observable_state(&context, first_file);
+        let second_warm = observable_state(&context, second_file);
+        context.recheck_source_file(first_file).unwrap();
+        context.recheck_source_file(second_file).unwrap();
+        assert_eq!(observable_state(&context, first_file), first_warm);
+        assert_eq!(observable_state(&context, second_file), second_warm);
+    }
+
+    #[test]
+    fn async_iife_preserves_function_flow_promise_type_and_warm_replay() {
+        let library = parsed(concat!(
+            "interface Promise<T> {} ",
+            "interface Error {} ",
+            "declare var Error: { new(): Error; };",
+        ));
+        let source = parsed(concat!(
+            "function f1() {\n",
+            "  (async () => {\n",
+            "    await 10\n",
+            "    throw new Error();\n",
+            "  })();\n",
+            "  var x = 1;\n",
+            "}",
+        ));
+        let library_file = FileId::new(9_355);
+        let file = FileId::new(9_356);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let arrow = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let callable = resolved_node_type(&context, arrow);
+        assert_eq!(
+            context.type_to_string(callable).unwrap(),
+            "() => Promise<never>"
+        );
+        let call = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, call))
+                .unwrap(),
+            "Promise<never>"
+        );
+        let awaited = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::AwaitExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, awaited))
+                .unwrap(),
+            "10",
+        );
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), resolved_node_type(&context, call))
+                .unwrap()
+                .type_arguments,
+            [context.store().intrinsic_bootstrap().unwrap().never_type],
+        );
+        let outer = context
+            .store()
+            .source_callable_type_for_owner(function_symbol(&context, &source, file, "f1"))
+            .unwrap();
+        assert_eq!(context.type_to_string(outer).unwrap(), "() => void");
+        assert_eq!(
+            variable_value_type(&context, &source, file, "x"),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
     }
 

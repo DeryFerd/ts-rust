@@ -13,8 +13,9 @@
 //! supports initialized annotated `const` declarations, authenticated
 //! `CommonJS` variables and named assignments, explicit and implicit ambient
 //! `export const` declarations in retained declaration files, annotated
-//! `FunctionDeclaration`s, and already-published inferred object
-//! constants with authenticated fresh-to-widened provenance. Declaration-file
+//! `FunctionDeclaration`s, already-published inferred object constants, and
+//! narrowly authenticated cold async-arrow object constants with canonical
+//! fresh-to-widened provenance. Declaration-file
 //! bodies are never source checked by this leaf; only the final imported
 //! annotation is queried.
 //!
@@ -58,6 +59,10 @@ use super::{
     jsdoc::{
         JsDocImportType, PlannedJsDocType, plan_javascript_source_jsdoc,
         preflight_planned_jsdoc_type, resolve_planned_jsdoc_type,
+    },
+    source_arrows::{
+        SourceArrowBodyPlan, SourceArrowError, plan_async_arrow_await_statement,
+        plan_source_arrow_value,
     },
     source_callables::{
         SourceCallableError, SourceCallableFamily, SourceCallablePlan, SourceCallableState,
@@ -2614,7 +2619,43 @@ pub(super) fn prepare_source_import_value(
         binding.alias_symbol,
         target,
         None,
-    )?;
+    );
+    let planned_target = match planned_target {
+        Ok(planned) => planned,
+        Err(
+            error @ SourceImportError::Unsupported(
+                SourceImportUnsupported::MissingTargetAnnotation(declaration),
+            ),
+        ) if cached_target_type.is_none()
+            && store.symbol(target).is_some_and(|symbol| {
+                symbol.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    && symbol.value_declaration() == Some(declaration)
+            }) =>
+        {
+            if !materialize_cold_async_arrow_object_target(
+                store,
+                declared_host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                target,
+                declaration,
+            )? {
+                return Err(error);
+            }
+            plan_direct_import_value_target(
+                store,
+                declared_host,
+                global_types,
+                options,
+                binding.alias_symbol,
+                target,
+                None,
+            )?
+        }
+        Err(error) => return Err(error),
+    };
     let target_declaration = match &planned_target {
         PlannedSourceImportValueTarget::AnnotatedConst { declaration, .. }
         | PlannedSourceImportValueTarget::DeclarationNumericConst { declaration, .. }
@@ -4017,6 +4058,221 @@ fn materialize_cold_export_equals_object_target(
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(target)));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep cold async-object publication atomic.
+fn materialize_cold_async_arrow_object_target(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    target: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<bool, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(target));
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let declaration_record = checked_node(arena, bound, store, declaration)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Ok(false);
+    };
+    let Some(expression) = variable
+        .initializer
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return Ok(false);
+    };
+    if variable.type_.is_some() || store.type_node_links(expression).is_some() {
+        return Ok(false);
+    }
+
+    let object = match super::object_members::plan_object_literal(store, host, expression) {
+        Ok(object) => object,
+        Err(super::object_members::PropertyObjectError::UnsupportedMember { .. }) => {
+            return Ok(false);
+        }
+        Err(_) => return Err(invalid()),
+    };
+    let [property] = object.properties.as_slice() else {
+        return Ok(false);
+    };
+    if property.readonly
+        || !object.methods.is_empty()
+        || !object.accessors.is_empty()
+        || !object.spreads.is_empty()
+        || !object.indexes.is_empty()
+        || !object.call_signatures.is_empty()
+        || object.alias_symbol.is_some()
+        || object.heritage.is_some()
+    {
+        return Ok(false);
+    }
+    let property_record = checked_node(arena, bound, store, property.declaration)?;
+    let NodeData::PropertyAssignment(assignment) = &property_record.data else {
+        return Ok(false);
+    };
+    if property_record.kind != SyntaxKind::PropertyAssignment
+        || property_record.flags.0 != 0
+        || property_record.parent != Some(expression.node)
+        || assignment.initializer != property.type_node.node
+        || assignment.postfix_token.is_some()
+        || assignment.symbol.is_some()
+        || assignment.type_.is_some()
+        || assignment.facts != 0
+        || assignment.modifiers.is_some()
+        || store
+            .type_node_links(property.type_node)
+            .is_some_and(|links| links != &TypeNodeLinks::default())
+    {
+        return Ok(false);
+    }
+
+    let (callable, body) = match plan_source_arrow_value(
+        store,
+        host,
+        property.type_node,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+    ) {
+        Ok(planned) => planned,
+        Err(SourceArrowError::Unsupported(_)) => return Ok(false),
+        Err(SourceArrowError::Invariant(_)) => return Err(invalid()),
+        Err(SourceArrowError::DeclaredType(error)) => return Err(error.into()),
+        Err(SourceArrowError::LiteralCache(error)) => {
+            return Err(SourceCallableError::LiteralCache(error).into());
+        }
+    };
+    let SourceArrowBodyPlan::EmptyBlock { block } = body else {
+        return Ok(false);
+    };
+    let awaited = match plan_async_arrow_await_statement(store, host, &callable) {
+        Ok(Some(awaited)) => awaited,
+        Ok(None) | Err(SourceArrowError::Unsupported(_)) => return Ok(false),
+        Err(SourceArrowError::Invariant(_)) => return Err(invalid()),
+        Err(SourceArrowError::DeclaredType(error)) => return Err(error.into()),
+        Err(SourceArrowError::LiteralCache(error)) => {
+            return Err(SourceCallableError::LiteralCache(error).into());
+        }
+    };
+    if !callable.is_async
+        || !callable.parameters.is_empty()
+        || !callable.type_parameters.is_empty()
+        || !callable.return_type.is_inferred()
+        || callable.min_argument_count != 0
+        || awaited.block != block
+        || awaited.throw_expression.is_some()
+    {
+        return Ok(false);
+    }
+
+    let call_record = checked_node(arena, bound, store, awaited.expression)?;
+    let NodeData::CallExpression(call) = &call_record.data else {
+        return Ok(false);
+    };
+    let access = NodeRef::new(declaration.arena, declaration.file, call.expression);
+    let access_record = checked_node(arena, bound, store, access)?;
+    let NodeData::PropertyAccessExpression(access_data) = &access_record.data else {
+        return Ok(false);
+    };
+    let receiver = NodeRef::new(declaration.arena, declaration.file, access_data.expression);
+    let receiver_record = checked_node(arena, bound, store, receiver)?;
+    let NodeData::Identifier(receiver_name) = &receiver_record.data else {
+        return Ok(false);
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, access_data.name);
+    let name_record = checked_node(arena, bound, store, name)?;
+    let NodeData::Identifier(name_text) = &name_record.data else {
+        return Ok(false);
+    };
+    let receiver_symbol = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&receiver_name.text));
+    if call_record.kind != SyntaxKind::CallExpression
+        || call_record.flags.0 != 0
+        || !call.arguments.nodes.is_empty()
+        || call.arguments.has_trailing_comma
+        || call.type_arguments.is_some()
+        || call.question_dot_token.is_some()
+        || call.symbol.is_some()
+        || call.facts != 0
+        || access_record.kind != SyntaxKind::PropertyAccessExpression
+        || access_record.flags.0 != 0
+        || access_record.parent != Some(awaited.expression.node)
+        || access_data.question_dot_token.is_some()
+        || access_data.flow_node.is_some()
+        || access_data.facts != 0
+        || receiver_record.kind != SyntaxKind::Identifier
+        || receiver_record.flags.0 != 0
+        || receiver_record.parent != Some(access.node)
+        || receiver_name.flow_node.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(access.node)
+        || name_text.flow_node.is_some()
+        || name_text.text != property.name
+        || receiver_symbol.is_none_or(|symbol| {
+            store
+                .symbol(symbol)
+                .is_none_or(|symbol| symbol.flags() != SymbolFlags::ALIAS)
+        })
+    {
+        return Ok(false);
+    }
+
+    session.reset_query();
+    let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )?
+    .get_type_of_source_callable(callable.declaration, callable.owner_symbol)?;
+    let signature = store
+        .source_callable_provenance(type_)
+        .filter(|provenance| {
+            provenance.family == SourceCallableFamily::ArrowFunction
+                && provenance.declaration == callable.declaration
+                && provenance.owner_symbol == callable.owner_symbol
+        })
+        .map(|provenance| provenance.signature)
+        .ok_or_else(invalid)?;
+    let void = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.void_type)
+        .ok_or_else(invalid)?;
+    session.reset_query();
+    let promise = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )?
+    .get_global_promise_type(void)?;
+    publish_inferred_source_callable_return(store, &callable, signature, promise)?;
+    if !matches!(
+        validate_stored_source_callable(store, type_),
+        StoredSourceCallableValidation::Valid(_)
+    ) || !store
+        .try_reserve_value_symbol_links(usize::from(store.value_symbol_links(target).is_none()))
+    {
+        return Err(invalid());
+    }
+
+    let expression_type = super::object_members::publish_object_literal(store, &object, &[type_])
+        .map_err(|_| invalid())?;
+    let widened = store
+        .get_widened_type_with_global_types(expression_type, global_types)
+        .map_err(|_| invalid())?;
+    let links = prepare_value_links(store, target, widened, false)?;
+    if !store.set_value_symbol_links(target, links) {
+        return Err(invalid());
+    }
+    Ok(true)
 }
 
 fn plan_direct_imported_module_namespace(

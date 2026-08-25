@@ -3978,10 +3978,43 @@ impl SyntaxPlanner<'_> {
             {
                 let callee = self.reference(call.expression);
                 let callee_record = self.node(callee)?;
+                let immediate_async_arrow = match &callee_record.data {
+                    NodeData::ParenthesizedExpression(parenthesized)
+                        if callee_record.kind == SyntaxKind::ParenthesizedExpression
+                            && call.arguments.nodes.is_empty()
+                            && !call.arguments.has_trailing_comma
+                            && call.type_arguments.is_none() =>
+                    {
+                        let arrow = self.reference(parenthesized.expression);
+                        let arrow_record = self.node(arrow)?;
+                        matches!(
+                            &arrow_record.data,
+                            NodeData::ArrowFunction(function)
+                                if arrow_record.kind == SyntaxKind::ArrowFunction
+                                    && arrow_record.flags.0 == 0
+                                    && arrow_record.parent == Some(callee.node)
+                                    && function.parameters.nodes.is_empty()
+                                    && !function.parameters.has_trailing_comma
+                                    && function.type_parameters.is_none()
+                                    && function.type_.is_none()
+                                    && function.modifiers.as_ref().is_some_and(|modifiers| {
+                                        matches!(modifiers.list.nodes.as_slice(), [modifier]
+                                            if self.arena.get(*modifier).is_some_and(|record| {
+                                                record.kind == SyntaxKind::AsyncKeyword
+                                                    && record.flags.0 == 0
+                                                    && record.parent == Some(arrow.node)
+                                                    && matches!(record.data, NodeData::Token(_))
+                                            }))
+                                    })
+                        )
+                    }
+                    _ => false,
+                };
                 if !matches!(
                     callee_record.kind,
                     SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
-                ) || callee_record.flags.0 != 0
+                ) && !immediate_async_arrow
+                    || callee_record.flags.0 != 0
                 {
                     return Err(self.unsupported(
                         callee,

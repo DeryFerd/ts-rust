@@ -176,6 +176,16 @@ pub(super) enum SourceArrowBodyPlan {
     },
 }
 
+/// Exact syntax for an awaited expression in an inferred async arrow body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceAsyncArrowAwaitStatement {
+    pub(super) block: NodeRef,
+    pub(super) statement: NodeRef,
+    pub(super) await_expression: NodeRef,
+    pub(super) expression: NodeRef,
+    pub(super) throw_expression: Option<NodeRef>,
+}
+
 /// Immutable syntax/binder proof retained by future source dispatch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceArrowPlan {
@@ -1822,7 +1832,9 @@ fn plan_body(
                 return Err(invariant(SourceArrowInvariant::InvalidBody(statement)));
             }
             if matches!(statement_record.data, NodeData::ExpressionStatement(_)) {
-                return if plan_array_arrow_identifier_statement(store, host, callable)?.is_some() {
+                return if plan_async_arrow_await_statement(store, host, callable)?.is_some()
+                    || plan_array_arrow_identifier_statement(store, host, callable)?.is_some()
+                {
                     Ok(SourceArrowBodyPlan::EmptyBlock { block: body })
                 } else {
                     Err(unsupported(SourceArrowUnsupported::ComplexBlock(body)))
@@ -1854,6 +1866,9 @@ fn plan_body(
                 statement,
                 expression,
             })
+        }
+        [_, _] if plan_async_arrow_await_statement(store, host, callable)?.is_some() => {
+            Ok(SourceArrowBodyPlan::EmptyBlock { block: body })
         }
         _ => Err(unsupported(SourceArrowUnsupported::ComplexBlock(body))),
     }
@@ -1911,6 +1926,250 @@ fn plan_bare_return_body(
         }
         annotation = inner;
     }
+}
+
+/// Authenticates an awaited call or the exact awaited-number/throw IIFE body.
+#[allow(clippy::too_many_lines)] // Keep both async statement proofs complete and read-only.
+pub(super) fn plan_async_arrow_await_statement(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    callable: &SourceCallablePlan,
+) -> Result<Option<SourceAsyncArrowAwaitStatement>, SourceArrowError> {
+    if callable.family != SourceCallableFamily::ArrowFunction
+        || !callable.is_async
+        || !callable.parameters.is_empty()
+        || !callable.type_parameters.is_empty()
+        || !callable.return_type.is_inferred()
+    {
+        return Ok(None);
+    }
+
+    let declaration_record = preflight_node(store, host, callable.declaration)?;
+    let block = callable.body;
+    let block_record = preflight_node(store, host, block)?;
+    let NodeData::Block(body) = &block_record.data else {
+        return Ok(None);
+    };
+    if block_record.kind != SyntaxKind::Block
+        || block_record.parent != Some(callable.declaration.node)
+        || !range_contains(declaration_record.range, block_record.range)
+        || block_record.flags.0 != 0
+        || body.flow_node.is_some()
+        || body.next_container.is_some()
+        || body.statements.has_trailing_comma
+        || body.facts != 0
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidBody(block)));
+    }
+    let (statement_id, throw_statement) = match body.statements.nodes.as_slice() {
+        [statement] => (*statement, None),
+        [statement, throw] => (*statement, Some(*throw)),
+        _ => return Ok(None),
+    };
+    let statement = NodeRef::new(block.arena, block.file, statement_id);
+    let statement_record = preflight_node(store, host, statement)?;
+    let NodeData::ExpressionStatement(data) = &statement_record.data else {
+        return Ok(None);
+    };
+    if statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.parent != Some(block.node)
+        || !range_contains(block_record.range, statement_record.range)
+        || statement_record.flags.0 != 0
+        || data.flow_node.is_some()
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidBody(statement)));
+    }
+
+    let await_expression = NodeRef::new(statement.arena, statement.file, data.expression);
+    let await_record = preflight_node(store, host, await_expression)?;
+    let NodeData::AwaitExpression(awaited) = &await_record.data else {
+        return Ok(None);
+    };
+    if await_record.kind != SyntaxKind::AwaitExpression
+        || await_record.parent != Some(statement.node)
+        || !range_contains(statement_record.range, await_record.range)
+        || await_record.flags.0 != 0
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidBody(
+            await_expression,
+        )));
+    }
+
+    let expression = NodeRef::new(
+        await_expression.arena,
+        await_expression.file,
+        awaited.expression,
+    );
+    let expression_record = preflight_node(store, host, expression)?;
+    if expression_record.parent != Some(await_expression.node)
+        || !range_contains(await_record.range, expression_record.range)
+        || expression_record.flags.0 != 0
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidBody(expression)));
+    }
+
+    let throw_expression = if let Some(throw_statement) = throw_statement {
+        let NodeData::NumericLiteral(literal) = &expression_record.data else {
+            return Ok(None);
+        };
+        if expression_record.kind != SyntaxKind::NumericLiteral || literal.token_flags.0 != 0 {
+            return Ok(None);
+        }
+        let throw_statement = NodeRef::new(block.arena, block.file, throw_statement);
+        let throw_record = preflight_node(store, host, throw_statement)?;
+        let NodeData::ThrowStatement(thrown) = &throw_record.data else {
+            return Ok(None);
+        };
+        if throw_record.kind != SyntaxKind::ThrowStatement
+            || throw_record.flags.0 != 0
+            || throw_record.parent != Some(block.node)
+            || !range_contains(block_record.range, throw_record.range)
+            || throw_record.range.start < statement_record.range.end
+            || thrown.flow_node.is_some()
+            || thrown.facts != 0
+        {
+            return Err(invariant(SourceArrowInvariant::InvalidBody(
+                throw_statement,
+            )));
+        }
+        let construction = NodeRef::new(block.arena, block.file, thrown.expression);
+        let construction_record = preflight_node(store, host, construction)?;
+        let NodeData::NewExpression(new_expression) = &construction_record.data else {
+            return Ok(None);
+        };
+        let Some(arguments) = new_expression.arguments.as_ref() else {
+            return Ok(None);
+        };
+        let name = NodeRef::new(block.arena, block.file, new_expression.expression);
+        let name_record = preflight_node(store, host, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(None);
+        };
+        if construction_record.kind != SyntaxKind::NewExpression
+            || construction_record.flags.0 != 0
+            || construction_record.parent != Some(throw_statement.node)
+            || !range_contains(throw_record.range, construction_record.range)
+            || !arguments.nodes.is_empty()
+            || arguments.has_trailing_comma
+            || new_expression.type_arguments.is_some()
+            || new_expression.facts != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(construction.node)
+            || identifier.text != "Error"
+            || identifier.flow_node.is_some()
+            || !async_arrow_is_immediately_invoked(store, host, callable.declaration)?
+            || !async_iife_error_constructor_is_global(store, host, name)?
+        {
+            return Ok(None);
+        }
+        Some(construction)
+    } else if matches!(expression_record.data, NodeData::CallExpression(_))
+        && expression_record.kind == SyntaxKind::CallExpression
+    {
+        None
+    } else {
+        return Ok(None);
+    };
+
+    Ok(Some(SourceAsyncArrowAwaitStatement {
+        block,
+        statement,
+        await_expression,
+        expression,
+        throw_expression,
+    }))
+}
+
+fn async_arrow_is_immediately_invoked(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> Result<bool, SourceArrowError> {
+    let declaration_record = preflight_node(store, host, declaration)?;
+    let Some(parenthesized) = declaration_record
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return Ok(false);
+    };
+    let parenthesized_record = preflight_node(store, host, parenthesized)?;
+    let NodeData::ParenthesizedExpression(parenthesized_expression) = &parenthesized_record.data
+    else {
+        return Ok(false);
+    };
+    let Some(call) = parenthesized_record
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return Ok(false);
+    };
+    let call_record = preflight_node(store, host, call)?;
+    let NodeData::CallExpression(call_expression) = &call_record.data else {
+        return Ok(false);
+    };
+    Ok(
+        parenthesized_record.kind == SyntaxKind::ParenthesizedExpression
+            && parenthesized_record.flags.0 == 0
+            && parenthesized_expression.expression == declaration.node
+            && range_contains(parenthesized_record.range, declaration_record.range)
+            && call_record.kind == SyntaxKind::CallExpression
+            && call_record.flags.0 == 0
+            && call_expression.expression == parenthesized.node
+            && call_expression.arguments.nodes.is_empty()
+            && !call_expression.arguments.has_trailing_comma
+            && call_expression.type_arguments.is_none()
+            && call_expression.question_dot_token.is_none()
+            && call_expression.symbol.is_none()
+            && call_expression.facts == 0,
+    )
+}
+
+fn async_iife_error_constructor_is_global(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    name: NodeRef,
+) -> Result<bool, SourceArrowError> {
+    let Some(global) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("Error"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(false);
+    };
+    let Some(owner) = store.symbol(global) else {
+        return Ok(false);
+    };
+    let Some(declaration) = owner.value_declaration() else {
+        return Ok(false);
+    };
+    if !owner.flags().intersects(SymbolFlags::VALUE)
+        || host
+            .bound_file(declaration)
+            .and_then(ts_binder::BoundFile::source_facts)
+            .is_none_or(|facts| !facts.is_default_library())
+    {
+        return Ok(false);
+    }
+
+    let (arena, bound) = host
+        .source(name)
+        .ok_or_else(|| invariant(SourceArrowInvariant::InvalidBody(name)))?;
+    let mut callback_host = host.name_resolver_host(store)?;
+    let resolved =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(DeclaredTypeError::from)?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(name)),
+                "Error",
+                SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+                None,
+                false,
+                false,
+            )
+            .map_err(DeclaredTypeError::from)?;
+    Ok(resolved.and_then(|symbol| store.get_merged_symbol(symbol)) == Some(global))
 }
 
 /// Returns one parameter-read statement from a single-element array arrow.
@@ -2428,6 +2687,96 @@ mod tests {
                     .store
                     .source_callable_type_for_owner(owner)
                     .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn async_arrow_await_statement_retains_authenticated_call_nodes() {
+        for source in [
+            "const value = async () => { await invoke(); };",
+            "const value = { f: async () => { await dependency.f(); } };",
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let host = fixture.host();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            let (callable, body) =
+                plan_source_arrow_value(&fixture.store, &host, declaration, None).unwrap();
+            let awaited = plan_async_arrow_await_statement(&fixture.store, &host, &callable)
+                .unwrap()
+                .unwrap();
+
+            assert!(callable.is_async);
+            assert_eq!(
+                body,
+                SourceArrowBodyPlan::EmptyBlock {
+                    block: awaited.block
+                }
+            );
+            assert!(awaited.throw_expression.is_none());
+            assert_eq!(
+                fixture
+                    .parsed
+                    .arena
+                    .get(awaited.await_expression.node)
+                    .unwrap()
+                    .kind,
+                SyntaxKind::AwaitExpression,
+            );
+            assert_eq!(
+                fixture
+                    .parsed
+                    .arena
+                    .get(awaited.expression.node)
+                    .unwrap()
+                    .kind,
+                SyntaxKind::CallExpression,
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn async_arrow_await_statement_rejects_unauthenticated_blocks() {
+        for source in [
+            "const value = async () => { invoke(); };",
+            "const value = async () => { await value; };",
+            "const value = async () => { await invoke(); await invoke(); };",
+            "const value = async () => { await 10; throw new Error(); };",
+        ] {
+            let fixture = Fixture::new(source);
+            assert!(
+                matches!(
+                    fixture.plan(0),
+                    Err(SourceArrowError::Unsupported(
+                        SourceArrowUnsupported::ComplexBlock(_)
+                    ))
+                ),
+                "{source}",
             );
         }
     }
