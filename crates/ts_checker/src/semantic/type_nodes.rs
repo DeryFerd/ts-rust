@@ -75,6 +75,7 @@ use super::{
     },
     source_namespaces::authenticated_merged_namespace_interface,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
+    store::SourceNodeParent,
     structured_members,
     template_types::{StringMappingKind, TemplateTypeError},
     tuple_type_nodes::{self, TupleTypeNodeError, TupleTypeNodePlan, validate_warm_tuple_elements},
@@ -16621,6 +16622,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             !infer_type_parameters.is_empty(),
             false,
         )?;
+        if demand == ConditionalBranchDemand::Neither
+            && self.has_branded_conditional_literal_branches(
+                node,
+                &conditional,
+                check_type,
+                extends_type,
+                plan,
+            )
+        {
+            self.execute_type_node(conditional.true_type, plan, prepared)?;
+            self.execute_type_node(conditional.false_type, plan, prepared)?;
+        }
         let branches = self.resolve_conditional_branches(&conditional, demand, plan, prepared)?;
         get_type_from_conditional_type(
             self.store,
@@ -16641,6 +16654,133 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 kind: SyntaxKind::ConditionalType,
             })
         })
+    }
+
+    #[allow(clippy::too_many_lines)] // Generic ownership and branded operands form one proof.
+    fn has_branded_conditional_literal_branches(
+        &self,
+        node: NodeRef,
+        conditional: &PlannedConditionalType,
+        check_type: TypeId,
+        extends_type: TypeId,
+        plan: &TypeQueryPlan,
+    ) -> bool {
+        let Some(SourceNodeParent::Parent(function)) = self.store.source_node_parent(node) else {
+            return false;
+        };
+        let Some(parameter) = cached_ordinary_type_parameter_owner(self.store, check_type) else {
+            return false;
+        };
+        let Some([declaration]) = self
+            .store
+            .symbol(parameter)
+            .and_then(|record| record.declarations())
+        else {
+            return false;
+        };
+        let Some(signature) = self
+            .store
+            .signature_links(function)
+            .and_then(|links| links.resolved_signature.signature())
+            .and_then(|signature| self.store.signature(signature))
+        else {
+            return false;
+        };
+        if self.store.source_node_kind(function) != Some(SyntaxKind::FunctionType)
+            || self.store.source_node_parent(*declaration)
+                != Some(SourceNodeParent::Parent(function))
+            || signature.declaration() != Some(function)
+            || signature.type_parameters() != [check_type].as_slice()
+            || !signature.parameters().is_empty()
+            || !conditional.infer_parameters.is_empty()
+            || !conditional.outer_parameters.is_empty()
+            || [conditional.true_type, conditional.false_type]
+                .into_iter()
+                .any(|branch| {
+                    self.store.source_node_kind(branch) != Some(SyntaxKind::LiteralType)
+                        || !matches!(
+                            plan.literals.get(&branch),
+                            Some(
+                                PlannedLiteralType::String(_)
+                                    | PlannedLiteralType::Number { .. }
+                                    | PlannedLiteralType::BigInt { .. }
+                                    | PlannedLiteralType::Boolean(_)
+                            )
+                        )
+                })
+        {
+            return false;
+        }
+
+        let branded_intersection = |type_: TypeId| {
+            self.store
+                .validate_intersection_type(type_)
+                .ok()
+                .is_some_and(|projection| {
+                    matches!(projection.types.as_slice(), [literal, brand]
+                    if self.store.type_payload(*literal).is_some_and(|record| {
+                        record.flags() == TypeFlags::STRING_LITERAL
+                    }) && self.store.type_payload(*brand).is_some_and(|record| {
+                        record.flags() == TypeFlags::OBJECT
+                    }))
+                })
+        };
+        let Some(record) = self.store.type_payload(extends_type) else {
+            return false;
+        };
+        match record.data() {
+            TypeData::TemplateLiteral(template) => {
+                record.flags() == TypeFlags::TEMPLATE_LITERAL
+                    && !template.types.is_empty()
+                    && template.texts.len() == template.types.len() + 1
+                    && self
+                        .store
+                        .cached_resolved_template_literal_type(&template.texts, &template.types)
+                        .ok()
+                        .flatten()
+                        == Some(extends_type)
+                    && template.types.iter().copied().all(branded_intersection)
+            }
+            TypeData::StringMapping(mapping) => {
+                let Some(symbol) = record.symbol() else {
+                    return false;
+                };
+                if record.flags() != TypeFlags::STRING_MAPPING
+                    || self.store.string_mapping_kind(symbol).is_err()
+                    || self
+                        .store
+                        .cached_resolved_string_mapping_type(symbol, mapping.target)
+                        .ok()
+                        .flatten()
+                        != Some(extends_type)
+                {
+                    return false;
+                }
+                match self
+                    .store
+                    .type_payload(mapping.target)
+                    .map(TypeRecord::data)
+                {
+                    Some(TypeData::Intersection(_)) => branded_intersection(mapping.target),
+                    Some(TypeData::TemplateLiteral(template)) => {
+                        template.texts.iter().all(String::is_empty)
+                            && matches!(template.types.as_slice(), [intersection]
+                                if branded_intersection(*intersection))
+                            && self
+                                .store
+                                .cached_resolved_template_literal_type(
+                                    &template.texts,
+                                    &template.types,
+                                )
+                                .ok()
+                                .flatten()
+                                == Some(mapping.target)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     fn resolve_conditional_callable_returns(
@@ -38024,6 +38164,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Both branded operand families share one lazy-cache fixture.
     fn generic_function_conditional_returns_support_branded_templates_and_string_mappings() {
         let mut fixture = fixture(concat!(
             "type Uppercase<Input extends string> = intrinsic;\n",
@@ -38071,6 +38212,9 @@ mod tests {
                 return_annotation.file,
                 conditional.extends_type,
             );
+            let branches = [conditional.true_type, conditional.false_type].map(|branch| {
+                NodeRef::new(return_annotation.arena, return_annotation.file, branch)
+            });
             assert_eq!(
                 fixture.store.source_node_kind(extends),
                 Some(if matches!(name, "a" | "b") {
@@ -38094,6 +38238,11 @@ mod tests {
             assert!(record.parameters().is_empty());
             assert!(record.resolved_return_type().is_none());
             assert!(fixture.store.type_node_links(return_annotation).is_none());
+            assert!(
+                branches
+                    .iter()
+                    .all(|branch| fixture.store.type_node_links(*branch).is_none())
+            );
 
             let StoredCallableSetValidation::Valid { projection, .. } =
                 validate_stored_callable_set(&fixture.store, function_type)
@@ -38114,6 +38263,8 @@ mod tests {
                 panic!("{name} must resolve to a deferred conditional return")
             };
             assert_eq!(conditional.check_type, type_parameter);
+            assert!(conditional.resolved_true_type.is_none());
+            assert!(conditional.resolved_false_type.is_none());
             assert_eq!(
                 fixture
                     .store
@@ -38122,6 +38273,17 @@ mod tests {
                     .node(),
                 return_annotation,
             );
+            for branch in branches {
+                let resolved = fixture
+                    .store
+                    .type_node_links(branch)
+                    .and_then(|links| links.resolved_type)
+                    .expect("branded conditional literal branches retain their node identities");
+                assert_eq!(
+                    fixture.store.type_payload(resolved).unwrap().flags(),
+                    TypeFlags::NUMBER_LITERAL,
+                );
+            }
             resolved.push((annotation, function_type, signature, return_type));
         }
 

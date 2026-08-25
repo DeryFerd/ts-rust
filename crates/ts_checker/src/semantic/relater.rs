@@ -28,6 +28,7 @@ use super::{
         validate_stored_single_callable,
     },
     classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
+    declared::cached_ordinary_type_parameter_owner,
     derived_types::DerivedObjectLiteralValidation,
     enums,
     generic_calls::{
@@ -38,7 +39,7 @@ use super::{
     indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
     instantiated_members::{GenericInterfaceMemberError, validate_generic_interface_members},
     intersection_types::IntersectionTypeProjection,
-    links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
+    links::{MembersOrExportsResolutionKind, TypeNodeLinks, ValueSymbolLinks},
     mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
     mapper::TypeMapper,
     reference_types::validate_direct_generic_reference,
@@ -52,6 +53,7 @@ use super::{
         InterfaceHeritageMembersValidation, validate_interface_heritage_members,
         validate_planned_interface_heritage_members,
     },
+    template_types::StringMappingKind,
     tuple_types::TupleShape,
     type_records::{
         CacheHashKey, ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord,
@@ -433,6 +435,34 @@ enum BroadStringRecordMappedState {
         members: SymbolTableId,
         index: IndexInfoId,
     },
+}
+
+#[derive(Clone, Copy)]
+struct AuthenticatedBrandedStringIntersection {
+    literal: TypeId,
+    brand: TypeId,
+}
+
+#[derive(Clone)]
+enum AuthenticatedBrandedConditionalOperand {
+    Template {
+        texts: Vec<String>,
+        intersections: Vec<AuthenticatedBrandedStringIntersection>,
+    },
+    StringMapping {
+        symbol: SemanticSymbolId,
+        kind: StringMappingKind,
+        intersection: AuthenticatedBrandedStringIntersection,
+    },
+}
+
+#[derive(Clone)]
+struct AuthenticatedBrandedConditional {
+    owner: TypeId,
+    signature: SignatureId,
+    operand: AuthenticatedBrandedConditionalOperand,
+    true_type: TypeId,
+    false_type: TypeId,
 }
 
 /// One validated own property from the exact property-only object domain.
@@ -1448,6 +1478,15 @@ impl<'store> RelaterSession<'store> {
         let source_flags = self.store.type_flags(source)?;
         let mut target_flags = self.store.type_flags(target)?;
 
+        if source_flags == TypeFlags::CONDITIONAL
+            && target_flags == TypeFlags::CONDITIONAL
+            && let Some((source, target)) = self
+                .store
+                .authenticated_branded_conditional_pair(source, target)?
+        {
+            return self.branded_conditional_types_related_to(&source, &target, intersection_state);
+        }
+
         if source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
             && self.cold_global_object_matches_empty_interface(source, target)?
@@ -1745,6 +1784,116 @@ impl<'store> RelaterSession<'store> {
             });
         }
         Ok(Ternary::False)
+    }
+
+    fn branded_conditional_types_related_to(
+        &mut self,
+        source: &AuthenticatedBrandedConditional,
+        target: &AuthenticatedBrandedConditional,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        match (&source.operand, &target.operand) {
+            (
+                AuthenticatedBrandedConditionalOperand::Template {
+                    texts: source_texts,
+                    intersections: source_intersections,
+                },
+                AuthenticatedBrandedConditionalOperand::Template {
+                    texts: target_texts,
+                    intersections: target_intersections,
+                },
+            ) => {
+                if source_texts != target_texts
+                    || source_intersections.len() != target_intersections.len()
+                {
+                    return Ok(Ternary::False);
+                }
+                for (source, target) in source_intersections.iter().zip(target_intersections) {
+                    if self.branded_string_intersections_related_to(
+                        *source,
+                        *target,
+                        intersection_state,
+                    )? == Ternary::False
+                    {
+                        return Ok(Ternary::False);
+                    }
+                }
+            }
+            (
+                AuthenticatedBrandedConditionalOperand::StringMapping {
+                    symbol: source_symbol,
+                    kind: source_kind,
+                    intersection: source_intersection,
+                },
+                AuthenticatedBrandedConditionalOperand::StringMapping {
+                    symbol: target_symbol,
+                    kind: target_kind,
+                    intersection: target_intersection,
+                },
+            ) => {
+                if source_symbol != target_symbol
+                    || source_kind != target_kind
+                    || self.branded_string_intersections_related_to(
+                        *source_intersection,
+                        *target_intersection,
+                        intersection_state,
+                    )? == Ternary::False
+                {
+                    return Ok(Ternary::False);
+                }
+            }
+            _ => return Ok(Ternary::False),
+        }
+
+        let true_branch = self.is_related_to_ex(
+            source.true_type,
+            target.true_type,
+            RecursionFlags::BOTH,
+            intersection_state,
+        )?;
+        if true_branch == Ternary::False {
+            return Ok(Ternary::False);
+        }
+        let false_branch = self.is_related_to_ex(
+            source.false_type,
+            target.false_type,
+            RecursionFlags::BOTH,
+            intersection_state,
+        )?;
+        Ok(true_branch & false_branch)
+    }
+
+    fn branded_string_intersections_related_to(
+        &mut self,
+        source: AuthenticatedBrandedStringIntersection,
+        target: AuthenticatedBrandedStringIntersection,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        let literal = self.is_related_to_ex(
+            source.literal,
+            target.literal,
+            RecursionFlags::BOTH,
+            intersection_state,
+        )?;
+        if literal == Ternary::False {
+            return Ok(Ternary::False);
+        }
+        let forward = self.is_related_to_ex(
+            source.brand,
+            target.brand,
+            RecursionFlags::BOTH,
+            intersection_state,
+        )?;
+        if forward == Ternary::False {
+            return Ok(Ternary::False);
+        }
+        let reverse = self.is_related_to_ex(
+            target.brand,
+            source.brand,
+            RecursionFlags::BOTH,
+            intersection_state,
+        )?;
+        Ok(literal & forward & reverse)
     }
 
     /// A property-free function cannot satisfy a canonical tuple, and a tuple
@@ -6210,6 +6359,38 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
 
+        if source_flags == TypeFlags::OBJECT
+            && target_flags == TypeFlags::OBJECT
+            && self.type_has_function_type_provenance(source)
+            && self.type_has_function_type_provenance(target)
+            && let Some((source_callable, target_callable)) =
+                self.authenticated_branded_conditional_function_pair(source, target)?
+        {
+            let mut session = RelaterSession::new_with_global_types_and_options(
+                self,
+                relation,
+                bootstrap,
+                global_types,
+                strict_function_types,
+            );
+            session.observe_type_surface(original_source);
+            session.observe_type_surface(original_target);
+            let result = session.call_signatures_related_to(
+                source,
+                target,
+                Some(&source_callable),
+                Some(&target_callable),
+                IntersectionState::NONE,
+            )?;
+            return Ok(session.finish_without_specialized_root_cache(result));
+        }
+
+        let supported_branded_conditional_relation = source_flags == TypeFlags::CONDITIONAL
+            && target_flags == TypeFlags::CONDITIONAL
+            && self
+                .authenticated_branded_conditional_pair(source, target)?
+                .is_some();
+
         let (supported_fixed_tuple_relation, supported_broad_string_record_relation) =
             if source_flags.intersects(TypeFlags::OBJECT)
                 && target_flags.intersects(TypeFlags::OBJECT)
@@ -6288,6 +6469,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     && target_flags.intersects(TypeFlags::OBJECT);
             if union_relation
                 || supported_object_relation
+                || supported_branded_conditional_relation
                 || supported_array_relation
                 || supported_array_concat_relation
                 || supported_apparent_primitive_relation
@@ -6311,6 +6493,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     || supported_tuple_array_relation
                     || supported_array_concat_relation
                     || supported_apparent_primitive_relation
+                    || supported_branded_conditional_relation
                 {
                     Ok(session.finish_without_specialized_root_cache(result))
                 } else {
@@ -6391,6 +6574,385 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Err(RelationUnavailable::MalformedStructuredType(type_));
         }
         Ok(())
+    }
+
+    fn authenticated_branded_conditional_function_pair(
+        &self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<Option<(ValidatedSingleCallable, ValidatedSingleCallable)>, RelationUnavailable>
+    {
+        let source_callable = match validate_stored_single_callable(self, source) {
+            StoredSingleCallableValidation::Valid {
+                family: CallableFamily::FunctionType,
+                callable,
+                ..
+            } => callable,
+            _ => return Ok(None),
+        };
+        let target_callable = match validate_stored_single_callable(self, target) {
+            StoredSingleCallableValidation::Valid {
+                family: CallableFamily::FunctionType,
+                callable,
+                ..
+            } => callable,
+            _ => return Ok(None),
+        };
+        let (Some(source_return), Some(target_return)) =
+            (source_callable.return_type, target_callable.return_type)
+        else {
+            return Ok(None);
+        };
+        if self.type_flags(source_return)? != TypeFlags::CONDITIONAL
+            || self.type_flags(target_return)? != TypeFlags::CONDITIONAL
+        {
+            return Ok(None);
+        }
+        let Some((source_conditional, target_conditional)) =
+            self.authenticated_branded_conditional_pair(source_return, target_return)?
+        else {
+            return Ok(None);
+        };
+        if source_conditional.owner != source
+            || source_conditional.signature != source_callable.signature
+        {
+            return Err(RelationUnavailable::MalformedStructuredType(source_return));
+        }
+        if target_conditional.owner != target
+            || target_conditional.signature != target_callable.signature
+        {
+            return Err(RelationUnavailable::MalformedStructuredType(target_return));
+        }
+        Ok(Some((source_callable, target_callable)))
+    }
+
+    fn authenticated_branded_conditional_pair(
+        &self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<
+        Option<(
+            AuthenticatedBrandedConditional,
+            AuthenticatedBrandedConditional,
+        )>,
+        RelationUnavailable,
+    > {
+        let Some(source) = self.authenticated_branded_conditional_type(source)? else {
+            return Ok(None);
+        };
+        let Some(target) = self.authenticated_branded_conditional_type(target)? else {
+            return Ok(None);
+        };
+        Ok(Some((source, target)))
+    }
+
+    #[allow(clippy::too_many_lines)] // Root, owner, and branch identities form one proof.
+    fn authenticated_branded_conditional_type(
+        &self,
+        type_: TypeId,
+    ) -> Result<Option<AuthenticatedBrandedConditional>, RelationUnavailable> {
+        let malformed = || RelationUnavailable::MalformedStructuredType(type_);
+        let record = self.type_payload(type_).ok_or_else(malformed)?;
+        let TypeData::Conditional(conditional) = record.data() else {
+            return Ok(None);
+        };
+        if record.flags() != TypeFlags::CONDITIONAL {
+            return Err(malformed());
+        }
+        let Some(operand) =
+            self.authenticated_branded_conditional_operand(conditional.extends_type)?
+        else {
+            return Ok(None);
+        };
+        let root = self
+            .conditional_root(conditional.root)
+            .ok_or_else(malformed)?;
+        let node = root.node();
+        let function = match self.source_node_parent(node) {
+            Some(SourceNodeParent::Parent(function))
+                if self.source_node_kind(function) == Some(SyntaxKind::FunctionType) =>
+            {
+                function
+            }
+            Some(SourceNodeParent::Parent(_)) => return Ok(None),
+            _ => return Err(malformed()),
+        };
+        if record.symbol().is_some()
+            || record.alias().is_some()
+            || conditional.constrained != ConstrainedTypeData::default()
+            || conditional.check_type != root.check_type()
+            || conditional.extends_type != root.extends_type()
+            || conditional.resolved_true_type.is_some()
+            || conditional.resolved_false_type.is_some()
+            || conditional.resolved_inferred_true_type.is_some()
+            || conditional.resolved_default_constraint.is_some()
+            || conditional.resolved_constraint_of_distributive.is_some()
+            || conditional.mapper.is_some()
+            || conditional.combined_mapper.is_some()
+            || !root.is_distributive()
+            || root.infer_type_parameters().is_some()
+            || root.outer_type_parameters().is_some()
+            || root.instantiations() != &TypeCacheState::Unallocated
+            || root.alias().is_some()
+            || self.source_node_kind(node) != Some(SyntaxKind::ConditionalType)
+            || self.type_node_links(node)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(type_),
+                    ..TypeNodeLinks::default()
+                })
+        {
+            return Err(malformed());
+        }
+
+        let parameter = cached_ordinary_type_parameter_owner(self, conditional.check_type)
+            .ok_or_else(malformed)?;
+        let parameter_record = self.symbol(parameter).ok_or_else(malformed)?;
+        let Some([declaration]) = parameter_record.declarations() else {
+            return Err(malformed());
+        };
+        if parameter_record.flags() != SymbolFlags::TYPE_PARAMETER
+            || parameter_record.check_flags() != CheckFlags::NONE
+            || self.get_merged_symbol(parameter) != Some(parameter)
+            || self.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
+            || self.source_node_parent(*declaration) != Some(SourceNodeParent::Parent(function))
+            || self.source_node_kind(function) != Some(SyntaxKind::FunctionType)
+        {
+            return Err(malformed());
+        }
+
+        let signature = self
+            .signature_links(function)
+            .and_then(|links| links.resolved_signature.signature())
+            .ok_or_else(malformed)?;
+        if self.signature_links(function)
+            != Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            })
+        {
+            return Err(malformed());
+        }
+        let signature_record = self.signature(signature).ok_or_else(malformed)?;
+        let [signature_parameter] = signature_record.type_parameters() else {
+            return Err(malformed());
+        };
+        if *signature_parameter != conditional.check_type
+            || signature_record.flags() != SignatureFlags::NONE
+            || signature_record.declaration() != Some(function)
+            || !signature_record.parameters().is_empty()
+            || signature_record.min_argument_count() != 0
+            || signature_record.resolved_return_type() != Some(type_)
+            || self.function_signature_return_annotation(signature) != Some((node, false))
+        {
+            return Err(malformed());
+        }
+        let owner = self
+            .type_node_links(function)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(malformed)?;
+        match validate_stored_single_callable(self, owner) {
+            StoredSingleCallableValidation::Valid {
+                family: CallableFamily::FunctionType,
+                callable,
+                ..
+            } if callable.owner == owner
+                && callable.signature == signature
+                && callable.return_type == Some(type_)
+                && callable.parameters.is_empty() => {}
+            _ => return Err(malformed()),
+        }
+
+        let mut children = Vec::with_capacity(4);
+        for index in 0..node.node.index() {
+            let child = NodeRef::new(
+                node.arena,
+                node.file,
+                NodeId::new(u32::try_from(index).map_err(|_| malformed())?),
+            );
+            if self.source_node_parent(child) == Some(SourceNodeParent::Parent(node)) {
+                children.push(child);
+            }
+        }
+        let [check, extends, true_branch, false_branch] = children.as_slice() else {
+            return Err(malformed());
+        };
+        if [*true_branch, *false_branch].into_iter().any(|branch| {
+            self.source_node_kind(branch) != Some(SyntaxKind::LiteralType)
+                || self.type_node_links(branch).is_none()
+        }) {
+            return Ok(None);
+        }
+        if self.source_node_kind(*check) != Some(SyntaxKind::TypeReference)
+            || self.type_node_links(*check)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(conditional.check_type),
+                    ..TypeNodeLinks::default()
+                })
+            || self
+                .symbol_node_links(*check)
+                .and_then(|links| links.resolved_symbol)
+                != Some(parameter)
+            || self.type_node_links(*extends)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(conditional.extends_type),
+                    ..TypeNodeLinks::default()
+                })
+            || match &operand {
+                AuthenticatedBrandedConditionalOperand::Template { .. } => {
+                    self.source_node_kind(*extends) != Some(SyntaxKind::TemplateLiteralType)
+                }
+                AuthenticatedBrandedConditionalOperand::StringMapping { symbol, .. } => {
+                    self.source_node_kind(*extends) != Some(SyntaxKind::TypeReference)
+                        || self
+                            .symbol_node_links(*extends)
+                            .and_then(|links| links.resolved_symbol)
+                            != Some(*symbol)
+                }
+            }
+        {
+            return Err(malformed());
+        }
+
+        let true_type = self.authenticated_branded_conditional_branch(type_, *true_branch)?;
+        let false_type = self.authenticated_branded_conditional_branch(type_, *false_branch)?;
+        Ok(Some(AuthenticatedBrandedConditional {
+            owner,
+            signature,
+            operand,
+            true_type,
+            false_type,
+        }))
+    }
+
+    fn authenticated_branded_conditional_branch(
+        &self,
+        conditional: TypeId,
+        node: NodeRef,
+    ) -> Result<TypeId, RelationUnavailable> {
+        let malformed = || RelationUnavailable::MalformedStructuredType(conditional);
+        if self.source_node_kind(node) != Some(SyntaxKind::LiteralType) {
+            return Err(malformed());
+        }
+        let links = self.type_node_links(node).ok_or_else(malformed)?;
+        let type_ = links.resolved_type.ok_or_else(malformed)?;
+        if links.outer_type_parameters.is_some()
+            || !matches!(
+                self.type_flags(type_)?,
+                TypeFlags::STRING_LITERAL
+                    | TypeFlags::NUMBER_LITERAL
+                    | TypeFlags::BIG_INT_LITERAL
+                    | TypeFlags::BOOLEAN_LITERAL
+            )
+        {
+            return Err(malformed());
+        }
+        self.validate_union_constituent(type_)
+            .map_err(|error| union_validation_unavailable(type_, error))?;
+        Ok(type_)
+    }
+
+    fn authenticated_branded_conditional_operand(
+        &self,
+        type_: TypeId,
+    ) -> Result<Option<AuthenticatedBrandedConditionalOperand>, RelationUnavailable> {
+        let malformed = || RelationUnavailable::MalformedStructuredType(type_);
+        let record = self.type_payload(type_).ok_or_else(malformed)?;
+        match record.data() {
+            TypeData::TemplateLiteral(template) => {
+                if template.types.is_empty()
+                    || !template.types.iter().all(|type_| {
+                        self.type_payload(*type_)
+                            .is_some_and(|record| record.flags() == TypeFlags::INTERSECTION)
+                    })
+                {
+                    return Ok(None);
+                }
+                self.authenticate_template_literal_type(type_)?;
+                let intersections = template
+                    .types
+                    .iter()
+                    .copied()
+                    .map(|type_| self.authenticated_branded_string_intersection(type_))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Some(AuthenticatedBrandedConditionalOperand::Template {
+                    texts: template.texts.clone(),
+                    intersections,
+                }))
+            }
+            TypeData::StringMapping(mapping) => {
+                let candidate = match self.type_payload(mapping.target).map(TypeRecord::data) {
+                    Some(TypeData::Intersection(_)) => Some(mapping.target),
+                    Some(TypeData::TemplateLiteral(template))
+                        if template.texts.iter().all(String::is_empty) =>
+                    {
+                        match template.types.as_slice() {
+                            [intersection]
+                                if self.type_payload(*intersection).is_some_and(|record| {
+                                    record.flags() == TypeFlags::INTERSECTION
+                                }) =>
+                            {
+                                self.authenticate_template_literal_type(mapping.target)?;
+                                Some(*intersection)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(intersection) = candidate else {
+                    return Ok(None);
+                };
+                let symbol = record.symbol().ok_or_else(malformed)?;
+                let kind = self.string_mapping_kind(symbol).map_err(|_| malformed())?;
+                if record.flags() != TypeFlags::STRING_MAPPING
+                    || record.alias().is_some()
+                    || self
+                        .symbol(symbol)
+                        .is_none_or(|record| !record.flags().contains(SymbolFlags::TYPE_ALIAS))
+                    || self.get_merged_symbol(symbol) != Some(symbol)
+                    || self
+                        .cached_resolved_string_mapping_type(symbol, mapping.target)
+                        .map_err(|_| malformed())?
+                        != Some(type_)
+                {
+                    return Err(malformed());
+                }
+                let intersection = self.authenticated_branded_string_intersection(intersection)?;
+                Ok(Some(
+                    AuthenticatedBrandedConditionalOperand::StringMapping {
+                        symbol,
+                        kind,
+                        intersection,
+                    },
+                ))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn authenticated_branded_string_intersection(
+        &self,
+        type_: TypeId,
+    ) -> Result<AuthenticatedBrandedStringIntersection, RelationUnavailable> {
+        let projection = self
+            .validate_intersection_type(type_)
+            .map_err(|_| RelationUnavailable::MalformedIntersection(type_))?;
+        let [literal, brand] = projection.types.as_slice() else {
+            return Err(RelationUnavailable::MalformedIntersection(type_));
+        };
+        if self.type_flags(*literal)? != TypeFlags::STRING_LITERAL
+            || self.type_flags(*brand)? != TypeFlags::OBJECT
+            || projection.reduced_to_never
+            || projection.properties.is_empty()
+        {
+            return Err(RelationUnavailable::MalformedIntersection(type_));
+        }
+        self.validate_union_constituent(*literal)
+            .map_err(|error| union_validation_unavailable(*literal, error))?;
+        Ok(AuthenticatedBrandedStringIntersection {
+            literal: *literal,
+            brand: *brand,
+        })
     }
 
     #[allow(clippy::too_many_lines)] // Keep the pinned branch order visibly linear.
@@ -7246,7 +7808,7 @@ const fn recursion_identity_unavailable(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use ts_ast::{FileId, NodeArena, NodeData, NodeRef, SyntaxKind};
     use ts_binder::{
@@ -7278,7 +7840,7 @@ mod tests {
         signatures::{ElementFlags, SignatureFlags, Ternary},
         tuple_types::CanonicalTupleTypeRequest,
         type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions},
-        type_records::{LiteralValue, RegularLiteralLink, TypeData, TypeRecord},
+        type_records::{LiteralValue, RegularLiteralLink, TypeCacheState, TypeData, TypeRecord},
         types::{ObjectFlags, TypeFlags},
     };
 
@@ -7730,6 +8292,27 @@ mod tests {
         .get_return_type_of_signature(signature)
         .unwrap();
         assert!(diagnostics.is_empty());
+    }
+
+    fn resolved_conditional_function_alias(
+        fixture: &mut FunctionRelationFixture,
+        name: &str,
+    ) -> (TypeId, SignatureId, TypeId) {
+        let (type_, signature) = query_function_alias(fixture, name);
+        resolve_function_return(fixture, signature);
+        let return_type = fixture
+            .store
+            .signature(signature)
+            .and_then(|record| record.resolved_return_type())
+            .expect("the generic function retains its conditional return");
+        assert!(matches!(
+            fixture
+                .store
+                .type_payload(return_type)
+                .map(TypeRecord::data),
+            Some(TypeData::Conditional(_))
+        ));
+        (type_, signature, return_type)
     }
 
     #[test]
@@ -8646,6 +9229,445 @@ mod tests {
             Err(RelationUnavailable::MalformedFunctionType(left))
         );
         assert_eq!(fixture.store.relation_state_snapshot(), poisoned);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both operand families share root and warm-cache assertions.
+    fn generic_branded_conditional_function_returns_compare_without_root_cache_entries() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Uppercase<Input extends string> = intrinsic; ",
+            "type TemplateLeft = <T>() => T extends `${'a' & { a: 1 }}` ? 1 : 2; ",
+            "type TemplateRight = <T>() => T extends `${'a' & { a: 1 }}` ? 1 : 2; ",
+            "type MappingLeft = <T>() => T extends Uppercase<'a' & { a: 1 }> ? 1 : 2; ",
+            "type MappingRight = <T>() => T extends Uppercase<'a' & { a: 1 }> ? 1 : 2;",
+        ));
+        let [template_left, template_right, mapping_left, mapping_right] = [
+            "TemplateLeft",
+            "TemplateRight",
+            "MappingLeft",
+            "MappingRight",
+        ]
+        .map(|name| resolved_conditional_function_alias(&mut fixture, name));
+
+        for ((source, _, source_return), (target, _, target_return)) in [
+            (template_left, template_right),
+            (mapping_left, mapping_right),
+        ] {
+            let function_key = fixture
+                .store
+                .relation_key_if_available(
+                    source,
+                    target,
+                    super::IntersectionState::NONE,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .key();
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_assignable_to_with_strict_function_types(source, target, true),
+                Ok(true),
+            );
+            assert_eq!(
+                fixture.store.is_type_related_to_with_strict_function_types(
+                    source_return,
+                    target_return,
+                    RelationKind::Assignable,
+                    true,
+                ),
+                Ok(true),
+            );
+            assert_eq!(
+                fixture.store.is_type_related_to_with_strict_function_types(
+                    source,
+                    target,
+                    RelationKind::Identity,
+                    true,
+                ),
+                Ok(true),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .relation_cache_get(RelationKind::Assignable, function_key),
+                RelationComparisonResult::NONE,
+            );
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.signature_len(),
+                fixture.store.conditional_root_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.relation_state_snapshot(),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_assignable_to_with_strict_function_types(source, target, true),
+                Ok(true),
+            );
+            assert_eq!(
+                fixture.store.is_type_related_to_with_strict_function_types(
+                    source_return,
+                    target_return,
+                    RelationKind::Assignable,
+                    true,
+                ),
+                Ok(true),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.mapper_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.conditional_root_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                    fixture.store.relation_state_snapshot(),
+                ),
+                warm,
+            );
+            for conditional in [source_return, target_return] {
+                let TypeData::Conditional(data) =
+                    fixture.store.type_payload(conditional).unwrap().data()
+                else {
+                    unreachable!("the resolved generic returns remain conditional")
+                };
+                assert!(data.resolved_true_type.is_none());
+                assert!(data.resolved_false_type.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn generic_branded_conditional_relations_reject_distinct_predicates_and_branches() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Uppercase<Input extends string> = intrinsic; ",
+            "type Lowercase<Input extends string> = intrinsic; ",
+            "type Template = <T>() => T extends `${'a' & { a: 1 }}` ? 1 : 2; ",
+            "type BrandName = <T>() => T extends `${'a' & { b: 1 }}` ? 1 : 2; ",
+            "type BrandValue = <T>() => T extends `${'a' & { a: 2 }}` ? 1 : 2; ",
+            "type BrandWidth = <T>() => T extends `${'a' & { a: 1; b: 2 }}` ? 1 : 2; ",
+            "type Literal = <T>() => T extends `${'b' & { a: 1 }}` ? 1 : 2; ",
+            "type TrueBranch = <T>() => T extends `${'a' & { a: 1 }}` ? 2 : 2; ",
+            "type FalseBranch = <T>() => T extends `${'a' & { a: 1 }}` ? 1 : 3; ",
+            "type Upper = <T>() => T extends Uppercase<'a' & { a: 1 }> ? 1 : 2; ",
+            "type Lower = <T>() => T extends Lowercase<'a' & { a: 1 }> ? 1 : 2; ",
+            "type Complex = <T>() => T extends `${'a' & { a: 1 }}` ? string : 2; ",
+            "type NullBranch = <T>() => T extends `${'a' & { a: 1 }}` ? null : 2; ",
+            "type Plain = <T>() => T extends string ? 1 : 2;",
+        ));
+        let (template, _, template_return) =
+            resolved_conditional_function_alias(&mut fixture, "Template");
+
+        for name in [
+            "BrandName",
+            "BrandValue",
+            "BrandWidth",
+            "Literal",
+            "TrueBranch",
+            "FalseBranch",
+            "Upper",
+        ] {
+            let (other, _, _) = resolved_conditional_function_alias(&mut fixture, name);
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_assignable_to_with_strict_function_types(template, other, true),
+                Ok(false),
+                "{name} must not match the authenticated template conditional",
+            );
+        }
+
+        let (upper, _, _) = resolved_conditional_function_alias(&mut fixture, "Upper");
+        let (lower, _, _) = resolved_conditional_function_alias(&mut fixture, "Lower");
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(upper, lower, true),
+            Ok(false),
+        );
+
+        for name in ["Plain", "Complex", "NullBranch"] {
+            let (unsupported, _, unsupported_return) =
+                resolved_conditional_function_alias(&mut fixture, name);
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_assignable_to_with_strict_function_types(template, unsupported, true),
+                Err(RelationUnavailable::StructuralRelation {
+                    source: template_return,
+                    target: unsupported_return,
+                    relation: RelationKind::Assignable,
+                }),
+                "{name} remains outside the branded literal-branch relation",
+            );
+        }
+
+        let function = alias_function_node(&fixture, "Plain");
+        let NodeData::FunctionTypeNode(function_data) =
+            &fixture.parsed.arena.get(function.node).unwrap().data
+        else {
+            panic!("the plain alias retains its generic function syntax")
+        };
+        let conditional = NodeRef::new(
+            function.arena,
+            function.file,
+            function_data
+                .type_
+                .expect("a generic function has a return annotation"),
+        );
+        let NodeData::ConditionalTypeNode(conditional_data) =
+            &fixture.parsed.arena.get(conditional.node).unwrap().data
+        else {
+            panic!("the plain generic function retains its conditional return")
+        };
+        for branch in [conditional_data.true_type, conditional_data.false_type] {
+            let branch = NodeRef::new(conditional.arena, conditional.file, branch);
+            assert!(fixture.store.type_node_links(branch).is_none());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Independent cache poison cases share one authenticated graph.
+    fn generic_branded_conditional_relations_reject_poisoned_roots_and_identities() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Uppercase<Input extends string> = intrinsic; ",
+            "type Left = <T>() => T extends `${'a' & { a: 1 }}` ? 1 : 2; ",
+            "type Right = <T>() => T extends `${'a' & { a: 1 }}` ? 1 : 2; ",
+            "type MappingLeft = <T>() => T extends Uppercase<'a' & { a: 1 }> ? 1 : 2; ",
+            "type MappingRight = <T>() => T extends Uppercase<'a' & { a: 1 }> ? 1 : 2;",
+        ));
+        let (left, _, left_return) = resolved_conditional_function_alias(&mut fixture, "Left");
+        let (right, _, _) = resolved_conditional_function_alias(&mut fixture, "Right");
+        let (mapping_left, _, mapping_return) =
+            resolved_conditional_function_alias(&mut fixture, "MappingLeft");
+        let (mapping_right, _, _) =
+            resolved_conditional_function_alias(&mut fixture, "MappingRight");
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(
+                    mapping_left,
+                    mapping_right,
+                    true,
+                ),
+            Ok(true),
+        );
+
+        let (root, template) = match fixture.store.type_payload(left_return).unwrap().data() {
+            TypeData::Conditional(data) => (data.root, data.extends_type),
+            _ => unreachable!("the template return remains conditional"),
+        };
+        let root_node = fixture.store.conditional_root(root).unwrap().node();
+        let warm = fixture.store.relation_state_snapshot();
+        assert!(
+            fixture.store.set_conditional_root_instantiations(
+                root,
+                TypeCacheState::Allocated(HashMap::new()),
+            )
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), warm);
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Err(RelationUnavailable::MalformedStructuredType(left_return)),
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), warm);
+        assert!(
+            fixture
+                .store
+                .set_conditional_root_instantiations(root, TypeCacheState::Unallocated)
+        );
+
+        let alias = fixture
+            .store
+            .type_payload(left)
+            .and_then(TypeRecord::alias)
+            .expect("the named generic function retains its alias");
+        assert!(fixture.store.set_conditional_root_alias(root, Some(alias)));
+        assert_eq!(fixture.store.relation_state_snapshot(), warm);
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Err(RelationUnavailable::MalformedStructuredType(left_return)),
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), warm);
+        assert!(fixture.store.set_conditional_root_alias(root, None));
+
+        let root_links = fixture.store.type_node_links(root_node).unwrap().clone();
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(root_node, TypeNodeLinks::default())
+        );
+        let poisoned_node = fixture.store.relation_state_snapshot();
+        assert!(matches!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Err(
+                RelationUnavailable::MalformedFunctionType(type_)
+                    | RelationUnavailable::UnresolvedFunctionType(type_)
+            ) if type_ == left
+        ));
+        assert_eq!(fixture.store.relation_state_snapshot(), poisoned_node);
+        assert!(fixture.store.set_type_node_links(root_node, root_links));
+
+        let branch = match &fixture.parsed.arena.get(root_node.node).unwrap().data {
+            NodeData::ConditionalTypeNode(data) => {
+                NodeRef::new(root_node.arena, root_node.file, data.true_type)
+            }
+            _ => unreachable!("the authenticated root retains its conditional syntax"),
+        };
+        let branch_links = fixture.store.type_node_links(branch).unwrap().clone();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_type_node_links(
+            branch,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned_branch = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Err(RelationUnavailable::MalformedStructuredType(left_return)),
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), poisoned_branch);
+        assert!(fixture.store.set_type_node_links(branch, branch_links));
+
+        let (texts, types, intersection) =
+            match fixture.store.type_payload(template).unwrap().data() {
+                TypeData::TemplateLiteral(data) => {
+                    (data.texts.clone(), data.types.clone(), data.types[0])
+                }
+                _ => unreachable!("the first conditional retains a branded template"),
+            };
+        let forged_template = fixture
+            .store
+            .alloc_template_literal_type(texts, types)
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .store
+                .authenticated_branded_conditional_operand(forged_template),
+            Err(RelationUnavailable::MalformedStructuredType(type_)) if type_ == forged_template
+        ));
+
+        let key = fixture
+            .store
+            .intersection_keys_by_type
+            .remove(&intersection)
+            .expect("a canonical branded intersection has a reverse cache key");
+        let poisoned_intersection = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Err(RelationUnavailable::MalformedIntersection(intersection)),
+        );
+        assert_eq!(
+            fixture.store.relation_state_snapshot(),
+            poisoned_intersection
+        );
+        assert_eq!(
+            fixture
+                .store
+                .intersection_keys_by_type
+                .insert(intersection, key),
+            None,
+        );
+
+        let brand = fixture
+            .store
+            .validate_intersection_type(intersection)
+            .unwrap()
+            .types[1];
+        let property = fixture
+            .store
+            .type_payload(brand)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| properties.first().copied())
+            .expect("a branded string intersection retains its declared property");
+        let property_links = fixture.store.value_symbol_links(property).unwrap().clone();
+        let mut invalid_property = property_links.clone();
+        invalid_property.resolved_type = None;
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(property, invalid_property)
+        );
+        let poisoned_property = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Err(RelationUnavailable::MalformedIntersection(intersection)),
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), poisoned_property);
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(property, property_links)
+        );
+
+        let mapping = match fixture.store.type_payload(mapping_return).unwrap().data() {
+            TypeData::Conditional(data) => data.extends_type,
+            _ => unreachable!("the mapping return remains conditional"),
+        };
+        let (symbol, target) = match fixture.store.type_payload(mapping).unwrap().data() {
+            TypeData::StringMapping(data) => (
+                fixture
+                    .store
+                    .type_payload(mapping)
+                    .unwrap()
+                    .symbol()
+                    .unwrap(),
+                data.target,
+            ),
+            _ => unreachable!("the conditional extends operand retains its mapping"),
+        };
+        let forged_mapping = fixture
+            .store
+            .alloc_string_mapping_type(Some(symbol), target)
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .store
+                .authenticated_branded_conditional_operand(forged_mapping),
+            Err(RelationUnavailable::MalformedStructuredType(type_)) if type_ == forged_mapping
+        ));
+
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(
+                    mapping_left,
+                    mapping_right,
+                    true,
+                ),
+            Ok(true),
+        );
     }
 
     #[test]
