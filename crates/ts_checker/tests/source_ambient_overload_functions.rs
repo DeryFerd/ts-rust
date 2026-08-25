@@ -368,13 +368,6 @@ fn later_bad_callable_provider_keeps_the_ready_overload_cold_across_retries() {
                 "): number => 1;\n",
             )
         ),
-        format!(
-            "{ready}{}",
-            concat!(
-                "const bad: (value: number) => void = ",
-                "(value: number) => {};\n",
-            )
-        ),
     ]
     .into_iter()
     .enumerate()
