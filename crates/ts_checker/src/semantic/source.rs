@@ -9332,15 +9332,30 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         };
         let property = self.reference(expression.expression);
         let property_record = self.node(property)?;
-        let NodeData::PropertyAccessExpression(access) = &property_record.data else {
-            return Ok(None);
+        let (namespace_id, member_id) = match &property_record.data {
+            NodeData::PropertyAccessExpression(access)
+                if property_record.kind == SyntaxKind::PropertyAccessExpression
+                    && access.flow_node.is_none()
+                    && access.question_dot_token.is_none()
+                    && access.facts == 0 =>
+            {
+                (access.expression, access.name)
+            }
+            NodeData::QualifiedName(qualified)
+                if property_record.kind == SyntaxKind::QualifiedName
+                    && qualified.flow_node.is_none()
+                    && qualified.facts == 0 =>
+            {
+                (qualified.left, qualified.right)
+            }
+            _ => return Ok(None),
         };
-        let namespace = self.reference(access.expression);
+        let namespace = self.reference(namespace_id);
         let namespace_record = self.node(namespace)?;
         let NodeData::Identifier(namespace_name) = &namespace_record.data else {
             return Ok(None);
         };
-        let member = self.reference(access.name);
+        let member = self.reference(member_id);
         let member_record = self.node(member)?;
         let NodeData::Identifier(member_name) = &member_record.data else {
             return Ok(None);
@@ -9359,12 +9374,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || base_record.range.end > heritage.types.range.end
             || expression.type_arguments.is_some()
             || expression.facts != 0
-            || property_record.kind != SyntaxKind::PropertyAccessExpression
             || property_record.flags.0 != 0
             || property_record.parent != Some(base.node)
-            || access.flow_node.is_some()
-            || access.question_dot_token.is_some()
-            || access.facts != 0
             || namespace_record.kind != SyntaxKind::Identifier
             || namespace_record.flags.0 != 0
             || namespace_record.parent != Some(property.node)
@@ -48084,6 +48095,20 @@ class Foo2 {
         let source = parse_javascript_source_file(text);
         assert!(ambient.diagnostics.is_empty(), "{:?}", ambient.diagnostics);
         assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let heritage_kinds = source
+            .arena
+            .iter()
+            .filter_map(|(_, record)| {
+                let NodeData::ExpressionWithTypeArguments(heritage) = &record.data else {
+                    return None;
+                };
+                source.arena.get(heritage.expression).map(|base| base.kind)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            heritage_kinds,
+            [SyntaxKind::QualifiedName, SyntaxKind::QualifiedName],
+        );
 
         let ambient_file = FileId::new(9_870);
         let source_file = FileId::new(9_871);
