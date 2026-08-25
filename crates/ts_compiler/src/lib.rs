@@ -5142,7 +5142,8 @@ fn canonical_source_file_facts(
         is_declaration_file,
         source.is_default_library,
         module_state,
-    ))
+    )
+    .with_always_strict(options.always_strict))
 }
 
 fn resolve_reference_path(
@@ -10230,6 +10231,58 @@ mod tests {
             "{:?}",
             program.diagnostics()
         );
+    }
+
+    #[test]
+    fn canonical_program_projects_always_strict_and_preserves_identifier_ranges() {
+        let fs = MemoryFileSystem::new(true);
+        let source = "var arguments = 1;\narguments = 2;\n";
+        fs.write_file("/project/input.ts", source).unwrap();
+
+        for (always_strict, expected_starts) in [(false, Vec::new()), (true, vec![4_u32, 19_u32])] {
+            let program = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &["input.ts".to_owned()],
+                CompilerOptions {
+                    always_strict,
+                    lib: Some(vec!["es5".to_owned()]),
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap();
+
+            let file = program.source_file("/project/input.ts").unwrap();
+            assert_eq!(
+                canonical_source_file_facts(file, program.options())
+                    .unwrap()
+                    .is_always_strict(),
+                always_strict
+            );
+            assert_eq!(
+                program
+                    .diagnostics()
+                    .iter()
+                    .map(|diagnostic| {
+                        assert_eq!(diagnostic.code, Some(1100));
+                        assert_eq!(
+                            diagnostic.message,
+                            "Invalid use of 'arguments' in strict mode."
+                        );
+                        assert_eq!(diagnostic.file_name.as_deref(), Some("/project/input.ts"));
+                        let range = diagnostic.range.unwrap();
+                        assert_eq!(
+                            &source[range.start.get() as usize..range.end.get() as usize],
+                            "arguments"
+                        );
+                        range.start.get()
+                    })
+                    .collect::<Vec<_>>(),
+                expected_starts,
+                "alwaysStrict={always_strict}: {:?}",
+                program.diagnostics()
+            );
+        }
     }
 
     #[test]

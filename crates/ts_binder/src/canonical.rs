@@ -315,6 +315,7 @@ pub struct CanonicalSourceFileFacts {
     language: CanonicalSourceLanguage,
     is_declaration_file: bool,
     is_default_library: bool,
+    always_strict: bool,
     module_state: CanonicalModuleState,
 }
 
@@ -405,8 +406,16 @@ impl CanonicalSourceFileFacts {
             language,
             is_declaration_file,
             is_default_library,
+            always_strict: false,
             module_state,
         }
+    }
+
+    /// Supplies the Program-owned `alwaysStrict` compiler option.
+    #[must_use]
+    pub const fn with_always_strict(mut self, always_strict: bool) -> Self {
+        self.always_strict = always_strict;
+        self
     }
 
     #[must_use]
@@ -428,6 +437,11 @@ impl CanonicalSourceFileFacts {
     #[must_use]
     pub const fn is_default_library(&self) -> bool {
         self.is_default_library
+    }
+
+    #[must_use]
+    pub const fn is_always_strict(&self) -> bool {
+        self.always_strict
     }
 
     #[must_use]
@@ -1818,6 +1832,13 @@ impl CanonicalBinder {
                 )?;
             }
             SyntaxKind::FunctionDeclaration => {
+                self.check_strict_mode_eval_or_arguments(
+                    arena,
+                    file,
+                    node,
+                    get_name_of_declaration(arena, node),
+                    facts,
+                );
                 self.bind_block_scoped_declaration(
                     arena,
                     file,
@@ -1884,13 +1905,22 @@ impl CanonicalBinder {
                     .expect("function expression is reachable")
                     .data
                 {
-                    NodeData::FunctionExpression(function) => function
-                        .name
-                        .and_then(|name| node_text(arena, name))
-                        .map_or_else(
-                            || EscapedName::internal(InternalSymbolName::Function),
-                            EscapedName::source,
-                        ),
+                    NodeData::FunctionExpression(function) => {
+                        self.check_strict_mode_eval_or_arguments(
+                            arena,
+                            file,
+                            node,
+                            function.name,
+                            facts,
+                        );
+                        function
+                            .name
+                            .and_then(|name| node_text(arena, name))
+                            .map_or_else(
+                                || EscapedName::internal(InternalSymbolName::Function),
+                                EscapedName::source,
+                            )
+                    }
                     _ => EscapedName::internal(InternalSymbolName::Function),
                 };
                 self.bind_anonymous_declaration(arena, file, node, SymbolFlags::FUNCTION, name);
@@ -1999,9 +2029,62 @@ impl CanonicalBinder {
                     facts,
                 )?;
             }
-            SyntaxKind::BinaryExpression | SyntaxKind::CallExpression
-                if facts.is_javascript_file() =>
-            {
+            SyntaxKind::BinaryExpression => {
+                if facts.is_javascript_file() {
+                    self.bind_javascript_assignment_declaration(arena, file, node, facts)?;
+                }
+                let Some(NodeData::BinaryExpression(expression)) =
+                    arena.get(node).map(|node| &node.data)
+                else {
+                    unreachable!("binary-expression dispatch is kind checked");
+                };
+                if arena
+                    .get(expression.operator_token)
+                    .is_some_and(|operator| operator.kind.is_assignment_operator())
+                {
+                    self.check_strict_mode_eval_or_arguments(
+                        arena,
+                        file,
+                        node,
+                        Some(expression.left),
+                        facts,
+                    );
+                }
+            }
+            SyntaxKind::PostfixUnaryExpression => {
+                let Some(NodeData::PostfixUnaryExpression(expression)) =
+                    arena.get(node).map(|node| &node.data)
+                else {
+                    unreachable!("postfix-expression dispatch is kind checked");
+                };
+                self.check_strict_mode_eval_or_arguments(
+                    arena,
+                    file,
+                    node,
+                    Some(expression.operand),
+                    facts,
+                );
+            }
+            SyntaxKind::PrefixUnaryExpression => {
+                let Some(NodeData::PrefixUnaryExpression(expression)) =
+                    arena.get(node).map(|node| &node.data)
+                else {
+                    unreachable!("prefix-expression dispatch is kind checked");
+                };
+                if matches!(
+                    expression.operator,
+                    SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+                ) {
+                    self.check_strict_mode_eval_or_arguments(
+                        arena,
+                        file,
+                        node,
+                        Some(expression.operand),
+                        facts,
+                    );
+                }
+            }
+            SyntaxKind::CallExpression if facts.is_javascript_file() => {
                 self.bind_javascript_assignment_declaration(arena, file, node, facts)?;
             }
             _ => {}
@@ -2475,6 +2558,38 @@ impl CanonicalBinder {
                 diagnostic: make_diagnostic(code, arguments),
                 related_information: Vec::new(),
             });
+    }
+
+    fn check_strict_mode_eval_or_arguments(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        context: NodeId,
+        name: Option<NodeId>,
+        facts: &CanonicalSourceFileFacts,
+    ) {
+        let Some(name) = name else {
+            return;
+        };
+        let Some(NodeData::Identifier(identifier)) = arena.get(name).map(|node| &node.data) else {
+            return;
+        };
+        if !matches!(identifier.text.as_str(), "arguments" | "eval")
+            || is_ambient_node(arena, context, facts)
+        {
+            return;
+        }
+
+        let code = if containing_class(arena, context).is_some() {
+            1210
+        } else if facts.is_external_module() {
+            1215
+        } else if facts.is_always_strict() {
+            1100
+        } else {
+            return;
+        };
+        self.push_bind_diagnostic(arena, file, name, code, [identifier.text.as_str()]);
     }
 
     fn declaration_facts_for(
@@ -2993,6 +3108,7 @@ impl CanonicalBinder {
         else {
             unreachable!("parameter dispatch is kind checked");
         };
+        self.check_strict_mode_eval_or_arguments(arena, file, node, Some(parameter.name), facts);
         if is_binding_pattern(arena, parameter.name) {
             let parent = arena
                 .get(node)
@@ -3055,6 +3171,7 @@ impl CanonicalBinder {
         let Some(name) = get_name_of_declaration(arena, node) else {
             return Ok(());
         };
+        self.check_strict_mode_eval_or_arguments(arena, file, node, Some(name), facts);
         if is_binding_pattern(arena, name) {
             return Ok(());
         }
@@ -7642,7 +7759,8 @@ mod tests {
             true,
             true,
             CanonicalModuleState::External,
-        );
+        )
+        .with_always_strict(true);
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts.clone())
@@ -7650,6 +7768,7 @@ mod tests {
         let bound = binder.file(file).unwrap();
         assert_eq!(bound.source_facts(), Some(&facts));
         assert!(bound.source_facts().unwrap().is_default_library());
+        assert!(bound.source_facts().unwrap().is_always_strict());
         assert_eq!(bound.phase(), BindingPhase::Traversal);
         assert_eq!(bound.symbol_count(), 0);
 
@@ -7669,6 +7788,269 @@ mod tests {
             CanonicalModuleState::Script,
         );
         assert!(!ordinary.is_default_library());
+        assert!(!ordinary.is_always_strict());
+    }
+
+    #[test]
+    fn strict_mode_rejects_eval_and_arguments_declarations_in_source_order() {
+        let parsed = parse_source_file(
+            r"
+type Callable = (arguments: number, ...eval: number[]) => void;
+interface Signatures {
+    (arguments: number): void;
+    new (eval: number): Signatures;
+    method(arguments: number): void;
+}
+function arguments(eval: number) {
+    const arguments = eval;
+    const expression = function eval(arguments: number) {};
+}
+const arrow = (...arguments: number[]) => { var eval = 1; };
+const object = { arguments: 1, eval: 2 };
+object.arguments = object.eval;
+",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(88);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/strict-declarations\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                )
+                .with_always_strict(true),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let diagnostics = binder.file(file).unwrap().diagnostics();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    assert_eq!(diagnostic.diagnostic.code(), 1100);
+                    assert_eq!(diagnostic.node.arena, parsed.arena.id());
+                    assert_eq!(diagnostic.node.file, file);
+                    let name = parsed.arena.get(diagnostic.node.node).unwrap();
+                    assert_eq!(name.kind, SyntaxKind::Identifier);
+                    assert_eq!(
+                        super::source_text_of_node(&parsed.arena, name),
+                        Some(diagnostic.diagnostic.arguments[0].as_str())
+                    );
+                    diagnostic.diagnostic.arguments[0].as_str()
+                })
+                .collect::<Vec<_>>(),
+            [
+                "arguments",
+                "eval",
+                "arguments",
+                "eval",
+                "arguments",
+                "arguments",
+                "eval",
+                "arguments",
+                "eval",
+                "arguments",
+                "arguments",
+                "eval",
+            ]
+        );
+        assert!(diagnostics.windows(2).all(|pair| {
+            parsed.arena.get(pair[0].node.node).unwrap().range.start
+                < parsed.arena.get(pair[1].node.node).unwrap().range.start
+        }));
+    }
+
+    #[test]
+    fn strict_mode_rejects_identifier_writes_but_accepts_property_writes() {
+        let parsed = parse_source_file(
+            r"
+var arguments = 0;
+arguments = 1;
+eval += 1;
+arguments++;
+--eval;
++arguments;
+const object = { arguments: 0, eval: 0 };
+object.arguments = 2;
+object.eval++;
+try {} catch (arguments) {}
+",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(89);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/strict-writes\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                )
+                .with_always_strict(true),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        assert_eq!(
+            binder
+                .file(file)
+                .unwrap()
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.diagnostic.code(),
+                    diagnostic.diagnostic.arguments[0].as_str(),
+                    parsed
+                        .arena
+                        .get(diagnostic.node.node)
+                        .unwrap()
+                        .range
+                        .start
+                        .get(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (1100, "arguments", 5),
+                (1100, "arguments", 20),
+                (1100, "eval", 35),
+                (1100, "arguments", 46),
+                (1100, "eval", 61),
+                (1100, "arguments", 172),
+            ]
+        );
+    }
+
+    #[test]
+    fn strict_mode_skips_disabled_scripts_and_ambient_declarations() {
+        for (index, source, is_declaration_file, always_strict) in [
+            (
+                0,
+                "function eval(arguments: number) { var eval = 1; arguments = 2; ++eval; }",
+                false,
+                false,
+            ),
+            (
+                1,
+                concat!(
+                    "declare function ambient(arguments: number, eval: number): void;\n",
+                    "declare namespace Ambient {\n",
+                    "    function nested(arguments: number): void;\n",
+                    "    const eval: number;\n",
+                    "}\n",
+                ),
+                false,
+                true,
+            ),
+            (
+                2,
+                "declare function ambient(arguments: number): void; declare const eval: number;",
+                true,
+                true,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(90 + index);
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/strict-exclusion-{index}\"")),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_declaration_file,
+                        CanonicalModuleState::Script,
+                    )
+                    .with_always_strict(always_strict),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+
+            assert!(
+                binder.file(file).unwrap().diagnostics().is_empty(),
+                "{source}: {:?}",
+                binder.file(file).unwrap().diagnostics()
+            );
+        }
+    }
+
+    #[test]
+    fn strict_mode_uses_class_and_external_module_diagnostic_variants() {
+        for (index, source, module_state, expected) in [
+            (
+                0,
+                "export function example(arguments: number) {}",
+                CanonicalModuleState::External,
+                vec![(1215, "arguments")],
+            ),
+            (
+                1,
+                "class Example { method(arguments: number) { let eval = 0; } }",
+                CanonicalModuleState::Script,
+                vec![(1210, "arguments"), (1210, "eval")],
+            ),
+            (
+                2,
+                "export class Example { method(arguments: number) {} }",
+                CanonicalModuleState::External,
+                vec![(1210, "arguments")],
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(93 + index);
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/strict-variant-{index}\"")),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        module_state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+
+            assert_eq!(
+                binder
+                    .file(file)
+                    .unwrap()
+                    .diagnostics()
+                    .iter()
+                    .map(|diagnostic| (
+                        diagnostic.diagnostic.code(),
+                        diagnostic.diagnostic.arguments[0].as_str(),
+                    ))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{source}"
+            );
+        }
     }
 
     #[test]
