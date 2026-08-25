@@ -18,6 +18,11 @@ use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes, UnionReduction},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+    classes::{
+        ClassMemberQueryPlan, authenticated_class_constructor_value,
+        execute_nongeneric_class_member_query, plan_nongeneric_class_member_query,
+        preflight_nongeneric_class_member_query,
+    },
     conditional_types::{
         ConditionalTypeBranches, ConditionalTypeInstantiation, ConditionalTypeRequest,
         conditional_check_is_assignable, conditional_operands_have_disjoint_primitive_domains,
@@ -718,6 +723,7 @@ struct TypeQueryPlan {
     recovered_missing_reference_diagnostics:
         BTreeMap<NodeRef, PlannedMissingTypeReferenceDiagnostic>,
     type_queries: BTreeMap<NodeRef, PlannedValueTypeQuery>,
+    class_type_queries: BTreeMap<SemanticSymbolId, ClassMemberQueryPlan>,
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
     unions: BTreeMap<NodeRef, PlannedUnionType>,
     intersections: BTreeMap<NodeRef, PlannedIntersectionType>,
@@ -9243,13 +9249,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Err(unsupported());
         };
         let declaration = *declaration;
+        let class_symbol = symbol_record.flags() == SymbolFlags::CLASS;
         if !declaration.is_for(node.arena, node.file)
             || symbol_record.value_declaration() != Some(declaration)
             || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
             || symbol_record.check_flags() != ts_binder::CheckFlags::NONE
             || symbol_record.parent().is_some()
-            || symbol_record.members().is_some()
-            || symbol_record.exports().is_some()
+            || !class_symbol
+                && (symbol_record.members().is_some() || symbol_record.exports().is_some())
             || symbol_record.export_symbol().is_some()
             || self.store.get_merged_symbol(symbol) != Some(symbol)
             || bound
@@ -9283,6 +9290,30 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
 
         let (source_node, type_) = match (&declaration_record.data, symbol_record.flags()) {
+            (NodeData::ClassDeclaration(_), SymbolFlags::CLASS)
+                if declaration_record.kind == SyntaxKind::ClassDeclaration
+                    && declaration_record.parent == Some(bound.source_file().node) =>
+            {
+                let class = plan_nongeneric_class_member_query(self.store, self.host, symbol)
+                    .map_err(|_| unsupported())?;
+                if class.symbol() != symbol || class.declaration() != declaration {
+                    return Err(invalid());
+                }
+                preflight_nongeneric_class_member_query(self.store, self.host, &class)
+                    .map_err(|_| invalid())?;
+                if value_type.is_some_and(|value| {
+                    authenticated_class_constructor_value(self.store, symbol)
+                        .is_none_or(|(actual, _)| actual != value)
+                }) {
+                    return Err(invalid());
+                }
+                if let Some(previous) = self.plan.class_type_queries.insert(symbol, class.clone())
+                    && previous != class
+                {
+                    return Err(invalid());
+                }
+                (None, value_type)
+            }
             (NodeData::VariableDeclaration(variable), SymbolFlags::BLOCK_SCOPED_VARIABLE)
                 if declaration_record.kind == SyntaxKind::VariableDeclaration =>
             {
@@ -23205,6 +23236,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Result<TypeId, DeclaredTypeError> {
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
         let query = plan.type_queries.get(&node).copied().ok_or_else(invalid)?;
+        let class_value = if let Some(class) = plan.class_type_queries.get(&query.symbol) {
+            let members = execute_nongeneric_class_member_query(self.store, self.host, class)
+                .map_err(|_| invalid())?;
+            let value = members.shells().value_type();
+            if authenticated_class_constructor_value(self.store, query.symbol)
+                .is_none_or(|(actual, _)| actual != value)
+            {
+                return Err(invalid());
+            }
+            Some(value)
+        } else {
+            None
+        };
         let source_type = match query.source_node {
             Some(source_node) => {
                 match self
@@ -23221,13 +23265,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
             None => None,
         };
-        let expected = query.type_.or(source_type).ok_or_else(invalid)?;
+        let expected = query
+            .type_
+            .or(source_type)
+            .or(class_value)
+            .ok_or_else(invalid)?;
         let value_type = self
             .store
             .value_symbol_links(query.symbol)
             .and_then(|links| links.resolved_type);
         if value_type.is_some_and(|type_| type_ != expected)
             || source_type.is_some_and(|type_| type_ != expected)
+            || class_value.is_some_and(|type_| type_ != expected)
             || value_type.is_none() && source_type != Some(expected)
             || self.store.type_payload(expected).is_none()
         {
@@ -42342,6 +42391,248 @@ mod tests {
         );
         assert_eq!(union_state(&fixture.store), warm);
         assert!(fixture.store.value_symbol_links(symbol).is_none());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn value_type_queries_materialize_authenticated_abstract_and_concrete_class_constructors() {
+        for (source, abstract_class) in [
+            (
+                concat!(
+                    "abstract class Model { abstract value: string; } ",
+                    "declare let result: typeof Model;",
+                ),
+                true,
+            ),
+            (
+                "class Model { value!: string; } declare let result: typeof Model;",
+                false,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let symbol = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Model");
+            let query = variable_type_node(&fixture, "result");
+            let name = type_query_name(&fixture, query);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let cold = function_store_state(&fixture.store);
+            {
+                let host = post_global_host(
+                    &fixture.parsed.arena,
+                    fixture.files.get(&fixture.file).unwrap(),
+                );
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .preflight_type_from_type_node(query)
+                .unwrap();
+            }
+            assert_eq!(function_store_state(&fixture.store), cold, "{source}");
+            assert!(fixture.store.declared_type_links(symbol).is_none());
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+
+            let value = query_node(&mut fixture, query, &mut diagnostics).unwrap();
+            let (authenticated, signature) =
+                authenticated_class_constructor_value(&fixture.store, symbol).unwrap();
+
+            assert_eq!(value, authenticated, "{source}");
+            assert_eq!(
+                fixture.store.signature(signature).unwrap().flags(),
+                SignatureFlags::CONSTRUCT
+                    | if abstract_class {
+                        SignatureFlags::ABSTRACT
+                    } else {
+                        SignatureFlags::NONE
+                    },
+                "{source}",
+            );
+            assert_eq!(
+                fixture.store.type_node_links(query),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(value),
+                    ..TypeNodeLinks::default()
+                }),
+                "{source}",
+            );
+            assert_eq!(
+                fixture.store.symbol_node_links(name),
+                Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(symbol),
+                }),
+                "{source}",
+            );
+
+            let warm = function_store_state(&fixture.store);
+            assert_eq!(query_node(&mut fixture, query, &mut diagnostics), Ok(value));
+            assert_eq!(function_store_state(&fixture.store), warm, "{source}");
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn abstract_class_constructor_union_preflights_every_provider_without_publication() {
+        let mut fixture = fixture(concat!(
+            "abstract class Abstract { abstract value: string; } ",
+            "class Concrete {} ",
+            "type Choice = typeof Abstract | typeof Concrete;",
+        ));
+        let abstract_class = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Abstract");
+        let concrete_class = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Concrete");
+        let union = alias_parts(&fixture, "Choice").2;
+        let queries = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeQuery).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(queries.len(), 2);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let cold = function_store_state(&fixture.store);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .preflight_type_from_type_node(union)
+        .unwrap();
+
+        assert_eq!(function_store_state(&fixture.store), cold);
+        for class in [abstract_class, concrete_class] {
+            assert!(fixture.store.declared_type_links(class).is_none());
+            assert!(fixture.store.value_symbol_links(class).is_none());
+        }
+        for query in queries {
+            assert!(fixture.store.type_node_links(query).is_none());
+            assert!(
+                fixture
+                    .store
+                    .symbol_node_links(type_query_name(&fixture, query))
+                    .is_none()
+            );
+        }
+        assert!(fixture.store.type_node_links(union).is_none());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn forged_class_constructor_type_queries_fail_before_class_or_query_publication() {
+        for corruption in 0..3 {
+            let mut fixture = fixture(concat!(
+                "abstract class Model { abstract value: string; } ",
+                "class Other {} ",
+                "declare let result: typeof Model;",
+            ));
+            let symbol = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Model");
+            let other = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Other");
+            let query = variable_type_node(&fixture, "result");
+            let name = type_query_name(&fixture, query);
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            match corruption {
+                0 => {
+                    assert!(fixture.store.set_type_node_links(
+                        query,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    assert!(fixture.store.set_symbol_node_links(
+                        name,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(symbol),
+                        },
+                    ));
+                }
+                1 => assert!(fixture.store.set_symbol_node_links(
+                    name,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(other),
+                    },
+                )),
+                2 => {
+                    let annotation = fixture
+                        .parsed
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            (record.kind == SyntaxKind::StringKeyword).then_some(NodeRef::new(
+                                fixture.parsed.arena.id(),
+                                fixture.file,
+                                node,
+                            ))
+                        })
+                        .unwrap();
+                    assert!(fixture.store.set_type_node_links(
+                        annotation,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                _ => unreachable!("only class type-query cache poison is visited"),
+            }
+            let state = function_store_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            assert!(
+                query_node(&mut fixture, query, &mut diagnostics).is_err(),
+                "corruption case {corruption}",
+            );
+            assert_eq!(
+                function_store_state(&fixture.store),
+                state,
+                "corruption case {corruption}",
+            );
+            assert!(fixture.store.declared_type_links(symbol).is_none());
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn forged_published_class_constructor_signatures_reject_later_type_queries_atomically() {
+        let mut fixture = fixture(concat!(
+            "abstract class Model { abstract value: string; } ",
+            "declare let first: typeof Model; ",
+            "declare let second: typeof Model;",
+        ));
+        let symbol = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Model");
+        let first = variable_type_node(&fixture, "first");
+        let second = variable_type_node(&fixture, "second");
+        let name = type_query_name(&fixture, second);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        query_node(&mut fixture, first, &mut diagnostics).unwrap();
+
+        let (_, signature) = authenticated_class_constructor_value(&fixture.store, symbol).unwrap();
+        assert!(
+            fixture
+                .store
+                .set_signature_flags(signature, SignatureFlags::CONSTRUCT)
+        );
+        let state = function_store_state(&fixture.store);
+
+        assert!(query_node(&mut fixture, second, &mut diagnostics).is_err());
+        assert_eq!(function_store_state(&fixture.store), state);
+        assert!(fixture.store.type_node_links(second).is_none());
+        assert!(fixture.store.symbol_node_links(name).is_none());
         assert!(diagnostics.is_empty());
     }
 

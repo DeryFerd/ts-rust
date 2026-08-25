@@ -21022,6 +21022,50 @@ pub(super) fn validate_class_heritage_members(
     }
 }
 
+/// Returns the real constructor value and signature of one completed class.
+pub(super) fn authenticated_class_constructor_value(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> Option<(TypeId, SignatureId)> {
+    let owner = store.symbol(symbol)?;
+    let [declaration] = owner.declarations()? else {
+        return None;
+    };
+    let instance = store.declared_type_links(symbol)?.declared_type?;
+    let value_links = store.value_symbol_links(symbol)?;
+    let value = value_links.resolved_type?;
+    let value_record = store.type_payload(value)?;
+    let TypeData::Object(object) = value_record.data() else {
+        return None;
+    };
+    let [signature] = object.structured.signatures.as_deref()? else {
+        return None;
+    };
+    let constructor = store.signature(*signature)?;
+    (owner.flags() == SymbolFlags::CLASS
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.value_declaration() == Some(*declaration)
+        && owner.parent().is_none()
+        && owner.export_symbol().is_none()
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && store.source_node_kind(*declaration) == Some(SyntaxKind::ClassDeclaration)
+        && value_links
+            == &(ValueSymbolLinks {
+                resolved_type: Some(value),
+                ..ValueSymbolLinks::default()
+            })
+        && value_record.flags() == TypeFlags::OBJECT
+        && value_record.object_flags() == (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+        && value_record.symbol() == Some(symbol)
+        && value_record.alias().is_none()
+        && object.structured.call_signature_count == 0
+        && constructor.flags().contains(SignatureFlags::CONSTRUCT)
+        && constructor.resolved_return_type() == Some(instance)
+        && validate_class_heritage_members(store, instance)
+            == ClassHeritageMembersValidation::Valid)
+        .then_some((value, *signature))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -23840,6 +23884,65 @@ mod tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    fn class_constructor_values_authenticate_abstract_and_concrete_signature_identity() {
+        for (source, abstract_class) in [
+            ("abstract class Model { abstract value: string; }", true),
+            ("class Model { value!: string; }", false),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            assert!(authenticated_class_constructor_value(&fixture.store, owner).is_none());
+
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+            let signature = members.default_construct_signature();
+            let value = members.shells().value_type();
+
+            assert_eq!(
+                authenticated_class_constructor_value(&fixture.store, owner),
+                Some((value, signature)),
+                "{source}",
+            );
+            assert_eq!(
+                fixture.store.signature(signature).unwrap().flags(),
+                SignatureFlags::CONSTRUCT
+                    | if abstract_class {
+                        SignatureFlags::ABSTRACT
+                    } else {
+                        SignatureFlags::NONE
+                    },
+                "{source}",
+            );
+
+            let forged = if abstract_class {
+                SignatureFlags::CONSTRUCT
+            } else {
+                SignatureFlags::CONSTRUCT | SignatureFlags::ABSTRACT
+            };
+            assert!(fixture.store.set_signature_flags(signature, forged));
+            let state = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(authenticated_class_constructor_value(&fixture.store, owner).is_none());
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                state,
+                "{source}",
+            );
+        }
     }
 
     #[test]
