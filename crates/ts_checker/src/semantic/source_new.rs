@@ -873,6 +873,7 @@ pub(super) fn plan_direct_default_new(
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
     if !global_array
+        && !(global_wrapper && identifier.text == "Boolean")
         && arguments
             .iter()
             .any(|argument| matches!(&argument.value, SourceNewArgumentValue::EmptyObject(_)))
@@ -6269,10 +6270,14 @@ mod tests {
         let library = global_boolean_constructor_library();
         assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
 
-        for (index, (argument, expected_boolean)) in
-            [("", None), ("true", Some(true)), ("false", Some(false))]
-                .into_iter()
-                .enumerate()
+        for (index, (argument, expected_boolean)) in [
+            ("", None),
+            ("true", Some(true)),
+            ("false", Some(false)),
+            ("{}", None),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let source = parse_source_file(&format!("const result = new Boolean({argument});"));
             assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
@@ -6355,6 +6360,16 @@ mod tests {
                         bootstrap.false_type
                     }),
                 );
+            } else if argument == "{}" {
+                let object = constructor_argument(&source, construction);
+                let object_type = store
+                    .type_node_links(object)
+                    .and_then(|links| links.resolved_type)
+                    .expect("Boolean's object argument must preserve its resolved object type");
+                assert!(matches!(
+                    store.type_payload(object_type).map(TypeRecord::data),
+                    Some(TypeData::Object(_)),
+                ));
             }
             assert!(context.diagnostics().is_empty());
             let warm = (
