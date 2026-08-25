@@ -6885,13 +6885,25 @@ fn plan_direct_typescript_const_target(
             statement_data.modifiers.as_ref(),
         )?
     };
+    let declaration_default_export = facts.is_declaration_file()
+        && !has_exact_export_modifiers
+        && declaration_default_const_export_is_exact(
+            arena,
+            bound,
+            store,
+            alias,
+            target,
+            declaration,
+            statement,
+            statement_data.modifiers.as_ref(),
+        )?;
     if statement_record.kind != SyntaxKind::VariableStatement
         || statement_record.parent != Some(bound.source_file().node)
         || statement_record.flags.0 != 0
         || statement_data.declaration_list != list.node
         || statement_data.flow_node.is_some()
         || statement_data.facts != 0
-        || !has_exact_export_modifiers
+        || !has_exact_export_modifiers && !declaration_default_export
     {
         return Err(unsupported(
             SourceImportUnsupported::TargetNotExportedConst(declaration),
@@ -6923,7 +6935,7 @@ fn plan_direct_typescript_const_target(
         name,
         &identifier.text,
         VariableBindingKind::Const,
-        true,
+        !declaration_default_export,
     )?;
     if inferred_declaration_literal {
         let initializer = NodeRef::new(
@@ -7112,6 +7124,107 @@ fn plan_direct_typescript_const_target(
         declaration,
         type_node,
     })
+}
+
+#[allow(clippy::too_many_arguments)] // Each argument authenticates one source-owned alias edge.
+fn declaration_default_const_export_is_exact(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    import_alias: SemanticSymbolId,
+    target: SemanticSymbolId,
+    declaration: NodeRef,
+    statement: NodeRef,
+    modifiers: Option<&ts_ast::ModifierList>,
+) -> Result<bool, SourceImportError> {
+    if modifiers.is_some()
+        && !has_exact_modifier_sequence(
+            arena,
+            bound,
+            store,
+            statement,
+            modifiers,
+            &[(SyntaxKind::DeclareKeyword, "declare")],
+        )?
+    {
+        return Ok(false);
+    }
+    let Some(module) = bound.symbol(bound.source_file()) else {
+        return Ok(false);
+    };
+    let Some(default) = store
+        .symbol(module)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get(InternalSymbolName::Default.as_ref()))
+    else {
+        return Ok(false);
+    };
+    let Some(default_record) = store.symbol(default) else {
+        return Ok(false);
+    };
+    let Some([export]) = default_record.declarations() else {
+        return Ok(false);
+    };
+    let export = *export;
+    let export_record = checked_node(arena, bound, store, export)?;
+    let NodeData::ExportAssignment(assignment) = &export_record.data else {
+        return Ok(false);
+    };
+    let expression = NodeRef::new(export.arena, export.file, assignment.expression);
+    let expression_record = checked_node(arena, bound, store, expression)?;
+    let NodeData::Identifier(identifier) = &expression_record.data else {
+        return Ok(false);
+    };
+    let Some(target_record) = store.symbol(target) else {
+        return Ok(false);
+    };
+    let Some(alias_links) = store.alias_symbol_links(import_alias) else {
+        return Ok(false);
+    };
+    let Some(default_links) = store.alias_symbol_links(default) else {
+        return Ok(false);
+    };
+    Ok(default_record.flags() == SymbolFlags::ALIAS
+        && default_record.check_flags() == CheckFlags::NONE
+        && default_record.name() == InternalSymbolName::Default.as_ref()
+        && default_record.value_declaration().is_none()
+        && default_record.members().is_none()
+        && default_record.exports().is_none()
+        && default_record.parent() == Some(module)
+        && default_record.export_symbol().is_none()
+        && store.get_merged_symbol(default) == Some(default)
+        && bound.symbol(export) == Some(default)
+        && export_record.kind == SyntaxKind::ExportAssignment
+        && export_record.flags.0 == 0
+        && export_record.parent == Some(bound.source_file().node)
+        && !assignment.is_export_equals
+        && assignment.flow_node.is_none()
+        && assignment.modifiers.is_none()
+        && assignment.symbol.is_none()
+        && assignment.type_.is_none()
+        && assignment.facts == 0
+        && expression_record.kind == SyntaxKind::Identifier
+        && expression_record.flags.0 == 0
+        && expression_record.parent == Some(export.node)
+        && identifier.flow_node.is_none()
+        && target_record.name().as_utf8() == Some(identifier.text.as_str())
+        && target_record.parent().is_none()
+        && bound.symbol(declaration) == Some(target)
+        && bound.local_symbol(declaration).is_none()
+        && bound
+            .locals(bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            == Some(target)
+        && alias_links.immediate_target == Some(default)
+        && alias_links.alias_target == AliasTargetState::Resolved(target)
+        && alias_links.type_only_declaration.is_none()
+        && default_links
+            .immediate_target
+            .is_none_or(|immediate| immediate == target)
+        && default_links.alias_target == AliasTargetState::Resolved(target)
+        && default_links.type_only_declaration.is_none())
 }
 
 fn published_spread_object_is_exact(
@@ -8016,6 +8129,7 @@ mod tests {
         global_types::initialize_global_library_types,
         instantiate::InstantiationLimits,
         jsdoc::JsDocType,
+        mapped_types::MappedTypeModifiers,
         module_resolution::{
             CanonicalModuleResolutionEntry, CanonicalModuleResolutionLookup,
             CanonicalModuleResolutionManifest, CanonicalModuleResolutionManifestInput,
@@ -8196,14 +8310,26 @@ mod tests {
         files: &[(FileId, &'arena ParseResult)],
         routes: &[Route],
     ) -> CanonicalCheckerContext<'arena> {
+        context_with_declaration_routes(files, routes, &[])
+    }
+
+    fn context_with_declaration_routes<'arena>(
+        files: &[(FileId, &'arena ParseResult)],
+        routes: &[Route],
+        declaration_files: &[usize],
+    ) -> CanonicalCheckerContext<'arena> {
         let mut binder = CanonicalBinder::new();
-        for &(file, parsed) in files {
+        for (index, &(file, parsed)) in files.iter().enumerate() {
             binder
                 .bind_source_file_with_facts(
                     &parsed.arena,
                     parsed.source_file,
                     file,
-                    facts(file, CanonicalModuleState::External),
+                    facts_with_declaration_flag(
+                        file,
+                        CanonicalModuleState::External,
+                        declaration_files.contains(&index),
+                    ),
                 )
                 .unwrap();
         }
@@ -8234,6 +8360,27 @@ mod tests {
             CanonicalModuleResolutionManifestInput::new(entries),
         )
         .unwrap()
+    }
+
+    fn context_exported_type(
+        context: &CanonicalCheckerContext<'_>,
+        file: FileId,
+        name: &str,
+    ) -> TypeId {
+        let (_, bound) = context.file(file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let exported = context
+            .store()
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source(name))
+            .unwrap_or_else(|| panic!("missing exported value {name}"));
+        context
+            .store()
+            .value_symbol_links(exported)
+            .and_then(|links| links.resolved_type)
+            .unwrap_or_else(|| panic!("missing type for exported value {name}"))
     }
 
     fn fixture(sources: &[&str], routes: &[Route]) -> Fixture {
@@ -12476,6 +12623,296 @@ mod tests {
         );
         assert!(context.diagnostics().is_empty());
 
+        let warm = store_state(context.store());
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(store_state(context.store()), warm);
+    }
+
+    #[test]
+    fn default_object_spreads_preserve_authenticated_imported_members() {
+        let provider = parsed(concat!(
+            "const source = { first: 'ready', shared: 1 }; ",
+            "export default { ...source, shared: true };",
+        ));
+        let consumer = parsed(concat!(
+            "import selected from './provider.js'; ",
+            "export const copied = { ...selected, added: 2 };",
+        ));
+        let provider_file = FileId::new(9_740);
+        let consumer_file = FileId::new(9_741);
+        let mut context = context_with_routes(
+            &[(provider_file, &provider), (consumer_file, &consumer)],
+            &[Route {
+                source: 1,
+                specifier: 0,
+                target: Some(0),
+            }],
+        );
+
+        context.check_source_file(provider_file).unwrap();
+        context.check_source_file(consumer_file).unwrap();
+
+        assert_eq!(
+            context
+                .type_to_string(context_exported_type(&context, consumer_file, "copied"))
+                .unwrap(),
+            "{ first: string; shared: boolean; added: number; }",
+        );
+        let warm = store_state(context.store());
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(store_state(context.store()), warm);
+    }
+
+    #[test]
+    fn namespace_object_member_spreads_preserve_nested_readonly_types() {
+        let provider = parsed("export const value = { nested: { label: 'ready' } } as const;");
+        let consumer = parsed(concat!(
+            "import * as namespace from './provider.js'; ",
+            "export const copied = { ...namespace.value } as const;",
+        ));
+        let provider_file = FileId::new(9_742);
+        let consumer_file = FileId::new(9_743);
+        let mut context = context_with_routes(
+            &[(provider_file, &provider), (consumer_file, &consumer)],
+            &[Route {
+                source: 1,
+                specifier: 0,
+                target: Some(0),
+            }],
+        );
+
+        context.check_source_file(provider_file).unwrap();
+        context.check_source_file(consumer_file).unwrap();
+
+        assert_eq!(
+            context
+                .type_to_string(context_exported_type(&context, consumer_file, "copied"))
+                .unwrap(),
+            "{ readonly nested: { readonly label: \"ready\"; }; }",
+        );
+        let warm = store_state(context.store());
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(store_state(context.store()), warm);
+    }
+
+    #[test]
+    fn package_declaration_object_exports_preserve_nested_readonly_tuples() {
+        let provider =
+            parsed("export declare const value: { readonly pair: readonly ['ready', 1] };");
+        let consumer = parsed(concat!(
+            "import { value } from 'package'; ",
+            "export const copied = { ...value } as const;",
+        ));
+        let provider_file = FileId::new(9_744);
+        let consumer_file = FileId::new(9_745);
+        let mut context = context_with_declaration_routes(
+            &[(provider_file, &provider), (consumer_file, &consumer)],
+            &[Route {
+                source: 1,
+                specifier: 0,
+                target: Some(0),
+            }],
+            &[0],
+        );
+
+        context.check_source_file(consumer_file).unwrap();
+
+        assert_eq!(
+            context
+                .type_to_string(context_exported_type(&context, consumer_file, "copied"))
+                .unwrap(),
+            "{ readonly pair: readonly [\"ready\", 1]; }",
+        );
+        let warm = store_state(context.store());
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(store_state(context.store()), warm);
+    }
+
+    #[test]
+    fn package_declaration_default_objects_preserve_nested_readonly_tuples() {
+        let provider = parsed(concat!(
+            "declare const value: { readonly pair: readonly ['ready', 1] }; ",
+            "export default value;",
+        ));
+        let consumer = parsed(concat!(
+            "import selected from 'package'; ",
+            "export const copied = { ...selected } as const;",
+        ));
+        let provider_file = FileId::new(9_746);
+        let consumer_file = FileId::new(9_747);
+        let mut context = context_with_declaration_routes(
+            &[(provider_file, &provider), (consumer_file, &consumer)],
+            &[Route {
+                source: 1,
+                specifier: 0,
+                target: Some(0),
+            }],
+            &[0],
+        );
+
+        context.check_source_file(consumer_file).unwrap();
+
+        assert_eq!(
+            context
+                .type_to_string(context_exported_type(&context, consumer_file, "copied"))
+                .unwrap(),
+            "{ readonly pair: readonly [\"ready\", 1]; }",
+        );
+        let warm = store_state(context.store());
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(store_state(context.store()), warm);
+    }
+
+    #[test]
+    fn package_default_aliases_authenticate_local_declaration_const_targets() {
+        let mut fixture = fixture_with_declaration_files(
+            &[
+                "import selected from 'package'; const copied = selected;",
+                concat!(
+                    "declare const value: { readonly pair: readonly ['ready', 1] }; ",
+                    "export default value;",
+                ),
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[1],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let node = identifier_initializer(&fixture, 0, "selected");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            node,
+            "selected",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let default = direct_export(&fixture, 1, "default");
+        let target = resolved[0].target_symbol;
+        let original_default_links = fixture.store.alias_symbol_links(default).unwrap().clone();
+        let mut poisoned_default_links = original_default_links.clone();
+        poisoned_default_links.immediate_target = Some(plan.bindings[0].alias_symbol);
+        assert!(
+            fixture
+                .store
+                .set_alias_symbol_links(default, poisoned_default_links)
+        );
+        let poisoned = store_state(&fixture.store);
+        assert!(matches!(
+            prepare_one(&mut fixture, &resolved[0], &read),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::TargetNotExportedConst(declaration)
+            )) if fixture.store.symbol(target).and_then(ts_binder::semantic::Symbol::value_declaration)
+                == Some(declaration)
+        ));
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .set_alias_symbol_links(default, original_default_links)
+        );
+
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+
+        assert_eq!(
+            display_type(&fixture, prepared.type_),
+            "{ readonly pair: readonly [\"ready\", 1]; }"
+        );
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared,
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn package_declaration_objects_preserve_enum_keyed_mapped_tuple_members() {
+        let provider = parsed(concat!(
+            "export declare enum Key { A = 'a', B = 'b' } ",
+            "export declare const value: { ",
+            "readonly lookup: { readonly [P in Key]: readonly [P, 1] } ",
+            "};",
+        ));
+        let consumer = parsed(concat!(
+            "import { value } from 'package'; ",
+            "export const copied = { ...value } as const;",
+        ));
+        let provider_file = FileId::new(9_748);
+        let consumer_file = FileId::new(9_749);
+        let mut context = context_with_declaration_routes(
+            &[(provider_file, &provider), (consumer_file, &consumer)],
+            &[Route {
+                source: 1,
+                specifier: 0,
+                target: Some(0),
+            }],
+            &[0],
+        );
+
+        context.check_source_file(consumer_file).unwrap();
+
+        let copied = context_exported_type(&context, consumer_file, "copied");
+        let lookup = context
+            .store_mut_for_test()
+            .resolved_own_property(copied, "lookup")
+            .unwrap()
+            .unwrap()
+            .type_;
+        let TypeData::Mapped(mapped) = context.store().type_payload(lookup).unwrap().data() else {
+            panic!("the imported lookup must retain its mapped identity")
+        };
+        let template = mapped.template_type.unwrap();
+        let tuple = context
+            .store()
+            .canonical_tuple_shape(template)
+            .unwrap()
+            .unwrap();
+        assert!(tuple.is_readonly());
+        assert!(matches!(
+            context
+                .store()
+                .type_payload(tuple.element_types()[0])
+                .map(TypeRecord::data),
+            Some(TypeData::TypeParameter(_))
+        ));
+        assert_eq!(
+            context.type_to_string(tuple.element_types()[1]).unwrap(),
+            "1",
+        );
+        let members = context
+            .store_mut_for_test()
+            .resolve_mapped_type_members(lookup, MappedTypeModifiers::INCLUDE_READONLY)
+            .unwrap();
+        assert_eq!(members.properties().len(), 2);
+        for (symbol, (name, expected_enum)) in members
+            .properties()
+            .iter()
+            .zip([("a", "Key.A"), ("b", "Key.B")])
+        {
+            let property = context.store().symbol(*symbol).unwrap();
+            assert_eq!(property.name().as_utf8(), Some(name));
+            assert!(property.check_flags().contains(CheckFlags::READONLY));
+            let key = context.store().mapped_symbol_links(*symbol).unwrap();
+            assert_eq!(
+                context.type_to_string(key.key_type.unwrap()).unwrap(),
+                expected_enum,
+            );
+        }
         let warm = store_state(context.store());
         context.recheck_source_file(consumer_file).unwrap();
         assert_eq!(store_state(context.store()), warm);
