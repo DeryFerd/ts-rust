@@ -107,6 +107,7 @@ impl CanonicalJsxRuntimeEvidence<'_> {
 /// `no_unchecked_indexed_access` includes `undefined` in unchecked index
 /// signature reads when strict null checking makes that distinction observable.
 /// `no_unused_locals` enables diagnostics for unreferenced local declarations.
+/// `no_unused_parameters` enables diagnostics for unread named parameters.
 /// `allow_unreachable_code` preserves whether unreachable-code diagnostics were
 /// explicitly enabled, explicitly suppressed, or left at their default.
 /// `preserve_const_enums` retains const enums as executable declarations.
@@ -130,6 +131,7 @@ pub struct CanonicalCheckerOptions {
     pub no_implicit_any: bool,
     pub no_unchecked_indexed_access: bool,
     pub no_unused_locals: bool,
+    pub no_unused_parameters: bool,
     pub allow_unreachable_code: Option<bool>,
     pub preserve_const_enums: bool,
     pub isolated_modules: bool,
@@ -153,6 +155,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             no_implicit_any: false,
             no_unchecked_indexed_access: false,
             no_unused_locals: false,
+            no_unused_parameters: false,
             allow_unreachable_code: None,
             preserve_const_enums: false,
             isolated_modules: false,
@@ -1020,6 +1023,14 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// unsupported source syntax, unavailable declared type or relation, type
     /// display boundary, or malformed literal cache.
     pub fn check_source_file(&mut self, file: FileId) -> Result<(), SourceCheckError> {
+        self.check_source_file_with_classic_jsx_factories(file, None)
+    }
+
+    fn check_source_file_with_classic_jsx_factories(
+        &mut self,
+        file: FileId,
+        classic_jsx_factories: Option<(&str, &str)>,
+    ) -> Result<(), SourceCheckError> {
         let Self {
             options,
             files,
@@ -1058,6 +1069,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             global_types,
             store,
             *options,
+            classic_jsx_factories,
             instantiation_session,
             &mut staged,
         );
@@ -1376,7 +1388,16 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         }
         let previous = self.options.jsx_runtime;
         self.options.jsx_runtime = runtime.mode();
-        let checked = self.check_source_file(file);
+        let classic_jsx_factories = match runtime {
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace,
+                fragment_factory_namespace,
+                ..
+            } => Some((factory_namespace, fragment_factory_namespace)),
+            _ => None,
+        };
+        let checked =
+            self.check_source_file_with_classic_jsx_factories(file, classic_jsx_factories);
         self.options.jsx_runtime = previous;
         checked?;
         source::merge_retry_diagnostics(&mut self.diagnostics, diagnostics);
@@ -3045,6 +3066,7 @@ mod tests {
         assert!(!defaults.no_implicit_any);
         assert!(!defaults.no_unchecked_indexed_access);
         assert!(!defaults.no_unused_locals);
+        assert!(!defaults.no_unused_parameters);
         assert_eq!(defaults.allow_unreachable_code, None);
         assert!(!defaults.preserve_const_enums);
         assert!(!defaults.should_preserve_const_enums());
@@ -3067,6 +3089,7 @@ mod tests {
         assert!(!options.no_implicit_any);
         assert!(!options.no_unchecked_indexed_access);
         assert!(!options.no_unused_locals);
+        assert!(!options.no_unused_parameters);
         assert_eq!(options.allow_unreachable_code, None);
         assert!(!options.preserve_const_enums);
         assert!(!options.should_preserve_const_enums());
@@ -3303,6 +3326,7 @@ mod tests {
             no_implicit_any: true,
             no_unchecked_indexed_access: true,
             no_unused_locals: true,
+            no_unused_parameters: true,
             allow_unreachable_code: Some(false),
             preserve_const_enums: true,
             isolated_modules: true,
@@ -3362,6 +3386,7 @@ mod tests {
         assert!(context.options().strict_function_types);
         assert!(context.options().no_unchecked_indexed_access);
         assert!(context.options().no_unused_locals);
+        assert!(context.options().no_unused_parameters);
         assert_eq!(context.options().allow_unreachable_code, Some(false));
         assert!(context.options().preserve_const_enums);
         assert!(context.options().should_preserve_const_enums());

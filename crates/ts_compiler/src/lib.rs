@@ -3986,6 +3986,7 @@ impl Program {
             no_implicit_any: self.options.no_implicit_any,
             no_unchecked_indexed_access: self.options.no_unchecked_indexed_access,
             no_unused_locals: self.options.no_unused_locals,
+            no_unused_parameters: self.options.no_unused_parameters,
             allow_unreachable_code: self.options.allow_unreachable_code,
             preserve_const_enums: self.options.preserve_const_enums,
             isolated_modules: self.options.isolated_modules,
@@ -10483,6 +10484,7 @@ mod tests {
             CompilerOptions {
                 lib: Some(vec!["es5".to_owned()]),
                 no_unused_locals: true,
+                no_unused_parameters: true,
                 allow_unreachable_code: Some(false),
                 preserve_const_enums: true,
                 isolated_modules: true,
@@ -10492,6 +10494,7 @@ mod tests {
                 let options = queries.context.options();
                 (
                     options.no_unused_locals,
+                    options.no_unused_parameters,
                     options.allow_unreachable_code,
                     options.preserve_const_enums,
                     options.isolated_modules,
@@ -10500,7 +10503,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(projected, Some((true, Some(false), true, true)));
+        assert_eq!(projected, Some((true, true, Some(false), true, true)));
         assert!(
             program.diagnostics().is_empty(),
             "{:?}",
