@@ -4378,7 +4378,7 @@ mod tests {
         let declarations = context
             .store()
             .symbol(owner)
-            .and_then(|owner| owner.members())
+            .and_then(ts_binder::semantic::Symbol::members)
             .and_then(|members| context.store().symbol_table(members))
             .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
             .and_then(|constructor| context.store().symbol(constructor))

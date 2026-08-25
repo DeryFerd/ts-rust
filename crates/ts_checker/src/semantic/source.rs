@@ -31145,10 +31145,10 @@ mod tests {
                     .and_then(|links| links.resolved_symbol),
                 Some(symbol),
             );
-            if property != "exact" {
-                assert_eq!(expected, number);
-            } else {
+            if property == "exact" {
                 assert_ne!(expected, number);
+            } else {
+                assert_eq!(expected, number);
             }
         }
         assert!(context.diagnostics().is_empty());
@@ -36878,7 +36878,7 @@ mod tests {
             }],
         );
         let value = variable_symbol(&context, &target, target_file, "foo");
-        let imported = source_import_alias_symbol(&context, &importer, importer_file, "foo");
+        let imported_alias = source_import_alias_symbol(&context, &importer, importer_file, "foo");
         let (_, target_bound) = context.file(target_file).unwrap();
         let target_module = target_bound.symbol(target_bound.source_file()).unwrap();
         let target_export = context
@@ -36904,8 +36904,8 @@ mod tests {
 
         for (alias, immediate) in [
             (target_export, value),
-            (imported, target_export),
-            (forwarded, imported),
+            (imported_alias, target_export),
+            (forwarded, imported_alias),
         ] {
             assert_eq!(
                 context

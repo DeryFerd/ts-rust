@@ -22911,7 +22911,7 @@ mod tests {
         let source_fixed = fixture
             .store
             .symbol(shape)
-            .and_then(|shape| shape.members())
+            .and_then(ts_binder::semantic::Symbol::members)
             .and_then(|members| fixture.store.symbol_table(members))
             .and_then(|members| members.get_source("fixed"))
             .unwrap();
