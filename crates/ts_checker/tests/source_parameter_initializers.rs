@@ -246,7 +246,7 @@ fn default_parameter_initializers_check_assignability_scope_calls_and_warm_state
 fn unsupported_initializer_and_arrow_body_retries_do_not_publish_partial_state() {
     for (index, source) in [
         "function unsupported(seed: number, value: number = true ? seed : 0): number { return value; }",
-        "const unsupported = (seed: number, value: number = seed): number => true ? value : seed;",
+        "const unsupported = (seed: number, value: number = seed): string => typeof value;",
     ]
     .into_iter()
     .enumerate()
