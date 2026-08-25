@@ -12453,6 +12453,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     let Ok(symbol) = self.resolve_uncached_type_reference_symbol(parent) else {
                         return false;
                     };
+                    if self
+                        .store
+                        .symbol(symbol)
+                        .and_then(|symbol| symbol.name().as_utf8())
+                        != Some(identifier.text.as_str())
+                    {
+                        return false;
+                    }
                     if identifier.text == "DetailedHTMLFactory" {
                         if arguments.nodes.len() != 2 || targets.len() > 1 {
                             return false;
