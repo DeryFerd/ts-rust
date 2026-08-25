@@ -5053,12 +5053,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 NodeRef::new(declaration.arena, declaration.file, alias.type_),
             )?
         {
-            let mut nodes = recovered
-                .access
-                .accesses()
-                .iter()
-                .copied()
-                .collect::<Vec<_>>();
+            let mut nodes = recovered.access.accesses().to_vec();
             nodes.extend([
                 recovered.root,
                 recovered.diagnostic,
@@ -14949,12 +14944,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         let error_type = self.error_type()?;
-        let mut nodes = recovered
-            .access
-            .accesses()
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
+        let mut nodes = recovered.access.accesses().to_vec();
         nodes.extend([
             recovered.root,
             recovered.diagnostic,

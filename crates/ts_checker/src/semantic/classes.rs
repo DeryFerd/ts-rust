@@ -227,6 +227,7 @@ enum ClassNamespaceVariablePlan {
 
 /// One annotated property, initialized property, or implicit-any ambient private field.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // Preserves independent upstream property flags.
 pub(super) struct ClassPropertyPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
@@ -1642,7 +1643,9 @@ fn validate_constructor_parameter_property_cache(
     if interface_type.is_some_and(|type_| {
         validate_resolved_declared_property_object(store, type_)
             != DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
-            || store.type_payload(type_).and_then(|record| record.symbol())
+            || store
+                .type_payload(type_)
+                .and_then(super::type_records::TypeRecord::symbol)
                 != Some(parameter.interface_symbol)
             || store.value_symbol_links(parameter.interface_property)
                 != Some(&ValueSymbolLinks {
@@ -5909,9 +5912,8 @@ fn property_initializer_fresh_literal_type(
     store: &CanonicalTypeMapperStore,
     property: &ClassPropertyPlan,
 ) -> Result<Option<TypeId>, ClassError> {
-    let initializer = match property.initializer_node {
-        Some(initializer) => initializer,
-        None => return Ok(None),
+    let Some(initializer) = property.initializer_node else {
+        return Ok(None);
     };
     let bootstrap = store
         .intrinsic_bootstrap()

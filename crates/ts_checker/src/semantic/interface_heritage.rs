@@ -1115,7 +1115,7 @@ fn authenticate_react_default_library_array_base(
         .is_some()
         || store
             .type_payload(target)
-            .and_then(|record| record.symbol())
+            .and_then(super::type_records::TypeRecord::symbol)
             .and_then(|symbol| store.get_merged_symbol(symbol))
             != Some(base)
     {

@@ -787,7 +787,7 @@ impl CanonicalTypeMapperStore {
             .type_payload(*brand)
             .and_then(|record| record.data().structured())
             .and_then(|structured| structured.properties.as_deref())
-            .is_none_or(|properties| properties.is_empty())
+            .is_none_or(<[ts_binder::SemanticSymbolId]>::is_empty)
         {
             return Err(IntersectionTypeError::UnsupportedConstituent(*brand));
         }

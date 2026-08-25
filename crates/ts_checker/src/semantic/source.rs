@@ -14236,12 +14236,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             {
                 return Err(unsupported());
             }
-            if !owner
+            if owner
                 .flags()
                 .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
             {
-                bootstrap.empty_object_type
-            } else {
                 let declarations = owner
                     .declarations()
                     .filter(|declarations| !declarations.is_empty())
@@ -14252,11 +14250,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 }) || !declarations.iter().any(|declaration| {
                     matches!(
                         host.node(*declaration).map(|node| (&node.kind, &node.data)),
-                        Some((SyntaxKind::ClassDeclaration, NodeData::ClassDeclaration(_)))
-                            | Some((
-                                SyntaxKind::InterfaceDeclaration,
-                                NodeData::InterfaceDeclaration(_)
-                            ))
+                        Some(
+                            (SyntaxKind::ClassDeclaration, NodeData::ClassDeclaration(_))
+                                | (
+                                    SyntaxKind::InterfaceDeclaration,
+                                    NodeData::InterfaceDeclaration(_)
+                                )
+                        )
                     )
                 }) {
                     return Err(unsupported());
@@ -14278,6 +14278,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                     declared
                 }
+            } else {
+                bootstrap.empty_object_type
             }
         } else {
             bootstrap.empty_object_type

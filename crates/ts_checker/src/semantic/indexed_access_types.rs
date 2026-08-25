@@ -250,7 +250,7 @@ pub(super) fn plan_recursive_indexed_access(
 ) -> Result<Option<RecursiveIndexedAccessPlan>, ConcreteIndexedAccessError> {
     let mut current = node;
     let mut accesses = Vec::new();
-    let mut indexes = Vec::new();
+    let mut index_nodes = Vec::new();
     let mut visited = HashSet::new();
 
     loop {
@@ -283,7 +283,7 @@ pub(super) fn plan_recursive_indexed_access(
         validate_existing_index_links(store, index, &key)?;
         validate_parent_links(store, current)?;
         accesses.push(current);
-        indexes.push(index);
+        index_nodes.push(index);
 
         match (&object_record.data, object_record.kind) {
             (NodeData::IndexedAccessTypeNode(_), SyntaxKind::IndexedAccessType) => {
@@ -307,7 +307,7 @@ pub(super) fn plan_recursive_indexed_access(
                 return Ok(Some(RecursiveIndexedAccessPlan {
                     root_reference: object,
                     accesses,
-                    indexes,
+                    indexes: index_nodes,
                 }));
             }
             _ => return Ok(None),
