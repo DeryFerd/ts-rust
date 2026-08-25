@@ -29,7 +29,7 @@ use super::{
         DirectCallApplicability, DirectCallError, DirectCallForm, DirectCallRequest,
         DirectCallUnsupported, resolve_direct_call,
     },
-    declared::{cached_ordinary_type_parameter_owner, execute_type_parameter},
+    declared::{cached_ordinary_type_parameter_owner, execute_type_parameter, type_list_key},
     formatter::{
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
         type_to_string_with_host_global_types_and_flags,
@@ -64,7 +64,8 @@ use super::{
     },
     source_imports::synthetic_source_import_origin,
     source_new::promise_executor_missing_argument_is_exact,
-    store::SourceNodeParent,
+    store::{CachedSignatureLookup, SourceNodeParent},
+    tuple_types::CanonicalTupleTypeRequest,
     type_nodes::CanonicalTypeQuery,
     type_records::{TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -1994,6 +1995,265 @@ fn check_authenticated_array_callback_call(
         return Err(SourceCheckError::Call(plan.node));
     }
     publish_call_links(store, plan.node, signature.signature, return_type)?;
+    Ok(Some(CheckedSourceCall { return_type }))
+}
+
+#[allow(clippy::too_many_arguments)] // Factory calls retain their source and diagnostic context.
+fn check_authenticated_generic_object_factory_call(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &SourceCallPlan,
+    callee_type: TypeId,
+    argument_types: &[TypeId],
+    explicit_type_arguments: &[TypeId],
+) -> Result<Option<CheckedSourceCall>, SourceCheckError> {
+    let ([type_argument], [argument_type]) = (explicit_type_arguments, argument_types) else {
+        return Ok(None);
+    };
+    let PlannedExpressionKind::Property(property) = &plan.callee.unparenthesized().kind else {
+        return Ok(None);
+    };
+    let PlannedExpressionKind::Identifier(receiver) = &property.receiver.unparenthesized().kind
+    else {
+        return Ok(None);
+    };
+    let Some(method) = store.type_payload(callee_type).and_then(TypeRecord::symbol) else {
+        return Ok(None);
+    };
+    let method_record = store
+        .symbol(method)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let Some(name @ ("entries" | "values")) = method_record.name().as_utf8() else {
+        return Ok(None);
+    };
+    let name = name.to_owned();
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let globals = store
+        .symbol_table(bootstrap.globals)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let Some(object) = globals
+        .get_source("Object")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(None);
+    };
+    if receiver.value_symbol != object {
+        return Ok(None);
+    }
+    let constructor = globals
+        .get_source("ObjectConstructor")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let receiver_type = store
+        .type_node_links(property.receiver.node)
+        .and_then(|links| links.resolved_type)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let string = bootstrap.string_type;
+    if method_record.flags() != SymbolFlags::METHOD
+        || store.authenticated_interface_method_owner(method) != Some((constructor, receiver_type))
+        || store.value_symbol_links(method)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(callee_type),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+
+    let StoredCallableSetValidation::Valid { projection, .. } =
+        validate_stored_callable_set(store, callee_type)
+    else {
+        return Err(SourceCheckError::Call(plan.node));
+    };
+    if !projection.construct_signatures.is_empty() {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+    let Some(generic) = projection.call_signatures.iter().find(|candidate| {
+        store
+            .signature(candidate.signature)
+            .is_some_and(|signature| !signature.type_parameters().is_empty())
+    }) else {
+        return Ok(None);
+    };
+    let signature = store
+        .signature(generic.signature)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let ([type_parameter], [parameter]) = (signature.type_parameters(), signature.parameters())
+    else {
+        return Err(SourceCheckError::Call(plan.node));
+    };
+    let (type_parameter, parameter) = (*type_parameter, *parameter);
+    if generic.parameters.as_slice() != [type_parameter]
+        || generic.min_argument_count != 1
+        || generic.rest_parameter.is_some()
+        || signature.flags() != SignatureFlags::NONE
+        || signature.this_parameter().is_some()
+        || signature.min_argument_count() != 1
+    {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+    let return_template = generic
+        .return_type
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let template_array = store
+        .canonical_array_reference(global_types, return_template)
+        .map_err(|_| SourceCheckError::Call(plan.node))?
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    if template_array.readonly || template_array.array_literal {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+    let tuple_infos = if name == "entries" {
+        let tuple = store
+            .canonical_tuple_shape(template_array.element_type)
+            .map_err(|_| SourceCheckError::Call(plan.node))?
+            .ok_or(SourceCheckError::Call(plan.node))?;
+        if tuple.element_types() != [string, type_parameter]
+            || tuple.min_length() != 2
+            || tuple.fixed_length() != 2
+            || tuple.is_readonly()
+        {
+            return Err(SourceCheckError::Call(plan.node));
+        }
+        Some(tuple.element_infos().to_vec())
+    } else {
+        if template_array.element_type != type_parameter {
+            return Err(SourceCheckError::Call(plan.node));
+        }
+        None
+    };
+
+    let type_arguments = [*type_argument];
+    let cache_key = type_list_key(&type_arguments);
+    let cached = match store.cached_signature(generic.signature, cache_key, &type_arguments) {
+        CachedSignatureLookup::Missing => None,
+        CachedSignatureLookup::Hit(signature) => Some(signature),
+        CachedSignatureLookup::Invalid | CachedSignatureLookup::HashCollision(_) => {
+            return Err(SourceCheckError::Call(plan.node));
+        }
+    };
+    let element_type = if let Some(infos) = tuple_infos {
+        store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[string, *type_argument],
+                &infos,
+                false,
+            ))
+            .map_err(|_| SourceCheckError::Call(plan.node))?
+    } else {
+        *type_argument
+    };
+    let return_type = store
+        .create_canonical_array_type(global_types, element_type, false)
+        .map_err(|_| SourceCheckError::Call(plan.node))?;
+
+    let instantiated = if let Some(instantiated) = cached {
+        let record = store
+            .signature(instantiated)
+            .ok_or(SourceCheckError::Call(plan.node))?;
+        let mapper = record.mapper().ok_or(SourceCheckError::Call(plan.node))?;
+        let [mapped_parameter] = record.parameters() else {
+            return Err(SourceCheckError::Call(plan.node));
+        };
+        if record.target() != Some(generic.signature)
+            || record.resolved_return_type() != Some(return_type)
+            || !record.type_parameters().is_empty()
+            || record.min_argument_count() != 1
+            || store.type_mapper_has_exact_endpoints(mapper, &[type_parameter], &type_arguments)
+                != Some(true)
+            || store.value_symbol_links(*mapped_parameter)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(*type_argument),
+                    target: Some(parameter),
+                    mapper: Some(mapper),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return Err(SourceCheckError::Call(plan.node));
+        }
+        instantiated
+    } else {
+        if !store.try_reserve_mappers(1)
+            || !store.try_reserve_checker_symbol_allocations(1, 0)
+            || !store.try_reserve_value_symbol_links(1)
+            || !store.try_reserve_signatures(1)
+            || !store.try_reserve_cached_signatures(1)
+        {
+            return Err(SourceCheckError::Call(plan.node));
+        }
+        let mapper = store
+            .new_simple_type_mapper(type_parameter, *type_argument)
+            .ok_or(SourceCheckError::Call(plan.node))?;
+        let instantiated = store
+            .instantiate_signature_ex(generic.signature, mapper, true)
+            .map_err(|_| SourceCheckError::Call(plan.node))?;
+        let [mapped_parameter] = store
+            .signature(instantiated)
+            .ok_or(SourceCheckError::Call(plan.node))?
+            .parameters()
+        else {
+            return Err(SourceCheckError::Call(plan.node));
+        };
+        let mapped_parameter = *mapped_parameter;
+        if !store.set_value_symbol_links(
+            mapped_parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(*type_argument),
+                target: Some(parameter),
+                mapper: Some(mapper),
+                ..ValueSymbolLinks::default()
+            },
+        ) || !store.set_signature_resolved_return_type(instantiated, Some(return_type))
+            || !store.set_cached_signature(
+                generic.signature,
+                cache_key,
+                Box::new(type_arguments),
+                instantiated,
+            )
+        {
+            return Err(SourceCheckError::Call(plan.node));
+        }
+        instantiated
+    };
+
+    if preflight_call_publication(store, plan.node, return_type)?
+        .is_some_and(|existing| existing != instantiated)
+    {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+    if !store
+        .is_type_assignable_to_with_global_types_and_strict_function_types(
+            *argument_type,
+            *type_argument,
+            global_types,
+            options.strict_function_types,
+        )
+        .map_err(SourceCheckError::RelationUnavailable)?
+    {
+        let argument = plan
+            .arguments
+            .first()
+            .ok_or(SourceCheckError::Call(plan.node))?;
+        for diagnostic in prepare_source_argument_mismatch_diagnostics(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            argument,
+            *argument_type,
+            *type_argument,
+        )? {
+            merge_retry_diagnostic(diagnostics, diagnostic);
+        }
+    }
+    publish_call_links(store, plan.node, instantiated, return_type)?;
     Ok(Some(CheckedSourceCall { return_type }))
 }
 
@@ -5658,6 +5918,22 @@ pub(super) fn check_direct_source_call(
             .as_ref()
             .map(|type_arguments| type_arguments.nodes.as_slice()),
     )?;
+    if let Some(type_arguments) = explicit_type_arguments.as_deref()
+        && let Some(checked) = check_authenticated_generic_object_factory_call(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            plan,
+            callee_type,
+            argument_types,
+            type_arguments,
+        )?
+    {
+        return Ok(checked);
+    }
     let mut retried_signatures = HashSet::new();
     let mut retried_members = HashSet::new();
     let mut retried_properties = HashSet::new();
