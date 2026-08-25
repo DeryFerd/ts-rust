@@ -5531,11 +5531,59 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         result
     }
 
+    /// Authenticates one React namespace export without publishing semantic state.
+    fn authenticated_react_interface_namespace(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<Option<SemanticSymbolId>, DeclaredTypeError> {
+        let Some(namespace) = self.store.get_parent_of_symbol(symbol) else {
+            return Ok(None);
+        };
+        let namespace_record =
+            self.store
+                .symbol(namespace)
+                .ok_or(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::SymbolNotOwned(namespace),
+                ))?;
+        if namespace_record.name().as_utf8() != Some("React") {
+            return Ok(None);
+        }
+        let owner = self
+            .store
+            .symbol(symbol)
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::SymbolNotOwned(symbol),
+            ))?;
+        if !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+            || namespace_record.check_flags() != CheckFlags::NONE
+            || self.store.get_merged_symbol(namespace) != Some(namespace)
+            || namespace_record
+                .exports()
+                .and_then(|exports| self.store.symbol_table(exports))
+                .and_then(|exports| exports.get(owner.name()))
+                .and_then(|export| self.store.get_merged_symbol(export))
+                != Some(symbol)
+        {
+            let node = owner
+                .declarations()
+                .and_then(|declarations| declarations.first())
+                .copied()
+                .ok_or(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::MissingDeclarations(symbol),
+                ))?;
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol },
+            ));
+        }
+        Ok(Some(namespace))
+    }
+
     fn has_generic_interface_heritage(
         &self,
         symbol: SemanticSymbolId,
     ) -> Result<bool, DeclaredTypeError> {
-        if self.store.get_parent_of_symbol(symbol).is_some() {
+        let react_namespace = self.authenticated_react_interface_namespace(symbol)?;
+        if self.store.get_parent_of_symbol(symbol).is_some() && react_namespace.is_none() {
             return Ok(false);
         }
         let declarations = self
@@ -5577,7 +5625,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         let NodeData::ExpressionWithTypeArguments(base) = &record.data else {
                             return Ok(false);
                         };
-                        if base.type_arguments.is_none() {
+                        if base.type_arguments.is_none() && react_namespace.is_none() {
                             return Ok(false);
                         }
                     }
@@ -5588,7 +5636,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(false)
     }
 
-    /// Plans generic bases without demanding either interface's own members.
+    /// Plans interface heritage while keeping generic interface members lazy.
     fn plan_generic_interface_heritage(
         &mut self,
         symbol: SemanticSymbolId,
@@ -5607,6 +5655,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let Some(heritage) = planned.heritage.as_ref() else {
             return Ok(());
         };
+        let react_namespace = self.authenticated_react_interface_namespace(symbol)?;
         let bases = heritage.bases.clone();
         self.plan.generic_interfaces.insert(symbol, planned);
         if !self.planning_interfaces.insert(symbol) {
@@ -5620,7 +5669,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
         let result = (|| {
             for base in bases {
-                if base.kind != DirectInterfaceBaseKind::Interface || base.type_arguments.is_empty()
+                if base.kind != DirectInterfaceBaseKind::Interface
+                    || base.type_arguments.is_empty() && react_namespace.is_none()
                 {
                     return Err(type_node_unavailable(
                         TypeNodeUnavailable::GenericReferenceUnsupported {
@@ -5649,6 +5699,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             symbol: base.symbol,
                         },
                     ));
+                }
+                if base.type_arguments.is_empty() {
+                    if self.authenticated_react_interface_namespace(base.symbol)? != react_namespace
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::GenericReferenceUnsupported {
+                                node: base.node,
+                                symbol: base.symbol,
+                            },
+                        ));
+                    }
+                    self.plan_property_interface(base.symbol)?;
+                    continue;
                 }
                 if self.has_generic_interface_heritage(base.symbol)? {
                     self.plan_generic_interface_heritage(base.symbol)?;
@@ -18281,13 +18344,28 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             for argument in &base.type_arguments {
                 arguments.push(self.execute_type_node(*argument, plan, prepared)?);
             }
-            let reference = create_direct_generic_reference(
-                self.store,
-                base_target,
-                &arguments,
-                ObjectFlags::NONE,
-            )
-            .map_err(|_| invalid())?;
+            let reference = if arguments.is_empty() {
+                if !matches!(
+                    object_members::validate_resolved_declared_property_object(
+                        self.store,
+                        base_target,
+                    ),
+                    object_members::DeclaredPropertyObjectValidation::Valid(
+                        object_members::DeclaredPropertyObjectProof::Interface,
+                    )
+                ) {
+                    return Err(invalid());
+                }
+                base_target
+            } else {
+                create_direct_generic_reference(
+                    self.store,
+                    base_target,
+                    &arguments,
+                    ObjectFlags::NONE,
+                )
+                .map_err(|_| invalid())?
+            };
             if reference == target || bases.contains(&reference) {
                 return Err(invalid());
             }
@@ -33561,6 +33639,302 @@ mod tests {
             Ok(target),
         );
         assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both React heritage shapes share one cold and warm cache proof.
+    fn react_generic_heritage_preserves_nongeneric_and_mixed_base_identities() {
+        let mut fixture = fixture(concat!(
+            "declare namespace React { ",
+            "interface Attributes { key: string; } ",
+            "interface AriaAttributes { label: string; } ",
+            "interface DOMAttributes<T> { target: T; } ",
+            "interface ClassAttributes<T> extends Attributes { ref: T; } ",
+            "interface HTMLAttributes<T> extends AriaAttributes, DOMAttributes<T> ",
+            "{ id: T; } ",
+            "interface HTMLAttributes<T> { title: boolean; } ",
+            "} ",
+            "type ClassProps = React.ClassAttributes<number>; ",
+            "type HtmlProps = React.HTMLAttributes<number>;",
+        ));
+        let attributes = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Attributes");
+        let aria = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "AriaAttributes");
+        let dom = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "DOMAttributes");
+        let class = named_symbol(
+            &fixture,
+            SyntaxKind::InterfaceDeclaration,
+            "ClassAttributes",
+        );
+        let html = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "HTMLAttributes");
+        let class_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "ClassProps");
+        let html_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "HtmlProps");
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let class_reference = query_declared(
+            &mut fixture,
+            class_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let html_reference = query_declared(
+            &mut fixture,
+            html_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let class_target = fixture
+            .store
+            .declared_type_links(class)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let html_target = fixture
+            .store
+            .declared_type_links(html)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        for (reference, target) in [
+            (class_reference, class_target),
+            (html_reference, html_target),
+        ] {
+            let reference = validate_direct_generic_reference(&fixture.store, reference).unwrap();
+            assert_eq!(reference.target, target);
+            assert_eq!(reference.type_arguments, [number]);
+        }
+
+        let attributes_type = fixture
+            .store
+            .declared_type_links(attributes)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let aria_type = fixture
+            .store
+            .declared_type_links(aria)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let dom_target = fixture
+            .store
+            .declared_type_links(dom)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(class_interface) =
+            fixture.store.type_payload(class_target).unwrap().data()
+        else {
+            panic!("ClassAttributes must preserve its generic interface target")
+        };
+        assert_eq!(
+            class_interface.resolved_base_types.as_deref(),
+            Some([attributes_type].as_slice())
+        );
+        assert!(!class_interface.declared_members_resolved);
+        let TypeData::Interface(html_interface) =
+            fixture.store.type_payload(html_target).unwrap().data()
+        else {
+            panic!("HTMLAttributes must preserve its merged generic interface target")
+        };
+        let [nongeneric, generic] = html_interface.resolved_base_types.as_deref().unwrap() else {
+            panic!("HTMLAttributes must retain both bases in declaration order")
+        };
+        assert_eq!(*nongeneric, aria_type);
+        let inherited = validate_direct_generic_reference(&fixture.store, *generic).unwrap();
+        assert_eq!(inherited.target, dom_target);
+        assert_eq!(
+            inherited.type_arguments,
+            validate_direct_generic_reference(&fixture.store, html_target)
+                .unwrap()
+                .type_arguments,
+        );
+        assert!(!html_interface.declared_members_resolved);
+        for base in [attributes_type, aria_type] {
+            assert_eq!(
+                object_members::validate_resolved_declared_property_object(&fixture.store, base),
+                object_members::DeclaredPropertyObjectValidation::Valid(
+                    object_members::DeclaredPropertyObjectProof::Interface,
+                ),
+            );
+        }
+
+        let warm = store_state(&fixture.store);
+        for (symbol, expected) in [
+            (class_alias, class_reference),
+            (html_alias, html_reference),
+            (class, class_target),
+            (html, html_target),
+        ] {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected),
+            );
+        }
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn ambient_react_module_generic_heritage_retains_its_namespace_owner() {
+        let mut fixture = fixture(concat!(
+            "declare module 'react' { ",
+            "export = React; ",
+            "namespace React { ",
+            "interface Attributes { key: string; } ",
+            "interface ClassAttributes<T> extends Attributes { ref: T; } ",
+            "} }",
+        ));
+        let attributes = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Attributes");
+        let class = named_symbol(
+            &fixture,
+            SyntaxKind::InterfaceDeclaration,
+            "ClassAttributes",
+        );
+        let namespace = fixture.store.get_parent_of_symbol(class).unwrap();
+        assert_eq!(
+            fixture.store.symbol(namespace).unwrap().name().as_utf8(),
+            Some("React"),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let target = query_declared(
+            &mut fixture,
+            class,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let base = fixture
+            .store
+            .declared_type_links(attributes)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(target).unwrap().data()
+        else {
+            panic!("the ambient React export must retain its generic interface identity")
+        };
+        assert_eq!(
+            interface.resolved_base_types.as_deref(),
+            Some([base].as_slice())
+        );
+        assert!(!interface.declared_members_resolved);
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                class,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(target),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn react_generic_heritage_rejects_forged_exports_and_poisoned_warm_bases() {
+        let mut fixture = fixture(concat!(
+            "declare namespace React { ",
+            "interface Attributes { key: string; } ",
+            "interface ClassAttributes<T> extends Attributes { ref: T; } ",
+            "}",
+        ));
+        let attributes = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Attributes");
+        let class = named_symbol(
+            &fixture,
+            SyntaxKind::InterfaceDeclaration,
+            "ClassAttributes",
+        );
+        let namespace = fixture.store.get_parent_of_symbol(class).unwrap();
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let target = query_declared(
+            &mut fixture,
+            class,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let original = fixture
+            .store
+            .type_payload(target)
+            .and_then(|record| match record.data() {
+                TypeData::Interface(interface) => interface.resolved_base_types.clone(),
+                _ => None,
+            })
+            .unwrap();
+
+        for (name, replacement, expected) in [
+            ("ClassAttributes", attributes, class),
+            ("Attributes", class, attributes),
+        ] {
+            assert_eq!(
+                fixture
+                    .store
+                    .insert_symbol(exports, EscapedName::source(name), replacement),
+                Some(Some(expected)),
+            );
+            let poisoned = store_state(&fixture.store);
+            assert!(
+                query_declared(
+                    &mut fixture,
+                    class,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .is_err(),
+            );
+            assert_eq!(store_state(&fixture.store), poisoned);
+            assert_eq!(
+                fixture
+                    .store
+                    .insert_symbol(exports, EscapedName::source(name), expected),
+                Some(Some(replacement)),
+            );
+        }
+
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(
+            fixture
+                .store
+                .set_interface_base_resolution(target, true, None, Some(vec![wrong])),
+        );
+        let poisoned = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                class,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                    symbol: class,
+                    declared_type: target,
+                },
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert!(
+            fixture
+                .store
+                .set_interface_base_resolution(target, true, None, Some(original),)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                class,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(target),
+        );
         assert!(diagnostics.is_empty());
     }
 
