@@ -4403,9 +4403,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             }
 
-            self.prior_variables = prior_variables.clone();
-            self.readable_variables = readable_variables.clone();
-            self.assignable_mutable_variables = mutable_variables.clone();
+            self.prior_variables.clone_from(&prior_variables);
+            self.readable_variables.clone_from(&readable_variables);
+            self.assignable_mutable_variables
+                .clone_from(&mutable_variables);
             for variable in locals
                 .iter()
                 .filter(|variable| variable.binding == VariableBindingKind::Var)
@@ -10673,9 +10674,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             }
 
-            self.prior_variables = prior_variables.clone();
-            self.readable_variables = readable_variables.clone();
-            self.assignable_mutable_variables = mutable_variables.clone();
+            self.prior_variables.clone_from(&prior_variables);
+            self.readable_variables.clone_from(&readable_variables);
+            self.assignable_mutable_variables
+                .clone_from(&mutable_variables);
             for variable in locals
                 .iter()
                 .filter(|variable| variable.binding == VariableBindingKind::Var)

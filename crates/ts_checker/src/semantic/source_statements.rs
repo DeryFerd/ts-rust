@@ -1124,8 +1124,7 @@ pub(super) fn plan_source_for_in_statement_syntax(
         bound,
         store,
         statement,
-        source,
-        source,
+        (source, source),
         SourceControlLoopKind::ForIn,
         None,
     )
@@ -1144,8 +1143,7 @@ pub(super) fn plan_source_labeled_for_in_statement_syntax(
         bound,
         store,
         statement,
-        parent,
-        bound.source_file(),
+        (parent, bound.source_file()),
         SourceControlLoopKind::ForIn,
         None,
     )
@@ -1189,11 +1187,11 @@ fn plan_source_scoped_iteration_statement_syntax(
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
     statement: NodeRef,
-    parent: NodeRef,
-    container: NodeRef,
+    parent_and_container: (NodeRef, NodeRef),
     expected_kind: SourceControlLoopKind,
     callable: Option<&SourceCallablePlan>,
 ) -> Result<SourceForInStatementSyntax, SourceFunctionStatementsError> {
+    let (parent, container) = parent_and_container;
     let control = plan_source_control_loop_syntax(arena, bound, statement, parent)?;
     if control.kind != expected_kind
         || !matches!(
@@ -6524,8 +6522,7 @@ impl SyntaxPlanner<'_> {
             self.bound,
             self.store,
             statement,
-            body,
-            declaration,
+            (body, declaration),
             expected_kind,
             Some(self.callable),
         )?;
