@@ -3,15 +3,17 @@
 //! This is the first exact branch of pinned `inferTypes` used by generic call
 //! resolution. When the target is the inference context's type parameter,
 //! upstream records the source type itself as a covariant or authenticated
-//! contravariant candidate. The bounded Rust branch accepts primitive,
-//! literal, unique-symbol, anonymous
-//! primitive-union, and exact resolved nongeneric declared-property-object
+//! contravariant candidate. The bounded Rust branch accepts primitive, literal,
+//! unique-symbol, anonymous primitive-union, and exact resolved nongeneric
+//! declared-property-object
 //! candidates, authenticated template-literal patterns, fixed tuples, and
 //! canonical Array/ReadonlyArray references when the caller retains the
 //! authoritative global targets.
 //! Declared objects and tuples are admitted only as root candidates or nested
 //! array/tuple elements, not as union constituents. The branch preserves
 //! candidates that do not require widening, including fresh literals.
+//! Authenticated internal placeholders are skipped so binding patterns cannot
+//! become the only source of a public type argument.
 //! Widening sentinels remain a typed boundary until the exact final
 //! `getWidenedType` step is available.
 
@@ -92,6 +94,7 @@ pub(super) enum NakedTypeInferenceError {
     RecursiveTupleCandidate(TypeId),
     MalformedDeclaredPropertyObject(TypeId),
     UnsupportedCandidate(TypeId),
+    NonInferrableCandidate(TypeId),
     RequiresWidening(TypeId),
     AliasedUnion(TypeId),
     OriginUnion(TypeId),
@@ -106,6 +109,151 @@ pub(super) enum NakedTypeInferenceError {
     },
 }
 
+/// Recognizes authenticated internal placeholders that upstream inference skips.
+///
+/// Array and tuple markers are accepted only when their canonical caches prove
+/// that the non-inferrable flag was propagated from an exact nested marker.
+pub(super) fn is_non_inferrable_inference_source(
+    store: &CanonicalTypeMapperStore,
+    candidate: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, NakedTypeInferenceError> {
+    non_inferrable_inference_source_worker(store, candidate, array_targets, &mut HashSet::new())
+}
+
+#[allow(clippy::too_many_lines)] // Authenticate sentinels and their propagated containers together.
+fn non_inferrable_inference_source_worker(
+    store: &CanonicalTypeMapperStore,
+    candidate: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    active_candidates: &mut HashSet<TypeId>,
+) -> Result<bool, NakedTypeInferenceError> {
+    let record = store
+        .type_payload(candidate)
+        .ok_or(NakedTypeInferenceError::InvalidCandidate(candidate))?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(NakedTypeInferenceError::InvalidCandidate(candidate))?;
+    let intrinsic_marker = if candidate == bootstrap.auto_type {
+        Some((TypeFlags::ANY, ObjectFlags::NON_INFERRABLE_TYPE))
+    } else if candidate == bootstrap.silent_never_type {
+        Some((TypeFlags::NEVER, ObjectFlags::NON_INFERRABLE_TYPE))
+    } else if candidate == bootstrap.non_inferrable_any_type {
+        Some((TypeFlags::ANY, ObjectFlags::CONTAINS_WIDENING_TYPE))
+    } else {
+        None
+    };
+    if let Some((flags, object_flags)) = intrinsic_marker {
+        return if record.flags() == flags
+            && record.object_flags() == object_flags
+            && record.symbol().is_none()
+            && record.alias().is_none()
+            && matches!(record.data(), TypeData::Intrinsic(_))
+        {
+            Ok(true)
+        } else {
+            Err(NakedTypeInferenceError::InvalidCandidate(candidate))
+        };
+    }
+    if candidate == bootstrap.any_function_type {
+        return if record.flags() == TypeFlags::OBJECT
+            && record.object_flags()
+                == ObjectFlags::ANONYMOUS
+                    | ObjectFlags::MEMBERS_RESOLVED
+                    | ObjectFlags::NON_INFERRABLE_TYPE
+            && record.symbol().is_none()
+            && record.alias().is_none()
+            && matches!(
+                record.data(),
+                TypeData::Object(object)
+                    if object.target.is_none()
+                        && object.mapper.is_none()
+                        && object.structured.members.is_none()
+                        && object.structured.properties.is_none()
+                        && object.structured.signatures.is_none()
+                        && object.structured.call_signature_count == 0
+                        && object.structured.index_infos.is_none()
+            ) {
+            Ok(true)
+        } else {
+            Err(NakedTypeInferenceError::InvalidCandidate(candidate))
+        };
+    }
+    if !record
+        .object_flags()
+        .contains(ObjectFlags::NON_INFERRABLE_TYPE)
+    {
+        return Ok(false);
+    }
+
+    if let Some(targets) = array_targets {
+        match store.canonical_array_reference_with_targets(targets, candidate) {
+            Ok(Some(reference)) => {
+                if !active_candidates.insert(candidate) {
+                    return Err(NakedTypeInferenceError::RecursiveArrayCandidate(candidate));
+                }
+                let blocked = non_inferrable_inference_source_worker(
+                    store,
+                    reference.element_type,
+                    Some(targets),
+                    active_candidates,
+                );
+                active_candidates.remove(&candidate);
+                return if blocked? {
+                    Ok(true)
+                } else {
+                    Err(NakedTypeInferenceError::InvalidCanonicalArrayCandidate {
+                        candidate,
+                        error: ArrayTypeError::InvalidReference(candidate),
+                    })
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(NakedTypeInferenceError::InvalidCanonicalArrayCandidate {
+                    candidate,
+                    error,
+                });
+            }
+        }
+    }
+
+    match store.canonical_tuple_shape(candidate) {
+        Ok(Some(tuple)) => {
+            if !active_candidates.insert(candidate) {
+                return Err(NakedTypeInferenceError::RecursiveTupleCandidate(candidate));
+            }
+            let mut blocked = false;
+            let result = tuple.element_types().iter().try_for_each(|element| {
+                blocked |= non_inferrable_inference_source_worker(
+                    store,
+                    *element,
+                    array_targets,
+                    active_candidates,
+                )?;
+                Ok::<_, NakedTypeInferenceError>(())
+            });
+            active_candidates.remove(&candidate);
+            result?;
+            if blocked {
+                Ok(true)
+            } else {
+                Err(NakedTypeInferenceError::InvalidCanonicalTupleCandidate {
+                    candidate,
+                    error: TupleTypeError::InvalidInstantiationCache {
+                        target: tuple.target(),
+                        instance: candidate,
+                    },
+                })
+            }
+        }
+        Ok(None) => Err(NakedTypeInferenceError::UnsupportedCandidate(candidate)),
+        Err(error) => {
+            Err(NakedTypeInferenceError::InvalidCanonicalTupleCandidate { candidate, error })
+        }
+    }
+}
+
 /// Infers one naked type parameter from one already-typed argument.
 ///
 /// The return is the exact candidate identity only after proving that pinned
@@ -114,6 +262,9 @@ pub(super) fn infer_naked_type_parameter(
     store: &CanonicalTypeMapperStore,
     candidate: TypeId,
 ) -> Result<TypeId, NakedTypeInferenceError> {
+    if is_non_inferrable_inference_source(store, candidate, None)? {
+        return Err(NakedTypeInferenceError::NonInferrableCandidate(candidate));
+    }
     validate_inference_leaf(store, candidate)?;
     Ok(candidate)
 }
@@ -207,6 +358,9 @@ pub(super) fn infer_naked_type_parameter_variance_candidates(
     ) -> Result<bool, RelationUnavailable>,
 ) -> Result<Option<TypeId>, NakedTypeCandidateError> {
     for candidate in covariant.iter().chain(contravariant) {
+        if is_non_inferrable_inference_source(store, *candidate, array_targets)? {
+            continue;
+        }
         validate_inference_leaf_with_optional_array_targets(store, *candidate, array_targets)?;
     }
 
@@ -221,6 +375,9 @@ pub(super) fn infer_naked_type_parameter_variance_candidates(
 
     let mut contravariant_result = None;
     for candidate in contravariant {
+        if is_non_inferrable_inference_source(store, *candidate, array_targets)? {
+            continue;
+        }
         if contravariant_result.is_none_or(|current| current == *candidate) {
             contravariant_result = Some(*candidate);
             continue;
@@ -243,6 +400,9 @@ pub(super) fn infer_naked_type_parameter_variance_candidates(
                 return Ok(Some(contravariant_result));
             }
             for candidate in contravariant {
+                if is_non_inferrable_inference_source(store, *candidate, array_targets)? {
+                    continue;
+                }
                 if is_assignable(store, covariant, *candidate)? {
                     return Ok(Some(covariant));
                 }
@@ -270,6 +430,9 @@ fn infer_naked_type_parameter_candidates_with_optional_array_targets(
 ) -> Result<Option<TypeId>, NakedTypeCandidateError> {
     let mut prepared = Vec::with_capacity(candidates.len());
     for candidate in candidates {
+        if is_non_inferrable_inference_source(store, *candidate, array_targets)? {
+            continue;
+        }
         validate_inference_leaf_with_optional_array_targets(store, *candidate, array_targets)?;
         let candidate = inference_candidate_literal_treatment(store, *candidate, treatment)?;
         if !prepared.contains(&candidate) {
@@ -880,6 +1043,217 @@ mod tests {
         assert_eq!(
             infer_naked_type_parameter(&store, duplicate),
             Err(NakedTypeInferenceError::InvalidCandidate(duplicate)),
+        );
+    }
+
+    #[test]
+    fn internal_placeholder_candidates_are_skipped_without_exposing_private_types() {
+        let mut store = initialized_store();
+        let (auto, silent_never, placeholder_any, any_function, never, any, string) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.auto_type,
+                bootstrap.silent_never_type,
+                bootstrap.non_inferrable_any_type,
+                bootstrap.any_function_type,
+                bootstrap.never_type,
+                bootstrap.any_type,
+                bootstrap.string_type,
+            )
+        };
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+
+        for candidate in [auto, silent_never, placeholder_any, any_function] {
+            assert_eq!(
+                is_non_inferrable_inference_source(&store, candidate, None),
+                Ok(true),
+            );
+            assert_eq!(
+                infer_naked_type_parameter(&store, candidate),
+                Err(NakedTypeInferenceError::NonInferrableCandidate(candidate)),
+            );
+            assert_eq!(infer_preserved(&mut store, &[candidate]), Ok(None));
+            assert_eq!(
+                infer_preserved(&mut store, &[candidate, string]),
+                Ok(Some(string)),
+            );
+            assert_eq!(
+                infer_variance(&mut store, &[candidate], &[string]),
+                Ok(Some(string)),
+            );
+            assert_eq!(
+                infer_variance(&mut store, &[string], &[candidate]),
+                Ok(Some(string)),
+            );
+        }
+        assert_eq!(infer_preserved(&mut store, &[never]), Ok(Some(never)));
+        assert_eq!(infer_preserved(&mut store, &[any]), Ok(Some(any)));
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn non_inferrable_markers_propagate_through_authenticated_arrays_and_tuples() {
+        let mut store = initialized_store();
+        let (auto, silent_never, string) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.auto_type,
+                bootstrap.silent_never_type,
+                bootstrap.string_type,
+            )
+        };
+        let targets = CanonicalArrayTargets::for_test(
+            canonical_array_target(&mut store, "Array"),
+            canonical_array_target(&mut store, "ReadonlyArray"),
+        );
+        let array = store
+            .create_canonical_array_type_with_targets(targets, auto, false)
+            .unwrap();
+        let readonly = store
+            .create_canonical_array_type_with_targets(targets, silent_never, true)
+            .unwrap();
+        let tuple = canonical_tuple(
+            &mut store,
+            &[string, auto],
+            &[ElementFlags::REQUIRED, ElementFlags::REQUIRED],
+            false,
+        );
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.canonical_tuple_target_len(),
+        );
+
+        for candidate in [array, readonly, tuple] {
+            assert!(
+                store
+                    .type_payload(candidate)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::NON_INFERRABLE_TYPE),
+            );
+            assert_eq!(
+                is_non_inferrable_inference_source(&store, candidate, Some(targets)),
+                Ok(true),
+            );
+            assert_eq!(
+                infer_naked_type_parameter_candidates_with_array_targets(
+                    &mut store,
+                    &[candidate],
+                    InferenceLiteralTreatment::Preserve,
+                    targets,
+                    CanonicalTypeMapperStore::is_type_strict_subtype_of,
+                    CanonicalTypeMapperStore::is_type_subtype_of,
+                ),
+                Ok(None),
+            );
+        }
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.canonical_tuple_target_len(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn forged_non_inferrable_markers_fail_before_candidate_publication() {
+        let mut store = initialized_store();
+        let forged = store
+            .alloc_plain_object_type(
+                ObjectFlags::ANONYMOUS | ObjectFlags::NON_INFERRABLE_TYPE,
+                None,
+            )
+            .unwrap();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+
+        assert_eq!(
+            is_non_inferrable_inference_source(&store, forged, None),
+            Err(NakedTypeInferenceError::UnsupportedCandidate(forged)),
+        );
+        assert_eq!(
+            infer_preserved(&mut store, &[string, forged]),
+            Err(NakedTypeCandidateError::Candidate(
+                NakedTypeInferenceError::UnsupportedCandidate(forged),
+            )),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            before,
+        );
+
+        let mut store = initialized_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let targets = CanonicalArrayTargets::for_test(
+            canonical_array_target(&mut store, "Array"),
+            canonical_array_target(&mut store, "ReadonlyArray"),
+        );
+        let array = store
+            .create_canonical_array_type_with_targets(targets, string, false)
+            .unwrap();
+        assert!(store.add_type_object_flags(array, ObjectFlags::NON_INFERRABLE_TYPE));
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+        let expected = NakedTypeInferenceError::InvalidCanonicalArrayCandidate {
+            candidate: array,
+            error: ArrayTypeError::InvalidReference(array),
+        };
+
+        assert_eq!(
+            is_non_inferrable_inference_source(&store, array, Some(targets)),
+            Err(expected),
+        );
+        assert_eq!(
+            infer_naked_type_parameter_candidates_with_array_targets(
+                &mut store,
+                &[array],
+                InferenceLiteralTreatment::Preserve,
+                targets,
+                CanonicalTypeMapperStore::is_type_strict_subtype_of,
+                CanonicalTypeMapperStore::is_type_subtype_of,
+            ),
+            Err(NakedTypeCandidateError::Candidate(expected)),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            before,
         );
     }
 

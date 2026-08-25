@@ -33,8 +33,8 @@ use super::{
         InferenceLiteralTreatment, NakedTypeCandidateError, NakedTypeInferenceError,
         infer_naked_type_parameter, infer_naked_type_parameter_candidates,
         infer_naked_type_parameter_candidates_with_array_targets,
-        infer_naked_type_parameter_variance_candidates, validate_inference_leaf,
-        validate_inference_leaf_with_array_targets,
+        infer_naked_type_parameter_variance_candidates, is_non_inferrable_inference_source,
+        validate_inference_leaf, validate_inference_leaf_with_array_targets,
     },
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession,
@@ -2142,6 +2142,11 @@ fn collect_generic_call_inferences(
     active_targets: &mut Vec<TypeId>,
     contravariant: bool,
 ) -> Result<(), GenericCallVectorError> {
+    if is_non_inferrable_inference_source(store, source, array_targets)
+        .map_err(|error| GenericCallVectorError::Inference(error.into()))?
+    {
+        return Ok(());
+    }
     if let Some(index) = type_parameters
         .iter()
         .position(|type_parameter| *type_parameter == target)
@@ -5448,6 +5453,186 @@ mod tests {
                 actual: 2,
             }
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check all private markers and each public fallback shape.
+    fn generic_calls_ignore_binding_placeholders_and_preserve_default_fallbacks() {
+        let mut store = initialized_store();
+        let (auto, silent_never, placeholder_any, any_function, never, any, unknown, string) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.auto_type,
+                bootstrap.silent_never_type,
+                bootstrap.non_inferrable_any_type,
+                bootstrap.any_function_type,
+                bootstrap.never_type,
+                bootstrap.any_type,
+                bootstrap.unknown_type,
+                bootstrap.string_type,
+            )
+        };
+        let (callable, _) = vector_callable(
+            &mut store,
+            &["T"],
+            &[None],
+            &[None],
+            &[0],
+            |_, parameters| parameters[0],
+        );
+
+        let first = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, None, &[auto]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.applicability,
+            GenericCallVectorApplicability::Applicable,
+        );
+        assert_eq!(first.projection.instantiation.type_arguments, [unknown]);
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &callable,
+                &first,
+                &first.projection.instantiation,
+            ),
+            unknown,
+        );
+        let warm = vector_cache_graph_counts(&store);
+        for source in [auto, silent_never, placeholder_any, any_function] {
+            let replay = project_vector(
+                &mut store,
+                &callable,
+                vector_request(callable.owner, None, &[source]),
+            )
+            .unwrap();
+            assert_eq!(replay, first);
+            assert_eq!(vector_cache_graph_counts(&store), warm);
+        }
+
+        let (defaulted, _) = vector_callable(
+            &mut store,
+            &["T"],
+            &[None],
+            &[Some(GenericTypeSpec::Exact(string))],
+            &[0],
+            |_, parameters| parameters[0],
+        );
+        let (constrained, _) = vector_callable(
+            &mut store,
+            &["T"],
+            &[Some(GenericTypeSpec::Exact(string))],
+            &[None],
+            &[0],
+            |_, parameters| parameters[0],
+        );
+        for callable in [&defaulted, &constrained] {
+            for source in [auto, silent_never, placeholder_any] {
+                let result = project_vector(
+                    &mut store,
+                    callable,
+                    vector_request(callable.owner, None, &[source]),
+                )
+                .unwrap();
+                assert_eq!(
+                    result.applicability,
+                    GenericCallVectorApplicability::Applicable,
+                );
+                assert_eq!(result.projection.instantiation.type_arguments, [string]);
+            }
+        }
+
+        for source in [never, any] {
+            let result = project_vector(
+                &mut store,
+                &callable,
+                vector_request(callable.owner, None, &[source]),
+            )
+            .unwrap();
+            assert_eq!(result.projection.instantiation.type_arguments, [source]);
+        }
+    }
+
+    #[test]
+    fn generic_array_inference_ignores_propagated_binding_placeholders() {
+        let mut store = initialized_store();
+        let targets = canonical_array_targets(&mut store);
+        let (auto, unknown) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.auto_type, bootstrap.unknown_type)
+        };
+        let (callable, _) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| canonical_array_type(store, targets, type_parameter, false),
+            |_, type_parameter| type_parameter,
+        );
+        let argument = canonical_array_type(&mut store, targets, auto, false);
+
+        let resolution = project_array_vector(
+            &mut store,
+            targets,
+            &callable,
+            vector_request(callable.owner, None, &[argument]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolution.applicability,
+            GenericCallVectorApplicability::Applicable,
+        );
+        assert_eq!(
+            resolution.projection.instantiation.type_arguments,
+            [unknown]
+        );
+        let warm = vector_cache_graph_counts(&store);
+        assert_eq!(
+            project_array_vector(
+                &mut store,
+                targets,
+                &callable,
+                vector_request(callable.owner, None, &[argument]),
+            ),
+            Ok(resolution),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), warm);
+    }
+
+    #[test]
+    fn forged_non_inferrable_call_source_fails_before_signature_publication() {
+        let mut store = initialized_store();
+        let (callable, _) = vector_callable(
+            &mut store,
+            &["T"],
+            &[None],
+            &[None],
+            &[0],
+            |_, parameters| parameters[0],
+        );
+        let forged = store
+            .alloc_plain_object_type(
+                ObjectFlags::ANONYMOUS | ObjectFlags::NON_INFERRABLE_TYPE,
+                None,
+            )
+            .unwrap();
+        let before = vector_cache_graph_counts(&store);
+
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &callable,
+                vector_request(callable.owner, None, &[forged]),
+            ),
+            Err(GenericCallVectorError::Inference(
+                NakedTypeCandidateError::Candidate(NakedTypeInferenceError::UnsupportedCandidate(
+                    forged
+                ),),
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
     }
 
     #[test]
