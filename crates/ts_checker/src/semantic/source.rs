@@ -6859,6 +6859,40 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 {
                     current = parent;
                 }
+                (NodeData::ArrowFunction(arrow), SyntaxKind::ArrowFunction)
+                    if current == expression && arrow.body == current.node =>
+                {
+                    let Some((store, host)) = self.semantic else {
+                        return Ok(false);
+                    };
+                    if !source_direct_call_argument_arrow_is_exact(store, host, parent)
+                        .map_err(Self::callable_plan_error)?
+                    {
+                        return Ok(false);
+                    }
+                    let Some(call) = record.parent.map(|node| self.reference(node)) else {
+                        return Ok(false);
+                    };
+                    let NodeData::CallExpression(invocation) = &self.node(call)?.data else {
+                        return Ok(false);
+                    };
+                    let property = self.reference(invocation.expression);
+                    let NodeData::PropertyAccessExpression(access) = &self.node(property)?.data
+                    else {
+                        return Ok(false);
+                    };
+                    let name = self.reference(access.name);
+                    let NodeData::Identifier(identifier) = &self.node(name)?.data else {
+                        return Ok(false);
+                    };
+                    if identifier.text != "map"
+                        || self.node(self.reference(access.expression))?.kind
+                            != SyntaxKind::ArrayLiteralExpression
+                    {
+                        return Ok(false);
+                    }
+                    current = parent;
+                }
                 (NodeData::VariableDeclaration(variable), SyntaxKind::VariableDeclaration)
                     if variable.initializer == Some(current.node) =>
                 {

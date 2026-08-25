@@ -45,7 +45,10 @@ use super::{
     reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
     signatures::{Signature, SignatureFlags},
     source::{PlannedExpression, PlannedExpressionKind},
-    source_callables::source_promise_constructor_argument_arrow_is_exact,
+    source_callables::{
+        source_direct_call_argument_arrow_is_exact,
+        source_promise_constructor_argument_arrow_is_exact,
+    },
     source_imports::SourceImportBindingPlan,
     store::{CachedSignatureLookup, SourceNodeParent},
     type_nodes::{CanonicalTypeQuery, normalize_numeric_separators},
@@ -191,8 +194,19 @@ struct SourceDeclaredConstructorPlan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceClassUnionConstructorPlan {
-    annotation: NodeRef,
+    provider: SourceClassUnionConstructorProvider,
     classes: Vec<ClassMemberQueryPlan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceClassUnionConstructorProvider {
+    Ambient(NodeRef),
+    ArrayCallback {
+        parameter: NodeRef,
+        arrow: NodeRef,
+        call: NodeRef,
+        receiver: NodeRef,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1027,34 +1041,52 @@ pub(super) fn plan_direct_default_new(
         symbol_record.flags(),
         SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE
     ) {
-        let declared = plan_declared_constructor(
-            arena,
-            bound,
-            store,
-            host,
-            node,
-            constructor,
-            symbol,
-            argument.as_ref(),
-        );
-        match declared {
-            Ok(declared) => (SourceNewTarget::Declared(declared), declared.parameter),
-            Err(SourceNewError::Unsupported(SourceNewUnsupported::ConstructorClass { .. }))
-                if argument.is_none() =>
-            {
-                let union = plan_declared_class_union_constructor(
-                    arena,
-                    bound,
-                    store,
-                    host,
-                    prior_classes,
-                    node,
-                    constructor,
-                    symbol,
-                )?;
-                (SourceNewTarget::ClassUnion(union), None)
+        let callback = if argument.is_none() {
+            plan_callback_class_union_constructor(
+                arena,
+                bound,
+                store,
+                host,
+                prior_classes,
+                node,
+                constructor,
+                symbol,
+            )?
+        } else {
+            None
+        };
+        if let Some(union) = callback {
+            (SourceNewTarget::ClassUnion(union), None)
+        } else {
+            let declared = plan_declared_constructor(
+                arena,
+                bound,
+                store,
+                host,
+                node,
+                constructor,
+                symbol,
+                argument.as_ref(),
+            );
+            match declared {
+                Ok(declared) => (SourceNewTarget::Declared(declared), declared.parameter),
+                Err(SourceNewError::Unsupported(SourceNewUnsupported::ConstructorClass {
+                    ..
+                })) if argument.is_none() => {
+                    let union = plan_declared_class_union_constructor(
+                        arena,
+                        bound,
+                        store,
+                        host,
+                        prior_classes,
+                        node,
+                        constructor,
+                        symbol,
+                    )?;
+                    (SourceNewTarget::ClassUnion(union), None)
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         }
     } else {
         return Err(unsupported(SourceNewUnsupported::ConstructorClass {
@@ -2691,9 +2723,247 @@ fn plan_declared_class_union_constructor(
         return Err(reject());
     }
     Ok(SourceClassUnionConstructorPlan {
-        annotation,
+        provider: SourceClassUnionConstructorProvider::Ambient(annotation),
         classes,
     })
+}
+
+#[allow(clippy::too_many_arguments)] // Callback, parameter, receiver, and class provenance are inseparable.
+fn plan_callback_class_union_constructor(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    prior_classes: &HashMap<SemanticSymbolId, ClassMemberPlan>,
+    node: NodeRef,
+    constructor: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<Option<SourceClassUnionConstructorPlan>, SourceNewError> {
+    let reject = || {
+        unsupported(SourceNewUnsupported::ConstructorClass {
+            node: constructor,
+            symbol,
+        })
+    };
+    let owner = store.symbol(symbol).ok_or_else(reject)?;
+    let Some([parameter]) = owner.declarations() else {
+        return Ok(None);
+    };
+    let parameter = *parameter;
+    let Some(parameter_record) = arena.get(parameter.node) else {
+        return Ok(None);
+    };
+    let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Ok(None);
+    };
+    let arrow = parameter_record
+        .parent
+        .map(|parent| NodeRef::new(parameter.arena, parameter.file, parent))
+        .ok_or_else(reject)?;
+    let arrow_record = arena.get(arrow.node).ok_or_else(reject)?;
+    let NodeData::ArrowFunction(callback) = &arrow_record.data else {
+        return Err(reject());
+    };
+    let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+    let name_record = arena.get(name.node).ok_or_else(reject)?;
+    let NodeData::Identifier(parameter_name) = &name_record.data else {
+        return Err(reject());
+    };
+    let constructor_record = arena.get(constructor.node).ok_or_else(reject)?;
+    let NodeData::Identifier(constructor_name) = &constructor_record.data else {
+        return Err(reject());
+    };
+    let locals = bound
+        .locals(arrow)
+        .and_then(|locals| store.symbol_table(locals))
+        .ok_or_else(reject)?;
+    if parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.flags.0 != 0
+        || parameter_record.parent != Some(arrow.node)
+        || parameter_data.dot_dot_dot_token.is_some()
+        || parameter_data.initializer.is_some()
+        || parameter_data.question_token.is_some()
+        || parameter_data.symbol.is_some()
+        || parameter_data.type_.is_some()
+        || parameter_data.facts != 0
+        || parameter_data.modifiers.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(parameter.node)
+        || parameter_name.flow_node.is_some()
+        || parameter_name.text.is_empty()
+        || parameter_name.text != constructor_name.text
+        || owner.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(parameter_name.text.as_str())
+        || owner.value_declaration() != Some(parameter)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || bound.symbol(parameter) != Some(symbol)
+        || locals.len() != 1
+        || locals.get_source(&parameter_name.text) != Some(symbol)
+        || arrow_record.kind != SyntaxKind::ArrowFunction
+        || arrow_record.flags.0 != 0
+        || callback.asterisk_token.is_some()
+        || callback.body != node.node
+        || callback.flow_node.is_some()
+        || callback.full_signature.is_some()
+        || callback.symbol.is_some()
+        || callback.type_.is_some()
+        || callback.type_parameters.is_some()
+        || callback.facts != 0
+        || callback.modifiers.is_some()
+        || callback.parameters.has_trailing_comma
+        || callback.parameters.nodes.as_slice() != [parameter.node]
+        || arena
+            .get(node.node)
+            .is_none_or(|construction| construction.parent != Some(arrow.node))
+        || !source_direct_call_argument_arrow_is_exact(store, host, arrow)
+            .map_err(|_| invariant(SourceNewInvariant::InvalidConstructorCache(constructor)))?
+    {
+        return Err(reject());
+    }
+
+    let call = arrow_record
+        .parent
+        .map(|parent| NodeRef::new(arrow.arena, arrow.file, parent))
+        .ok_or_else(reject)?;
+    let call_record = arena.get(call.node).ok_or_else(reject)?;
+    let NodeData::CallExpression(invocation) = &call_record.data else {
+        return Err(reject());
+    };
+    let property = NodeRef::new(call.arena, call.file, invocation.expression);
+    let property_record = arena.get(property.node).ok_or_else(reject)?;
+    let NodeData::PropertyAccessExpression(access) = &property_record.data else {
+        return Err(reject());
+    };
+    let method = NodeRef::new(property.arena, property.file, access.name);
+    let method_record = arena.get(method.node).ok_or_else(reject)?;
+    let NodeData::Identifier(method_name) = &method_record.data else {
+        return Err(reject());
+    };
+    let receiver = NodeRef::new(property.arena, property.file, access.expression);
+    let receiver_record = arena.get(receiver.node).ok_or_else(reject)?;
+    let NodeData::ArrayLiteralExpression(array) = &receiver_record.data else {
+        return Err(reject());
+    };
+    if call_record.kind != SyntaxKind::CallExpression
+        || call_record.flags.0 != 0
+        || invocation.question_dot_token.is_some()
+        || invocation.symbol.is_some()
+        || invocation.type_arguments.is_some()
+        || invocation.facts != 0
+        || invocation.arguments.has_trailing_comma
+        || invocation.arguments.nodes.as_slice() != [arrow.node]
+        || property_record.kind != SyntaxKind::PropertyAccessExpression
+        || property_record.flags.0 != 0
+        || property_record.parent != Some(call.node)
+        || access.flow_node.is_some()
+        || access.question_dot_token.is_some()
+        || access.facts != 0
+        || method_record.kind != SyntaxKind::Identifier
+        || method_record.flags.0 != 0
+        || method_record.parent != Some(property.node)
+        || method_name.flow_node.is_some()
+        || method_name.text != "map"
+        || receiver_record.kind != SyntaxKind::ArrayLiteralExpression
+        || receiver_record.flags.0 != 0
+        || receiver_record.parent != Some(property.node)
+        || array.facts != 0
+        || array.elements.has_trailing_comma
+        || array.elements.nodes.len() < 2
+    {
+        return Err(reject());
+    }
+
+    let mut classes = Vec::new();
+    classes
+        .try_reserve(array.elements.nodes.len())
+        .map_err(|_| invariant(SourceNewInvariant::Capacity(constructor)))?;
+    for element in &array.elements.nodes {
+        let element = NodeRef::new(receiver.arena, receiver.file, *element);
+        let element_record = arena.get(element.node).ok_or_else(reject)?;
+        let NodeData::Identifier(identifier) = &element_record.data else {
+            return Err(reject());
+        };
+        if element_record.kind != SyntaxKind::Identifier
+            || element_record.flags.0 != 0
+            || element_record.parent != Some(receiver.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(reject());
+        }
+        let mut callback_host = host.name_resolver_host(store)?;
+        let class_symbol =
+            CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+                .map_err(|error| {
+                    invariant(SourceNewInvariant::NameResolution {
+                        node: element,
+                        error,
+                    })
+                })?
+                .resolve(
+                    Some(CanonicalResolutionLocation::Bound(element)),
+                    &identifier.text,
+                    SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+                    None,
+                    false,
+                    false,
+                )
+                .map_err(|error| {
+                    invariant(SourceNewInvariant::NameResolution {
+                        node: element,
+                        error,
+                    })
+                })?
+                .and_then(|class| store.get_merged_symbol(class))
+                .ok_or_else(reject)?;
+        let class = prior_classes.get(&class_symbol).ok_or_else(reject)?;
+        let class = ClassMemberQueryPlan::Direct(class.clone());
+        if class.symbol() != class_symbol
+            || class.constructor_visibility() != ClassConstructorVisibility::Public
+            || class.constructor_parameter_symbol().is_some()
+            || class.constructor_minimum_argument_count() != 0
+            || classes
+                .iter()
+                .any(|previous: &ClassMemberQueryPlan| previous.symbol() == class_symbol)
+        {
+            return Err(reject());
+        }
+        preflight_nongeneric_class_member_query(store, host, &class)?;
+        if exact_symbol_cache(store, element)
+            .map_err(|()| invariant(SourceNewInvariant::InvalidConstructorCache(element)))?
+            .is_some_and(|cached| cached != class_symbol)
+        {
+            return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                element,
+            )));
+        }
+        if let Some(cached) = exact_type_cache(store, element)
+            .map_err(|()| invariant(SourceNewInvariant::InvalidConstructorCache(element)))?
+            && authenticated_class_constructor_value(store, class_symbol)
+                .is_none_or(|(value, _)| value != cached)
+        {
+            return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                element,
+            )));
+        }
+        classes.push(class);
+    }
+
+    Ok(Some(SourceClassUnionConstructorPlan {
+        provider: SourceClassUnionConstructorProvider::ArrayCallback {
+            parameter,
+            arrow,
+            call,
+            receiver,
+        },
+        classes,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)] // Every nested alias must preserve the same source ownership.
@@ -3298,16 +3568,37 @@ pub(super) fn preflight_direct_default_new(
                     )));
                 }
             }
-            let actual = plan_declared_class_union_constructor(
-                arena,
-                bound,
-                store,
-                host,
-                &prior_classes,
-                plan.node,
-                plan.constructor,
-                plan.resolved_symbol,
-            )?;
+            let actual = match expected.provider {
+                SourceClassUnionConstructorProvider::Ambient(_) => {
+                    plan_declared_class_union_constructor(
+                        arena,
+                        bound,
+                        store,
+                        host,
+                        &prior_classes,
+                        plan.node,
+                        plan.constructor,
+                        plan.resolved_symbol,
+                    )?
+                }
+                SourceClassUnionConstructorProvider::ArrayCallback { .. } => {
+                    plan_callback_class_union_constructor(
+                        arena,
+                        bound,
+                        store,
+                        host,
+                        &prior_classes,
+                        plan.node,
+                        plan.constructor,
+                        plan.resolved_symbol,
+                    )?
+                    .ok_or_else(|| {
+                        invariant(SourceNewInvariant::InvalidConstructorCache(
+                            plan.constructor,
+                        ))
+                    })?
+                }
+            };
             if actual != *expected || plan.argument.is_some() || plan.parameter.is_some() {
                 return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
                     plan.constructor,
@@ -4780,8 +5071,50 @@ fn resolved_declared_class_union_constructor(
             plan.constructor,
         ))
     };
-    let Some(value_type) = exact_type_cache(store, union.annotation).map_err(|()| invalid())?
-    else {
+    let value_type = match union.provider {
+        SourceClassUnionConstructorProvider::Ambient(annotation) => {
+            exact_type_cache(store, annotation).map_err(|()| invalid())?
+        }
+        SourceClassUnionConstructorProvider::ArrayCallback { receiver, .. } => {
+            let Some(receiver_type) = exact_type_cache(store, receiver).map_err(|()| invalid())?
+            else {
+                if exact_class_value_type(store, plan.resolved_symbol)?.is_some() {
+                    return Err(invalid());
+                }
+                return Ok(None);
+            };
+            let receiver_record = store.type_payload(receiver_type).ok_or_else(invalid)?;
+            let TypeData::TypeReference(reference) = receiver_record.data() else {
+                return Err(invalid());
+            };
+            let Some([element]) = reference.resolved_type_arguments.as_deref() else {
+                return Err(invalid());
+            };
+            let target = reference.object.target.ok_or_else(invalid)?;
+            let target_owner = store
+                .type_payload(target)
+                .and_then(|record| record.symbol())
+                .ok_or_else(invalid)?;
+            let global_array = store
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                .and_then(|globals| globals.get_source("Array"))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .ok_or_else(invalid)?;
+            if receiver_record.flags() != TypeFlags::OBJECT
+                || !receiver_record
+                    .object_flags()
+                    .contains(ObjectFlags::ARRAY_LITERAL)
+                || receiver_record.symbol() != Some(global_array)
+                || reference.object.mapper.is_some()
+                || target_owner != global_array
+            {
+                return Err(invalid());
+            }
+            Some(*element)
+        }
+    };
+    let Some(value_type) = value_type else {
         if exact_class_value_type(store, plan.resolved_symbol)?.is_some() {
             return Err(invalid());
         }
@@ -4793,17 +5126,30 @@ fn resolved_declared_class_union_constructor(
     {
         return Err(invalid());
     }
-    let Some(TypeData::Union(candidates)) =
-        store.type_payload(value_type).map(|record| record.data())
-    else {
-        return Err(invalid());
+    let candidates = match store.type_payload(value_type).map(|record| record.data()) {
+        Some(TypeData::Union(candidates)) => candidates.union.types.as_slice(),
+        Some(TypeData::Object(_))
+            if matches!(
+                union.provider,
+                SourceClassUnionConstructorProvider::ArrayCallback { .. }
+            ) =>
+        {
+            std::slice::from_ref(&value_type)
+        }
+        _ => return Err(invalid()),
     };
-    if candidates.union.types.len() != union.classes.len() {
+    if candidates.len() > union.classes.len()
+        || candidates.len() != union.classes.len()
+            && matches!(
+                union.provider,
+                SourceClassUnionConstructorProvider::Ambient(_)
+            )
+    {
         return Err(invalid());
     }
 
     let mut selected = None;
-    for candidate in &candidates.union.types {
+    for candidate in candidates {
         let owner = store
             .type_payload(*candidate)
             .and_then(|record| record.symbol())
@@ -6244,6 +6590,15 @@ mod tests {
             "readonly prototype: Boolean; ",
             "} ",
             "declare var Boolean: BooleanConstructor;",
+        ))
+    }
+
+    fn global_array_map_constructor_library() -> ParseResult {
+        parse_source_file(concat!(
+            "interface Array<T> { ",
+            "map<U>(callbackfn: ",
+            "(value: T, index: number, array: T[]) => U, thisArg?: any): U[]; ",
+            "} interface ReadonlyArray<T> {}",
         ))
     }
 
@@ -8665,6 +9020,273 @@ mod tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    fn class_constructor_array_callbacks_preserve_abstract_diagnostics_and_warm_identity() {
+        let library = global_array_map_constructor_library();
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        for (index, (classes, expected_diagnostics)) in [
+            (
+                concat!(
+                    "class First {} class Second {} ",
+                    "[First, Second].map(cls => new cls());",
+                ),
+                0,
+            ),
+            (
+                concat!(
+                    "class Concrete {} ",
+                    "abstract class Abstract { value!: string; } ",
+                    "[Concrete, Abstract].map(cls => new cls());",
+                ),
+                1,
+            ),
+            (
+                concat!(
+                    "abstract class First { value!: string; } ",
+                    "abstract class Second { other!: number; } ",
+                    "[First, Second].map(cls => new cls());",
+                ),
+                1,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parse_source_file(classes);
+            assert!(
+                source.diagnostics.is_empty(),
+                "{classes}: {:?}",
+                source.diagnostics
+            );
+            let library_file = FileId::new(1_870 + u32::try_from(index * 2).unwrap());
+            let source_file = FileId::new(1_871 + u32::try_from(index * 2).unwrap());
+            let mut context =
+                global_object_constructor_context(&library, &source, library_file, source_file);
+            let construction = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        source_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+
+            context.check_source_file(source_file).unwrap();
+
+            assert_eq!(
+                context.diagnostics().len(),
+                expected_diagnostics,
+                "{classes}"
+            );
+            if expected_diagnostics != 0 {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("{classes} must retain one abstract constructor diagnostic")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2511);
+                assert!(diagnostic.diagnostic.arguments.is_empty());
+                assert_eq!(diagnostic.node, Some(construction));
+            }
+            let signature = context
+                .store()
+                .signature_links(construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let instance = context
+                .store()
+                .type_node_links(construction)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .and_then(Signature::resolved_return_type),
+                Some(instance),
+            );
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().clone(),
+            );
+
+            context.recheck_source_file(source_file).unwrap();
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().clone(),
+                ),
+                warm,
+                "{classes}",
+            );
+        }
+    }
+
+    #[test]
+    fn abstract_class_union_fixture_preserves_top_level_and_array_callback_diagnostics() {
+        let library = global_array_map_constructor_library();
+        let source = parse_source_file(concat!(
+            "class ConcreteA {} class ConcreteB {} ",
+            "abstract class AbstractA { a: string; } ",
+            "abstract class AbstractB { b: string; } ",
+            "type Abstracts = typeof AbstractA | typeof AbstractB; ",
+            "type Concretes = typeof ConcreteA | typeof ConcreteB; ",
+            "type ConcretesOrAbstracts = Concretes | Abstracts; ",
+            "declare const cls1: ConcretesOrAbstracts; ",
+            "declare const cls2: Abstracts; ",
+            "declare const cls3: Concretes; ",
+            "new cls1(); new cls2(); new cls3(); ",
+            "[ConcreteA, AbstractA, AbstractB].map(cls => new cls()); ",
+            "[AbstractA, AbstractB, ConcreteA].map(cls => new cls()); ",
+            "[ConcreteA, ConcreteB].map(cls => new cls()); ",
+            "[AbstractA, AbstractB].map(cls => new cls());",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(1_890);
+        let source_file = FileId::new(1_891);
+        let mut context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+
+        context.check_source_file(source_file).unwrap();
+
+        let constructions = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(constructions.len(), 7);
+        let expected = [
+            constructions[0],
+            constructions[1],
+            constructions[3],
+            constructions[4],
+            constructions[6],
+        ];
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), expected.len());
+        for (diagnostic, construction) in diagnostics.iter().zip(expected) {
+            assert_eq!(diagnostic.diagnostic.code(), 2511);
+            assert!(diagnostic.diagnostic.arguments.is_empty());
+            assert_eq!(diagnostic.node, Some(construction));
+        }
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().clone(),
+        );
+
+        context.recheck_source_file(source_file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().clone(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn constructor_union_callbacks_reject_forged_parameter_and_class_caches() {
+        for poison in 0..2 {
+            let library = global_array_map_constructor_library();
+            let source = parse_source_file(concat!(
+                "class First {} class Second {} ",
+                "[First, Second].map(cls => new cls());",
+            ));
+            let library_file = FileId::new(1_880 + poison * 2);
+            let source_file = FileId::new(1_881 + poison * 2);
+            let mut context =
+                global_object_constructor_context(&library, &source, library_file, source_file);
+            let construction = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        source_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            match poison {
+                0 => {
+                    let parameter = source
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            (record.kind == SyntaxKind::Parameter).then_some(NodeRef::new(
+                                source.arena.id(),
+                                source_file,
+                                node,
+                            ))
+                        })
+                        .unwrap();
+                    let symbol = context
+                        .file(source_file)
+                        .unwrap()
+                        .1
+                        .symbol(parameter)
+                        .unwrap();
+                    let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                1 => {
+                    let first = class_symbol(&source, source_file, &context, "First");
+                    assert!(context.store_mut_for_test().set_symbol_flags(
+                        first,
+                        SymbolFlags::CLASS | SymbolFlags::INTERFACE,
+                        CheckFlags::NONE,
+                    ));
+                }
+                _ => unreachable!("only callback parameters and class owners are poisoned"),
+            }
+            let state = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                context.check_source_file(source_file).is_err(),
+                "case {poison}"
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                state,
+                "case {poison}",
+            );
+            assert!(context.store().type_node_links(construction).is_none());
+            assert!(context.store().signature_links(construction).is_none());
+        }
     }
 
     #[test]
