@@ -37690,6 +37690,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // DOM roots, native method caches, and library rejection share one proof.
     fn default_library_dom_root_arguments_keep_multibase_heritage_cold() {
         let library = parse_source_file(concat!(
             "interface DomRoot {} interface DomExtra {} interface DomMore {} ",
