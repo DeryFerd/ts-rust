@@ -4624,6 +4624,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         statement: NodeRef,
         expression: NodeRef,
     ) -> Result<Option<PlannedEvolvingArrayAssignment>, SourceCheckError> {
+        if self.evolving_array_variables.is_empty() {
+            return Ok(None);
+        }
+
         let (left, right, operator) = {
             let record = self.node(expression)?;
             let NodeData::BinaryExpression(binary) = &record.data else {
@@ -4667,6 +4671,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         };
         let syntax = plan_direct_source_element_write_syntax(self.arena, store, left, expression)
             .map_err(|error| Self::element_plan_error(left, error))?;
+        let receiver_record = self.node(syntax.receiver())?;
+        let NodeData::Identifier(identifier) = &receiver_record.data else {
+            return Ok(None);
+        };
+        let Some(receiver_symbol) = self
+            .bound
+            .locals(self.source.node_ref())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+        else {
+            return Ok(None);
+        };
+        if !self.evolving_array_variables.contains(&receiver_symbol) {
+            return Ok(None);
+        }
         let receiver = self.plan_expression(syntax.receiver())?;
         let PlannedExpressionKind::Identifier(read) = &receiver.kind else {
             return Ok(None);
@@ -40874,6 +40894,23 @@ mod tests {
             .and_then(ts_binder::semantic::Symbol::exports)
             .and_then(|exports| context.store().symbol_table(exports))
             .unwrap();
+        let (computed, _) = assignment_parts(&source, file, 0);
+        let NodeData::ElementAccessExpression(access) =
+            &source.arena.get(computed.node).unwrap().data
+        else {
+            panic!("the first CommonJS export must retain its computed access")
+        };
+        let receiver = NodeRef::new(source.arena.id(), file, access.expression);
+        let exports_alias = bound
+            .locals(bound.source_file())
+            .and_then(|locals| context.store().symbol_table(locals))
+            .and_then(|locals| locals.get_source("exports"))
+            .unwrap();
+        assert_eq!(
+            context.store().symbol(exports_alias).unwrap().flags(),
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::MODULE_EXPORTS,
+        );
+        assert!(context.store().symbol_node_links(receiver).is_none());
         let value_type = context
             .store()
             .value_symbol_links(exports.get_source("value").unwrap())
