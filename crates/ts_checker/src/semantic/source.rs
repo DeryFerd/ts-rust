@@ -267,6 +267,8 @@ const NODE_FLAG_USING: u32 = 1 << 2;
 const NODE_FLAG_AWAIT_USING: u32 = NODE_FLAG_CONST | NODE_FLAG_USING;
 const NODE_FLAG_HAS_ERROR: u32 = 1 << 15;
 const NODE_FLAG_PARSER_RECOVERY: u32 = NODE_FLAG_HAS_ERROR | (1 << 17);
+const ES2016_SCRIPT_TARGET: u8 = 3;
+const ES2020_SCRIPT_TARGET: u8 = 7;
 const ES2022_SCRIPT_TARGET: u8 = 9;
 const MAX_NESTED_SOURCE_ARROW_ARGUMENT_DEPTH: usize = 8;
 
@@ -1575,6 +1577,7 @@ struct SourceCheckPlan {
     strings: Vec<String>,
     numbers: Vec<Number>,
     bigints: Vec<PseudoBigInt>,
+    bigint_literals: Vec<NodeRef>,
 }
 
 enum PlannedVariableStatement {
@@ -1594,6 +1597,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     strings: Vec<String>,
     numbers: Vec<Number>,
     bigints: Vec<PseudoBigInt>,
+    bigint_literals: Vec<NodeRef>,
     identifier_reads: Vec<(NodeRef, SemanticSymbolId)>,
     default_news: Vec<SourceDefaultNewPlan>,
     nested_arrow_callables: Vec<SourceCallablePlan>,
@@ -1642,6 +1646,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             strings: Vec::new(),
             numbers: Vec::new(),
             bigints: Vec::new(),
+            bigint_literals: Vec::new(),
             identifier_reads: Vec::new(),
             default_news: Vec::new(),
             nested_arrow_callables: Vec::new(),
@@ -1691,6 +1696,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             strings: Vec::new(),
             numbers: Vec::new(),
             bigints: Vec::new(),
+            bigint_literals: Vec::new(),
             identifier_reads: Vec::new(),
             default_news: Vec::new(),
             nested_arrow_callables: Vec::new(),
@@ -3402,6 +3408,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             strings: self.strings,
             numbers: self.numbers,
             bigints: self.bigints,
+            bigint_literals: self.bigint_literals,
         })
     }
 
@@ -14808,6 +14815,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             SyntaxKind::BigIntLiteral => {
                 let value = self.plan_bigint_literal(expression)?;
                 self.bigints.push(value.clone());
+                self.bigint_literals.push(expression);
                 Ok(PlannedExpression::new(
                     expression,
                     PlannedExpressionKind::BigInt {
@@ -16867,6 +16875,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let value = PseudoBigInt::new(&positive.base10_value, true);
                 self.bigints.push(positive.clone());
                 self.bigints.push(value.clone());
+                self.bigint_literals.push(operand);
                 Ok(PlannedExpression::new(
                     expression,
                     PlannedExpressionKind::BigInt {
@@ -20933,8 +20942,7 @@ fn check_expression_type(
                             right_type: right.result,
                             left_recovery,
                             right_recovery,
-                            bigint_exponentiation_target:
-                                PrimitiveBigIntExponentiationTarget::Unknown,
+                            bigint_exponentiation_target: bigint_exponentiation_target(options),
                         },
                     )
                     .map_err(|error| primitive_binary_check_error(host, node, &error))?;
@@ -22582,6 +22590,76 @@ fn issue_invalid_const_enum_value_diagnostic(
     issue_node_diagnostic(diagnostics, expression.node, 2475)
 }
 
+fn issue_bigint_literal_target_diagnostics(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    literals: &[NodeRef],
+) -> Result<(), SourceCheckError> {
+    if !options.check_bigint_target
+        || options.name_resolution.emit_target as u8 >= ES2020_SCRIPT_TARGET
+        || bound
+            .source_facts()
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+    {
+        return Ok(());
+    }
+
+    for literal in literals {
+        let record = arena.get(literal.node).ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingNode(*literal),
+        ))?;
+        let NodeData::BigIntLiteral(data) = &record.data else {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MismatchedNodeData {
+                    node: *literal,
+                    kind: record.kind,
+                },
+            ));
+        };
+        if record.kind != SyntaxKind::BigIntLiteral
+            || record.flags.0 != 0
+            || data.token_flags.0 != 0
+            || !bound.contains(*literal)
+        {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::InvalidLiteralFlags(*literal),
+            ));
+        }
+
+        let mut current = record.parent;
+        let mut ambient = false;
+        while let Some(parent) = current {
+            if ts_binder::canonical_has_syntactic_modifier(
+                arena,
+                parent,
+                SyntaxKind::DeclareKeyword,
+            ) {
+                ambient = true;
+                break;
+            }
+            current = arena.get(parent).and_then(|node| node.parent);
+        }
+        if !ambient {
+            issue_node_diagnostic(diagnostics, *literal, 2737)?;
+        }
+    }
+    Ok(())
+}
+
+const fn bigint_exponentiation_target(
+    options: CanonicalCheckerOptions,
+) -> PrimitiveBigIntExponentiationTarget {
+    if !options.check_bigint_target {
+        PrimitiveBigIntExponentiationTarget::Unknown
+    } else if options.name_resolution.emit_target as u8 >= ES2016_SCRIPT_TARGET {
+        PrimitiveBigIntExponentiationTarget::KnownAtLeastEs2016
+    } else {
+        PrimitiveBigIntExponentiationTarget::KnownBeforeEs2016
+    }
+}
+
 fn issue_source_enum_diagnostics(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     enumeration: &SourceEnumPlan,
@@ -23374,7 +23452,7 @@ fn check_compound_assignment(
             right_type: right.result,
             left_recovery: None,
             right_recovery: right.primitive_binary_recovery,
-            bigint_exponentiation_target: PrimitiveBigIntExponentiationTarget::Unknown,
+            bigint_exponentiation_target: bigint_exponentiation_target(options),
         },
     )
     .map_err(|error| primitive_binary_check_error(host, assignment.expression, &error))?;
@@ -30499,6 +30577,7 @@ pub(super) fn check_source_file(
         strings,
         numbers,
         bigints,
+        bigint_literals,
     } = SourcePlanner::new_semantic_with_global_types(
         arena,
         bound,
@@ -31469,6 +31548,7 @@ pub(super) fn check_source_file(
     }
 
     store.prepare_regular_literal_types(&strings, &numbers, &bigints)?;
+    issue_bigint_literal_target_diagnostics(arena, bound, options, diagnostics, &bigint_literals)?;
     let mut deferred = Vec::new();
     // Publication owns every source value, including function-local symbols.
     // Top-level assignment/capture semantics must remain a separate map so a
@@ -42960,6 +43040,83 @@ mod tests {
         let warm = observable_state(&context, file);
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn bigint_target_diagnostics_preserve_normalized_literal_and_type_alias_identities() {
+        let source = parsed(concat!(
+            "type TypeOnly = 255n; ",
+            "const decimal = 255n; ",
+            "const hex = 0xffn; ",
+            "const separated = 2_5_5n; ",
+            "const negative = -255n;",
+        ));
+        let file = FileId::new(9_834);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                check_bigint_target: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 4);
+        for (diagnostic, spelling) in diagnostics.iter().zip(["255n", "0xffn", "2_5_5n", "255n"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2737);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), spelling);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "BigInt literals are not available when targeting lower than ES2020.",
+            );
+        }
+
+        let positive = context
+            .store()
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| {
+                bootstrap.cached_bigint_literal_type(&PseudoBigInt::parse_valid("255n"))
+            })
+            .unwrap();
+        let negative = context
+            .store()
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| {
+                bootstrap.cached_bigint_literal_type(&PseudoBigInt::parse_valid("-255n"))
+            })
+            .unwrap();
+        let positive_fresh = context
+            .store()
+            .fresh_type_of_literal_type(positive)
+            .unwrap();
+        let negative_fresh = context
+            .store()
+            .fresh_type_of_literal_type(negative)
+            .unwrap();
+        for name in ["decimal", "hex", "separated"] {
+            assert_eq!(
+                variable_value_type(&context, &source, file, name),
+                positive_fresh,
+            );
+        }
+        assert_eq!(
+            variable_value_type(&context, &source, file, "negative"),
+            negative_fresh,
+        );
+        let alias = global_symbol(&context, "TypeOnly");
+        assert_eq!(
+            context
+                .store()
+                .type_alias_links(alias)
+                .and_then(|links| links.declared_type),
+            Some(positive),
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
     }
 
@@ -60461,6 +60618,60 @@ class Foo2 {
         assert_eq!(context.check_source_file(file), Err(expected));
         assert_eq!(observable_state(&context, file), rejected);
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn configured_bigint_exponentiation_reports_target_diagnostics_and_publishes_bigint() {
+        for (index, (text, root, expected_literals)) in [
+            ("const value = 1n ** 2n;", "1n ** 2n", ["1n", "2n"]),
+            (
+                "let value = 1n; value **= 2n;",
+                "value **= 2n",
+                ["1n", "2n"],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_835 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    check_bigint_target: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let diagnostics = context.diagnostics().as_slice();
+            assert_eq!(diagnostics.len(), 3, "{text}");
+            for (diagnostic, spelling) in diagnostics[..2].iter().zip(expected_literals) {
+                assert_eq!(diagnostic.diagnostic.code(), 2737, "{text}");
+                assert_eq!(node_text(&source, diagnostic.node.unwrap()), spelling);
+            }
+            assert_eq!(diagnostics[2].diagnostic.code(), 2791, "{text}");
+            assert_eq!(node_text(&source, diagnostics[2].node.unwrap()), root);
+
+            let expression = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let node = NodeRef::new(source.arena.id(), file, node);
+                    (record.kind == SyntaxKind::BinaryExpression
+                        && node_text(&source, node) == root)
+                        .then_some(node)
+                })
+                .unwrap();
+            assert_eq!(
+                resolved_node_type(&context, expression),
+                context.store().intrinsic_bootstrap().unwrap().bigint_type,
+            );
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]

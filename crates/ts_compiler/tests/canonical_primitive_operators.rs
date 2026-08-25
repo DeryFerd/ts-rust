@@ -1,5 +1,5 @@
 use ts_compiler::Program;
-use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind};
+use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind, ScriptTarget};
 use ts_vfs::{FileSystem, MemoryFileSystem};
 
 fn span(source: &str, expected: &str) -> (u32, u32) {
@@ -27,6 +27,7 @@ fn canonical_program_source_sorts_mixed_bigint_operator_diagnostics() {
             module_specified: true,
             module_resolution: ModuleResolutionKind::Bundler,
             lib: Some(vec!["es5".to_owned()]),
+            target: ScriptTarget::Es2020,
             ..CompilerOptions::default()
         },
     )
@@ -82,6 +83,7 @@ fn canonical_program_sorts_assignment_children_and_fixed_call_arguments() {
             module_specified: true,
             module_resolution: ModuleResolutionKind::Bundler,
             lib: Some(vec!["es5".to_owned()]),
+            target: ScriptTarget::Es2020,
             ..CompilerOptions::default()
         },
     )

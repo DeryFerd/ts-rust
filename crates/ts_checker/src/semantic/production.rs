@@ -117,6 +117,8 @@ impl CanonicalJsxRuntimeEvidence<'_> {
 /// `uses_wildcard_types` selects the upstream missing-type-definition message.
 /// `no_error_truncation` raises semantic type display to the pinned hard output
 /// cutoff.
+/// `check_bigint_target` enables runtime bigint grammar and exponentiation
+/// checks against the configured language target.
 #[allow(clippy::struct_excessive_bools)] // Flat immutable compiler-option projection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CanonicalCheckerOptions {
@@ -136,6 +138,7 @@ pub struct CanonicalCheckerOptions {
     pub no_emit: bool,
     pub uses_wildcard_types: bool,
     pub no_error_truncation: bool,
+    pub check_bigint_target: bool,
     pub name_resolution: CanonicalNameResolverOptions,
 }
 
@@ -158,6 +161,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             no_emit: false,
             uses_wildcard_types: false,
             no_error_truncation: false,
+            check_bigint_target: false,
             name_resolution: CanonicalNameResolverOptions::default(),
         }
     }
@@ -3049,6 +3053,7 @@ mod tests {
         assert!(!defaults.emit_common_js);
         assert!(!defaults.no_emit);
         assert!(!defaults.no_error_truncation);
+        assert!(!defaults.check_bigint_target);
 
         let intrinsic = IntrinsicBootstrapOptions {
             strict_null_checks: true,
@@ -3070,6 +3075,7 @@ mod tests {
         assert!(!options.emit_common_js);
         assert!(!options.no_emit);
         assert!(!options.no_error_truncation);
+        assert!(!options.check_bigint_target);
     }
 
     #[test]

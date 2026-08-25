@@ -3986,6 +3986,7 @@ impl Program {
                 .as_ref()
                 .is_some_and(|types| types.iter().any(|name| name == "*")),
             no_error_truncation: self.options.no_error_truncation,
+            check_bigint_target: true,
             name_resolution: (&self.options).into(),
         };
         let module_resolutions = self.canonical_module_resolution_manifest()?;
@@ -10342,6 +10343,96 @@ mod tests {
                 program.diagnostics().is_empty(),
                 "{:?}",
                 program.diagnostics()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_program_enforces_bigint_literal_targets_without_rejecting_literal_types() {
+        let fs = MemoryFileSystem::new(true);
+        let source = concat!(
+            "type Allowed = 255n; ",
+            "const decimal = 255n; ",
+            "const hexadecimal = 0xffn; ",
+            "const negative = -255n;",
+        );
+        fs.write_file("/project/input.ts", source).unwrap();
+
+        for (target, expected) in [
+            (ScriptTarget::Es5, 3),
+            (ScriptTarget::Es2019, 3),
+            (ScriptTarget::Es2020, 0),
+            (ScriptTarget::EsNext, 0),
+        ] {
+            let program = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &["input.ts".to_owned()],
+                CompilerOptions {
+                    lib: Some(vec!["es5".to_owned()]),
+                    target,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("target {target:?}: {error:?}"));
+
+            let diagnostics = program.diagnostics();
+            assert_eq!(diagnostics.len(), expected, "target {target:?}");
+            for (diagnostic, spelling) in diagnostics.iter().zip(["255n", "0xffn", "255n"]) {
+                assert_eq!(diagnostic.code, Some(2737), "target {target:?}");
+                let range = diagnostic.range.unwrap();
+                assert_eq!(
+                    &source[range.start.get() as usize..range.end.get() as usize],
+                    spelling,
+                );
+                assert_eq!(
+                    diagnostic.message,
+                    "BigInt literals are not available when targeting lower than ES2020.",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_program_projects_bigint_exponentiation_target_capability() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.ts", "const value = 1n ** 2n;")
+            .unwrap();
+
+        for (target, expected_literal_errors, expected_exponent_errors) in [
+            (ScriptTarget::Es2015, 2, 1),
+            (ScriptTarget::Es2016, 2, 0),
+            (ScriptTarget::Es2020, 0, 0),
+        ] {
+            let program = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &["input.ts".to_owned()],
+                CompilerOptions {
+                    lib: Some(vec!["es5".to_owned()]),
+                    target,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("target {target:?}: {error:?}"));
+
+            assert_eq!(
+                program
+                    .diagnostics()
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == Some(2737))
+                    .count(),
+                expected_literal_errors,
+                "target {target:?}",
+            );
+            assert_eq!(
+                program
+                    .diagnostics()
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == Some(2791))
+                    .count(),
+                expected_exponent_errors,
+                "target {target:?}",
             );
         }
     }
