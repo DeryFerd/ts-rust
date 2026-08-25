@@ -1457,6 +1457,7 @@ enum PlannedStatement {
     TypeAlias(SemanticSymbolId),
     Interface(SemanticSymbolId),
     InterfaceGrammar(PlannedInterfaceGrammar),
+    InvalidBigIntIndexSignature(NodeRef),
     InterfaceConflict(PlannedInterfaceConflict),
     FunctionTypeGrammar(PlannedFunctionTypeGrammar),
     GenericInterface(super::object_members::PropertyObjectPlan),
@@ -1471,6 +1472,7 @@ enum PlannedStatement {
     Enum(SourceEnumPlan),
     ExternalModuleMarker,
     LocalNamedExport,
+    RecoveredBigIntNamedExport(NodeRef),
     NamedReexport,
     DefaultAlias(Box<PlannedDefaultAliasExport>),
     DefaultObject(Box<PlannedDefaultObjectExport>),
@@ -2055,8 +2057,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let mut functions = Vec::with_capacity(preplanned_functions.len());
         let mut arrows = Vec::new();
         let mut contextual_arrows = Vec::new();
+        let mut recovered_bigint_export_statements = HashSet::new();
         for statement in source_statements {
             let statement = self.reference(statement);
+            if recovered_bigint_export_statements.remove(&statement) {
+                continue;
+            }
             match self.node(statement)?.kind {
                 SyntaxKind::ImportDeclaration | SyntaxKind::ImportEqualsDeclaration => {
                     if let SourceModuleSpecifierGrammar::Invalid(specifier) =
@@ -2349,9 +2355,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 ));
                                 continue;
                             }
-                            let plan =
-                                super::object_members::plan_generic_interface(store, host, symbol)
-                                    .map_err(|error| self.interface_plan_error(statement, error))?;
+                            let plan = match super::object_members::plan_generic_interface(
+                                store, host, symbol,
+                            ) {
+                                Ok(plan) => plan,
+                                Err(error) => {
+                                    if let Some(parameter) =
+                                        self.plan_invalid_bigint_index_signature(statement, symbol)?
+                                    {
+                                        statements.push(
+                                            PlannedStatement::InvalidBigIntIndexSignature(
+                                                parameter,
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                    return Err(self.interface_plan_error(statement, error));
+                                }
+                            };
                             statements.push(PlannedStatement::GenericInterface(plan));
                             continue;
                         }
@@ -2393,6 +2414,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 self.plan_interface_construct_signature_grammar(statement, symbol)?
                             {
                                 statements.push(PlannedStatement::InterfaceGrammar(grammar));
+                                continue;
+                            }
+                            if let Some(parameter) =
+                                self.plan_invalid_bigint_index_signature(statement, symbol)?
+                            {
+                                statements
+                                    .push(PlannedStatement::InvalidBigIntIndexSignature(parameter));
                                 continue;
                             }
                             return Err(self.interface_plan_error(statement, error));
@@ -2839,6 +2867,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         named_reexports.push(reexport);
                         statements.push(PlannedStatement::NamedReexport);
                     } else {
+                        if let Some((name, recovered_statement)) =
+                            self.plan_recovered_bigint_named_export(statement)?
+                        {
+                            if !recovered_bigint_export_statements.insert(recovered_statement) {
+                                return Err(SourceCheckError::Import(statement));
+                            }
+                            statements.push(PlannedStatement::RecoveredBigIntNamedExport(name));
+                            continue;
+                        }
                         let exports = self.plan_external_module_marker(statement)?;
                         if exports.is_empty() {
                             statements.push(PlannedStatement::ExternalModuleMarker);
@@ -6465,6 +6502,239 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }))
     }
 
+    fn plan_invalid_bigint_index_signature(
+        &self,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<Option<NodeRef>, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Ok(None);
+        };
+        let record = self.node(declaration)?;
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return Ok(None);
+        };
+        let [signature] = interface.members.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let signature = self.reference(*signature);
+        let signature_record = self.node(signature)?;
+        let NodeData::IndexSignatureDeclaration(index) = &signature_record.data else {
+            return Ok(None);
+        };
+        if record.kind != SyntaxKind::InterfaceDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(self.source.node_ref().node)
+            || interface.heritage_clauses.is_some()
+            || interface.members.has_trailing_comma
+            || signature_record.kind != SyntaxKind::IndexSignature
+            || signature_record.flags.0 != 0
+            || signature_record.parent != Some(declaration.node)
+            || signature_record.range.start < interface.members.range.start
+            || signature_record.range.end > interface.members.range.end
+            || index.full_signature.is_some()
+            || index.next_container.is_some()
+            || index.symbol.is_some()
+            || index.type_parameters.is_some()
+            || index.modifiers.is_some()
+            || index.parameters.has_trailing_comma
+            || index.parameters.nodes.len() != 1
+            || index.parameters.range.start < signature_record.range.start
+            || index.parameters.range.end > signature_record.range.end
+        {
+            return Ok(None);
+        }
+
+        let parameter = self.reference(index.parameters.nodes[0]);
+        let parameter_record = self.node(parameter)?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Ok(None);
+        };
+        let Some(key) = parameter_data.type_.map(|node| self.reference(node)) else {
+            return Ok(None);
+        };
+        let key_record = self.node(key)?;
+        if key_record.kind != SyntaxKind::BigIntKeyword {
+            return Ok(None);
+        }
+        let name = self.reference(parameter_data.name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(None);
+        };
+        let value = self.reference(index.type_);
+        let value_record = self.node(value)?;
+        if parameter_record.kind != SyntaxKind::Parameter
+            || parameter_record.flags.0 != 0
+            || parameter_record.parent != Some(signature.node)
+            || parameter_record.range.start < index.parameters.range.start
+            || parameter_record.range.end > index.parameters.range.end
+            || parameter_data.dot_dot_dot_token.is_some()
+            || parameter_data.initializer.is_some()
+            || parameter_data.question_token.is_some()
+            || parameter_data.symbol.is_some()
+            || parameter_data.modifiers.is_some()
+            || parameter_data.facts != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(parameter.node)
+            || name_record.range.start < parameter_record.range.start
+            || name_record.range.end > parameter_record.range.end
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || key_record.flags.0 != 0
+            || key_record.parent != Some(parameter.node)
+            || key_record.range.start < name_record.range.end
+            || key_record.range.end > parameter_record.range.end
+            || !matches!(key_record.data, NodeData::KeywordTypeNode(_))
+            || value_record.parent != Some(signature.node)
+            || value_record.range.start < index.parameters.range.end
+            || value_record.range.end > signature_record.range.end
+        {
+            return Ok(None);
+        }
+
+        let Some(owner) = store.symbol(symbol) else {
+            return Ok(None);
+        };
+        let Some(members) = owner
+            .members()
+            .and_then(|members| store.symbol_table(members))
+        else {
+            return Ok(None);
+        };
+        let Some(signature_symbol) = self.bound.symbol(signature) else {
+            return Ok(None);
+        };
+        let Some(signature_owner) = store.symbol(signature_symbol) else {
+            return Ok(None);
+        };
+        let Some(parameter_symbol) = self.bound.symbol(parameter) else {
+            return Ok(None);
+        };
+        let Some(parameter_owner) = store.symbol(parameter_symbol) else {
+            return Ok(None);
+        };
+        let Some(locals) = self
+            .bound
+            .locals(signature)
+            .and_then(|locals| store.symbol_table(locals))
+        else {
+            return Ok(None);
+        };
+        if owner.flags() != SymbolFlags::INTERFACE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration().is_some()
+            || owner.parent().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || signature_owner.flags() != SymbolFlags::SIGNATURE
+            || signature_owner.check_flags() != CheckFlags::NONE
+            || signature_owner.name() != ts_binder::InternalSymbolName::Index.as_ref()
+            || signature_owner.declarations() != Some(&[signature])
+            || signature_owner.value_declaration().is_some()
+            || signature_owner.members().is_some()
+            || signature_owner.exports().is_some()
+            || store.get_parent_of_symbol(signature_symbol) != Some(symbol)
+            || signature_owner.export_symbol().is_some()
+            || members.get(ts_binder::InternalSymbolName::Index.as_ref()) != Some(signature_symbol)
+            || store.get_merged_symbol(signature_symbol) != Some(signature_symbol)
+            || parameter_owner.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || parameter_owner.check_flags() != CheckFlags::NONE
+            || parameter_owner.name().as_utf8() != Some(identifier.text.as_str())
+            || parameter_owner.declarations() != Some(&[parameter])
+            || parameter_owner.value_declaration() != Some(parameter)
+            || parameter_owner.members().is_some()
+            || parameter_owner.exports().is_some()
+            || parameter_owner.parent().is_some()
+            || parameter_owner.export_symbol().is_some()
+            || locals.len() != 1
+            || locals.get_source(&identifier.text) != Some(parameter_symbol)
+            || store.get_merged_symbol(parameter_symbol) != Some(parameter_symbol)
+        {
+            return Ok(None);
+        }
+
+        let expected_members = interface
+            .type_parameters
+            .as_ref()
+            .map_or(1, |parameters| parameters.nodes.len() + 1);
+        if members.len() != expected_members {
+            return Ok(None);
+        }
+        if let Some(parameters) = &interface.type_parameters {
+            if parameters.has_trailing_comma
+                || parameters.nodes.len() != 1
+                || parameters.range.start < record.range.start
+                || parameters.range.end > interface.members.range.start
+            {
+                return Ok(None);
+            }
+            let type_parameter = self.reference(parameters.nodes[0]);
+            let parameter_record = self.node(type_parameter)?;
+            let NodeData::TypeParameterDeclaration(parameter) = &parameter_record.data else {
+                return Ok(None);
+            };
+            let type_name = self.reference(parameter.name);
+            let type_name_record = self.node(type_name)?;
+            let NodeData::Identifier(type_identifier) = &type_name_record.data else {
+                return Ok(None);
+            };
+            let Some(type_symbol) = self.bound.symbol(type_parameter) else {
+                return Ok(None);
+            };
+            let Some(type_owner) = store.symbol(type_symbol) else {
+                return Ok(None);
+            };
+            let NodeData::TypeReferenceNode(value_reference) = &value_record.data else {
+                return Ok(None);
+            };
+            let value_name = self.reference(value_reference.type_name);
+            let value_name_record = self.node(value_name)?;
+            let NodeData::Identifier(value_identifier) = &value_name_record.data else {
+                return Ok(None);
+            };
+            if parameter_record.kind != SyntaxKind::TypeParameter
+                || parameter_record.flags.0 != 0
+                || parameter_record.parent != Some(declaration.node)
+                || parameter.constraint.is_some()
+                || parameter.default_type.is_some()
+                || parameter.expression.is_some()
+                || parameter.modifiers.is_some()
+                || parameter.symbol.is_some()
+                || type_name_record.kind != SyntaxKind::Identifier
+                || type_name_record.flags.0 != 0
+                || type_name_record.parent != Some(type_parameter.node)
+                || type_identifier.flow_node.is_some()
+                || type_identifier.text.is_empty()
+                || type_owner.flags() != SymbolFlags::TYPE_PARAMETER
+                || type_owner.check_flags() != CheckFlags::NONE
+                || type_owner.name().as_utf8() != Some(type_identifier.text.as_str())
+                || type_owner.declarations() != Some(&[type_parameter])
+                || type_owner.value_declaration().is_some()
+                || type_owner.members().is_some()
+                || type_owner.exports().is_some()
+                || store.get_parent_of_symbol(type_symbol) != Some(symbol)
+                || type_owner.export_symbol().is_some()
+                || members.get_source(&type_identifier.text) != Some(type_symbol)
+                || store.get_merged_symbol(type_symbol) != Some(type_symbol)
+                || value_record.kind != SyntaxKind::TypeReference
+                || value_record.flags.0 != 0
+                || value_reference.type_arguments.is_some()
+                || value_name_record.kind != SyntaxKind::Identifier
+                || value_name_record.flags.0 != 0
+                || value_name_record.parent != Some(value.node)
+                || value_identifier.flow_node.is_some()
+                || value_identifier.text != type_identifier.text
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(name))
+    }
+
     fn plan_interface_construct_signature_grammar(
         &self,
         declaration: NodeRef,
@@ -10009,6 +10279,191 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             static_members,
             prototype,
         })
+    }
+
+    fn plan_recovered_bigint_named_export(
+        &self,
+        statement: NodeRef,
+    ) -> Result<Option<(NodeRef, NodeRef)>, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Ok(None);
+        };
+        let record = self.node(statement)?;
+        let NodeData::ExportDeclaration(export) = &record.data else {
+            return Ok(None);
+        };
+        let Some(clause) = export.export_clause.map(|node| self.reference(node)) else {
+            return Ok(None);
+        };
+        let clause_record = self.node(clause)?;
+        let NodeData::NamedExports(exports) = &clause_record.data else {
+            return Ok(None);
+        };
+        if record.kind != SyntaxKind::ExportDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(self.source.node_ref().node)
+            || export.is_type_only
+            || export.module_specifier.is_some()
+            || export.attributes.is_some()
+            || export.flow_node.is_some()
+            || export.symbol.is_some()
+            || export.facts != 0
+            || export.modifiers.is_some()
+            || clause_record.kind != SyntaxKind::NamedExports
+            || clause_record.flags.0 != 0
+            || clause_record.parent != Some(statement.node)
+            || exports.elements.range != clause_record.range
+            || exports.elements.has_trailing_comma
+            || exports.facts != 0
+        {
+            return Ok(None);
+        }
+        match exports.elements.nodes.as_slice() {
+            [binding] => {
+                let binding = self.reference(*binding);
+                let NodeData::ExportSpecifier(specifier) = &self.node(binding)?.data else {
+                    return Ok(None);
+                };
+                let missing = self.node(self.reference(specifier.name))?;
+                if missing.flags.0 != NODE_FLAG_HAS_ERROR
+                    || missing.range.start != missing.range.end
+                {
+                    return Ok(None);
+                }
+            }
+            [] if clause_record.range.start == clause_record.range.end => {}
+            _ => return Ok(None),
+        }
+
+        let Some((recovery_id, recovery_record)) = self
+            .arena
+            .iter()
+            .filter(|(_, candidate)| {
+                candidate.kind == SyntaxKind::ExpressionStatement
+                    && candidate.parent == Some(self.source.node_ref().node)
+                    && candidate.range.start >= record.range.end
+            })
+            .min_by_key(|(_, candidate)| candidate.range.start)
+        else {
+            return Ok(None);
+        };
+        let recovery = self.reference(recovery_id);
+        let NodeData::ExpressionStatement(expression) = &recovery_record.data else {
+            return Ok(None);
+        };
+        let recovered_expression = self.reference(expression.expression);
+        let expression_record = self.node(recovered_expression)?;
+        if recovery_record.flags.0 != 0
+            || expression.flow_node.is_some()
+            || expression_record.parent != Some(recovery.node)
+        {
+            return Ok(None);
+        }
+
+        let name = match exports.elements.nodes.as_slice() {
+            [binding] => {
+                let binding = self.reference(*binding);
+                let binding_record = self.node(binding)?;
+                let NodeData::ExportSpecifier(specifier) = &binding_record.data else {
+                    return Ok(None);
+                };
+                let Some(local) = specifier.property_name.map(|node| self.reference(node)) else {
+                    return Ok(None);
+                };
+                let missing = self.reference(specifier.name);
+                let missing_record = self.node(missing)?;
+                let NodeData::Identifier(missing_identifier) = &missing_record.data else {
+                    return Ok(None);
+                };
+                let NodeData::BigIntLiteral(bigint) = &expression_record.data else {
+                    return Ok(None);
+                };
+                if binding_record.kind != SyntaxKind::ExportSpecifier
+                    || binding_record.flags.0 != 0
+                    || binding_record.parent != Some(clause.node)
+                    || specifier.is_type_only
+                    || specifier.local_symbol.is_some()
+                    || specifier.symbol.is_some()
+                    || specifier.facts != 0
+                    || missing_record.kind != SyntaxKind::Identifier
+                    || missing_record.flags.0 != NODE_FLAG_HAS_ERROR
+                    || missing_record.parent != Some(binding.node)
+                    || missing_record.range.start != missing_record.range.end
+                    || !missing_identifier.text.is_empty()
+                    || missing_identifier.flow_node.is_some()
+                    || expression_record.kind != SyntaxKind::BigIntLiteral
+                    || expression_record.flags.0 != 0
+                    || bigint.token_flags.0 != 0
+                    || expression_record.range.start != missing_record.range.start
+                {
+                    return Ok(None);
+                }
+                local
+            }
+            [] => {
+                let NodeData::AsExpression(assertion) = &expression_record.data else {
+                    return Ok(None);
+                };
+                let literal = self.reference(assertion.expression);
+                let literal_record = self.node(literal)?;
+                let NodeData::BigIntLiteral(bigint) = &literal_record.data else {
+                    return Ok(None);
+                };
+                let type_node = self.reference(assertion.type_);
+                let type_record = self.node(type_node)?;
+                let NodeData::TypeReferenceNode(reference) = &type_record.data else {
+                    return Ok(None);
+                };
+                let name = self.reference(reference.type_name);
+                let Some(source) = self.arena.source_text() else {
+                    return Ok(None);
+                };
+                let Some(prefix) = source.get(
+                    clause_record.range.start.get() as usize
+                        ..literal_record.range.start.get() as usize,
+                ) else {
+                    return Ok(None);
+                };
+                if expression_record.kind != SyntaxKind::AsExpression
+                    || expression_record.flags.0 != 0
+                    || literal_record.kind != SyntaxKind::BigIntLiteral
+                    || literal_record.flags.0 != 0
+                    || literal_record.parent != Some(recovered_expression.node)
+                    || bigint.token_flags.0 != 0
+                    || type_record.kind != SyntaxKind::TypeReference
+                    || type_record.flags.0 != 0
+                    || type_record.parent != Some(recovered_expression.node)
+                    || reference.type_arguments.is_some()
+                    || prefix.trim() != "{"
+                {
+                    return Ok(None);
+                }
+                name
+            }
+            _ => return Ok(None),
+        };
+
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(None);
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || self
+                .bound
+                .locals(self.source.node_ref())
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&identifier.text))
+                .is_some()
+            || !store.contains_node_ref(name)
+            || !store.contains_node_ref(recovery)
+        {
+            return Ok(None);
+        }
+
+        Ok(Some((name, recovery)))
     }
 
     fn plan_external_module_marker(
@@ -31961,6 +32416,9 @@ pub(super) fn check_source_file(
                     );
                 }
             }
+            PlannedStatement::InvalidBigIntIndexSignature(parameter) => {
+                issue_node_diagnostic(diagnostics, parameter, 1268)?;
+            }
             PlannedStatement::InterfaceConflict(interface) => {
                 let detail = Diagnostic::with_arguments(
                     message_by_code(2319).ok_or(SourceCheckError::MissingDiagnostic(2319))?,
@@ -32533,6 +32991,27 @@ pub(super) fn check_source_file(
             | PlannedStatement::DefaultAlias(_)
             | PlannedStatement::AmbientNamespaceExport
             | PlannedStatement::AmbientOverload => {}
+            PlannedStatement::RecoveredBigIntNamedExport(name) => {
+                let record = host.node(name).ok_or(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingNode(name),
+                ))?;
+                let NodeData::Identifier(identifier) = &record.data else {
+                    return Err(SourceCheckError::Import(name));
+                };
+                merge_retry_diagnostic(
+                    diagnostics,
+                    CanonicalCheckerDiagnostic {
+                        node: Some(name),
+                        range_override: None,
+                        diagnostic: Diagnostic::with_arguments(
+                            message_by_code(2304)
+                                .ok_or(SourceCheckError::MissingDiagnostic(2304))?,
+                            [identifier.text.clone()],
+                        ),
+                        related_information: Vec::new(),
+                    },
+                );
+            }
             PlannedStatement::AmbientExportAssignment(expression) => {
                 issue_node_diagnostic(diagnostics, expression, 2714)?;
             }
@@ -42176,6 +42655,34 @@ mod tests {
     }
 
     #[test]
+    fn bigint_element_indices_report_ts2538_with_the_widened_primitive_name() {
+        let source = parsed(concat!(
+            "declare const key: bigint; ",
+            "declare const object: { known: number }; ",
+            "object[1n]; object[key];",
+        ));
+        let file = FileId::new(9_830);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, index) in diagnostics.iter().zip(["1n", "key"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2538);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), index);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type 'bigint' cannot be used as an index type.",
+            );
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn top_level_property_call_statements_publish_call_and_property_links() {
         let source = parsed(concat!(
             "declare const service: { run: () => void }; ",
@@ -50219,6 +50726,35 @@ class Foo2 {
     }
 
     #[test]
+    fn bigint_index_signatures_report_ts1268_at_the_authenticated_parameter_name() {
+        let source = parsed("interface BigIntIndex<Element> { [index: bigint]: Element; }");
+        let file = FileId::new(9_831);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("an invalid bigint index signature must report exactly one diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 1268);
+        assert_eq!(
+            node_text(
+                &source,
+                diagnostic.node.expect("index parameter diagnostic")
+            ),
+            "index",
+        );
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "An index signature parameter type must be 'string', 'number', 'symbol', or a template literal type.",
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn contextual_object_properties_preserve_literals_or_widen_primitives_by_kind() {
         let source = parsed(concat!(
             "interface Expected { ",
@@ -52728,6 +53264,44 @@ class Foo2 {
             assert_eq!(missing_name.diagnostic.code(), 2304);
             assert_eq!(node_text(&source, missing_name.node.unwrap()), "from");
             assert_eq!(missing_name.diagnostic.arguments, ["from"]);
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn recovered_bigint_export_names_report_the_missing_local_binding() {
+        for (index, text) in ["export { foo as 0n };", "export { 0n as foo };"]
+            .into_iter()
+            .enumerate()
+        {
+            let source = parse_source_file(text);
+            assert_eq!(
+                source
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                [Some(1003), Some(1128)],
+                "{text}",
+            );
+            let file = FileId::new(9_832 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("the recovered bigint export must report its missing binding: {text}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2304);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), "foo");
+            assert_eq!(diagnostic.diagnostic.arguments, ["foo"]);
 
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();

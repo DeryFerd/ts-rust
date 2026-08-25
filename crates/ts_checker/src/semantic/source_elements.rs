@@ -2208,7 +2208,17 @@ fn prepare_element_diagnostic(
                     host,
                     global_types,
                     options,
-                    index_type,
+                    if store
+                        .type_payload(index_type)
+                        .is_some_and(|record| record.flags().intersects(TypeFlags::BIG_INT_LIKE))
+                    {
+                        store
+                            .intrinsic_bootstrap()
+                            .ok_or(RelationUnavailable::MissingBootstrap)?
+                            .bigint_type
+                    } else {
+                        index_type
+                    },
                 )?],
             ),
             related_information: Vec::new(),
@@ -4612,6 +4622,47 @@ mod tests {
         assert_eq!(
             diagnostic.diagnostic.render().unwrap(),
             "Type 'true' cannot be used as an index type."
+        );
+    }
+
+    #[test]
+    fn bigint_literal_indices_report_the_widened_bigint_name() {
+        let parsed = parse_fixture("const result = object[1n];");
+        let file = FileId::new(6_608);
+        let mut store = registered_store(&parsed, file);
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let value = ts_jsnum::PseudoBigInt::parse_valid("1n");
+        let bigint = store.regular_bigint_literal_type(value.clone()).unwrap();
+        let (object, _) = property_object(&mut store, "known", number, false);
+        let receiver_symbol =
+            alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "object");
+        let plan = source_plan(
+            &parsed,
+            file,
+            &store,
+            PlannedExpressionKind::BigInt {
+                value,
+                unary_operand: None,
+            },
+            receiver_symbol,
+        );
+
+        let checked = check_direct_source_element_with_array_targets(
+            &mut store,
+            &empty_host(),
+            CanonicalArrayTargets::for_single_target_validation(object),
+            CanonicalCheckerOptions::default(),
+            &plan,
+            object,
+            bigint,
+        )
+        .unwrap();
+        let diagnostic = checked.diagnostic.unwrap();
+        assert_eq!(diagnostic.node, Some(plan.index.node));
+        assert_eq!(diagnostic.diagnostic.code(), 2538);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type 'bigint' cannot be used as an index type."
         );
     }
 
