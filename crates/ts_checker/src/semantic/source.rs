@@ -38,8 +38,9 @@
 //! and variable initializer expressions,
 //! strict top-level call expression statements, exhaustive grouped literal
 //! switch returns, inferred-void string switches with exact unreachable ranges,
-//! atomic primitive/literal scalar binary and comma operators, flattened long
-//! top-level literal addition chains, direct top-level and function-local
+//! atomic primitive/literal scalar binary and comma operators, bounded
+//! string-key object membership expressions, flattened long top-level literal
+//! addition chains, direct top-level and function-local
 //! conditional initializers, required own-property reads (including exact
 //! two-constituent declared unions), direct indexed reads over supported
 //! objects, arrays, and strings, direct-identifier `typeof`, nullable equality,
@@ -17576,6 +17577,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 | SyntaxKind::QuestionQuestionToken
         );
         let comma = operator_kind == SyntaxKind::CommaToken;
+        let membership = operator_kind == SyntaxKind::InKeyword;
         let Some(operator_text) = (if assignment {
             Some("=")
         } else {
@@ -17593,6 +17595,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             } else {
                 SourceCheckError::PrimitiveOperator(operator)
             });
+        }
+        if membership
+            && (!self.is_direct_top_level_variable_initializer(expression)?
+                || left_kind != SyntaxKind::StringLiteral
+                || right_kind != SyntaxKind::ObjectLiteralExpression)
+        {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::BinaryExpression,
+                SourceSyntaxRole::BinaryExpression,
+            ));
         }
 
         let top_level_chain = self.is_direct_top_level_variable_initializer(expression)?
@@ -17620,6 +17633,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         if !logical
             && !comma
             && !assignment
+            && !membership
             && !primitive_binary_operand_plan_is_supported(&left_plan)
             && !self.is_enum_member_expression(&left_plan)?
         {
@@ -17635,10 +17649,46 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         if !logical
             && !comma
             && !assignment
+            && !membership
             && !primitive_binary_operand_plan_is_supported(&right_plan)
             && !self.is_enum_member_expression(&right_plan)?
         {
             return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
+        }
+        if membership {
+            let PlannedExpressionKind::String(_) = &left_plan.kind else {
+                return Err(self.unsupported(left, left_kind, SourceSyntaxRole::BinaryOperand));
+            };
+            let PlannedExpressionKind::Object { plan, properties } = &right_plan.kind else {
+                return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
+            };
+            let [property] = plan.properties.as_slice() else {
+                return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
+            };
+            let [initializer] = properties.as_slice() else {
+                return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
+            };
+            if plan.kind != super::object_members::PropertyObjectKind::ObjectLiteral
+                || property.optional
+                || property.readonly
+                || !plan.methods.is_empty()
+                || !plan.accessors.is_empty()
+                || !plan.spreads.is_empty()
+                || !plan.indexes.is_empty()
+                || !plan.call_signatures.is_empty()
+                || plan.alias_symbol.is_some()
+                || plan.heritage.is_some()
+                || !matches!(initializer.kind, PlannedExpressionKind::Number { .. })
+            {
+                return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
+            }
+            let boolean = store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.boolean_type)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            preflight_source_expression_cache(store, expression, boolean)?;
         }
         let parent = DirectBinaryParent {
             left: left_plan.node,
@@ -20155,6 +20205,9 @@ pub(super) const fn logical_binary_operator_text(kind: SyntaxKind) -> Option<&'s
 const fn binary_operator_text(kind: SyntaxKind) -> Option<&'static str> {
     if matches!(kind, SyntaxKind::CommaToken) {
         return Some(",");
+    }
+    if matches!(kind, SyntaxKind::InKeyword) {
+        return Some("in");
     }
     match logical_binary_operator_text(kind) {
         Some(text) => Some(text),
@@ -22914,6 +22967,66 @@ fn check_expression_type(
                     }
                     publish_expression_type(store, node, right.raw)?;
                     left = CheckedExpressionTypes::leaf(right.raw, right.result);
+                } else if operator == SyntaxKind::InKeyword {
+                    let PlannedExpressionKind::String(_) = &binary.left.kind else {
+                        return Err(SourceCheckError::PrimitiveOperator(node));
+                    };
+                    let PlannedExpressionKind::Object { plan, properties } = &right_expression.kind
+                    else {
+                        return Err(SourceCheckError::PrimitiveOperator(node));
+                    };
+                    let [property] = plan.properties.as_slice() else {
+                        return Err(SourceCheckError::PrimitiveOperator(node));
+                    };
+                    if binary.node != node || !binary.prefix.is_empty() || properties.len() != 1 {
+                        return Err(SourceCheckError::PrimitiveOperator(node));
+                    }
+                    let bootstrap =
+                        store
+                            .intrinsic_bootstrap()
+                            .ok_or(SourceCheckError::LiteralCache(
+                                SourceLiteralCacheError::BootstrapUninitialized,
+                            ))?;
+                    let boolean = bootstrap.boolean_type;
+                    let number = bootstrap.number_type;
+                    let Some(left_record) = store.type_payload(left.result) else {
+                        return Err(SourceCheckError::PrimitiveOperator(node));
+                    };
+                    let Some(right_record) = store.type_payload(right.result) else {
+                        return Err(SourceCheckError::PrimitiveOperator(node));
+                    };
+                    let TypeData::Object(object) = right_record.data() else {
+                        return Err(SourceCheckError::PrimitiveOperator(node));
+                    };
+                    let Some([published_property]) = object.structured.properties.as_deref() else {
+                        return Err(SourceCheckError::PrimitiveOperator(node));
+                    };
+                    let Some(property_record) = store.symbol(*published_property) else {
+                        return Err(SourceCheckError::PrimitiveOperator(node));
+                    };
+                    if !left_record.flags().intersects(TypeFlags::STRING_LITERAL)
+                        || right_record.flags() != TypeFlags::OBJECT
+                        || right_record.symbol() != Some(plan.symbol)
+                        || super::object_members::object_literal_state(store, plan)
+                            .map_err(source_object_execution_error)?
+                            .is_none_or(|state| state.type_id() != right.result)
+                        || object
+                            .structured
+                            .members
+                            .and_then(|members| store.symbol_table(members))
+                            .and_then(|members| members.get(property_record.name()))
+                            != Some(*published_property)
+                        || store.value_symbol_links(*published_property)
+                            != Some(&ValueSymbolLinks {
+                                resolved_type: Some(number),
+                                target: Some(property.symbol),
+                                ..ValueSymbolLinks::default()
+                            })
+                    {
+                        return Err(SourceCheckError::PrimitiveOperator(node));
+                    }
+                    publish_expression_type(store, node, boolean)?;
+                    left = CheckedExpressionTypes::leaf(boolean, boolean);
                 } else {
                     let left_recovery = left.primitive_binary_recovery.or_else(|| {
                         shorthand_default_arrow_any_operand_recovery(
@@ -41495,6 +41608,163 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn bounded_object_membership_publishes_boolean_results_and_preserves_property_types() {
+        let source = parsed(concat!(
+            "const present = \"x\" in { x: 1 }; ",
+            "const missing = \"other\" in { x: 1 };",
+        ));
+        let file = FileId::new(9_940);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for name in ["present", "missing"] {
+            let expression = variable_initializer(&source, file, name);
+            let (_, object) = primitive_binary_parts(&source, file, expression);
+            assert_eq!(
+                variable_value_type(&context, &source, file, name),
+                bootstrap.boolean_type,
+            );
+            assert_eq!(
+                resolved_node_type(&context, expression),
+                bootstrap.boolean_type
+            );
+            assert_eq!(
+                object_property_type(&context, object, "x"),
+                bootstrap.number_type
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn class_field_variance_fixture_preserves_membership_and_for_in_diagnostics() {
+        let library = parsed(concat!(
+            "interface Array<T> {} ",
+            "interface Console { log(...values: any[]): void; } ",
+            "declare var console: Console;",
+        ));
+        let source = parsed(concat!(
+            "class C { in x = 1; out y = 2; }\n",
+            "const isIn = \"x\" in { x: 1 };\n",
+            "for (const k in { x: 1 }) {\n",
+            "  console.log(k);\n",
+            "}\n",
+        ));
+        let library_file = FileId::new(9_941);
+        let file = FileId::new(9_942);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, expected) in diagnostics.iter().zip(["in", "out"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 1274);
+            assert_eq!(diagnostic.diagnostic.arguments, [expected]);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), expected);
+        }
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let membership = variable_initializer(&source, file, "isIn");
+        assert_eq!(
+            variable_value_type(&context, &source, file, "isIn"),
+            bootstrap.boolean_type,
+        );
+        assert_eq!(
+            resolved_node_type(&context, membership),
+            bootstrap.boolean_type
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "k"),
+            bootstrap.string_type,
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn unsupported_object_membership_shapes_fail_before_source_publication() {
+        for (index, text) in [
+            "const value = 1 in { x: 1 };",
+            "const value = \"x\" in 1;",
+            "const value = \"x\" in {};",
+            "const value = \"x\" in { x: 1, y: 2 };",
+            "const value = \"x\" in { x: \"ready\" };",
+            "const object = { x: 1 }; const value = \"x\" in object;",
+            "const value = (\"x\" in { x: 1 });",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_943 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let value = variable_symbol(&context, &source, file, "value");
+            let before = observable_state(&context, file);
+
+            assert!(
+                matches!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Unsupported(_)),
+                ),
+                "unexpectedly admitted object membership: {text}",
+            );
+            assert_eq!(observable_state(&context, file), before, "source: {text}");
+            assert!(context.store().value_symbol_links(value).is_none());
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn object_membership_root_cache_poison_fails_before_source_publication() {
+        let source = parsed("const value = \"x\" in { x: 1 };");
+        let file = FileId::new(9_950);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let expression = variable_initializer(&source, file, "value");
+        let (_, object) = primitive_binary_parts(&source, file, expression);
+        let value = variable_symbol(&context, &source, file, "value");
+        let (poison, expected) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.boolean_type)
+        };
+        assert!(context.store_mut_for_test().set_type_node_links(
+            expression,
+            TypeNodeLinks {
+                resolved_type: Some(poison),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let before = observable_state(&context, file);
+        let error = SourceCheckError::Assertion(SourceAssertionError::InvalidExpressionCache {
+            node: expression,
+            cached: Some(poison),
+            expected,
+        });
+
+        assert_eq!(context.check_source_file(file), Err(error));
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.store().type_node_links(object).is_none());
+        assert!(context.store().value_symbol_links(value).is_none());
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+
+        assert_eq!(context.check_source_file(file), Err(error));
+        assert_eq!(observable_state(&context, file), before);
     }
 
     #[test]
