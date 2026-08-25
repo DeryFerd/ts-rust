@@ -6961,6 +6961,284 @@ fn plan_interface_accessor(
     })
 }
 
+/// Authenticates only React Mixin's two optional, deferred parameter-returning methods.
+#[allow(clippy::too_many_lines)] // Ambient React ownership, method syntax, and forwarded return identity form one proof.
+fn authenticated_react_mixin_optional_method(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
+    let Some(bound) = host.bound_file(owner) else {
+        return false;
+    };
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let Some(owner_record) = store.symbol(owner_symbol) else {
+        return false;
+    };
+    let Some(namespace) = store.get_parent_of_symbol(owner_symbol) else {
+        return false;
+    };
+    let Some(namespace_record) = store.symbol(namespace) else {
+        return false;
+    };
+    let Some(exports) = namespace_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+    else {
+        return false;
+    };
+    let Ok(interface_record) = preflight_node(store, host, owner) else {
+        return false;
+    };
+    let NodeData::InterfaceDeclaration(interface) = &interface_record.data else {
+        return false;
+    };
+    let Some([props, state]) = interface
+        .type_parameters
+        .as_ref()
+        .map(|parameters| parameters.nodes.as_slice())
+    else {
+        return false;
+    };
+    let Ok(method_record) = preflight_node(store, host, declaration) else {
+        return false;
+    };
+    let NodeData::MethodSignatureDeclaration(method) = &method_record.data else {
+        return false;
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, method.name);
+    let Ok(name_record) = preflight_node(store, host, name) else {
+        return false;
+    };
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return false;
+    };
+    let (expected_parameter, expected_name) = match identifier.text.as_str() {
+        "getDefaultProps" => (*props, "P"),
+        "getInitialState" => (*state, "S"),
+        _ => return false,
+    };
+    let parameter = NodeRef::new(owner.arena, owner.file, expected_parameter);
+    let Some(parameter_symbol) = bound
+        .symbol(parameter)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(parameter_owner) = store.symbol(parameter_symbol) else {
+        return false;
+    };
+    let Some(token) = method
+        .postfix_token
+        .map(|token| NodeRef::new(declaration.arena, declaration.file, token))
+    else {
+        return false;
+    };
+    let Ok(token_record) = preflight_node(store, host, token) else {
+        return false;
+    };
+    let Some(return_type) = method
+        .type_
+        .map(|type_| NodeRef::new(declaration.arena, declaration.file, type_))
+    else {
+        return false;
+    };
+    let Ok(return_record) = preflight_node(store, host, return_type) else {
+        return false;
+    };
+    let NodeData::TypeReferenceNode(reference) = &return_record.data else {
+        return false;
+    };
+    let return_name = NodeRef::new(return_type.arena, return_type.file, reference.type_name);
+    let Ok(return_name_record) = preflight_node(store, host, return_name) else {
+        return false;
+    };
+    let NodeData::Identifier(return_identifier) = &return_name_record.data else {
+        return false;
+    };
+    let Some(method_symbol) = bound
+        .symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(method_owner) = store.symbol(method_symbol) else {
+        return false;
+    };
+    let Some(namespace_block) = interface_record
+        .parent
+        .map(|parent| NodeRef::new(owner.arena, owner.file, parent))
+    else {
+        return false;
+    };
+    let Ok(namespace_block_record) = preflight_node(store, host, namespace_block) else {
+        return false;
+    };
+    let Some(namespace_declaration) = namespace_block_record
+        .parent
+        .map(|parent| NodeRef::new(namespace_block.arena, namespace_block.file, parent))
+    else {
+        return false;
+    };
+    let Ok(namespace_declaration_record) = preflight_node(store, host, namespace_declaration)
+    else {
+        return false;
+    };
+    let NodeData::ModuleDeclaration(namespace_data) = &namespace_declaration_record.data else {
+        return false;
+    };
+    let Some(module_block) = namespace_declaration_record.parent.map(|parent| {
+        NodeRef::new(
+            namespace_declaration.arena,
+            namespace_declaration.file,
+            parent,
+        )
+    }) else {
+        return false;
+    };
+    let Ok(module_block_record) = preflight_node(store, host, module_block) else {
+        return false;
+    };
+    let Some(module) = module_block_record
+        .parent
+        .map(|parent| NodeRef::new(module_block.arena, module_block.file, parent))
+    else {
+        return false;
+    };
+    let Ok(module_record) = preflight_node(store, host, module) else {
+        return false;
+    };
+    let NodeData::ModuleDeclaration(module_data) = &module_record.data else {
+        return false;
+    };
+    let module_name = NodeRef::new(module.arena, module.file, module_data.name);
+    let Ok(module_name_record) = preflight_node(store, host, module_name) else {
+        return false;
+    };
+    let NodeData::StringLiteral(module_literal) = &module_name_record.data else {
+        return false;
+    };
+
+    if !facts.is_declaration_file()
+        || facts.is_default_library()
+        || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name().as_utf8() != Some("Mixin")
+        || owner_record.declarations() != Some(&[owner])
+        || !host.symbol_matches(store, owner, owner_symbol)
+        || namespace_record.name().as_utf8() != Some("React")
+        || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+        || namespace_record.check_flags() != CheckFlags::NONE
+        || store.get_merged_symbol(namespace) != Some(namespace)
+        || exports
+            .get_source("Mixin")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(owner_symbol)
+        || exports
+            .get_source("ComponentLifecycle")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .and_then(|symbol| store.symbol(symbol))
+            .is_none_or(|symbol| {
+                symbol.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+                    || symbol.check_flags() != CheckFlags::NONE
+                    || symbol.name().as_utf8() != Some("ComponentLifecycle")
+            })
+        || interface_record.kind != SyntaxKind::InterfaceDeclaration
+        || interface_record.flags.0 != 0
+        || interface.heritage_clauses.is_none()
+        || method_record.kind != SyntaxKind::MethodSignature
+        || method_record.flags.0 != 0
+        || method_record.parent != Some(owner.node)
+        || method.type_parameters.is_some()
+        || !method.parameters.nodes.is_empty()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || token_record.kind != SyntaxKind::QuestionToken
+        || token_record.flags.0 != 0
+        || token_record.parent != Some(declaration.node)
+        || !matches!(token_record.data, NodeData::Token(_))
+        || return_record.kind != SyntaxKind::TypeReference
+        || return_record.flags.0 != 0
+        || return_record.parent != Some(declaration.node)
+        || reference.type_arguments.is_some()
+        || return_name_record.kind != SyntaxKind::Identifier
+        || return_name_record.flags.0 != 0
+        || return_name_record.parent != Some(return_type.node)
+        || return_identifier.flow_node.is_some()
+        || return_identifier.text != expected_name
+        || store
+            .symbol_node_links(return_type)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|cached| store.get_merged_symbol(cached) != Some(parameter_symbol))
+        || store.type_node_links(return_type).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|cached| {
+                    store
+                        .declared_type_links(parameter_symbol)
+                        .and_then(|parameter| parameter.declared_type)
+                        != Some(cached)
+                })
+        })
+        || parameter_owner.flags() != SymbolFlags::TYPE_PARAMETER
+        || parameter_owner.check_flags() != CheckFlags::NONE
+        || parameter_owner.name().as_utf8() != Some(expected_name)
+        || store.get_parent_of_symbol(parameter_symbol) != Some(owner_symbol)
+        || owner_record
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(expected_name))
+            != Some(parameter_symbol)
+        || method_owner.flags() != SymbolFlags::METHOD | SymbolFlags::OPTIONAL
+        || method_owner.check_flags() != CheckFlags::NONE
+        || method_owner.name().as_utf8() != Some(identifier.text.as_str())
+        || method_owner.declarations() != Some(&[declaration])
+        || method_owner.value_declaration() != Some(declaration)
+        || store.get_parent_of_symbol(method_symbol) != Some(owner_symbol)
+        || owner_record
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(&identifier.text))
+            != Some(method_symbol)
+        || store
+            .value_symbol_links(method_symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || store
+            .signature_links(declaration)
+            .is_some_and(|links| links != &SignatureLinks::default())
+        || namespace_block_record.kind != SyntaxKind::ModuleBlock
+        || namespace_declaration_record.kind != SyntaxKind::ModuleDeclaration
+        || namespace_data.keyword != SyntaxKind::NamespaceKeyword
+        || namespace_data.body != Some(namespace_block.node)
+        || !host.symbol_matches(store, namespace_declaration, namespace)
+        || module_block_record.kind != SyntaxKind::ModuleBlock
+        || module_record.kind != SyntaxKind::ModuleDeclaration
+        || module_record.parent != Some(bound.source_file().node)
+        || module_data.keyword != SyntaxKind::ModuleKeyword
+        || module_data.body != Some(module_block.node)
+        || module_name_record.kind != SyntaxKind::StringLiteral
+        || module_name_record.parent != Some(module.node)
+        || module_literal.text != "react"
+    {
+        return false;
+    }
+
+    let Ok(mut resolver) = host.name_resolver_host(store) else {
+        return false;
+    };
+    resolver
+        .resolve_entity_name(return_name, SymbolFlags::TYPE)
+        .ok()
+        .flatten()
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        == Some(parameter_symbol)
+}
+
 fn plan_interface_method(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -6976,12 +7254,14 @@ fn plan_interface_method(
     let NodeData::MethodSignatureDeclaration(method) = &record.data else {
         return Err(unsupported());
     };
+    let optional_react_mixin = method.postfix_token.is_some()
+        && authenticated_react_mixin_optional_method(store, host, owner, owner_symbol, declaration);
     if record.kind != SyntaxKind::MethodSignature
         || record.flags.0 != 0
         || record.parent != Some(owner.node)
         || method.full_signature.is_some()
         || method.next_container.is_some()
-        || method.postfix_token.is_some()
+        || method.postfix_token.is_some() && !optional_react_mixin
         || method.symbol.is_some()
         || method.modifiers.is_some()
         || method.parameters.has_trailing_comma
@@ -7029,7 +7309,13 @@ fn plan_interface_method(
     let declarations = method_symbol.declarations().ok_or_else(unsupported)?;
     if symbol != raw_symbol
         || !host.symbol_matches(store, declaration, symbol)
-        || method_symbol.flags() != SymbolFlags::METHOD
+        || method_symbol.flags()
+            != SymbolFlags::METHOD
+                | if optional_react_mixin {
+                    SymbolFlags::OPTIONAL
+                } else {
+                    SymbolFlags::NONE
+                }
         || method_symbol.check_flags() != CheckFlags::NONE
         || method_symbol.name().as_utf8() != Some(identifier.text.as_str())
         || !declarations.contains(&declaration)
@@ -19356,6 +19642,195 @@ mod generic_publication_tests {
                 warm,
             );
         }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both React methods, inherited defaults, forged exports, and warm identity share one proof.
+    fn ambient_react_mixin_optional_methods_remain_authenticated_and_lazy() {
+        let parsed = parse_source_file(concat!(
+            "declare module 'react' { export = React; namespace React { ",
+            "interface ComponentLifecycle<P, S, SS = any> {} ",
+            "interface Mixin<P, S> extends ComponentLifecycle<P, S> { ",
+            "getDefaultProps?(): P; getInitialState?(): S; ",
+            "} } }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_943);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source("\"/react-mixin.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let root_symbols = store
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in root_symbols {
+            store.merge_global_symbol(globals, symbol).unwrap();
+        }
+        let symbol = |expected: &str| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &parsed.arena.get(interface.name)?.data else {
+                        return None;
+                    };
+                    (name.text == expected)
+                        .then(|| bound.symbol(NodeRef::new(parsed.arena.id(), file, node)))
+                        .flatten()
+                })
+                .unwrap()
+        };
+        let mixin = symbol("Mixin");
+        let lifecycle = symbol("ComponentLifecycle");
+        let host = host(&parsed, &bound);
+        let cold = (
+            store.type_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_generic_interface(&store, &host, mixin).unwrap();
+        assert_eq!(plan.methods.len(), 2);
+        assert_eq!(
+            plan.methods
+                .iter()
+                .map(|method| store.symbol(method.symbol).unwrap().name().as_utf8())
+                .collect::<Vec<_>>(),
+            [Some("getDefaultProps"), Some("getInitialState")],
+        );
+        for method in &plan.methods {
+            assert_eq!(
+                store.symbol(method.symbol).unwrap().flags(),
+                SymbolFlags::METHOD | SymbolFlags::OPTIONAL,
+            );
+            assert!(store.value_symbol_links(method.symbol).is_none());
+            assert!(store.signature_links(method.declaration).is_none());
+        }
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let target = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(mixin)
+        .unwrap();
+        let TypeData::Interface(interface) = store.type_payload(target).unwrap().data() else {
+            panic!("Mixin must retain its unresolved generic interface members")
+        };
+        assert!(interface.base_types_resolved);
+        assert!(!interface.declared_members_resolved);
+        let [base] = interface.resolved_base_types.as_deref().unwrap() else {
+            panic!("Mixin must retain its authenticated lifecycle base")
+        };
+        let reference = validate_direct_generic_reference(&store, *base).unwrap();
+        assert_eq!(reference.type_arguments.len(), 3);
+        assert_eq!(
+            reference.type_arguments[2],
+            store.intrinsic_bootstrap().unwrap().any_type,
+        );
+        for method in &plan.methods {
+            assert!(store.value_symbol_links(method.symbol).is_none());
+            assert!(store.signature_links(method.declaration).is_none());
+        }
+
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            plan_generic_interface(&store, &host, mixin),
+            Ok(plan.clone())
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(mixin),
+            Ok(target),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+
+        let namespace = store.get_parent_of_symbol(mixin).unwrap();
+        let exports = store.symbol(namespace).unwrap().exports().unwrap();
+        assert_eq!(
+            store.insert_symbol(exports, EscapedName::source("Mixin"), lifecycle),
+            Some(Some(mixin)),
+        );
+        let poisoned = (
+            store.type_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert!(plan_generic_interface(&store, &host, mixin).is_err());
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+        assert_eq!(
+            store.insert_symbol(exports, EscapedName::source("Mixin"), mixin),
+            Some(Some(lifecycle)),
+        );
+        assert_eq!(plan_generic_interface(&store, &host, mixin), Ok(plan));
         assert!(diagnostics.is_empty());
     }
 
