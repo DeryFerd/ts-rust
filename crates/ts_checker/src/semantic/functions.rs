@@ -1,8 +1,9 @@
 //! Exact function-type signatures for the dependency-closed type-node cut.
 //!
 //! This module owns nongeneric function types, authenticated implicit, explicit
-//! `any[]`, and other typed rest parameters, identifier and assertion
-//! predicates, and generic function types with outer lexical constraints.
+//! `any[]`, typed and variadic type-parameter rest parameters, identifier and
+//! assertion predicates, and generic function types with outer lexical
+//! constraints.
 //! The type-node planner/executor only supplies recursive annotation callbacks;
 //! binder proof, cache validation, shell publication, signatures, parameter
 //! value types, and lazy return-type validation stay here.
@@ -54,6 +55,7 @@ pub(super) struct FunctionParameterPlan {
     rest_tuple_element: Option<FunctionRestTupleElementPlan>,
     implicit_any_rest: bool,
     typed_rest: bool,
+    rest_type_parameter: Option<SemanticSymbolId>,
 }
 
 /// One required labeled tuple element expanded into a fixed signature parameter.
@@ -502,8 +504,18 @@ pub(super) fn plan_function_type(
                 preflight_node(store, host, type_node)?.kind,
                 SyntaxKind::ArrayType | SyntaxKind::InferType
             );
+        let rest_type_parameter = if data.dot_dot_dot_token.is_some()
+            && !implicit_any_rest
+            && !explicit_any_rest
+        {
+            plan_variadic_type_parameter_rest_parameter(store, host, node, parameter, type_node)?
+        } else {
+            None
+        };
         let rest_tuple_element = match data.dot_dot_dot_token {
-            Some(token) if implicit_any_rest || explicit_any_rest => {
+            Some(token)
+                if implicit_any_rest || explicit_any_rest || rest_type_parameter.is_some() =>
+            {
                 let token = NodeRef::new(node.arena, node.file, token);
                 let token_record = preflight_node(store, host, token)?;
                 if token_record.kind != SyntaxKind::DotDotDotToken
@@ -692,8 +704,14 @@ pub(super) fn plan_function_type(
             rest_tuple_element,
             implicit_any_rest,
             typed_rest,
+            rest_type_parameter,
         });
-        if !optional && !implicit_any_rest && !explicit_any_rest && !typed_rest {
+        if !optional
+            && !implicit_any_rest
+            && !explicit_any_rest
+            && !typed_rest
+            && rest_type_parameter.is_none()
+        {
             min_argument_count = parameters.len();
         }
     }
@@ -854,6 +872,223 @@ fn plan_explicit_any_array_rest_parameter(
         )));
     }
     Ok(true)
+}
+
+fn plan_variadic_type_parameter_rest_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    function: NodeRef,
+    parameter: NodeRef,
+    annotation: NodeRef,
+) -> Result<Option<SemanticSymbolId>, FunctionTypeError> {
+    let annotation_record = preflight_node(store, host, annotation)?;
+    let (symbol, declaration, inferred) = match &annotation_record.data {
+        NodeData::TypeReferenceNode(reference)
+            if annotation_record.kind == SyntaxKind::TypeReference
+                && reference.type_arguments.is_none() =>
+        {
+            let symbol = match function_type_parameter_reference_symbol(store, host, annotation) {
+                Ok(symbol) => symbol,
+                Err(FunctionTypeError::Unsupported(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let Some(owner) = store.symbol(symbol) else {
+                return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
+                    parameter,
+                )));
+            };
+            if owner.flags() != SymbolFlags::TYPE_PARAMETER {
+                return Ok(None);
+            }
+            let Some([declaration]) = owner.declarations() else {
+                return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
+                    parameter,
+                )));
+            };
+            (symbol, *declaration, false)
+        }
+        NodeData::InferTypeNode(inferred) if annotation_record.kind == SyntaxKind::InferType => {
+            let declaration =
+                NodeRef::new(annotation.arena, annotation.file, inferred.type_parameter);
+            let bound = host.bound_file(declaration).ok_or_else(|| {
+                invariant(FunctionTypeInvariant::InvalidParameterCache(parameter))
+            })?;
+            let raw_symbol = bound.symbol(declaration).ok_or_else(|| {
+                invariant(FunctionTypeInvariant::InvalidParameterCache(parameter))
+            })?;
+            let symbol = store.get_merged_symbol(raw_symbol).ok_or_else(|| {
+                invariant(FunctionTypeInvariant::InvalidParameterCache(parameter))
+            })?;
+            if symbol != raw_symbol {
+                return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
+                    parameter,
+                )));
+            }
+            (symbol, declaration, true)
+        }
+        _ => return Ok(None),
+    };
+
+    let function_record = preflight_node(store, host, function)?;
+    let NodeData::FunctionTypeNode(function_data) = &function_record.data else {
+        return Err(invariant(FunctionTypeInvariant::InvalidSyntax(function)));
+    };
+    let parameter_record = preflight_node(store, host, parameter)?;
+    let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+            parameter,
+        )));
+    };
+    if function_data.parameters.nodes.last() != Some(&parameter.node)
+        || parameter_data.question_token.is_some()
+    {
+        return Err(FunctionTypeError::Unsupported(
+            FunctionTypeUnsupported::RestParameter(parameter),
+        ));
+    }
+
+    preflight_type_parameter_symbol(store, host, symbol, &mut HashSet::new())?;
+    let declaration_record = preflight_node(store, host, declaration)?;
+    let NodeData::TypeParameterDeclaration(declaration_data) = &declaration_record.data else {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
+            parameter,
+        )));
+    };
+    if declaration_data.default_type.is_some()
+        || declaration_data.expression.is_some()
+        || declaration_data.modifiers.is_some()
+    {
+        return Ok(None);
+    }
+    let name = NodeRef::new(declaration.arena, declaration.file, declaration_data.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
+            parameter,
+        )));
+    };
+    let owner = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(FunctionTypeInvariant::InvalidParameterCache(parameter)))?;
+    if declaration_record.kind != SyntaxKind::TypeParameter
+        || declaration_record.flags.0 != 0
+        || declaration_data.symbol.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || owner.flags() != SymbolFlags::TYPE_PARAMETER
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(identifier.text.as_str())
+        || owner.declarations() != Some(&[declaration])
+        || owner.value_declaration().is_some()
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+    {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
+            parameter,
+        )));
+    }
+
+    if inferred {
+        if declaration_record.parent != Some(annotation.node)
+            || declaration_data.constraint.is_some()
+            || !function_type_is_conditional_extends(store, host, function)?
+        {
+            return Ok(None);
+        }
+        if let Some(type_parameter) = store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            && !store
+                .type_payload(type_parameter)
+                .map(TypeRecord::data)
+                .is_some_and(|data| {
+                    matches!(data, TypeData::TypeParameter(data) if data.constraint.is_none())
+                })
+        {
+            return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
+                parameter,
+            )));
+        }
+    } else {
+        if !function_type_parameter_is_outer(store, function, declaration) {
+            return Ok(None);
+        }
+        let Some(constraint) = declaration_data.constraint else {
+            return Ok(None);
+        };
+        let constraint = NodeRef::new(declaration.arena, declaration.file, constraint);
+        let constraint_record = preflight_node(store, host, constraint)?;
+        let NodeData::ArrayTypeNode(array) = &constraint_record.data else {
+            return Ok(None);
+        };
+        let element = NodeRef::new(constraint.arena, constraint.file, array.element_type);
+        let element_record = preflight_node(store, host, element)?;
+        if element_record.kind != SyntaxKind::UnknownKeyword {
+            return Ok(None);
+        }
+        if constraint_record.kind != SyntaxKind::ArrayType
+            || constraint_record.flags.0 != 0
+            || constraint_record.parent != Some(declaration.node)
+            || constraint_record.range.start < declaration_record.range.start
+            || constraint_record.range.end > declaration_record.range.end
+            || element_record.flags.0 != 0
+            || element_record.parent != Some(constraint.node)
+            || element_record.range.start != constraint_record.range.start
+            || element_record.range.end > constraint_record.range.end
+        {
+            return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
+                parameter,
+            )));
+        }
+        if let Some(type_parameter) = store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            && !valid_variadic_type_parameter_constraint(store, type_parameter, constraint)
+        {
+            return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
+                parameter,
+            )));
+        }
+    }
+    Ok(Some(symbol))
+}
+
+fn function_type_is_conditional_extends(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    function: NodeRef,
+) -> Result<bool, FunctionTypeError> {
+    let mut current = function;
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        let record = preflight_node(store, host, current)?;
+        let Some(parent) = record.parent else {
+            return Ok(false);
+        };
+        let parent = NodeRef::new(current.arena, current.file, parent);
+        let parent_record = preflight_node(store, host, parent)?;
+        match &parent_record.data {
+            NodeData::ParenthesizedTypeNode(parenthesized)
+                if parent_record.kind == SyntaxKind::ParenthesizedType
+                    && parenthesized.type_ == current.node =>
+            {
+                current = parent;
+            }
+            NodeData::ConditionalTypeNode(conditional)
+                if parent_record.kind == SyntaxKind::ConditionalType =>
+            {
+                return Ok(conditional.extends_type == current.node);
+            }
+            _ => return Ok(false),
+        }
+    }
+    Err(invariant(FunctionTypeInvariant::InvalidSyntax(function)))
 }
 
 fn plan_rest_tuple_parameter(
@@ -1843,6 +2078,15 @@ pub(super) fn publish_parameter_types(
                     )
                     .is_err()
                 || planned_signature_parameter_type(store, parameter, supplied_base).is_none()
+                || parameter.rest_type_parameter.is_some_and(|symbol| {
+                    cached_ordinary_type_parameter_owner(store, supplied_base) != Some(symbol)
+                        || !valid_stored_variadic_type_parameter_rest(
+                            store,
+                            function.plan.node,
+                            parameter.declaration,
+                            supplied_base,
+                        )
+                })
             {
                 return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
                     parameter.declaration,
@@ -2304,13 +2548,13 @@ pub(super) fn validate_stored_function_type(
                 let Some(parameter) = signature_record.parameters().last().copied() else {
                     return false;
                 };
-                let Some(declaration) = store
+                let Some(parameter_declaration) = store
                     .symbol(parameter)
                     .and_then(ts_binder::semantic::Symbol::value_declaration)
                 else {
                     return false;
                 };
-                match store.source_direct_type_annotation(declaration) {
+                match store.source_direct_type_annotation(parameter_declaration) {
                     None => implicit_any_array_type(store) == Some(expected),
                     Some(annotation)
                         if matches!(
@@ -2320,14 +2564,25 @@ pub(super) fn validate_stored_function_type(
                     {
                         super::object_members::declared_signature_parameter_is_rest(
                             store,
-                            declaration,
+                            parameter_declaration,
                         ) == Some(true)
                             && store
                                 .type_node_links(annotation)
                                 .and_then(|links| links.resolved_type)
                                 == Some(expected)
+                            || valid_stored_variadic_type_parameter_rest(
+                                store,
+                                declaration,
+                                parameter_declaration,
+                                expected,
+                            )
                     }
-                    Some(_) => false,
+                    Some(_) => valid_stored_variadic_type_parameter_rest(
+                        store,
+                        declaration,
+                        parameter_declaration,
+                        expected,
+                    ),
                 }
             });
     let alias_state = stored_alias_state(store, type_, record, declaration);
@@ -2848,6 +3103,122 @@ fn stored_rest_tuple_parameter_type(
     Some(*element_type)
 }
 
+fn valid_stored_variadic_type_parameter_rest(
+    store: &CanonicalTypeMapperStore,
+    function: NodeRef,
+    parameter: NodeRef,
+    type_parameter: TypeId,
+) -> bool {
+    let Some(annotation) = store.source_direct_type_annotation(parameter) else {
+        return false;
+    };
+    let Some(symbol) = cached_ordinary_type_parameter_owner(store, type_parameter) else {
+        return false;
+    };
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some([declaration]) = owner.declarations() else {
+        return false;
+    };
+    if owner.flags() != SymbolFlags::TYPE_PARAMETER
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.value_declaration().is_some()
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
+        || store.source_node_parent(annotation) != Some(SourceNodeParent::Parent(parameter))
+    {
+        return false;
+    }
+
+    match store.source_node_kind(annotation) {
+        Some(SyntaxKind::TypeReference) => {
+            let Some(constraint) = store.source_direct_type_annotation(*declaration) else {
+                return false;
+            };
+            let Some(element) = store.source_direct_type_annotation(constraint) else {
+                return false;
+            };
+            function_type_parameter_is_outer(store, function, *declaration)
+                && store.source_node_kind(constraint) == Some(SyntaxKind::ArrayType)
+                && store.source_node_kind(element) == Some(SyntaxKind::UnknownKeyword)
+                && store.symbol_node_links(annotation)
+                    == Some(&SymbolNodeLinks {
+                        resolved_symbol: Some(symbol),
+                    })
+                && store.type_node_links(annotation)
+                    == Some(&TypeNodeLinks {
+                        resolved_type: Some(type_parameter),
+                        outer_type_parameters: None,
+                    })
+                && valid_variadic_type_parameter_constraint(store, type_parameter, constraint)
+        }
+        Some(SyntaxKind::InferType) => {
+            store.source_node_parent(*declaration) == Some(SourceNodeParent::Parent(annotation))
+                && store.source_direct_type_annotation(*declaration).is_none()
+                && store.symbol_node_links(annotation)
+                    .is_none_or(|links| links == &SymbolNodeLinks::default())
+                && store.type_node_links(annotation).is_none_or(|links| {
+                    links == &TypeNodeLinks::default()
+                        || links
+                            == &TypeNodeLinks {
+                                resolved_type: Some(type_parameter),
+                                outer_type_parameters: None,
+                            }
+                })
+                && store
+                    .type_payload(type_parameter)
+                    .map(TypeRecord::data)
+                    .is_some_and(|data| {
+                        matches!(data, TypeData::TypeParameter(data) if data.constraint.is_none())
+                    })
+        }
+        _ => false,
+    }
+}
+
+fn valid_variadic_type_parameter_constraint(
+    store: &CanonicalTypeMapperStore,
+    type_parameter: TypeId,
+    annotation: NodeRef,
+) -> bool {
+    let Some(TypeData::TypeParameter(parameter)) =
+        store.type_payload(type_parameter).map(TypeRecord::data)
+    else {
+        return false;
+    };
+    let Some(constraint) = parameter.constraint else {
+        return true;
+    };
+    if !store.source_direct_type_annotation_is_exact(annotation, constraint) {
+        return false;
+    }
+    let Some(TypeData::TypeReference(reference)) =
+        store.type_payload(constraint).map(TypeRecord::data)
+    else {
+        return false;
+    };
+    let Some(target) = reference.object.target else {
+        return false;
+    };
+    let Ok(Some(array)) = store.canonical_array_reference_with_targets(
+        CanonicalArrayTargets::for_single_target_validation(target),
+        constraint,
+    ) else {
+        return false;
+    };
+    store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+        array.element_type == bootstrap.unknown_type
+            && array.base_type == constraint
+            && !array.readonly
+            && !array.array_literal
+    })
+}
+
 fn validate_parameter_links(
     store: &CanonicalTypeMapperStore,
     plan: &FunctionTypePlan,
@@ -2870,6 +3241,15 @@ fn validate_parameter_links(
                 resolved_type: Some(resolved),
                 ..ValueSymbolLinks::default()
             })
+        || parameter.rest_type_parameter.is_some_and(|symbol| {
+            cached_ordinary_type_parameter_owner(store, resolved) != Some(symbol)
+                || !valid_stored_variadic_type_parameter_rest(
+                    store,
+                    plan.node,
+                    parameter.declaration,
+                    resolved,
+                )
+        })
     {
         return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
             parameter.declaration,
@@ -2908,6 +3288,26 @@ fn function_parameter_base_type(
 ) -> Option<TypeId> {
     if parameter.implicit_any_rest {
         implicit_any_array_type(store)
+    } else if parameter.rest_type_parameter.is_some()
+        && store.source_node_kind(parameter.identity_node) == Some(SyntaxKind::InferType)
+    {
+        let symbol = parameter.rest_type_parameter?;
+        let type_parameter = store.declared_type_links(symbol)?.declared_type?;
+        (cached_ordinary_type_parameter_owner(store, type_parameter) == Some(symbol)
+            && store
+                .symbol_node_links(parameter.identity_node)
+                .is_none_or(|links| links == &SymbolNodeLinks::default())
+            && store
+                .type_node_links(parameter.identity_node)
+                .is_none_or(|links| {
+                    links == &TypeNodeLinks::default()
+                        || links
+                            == &TypeNodeLinks {
+                                resolved_type: Some(type_parameter),
+                                outer_type_parameters: None,
+                            }
+                }))
+        .then_some(type_parameter)
     } else if parameter.typed_rest
         && !matches!(
             store.source_node_kind(parameter.type_node),
@@ -4056,6 +4456,271 @@ mod tests {
                     fixture.store.checker_link_allocated_lengths(),
                 ),
                 before
+            );
+        }
+    }
+
+    #[test]
+    fn variadic_type_parameter_rests_preserve_identity_and_replay_warm() {
+        let source = concat!(
+            "type Prepend<Head, Tail extends unknown[]> = ",
+            "((head: Head, ...tail: Tail) => void) extends ",
+            "((...args: infer Result) => void) ? Result : never;",
+        );
+        for (index, (parameter_count, minimum)) in [(2, 1), (1, 0)].into_iter().enumerate() {
+            let mut fixture = fixture(source, FileId::new(95_050 + u32::try_from(index).unwrap()));
+            let function =
+                fixture
+                    .parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        let NodeData::FunctionTypeNode(function) = &record.data else {
+                            return None;
+                        };
+                        (function.parameters.nodes.len() == parameter_count)
+                            .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                    })
+                    .unwrap();
+            let plan = {
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&fixture.parsed.arena, &fixture.bound)],
+                    GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                )
+                .unwrap();
+                plan_function_type(&fixture.store, &host, function, None, false, None).unwrap()
+            };
+            let rest = *plan.parameters.last().unwrap();
+            let type_parameter_symbol = rest.rest_type_parameter.unwrap();
+            assert_eq!(plan.flags, SignatureFlags::HAS_REST_PARAMETER);
+            assert_eq!(plan.min_argument_count, minimum);
+            assert!(!rest.implicit_any_rest);
+            assert!(rest.rest_tuple_element.is_none());
+
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let function_type = {
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&fixture.parsed.arena, &fixture.bound)],
+                    GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                )
+                .unwrap();
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(function)
+                .unwrap()
+            };
+            let FunctionTypeState::Resolved { signature, .. } =
+                function_type_state(&fixture.store, &plan, false).unwrap()
+            else {
+                panic!("the variadic function signature must be resolved")
+            };
+            let signature_record = fixture.store.signature(signature).unwrap();
+            let rest_type = fixture
+                .store
+                .value_symbol_links(rest.symbol)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(signature_record.flags(), SignatureFlags::HAS_REST_PARAMETER);
+            assert_eq!(signature_record.min_argument_count(), minimum);
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(&fixture.store, rest_type),
+                Some(type_parameter_symbol),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .callable_signature_parameter_types(signature)
+                    .and_then(|types| types.last().copied()),
+                Some(rest_type),
+            );
+            assert!(matches!(
+                validate_stored_function_type(&fixture.store, function_type),
+                StoredFunctionTypeValidation::Valid(_)
+            ));
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let replay = {
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&fixture.parsed.arena, &fixture.bound)],
+                    GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                )
+                .unwrap();
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(function)
+                .unwrap()
+            };
+            assert_eq!(replay, function_type);
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn variadic_type_parameter_rests_reject_poisoned_constraints_without_publication() {
+        let mut fixture = fixture(
+            concat!(
+                "type Outer<Head, Tail extends unknown[]> = ",
+                "((head: Head, ...tail: Tail) => void) extends ",
+                "(() => void) ? Head : never;",
+            ),
+            FileId::new(95_052),
+        );
+        let function = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::FunctionTypeNode(function) = &record.data else {
+                    return None;
+                };
+                (function.parameters.nodes.len() == 2).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let plan = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            plan_function_type(&fixture.store, &host, function, None, false, None).unwrap()
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let function_type = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap()
+        };
+        let rest = plan.parameters.last().unwrap();
+        let rest_type = fixture
+            .store
+            .value_symbol_links(rest.symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_type_parameter_resolution(
+            rest_type,
+            Some(string),
+            None,
+            None,
+            None,
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            validate_stored_function_type(&fixture.store, function_type),
+            StoredFunctionTypeValidation::Malformed,
+        );
+        assert!(begin_function_type(&mut fixture.store, &plan).is_err());
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+        assert!(
+            fixture
+                .store
+                .set_type_parameter_resolution(rest_type, None, None, None, None)
+        );
+        assert_eq!(
+            begin_function_type(&mut fixture.store, &plan),
+            Ok(Err(function_type)),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unsupported_and_cyclic_variadic_type_parameter_rests_publish_nothing() {
+        for (index, source) in [
+            "type Outer<Tail> = (...tail: Tail) => void;",
+            "type Outer<Tail extends Tail> = (...tail: Tail) => void;",
+            "type Outer<Tail extends Other, Other extends Tail> = (...tail: Tail) => void;",
+            "type Outer<Tail extends string[]> = (...tail: Tail) => void;",
+            "type Outer<Tail extends unknown[] = []> = (...tail: Tail) => void;",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = fixture(source, FileId::new(95_060 + u32::try_from(index).unwrap()));
+            let function = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                plan_function_type(&fixture.store, &host, function, None, false, None),
+                Err(FunctionTypeError::Unsupported(
+                    FunctionTypeUnsupported::RestParameter(_)
+                ))
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
             );
         }
     }
