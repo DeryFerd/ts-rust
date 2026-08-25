@@ -161,6 +161,10 @@ enum JsxScalarPlan {
         name_node: NodeRef,
         name: String,
     },
+    Call {
+        node: NodeRef,
+        callee: Box<Self>,
+    },
     TypeAssertion {
         node: NodeRef,
         type_node: NodeRef,
@@ -968,7 +972,9 @@ fn plan_jsx_attributes(
             let expression_record = jsx_node(arena, bound, store, expression)?;
             return if matches!(
                 expression_record.kind,
-                SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
+                SyntaxKind::Identifier
+                    | SyntaxKind::PropertyAccessExpression
+                    | SyntaxKind::CallExpression
             ) {
                 plan_jsx_source_spread(arena, bound, store, attributes_node, node)
                     .map(|spread| JsxAttributesPlan::SourceSpread(Box::new(spread)))
@@ -1204,7 +1210,10 @@ fn plan_jsx_source_spread(
     )?;
     let receiver = match &value {
         JsxScalarPlan::Identifier { .. } => &value,
-        JsxScalarPlan::Property { receiver, .. } => receiver.as_ref(),
+        JsxScalarPlan::Property { receiver, .. }
+        | JsxScalarPlan::Call {
+            callee: receiver, ..
+        } => receiver.as_ref(),
         _ => return Err(unsupported(node, SyntaxKind::JsxSpreadAttribute)),
     };
     let JsxScalarPlan::Identifier {
@@ -1323,6 +1332,30 @@ fn plan_scalar(
             Ok(JsxScalarPlan::Identifier {
                 node,
                 name: identifier.text.clone(),
+            })
+        }
+        NodeData::CallExpression(call)
+            if record.kind == SyntaxKind::CallExpression
+                && call.question_dot_token.is_none()
+                && call.symbol.is_none()
+                && call.facts == 0
+                && call.type_arguments.is_none()
+                && call.arguments.nodes.is_empty()
+                && !call.arguments.has_trailing_comma =>
+        {
+            let syntax = super::source_calls::plan_direct_source_call_syntax(arena, store, node)?;
+            if syntax.callee_form() != super::source_calls::SourceCallCalleeForm::Identifier
+                || !syntax.arguments().is_empty()
+            {
+                return Err(unsupported(node, record.kind));
+            }
+            let callee = plan_scalar(arena, bound, store, node, syntax.callee())?;
+            if !matches!(callee, JsxScalarPlan::Identifier { .. }) {
+                return Err(unsupported(node, record.kind));
+            }
+            Ok(JsxScalarPlan::Call {
+                node,
+                callee: Box::new(callee),
             })
         }
         NodeData::BinaryExpression(_) if record.kind == SyntaxKind::BinaryExpression => {
@@ -2082,7 +2115,10 @@ fn collect_jsx_scalar_intrinsic_names(
         JsxScalarPlan::Element(element) => {
             collect_jsx_plan_intrinsic_names(store, arena, bound, element, names);
         }
-        JsxScalarPlan::Property { receiver, .. } => {
+        JsxScalarPlan::Property { receiver, .. }
+        | JsxScalarPlan::Call {
+            callee: receiver, ..
+        } => {
             collect_jsx_scalar_intrinsic_names(store, arena, bound, receiver, names);
         }
         JsxScalarPlan::TypeAssertion { value, .. } | JsxScalarPlan::Parenthesized { value, .. } => {
@@ -6243,7 +6279,9 @@ fn check_jsx_source_spread(
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Vec<CheckedJsxAttribute>, SourceCheckError> {
     let node = match &spread.value {
-        JsxScalarPlan::Identifier { node, .. } | JsxScalarPlan::Property { node, .. } => node,
+        JsxScalarPlan::Identifier { node, .. }
+        | JsxScalarPlan::Property { node, .. }
+        | JsxScalarPlan::Call { node, .. } => node,
         _ => return Err(unsupported(spread.node, SyntaxKind::JsxSpreadAttribute)),
     };
     let type_ = execute_scalar(
@@ -6550,6 +6588,58 @@ fn execute_scalar(
                 )?;
                 (*node, namespace.error_type)
             }
+        }
+        JsxScalarPlan::Call { node, callee } => {
+            let callee_type =
+                execute_scalar(store, source, namespace, callee, options, diagnostics)?;
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(store, callee_type)
+            else {
+                return Err(unsupported(*node, SyntaxKind::CallExpression));
+            };
+            let [callable] = projection.call_signatures.as_ref() else {
+                return Err(unsupported(*node, SyntaxKind::CallExpression));
+            };
+            let signature = callable.signature;
+            let record = store
+                .signature(signature)
+                .ok_or(SourceCheckError::Call(*node))?;
+            if !projection.construct_signatures.is_empty()
+                || !record.type_parameters().is_empty()
+                || record.this_parameter().is_some()
+                || record.has_rest_parameter()
+                || record.min_argument_count() != 0
+                || !record.parameters().is_empty()
+                || !callable.parameters.is_empty()
+                || callable.min_argument_count != 0
+                || callable.rest_parameter.is_some()
+            {
+                return Err(unsupported(*node, SyntaxKind::CallExpression));
+            }
+            let type_ = if let Some(type_) = callable.return_type {
+                type_
+            } else if let Some(global_types) = source.3 {
+                CanonicalTypeQuery::new_with_global_types(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                )?
+                .get_return_type_of_signature(signature)?
+            } else {
+                CanonicalTypeQuery::new(store, host, options, diagnostics)?
+                    .get_return_type_of_signature(signature)?
+            };
+            if store
+                .signature(signature)
+                .and_then(super::signatures::Signature::resolved_return_type)
+                != Some(type_)
+            {
+                return Err(SourceCheckError::Call(*node));
+            }
+            publish_signature_links(store, *node, signature)?;
+            (*node, type_)
         }
         JsxScalarPlan::TypeAssertion {
             node,
@@ -13772,6 +13862,176 @@ mod runtime_tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Donor signatures, inferred props, and warm identities are one contract.
+    fn generic_jsx_components_infer_zero_argument_call_spreads_and_replay_warm() {
+        let source = concat!(
+            "declare namespace JSX { interface Element {} }\n",
+            "interface Props<T> { value: T; }\n",
+            "declare function Widget<T>(props: Props<T>): any;\n",
+            "declare function numericProps(): Props<number>;\n",
+            "declare function textualProps(): Props<string>;\n",
+            "const numeric = <Widget {...numericProps()} />;\n",
+            "const textual = <Widget {...textualProps()} />;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_189);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/generic-jsx-call-spread.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let expected = [bootstrap.number_type, bootstrap.string_type];
+        let mut checked = 0;
+        for (node, record) in parsed.arena.iter() {
+            let NodeData::JsxSelfClosingElement(element) = &record.data else {
+                continue;
+            };
+            let opening = NodeRef::new(parsed.arena.id(), file, node);
+            let component_signature = context
+                .store()
+                .signature_links(opening)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let component = context.store().signature(component_signature).unwrap();
+            assert!(component.type_parameters().is_empty());
+            let [parameter] = component.parameters() else {
+                panic!("the specialized component must retain its one props parameter")
+            };
+            let props = context
+                .store()
+                .value_symbol_links(*parameter)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let inferred = validate_direct_generic_reference(context.store(), props).unwrap();
+            assert_eq!(inferred.type_arguments.as_slice(), &[expected[checked]]);
+
+            let attributes = child_ref(opening, element.attributes);
+            let NodeData::JsxAttributes(attribute_list) =
+                &parsed.arena.get(attributes.node).unwrap().data
+            else {
+                panic!("the component must retain its JSX attributes")
+            };
+            let [spread] = attribute_list.properties.nodes.as_slice() else {
+                panic!("the component must retain its one call-result spread")
+            };
+            let spread = child_ref(attributes, *spread);
+            let NodeData::JsxSpreadAttribute(value) = &parsed.arena.get(spread.node).unwrap().data
+            else {
+                panic!("the JSX attribute must remain a spread")
+            };
+            let call = child_ref(spread, value.expression);
+            assert_eq!(
+                parsed.arena.get(call.node).unwrap().kind,
+                SyntaxKind::CallExpression,
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(call)
+                    .and_then(|links| links.resolved_type),
+                Some(props),
+            );
+            let donor_signature = context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let donor = context.store().signature(donor_signature).unwrap();
+            assert!(donor.parameters().is_empty());
+            assert_eq!(donor.resolved_return_type(), Some(props));
+            checked += 1;
+        }
+        assert_eq!(checked, expected.len());
+
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn jsx_call_result_spreads_reject_unsupported_call_shapes_before_publication() {
+        for (index, donor) in ["make(1)", "make<string>()", "make?.()"]
+            .into_iter()
+            .enumerate()
+        {
+            let source = format!(
+                "declare function make(value?: number): any; \
+                 declare const Widget: any; \
+                 const view = <Widget {{...{donor}}} />;",
+            );
+            let fixture =
+                RuntimeFixture::new(&source, FileId::new(8_220 + u32::try_from(index).unwrap()));
+            let expression = fixture.expression("view");
+            let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                fixture.store.preflight_jsx_element(&host, expression),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        kind: SyntaxKind::CallExpression,
+                        ..
+                    }
+                ))
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
     }
 
     #[test]
