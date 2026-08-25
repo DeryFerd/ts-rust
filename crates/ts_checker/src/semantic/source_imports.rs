@@ -258,6 +258,12 @@ enum PreparedSourceImportTarget {
         expression: NodeRef,
         expression_type: TypeId,
     },
+    PublishedNamespaceConst {
+        initializer: NodeRef,
+        namespace_alias: SemanticSymbolId,
+        module: SemanticSymbolId,
+        properties: Vec<PreparedSourceImportModuleProperty>,
+    },
     PublishedSpreadObject {
         object: Box<PropertyObjectPlan>,
     },
@@ -325,6 +331,14 @@ enum PlannedSourceImportValueTarget {
         declaration: NodeRef,
         expression: NodeRef,
         expression_type: TypeId,
+        type_: TypeId,
+    },
+    PublishedNamespaceConst {
+        declaration: NodeRef,
+        initializer: NodeRef,
+        namespace_alias: SemanticSymbolId,
+        module: SemanticSymbolId,
+        properties: Vec<PreparedSourceImportModuleProperty>,
         type_: TypeId,
     },
     PublishedSpreadObject {
@@ -2942,6 +2956,7 @@ pub(super) fn prepare_source_import_value(
         | PlannedSourceImportValueTarget::RegularEnum { declaration }
         | PlannedSourceImportValueTarget::ExportedObject { declaration, .. }
         | PlannedSourceImportValueTarget::PublishedObjectConst { declaration, .. }
+        | PlannedSourceImportValueTarget::PublishedNamespaceConst { declaration, .. }
         | PlannedSourceImportValueTarget::PublishedSpreadObject { declaration, .. }
         | PlannedSourceImportValueTarget::PublishedConstAssertedObject { declaration, .. }
         | PlannedSourceImportValueTarget::JavaScriptAnnotatedConst { declaration, .. }
@@ -3129,6 +3144,22 @@ pub(super) fn prepare_source_import_value(
             PreparedSourceImportTarget::PublishedObjectConst {
                 expression,
                 expression_type,
+            },
+        ),
+        PlannedSourceImportValueTarget::PublishedNamespaceConst {
+            initializer,
+            namespace_alias,
+            module,
+            properties,
+            type_,
+            ..
+        } => (
+            type_,
+            PreparedSourceImportTarget::PublishedNamespaceConst {
+                initializer,
+                namespace_alias,
+                module,
+                properties,
             },
         ),
         PlannedSourceImportValueTarget::PublishedSpreadObject { object, type_, .. } => (
@@ -5814,6 +5845,7 @@ fn materialize_imported_module_namespace(
             ),
             PlannedSourceImportValueTarget::ExportedObject { type_, .. }
             | PlannedSourceImportValueTarget::PublishedObjectConst { type_, .. }
+            | PlannedSourceImportValueTarget::PublishedNamespaceConst { type_, .. }
             | PlannedSourceImportValueTarget::PublishedSpreadObject { type_, .. }
             | PlannedSourceImportValueTarget::PublishedConstAssertedObject { type_, .. } => {
                 (type_, None)
@@ -5986,6 +6018,7 @@ fn preflight_imported_module_namespace_members(
             | PlannedSourceImportValueTarget::CommonJsNamedExport { .. }
             | PlannedSourceImportValueTarget::ExportedObject { .. }
             | PlannedSourceImportValueTarget::PublishedObjectConst { .. }
+            | PlannedSourceImportValueTarget::PublishedNamespaceConst { .. }
             | PlannedSourceImportValueTarget::PublishedSpreadObject { .. }
             | PlannedSourceImportValueTarget::PublishedConstAssertedObject { .. } => {}
             PlannedSourceImportValueTarget::ConstEnum { .. }
@@ -7167,6 +7200,16 @@ fn plan_direct_typescript_const_target(
                 ))
             })?;
         let expression_record = checked_node(arena, bound, store, expression)?;
+        if matches!(&expression_record.data, NodeData::Identifier(_)) {
+            return plan_published_namespace_const_target(
+                store,
+                arena,
+                bound,
+                declaration,
+                target,
+                expression,
+            );
+        }
         if matches!(
             expression_record.kind,
             SyntaxKind::AsExpression | SyntaxKind::TypeAssertionExpression
@@ -7391,6 +7434,215 @@ fn declaration_default_const_export_is_exact(
             .is_none_or(|immediate| immediate == target)
         && default_links.alias_target == AliasTargetState::Resolved(target)
         && default_links.type_only_declaration.is_none())
+}
+
+fn plan_published_namespace_const_target(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    declaration: NodeRef,
+    target: SemanticSymbolId,
+    initializer: NodeRef,
+) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
+    let unsupported_target = || {
+        unsupported(SourceImportUnsupported::MissingTargetAnnotation(
+            declaration,
+        ))
+    };
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(target));
+    let record = checked_node(arena, bound, store, initializer)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(unsupported_target());
+    };
+    let Some(namespace_alias) = store
+        .symbol_node_links(initializer)
+        .and_then(|links| links.resolved_symbol)
+    else {
+        return Err(unsupported_target());
+    };
+    let Some(alias_record) = store.symbol(namespace_alias) else {
+        return Err(invalid());
+    };
+    if alias_record.flags() != SymbolFlags::ALIAS {
+        return Err(unsupported_target());
+    }
+    let Some([binding]) = alias_record.declarations() else {
+        return Err(invalid());
+    };
+    let binding = *binding;
+    if store.source_node_kind(binding) != Some(SyntaxKind::NamespaceImport) {
+        return Err(unsupported_target());
+    }
+    let type_ = store
+        .value_symbol_links(target)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(unsupported_target)?;
+    let module = store
+        .alias_symbol_links(namespace_alias)
+        .and_then(|links| links.alias_target.symbol())
+        .ok_or_else(invalid)?;
+    let namespace = store
+        .type_payload(type_)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(invalid)?;
+    let properties = namespace
+        .properties
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .map(|symbol| {
+            let record = store.symbol(symbol).ok_or_else(invalid)?;
+            let links = store.value_symbol_links(symbol).ok_or_else(invalid)?;
+            let target_symbol = links.target.ok_or_else(invalid)?;
+            let target_record = store.symbol(target_symbol).ok_or_else(invalid)?;
+            let value_symbol = if target_record.flags() == SymbolFlags::ALIAS {
+                store
+                    .alias_symbol_links(target_symbol)
+                    .and_then(|links| links.alias_target.symbol())
+                    .ok_or_else(invalid)?
+            } else {
+                target_symbol
+            };
+            Ok(PreparedSourceImportModuleProperty {
+                name: record.name().to_owned(),
+                symbol,
+                target_symbol,
+                value_symbol,
+                type_: links.resolved_type.ok_or_else(invalid)?,
+                namespace: None,
+            })
+        })
+        .collect::<Result<Vec<_>, SourceImportError>>()?;
+    if record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || alias_record.name().as_utf8() != Some(identifier.text.as_str())
+        || !binding.is_for(arena.id(), bound.file_id())
+        || bound.symbol(binding) != Some(namespace_alias)
+        || bound
+            .locals(bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            != Some(namespace_alias)
+        || !published_namespace_const_is_exact(
+            store,
+            target,
+            declaration,
+            initializer,
+            namespace_alias,
+            module,
+            type_,
+            &properties,
+        )
+    {
+        return Err(invalid());
+    }
+
+    Ok(PlannedSourceImportValueTarget::PublishedNamespaceConst {
+        declaration,
+        initializer,
+        namespace_alias,
+        module,
+        properties,
+        type_,
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // Each argument proves one retained import or cache edge.
+fn published_namespace_const_is_exact(
+    store: &CanonicalTypeMapperStore,
+    target: SemanticSymbolId,
+    declaration: NodeRef,
+    initializer: NodeRef,
+    namespace_alias: SemanticSymbolId,
+    module: SemanticSymbolId,
+    type_: TypeId,
+    properties: &[PreparedSourceImportModuleProperty],
+) -> bool {
+    let Some(target_record) = store.symbol(target) else {
+        return false;
+    };
+    let Some(alias_record) = store.symbol(namespace_alias) else {
+        return false;
+    };
+    let Some([binding]) = alias_record.declarations() else {
+        return false;
+    };
+    let binding = *binding;
+    let Some(SourceNodeParent::Parent(clause)) = store.source_node_parent(binding) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(import)) = store.source_node_parent(clause) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(import) else {
+        return false;
+    };
+    let Some(module_record) = store.symbol(module) else {
+        return false;
+    };
+    let Some([module_declaration]) = module_record.declarations() else {
+        return false;
+    };
+    let module_declaration = *module_declaration;
+    let expected_links = ValueSymbolLinks {
+        resolved_type: Some(type_),
+        ..ValueSymbolLinks::default()
+    };
+
+    target_record.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+        && target_record.check_flags() == CheckFlags::NONE
+        && target_record.declarations() == Some(&[declaration])
+        && target_record.value_declaration() == Some(declaration)
+        && store.get_merged_symbol(target) == Some(target)
+        && store.source_node_kind(declaration) == Some(SyntaxKind::VariableDeclaration)
+        && store.source_node_kind(initializer) == Some(SyntaxKind::Identifier)
+        && store.source_node_parent(initializer) == Some(SourceNodeParent::Parent(declaration))
+        && store
+            .symbol_node_links(initializer)
+            .is_some_and(|links| links.resolved_symbol == Some(namespace_alias))
+        && store.type_node_links(initializer)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(type_),
+                ..TypeNodeLinks::default()
+            })
+        && store.value_symbol_links(target) == Some(&expected_links)
+        && alias_record.flags() == SymbolFlags::ALIAS
+        && alias_record.check_flags() == CheckFlags::NONE
+        && alias_record.value_declaration().is_none()
+        && alias_record.members().is_none()
+        && alias_record.exports().is_none()
+        && alias_record.parent().is_none()
+        && alias_record.export_symbol().is_none()
+        && store.get_merged_symbol(namespace_alias) == Some(namespace_alias)
+        && store.source_node_kind(binding) == Some(SyntaxKind::NamespaceImport)
+        && store.source_node_kind(clause) == Some(SyntaxKind::ImportClause)
+        && store.source_node_kind(import) == Some(SyntaxKind::ImportDeclaration)
+        && store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
+        && source.file == declaration.file
+        && store
+            .alias_symbol_links(namespace_alias)
+            .is_some_and(|links| {
+                links.immediate_target == Some(module)
+                    && links.alias_target == AliasTargetState::Resolved(module)
+                    && links.type_only_declaration.is_none()
+            })
+        && store.value_symbol_links(namespace_alias) == Some(&expected_links)
+        && module_record.flags() == SymbolFlags::VALUE_MODULE
+        && module_record.check_flags() == CheckFlags::NONE
+        && store.source_node_kind(module_declaration) == Some(SyntaxKind::SourceFile)
+        && store.get_merged_symbol(module) == Some(module)
+        && store.value_symbol_links(module) == Some(&expected_links)
+        && valid_prepared_imported_namespace(
+            store,
+            Some(namespace_alias),
+            module,
+            module_declaration,
+            type_,
+            properties,
+        )
 }
 
 fn published_spread_object_is_exact(
@@ -7999,6 +8251,21 @@ fn validate_prepared_import_value(
                                 )
                     ))
         }
+        PreparedSourceImportTarget::PublishedNamespaceConst {
+            initializer,
+            namespace_alias,
+            module,
+            properties,
+        } => published_namespace_const_is_exact(
+            store,
+            prepared.target_symbol,
+            prepared.target_declaration,
+            *initializer,
+            *namespace_alias,
+            *module,
+            prepared.type_,
+            properties,
+        ),
         PreparedSourceImportTarget::PublishedSpreadObject { object } => {
             store.symbol(prepared.target_symbol).is_some_and(|target| {
                 target.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
@@ -10467,6 +10734,138 @@ mod tests {
                 .value_symbol_links(binding.alias_symbol)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn published_namespace_const_exports_preserve_module_identity_across_imports() {
+        for (index, consumer) in [
+            "import { forwarded } from './provider'; export const copied = forwarded;",
+            concat!(
+                "import * as values from './provider'; ",
+                "export const copied = values.forwarded;",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dependency = parsed("export const value: number = 1;");
+            let provider = parsed(concat!(
+                "import * as namespace from './dependency'; ",
+                "export const forwarded = namespace;",
+            ));
+            let consumer = parsed(consumer);
+            let offset = u32::try_from(index).unwrap() * 3;
+            let dependency_file = FileId::new(9_790 + offset);
+            let provider_file = FileId::new(9_791 + offset);
+            let consumer_file = FileId::new(9_792 + offset);
+            let mut context = context_with_routes(
+                &[
+                    (dependency_file, &dependency),
+                    (provider_file, &provider),
+                    (consumer_file, &consumer),
+                ],
+                &[
+                    Route {
+                        source: 1,
+                        specifier: 0,
+                        target: Some(0),
+                    },
+                    Route {
+                        source: 2,
+                        specifier: 0,
+                        target: Some(1),
+                    },
+                ],
+            );
+
+            context.check_source_file(provider_file).unwrap();
+            let forwarded = context_exported_type(&context, provider_file, "forwarded");
+            let (_, dependency_bound) = context.file(dependency_file).unwrap();
+            let module = dependency_bound
+                .symbol(dependency_bound.source_file())
+                .unwrap();
+            assert_eq!(
+                context.store().type_payload(forwarded).unwrap().symbol(),
+                Some(module)
+            );
+
+            context.check_source_file(consumer_file).unwrap();
+
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(
+                context_exported_type(&context, consumer_file, "copied"),
+                forwarded,
+            );
+            let warm = (store_state(context.store()), context.store().symbol_len());
+            context.recheck_source_file(consumer_file).unwrap();
+            assert_eq!(
+                (store_state(context.store()), context.store().symbol_len()),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn published_namespace_const_imports_reject_forged_namespace_value_links() {
+        let dependency = parsed("export const value: number = 1;");
+        let provider = parsed(concat!(
+            "import * as namespace from './dependency'; ",
+            "export const forwarded = namespace;",
+        ));
+        let consumer = parsed(concat!(
+            "import { forwarded } from './provider'; ",
+            "export const copied = forwarded;",
+        ));
+        let dependency_file = FileId::new(9_796);
+        let provider_file = FileId::new(9_797);
+        let consumer_file = FileId::new(9_798);
+        let mut context = context_with_routes(
+            &[
+                (dependency_file, &dependency),
+                (provider_file, &provider),
+                (consumer_file, &consumer),
+            ],
+            &[
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(0),
+                },
+                Route {
+                    source: 2,
+                    specifier: 0,
+                    target: Some(1),
+                },
+            ],
+        );
+        context.check_source_file(provider_file).unwrap();
+        let namespace_declaration = provider
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NamespaceImport).then_some(NodeRef::new(
+                    provider.arena.id(),
+                    provider_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, bound) = context.file(provider_file).unwrap();
+        let namespace_alias = bound.symbol(namespace_declaration).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            namespace_alias,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+
+        assert!(matches!(
+            context.check_source_file(consumer_file),
+            Err(crate::semantic::SourceCheckError::Import(_))
+        ));
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
