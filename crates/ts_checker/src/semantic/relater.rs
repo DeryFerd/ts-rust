@@ -7274,6 +7274,7 @@ mod tests {
         declared::type_list_key,
         global_types::create_type_from_generic_global_type,
         production::GlobalMergeCompletion,
+        reference_types::validate_direct_generic_reference,
         signatures::{ElementFlags, SignatureFlags, Ternary},
         tuple_types::CanonicalTupleTypeRequest,
         type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions},
