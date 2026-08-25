@@ -5597,6 +5597,73 @@ impl Drop for RelaterSession<'_> {
 }
 
 impl SemanticStore<TypeRecord, TypeMapper> {
+    fn authenticated_class_construct_signature(
+        &self,
+        type_: TypeId,
+    ) -> Result<Option<ValidatedSingleCallable>, RelationUnavailable> {
+        let record = self
+            .type_payload(type_)
+            .ok_or(RelationUnavailable::Type(type_))?;
+        if record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+        {
+            return Ok(None);
+        }
+        let Some(owner) = record.symbol() else {
+            return Ok(None);
+        };
+        let owner_record = self
+            .symbol(owner)
+            .ok_or(RelationUnavailable::Symbol(owner))?;
+        if !owner_record.flags().intersects(SymbolFlags::CLASS) {
+            return Ok(None);
+        }
+        if self.get_merged_symbol(owner) != Some(owner) {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_));
+        }
+        let instance = self
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(type_))?;
+        if validate_class_heritage_members(self, instance) != ClassHeritageMembersValidation::Valid
+            || self
+                .value_symbol_links(owner)
+                .is_none_or(|links| links.resolved_type != Some(type_))
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_));
+        }
+
+        let TypeData::Object(object) = record.data() else {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_));
+        };
+        let Some([signature]) = object.structured.signatures.as_deref() else {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_));
+        };
+        let signature = *signature;
+        let record = self
+            .signature(signature)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(type_))?;
+        if object.structured.call_signature_count != 0
+            || record.flags() != SignatureFlags::CONSTRUCT
+            || !record.type_parameters().is_empty()
+            || !record.parameters().is_empty()
+            || record.min_argument_count() != 0
+            || record.resolved_return_type() != Some(instance)
+        {
+            return Err(RelationUnavailable::StructuredSignatures(type_));
+        }
+
+        Ok(Some(ValidatedSingleCallable {
+            owner: type_,
+            signature,
+            parameters: Vec::new(),
+            rest_parameter: None,
+            min_argument_count: 0,
+            return_type: Some(instance),
+            strict_variance_exempt: false,
+        }))
+    }
+
     fn authenticated_declared_construct_signature(
         &self,
         type_: TypeId,
@@ -5664,6 +5731,29 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Ok(Some((source, target)))
             }
             (Some(source), _) => Err(RelationUnavailable::StructuredSignatures(source.owner)),
+            (None, Some(target))
+                if relation == RelationKind::Assignable && strict_function_types.is_some() =>
+            {
+                let Some(source) = self.authenticated_class_construct_signature(source)? else {
+                    return Err(RelationUnavailable::StructuredSignatures(target.owner));
+                };
+                let structured = self
+                    .type_payload(target.owner)
+                    .and_then(|record| record.data().structured())
+                    .ok_or(RelationUnavailable::MalformedFunctionType(target.owner))?;
+                if structured
+                    .properties
+                    .as_deref()
+                    .is_some_and(|properties| !properties.is_empty())
+                    || structured
+                        .index_infos
+                        .as_deref()
+                        .is_some_and(|indexes| !indexes.is_empty())
+                {
+                    return Err(RelationUnavailable::StructuredSignatures(target.owner));
+                }
+                Ok(Some((source, target)))
+            }
             (None, Some(target)) => Err(RelationUnavailable::StructuredSignatures(target.owner)),
         }
     }
@@ -9517,6 +9607,167 @@ mod tests {
             bivariant
                 .store
                 .is_type_assignable_to_with_strict_function_types(narrow, wide, false),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn authenticated_class_constructors_compare_with_declared_constructor_targets() {
+        let mut fixture = function_relation_fixture(concat!(
+            "class Base { value: string; } ",
+            "class Derived extends Base { extra: string; } ",
+            "type BaseConstructor = { new(): Base }; ",
+            "type DerivedConstructor = { new(): Derived }; ",
+            "interface ConstructorWithProperty { new(): Base; required: string; }",
+        ));
+        let base = query_class_members(&mut fixture, "Base").shells();
+        let derived = query_class_members(&mut fixture, "Derived").shells();
+        let base_constructor = query_declared_relation_alias(&mut fixture, "BaseConstructor");
+        let derived_constructor = query_declared_relation_alias(&mut fixture, "DerivedConstructor");
+        let constructor_with_property =
+            query_declared_relation_alias(&mut fixture, "ConstructorWithProperty");
+
+        let before = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(derived.value_type(), base_constructor),
+            Err(RelationUnavailable::StructuredSignatures(base_constructor))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
+
+        for (source, target, expected) in [
+            (derived.value_type(), base_constructor, true),
+            (base.value_type(), derived_constructor, false),
+            (derived.value_type(), derived_constructor, true),
+        ] {
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_assignable_to_with_strict_function_types(source, target, true),
+                Ok(expected)
+            );
+        }
+        for (source, target, unsupported) in [
+            (
+                derived.value_type(),
+                constructor_with_property,
+                constructor_with_property,
+            ),
+            (base_constructor, derived.value_type(), base_constructor),
+        ] {
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_assignable_to_with_strict_function_types(source, target, true),
+                Err(RelationUnavailable::StructuredSignatures(unsupported))
+            );
+        }
+        assert_eq!(
+            fixture.store.is_type_related_to_with_strict_function_types(
+                derived.value_type(),
+                base_constructor,
+                RelationKind::Subtype,
+                true,
+            ),
+            Err(RelationUnavailable::StructuredSignatures(base_constructor))
+        );
+    }
+
+    #[test]
+    fn poisoned_class_constructor_graph_invalidates_a_warmed_relation() {
+        let mut fixture = function_relation_fixture(concat!(
+            "class Concrete { value: string; } ",
+            "type Constructor = { new(): Concrete };",
+        ));
+        let class = query_class_members(&mut fixture, "Concrete");
+        let source = class.shells().value_type();
+        let owner = class.shells().symbol();
+        let signature = class.default_construct_signature();
+        let target = query_declared_relation_alias(&mut fixture, "Constructor");
+
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(source, target, true),
+            Ok(true)
+        );
+        let key = fixture
+            .store
+            .relation_key_if_available(source, target, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, key)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+        let warm = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(source, target, true),
+            Ok(true)
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), warm);
+
+        assert!(
+            fixture
+                .store
+                .set_signature_flags(signature, SignatureFlags::NONE)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        let poisoned = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(source, target, true),
+            Err(RelationUnavailable::InvalidStructuredMembers(source))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), poisoned);
+        assert!(
+            fixture
+                .store
+                .set_signature_flags(signature, SignatureFlags::CONSTRUCT)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(source, target, true),
+            Ok(true)
+        );
+
+        let links = fixture.store.value_symbol_links(owner).unwrap().clone();
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(owner, ValueSymbolLinks::default())
+        );
+        assert_eq!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        let poisoned = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(source, target, true),
+            Err(RelationUnavailable::InvalidStructuredMembers(source))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), poisoned);
+        assert!(fixture.store.set_value_symbol_links(owner, links));
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(source, target, true),
             Ok(true)
         );
     }
