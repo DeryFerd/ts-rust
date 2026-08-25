@@ -4676,6 +4676,38 @@ fn is_exact_source_type_parameter_bound(
     ) {
         return Ok(true);
     }
+    if kind == SyntaxKind::TupleType {
+        let record = preflight_node(store, host, bound)?;
+        let NodeData::TupleTypeNode(tuple) = &record.data else {
+            return Ok(false);
+        };
+        let [element] = tuple.elements.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let element = NodeRef::new(bound.arena, bound.file, *element);
+        let element_record = preflight_node(store, host, element)?;
+        if record.flags.0 != 0
+            || tuple.elements.has_trailing_comma
+            || element_record.kind != SyntaxKind::StringKeyword
+            || element_record.flags.0 != 0
+            || element_record.parent != Some(bound.node)
+        {
+            return Ok(false);
+        }
+        if store
+            .symbol_node_links(bound)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+            || store.type_node_links(bound).is_some_and(|links| {
+                links != &TypeNodeLinks::default()
+                    && links.resolved_type.is_none_or(|type_| {
+                        !store.source_type_node_result_is_exact(bound, type_, &[])
+                    })
+            })
+        {
+            return Err(invariant(SourceCallableInvariant::InvalidTypeCache(bound)));
+        }
+        return Ok(true);
+    }
     if source_type_parameter_literal_kind(store, host, bound)?.is_some() {
         return Ok(true);
     }
@@ -12490,6 +12522,88 @@ mod tests {
             Ok(type_)
         );
         assert_eq!(generic_transaction_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn generic_function_authenticates_fixed_string_tuple_constraint_cold_and_warm() {
+        let mut fixture = QueryFixture::new(
+            "function keep<T extends [string]>(value: T): T { return value; }",
+            FileId::new(42_104),
+        );
+        let (declaration, type_parameter) = fixture.declaration_and_type_parameter();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let NodeData::TypeParameterDeclaration(parameter) =
+            &fixture.parsed.arena.get(type_parameter.node).unwrap().data
+        else {
+            panic!("expected one constrained source type parameter")
+        };
+        let constraint = NodeRef::new(
+            type_parameter.arena,
+            type_parameter.file,
+            parameter.constraint.unwrap(),
+        );
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = generic_transaction_state(&fixture.store);
+
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        assert_eq!(plan.type_parameters[0].constraint, Some(constraint));
+        assert_eq!(generic_transaction_state(&fixture.store), before);
+        drop(host);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        let resolved_constraint = fixture
+            .store
+            .type_node_links(constraint)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert!(fixture.store.source_type_node_result_is_exact(
+            constraint,
+            resolved_constraint,
+            &[]
+        ));
+        let warm = generic_transaction_state(&fixture.store);
+        assert_eq!(
+            fixture.query_callable(declaration, owner, &mut diagnostics),
+            Ok(callable),
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+
+        let target = fixture
+            .store
+            .canonical_tuple_shape(resolved_constraint)
+            .unwrap()
+            .unwrap()
+            .target();
+        let Some(TypeData::Tuple(tuple)) = fixture.store.type_payload(target).map(TypeRecord::data)
+        else {
+            panic!("the fixed constraint must retain a canonical tuple target")
+        };
+        let this_type = tuple.interface.this_type.unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(
+            fixture
+                .store
+                .set_resolved_base_constraint(this_type, Some(number))
+        );
+        let poisoned = generic_transaction_state(&fixture.store);
+        assert!(
+            fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .is_err()
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), poisoned);
     }
 
     #[test]

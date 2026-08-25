@@ -40,9 +40,9 @@ use super::{
     },
     relation::{RelationCaches, RelationComparisonResult, RelationKind, RelationStateSnapshot},
     signatures::{
-        CompositeSignature, IndexFlags, IndexInfo, IndexInfoArena, Signature, SignatureArena,
-        SignatureFlags, TupleElementInfo, TupleMetadata, TypePredicate, TypePredicateArena,
-        TypePredicateKind,
+        CompositeSignature, ElementFlags, IndexFlags, IndexInfo, IndexInfoArena, Signature,
+        SignatureArena, SignatureFlags, TupleElementInfo, TupleMetadata, TypePredicate,
+        TypePredicateArena, TypePredicateKind,
     },
     source_callables::{
         SourceCallableTypeParameterSyntaxProof, source_type_parameter_default_is_assignable,
@@ -7732,10 +7732,108 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 Some(TypeData::Literal(_) | TypeData::UniqueEsSymbol(_))
             )
             || annotation.is_some_and(|node| {
-                self.source_named_interface_keyof_result_is_exact(node, constraint)
+                self.source_fixed_string_tuple_result_is_exact(node, constraint)
+                    || self.source_named_interface_keyof_result_is_exact(node, constraint)
                     || self.source_recovered_unresolved_type_reference_is_exact(node, constraint)
                     || self.source_named_generic_type_reference_is_exact(node, constraint, &[])
             })
+    }
+
+    fn source_fixed_string_tuple_result_is_exact(&self, node: NodeRef, result: TypeId) -> bool {
+        let Some(string) = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .map(|bootstrap| bootstrap.string_type)
+        else {
+            return false;
+        };
+        let Some(record) = self.type_payload(result) else {
+            return false;
+        };
+        let TypeData::TypeReference(reference) = record.data() else {
+            return false;
+        };
+        let Some(target) = reference.object.target else {
+            return false;
+        };
+        let Some(TypeData::Tuple(tuple)) = self.type_payload(target).map(TypeRecord::data) else {
+            return false;
+        };
+        let Some((key, provenance)) = self.canonical_tuple_target_for_type(target) else {
+            return false;
+        };
+        let [element] = tuple.metadata.element_infos() else {
+            return false;
+        };
+        let TypeCacheState::Allocated(instantiations) =
+            &tuple.interface.reference.object.instantiations
+        else {
+            return false;
+        };
+        let Some(TypeData::TypeParameter(this)) = tuple
+            .interface
+            .this_type
+            .and_then(|this| self.type_payload(this))
+            .map(TypeRecord::data)
+        else {
+            return false;
+        };
+        if self.source_node_kind(node) != Some(SyntaxKind::TupleType)
+            || self.type_node_links(node)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(result),
+                    outer_type_parameters: None,
+                })
+            || self
+                .symbol_node_links(node)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+            || record.flags() != TypeFlags::OBJECT
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || reference.object.mapper.is_some()
+            || reference.object.instantiations != TypeCacheState::Unallocated
+            || reference.node.is_some()
+            || reference.resolved_type_arguments.as_deref() != Some(&[string])
+            || provenance.target != target
+            || key.element_infos.as_slice() != tuple.metadata.element_infos()
+            || key.readonly
+            || instantiations.get(&type_list_key(&[string])) != Some(&result)
+            || element.flags() != ElementFlags::REQUIRED
+            || element.labeled_declaration().is_some()
+            || tuple.metadata.min_length() != 1
+            || tuple.metadata.fixed_length() != 1
+            || tuple.metadata.is_readonly()
+            || this.constraint != Some(target)
+            || this
+                .constrained
+                .resolved_base_constraint
+                .is_some_and(|base| base != target)
+        {
+            return false;
+        }
+
+        let Some(facts) = self.source_node_facts.get(&node.arena) else {
+            return false;
+        };
+        let mut children = facts.iter().enumerate().filter_map(|(index, facts)| {
+            facts
+                .as_ref()
+                .filter(|facts| facts.parent == Some(node.node))
+                .map(|facts| (index, facts))
+        });
+        let Some((index, child)) = children.next() else {
+            return false;
+        };
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        child.kind == SyntaxKind::StringKeyword
+            && children.next().is_none()
+            && self.source_type_node_result_is_exact(
+                NodeRef::new(node.arena, node.file, NodeId::new(index)),
+                string,
+                &[],
+            )
     }
 
     /// Authenticates an instantiated interface, class, or alias annotation.
@@ -8151,6 +8249,10 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return result == intrinsic && type_links_valid && symbol_links_valid;
         }
 
+        if kind == Some(SyntaxKind::TupleType) {
+            return self.source_fixed_string_tuple_result_is_exact(node, result);
+        }
+
         if kind == Some(SyntaxKind::TypeOperator) {
             return self.source_named_interface_keyof_result_is_exact(node, result);
         }
@@ -8259,9 +8361,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 && cached == Some(result);
         }
 
-        // The opaque source proof does not yet retain enough structure to
-        // authenticate aliases or composite type syntax. Earlier type
-        // parameters are proven by both canonical query links.
+        // Except for the fixed tuple above, the source proof does not retain
+        // enough structure to authenticate aliases or composite type syntax.
+        // Earlier type parameters are proven by both canonical query links.
         if kind != Some(SyntaxKind::TypeReference) {
             return false;
         }
