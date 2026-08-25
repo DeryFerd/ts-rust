@@ -4020,13 +4020,14 @@ mod tests {
     fn immediate_async_arrow_calls_require_exact_parenthesized_zero_argument_syntax() {
         let accepted = parsed("function run() { (async () => {})(); }");
         let file = FileId::new(496);
-        let context = context(&accepted, file);
+        let accepted_context = context(&accepted, file);
         let accepted_calls = calls(&accepted, file);
         let [call] = accepted_calls.as_slice() else {
             panic!("expected one immediately invoked async arrow")
         };
-        let syntax = plan_direct_source_call_syntax(&accepted.arena, context.store(), *call)
-            .expect("an authenticated async arrow IIFE must retain its callee");
+        let syntax =
+            plan_direct_source_call_syntax(&accepted.arena, accepted_context.store(), *call)
+                .expect("an authenticated async arrow IIFE must retain its callee");
         assert_eq!(
             syntax.callee_form(),
             SourceCallCalleeForm::ParenthesizedAsyncArrow

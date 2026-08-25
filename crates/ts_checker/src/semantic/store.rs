@@ -1953,6 +1953,72 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.declared_method_linked_type(requested, method_symbol)
     }
 
+    fn valid_declared_method_type_parameters(
+        &self,
+        signature: &Signature,
+        declaration: NodeRef,
+    ) -> bool {
+        if signature.type_parameters().is_empty() {
+            return true;
+        }
+
+        let mut declarations = Vec::with_capacity(signature.type_parameters().len());
+        for index in 0..declaration.node.index() {
+            let Ok(index) = u32::try_from(index) else {
+                return false;
+            };
+            let parameter = NodeRef::new(declaration.arena, declaration.file, NodeId::new(index));
+            if self.source_node_kind(parameter) == Some(SyntaxKind::TypeParameter)
+                && self.source_node_parent(parameter) == Some(SourceNodeParent::Parent(declaration))
+            {
+                declarations.push(parameter);
+            }
+        }
+        if declarations.len() != signature.type_parameters().len() {
+            return false;
+        }
+
+        let mut seen = HashSet::with_capacity(signature.type_parameters().len());
+        signature
+            .type_parameters()
+            .iter()
+            .copied()
+            .zip(declarations)
+            .all(|(type_, expected_declaration)| {
+                if self.types.get(type_).is_none() || !seen.insert(type_) {
+                    return false;
+                }
+                let Some(symbol) = self
+                    .links
+                    .declared_type
+                    .find_key(|symbol| {
+                        self.links
+                            .declared_type
+                            .try_get(symbol)
+                            .is_some_and(|links| links.declared_type == Some(type_))
+                            && self
+                                .symbol(*symbol)
+                                .and_then(Symbol::declarations)
+                                .is_some_and(|declarations| declarations == [expected_declaration])
+                    })
+                    .copied()
+                else {
+                    return false;
+                };
+                let Some(record) = self.symbol(symbol) else {
+                    return false;
+                };
+                record.flags() == SymbolFlags::TYPE_PARAMETER
+                    && record.check_flags() == CheckFlags::NONE
+                    && record.value_declaration().is_none()
+                    && record.members().is_none()
+                    && record.exports().is_none()
+                    && record.parent().is_none()
+                    && record.export_symbol().is_none()
+                    && self.get_merged_symbol(symbol) == Some(symbol)
+            })
+    }
+
     fn declared_method_linked_type(
         &self,
         requested: SignatureId,
@@ -1988,11 +2054,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 })
                 || signature.declaration() != Some(*method_declaration)
                 || signature.flags() & !allowed_flags != SignatureFlags::NONE
-                || !super::callable_sets::valid_declared_method_type_parameters(
-                    self,
-                    signature,
-                    *method_declaration,
-                )
+                || !self.valid_declared_method_type_parameters(signature, *method_declaration)
                 || signature.this_parameter().is_some()
                 || signature.resolved_min_argument_count() != -1
                 || signature.resolved_type_predicate().is_some()
