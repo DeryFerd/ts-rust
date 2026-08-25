@@ -3463,12 +3463,7 @@ fn check_react_jsx_fragment_children(
     }
 
     let actual = format_attribute_object(store, host, source.3, &[], Some(children))?;
-    let expected_object = type_to_string_with_host_and_flags(
-        store,
-        host,
-        attributes,
-        CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
-    )?;
+    let expected_object = jsx_fragment_attributes_display(store, host, attributes, expected)?;
     let display = jsx_child_assignability_display(store, host, source.3, children.type_, expected)?;
     let property_detail = Diagnostic::with_arguments(
         message_by_code(2326).ok_or(SourceCheckError::MissingDiagnostic(2326))?,
@@ -3679,7 +3674,7 @@ fn jsx_child_assignability_display(
     source: TypeId,
     target: TypeId,
 ) -> Result<AssignabilityErrorDisplay, SourceCheckError> {
-    if let Some(global_types) = global_types {
+    let mut display = if let Some(global_types) = global_types {
         get_type_names_for_assignability_error_with_host_global_types_and_flags(
             store,
             host,
@@ -3697,7 +3692,108 @@ fn jsx_child_assignability_display(
             CanonicalTypeFormatFlags::NONE,
         )
     }
+    .map_err(SourceCheckError::from)?;
+    if display.target == "React.ReactNode"
+        && contextual_react_node_alias(store, host, target).is_some()
+    {
+        display.target = "ReactNode".to_owned();
+    }
+    Ok(display)
+}
+
+fn jsx_fragment_attributes_display(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    attributes: TypeId,
+    child: TypeId,
+) -> Result<String, SourceCheckError> {
+    if let Some(alias) = contextual_react_node_alias(store, host, child)
+        && let Some(structured) = store
+            .type_payload(attributes)
+            .and_then(|record| record.data().structured())
+        && let Some([property]) = structured.properties.as_deref()
+        && let Some(record) = store.symbol(*property)
+        && record
+            .flags()
+            .contains(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+        && record.check_flags() == CheckFlags::NONE
+        && record.name().as_utf8() == Some("children")
+        && structured
+            .members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("children"))
+            == Some(*property)
+        && store
+            .value_symbol_links(*property)
+            .and_then(|links| links.resolved_type)
+            == Some(child)
+    {
+        return Ok(format!("{{ children?: {alias}; }}"));
+    }
+
+    type_to_string_with_host_and_flags(
+        store,
+        host,
+        attributes,
+        CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+    )
     .map_err(Into::into)
+}
+
+fn contextual_react_node_alias(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+) -> Option<&'static str> {
+    let record = store.type_payload(type_)?;
+    if !matches!(record.data(), super::TypeData::Union(_)) {
+        return None;
+    }
+    let alias = store.type_alias(record.alias()?)?;
+    if alias.type_arguments().is_some() {
+        return None;
+    }
+    let symbol = alias.symbol()?;
+    let owner = store.symbol(symbol)?;
+    let [declaration] = owner.declarations()? else {
+        return None;
+    };
+    let declaration = *declaration;
+    let namespace = store.get_parent_of_symbol(symbol)?;
+    let namespace_record = store.symbol(namespace)?;
+    let globals = store.intrinsic_bootstrap()?.globals;
+    if owner.flags() != SymbolFlags::TYPE_ALIAS
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some("ReactNode")
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store.type_alias_links(symbol).is_none_or(|links| {
+            links.declared_type != Some(type_) || links.type_parameters.is_some()
+        })
+        || host.node(declaration).is_none_or(|node| {
+            node.kind != SyntaxKind::TypeAliasDeclaration
+                || !matches!(node.data, NodeData::TypeAliasDeclaration(_))
+        })
+        || !host.symbol_matches(store, declaration, symbol)
+        || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+        || namespace_record.check_flags() != CheckFlags::NONE
+        || namespace_record.name().as_utf8() != Some("React")
+        || store.get_merged_symbol(namespace) != Some(namespace)
+        || namespace_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("ReactNode"))
+            .and_then(|export| store.get_merged_symbol(export))
+            != Some(symbol)
+        || store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("React"))
+            .and_then(|global| store.get_merged_symbol(global))
+            != Some(namespace)
+    {
+        return None;
+    }
+
+    Some("ReactNode")
 }
 
 #[allow(clippy::too_many_arguments)] // Contextual children retain their owner and expected props.
