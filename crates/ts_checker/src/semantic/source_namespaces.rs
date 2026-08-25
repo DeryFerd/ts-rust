@@ -1913,6 +1913,12 @@ fn namespace_generic_annotation_requires_deferral(
                     return Ok(true);
                 }
 
+                if authenticated_react_mixin_self_reference(
+                    arena, bound, store, namespace, target, annotation, node, reference,
+                ) {
+                    return Ok(true);
+                }
+
                 if target_record.flags().contains(SymbolFlags::INTERFACE)
                     && !target_record.flags().contains(SymbolFlags::CLASS)
                     && target_record
@@ -1933,6 +1939,171 @@ fn namespace_generic_annotation_requires_deferral(
         record.for_each_child(|nested| pending.push(child(node, nested)));
     }
     Ok(false)
+}
+
+/// Keeps only React's `mixins?: Array<Mixin<P, S>>` self-reference lazy.
+#[allow(clippy::too_many_arguments)] // The property annotation and nested reference require distinct anchors.
+fn authenticated_react_mixin_self_reference(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    target: SemanticSymbolId,
+    annotation: NodeRef,
+    node: NodeRef,
+    reference: &ts_ast::TypeReferenceNodeData,
+) -> bool {
+    let Some(namespace_owner) = store.symbol(namespace) else {
+        return false;
+    };
+    let Some(owner) = store.symbol(target) else {
+        return false;
+    };
+    let Some([declaration]) = owner.declarations() else {
+        return false;
+    };
+    let declaration = *declaration;
+    let Some(interface_record) = arena.get(declaration.node) else {
+        return false;
+    };
+    let NodeData::InterfaceDeclaration(interface) = &interface_record.data else {
+        return false;
+    };
+    let Some([props, state]) = interface
+        .type_parameters
+        .as_ref()
+        .map(|parameters| parameters.nodes.as_slice())
+    else {
+        return false;
+    };
+    let Some([first, second]) = reference
+        .type_arguments
+        .as_ref()
+        .map(|arguments| arguments.nodes.as_slice())
+    else {
+        return false;
+    };
+    let Some(annotation_record) = arena.get(annotation.node) else {
+        return false;
+    };
+    let NodeData::TypeReferenceNode(array_reference) = &annotation_record.data else {
+        return false;
+    };
+    let Some([nested]) = array_reference
+        .type_arguments
+        .as_ref()
+        .map(|arguments| arguments.nodes.as_slice())
+    else {
+        return false;
+    };
+    let array_name = child(annotation, array_reference.type_name);
+    let Some(array_name_record) = arena.get(array_name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(array_identifier) = &array_name_record.data else {
+        return false;
+    };
+    let Some(property) = annotation_record
+        .parent
+        .map(|parent| child(annotation, parent))
+    else {
+        return false;
+    };
+    let Some(property_record) = arena.get(property.node) else {
+        return false;
+    };
+    let NodeData::PropertyDeclaration(property_data) = &property_record.data else {
+        return false;
+    };
+    let property_name = child(property, property_data.name);
+    let Some(property_name_record) = arena.get(property_name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(property_identifier) = &property_name_record.data else {
+        return false;
+    };
+    let Some(property_symbol) = bound
+        .symbol(property)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(property_owner) = store.symbol(property_symbol) else {
+        return false;
+    };
+    if !bound
+        .source_facts()
+        .is_some_and(|facts| facts.is_declaration_file() && !facts.is_default_library())
+        || namespace_owner.name().as_utf8() != Some("React")
+        || !namespace_owner.flags().intersects(SymbolFlags::NAMESPACE)
+        || namespace_owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some("Mixin")
+        || owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+        || owner.check_flags() != CheckFlags::NONE
+        || store.get_parent_of_symbol(target) != Some(namespace)
+        || namespace_owner
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("Mixin"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(target)
+        || interface_record.kind != SyntaxKind::InterfaceDeclaration
+        || property_record.kind != SyntaxKind::PropertyDeclaration
+        || property_record.parent != Some(declaration.node)
+        || property_data.type_ != Some(annotation.node)
+        || property_data.postfix_token.is_none()
+        || property_identifier.text != "mixins"
+        || property_owner.name().as_utf8() != Some("mixins")
+        || !property_owner.flags().contains(SymbolFlags::PROPERTY)
+        || store.get_parent_of_symbol(property_symbol) != Some(target)
+        || owner
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("mixins"))
+            != Some(property_symbol)
+        || annotation_record.kind != SyntaxKind::TypeReference
+        || array_identifier.text != "Array"
+        || *nested != node.node
+    {
+        return false;
+    }
+
+    for (argument, parameter, expected) in [(*first, *props, "P"), (*second, *state, "S")] {
+        let argument = child(node, argument);
+        let Some(argument_record) = arena.get(argument.node) else {
+            return false;
+        };
+        let NodeData::TypeReferenceNode(argument_data) = &argument_record.data else {
+            return false;
+        };
+        let argument_name = child(argument, argument_data.type_name);
+        let Some(argument_name_record) = arena.get(argument_name.node) else {
+            return false;
+        };
+        let NodeData::Identifier(identifier) = &argument_name_record.data else {
+            return false;
+        };
+        let parameter = child(declaration, parameter);
+        let Some(parameter_symbol) = bound
+            .symbol(parameter)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+        else {
+            return false;
+        };
+        if argument_record.kind != SyntaxKind::TypeReference
+            || argument_record.parent != Some(node.node)
+            || argument_data.type_arguments.is_some()
+            || identifier.text != expected
+            || store
+                .symbol(parameter_symbol)
+                .and_then(|symbol| symbol.name().as_utf8())
+                != Some(expected)
+            || store.get_parent_of_symbol(parameter_symbol) != Some(target)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Keeps the legacy React component-class default outside eager declaration checks.
@@ -14596,6 +14767,38 @@ mod tests {
                 before,
             );
         }
+    }
+
+    #[test]
+    fn react_mixin_self_reference_keeps_optional_lifecycle_methods_lazy() {
+        let fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface ComponentLifecycle<P, S, SS = any> {} ",
+                "interface Mixin<P, S> extends ComponentLifecycle<P, S> { ",
+                "mixins?: Array<Mixin<P, S>>; ",
+                "getDefaultProps?(): P; getInitialState?(): S; ",
+                "} }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::Interface {
+                generic: Some(generic),
+                annotations,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("React must retain its lifecycle and generic mixin")
+        };
+        let mixins = generic.properties[0].annotation;
+
+        assert!(annotations.contains(&mixins));
+        assert!(generic.annotation_is_deferred(mixins));
+        assert_eq!(generic.methods.len(), 2);
     }
 
     #[test]
