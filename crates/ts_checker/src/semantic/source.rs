@@ -37344,6 +37344,10 @@ fn recover_protected_generic_constructor_access(
     else {
         return Ok(false);
     };
+    let derived_heritage = arena
+        .get(middle_reference.node)
+        .and_then(|reference| reference.parent)
+        .map(|node| NodeRef::new(middle_reference.arena, middle_reference.file, node));
     let Some((construction, constructor_reference)) =
         recovered_protected_method_construction(arena, bound, store, &derived)
     else {
@@ -37352,7 +37356,7 @@ fn recover_protected_generic_constructor_access(
     let source_locals = bound
         .locals(bound.source_file())
         .and_then(|locals| store.symbol_table(locals));
-    if failure != middle.declaration
+    if (failure != middle.declaration && derived_heritage != Some(failure))
         || base_class.heritage_clauses.is_some()
         || base_class.type_parameters.is_some()
         || !middle_class.members.nodes.is_empty()
