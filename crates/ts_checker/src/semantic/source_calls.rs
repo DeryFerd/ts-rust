@@ -5919,12 +5919,30 @@ fn recover_non_callable_source_call(
                 callee_type,
             )?
         };
-        let detail = Diagnostic::with_arguments(
-            message_by_code(2757).ok_or(SourceCheckError::MissingDiagnostic(2757))?,
-            [apparent_type],
-        )
-        .render()
-        .expect("TS2757 has one formatting argument");
+        let details = match classify_non_callable_union(store, plan.node, callee_type)? {
+            None => vec![non_callable_detail(2757, &apparent_type, 2)?],
+            Some(NonCallableUnionKind::NoCallable) => {
+                vec![non_callable_detail(2755, &apparent_type, 2)?]
+            }
+            Some(NonCallableUnionKind::IncompatibleSignatures) => {
+                vec![non_callable_detail(2758, &apparent_type, 2)?]
+            }
+            Some(NonCallableUnionKind::Mixed(non_callable)) => {
+                let constituent = format_non_callable_source_type(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    non_callable,
+                )?;
+                vec![
+                    non_callable_detail(2756, &apparent_type, 2)?,
+                    non_callable_detail(2757, &constituent, 4)?,
+                ]
+            }
+        };
         let mut related_information = missing_semicolon_related_information(host, plan)?
             .into_iter()
             .collect::<Vec<_>>();
@@ -5942,7 +5960,7 @@ fn recover_non_callable_source_call(
             diagnostic: Diagnostic::new(
                 message_by_code(2349).ok_or(SourceCheckError::MissingDiagnostic(2349))?,
             )
-            .with_details([format!("  {detail}")]),
+            .with_details(details),
             related_information,
         })
     } else if return_type != error_type
@@ -5967,6 +5985,73 @@ fn recover_non_callable_source_call(
         merge_retry_diagnostic(diagnostics, diagnostic);
     }
     Ok(CheckedSourceCall { return_type })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NonCallableUnionKind {
+    NoCallable,
+    Mixed(TypeId),
+    IncompatibleSignatures,
+}
+
+fn classify_non_callable_union(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    type_: TypeId,
+) -> Result<Option<NonCallableUnionKind>, SourceCheckError> {
+    let Some(record) = store.type_payload(type_) else {
+        return Err(SourceCheckError::Call(node));
+    };
+    let TypeData::Union(union) = record.data() else {
+        return Ok(None);
+    };
+    let mut has_signatures = false;
+    let mut first_non_callable = None;
+    for constituent in &union.union.types {
+        match validate_stored_callable_set(store, *constituent) {
+            StoredCallableSetValidation::Valid { projection, .. } => {
+                if projection.owner != *constituent {
+                    return Err(SourceCheckError::Call(node));
+                }
+                if projection.call_signatures.is_empty() {
+                    first_non_callable.get_or_insert(*constituent);
+                } else {
+                    has_signatures = true;
+                }
+            }
+            StoredCallableSetValidation::NotCallable => {
+                first_non_callable.get_or_insert(*constituent);
+            }
+            StoredCallableSetValidation::Pending { .. }
+            | StoredCallableSetValidation::Malformed { .. } => {
+                return Err(SourceCheckError::Call(node));
+            }
+        }
+        if has_signatures && first_non_callable.is_some() {
+            break;
+        }
+    }
+    Ok(Some(if !has_signatures {
+        NonCallableUnionKind::NoCallable
+    } else if let Some(non_callable) = first_non_callable {
+        NonCallableUnionKind::Mixed(non_callable)
+    } else {
+        NonCallableUnionKind::IncompatibleSignatures
+    }))
+}
+
+fn non_callable_detail(
+    code: u32,
+    type_: &str,
+    indentation: usize,
+) -> Result<String, SourceCheckError> {
+    let detail = Diagnostic::with_arguments(
+        message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
+        [type_],
+    )
+    .render()
+    .expect("union invocation diagnostics retain one formatting argument");
+    Ok(format!("{}{detail}", " ".repeat(indentation)))
 }
 
 fn format_non_callable_source_type(
@@ -11416,7 +11501,9 @@ mod tests {
             diagnostic.diagnostic.render().unwrap(),
             concat!(
                 "This expression is not callable.\n",
-                "  Type '{ label: string; } | ((input: string) => void)' has no call signatures.",
+                "  Not all constituents of type '{ label: string; } | ",
+                "((input: string) => void)' are callable.\n",
+                "    Type '{ label: string; }' has no call signatures.",
             ),
         );
         let signature = context
