@@ -24551,6 +24551,20 @@ pub(super) fn check_source_file(
     }
     for statement in &statements {
         match statement {
+            PlannedStatement::Class(class) => {
+                if let Some(annotation) = class.constructor_interface_annotation() {
+                    session.reset_query();
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        &mut type_import_preflight_diagnostics,
+                    )?
+                    .preflight_type_from_type_node(annotation)?;
+                }
+            }
             PlannedStatement::GenericInterface(interface) => {
                 for property in interface.property_type_nodes() {
                     session.reset_query();
@@ -26066,6 +26080,36 @@ pub(super) fn check_source_file(
                     .is_some()
                 {
                     return Err(SourceCheckError::Class(declaration));
+                }
+                if let Some((argument, source_type, target_type)) =
+                    class.constructor_super_argument_mismatch()
+                {
+                    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+                    if options.no_error_truncation {
+                        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+                    }
+                    let display =
+                        get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                            store,
+                            host,
+                            global_types,
+                            source_type,
+                            target_type,
+                            flags,
+                        )?;
+                    merge_retry_diagnostic(
+                        diagnostics,
+                        CanonicalCheckerDiagnostic {
+                            node: Some(argument),
+                            range_override: None,
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(2345)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(2345))?,
+                                [display.source, display.target],
+                            ),
+                            related_information: Vec::new(),
+                        },
+                    );
                 }
                 let standard_class_fields = options.name_resolution.use_define_for_class_fields
                     != Some(false)
@@ -32529,6 +32573,350 @@ mod tests {
         let warm = observable_state(&context, file);
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn derived_constructor_parameter_property_preserves_source_and_signature_identities() {
+        for (index, annotation) in ["number", "string"].into_iter().enumerate() {
+            let text = format!(
+                "interface Options {{ value: {annotation}; }} \
+                 class Super {{ constructor(value: {annotation}) {{}} }} \
+                 class Sub extends Super {{ \
+                 constructor(public options: Options) {{ super(options.value); }} \
+                 }}",
+            );
+            let source = parsed(&text);
+            let file = FileId::new(8_510 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    strict_property_initialization: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let owner = global_symbol(&context, "Sub");
+            let base = global_symbol(&context, "Super");
+            let interface = global_symbol(&context, "Options");
+
+            context.check_source_file(file).unwrap();
+
+            let members = context.get_nongeneric_class_members(owner).unwrap();
+            let base_members = context.get_nongeneric_class_members(base).unwrap();
+            let interface_type = context
+                .store()
+                .declared_type_links(interface)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let [property] = members.declared_instance_properties() else {
+                panic!("the public parameter must publish one class property")
+            };
+            let property = *property;
+            let constructor = context
+                .store()
+                .signature(members.default_construct_signature())
+                .unwrap();
+            let [local] = constructor.parameters() else {
+                panic!("the derived signature must retain its constructor-local parameter")
+            };
+            let local = *local;
+            assert_ne!(property, local);
+            assert_eq!(constructor.min_argument_count(), 1);
+            assert_eq!(
+                constructor.resolved_return_type(),
+                Some(members.shells().instance_type())
+            );
+            assert_eq!(
+                context.store().symbol(property).unwrap().flags(),
+                SymbolFlags::PROPERTY
+            );
+            assert_eq!(
+                context.store().symbol(local).unwrap().flags(),
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            );
+            for symbol in [property, local] {
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(symbol)
+                        .and_then(|links| links.resolved_type),
+                    Some(interface_type),
+                );
+            }
+
+            let parameter = *context
+                .store()
+                .symbol(property)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .first()
+                .unwrap();
+            let NodeData::ParameterDeclaration(parameter_data) =
+                &source.arena.get(parameter.node).unwrap().data
+            else {
+                panic!("the public class property must retain its parameter declaration")
+            };
+            let type_node = NodeRef::new(
+                parameter.arena,
+                parameter.file,
+                parameter_data.type_.unwrap(),
+            );
+            assert_eq!(resolved_node_type(&context, type_node), interface_type);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(type_node)
+                    .and_then(|links| links.resolved_symbol),
+                Some(interface),
+            );
+
+            let call = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let NodeData::CallExpression(call_data) = &source.arena.get(call.node).unwrap().data
+            else {
+                panic!("the constructor retains its one super call")
+            };
+            let argument = NodeRef::new(call.arena, call.file, call_data.arguments.nodes[0]);
+            let NodeData::PropertyAccessExpression(access) =
+                &source.arena.get(argument.node).unwrap().data
+            else {
+                panic!("super receives the interface property")
+            };
+            let receiver = NodeRef::new(argument.arena, argument.file, access.expression);
+            let interface_property = context
+                .store()
+                .symbol(interface)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source("value"))
+                .unwrap();
+            let expected_argument = if annotation == "number" {
+                context.store().intrinsic_bootstrap().unwrap().number_type
+            } else {
+                context.store().intrinsic_bootstrap().unwrap().string_type
+            };
+            assert_eq!(resolved_node_type(&context, receiver), interface_type);
+            assert_eq!(resolved_node_type(&context, argument), expected_argument);
+            assert_eq!(
+                resolved_node_type(&context, call),
+                context.store().intrinsic_bootstrap().unwrap().void_type,
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(receiver)
+                    .and_then(|links| links.resolved_symbol),
+                Some(local),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(argument)
+                    .and_then(|links| links.resolved_symbol),
+                Some(interface_property),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .signature_links(call)
+                    .and_then(|links| links.resolved_signature.signature()),
+                Some(base_members.default_construct_signature()),
+            );
+            assert_eq!(
+                validate_class_heritage_members(context.store(), members.shells().instance_type()),
+                ClassHeritageMembersValidation::Valid,
+            );
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn derived_constructor_super_argument_reports_exact_property_access_diagnostic() {
+        let source = parsed(concat!(
+            "interface Options { value: string; } ",
+            "class Super { constructor(value: number) {} } ",
+            "class Sub extends Super { ",
+            "constructor(public options: Options) { super(options.value); } ",
+            "}",
+        ));
+        let file = FileId::new(8_512);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the incompatible super argument must retain one diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(diagnostic.diagnostic.arguments, ["string", "number"]);
+        assert_eq!(
+            node_text(&source, diagnostic.node.unwrap()),
+            "options.value"
+        );
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Argument of type 'string' is not assignable to parameter of type 'number'.",
+        );
+        assert!(diagnostic.related_information.is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn poisoned_derived_constructor_super_argument_rejects_without_further_publication() {
+        let source = parsed(concat!(
+            "interface Options { value: number; } ",
+            "class Super { constructor(value: number) {} } ",
+            "class Sub extends Super { ",
+            "constructor(public options: Options) { super(options.value); } ",
+            "}",
+        ));
+        let file = FileId::new(8_516);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let owner = global_symbol(&context, "Sub");
+        let argument = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            argument,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(context.get_nongeneric_class_members(owner).is_err());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+    }
+
+    #[test]
+    fn invalid_derived_constructor_parameter_property_leaves_every_declaration_cold() {
+        for (index, text) in [
+            concat!(
+                "interface Options { value: number; } ",
+                "class Super { constructor(value: number) {} } ",
+                "class Sub extends Super { constructor(public options: Options) {} }",
+            ),
+            concat!(
+                "interface Options { value: number; } ",
+                "class Super { constructor(value: number) {} } ",
+                "class Sub extends Super { ",
+                "constructor(public options: Options) { super(options.missing); } ",
+                "}",
+            ),
+            concat!(
+                "interface Options { value: number; } ",
+                "class Super { constructor(value: number) {} } ",
+                "class Sub extends Super { ",
+                "constructor(private options: Options) { super(options.value); } ",
+                "}",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(8_513 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let owner = global_symbol(&context, "Sub");
+            let base = global_symbol(&context, "Super");
+            let interface = global_symbol(&context, "Options");
+            let cold = observable_state(&context, file);
+
+            assert!(
+                matches!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Class(_)
+                    ))
+                ),
+                "{text}",
+            );
+            assert_eq!(observable_state(&context, file), cold, "{text}");
+            for symbol in [owner, base, interface] {
+                assert!(context.store().declared_type_links(symbol).is_none());
+            }
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn derived_constructor_parameter_properties_preserve_initialized_static_inheritance() {
+        let source = parsed(concat!(
+            "interface Options { value: number; } ",
+            "class Super { static shared = 1; constructor(value: number) {} } ",
+            "class Sub extends Super { ",
+            "static own = 2; ",
+            "constructor(public options: Options) { super(options.value); } ",
+            "} ",
+            "const inherited = Sub.shared; const local = Sub.own;",
+        ));
+        let file = FileId::new(8_517);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let owner = global_symbol(&context, "Sub");
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for name in ["inherited", "local"] {
+            assert_eq!(variable_value_type(&context, &source, file, name), number);
+        }
+        for name in ["shared", "own"] {
+            assert!(
+                context
+                    .store()
+                    .symbol_table(members.static_members())
+                    .is_some_and(|members| members.get_source(name).is_some()),
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
     }
 

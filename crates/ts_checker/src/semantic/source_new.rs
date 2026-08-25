@@ -609,6 +609,9 @@ pub(super) fn plan_direct_default_new(
             )));
         }
         preflight_nongeneric_class_member_query(store, host, &class)?;
+        if class.constructor_interface_annotation().is_some() {
+            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+        }
         let parameter = constructor_parameter(store, host, &class)?;
         if argument.is_some() && class.direct_plan().is_none() {
             return Err(unsupported(SourceNewUnsupported::Arguments(node)));
@@ -4965,6 +4968,48 @@ mod tests {
             assert!(context.store().declared_type_links(owner).is_none());
             assert!(context.store().value_symbol_links(owner).is_none());
         }
+    }
+
+    #[test]
+    fn unsupported_interface_constructor_arguments_reject_without_partial_class_publication() {
+        let parsed = parse_source_file(concat!(
+            "interface Options { value: number; } ",
+            "class Super { constructor(value: number) {} } ",
+            "class Sub extends Super { ",
+            "constructor(public options: Options) { super(options.value); } ",
+            "} ",
+            "const model = new Sub(1);",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_810);
+        let mut context = context(&parsed, file);
+        let owner = class_symbol(&parsed, file, &context, "Sub");
+        let base = class_symbol(&parsed, file, &context, "Super");
+        let (construction, _) = variable_new(&parsed, file, "model");
+        let cold = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                construction,
+            ))),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+        assert!(context.store().declared_type_links(owner).is_none());
+        assert!(context.store().declared_type_links(base).is_none());
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
