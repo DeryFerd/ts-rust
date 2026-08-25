@@ -7442,7 +7442,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::OpenBraceToken => self.parse_object_literal(),
             SyntaxKind::TemplateHead => self.parse_template_expression(),
             SyntaxKind::LessThanToken if self.language_variant == LanguageVariant::Jsx => {
-                self.parse_jsx_element(false)
+                self.parse_jsx_element(false, None)
             }
             _ => {
                 let position = if self.current.kind == SyntaxKind::EndOfFile {
@@ -7979,7 +7979,7 @@ impl<'a> Parser<'a> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn parse_jsx_element(&mut self, resume_jsx: bool) -> NodeId {
+    fn parse_jsx_element(&mut self, resume_jsx: bool, parent_opening: Option<NodeId>) -> NodeId {
         let start = self.current.range.start;
         self.bump();
         if self.current.kind == SyntaxKind::GreaterThanToken {
@@ -8049,42 +8049,87 @@ impl<'a> Parser<'a> {
             &element_children,
         );
         let children = self.parse_jsx_children(opening);
-        let closing_start = self.current.range.start;
-        self.parse_jsx_closing_tag_start();
-        let missing_closing_tag = matches!(
-            self.current.kind,
-            SyntaxKind::EndOfFile | SyntaxKind::ConflictMarkerTrivia
-        );
-        let closing_name = if missing_closing_tag {
-            self.missing_identifier(closing_start)
+        let recovered_child = children
+            .last()
+            .copied()
+            .filter(|child| self.jsx_child_closes_opening(opening, *child));
+        let (closing_start, end, closing) = if let Some(child) = recovered_child {
+            let (child_end, closing) = match &self.arena.get(child).unwrap().data {
+                NodeData::JsxElement(element) => {
+                    (element.children.range.end, element.closing_element)
+                }
+                _ => unreachable!("the recovered JSX child was validated"),
+            };
+            let closing_range = self.arena.get(closing).unwrap().range;
+            let missing_name = self.missing_identifier(child_end);
+            let missing_closing = self.alloc_node(
+                SyntaxKind::JsxClosingElement,
+                TextRange::new(child_end, child_end),
+                NodeData::JsxClosingElement(Box::new(JsxClosingElementData {
+                    tag_name: missing_name,
+                })),
+                &[missing_name],
+            );
+            let child_record = self.arena.get_mut(child).unwrap();
+            let NodeData::JsxElement(element) = &mut child_record.data else {
+                unreachable!("the recovered JSX child was validated")
+            };
+            child_record.range.end = child_end;
+            element.closing_element = missing_closing;
+            self.arena.get_mut(missing_closing).unwrap().parent = Some(child);
+            (closing_range.start, closing_range.end, closing)
         } else {
-            self.parse_jsx_tag_name("Expected a JSX closing tag name.")
+            let closing_start = self.current.range.start;
+            self.parse_jsx_closing_tag_start();
+            let missing_closing_tag = matches!(
+                self.current.kind,
+                SyntaxKind::EndOfFile | SyntaxKind::ConflictMarkerTrivia
+            );
+            let closing_name = if missing_closing_tag {
+                self.missing_identifier(closing_start)
+            } else {
+                self.parse_jsx_tag_name("Expected a JSX closing tag name.")
+            };
+            let names_are_equivalent =
+                !missing_closing_tag && self.jsx_tag_names_are_equivalent(tag_name, closing_name);
+            if !missing_closing_tag
+                && !names_are_equivalent
+                && let Some(opening_name) = self.arena.get(tag_name).and_then(|node| {
+                    self.arena
+                        .source_text()?
+                        .get(node.range.start.get() as usize..node.range.end.get() as usize)
+                })
+            {
+                let opening_name = opening_name.to_owned();
+                let closes_parent = parent_opening
+                    .and_then(|parent| self.arena.get(parent))
+                    .and_then(|parent| match &parent.data {
+                        NodeData::JsxOpeningElement(parent) => Some(parent.tag_name),
+                        _ => None,
+                    })
+                    .is_some_and(|parent| self.jsx_tag_names_are_equivalent(parent, closing_name));
+                let (range, code) = if closes_parent {
+                    (self.arena.get(tag_name).unwrap().range, 17008)
+                } else {
+                    (self.arena.get(closing_name).unwrap().range, 17002)
+                };
+                self.error_code_at(range, code, [opening_name]);
+            }
+            let end = if missing_closing_tag {
+                closing_start
+            } else {
+                self.finish_jsx_tag(resume_jsx && names_are_equivalent)
+            };
+            let closing = self.alloc_node(
+                SyntaxKind::JsxClosingElement,
+                TextRange::new(closing_start, end),
+                NodeData::JsxClosingElement(Box::new(JsxClosingElementData {
+                    tag_name: closing_name,
+                })),
+                &[closing_name],
+            );
+            (closing_start, end, closing)
         };
-        if !missing_closing_tag
-            && !self.jsx_tag_names_are_equivalent(tag_name, closing_name)
-            && let Some(opening_name) = self.arena.get(tag_name).and_then(|node| {
-                self.arena
-                    .source_text()?
-                    .get(node.range.start.get() as usize..node.range.end.get() as usize)
-            })
-        {
-            let opening_name = opening_name.to_owned();
-            let range = self.arena.get(closing_name).unwrap().range;
-            self.error_code_at(range, 17002, [opening_name]);
-        }
-        let end = if missing_closing_tag {
-            closing_start
-        } else {
-            self.finish_jsx_tag(resume_jsx)
-        };
-        let closing = self.alloc_node(
-            SyntaxKind::JsxClosingElement,
-            TextRange::new(closing_start, end),
-            NodeData::JsxClosingElement(Box::new(JsxClosingElementData {
-                tag_name: closing_name,
-            })),
-            &[closing_name],
-        );
         if self.current.kind == SyntaxKind::ConflictMarkerTrivia {
             let checkpoint = self.scanner.mark();
             let next = if resume_jsx {
@@ -8196,7 +8241,14 @@ impl<'a> Parser<'a> {
                         &expression_children,
                     ));
                 }
-                SyntaxKind::LessThanToken => children.push(self.parse_jsx_element(true)),
+                SyntaxKind::LessThanToken => {
+                    let child = self.parse_jsx_element(true, Some(opening));
+                    let closes_opening = self.jsx_child_closes_opening(opening, child);
+                    children.push(child);
+                    if closes_opening {
+                        break;
+                    }
+                }
                 _ => {
                     self.error_current("Unexpected token in JSX children.");
                     self.current = self.scanner.scan_jsx_token();
@@ -8398,9 +8450,9 @@ impl<'a> Parser<'a> {
             return None;
         }
 
-        let mut expression = self.parse_jsx_element(false);
+        let mut expression = self.parse_jsx_element(false, None);
         while self.current.kind == SyntaxKind::LessThanToken {
-            let right = self.parse_jsx_element(false);
+            let right = self.parse_jsx_element(false, None);
             let comma_position = self.node_start(right);
             let comma = self.alloc_node(
                 SyntaxKind::CommaToken,
@@ -8504,6 +8556,30 @@ impl<'a> Parser<'a> {
             self.error_code_at(self.current.range, 17021, []);
         }
         self.parse_identifier_name(message)
+    }
+
+    /// Detects a nested element that consumed its parent's closing tag.
+    fn jsx_child_closes_opening(&self, opening: NodeId, child: NodeId) -> bool {
+        let Some(NodeData::JsxOpeningElement(opening)) =
+            self.arena.get(opening).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::JsxElement(child)) = self.arena.get(child).map(|node| &node.data) else {
+            return false;
+        };
+        let Some(NodeData::JsxOpeningElement(child_opening)) =
+            self.arena.get(child.opening_element).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::JsxClosingElement(child_closing)) =
+            self.arena.get(child.closing_element).map(|node| &node.data)
+        else {
+            return false;
+        };
+        !self.jsx_tag_names_are_equivalent(child_opening.tag_name, child_closing.tag_name)
+            && self.jsx_tag_names_are_equivalent(opening.tag_name, child_closing.tag_name)
     }
 
     fn jsx_tag_names_are_equivalent(&self, first: NodeId, second: NodeId) -> bool {
@@ -17557,6 +17633,95 @@ export as namespace GlobalName;
     }
 
     #[test]
+    fn jsx_unicode_fixture_preserves_text_inside_exported_arrow_bodies() {
+        let source = concat!(
+            "export const InlineUnicodeChar = () => {\n",
+            "    return <div><span>Warning: ⚠ Error</span></div>;\n",
+            "};\n",
+            "export const StandaloneUnicodeChar = () => {\n",
+            "    return (<div><span>⚠</span>\n",
+            "        ⚠\n",
+            "    </div>);\n",
+            "};\n",
+            "export const MultipleUnicodeChars = () => {\n",
+            "    return (<div>\n",
+            "        ⚠\n",
+            "        ⛔\n",
+            "        🚨\n",
+            "    </div>);\n",
+            "};\n",
+        );
+        let result = parse_jsx_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let text = result
+            .arena
+            .iter()
+            .filter_map(|(_, node)| match &node.data {
+                NodeData::JsxText(text) => {
+                    let start = usize::try_from(node.range.start.get()).unwrap();
+                    let end = usize::try_from(node.range.end.get()).unwrap();
+                    assert_eq!(text.text, &source[start..end]);
+                    Some(text.text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            text,
+            [
+                "Warning: ⚠ Error",
+                "⚠",
+                "\n        ⚠\n    ",
+                "\n        ⚠\n        ⛔\n        🚨\n    ",
+            ],
+        );
+    }
+
+    #[test]
+    fn jsx_type_argument_nodes_skip_spaces_and_newlines_in_their_ranges() {
+        let source = concat!(
+            "const first = <div<   number> />;\n",
+            "const second = <div<\n    number> />;",
+        );
+        let result = parse_jsx_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let arguments = result
+            .arena
+            .iter()
+            .filter_map(|(opening, node)| {
+                let NodeData::JsxSelfClosingElement(element) = &node.data else {
+                    return None;
+                };
+                let arguments = element.type_arguments.as_ref().unwrap();
+                let [argument] = arguments.nodes.as_slice() else {
+                    panic!("the intrinsic element must retain exactly one type argument")
+                };
+                let argument_node = result.arena.get(*argument).unwrap();
+                let argument_start = usize::try_from(argument_node.range.start.get()).unwrap();
+                let argument_end = usize::try_from(argument_node.range.end.get()).unwrap();
+                assert_eq!(&source[argument_start..argument_end], "number");
+                assert_eq!(argument_node.parent, Some(opening));
+                let list_start = usize::try_from(arguments.range.start.get()).unwrap();
+                let list_end = usize::try_from(arguments.range.end.get()).unwrap();
+                Some((&source[list_start..list_end], argument_start))
+            })
+            .collect::<Vec<_>>();
+        let expected_starts = source
+            .match_indices("number")
+            .map(|(start, _)| start)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            arguments,
+            [
+                ("<   number>", expected_starts[0]),
+                ("<\n    number>", expected_starts[1]),
+            ],
+        );
+    }
+
+    #[test]
     fn escaped_jsx_identifiers_report_exact_diagnostics_without_false_tag_mismatches() {
         for (source, spelling, decoded) in [
             (r"const view = <\u0061></a>;", r"\u0061", "a"),
@@ -17711,6 +17876,115 @@ export as namespace GlobalName;
     }
 
     #[test]
+    fn nested_unclosed_jsx_tags_restore_the_parent_closing_element() {
+        let source = "const view = <div><span></div>; const after = 1;";
+        let result = parse_jsx_source_file(source);
+        let missing_start = u32::try_from(source.find("span").unwrap()).unwrap();
+        let closing_start = u32::try_from(source.find("</div>").unwrap()).unwrap();
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.code,
+                    diagnostic.range.start.get(),
+                    diagnostic.range.end.get(),
+                    diagnostic.message.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            [(
+                Some(17008),
+                missing_start,
+                missing_start + 4,
+                "JSX element 'span' has no corresponding closing tag.",
+            )],
+        );
+
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        let (list, _) = variable_list(&result, statements[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected JSX variable declaration")
+        };
+        let outer = declaration.initializer.unwrap();
+        let NodeData::JsxElement(outer_element) = &result.arena.get(outer).unwrap().data else {
+            panic!("expected outer JSX element")
+        };
+        let [inner] = outer_element.children.nodes.as_slice() else {
+            panic!("expected one unclosed nested JSX element")
+        };
+        let inner = *inner;
+        let inner_record = result.arena.get(inner).unwrap();
+        let NodeData::JsxElement(inner_element) = &inner_record.data else {
+            panic!("expected nested JSX element")
+        };
+        assert_eq!(inner_record.parent, Some(outer));
+        assert_eq!(inner_record.range.end.get(), closing_start);
+
+        let synthetic_closing = result.arena.get(inner_element.closing_element).unwrap();
+        let NodeData::JsxClosingElement(synthetic) = &synthetic_closing.data else {
+            panic!("expected synthetic nested JSX closing element")
+        };
+        assert_eq!(synthetic_closing.parent, Some(inner));
+        assert_eq!(synthetic_closing.range.start.get(), closing_start);
+        assert_eq!(synthetic_closing.range.end.get(), closing_start);
+        assert_eq!(identifier_text(&result, synthetic.tag_name), "");
+        assert_eq!(
+            result.arena.get(synthetic.tag_name).unwrap().parent,
+            Some(inner_element.closing_element),
+        );
+
+        let actual_closing = result.arena.get(outer_element.closing_element).unwrap();
+        let NodeData::JsxClosingElement(actual) = &actual_closing.data else {
+            panic!("expected recovered parent JSX closing element")
+        };
+        assert_eq!(actual_closing.parent, Some(outer));
+        assert_eq!(actual_closing.range.start.get(), closing_start);
+        assert_eq!(identifier_text(&result, actual.tag_name), "div");
+    }
+
+    #[test]
+    fn nested_jsx_recovery_compares_decoded_dotted_and_namespaced_parent_tags() {
+        for (source, escaped, missing) in [
+            (
+                r"const view = <UI.\u0052oot><Nested></UI.Root>;",
+                r"\u0052oot",
+                "Nested",
+            ),
+            (
+                r"const view = <ui:\u0072oot><Nested></ui:root>;",
+                r"\u0072oot",
+                "Nested",
+            ),
+        ] {
+            let result = parse_jsx_source_file(source);
+            let escape_start = u32::try_from(source.find(escaped).unwrap()).unwrap();
+            let escape_end = escape_start + u32::try_from(escaped.len()).unwrap();
+            let missing_start = u32::try_from(source.find(missing).unwrap()).unwrap();
+            let missing_end = missing_start + u32::try_from(missing.len()).unwrap();
+            assert_eq!(
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                    ))
+                    .collect::<Vec<_>>(),
+                [
+                    (Some(17021), escape_start, escape_end),
+                    (Some(17008), missing_start, missing_end),
+                ],
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
     fn preserves_empty_jsx_attribute_expressions_for_grammar_checks() {
         let result = parse_jsx_source_file("const view = <View onRefresh={} loading={} />;");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -17787,7 +18061,15 @@ export as namespace GlobalName;
 
     #[test]
     fn reports_unclosed_jsx_elements_at_their_opening_tag_names() {
-        let source = "let x = <    Foo.Bar >Hello\nlet y = <   Baz >Hello";
+        let source = concat!(
+            "declare const React: any\n\n",
+            "let Foo = {\n",
+            "  Bar() {}\n",
+            "}\n\n",
+            "let Baz = () => {}\n\n",
+            "let x = <    Foo.Bar >Hello\n\n",
+            "let y = <   Baz >Hello",
+        );
         let result = parse_jsx_source_file(source);
         let mut diagnostics = result
             .diagnostics
@@ -17796,6 +18078,7 @@ export as namespace GlobalName;
                 (
                     diagnostic.code,
                     diagnostic.range.start.get(),
+                    diagnostic.range.end.get(),
                     diagnostic.message.as_str(),
                 )
             })
@@ -17808,15 +18091,18 @@ export as namespace GlobalName;
                 (
                     Some(17008),
                     u32::try_from(source.find("Foo.Bar").unwrap()).unwrap(),
+                    u32::try_from(source.find("Foo.Bar").unwrap() + "Foo.Bar".len()).unwrap(),
                     "JSX element 'Foo.Bar' has no corresponding closing tag.",
                 ),
                 (
                     Some(17008),
-                    u32::try_from(source.find("Baz").unwrap()).unwrap(),
+                    u32::try_from(source.rfind("Baz").unwrap()).unwrap(),
+                    u32::try_from(source.rfind("Baz").unwrap() + "Baz".len()).unwrap(),
                     "JSX element 'Baz' has no corresponding closing tag.",
                 ),
                 (
                     Some(1005),
+                    u32::try_from(source.len()).unwrap(),
                     u32::try_from(source.len()).unwrap(),
                     "'</' expected.",
                 ),
