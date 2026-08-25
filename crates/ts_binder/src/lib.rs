@@ -33,8 +33,8 @@ use std::{
 };
 
 use ts_ast::{
-    FileId, FlowNodeArena, FlowRef, NodeArena, NodeArenaId, NodeData, NodeFlags, NodeId, NodeRef,
-    SymbolId, SyntaxKind,
+    FileId, FlowNodeArena, FlowRef, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SymbolId,
+    SyntaxKind,
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 
@@ -1352,7 +1352,8 @@ impl<'a> Binder<'a> {
         let NodeData::VariableDeclarationList(data) = &node.data else {
             return;
         };
-        let block_scoped = node.flags.0 & (NodeFlags(1 << 0).0 | NodeFlags(1 << 1).0) != 0;
+        const BLOCK_SCOPED_FLAGS: u32 = (1 << 0) | (1 << 1) | (1 << 2);
+        let block_scoped = node.flags.0 & BLOCK_SCOPED_FLAGS != 0;
         let flags = if block_scoped {
             SymbolFlags::BLOCK_SCOPED_VARIABLE
         } else {
@@ -5410,6 +5411,133 @@ mod tests {
         );
         assert_eq!(result.containers[&first_let_decl], block);
         assert_eq!(result.node_symbols[&first_var_decl], root_value);
+    }
+
+    #[test]
+    fn using_declarations_remain_block_scoped_and_keep_symbol_identity() {
+        for (keyword, expected_flags) in [("using", 1 << 2), ("await using", (1 << 1) | (1 << 2))] {
+            let parsed = parse_source_file(&format!(
+                "{{ {keyword} resource = null; resource; }} resource;"
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+            let result = bind_source_file(&parsed.arena, parsed.source_file);
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+            let statements = source_statements(&parsed.arena, parsed.source_file);
+            let block = statements[0];
+            let outside = statements[1];
+            let statements = block_statements(&parsed.arena, block);
+            let NodeData::VariableStatement(statement) =
+                &parsed.arena.get(statements[0]).unwrap().data
+            else {
+                panic!("expected a resource declaration statement")
+            };
+            let list = parsed.arena.get(statement.declaration_list).unwrap();
+            assert_eq!(list.flags.0, expected_flags);
+            let NodeData::VariableDeclarationList(declarations) = &list.data else {
+                panic!("expected a resource declaration list")
+            };
+            let [declaration] = declarations.declarations.nodes.as_slice() else {
+                panic!("expected one resource declaration")
+            };
+            let NodeData::VariableDeclaration(variable) =
+                &parsed.arena.get(*declaration).unwrap().data
+            else {
+                panic!("expected a resource declaration")
+            };
+
+            let root = result.root_scope().unwrap();
+            assert!(root.symbols.get("resource").is_none());
+            let block_scope = result
+                .scopes
+                .iter()
+                .find(|scope| scope.owner == block)
+                .unwrap();
+            let resource = block_scope.symbols.get("resource").unwrap();
+            assert_eq!(
+                result.symbols.get(resource).unwrap().flags,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            );
+            assert_eq!(result.node_symbols.get(declaration), Some(&resource));
+            assert_eq!(result.node_symbols.get(&variable.name), Some(&resource));
+
+            let NodeData::ExpressionStatement(inside) =
+                &parsed.arena.get(statements[1]).unwrap().data
+            else {
+                panic!("expected a resource read inside the block")
+            };
+            let NodeData::ExpressionStatement(outside) = &parsed.arena.get(outside).unwrap().data
+            else {
+                panic!("expected a resource read outside the block")
+            };
+            assert_eq!(
+                result.resolve_name_at(inside.expression, "resource"),
+                Some(resource),
+            );
+            assert_eq!(result.resolve_name_at(outside.expression, "resource"), None);
+        }
+    }
+
+    #[test]
+    fn using_declarations_preserve_ordered_class_exports_and_stay_module_local() {
+        let parsed = parse_source_file(concat!(
+            "using x = null; ",
+            "export class C01 {} ",
+            "export class C02 {} ",
+            "export class C03 {} ",
+            "export class C04 {} ",
+            "export class C05 {} ",
+            "export class C06 {} ",
+            "export class C07 {} ",
+            "export class C08 {} ",
+            "export class C09 {} ",
+            "export class C10 {} ",
+            "export class C11 {} ",
+            "export class C12 {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let root = result.root_scope().unwrap();
+        let resource = root.symbols.get("x").unwrap();
+        assert_eq!(resource.0, 0);
+        assert_eq!(
+            result.symbols.get(resource).unwrap().flags,
+            SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        );
+        assert!(result.exports.get("x").is_none());
+
+        let expected = (1..=12)
+            .map(|index| format!("C{index:02}"))
+            .collect::<Vec<_>>();
+        assert_eq!(result.exports.len(), expected.len());
+        assert_eq!(
+            result
+                .exports
+                .iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+
+        for (index, class) in source_statements(&parsed.arena, parsed.source_file)
+            .into_iter()
+            .skip(1)
+            .enumerate()
+        {
+            let name = &expected[index];
+            let symbol = result.node_symbols[&class];
+            assert_eq!(symbol.0, u32::try_from(index + 1).unwrap());
+            assert_eq!(root.symbols.get(name), Some(symbol));
+            assert_eq!(result.exports.get(name), Some(symbol));
+            assert_eq!(
+                result.symbols.get(symbol).unwrap().flags,
+                SymbolFlags::CLASS
+            );
+        }
     }
 
     #[test]
