@@ -1121,15 +1121,22 @@ impl<'store> RelaterSession<'store> {
     /// The pinned oracle is surface-sensitive: a sole empty `Array<T>` shell
     /// makes `[[1], {}]` infer `number[][]`, while a shell with required
     /// `length` and the default library infer `{}[]`. Array -> regularized
-    /// empty object is always true. The reverse direction is false only when
-    /// the authoritative raw target proves a required own property; otherwise
-    /// it remains unavailable rather than guessing that a cold shell is empty.
+    /// empty object is always true for structural relations. Strict subtype
+    /// reduction also proves the reverse direction false only when the raw
+    /// target has a required own property; otherwise it remains unavailable
+    /// rather than guessing that a cold shell is empty.
     fn canonical_array_empty_object_relation(
         &mut self,
         source: TypeId,
         target: TypeId,
     ) -> Result<Option<Ternary>, RelationUnavailable> {
-        if self.relation != RelationKind::StrictSubtype {
+        if !matches!(
+            self.relation,
+            RelationKind::Assignable
+                | RelationKind::Comparable
+                | RelationKind::Subtype
+                | RelationKind::StrictSubtype
+        ) {
             return Ok(None);
         }
         let source_array = self.configured_array_reference_target(source)?;
@@ -1137,7 +1144,9 @@ impl<'store> RelaterSession<'store> {
         let (array, object, result, reverse_requires_property) = match (source_array, target_array)
         {
             (Some(_), None) => (source, target, Ternary::True, false),
-            (None, Some(_)) => (target, source, Ternary::False, true),
+            (None, Some(_)) if self.relation == RelationKind::StrictSubtype => {
+                (target, source, Ternary::False, true)
+            }
             _ => return Ok(None),
         };
         let array_target = source_array.or(target_array).expect("one side is an Array");
@@ -14806,6 +14815,22 @@ mod tests {
             Ok(true)
         );
         assert_eq!(store.relation_state_snapshot(), before);
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::Comparable,
+        ] {
+            assert_eq!(
+                store.is_type_related_to_with_optional_global_types(
+                    array_number,
+                    empty,
+                    relation,
+                    Some(global_types),
+                ),
+                Ok(true),
+            );
+            assert_eq!(store.relation_state_snapshot(), before);
+        }
         assert_eq!(
             store.is_type_related_to_with_optional_global_types(
                 empty,
@@ -15069,6 +15094,102 @@ mod tests {
                 Ok(())
             );
         }
+        assert_eq!(store.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn array_empty_object_relations_authenticate_literal_clones_without_cache_writes() {
+        let mut store = initialized(true);
+        let (number, empty_object) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.empty_object_type)
+        };
+        let array = alloc_canonical_array_target(&mut store, "Array");
+        let global_types = RelationGlobalTypes {
+            array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
+        };
+        let base = canonical_array_reference(&mut store, array.target, number);
+        let literal = alloc_array_literal_clone(&mut store, array, number);
+        let empty = alloc_property_object(&mut store, Vec::new());
+        let literal_flags = store.type_payload(literal).unwrap().object_flags();
+        let forged = store
+            .alloc_type_reference(literal_flags, Some(array.symbol))
+            .unwrap();
+        assert!(store.set_object_target_and_mapper(forged, Some(array.target), None));
+        assert!(store.set_type_reference_resolution(forged, None, Some(vec![number])));
+
+        let relations = [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+            RelationKind::Comparable,
+        ];
+        let before = store.relation_state_snapshot();
+        for relation in relations {
+            for source in [base, literal] {
+                assert_eq!(
+                    store.is_type_related_to_with_optional_global_types(
+                        source,
+                        empty,
+                        relation,
+                        Some(global_types),
+                    ),
+                    Ok(true),
+                );
+                assert_eq!(store.relation_state_snapshot(), before);
+            }
+            assert_eq!(
+                store.is_type_related_to_with_optional_global_types(
+                    forged,
+                    empty,
+                    relation,
+                    Some(global_types),
+                ),
+                Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                    forged
+                )),
+            );
+            assert_eq!(store.relation_state_snapshot(), before);
+        }
+
+        assert_eq!(
+            store.derived_types.array_literal_types.insert(base, forged),
+            Some(literal),
+        );
+        let poisoned = store.relation_state_snapshot();
+        for relation in relations {
+            assert_eq!(
+                store.is_type_related_to_with_optional_global_types(
+                    literal,
+                    empty,
+                    relation,
+                    Some(global_types),
+                ),
+                Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                    literal
+                )),
+            );
+            assert_eq!(store.relation_state_snapshot(), poisoned);
+        }
+        assert_eq!(
+            store
+                .derived_types
+                .array_literal_types
+                .insert(base, literal),
+            Some(forged),
+        );
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                literal,
+                empty,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Ok(true),
+        );
         assert_eq!(store.relation_state_snapshot(), before);
     }
 
