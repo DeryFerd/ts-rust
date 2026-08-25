@@ -31058,7 +31058,71 @@ fn source_awaited_expression_type(
         return Ok(type_);
     };
     let mut visited = HashSet::new();
-    while store.type_payload(type_).and_then(TypeRecord::symbol) == Some(promise) {
+    loop {
+        let Some(symbol) = store
+            .type_payload(type_)
+            .and_then(TypeRecord::symbol)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+        else {
+            return Ok(type_);
+        };
+        if symbol != promise {
+            let Ok(reference) = validate_direct_generic_reference(store, type_) else {
+                return Ok(type_);
+            };
+            let Some(TypeData::Interface(interface)) =
+                store.type_payload(reference.target).map(TypeRecord::data)
+            else {
+                return Ok(type_);
+            };
+            let Some([base]) = interface.resolved_base_types.as_deref() else {
+                return Ok(type_);
+            };
+            if store
+                .type_payload(*base)
+                .and_then(TypeRecord::symbol)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(promise)
+            {
+                return Ok(type_);
+            }
+            if !visited.insert(type_)
+                || !interface.base_types_resolved
+                || interface.resolved_base_constructor_type.is_some()
+                || store
+                    .declared_type_links(symbol)
+                    .and_then(|links| links.declared_type)
+                    != Some(reference.target)
+            {
+                return Err(SourceCheckError::Arrow(expression));
+            }
+            let base_reference = validate_direct_generic_reference(store, *base)
+                .map_err(|_| SourceCheckError::Arrow(expression))?;
+            if store
+                .declared_type_links(promise)
+                .and_then(|links| links.declared_type)
+                != Some(base_reference.target)
+            {
+                return Err(SourceCheckError::Arrow(expression));
+            }
+            let [base_argument] = base_reference.type_arguments.as_slice() else {
+                return Err(SourceCheckError::Arrow(expression));
+            };
+            let target_reference = validate_direct_generic_reference(store, reference.target)
+                .map_err(|_| SourceCheckError::Arrow(expression))?;
+            let Some(index) = target_reference
+                .type_arguments
+                .iter()
+                .position(|parameter| parameter == base_argument)
+            else {
+                return Err(SourceCheckError::Arrow(expression));
+            };
+            type_ = *reference
+                .type_arguments
+                .get(index)
+                .ok_or(SourceCheckError::Arrow(expression))?;
+            continue;
+        }
         if !visited.insert(type_) {
             return Err(SourceCheckError::Arrow(expression));
         }
@@ -31069,7 +31133,6 @@ fn source_awaited_expression_type(
         };
         type_ = *awaited;
     }
-    Ok(type_)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -61023,6 +61086,145 @@ class Foo2 {
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn async_arrows_unwrap_authenticated_multi_parameter_promise_heritage() {
+        let library = parsed("interface Promise<T> {}");
+        let source = parsed(concat!(
+            "interface Deferred<Value, Failure> extends Promise<Value> {} ",
+            "declare function nested(): Deferred<Promise<number>, string>; ",
+            "const forwarded = async () => nested(); ",
+            "const object = { f: async () => { await nested(); } };",
+        ));
+        let library_file = FileId::new(9_374);
+        let file = FileId::new(9_375);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let forwarded = variable_value_type(&context, &source, file, "forwarded");
+        assert_eq!(
+            context.type_to_string(forwarded).unwrap(),
+            "() => Promise<number>",
+        );
+        let awaited = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::AwaitExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            resolved_node_type(&context, awaited),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        let object = variable_initializer(&source, file, "object");
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, object, "f"))
+                .unwrap(),
+            "() => Promise<void>",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn awaited_derived_promise_rejects_forged_heritage_without_publication() {
+        let library = parsed("interface Promise<T> {}");
+        let source = parsed(concat!(
+            "interface Deferred<Value, Failure> extends Promise<Value> {} ",
+            "declare function nested(): Deferred<number, string>; ",
+            "const forwarded = async () => nested();",
+        ));
+        let library_file = FileId::new(9_376);
+        let file = FileId::new(9_377);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+        context.check_source_file(file).unwrap();
+
+        let nested = function_symbol(&context, &source, file, "nested");
+        let nested_callable = context
+            .store()
+            .source_callable_type_for_owner(nested)
+            .unwrap();
+        let nested_signature = context
+            .store()
+            .source_callable_provenance(nested_callable)
+            .unwrap()
+            .signature;
+        let deferred = context
+            .store()
+            .signature(nested_signature)
+            .and_then(super::super::signatures::Signature::resolved_return_type)
+            .unwrap();
+        let forwarded = variable_value_type(&context, &source, file, "forwarded");
+        let forwarded_signature = context
+            .store()
+            .source_callable_provenance(forwarded)
+            .unwrap()
+            .signature;
+        let promise = context
+            .store()
+            .signature(forwarded_signature)
+            .and_then(super::super::signatures::Signature::resolved_return_type)
+            .unwrap();
+        let owner = global_symbol(&context, "Deferred");
+        let target = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let original = match context.store().type_payload(target).unwrap().data() {
+            TypeData::Interface(interface) => interface.resolved_base_types.clone().unwrap(),
+            _ => panic!("Deferred must retain an authenticated interface target"),
+        };
+        let arrow = variable_initializer(&source, file, "forwarded");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            source_awaited_expression_type(context.store(), arrow, deferred),
+            Ok(number),
+        );
+
+        assert!(context.store_mut_for_test().set_interface_base_resolution(
+            target,
+            true,
+            None,
+            Some(vec![promise]),
+        ));
+        let poisoned = observable_state(&context, file);
+        assert_eq!(
+            source_awaited_expression_type(context.store(), arrow, deferred),
+            Err(SourceCheckError::Arrow(arrow)),
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+
+        assert!(context.store_mut_for_test().set_interface_base_resolution(
+            target,
+            true,
+            None,
+            Some(original),
+        ));
+        assert_eq!(
+            source_awaited_expression_type(context.store(), arrow, deferred),
+            Ok(number),
+        );
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
