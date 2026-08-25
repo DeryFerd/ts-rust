@@ -15,7 +15,8 @@
 //! that graph only after seeing the exact direct base plan earlier in source.
 //! Empty methods retain their canonical callable identities, including one
 //! authenticated `...args: any[]` rest parameter. Ambient classes also admit
-//! bodyless methods with direct primitive parameter and return annotations.
+//! bodyless methods with direct primitive parameter and return annotations,
+//! plus unannotated private instance fields with the implicit `any` type.
 //! Direct classes can also retain one string-to-number index signature.
 //! Annotated fields admit one authenticated ambient-function decorator.
 //! One direct getter/setter pair can expose an annotated numeric property.
@@ -211,7 +212,7 @@ enum ClassNamespaceVariablePlan {
     Export(ClassNamespaceExportPlan),
 }
 
-/// One source property with an annotation, a numeric initializer, or both.
+/// One annotated property, initialized property, or implicit-any ambient private field.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ClassPropertyPlan {
     declaration: NodeRef,
@@ -226,6 +227,7 @@ pub(super) struct ClassPropertyPlan {
     optional: bool,
     definite: bool,
     readonly: bool,
+    ambient_private_modifier: Option<NodeRef>,
 }
 
 impl ClassPropertyPlan {
@@ -3288,6 +3290,130 @@ fn plan_property(
         optional,
         definite,
         readonly,
+        ambient_private_modifier: None,
+    })
+}
+
+fn plan_ambient_private_implicit_any_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    member: NodeRef,
+    instance_members: Option<SymbolTableId>,
+) -> Result<ClassPropertyPlan, ClassError> {
+    let reject = || unsupported(ClassUnsupported::MissingPropertyType(member));
+    let record = preflight_node(store, host, member)?;
+    let NodeData::PropertyDeclaration(property) = &record.data else {
+        return Err(reject());
+    };
+    let Some(modifiers) = property.modifiers.as_ref() else {
+        return Err(reject());
+    };
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return Err(unsupported(ClassUnsupported::PropertyModifiers(member)));
+    };
+    let modifier = NodeRef::new(member.arena, member.file, *modifier);
+    let modifier_record = preflight_node(store, host, modifier)?;
+    let name = NodeRef::new(member.arena, member.file, property.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported(ClassUnsupported::PropertyName {
+            node: name,
+            kind: name_record.kind,
+        }));
+    };
+    let source = host
+        .source(member)
+        .and_then(|(arena, _)| arena.source_text())
+        .ok_or_else(|| invariant(ClassInvariant::InvalidProperty(member)))?;
+    if record.kind != SyntaxKind::PropertyDeclaration
+        || record.flags.0 & (NODE_FLAG_JSDOC | NODE_FLAG_HAS_ERROR) != 0
+        || property.symbol.is_some()
+        || property.facts != 0
+        || property.type_.is_some()
+        || property.initializer.is_some()
+        || property.postfix_token.is_some()
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifiers.list.range.start != record.range.start
+        || modifiers.list.range.end > name_record.range.start
+        || modifier_record.kind != SyntaxKind::PrivateKeyword
+        || modifier_record.flags.0 != 0
+        || modifier_record.parent != Some(member.node)
+        || !matches!(modifier_record.data, NodeData::Token(_))
+        || modifier_record.range.start != record.range.start
+        || modifier_record.range.end > modifiers.list.range.end
+        || source.get(
+            modifier_record.range.start.get() as usize..modifier_record.range.end.get() as usize,
+        ) != Some("private")
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(member.node)
+        || name_record.range.start < modifiers.list.range.end
+        || name_record.range.end > record.range.end
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(reject());
+    }
+
+    let symbol = bound_symbol(store, host, member)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(member)))?;
+    let symbol_record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(member)))?;
+    if symbol_record.flags() != SymbolFlags::PROPERTY
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.declarations() != Some(&[member])
+        || symbol_record.value_declaration() != Some(member)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || instance_members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(&identifier.text))
+            != Some(symbol)
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(member)));
+    }
+    let any = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.any_type)
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(name)))?;
+    if store
+        .type_node_links(name)
+        .is_some_and(|links| links != &TypeNodeLinks::default())
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(name)));
+    }
+    if store.value_symbol_links(symbol).is_some_and(|links| {
+        links != &ValueSymbolLinks::default()
+            && links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(any),
+                    ..ValueSymbolLinks::default()
+                })
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+    }
+
+    Ok(ClassPropertyPlan {
+        declaration: member,
+        symbol,
+        name_node: name,
+        type_node: name,
+        initializer_node: None,
+        initializer_text: None,
+        initializer_parameter_name: None,
+        name: identifier.text.clone(),
+        side: ClassPropertySide::Instance,
+        optional: false,
+        definite: false,
+        readonly: false,
+        ambient_private_modifier: Some(modifier),
     })
 }
 
@@ -4685,14 +4811,41 @@ fn plan_class_declaration(
         {
             return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
         }
-        let property = plan_property(
-            store,
-            host,
-            symbol,
-            member,
-            instance_members,
-            static_members,
-        )?;
+        let implicit_ambient_private = ambient
+            && matches!(
+                &member_record.data,
+                NodeData::PropertyDeclaration(property)
+                    if property.type_.is_none()
+                        && property.initializer.is_none()
+                        && property.modifiers.as_ref().is_some_and(|modifiers| {
+                            matches!(
+                                modifiers.list.nodes.as_slice(),
+                                [modifier] if host
+                                    .node(NodeRef::new(member.arena, member.file, *modifier))
+                                    .is_some_and(|modifier| {
+                                        modifier.kind == SyntaxKind::PrivateKeyword
+                                    })
+                            )
+                        })
+            );
+        let property = if implicit_ambient_private {
+            plan_ambient_private_implicit_any_property(
+                store,
+                host,
+                symbol,
+                member,
+                instance_members,
+            )?
+        } else {
+            plan_property(
+                store,
+                host,
+                symbol,
+                member,
+                instance_members,
+                static_members,
+            )?
+        };
         let names = match property.side {
             ClassPropertySide::Instance => &mut instance_names,
             ClassPropertySide::Static => &mut static_names,
@@ -5463,6 +5616,33 @@ fn planned_property_type(
             kind: record.kind,
         }));
     }
+    if let Some(modifier) = property.ambient_private_modifier {
+        let NodeData::Identifier(identifier) = &record.data else {
+            return Err(invariant(ClassInvariant::InvalidPlan(property.declaration)));
+        };
+        let modifier_record = preflight_node(store, host, modifier)?;
+        if record.kind != SyntaxKind::Identifier
+            || property.type_node != property.name_node
+            || identifier.text != property.name
+            || modifier_record.kind != SyntaxKind::PrivateKeyword
+            || modifier_record.flags.0 != 0
+            || modifier_record.parent != Some(property.declaration.node)
+            || !matches!(modifier_record.data, NodeData::Token(_))
+            || property.initializer_node.is_some()
+            || property.initializer_text.is_some()
+            || property.initializer_parameter_name.is_some()
+            || property.side != ClassPropertySide::Instance
+            || property.optional
+            || property.definite
+            || property.readonly
+        {
+            return Err(invariant(ClassInvariant::InvalidPlan(property.declaration)));
+        }
+        return store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.any_type)
+            .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(property.type_node)));
+    }
     if let Some(expected) = &property.initializer_parameter_name {
         let NodeData::Identifier(identifier) = &record.data else {
             return Err(unsupported(ClassUnsupported::PropertyInitializer(
@@ -6006,12 +6186,23 @@ fn validate_property_cache_state(
         }
         Ok(())
     };
-    let expected_type_node = if property.initializer_node == Some(property.type_node) {
-        initializer_type
+    if property.ambient_private_modifier.is_some() {
+        if store
+            .type_node_links(property.type_node)
+            .is_some_and(|links| links != &TypeNodeLinks::default())
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                property.type_node,
+            )));
+        }
     } else {
-        Some(property_type)
-    };
-    validate_node(property.type_node, expected_type_node)?;
+        let expected_type_node = if property.initializer_node == Some(property.type_node) {
+            initializer_type
+        } else {
+            Some(property_type)
+        };
+        validate_node(property.type_node, expected_type_node)?;
+    }
     if let Some(initializer) = property.initializer_node
         && initializer != property.type_node
     {
@@ -6061,6 +6252,21 @@ fn exact_property_type_links(
     property: &ClassPropertyPlan,
     property_type: TypeId,
 ) -> bool {
+    if let Some(modifier) = property.ambient_private_modifier {
+        return store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| property_type == bootstrap.any_type)
+            && property.type_node == property.name_node
+            && store.source_node_kind(modifier) == Some(SyntaxKind::PrivateKeyword)
+            && store.source_node_parent(modifier)
+                == Some(SourceNodeParent::Parent(property.declaration))
+            && store.source_node_kind(property.type_node) == Some(SyntaxKind::Identifier)
+            && store.source_node_parent(property.type_node)
+                == Some(SourceNodeParent::Parent(property.declaration))
+            && store
+                .type_node_links(property.type_node)
+                .is_none_or(|links| links == &TypeNodeLinks::default());
+    }
     let initializer_type = if property.initializer_parameter_name.is_some() {
         Some(property_type)
     } else if property.initializer_text.is_some() {
@@ -10699,18 +10905,20 @@ fn publish_class_property(
         } else {
             (None, None)
         };
-    let node_type = if property.initializer_node == Some(property.type_node) {
-        initializer_type.expect("an inferred field retains its initializer type")
-    } else {
-        property_type
-    };
-    assert!(store.set_type_node_links(
-        property.type_node,
-        TypeNodeLinks {
-            resolved_type: Some(node_type),
-            ..TypeNodeLinks::default()
-        },
-    ));
+    if property.ambient_private_modifier.is_none() {
+        let node_type = if property.initializer_node == Some(property.type_node) {
+            initializer_type.expect("an inferred field retains its initializer type")
+        } else {
+            property_type
+        };
+        assert!(store.set_type_node_links(
+            property.type_node,
+            TypeNodeLinks {
+                resolved_type: Some(node_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+    }
     if let Some(initializer) = property.initializer_node
         && initializer != property.type_node
     {
@@ -10852,11 +11060,16 @@ pub(super) fn execute_nongeneric_class_members(
         .properties
         .iter()
         .flat_map(|property| {
-            std::iter::once(property.type_node).chain(
-                property
-                    .initializer_node
-                    .filter(|initializer| *initializer != property.type_node),
-            )
+            property
+                .ambient_private_modifier
+                .is_none()
+                .then_some(property.type_node)
+                .into_iter()
+                .chain(
+                    property
+                        .initializer_node
+                        .filter(|initializer| *initializer != property.type_node),
+                )
         })
         .filter(|node| store.type_node_links(*node).is_none())
         .count();
@@ -11314,11 +11527,16 @@ fn execute_direct_derived_class_members(
         .iter()
         .chain(&base_plan.class.properties)
         .flat_map(|property| {
-            std::iter::once(property.type_node).chain(
-                property
-                    .initializer_node
-                    .filter(|initializer| *initializer != property.type_node),
-            )
+            property
+                .ambient_private_modifier
+                .is_none()
+                .then_some(property.type_node)
+                .into_iter()
+                .chain(
+                    property
+                        .initializer_node
+                        .filter(|initializer| *initializer != property.type_node),
+                )
         })
         .filter(|node| store.type_node_links(*node).is_none())
         .count();
@@ -12177,6 +12395,89 @@ fn exact_stored_constructor_parameter_property(
     .then_some(declaration)
 }
 
+fn exact_stored_ambient_private_property(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    property: SemanticSymbolId,
+    declaration: NodeRef,
+    type_: TypeId,
+) -> bool {
+    let Some(any) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.any_type)
+    else {
+        return false;
+    };
+    if type_ != any {
+        return false;
+    }
+    let Some(record) = store.symbol(property) else {
+        return false;
+    };
+    if record.flags() != SymbolFlags::PROPERTY
+        || record.check_flags() != CheckFlags::NONE
+        || store.source_direct_type_annotation(declaration).is_some()
+    {
+        return false;
+    }
+    let Some(name_index) = declaration
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let name = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(name_index),
+    );
+    let Some(modifier_index) = name
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let modifier = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(modifier_index),
+    );
+    if store.source_node_kind(name) != Some(SyntaxKind::Identifier)
+        || store.source_node_parent(name) != Some(SourceNodeParent::Parent(declaration))
+        || store
+            .type_node_links(name)
+            .is_some_and(|links| links != &TypeNodeLinks::default())
+        || store.source_node_kind(modifier) != Some(SyntaxKind::PrivateKeyword)
+        || store.source_node_parent(modifier) != Some(SourceNodeParent::Parent(declaration))
+    {
+        return false;
+    }
+    let class_is_ambient = (0..owner_declaration.node.index()).any(|index| {
+        u32::try_from(index).ok().is_some_and(|index| {
+            let candidate = NodeRef::new(
+                owner_declaration.arena,
+                owner_declaration.file,
+                ts_ast::NodeId::new(index),
+            );
+            store.source_node_kind(candidate) == Some(SyntaxKind::DeclareKeyword)
+                && store.source_node_parent(candidate)
+                    == Some(SourceNodeParent::Parent(owner_declaration))
+        })
+    });
+    class_is_ambient
+        && store
+            .symbol(owner)
+            .and_then(Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(record.name()))
+            == Some(property)
+}
+
 fn exact_stored_property(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
@@ -12260,7 +12561,14 @@ fn exact_stored_property(
                         StoredSourceCallableValidation::Valid(_)
                     )
             });
-    let source_type_valid = store
+    let source_type_valid = exact_stored_ambient_private_property(
+        store,
+        owner,
+        owner_declaration,
+        property,
+        *declaration,
+        property_type,
+    ) || store
         .source_primitive_type_annotation(*declaration)
         .map_or_else(
             || {

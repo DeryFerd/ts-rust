@@ -890,6 +890,203 @@ fn exported_ambient_classes_publish_their_existing_local_alias() {
 }
 
 #[test]
+fn exported_ambient_declaration_file_private_fields_preserve_implicit_any() {
+    let parsed = parse_source_file("export declare class C {\n  private p;\n}\n");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(82);
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/node_modules/pkg/index.d.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                true,
+                CanonicalModuleState::External,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    let mut context = CanonicalCheckerContext::new(
+        binder.finish(),
+        [(file, &parsed.arena)].into_iter().collect(),
+        strict_property_options(),
+    )
+    .unwrap();
+    let declaration = class_declaration(&parsed, file, "C");
+    let NodeData::ClassDeclaration(class) = &parsed.arena.get(declaration.node).unwrap().data
+    else {
+        panic!("the package declaration must retain its class")
+    };
+    let field = NodeRef::new(parsed.arena.id(), file, class.members.nodes[0]);
+    let NodeData::PropertyDeclaration(property) = &parsed.arena.get(field.node).unwrap().data
+    else {
+        panic!("the package class must retain its private field")
+    };
+    let name = NodeRef::new(parsed.arena.id(), file, property.name);
+    let bound = context.file(file).unwrap().1;
+    let owner = bound.symbol(declaration).unwrap();
+    let local = bound.local_symbol(declaration).unwrap();
+    let private = bound.symbol(field).unwrap();
+
+    context.check_source_file(file).unwrap();
+
+    let members = context.get_nongeneric_class_members(owner).unwrap();
+    assert_eq!(members.instance_properties(), &[private]);
+    assert_eq!(
+        context.store().symbol(private).unwrap().name().as_utf8(),
+        Some("p")
+    );
+    assert_eq!(
+        context.store().value_symbol_links(private),
+        Some(&ValueSymbolLinks {
+            resolved_type: Some(context.store().intrinsic_bootstrap().unwrap().any_type),
+            ..ValueSymbolLinks::default()
+        }),
+    );
+    assert!(context.store().type_node_links(name).is_none());
+    let class_value = ValueSymbolLinks {
+        resolved_type: Some(members.shells().value_type()),
+        ..ValueSymbolLinks::default()
+    };
+    assert_eq!(
+        context.store().value_symbol_links(owner),
+        Some(&class_value)
+    );
+    assert_eq!(
+        context.store().value_symbol_links(local),
+        Some(&class_value)
+    );
+    assert!(context.diagnostics().is_empty());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.store().relation_state_snapshot(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        context.get_nongeneric_class_members(owner).unwrap(),
+        members
+    );
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+fn separate_package_declarations_preserve_distinct_private_field_symbols() {
+    let first = parse_source_file("export declare class C { private p; }");
+    let second = parse_source_file("export declare class C { private p; }");
+    assert!(first.diagnostics.is_empty(), "{:?}", first.diagnostics);
+    assert!(second.diagnostics.is_empty(), "{:?}", second.diagnostics);
+    let first_file = FileId::new(85);
+    let second_file = FileId::new(86);
+    let mut binder = CanonicalBinder::new();
+    for (parsed, file, path) in [
+        (&first, first_file, "\"/node_modules/pkg/index.d.ts\""),
+        (
+            &second,
+            second_file,
+            "\"/node_modules/pkg/dist/index.d.ts\"",
+        ),
+    ] {
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(path),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+    }
+    for (parsed, file) in [(&first, first_file), (&second, second_file)] {
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+    }
+    let mut context = CanonicalCheckerContext::new(
+        binder.finish(),
+        [(first_file, &first.arena), (second_file, &second.arena)]
+            .into_iter()
+            .collect(),
+        CanonicalCheckerOptions::default(),
+    )
+    .unwrap();
+
+    context.check_source_file(first_file).unwrap();
+    context.check_source_file(second_file).unwrap();
+
+    let first_owner = class_symbol(&first, first_file, &context, "C");
+    let second_owner = class_symbol(&second, second_file, &context, "C");
+    assert_ne!(first_owner, second_owner);
+    let first_members = context.get_nongeneric_class_members(first_owner).unwrap();
+    let second_members = context.get_nongeneric_class_members(second_owner).unwrap();
+    let first_private = first_members.instance_properties()[0];
+    let second_private = second_members.instance_properties()[0];
+    assert_ne!(first_private, second_private);
+    let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+    for (owner, private) in [(first_owner, first_private), (second_owner, second_private)] {
+        assert_eq!(
+            context.store().symbol(private).unwrap().parent(),
+            Some(owner)
+        );
+        assert_eq!(
+            context.store().value_symbol_links(private),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(any),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+    }
+    assert!(context.diagnostics().is_empty());
+}
+
+#[test]
+fn unannotated_non_private_and_non_ambient_fields_remain_unsupported() {
+    for (index, source) in ["declare class C { p; }", "class C { private p; }"]
+        .into_iter()
+        .enumerate()
+    {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(83 + u32::try_from(index).unwrap());
+        let mut context = checker_context(&parsed, file);
+        let owner = class_symbol(&parsed, file, &context, "C");
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Class(_)
+            ))
+        ));
+        assert!(context.store().declared_type_links(owner).is_none());
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(context.diagnostics().is_empty());
+    }
+}
+
+#[test]
 fn unsupported_ambient_class_shapes_leave_class_publication_cold() {
     let cases = [
         ("declare class Generic<T> {}", "Generic"),
