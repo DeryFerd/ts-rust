@@ -1035,6 +1035,7 @@ fn plan_javascript_expando_object_literal(
         members: Some(exports),
         properties,
         methods: Vec::new(),
+        accessors: Vec::new(),
         spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
@@ -5150,6 +5151,7 @@ fn plan_interface_accessor(
                 type_node: annotation,
                 identity_node: annotation,
                 null_literal_identity: false,
+                optional: false,
             }),
         )
     };
