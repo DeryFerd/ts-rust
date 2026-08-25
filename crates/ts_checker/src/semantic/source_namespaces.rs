@@ -2150,6 +2150,11 @@ fn namespace_generic_annotation_requires_deferral(
         authenticated_react_synthetic_event_dom_reference_annotation(
             arena, bound, store, namespace, annotation,
         )
+    })
+    .or_else(|| {
+        authenticated_react_clipboard_event_data_transfer_annotation(
+            arena, bound, store, namespace, annotation,
+        )
     }) {
         return Ok(authenticated);
     }
@@ -2623,6 +2628,284 @@ fn authenticated_react_synthetic_event_dom_reference_annotation(
                         .resolved_type
                         .is_none_or(|cached| Some(cached) == target_type)
             }))
+        .then_some(())
+    })()
+    .is_some();
+    Some(valid)
+}
+
+/// Keeps only React's `ClipboardEvent<T = Element>.clipboardData: DataTransfer` cold.
+#[allow(clippy::too_many_lines)] // React ownership, forwarded heritage, global DOM identities, and caches share one proof.
+fn authenticated_react_clipboard_event_data_transfer_annotation(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    annotation: NodeRef,
+) -> Option<bool> {
+    let annotation_record = arena.get(annotation.node)?;
+    let property = child(annotation, annotation_record.parent?);
+    let property_record = arena.get(property.node)?;
+    let NodeData::PropertyDeclaration(property_data) = &property_record.data else {
+        return None;
+    };
+    let property_name = child(property, property_data.name);
+    let property_name_record = arena.get(property_name.node)?;
+    let NodeData::Identifier(property_identifier) = &property_name_record.data else {
+        return None;
+    };
+    if property_identifier.text != "clipboardData" {
+        return None;
+    }
+    let interface = child(property, property_record.parent?);
+    let interface_symbol = bound
+        .symbol(interface)
+        .and_then(|symbol| store.get_merged_symbol(symbol))?;
+    let interface_owner = store.symbol(interface_symbol)?;
+    let namespace_owner = store.symbol(namespace)?;
+    if interface_owner.name().as_utf8() != Some("ClipboardEvent")
+        || namespace_owner.name().as_utf8() != Some("React")
+    {
+        return None;
+    }
+
+    let valid = (|| {
+        let facts = bound.source_facts()?;
+        let exports = namespace_owner
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))?;
+        let members = interface_owner
+            .members()
+            .and_then(|members| store.symbol_table(members))?;
+        let interface_record = arena.get(interface.node)?;
+        let NodeData::InterfaceDeclaration(interface_data) = &interface_record.data else {
+            return None;
+        };
+        let parameters = interface_data.type_parameters.as_ref()?;
+        let [parameter] = parameters.nodes.as_slice() else {
+            return None;
+        };
+        let parameter = child(interface, *parameter);
+        let parameter_record = arena.get(parameter.node)?;
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return None;
+        };
+        let parameter_name = child(parameter, parameter_data.name);
+        let parameter_name_record = arena.get(parameter_name.node)?;
+        let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+            return None;
+        };
+        let parameter_symbol = bound
+            .symbol(parameter)
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let parameter_owner = store.symbol(parameter_symbol)?;
+        let default = child(parameter, parameter_data.default_type?);
+        let default_record = arena.get(default.node)?;
+        let NodeData::TypeReferenceNode(default_reference) = &default_record.data else {
+            return None;
+        };
+        let default_name = child(default, default_reference.type_name);
+        let default_name_record = arena.get(default_name.node)?;
+        let NodeData::Identifier(default_identifier) = &default_name_record.data else {
+            return None;
+        };
+        let clauses = interface_data.heritage_clauses.as_ref()?;
+        let [clause] = clauses.nodes.as_slice() else {
+            return None;
+        };
+        let clause = child(interface, *clause);
+        let clause_record = arena.get(clause.node)?;
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return None;
+        };
+        let [base] = heritage.types.nodes.as_slice() else {
+            return None;
+        };
+        let base = child(clause, *base);
+        let base_record = arena.get(base.node)?;
+        let NodeData::ExpressionWithTypeArguments(base_data) = &base_record.data else {
+            return None;
+        };
+        let base_name = child(base, base_data.expression);
+        let base_name_record = arena.get(base_name.node)?;
+        let NodeData::Identifier(base_identifier) = &base_name_record.data else {
+            return None;
+        };
+        let arguments = base_data.type_arguments.as_ref()?;
+        let [forwarded] = arguments.nodes.as_slice() else {
+            return None;
+        };
+        let forwarded = child(base, *forwarded);
+        let forwarded_record = arena.get(forwarded.node)?;
+        let NodeData::TypeReferenceNode(forwarded_reference) = &forwarded_record.data else {
+            return None;
+        };
+        let forwarded_name = child(forwarded, forwarded_reference.type_name);
+        let forwarded_name_record = arena.get(forwarded_name.node)?;
+        let NodeData::Identifier(forwarded_identifier) = &forwarded_name_record.data else {
+            return None;
+        };
+        let synthetic = exports
+            .get_source("SyntheticEvent")
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let synthetic_owner = store.symbol(synthetic)?;
+        let globals = store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))?;
+        let element = globals
+            .get_source("Element")
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let element_owner = store.symbol(element)?;
+        let transfer = globals
+            .get_source("DataTransfer")
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let transfer_owner = store.symbol(transfer)?;
+        let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+            return None;
+        };
+        let target_name = child(annotation, reference.type_name);
+        let target_name_record = arena.get(target_name.node)?;
+        let NodeData::Identifier(target_identifier) = &target_name_record.data else {
+            return None;
+        };
+        let property_symbol = bound
+            .symbol(property)
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let property_owner = store.symbol(property_symbol)?;
+        let element_type = store
+            .declared_type_links(element)
+            .and_then(|links| links.declared_type);
+        let transfer_type = store
+            .declared_type_links(transfer)
+            .and_then(|links| links.declared_type);
+        let parameter_type = store
+            .declared_type_links(parameter_symbol)
+            .and_then(|links| links.declared_type);
+
+        (facts.is_declaration_file()
+            && !facts.is_default_library()
+            && namespace_owner.flags().intersects(SymbolFlags::NAMESPACE)
+            && namespace_owner.check_flags() == CheckFlags::NONE
+            && store.get_merged_symbol(namespace) == Some(namespace)
+            && interface_owner.flags().without(SymbolFlags::TRANSIENT) == SymbolFlags::INTERFACE
+            && interface_owner.check_flags() == CheckFlags::NONE
+            && interface_owner.declarations() == Some(&[interface])
+            && store.get_parent_of_symbol(interface_symbol) == Some(namespace)
+            && exports
+                .get_source("ClipboardEvent")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                == Some(interface_symbol)
+            && interface_record.kind == SyntaxKind::InterfaceDeclaration
+            && interface_record.flags.0 == 0
+            && !parameters.has_trailing_comma
+            && parameter_record.kind == SyntaxKind::TypeParameter
+            && parameter_record.flags.0 == 0
+            && parameter_record.parent == Some(interface.node)
+            && parameter_name_record.kind == SyntaxKind::Identifier
+            && parameter_name_record.parent == Some(parameter.node)
+            && parameter_identifier.text == "T"
+            && parameter_owner.flags() == SymbolFlags::TYPE_PARAMETER
+            && parameter_owner.check_flags() == CheckFlags::NONE
+            && parameter_owner.name().as_utf8() == Some("T")
+            && store.get_parent_of_symbol(parameter_symbol) == Some(interface_symbol)
+            && members.get_source("T") == Some(parameter_symbol)
+            && default_record.kind == SyntaxKind::TypeReference
+            && default_record.parent == Some(parameter.node)
+            && default_reference.type_arguments.is_none()
+            && default_name_record.kind == SyntaxKind::Identifier
+            && default_name_record.parent == Some(default.node)
+            && default_identifier.text == "Element"
+            && element_owner.name().as_utf8() == Some("Element")
+            && element_owner.flags().contains(SymbolFlags::INTERFACE)
+            && element_owner.parent().is_none()
+            && !clauses.has_trailing_comma
+            && clause_record.kind == SyntaxKind::HeritageClause
+            && clause_record.parent == Some(interface.node)
+            && heritage.token == SyntaxKind::ExtendsKeyword
+            && !heritage.types.has_trailing_comma
+            && base_record.kind == SyntaxKind::ExpressionWithTypeArguments
+            && base_record.parent == Some(clause.node)
+            && !arguments.has_trailing_comma
+            && base_name_record.kind == SyntaxKind::Identifier
+            && base_name_record.parent == Some(base.node)
+            && base_identifier.text == "SyntheticEvent"
+            && synthetic_owner.name().as_utf8() == Some("SyntheticEvent")
+            && synthetic_owner.flags().without(SymbolFlags::TRANSIENT) == SymbolFlags::INTERFACE
+            && synthetic_owner.check_flags() == CheckFlags::NONE
+            && store.get_parent_of_symbol(synthetic) == Some(namespace)
+            && forwarded_record.kind == SyntaxKind::TypeReference
+            && forwarded_record.parent == Some(base.node)
+            && forwarded_reference.type_arguments.is_none()
+            && forwarded_name_record.kind == SyntaxKind::Identifier
+            && forwarded_name_record.parent == Some(forwarded.node)
+            && forwarded_identifier.text == "T"
+            && property_record.kind == SyntaxKind::PropertyDeclaration
+            && property_record.flags.0 == 0
+            && property_record.parent == Some(interface.node)
+            && property_data.type_ == Some(annotation.node)
+            && property_data.postfix_token.is_none()
+            && property_data.initializer.is_none()
+            && property_name_record.kind == SyntaxKind::Identifier
+            && property_name_record.parent == Some(property.node)
+            && property_owner.name().as_utf8() == Some("clipboardData")
+            && property_owner.flags() == SymbolFlags::PROPERTY
+            && property_owner.check_flags() == CheckFlags::NONE
+            && store.get_parent_of_symbol(property_symbol) == Some(interface_symbol)
+            && members.get_source("clipboardData") == Some(property_symbol)
+            && annotation_record.kind == SyntaxKind::TypeReference
+            && annotation_record.flags.0 == 0
+            && annotation_record.parent == Some(property.node)
+            && reference.type_arguments.is_none()
+            && target_name_record.kind == SyntaxKind::Identifier
+            && target_name_record.parent == Some(annotation.node)
+            && target_identifier.text == "DataTransfer"
+            && transfer_owner.name().as_utf8() == Some("DataTransfer")
+            && transfer_owner.flags().contains(SymbolFlags::INTERFACE)
+            && transfer_owner.check_flags() == CheckFlags::NONE
+            && transfer_owner.parent().is_none()
+            && store.symbol_node_links(default).is_none_or(|links| {
+                links
+                    .resolved_symbol
+                    .is_none_or(|cached| store.get_merged_symbol(cached) == Some(element))
+            })
+            && store.type_node_links(default).is_none_or(|links| {
+                links.outer_type_parameters.is_none()
+                    && links
+                        .resolved_type
+                        .is_none_or(|cached| Some(cached) == element_type)
+            })
+            && store.symbol_node_links(forwarded).is_none_or(|links| {
+                links
+                    .resolved_symbol
+                    .is_none_or(|cached| store.get_merged_symbol(cached) == Some(parameter_symbol))
+            })
+            && store.type_node_links(forwarded).is_none_or(|links| {
+                links.outer_type_parameters.is_none()
+                    && links
+                        .resolved_type
+                        .is_none_or(|cached| Some(cached) == parameter_type)
+            })
+            && store.symbol_node_links(annotation).is_none_or(|links| {
+                links
+                    .resolved_symbol
+                    .is_none_or(|cached| store.get_merged_symbol(cached) == Some(transfer))
+            })
+            && store.type_node_links(annotation).is_none_or(|links| {
+                links.outer_type_parameters.is_none()
+                    && links
+                        .resolved_type
+                        .is_none_or(|cached| Some(cached) == transfer_type)
+            })
+            && store
+                .value_symbol_links(property_symbol)
+                .is_none_or(|links| {
+                    links.resolved_type.is_none_or(|cached| {
+                        store
+                            .type_node_links(annotation)
+                            .and_then(|links| links.resolved_type)
+                            == Some(cached)
+                    })
+                }))
         .then_some(())
     })()
     .is_some();
@@ -16222,6 +16505,192 @@ mod tests {
                 .value_symbol_links(listener)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn react_clipboard_data_transfer_remains_lazy_and_rejects_forged_identities() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "interface Element {} declare var Element: unknown; ",
+                "interface DataTransfer { getData(format: string): string; } ",
+                "declare var DataTransfer: unknown; ",
+                "declare namespace React { ",
+                "interface SyntheticEvent<T = Element> {} ",
+                "interface ClipboardEvent<T = Element> extends SyntheticEvent<T> { ",
+                "clipboardData: DataTransfer; ",
+                "} }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 4);
+        let [
+            SourceNamespaceMemberPlan::Interface {
+                symbol: synthetic, ..
+            },
+            SourceNamespaceMemberPlan::Interface {
+                symbol: clipboard,
+                generic: Some(generic),
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("React must retain its synthetic and clipboard event interfaces")
+        };
+        let synthetic = *synthetic;
+        let clipboard = *clipboard;
+        let annotation = generic.properties[0].annotation;
+        let globals = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .globals;
+        let transfer = fixture
+            .context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("DataTransfer"))
+            .unwrap();
+        let element = fixture
+            .context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("Element"))
+            .unwrap();
+        let exports = fixture
+            .context
+            .store()
+            .symbol(namespace.symbol)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let method = fixture
+            .context
+            .store()
+            .symbol(transfer)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.context.store().symbol_table(members))
+            .and_then(|members| members.get_source("getData"))
+            .unwrap();
+
+        assert!(generic.annotation_is_deferred(annotation));
+        assert!(
+            fixture
+                .context
+                .store()
+                .type_node_links(annotation)
+                .is_none()
+        );
+        assert!(fixture.context.store().value_symbol_links(method).is_none());
+        let cold = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(plan(&fixture, 4), namespace);
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                globals,
+                EscapedName::source("DataTransfer"),
+                element,
+            ),
+            Some(Some(transfer)),
+        );
+        {
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+            assert_eq!(
+                authenticated_react_clipboard_event_data_transfer_annotation(
+                    arena,
+                    bound,
+                    fixture.context.store(),
+                    namespace.symbol,
+                    annotation,
+                ),
+                Some(false),
+            );
+        }
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                globals,
+                EscapedName::source("DataTransfer"),
+                transfer,
+            ),
+            Some(Some(element)),
+        );
+
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("SyntheticEvent"),
+                clipboard,
+            ),
+            Some(Some(synthetic)),
+        );
+        {
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+            assert_eq!(
+                authenticated_react_clipboard_event_data_transfer_annotation(
+                    arena,
+                    bound,
+                    fixture.context.store(),
+                    namespace.symbol,
+                    annotation,
+                ),
+                Some(false),
+            );
+        }
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("SyntheticEvent"),
+                synthetic,
+            ),
+            Some(Some(clipboard)),
+        );
+
+        assert!(fixture.context.store_mut_for_test().set_symbol_node_links(
+            annotation,
+            SymbolNodeLinks {
+                resolved_symbol: Some(element),
+                ..SymbolNodeLinks::default()
+            },
+        ));
+        let poisoned = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        {
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+            assert_eq!(
+                authenticated_react_clipboard_event_data_transfer_annotation(
+                    arena,
+                    bound,
+                    fixture.context.store(),
+                    namespace.symbol,
+                    annotation,
+                ),
+                Some(false),
+            );
+        }
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+        assert!(fixture.context.store().value_symbol_links(method).is_none());
     }
 
     #[test]
