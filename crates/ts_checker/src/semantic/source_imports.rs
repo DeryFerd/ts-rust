@@ -8420,6 +8420,40 @@ mod tests {
         flagged_wrapper: Option<SyntaxKind>,
         declaration_files: &[usize],
     ) -> Fixture {
+        fixture_with_source_file_facts(
+            sources,
+            routes,
+            module_states,
+            flagged_wrapper,
+            declaration_files,
+            &[],
+        )
+    }
+
+    fn fixture_with_default_library_files(
+        sources: &[&str],
+        routes: &[Route],
+        module_states: &[CanonicalModuleState],
+        default_library_files: &[usize],
+    ) -> Fixture {
+        fixture_with_source_file_facts(
+            sources,
+            routes,
+            module_states,
+            None,
+            &[],
+            default_library_files,
+        )
+    }
+
+    fn fixture_with_source_file_facts(
+        sources: &[&str],
+        routes: &[Route],
+        module_states: &[CanonicalModuleState],
+        flagged_wrapper: Option<SyntaxKind>,
+        declaration_files: &[usize],
+        default_library_files: &[usize],
+    ) -> Fixture {
         assert_eq!(sources.len(), module_states.len());
         let mut files = sources
             .iter()
@@ -8445,16 +8479,27 @@ mod tests {
         for (index, (file, module_state)) in
             files.iter().zip(module_states.iter().copied()).enumerate()
         {
+            let facts = if default_library_files.contains(&index) {
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source(format!("\"/project/{}.d.ts\"", file.file.index())),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    true,
+                    module_state,
+                )
+            } else {
+                facts_with_declaration_flag(
+                    file.file,
+                    module_state,
+                    declaration_files.contains(&index),
+                )
+            };
             binder
                 .bind_source_file_with_facts(
                     &file.parsed.arena,
                     file.parsed.source_file,
                     file.file,
-                    facts_with_declaration_flag(
-                        file.file,
-                        module_state,
-                        declaration_files.contains(&index),
-                    ),
+                    facts,
                 )
                 .unwrap();
         }
@@ -15925,6 +15970,155 @@ mod tests {
         assert_eq!(warm, prepared);
         assert_eq!(store_state(&fixture.store), warm_state);
         publish_for_test(&mut fixture.store, std::slice::from_ref(&warm));
+    }
+
+    #[test]
+    fn exported_async_function_import_preserves_canonical_promise_and_replays_warm() {
+        let mut fixture = fixture_with_default_library_files(
+            &[
+                r#"import { fetch } from "./target"; const imported = fetch;"#,
+                r#"export async function fetch(): Promise<string> { return "ready"; }"#,
+                "interface Promise<T> {}",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[
+                CanonicalModuleState::External,
+                CanonicalModuleState::External,
+                CanonicalModuleState::Script,
+            ],
+            &[2],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let read_node = identifier_initializer(&fixture, 0, "fetch");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            read_node,
+            "fetch",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let [resolved] = resolved.as_slice() else {
+            panic!("expected one async function import")
+        };
+        let target = direct_export(&fixture, 1, "fetch");
+        assert_eq!(resolved.target_symbol, target);
+
+        let prepared = prepare_one(&mut fixture, resolved, &read).unwrap();
+        let PreparedSourceImportTarget::AnnotatedFunction { signature } = &prepared.target else {
+            panic!("expected an annotated async function target")
+        };
+        let returned = fixture
+            .store
+            .signature(*signature)
+            .and_then(super::super::signatures::Signature::resolved_return_type)
+            .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            super::super::reference_types::validate_direct_generic_reference(
+                &fixture.store,
+                returned,
+            )
+            .unwrap()
+            .type_arguments,
+            [string],
+        );
+        assert_eq!(
+            fixture.store.source_callable_type_for_owner(target),
+            Some(prepared.type_),
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .is_none()
+        );
+
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let warm_state = store_state(&fixture.store);
+        let warm_resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let warm = prepare_one(&mut fixture, &warm_resolved[0], &read).unwrap();
+        assert_eq!(warm, prepared);
+        assert_eq!(store_state(&fixture.store), warm_state);
+    }
+
+    #[test]
+    fn exported_async_function_import_rejects_forged_promise_without_publication() {
+        for (provider, library, default_library) in [
+            (
+                r#"export async function fetch(): Promise<string> { return "ready"; }"#,
+                "interface Promise<T> {}",
+                false,
+            ),
+            (
+                r#"export async function fetch(): Promise<string> { return "ready"; }"#,
+                "interface Promise<T, Extra> {}",
+                true,
+            ),
+            (
+                r#"export async function fetch(): string { return "ready"; }"#,
+                "interface Promise<T> {}",
+                true,
+            ),
+        ] {
+            let default_library_files: &[usize] = if default_library { &[2] } else { &[] };
+            let mut fixture = fixture_with_default_library_files(
+                &[
+                    r#"import { fetch } from "./target"; const imported = fetch;"#,
+                    provider,
+                    library,
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+                &[
+                    CanonicalModuleState::External,
+                    CanonicalModuleState::External,
+                    CanonicalModuleState::Script,
+                ],
+                default_library_files,
+            );
+            let plan = fixture.plan_import(0, 0);
+            let read_node = identifier_initializer(&fixture, 0, "fetch");
+            let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+            let read = plan_source_import_identifier_read(
+                &fixture.files[0].parsed.arena,
+                bound,
+                &fixture.store,
+                &plan.bindings[0],
+                read_node,
+                "fetch",
+                plan.bindings[0].alias_symbol,
+            )
+            .unwrap();
+            let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+            let before = store_state(&fixture.store);
+
+            assert!(prepare_one(&mut fixture, &resolved[0], &read).is_err());
+            assert_eq!(store_state(&fixture.store), before);
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(plan.bindings[0].alias_symbol)
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(resolved[0].target_symbol)
+                    .is_none()
+            );
+        }
     }
 
     #[test]

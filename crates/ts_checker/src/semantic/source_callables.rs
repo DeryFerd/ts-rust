@@ -295,7 +295,7 @@ pub(super) struct SourceCallablePlan {
     pub(super) return_type: SourceCallableReturnPlan,
     pub(super) type_predicate: Option<CallableTypePredicatePlan>,
     pub(super) body_mode: SourceCallableBodyMode,
-    /// True only for an authenticated async arrow or zero-parameter function.
+    /// True for an authenticated async arrow, JSX function, or ordinary function.
     pub(super) is_async: bool,
     /// The actual body for `Present`, or the declaration diagnostic anchor for
     /// `AmbientDeclaration`.
@@ -571,6 +571,19 @@ impl SourceSyntaxView<'_> {
                     declaration.file,
                     *modifier,
                 )) == Some(SyntaxKind::AsyncKeyword)
+            ) || matches!(
+                modifiers.list.nodes.as_slice(),
+                [export, modifier]
+                    if store.source_node_kind(NodeRef::new(
+                        declaration.arena,
+                        declaration.file,
+                        *export,
+                    )) == Some(SyntaxKind::ExportKeyword)
+                        && store.source_node_kind(NodeRef::new(
+                            declaration.arena,
+                            declaration.file,
+                            *modifier,
+                        )) == Some(SyntaxKind::AsyncKeyword)
             )
         })
     }
@@ -6065,6 +6078,12 @@ fn validate_modifiers(
         {
             Ok(SourceCallableBodyMode::Present)
         }
+        [SyntaxKind::AsyncKeyword] | [SyntaxKind::ExportKeyword, SyntaxKind::AsyncKeyword]
+            if !is_declaration_file
+                && valid_async_annotated_source_function(store, host, declaration, view)? =>
+        {
+            Ok(SourceCallableBodyMode::Present)
+        }
         [SyntaxKind::AsyncKeyword] => Err(SourceCallableError::Unsupported(
             SourceCallableUnsupported::Async(NodeRef::new(
                 declaration.arena,
@@ -6072,6 +6091,13 @@ fn validate_modifiers(
                 modifiers.list.nodes[0],
             )),
         )),
+        [SyntaxKind::ExportKeyword, SyntaxKind::AsyncKeyword] => Err(
+            SourceCallableError::Unsupported(SourceCallableUnsupported::Async(NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                modifiers.list.nodes[1],
+            ))),
+        ),
         [SyntaxKind::DeclareKeyword] | [SyntaxKind::ExportKeyword, SyntaxKind::DeclareKeyword]
             if view.family == SourceCallableFamily::FunctionDeclaration =>
         {
@@ -6187,6 +6213,136 @@ fn valid_async_source_function(
         && argument_record.kind == SyntaxKind::NumberKeyword
         && argument_record.flags.0 == 0
         && argument_record.parent == Some(annotation.node))
+}
+
+fn valid_async_annotated_source_function(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    view: &SourceSyntaxView<'_>,
+) -> Result<bool, SourceCallableError> {
+    if view.family != SourceCallableFamily::FunctionDeclaration
+        || view.parameters.has_trailing_comma
+        || view.type_parameters.is_some()
+        || view.body.is_none()
+    {
+        return Ok(false);
+    }
+    let Some(bound) = host.bound_file(declaration) else {
+        return Ok(false);
+    };
+    if bound
+        .source_facts()
+        .is_none_or(|facts| facts.is_declaration_file() || facts.is_javascript_file())
+    {
+        return Ok(false);
+    }
+    let Some(annotation) = view
+        .return_type
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return Ok(false);
+    };
+    let annotation_record = preflight_node(store, host, annotation)?;
+    let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+        return Ok(false);
+    };
+    let Some(arguments) = reference.type_arguments.as_ref() else {
+        return Ok(false);
+    };
+    let [argument] = arguments.nodes.as_slice() else {
+        return Ok(false);
+    };
+    let argument = NodeRef::new(annotation.arena, annotation.file, *argument);
+    let argument_record = preflight_node(store, host, argument)?;
+    let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Ok(false);
+    };
+    if annotation_record.kind != SyntaxKind::TypeReference
+        || annotation_record.flags.0 != 0
+        || annotation_record.parent != Some(declaration.node)
+        || arguments.has_trailing_comma
+        || argument_record.parent != Some(annotation.node)
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(annotation.node)
+        || identifier.text != "Promise"
+        || identifier.flow_node.is_some()
+    {
+        return Ok(false);
+    }
+
+    let Some(global_promise) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("Promise"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(false);
+    };
+    let Some(owner) = store.symbol(global_promise) else {
+        return Ok(false);
+    };
+    let allowed_flags =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    if !owner.flags().contains(SymbolFlags::INTERFACE)
+        || owner.flags().without(allowed_flags) != SymbolFlags::NONE
+        || owner.parent().is_some()
+        || owner.declarations().is_none_or(|declarations| {
+            declarations.is_empty()
+                || declarations.iter().any(|candidate| {
+                    host.bound_file(*candidate)
+                        .and_then(ts_binder::BoundFile::source_facts)
+                        .is_none_or(|facts| {
+                            !facts.is_default_library() || !facts.is_declaration_file()
+                        })
+                        || !host.symbol_matches(store, *candidate, global_promise)
+                        || host
+                            .node(*candidate)
+                            .is_none_or(|record| match &record.data {
+                                NodeData::InterfaceDeclaration(interface) => {
+                                    record.kind != SyntaxKind::InterfaceDeclaration
+                                        || interface.type_parameters.as_ref().is_none_or(
+                                            |parameters| {
+                                                parameters.nodes.len() != 1
+                                                    || parameters.has_trailing_comma
+                                            },
+                                        )
+                                }
+                                NodeData::VariableDeclaration(_) => {
+                                    record.kind != SyntaxKind::VariableDeclaration
+                                        || !owner
+                                            .flags()
+                                            .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                                }
+                                _ => true,
+                            })
+                })
+        })
+    {
+        return Ok(false);
+    }
+
+    let (arena, bound) = host
+        .source(annotation)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidTypeCache(annotation)))?;
+    let mut callback_host = host.name_resolver_host(store)?;
+    let resolved =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(DeclaredTypeError::from)?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(name)),
+                "Promise",
+                SymbolFlags::TYPE,
+                None,
+                true,
+                false,
+            )
+            .map_err(DeclaredTypeError::from)?
+            .and_then(|symbol| store.get_merged_symbol(symbol));
+    Ok(resolved == Some(global_promise))
 }
 
 fn valid_async_jsx_source_function(

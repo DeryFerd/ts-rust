@@ -1025,6 +1025,7 @@ struct PlannedFunctionHeader {
 enum PlannedFunctionModifierMode {
     None,
     Export(NodeRef),
+    ExportAsync(NodeRef),
     Declare,
     ExportDeclare(NodeRef),
     Async,
@@ -6273,6 +6274,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             self.validate_function_modifiers(declaration, range, name_start, modifiers.as_ref())?;
         match modifier_mode {
             PlannedFunctionModifierMode::Export(export_modifier)
+            | PlannedFunctionModifierMode::ExportAsync(export_modifier)
             | PlannedFunctionModifierMode::ExportDeclare(export_modifier)
                 if !is_external_module =>
             {
@@ -6329,6 +6331,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             matches!(
                 header.modifier_mode,
                 PlannedFunctionModifierMode::Export(_)
+                    | PlannedFunctionModifierMode::ExportAsync(_)
                     | PlannedFunctionModifierMode::ExportDeclare(_)
             ),
         )
@@ -6365,6 +6368,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ) | (
                 PlannedFunctionModifierMode::None
                     | PlannedFunctionModifierMode::Export(_)
+                    | PlannedFunctionModifierMode::ExportAsync(_)
                     | PlannedFunctionModifierMode::Async,
                 SourceCallableBodyMode::Present
             )
@@ -6381,7 +6385,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceFunctionInvariant::Callable(declaration),
             ));
         }
-        if callable.is_async != matches!(header.modifier_mode, PlannedFunctionModifierMode::Async) {
+        if callable.is_async
+            != matches!(
+                header.modifier_mode,
+                PlannedFunctionModifierMode::Async | PlannedFunctionModifierMode::ExportAsync(_)
+            )
+        {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(declaration),
             ));
@@ -7554,7 +7563,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         };
         let (export_modifier, modifier_id) = match modifiers.list.nodes.as_slice() {
             [modifier] => (None, *modifier),
-            [export, declare] => (Some(self.reference(*export)), *declare),
+            [export, modifier] => (Some(self.reference(*export)), *modifier),
             _ => {
                 return Err(self.unsupported(
                     declaration,
@@ -7574,7 +7583,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 || export_node.range.start != declaration_range.start
                 || export_node.range.end > node.range.start
                 || !self.source_spelling_matches(export_modifier, "export")
-                || node.kind != SyntaxKind::DeclareKeyword
+                || !matches!(
+                    node.kind,
+                    SyntaxKind::DeclareKeyword | SyntaxKind::AsyncKeyword
+                )
             {
                 return Err(self.unsupported(
                     export_modifier,
@@ -7612,6 +7624,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(match (export_modifier, node.kind) {
             (Some(export), SyntaxKind::DeclareKeyword) => {
                 PlannedFunctionModifierMode::ExportDeclare(export)
+            }
+            (Some(export), SyntaxKind::AsyncKeyword) => {
+                PlannedFunctionModifierMode::ExportAsync(export)
             }
             (None, SyntaxKind::ExportKeyword) => PlannedFunctionModifierMode::Export(modifier),
             (None, SyntaxKind::DeclareKeyword) => PlannedFunctionModifierMode::Declare,
@@ -60815,6 +60830,105 @@ class Foo2 {
         context.recheck_source_file(second_file).unwrap();
         assert_eq!(observable_state(&context, first_file), first_warm);
         assert_eq!(observable_state(&context, second_file), second_warm);
+    }
+
+    #[test]
+    fn imported_exported_async_function_keeps_its_promise_return_on_cold_and_warm_checks() {
+        let library = parsed("interface Promise<T> {}");
+        let provider =
+            parsed(r#"export async function fetch(): Promise<string> { return "ready"; }"#);
+        let consumer = parsed(r#"import { fetch } from "./provider"; const imported = fetch;"#);
+        let library_file = FileId::new(9_357);
+        let provider_file = FileId::new(9_358);
+        let consumer_file = FileId::new(9_359);
+        let files = [
+            (library_file, &library),
+            (provider_file, &provider),
+            (consumer_file, &consumer),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for &(file, parsed) in &files {
+            let facts = if file == library_file {
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source(format!("\"/project/{}.d.ts\"", file.index())),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    true,
+                    CanonicalModuleState::Script,
+                )
+            } else {
+                source_facts_with_module_state(file, CanonicalModuleState::External)
+            };
+            binder
+                .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+                .unwrap();
+        }
+        for &(file, parsed) in &files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let route = CanonicalModuleResolutionEntry::resolved(
+            NodeRef::new(
+                consumer.arena.id(),
+                consumer_file,
+                source_module_specifiers(&consumer)[0],
+            ),
+            CanonicalResolvedModuleInput::new(
+                provider_file,
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::Esm,
+            ),
+        );
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new([route]),
+        )
+        .unwrap();
+
+        context.check_source_file(consumer_file).unwrap();
+        assert!(!is_type_checked(&context, provider_file));
+        let imported = variable_value_type(&context, &consumer, consumer_file, "imported");
+        let owner = function_symbol(&context, &provider, provider_file, "fetch");
+        assert_eq!(
+            context.store().source_callable_type_for_owner(owner),
+            Some(imported),
+        );
+        assert_eq!(
+            context.type_to_string(imported).unwrap(),
+            "() => Promise<string>",
+        );
+
+        context.check_source_file(provider_file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let signature = context
+            .store()
+            .source_callable_provenance(imported)
+            .unwrap()
+            .signature;
+        let returned = context
+            .store()
+            .signature(signature)
+            .and_then(super::super::signatures::Signature::resolved_return_type)
+            .unwrap();
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), returned)
+                .unwrap()
+                .type_arguments,
+            [context.store().intrinsic_bootstrap().unwrap().string_type],
+        );
+
+        let provider_warm = observable_state(&context, provider_file);
+        let consumer_warm = observable_state(&context, consumer_file);
+        context.recheck_source_file(provider_file).unwrap();
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(observable_state(&context, provider_file), provider_warm);
+        assert_eq!(observable_state(&context, consumer_file), consumer_warm);
     }
 
     #[test]

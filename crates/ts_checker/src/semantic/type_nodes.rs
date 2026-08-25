@@ -587,6 +587,12 @@ struct DefaultLibraryNonNullablePlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DefaultLibraryAwaitedPlan {
+    declaration: NodeRef,
+    parameter: SemanticSymbolId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PropTypesInferPropsPlan {
     parameter: SemanticSymbolId,
     intersection: NodeRef,
@@ -683,6 +689,7 @@ struct TypeQueryPlan {
     keyofs: BTreeMap<NodeRef, NodeRef>,
     aliases: BTreeMap<SemanticSymbolId, TypeAliasPlan>,
     react_detailed_html_props_aliases: BTreeMap<SemanticSymbolId, ReactDetailedHtmlPropsPlan>,
+    default_library_awaited_aliases: BTreeMap<SemanticSymbolId, DefaultLibraryAwaitedPlan>,
     default_library_non_nullable_aliases: BTreeMap<SemanticSymbolId, DefaultLibraryNonNullablePlan>,
     prop_types_infer_props_aliases: BTreeMap<SemanticSymbolId, PropTypesInferPropsPlan>,
     prop_types_key_aliases: BTreeMap<SemanticSymbolId, PropTypesKeyAliasPlan>,
@@ -6678,6 +6685,40 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         }
                         return Ok(());
                     }
+                    if self.global_symbol_has_name(canonical, "Awaited") {
+                        if self
+                            .authenticated_default_library_awaited_alias(canonical)
+                            .is_none()
+                            || !missing_generic_metadata.is_empty()
+                        {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                            ));
+                        }
+                        let arguments = self.type_reference_argument_nodes(reference)?;
+                        let [argument] = arguments.as_slice() else {
+                            return if self
+                                .store
+                                .intrinsic_bootstrap()
+                                .is_some_and(|bootstrap| declared_type == bootstrap.error_type)
+                            {
+                                Ok(())
+                            } else {
+                                Err(type_node_unavailable(
+                                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                                ))
+                            };
+                        };
+                        let argument = self.cached_type_node_identity(root_symbol, *argument)?;
+                        return if self.canonical_awaited_type(reference, argument)? == declared_type
+                        {
+                            Ok(())
+                        } else {
+                            Err(type_node_unavailable(
+                                TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                            ))
+                        };
+                    }
                     let Some(target_cached) = cached_type_alias(
                         self.store,
                         self.host,
@@ -8024,7 +8065,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !qualified
             && !source_parameter_constraint
             && !self.is_recovered_source_variable_reference(node, cached_type)?
-            && !matches!(name_text, "Array" | "ReadonlyArray" | "NonNullable")
+            && !matches!(
+                name_text,
+                "Array" | "ReadonlyArray" | "Awaited" | "NonNullable"
+            )
         {
             return Ok(());
         }
@@ -8380,6 +8424,31 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 PlannedTypeReferenceArity::Valid
             } else {
                 PlannedTypeReferenceArity::NotGeneric
+            }
+        } else if flags.contains(SymbolFlags::TYPE_ALIAS)
+            && self.global_symbol_has_name(symbol, "Awaited")
+        {
+            let awaited = self
+                .authenticated_default_library_awaited_alias(symbol)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported {
+                        node,
+                        symbol,
+                    })
+                })?;
+            self.plan
+                .default_library_awaited_aliases
+                .insert(symbol, awaited);
+            for argument in &type_arguments {
+                self.preflight_awaited_type_argument(*argument)?;
+            }
+            if type_arguments.len() == 1 {
+                PlannedTypeReferenceArity::Valid
+            } else {
+                PlannedTypeReferenceArity::InvalidGeneric {
+                    minimum: 1,
+                    maximum: 1,
+                }
             }
         } else if flags.contains(SymbolFlags::TYPE_ALIAS) {
             let type_parameter_count = self.plan_type_alias(symbol, union_constituent)?;
@@ -10080,6 +10149,398 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             parameter_reference,
             empty_object,
         })
+    }
+
+    #[allow(clippy::too_many_lines)] // The recursive library alias is authenticated as one AST proof.
+    fn authenticated_default_library_awaited_alias(
+        &self,
+        alias: SemanticSymbolId,
+    ) -> Option<DefaultLibraryAwaitedPlan> {
+        if !self.global_symbol_has_name(alias, "Awaited") {
+            return None;
+        }
+        let owner = self.store.symbol(alias)?;
+        let [declaration] = owner.declarations()? else {
+            return None;
+        };
+        let declaration = *declaration;
+        let bound = self.host.bound_file(declaration)?;
+        let facts = bound.source_facts()?;
+        let declaration_record = preflight_node(self.store, self.host, declaration).ok()?;
+        let NodeData::TypeAliasDeclaration(data) = &declaration_record.data else {
+            return None;
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, data.name);
+        if owner.flags() != SymbolFlags::TYPE_ALIAS
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.parent().is_some()
+            || owner.value_declaration().is_some()
+            || owner.members().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || owner.name().as_utf8() != Some("Awaited")
+            || self.store.get_merged_symbol(alias) != Some(alias)
+            || !facts.is_default_library()
+            || !facts.is_declaration_file()
+            || facts.is_javascript_file()
+            || facts.is_external_or_common_js_module()
+            || declaration_record.kind != SyntaxKind::TypeAliasDeclaration
+            || declaration_record.flags.0 != 0
+            || declaration_record.parent != Some(bound.source_file().node)
+            || !self.host.symbol_matches(self.store, declaration, alias)
+            || bound
+                .symbol(declaration)
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                != Some(alias)
+            || data.flow_node.is_some()
+            || data.local_symbol.is_some()
+            || data.next_container.is_some()
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+            || !self.react_detailed_html_props_identifier(name, declaration, "Awaited")
+        {
+            return None;
+        }
+
+        let parameters = data.type_parameters.as_ref()?;
+        let [parameter] = parameters.nodes.as_slice() else {
+            return None;
+        };
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+        let parameter_record = preflight_node(self.store, self.host, parameter).ok()?;
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return None;
+        };
+        let parameter_name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+        let parameter_symbol = bound
+            .symbol(parameter)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+        let parameter_owner = self.store.symbol(parameter_symbol)?;
+        let locals = bound
+            .locals(declaration)
+            .and_then(|locals| self.store.symbol_table(locals))?;
+        if parameters.has_trailing_comma
+            || parameter_record.kind != SyntaxKind::TypeParameter
+            || parameter_record.flags.0 != 0
+            || parameter_record.parent != Some(declaration.node)
+            || parameter_data.constraint.is_some()
+            || parameter_data.default_type.is_some()
+            || parameter_data.expression.is_some()
+            || parameter_data.symbol.is_some()
+            || parameter_data.modifiers.is_some()
+            || parameter_owner.flags() != SymbolFlags::TYPE_PARAMETER
+            || parameter_owner.check_flags() != CheckFlags::NONE
+            || parameter_owner.name().as_utf8() != Some("T")
+            || parameter_owner.declarations() != Some(&[parameter])
+            || parameter_owner.parent().is_some()
+            || parameter_owner.value_declaration().is_some()
+            || parameter_owner.members().is_some()
+            || parameter_owner.exports().is_some()
+            || parameter_owner.export_symbol().is_some()
+            || locals.len() != 1
+            || locals.get_source("T") != Some(parameter_symbol)
+            || !self
+                .host
+                .symbol_matches(self.store, parameter, parameter_symbol)
+            || !self.react_detailed_html_props_identifier(parameter_name, parameter, "T")
+        {
+            return None;
+        }
+
+        let outer = NodeRef::new(declaration.arena, declaration.file, data.type_);
+        let outer_record = preflight_node(self.store, self.host, outer).ok()?;
+        let NodeData::ConditionalTypeNode(outer_data) = &outer_record.data else {
+            return None;
+        };
+        let outer_check = NodeRef::new(outer.arena, outer.file, outer_data.check_type);
+        let outer_extends = NodeRef::new(outer.arena, outer.file, outer_data.extends_type);
+        let outer_true = NodeRef::new(outer.arena, outer.file, outer_data.true_type);
+        let middle = NodeRef::new(outer.arena, outer.file, outer_data.false_type);
+        let extends_record = preflight_node(self.store, self.host, outer_extends).ok()?;
+        let NodeData::UnionTypeNode(nullable) = &extends_record.data else {
+            return None;
+        };
+        let [null, undefined] = nullable.types.nodes.as_slice() else {
+            return None;
+        };
+        let null = NodeRef::new(outer_extends.arena, outer_extends.file, *null);
+        let undefined = NodeRef::new(outer_extends.arena, outer_extends.file, *undefined);
+        let null_record = preflight_node(self.store, self.host, null).ok()?;
+        let null_is_exact = match &null_record.data {
+            NodeData::LiteralTypeNode(literal) => {
+                let token = NodeRef::new(null.arena, null.file, literal.literal);
+                self.awaited_exact_child_kind(token, null, SyntaxKind::NullKeyword)
+            }
+            _ => null_record.kind == SyntaxKind::NullKeyword,
+        };
+        if outer_record.kind != SyntaxKind::ConditionalType
+            || outer_record.flags.0 != 0
+            || outer_record.parent != Some(declaration.node)
+            || !self.react_detailed_html_props_parameter_reference(
+                outer_check,
+                outer,
+                "T",
+                parameter_symbol,
+            )
+            || !self.react_detailed_html_props_parameter_reference(
+                outer_true,
+                outer,
+                "T",
+                parameter_symbol,
+            )
+            || extends_record.kind != SyntaxKind::UnionType
+            || extends_record.flags.0 != 0
+            || extends_record.parent != Some(outer.node)
+            || nullable.types.has_trailing_comma
+            || null_record.flags.0 != 0
+            || null_record.parent != Some(outer_extends.node)
+            || !null_is_exact
+            || !self.awaited_exact_child_kind(
+                undefined,
+                outer_extends,
+                SyntaxKind::UndefinedKeyword,
+            )
+        {
+            return None;
+        }
+
+        let middle_record = preflight_node(self.store, self.host, middle).ok()?;
+        let NodeData::ConditionalTypeNode(middle_data) = &middle_record.data else {
+            return None;
+        };
+        let middle_check = NodeRef::new(middle.arena, middle.file, middle_data.check_type);
+        let intersection = NodeRef::new(middle.arena, middle.file, middle_data.extends_type);
+        let inner = NodeRef::new(middle.arena, middle.file, middle_data.true_type);
+        let middle_false = NodeRef::new(middle.arena, middle.file, middle_data.false_type);
+        let intersection_record = preflight_node(self.store, self.host, intersection).ok()?;
+        let NodeData::IntersectionTypeNode(intersection_data) = &intersection_record.data else {
+            return None;
+        };
+        let [object, literal] = intersection_data.types.nodes.as_slice() else {
+            return None;
+        };
+        let object = NodeRef::new(intersection.arena, intersection.file, *object);
+        let literal = NodeRef::new(intersection.arena, intersection.file, *literal);
+        let literal_record = preflight_node(self.store, self.host, literal).ok()?;
+        let NodeData::TypeLiteralNode(literal_data) = &literal_record.data else {
+            return None;
+        };
+        let [method] = literal_data.members.nodes.as_slice() else {
+            return None;
+        };
+        let method = NodeRef::new(literal.arena, literal.file, *method);
+        let method_record = preflight_node(self.store, self.host, method).ok()?;
+        let NodeData::MethodSignatureDeclaration(method_data) = &method_record.data else {
+            return None;
+        };
+        let [callback, rest] = method_data.parameters.nodes.as_slice() else {
+            return None;
+        };
+        let method_name = NodeRef::new(method.arena, method.file, method_data.name);
+        let callback = NodeRef::new(method.arena, method.file, *callback);
+        let rest = NodeRef::new(method.arena, method.file, *rest);
+        let method_return = method_data
+            .type_
+            .map(|node| NodeRef::new(method.arena, method.file, node))?;
+        let callback_symbol =
+            self.awaited_inferred_parameter(callback, method, "onfulfilled", "F", false)?;
+        self.awaited_inferred_parameter(rest, method, "args", "_", true)?;
+        if middle_record.kind != SyntaxKind::ConditionalType
+            || middle_record.flags.0 != 0
+            || middle_record.parent != Some(outer.node)
+            || !self.react_detailed_html_props_parameter_reference(
+                middle_check,
+                middle,
+                "T",
+                parameter_symbol,
+            )
+            || !self.react_detailed_html_props_parameter_reference(
+                middle_false,
+                middle,
+                "T",
+                parameter_symbol,
+            )
+            || intersection_record.kind != SyntaxKind::IntersectionType
+            || intersection_record.flags.0 != 0
+            || intersection_record.parent != Some(middle.node)
+            || intersection_data.types.has_trailing_comma
+            || !self.awaited_exact_child_kind(object, intersection, SyntaxKind::ObjectKeyword)
+            || literal_record.kind != SyntaxKind::TypeLiteral
+            || literal_record.flags.0 != 0
+            || literal_record.parent != Some(intersection.node)
+            || literal_data.members.has_trailing_comma
+            || method_record.kind != SyntaxKind::MethodSignature
+            || method_record.flags.0 != 0
+            || method_record.parent != Some(literal.node)
+            || method_data.full_signature.is_some()
+            || method_data.next_container.is_some()
+            || method_data.postfix_token.is_some()
+            || method_data.symbol.is_some()
+            || method_data.type_parameters.is_some()
+            || method_data.modifiers.is_some()
+            || method_data.parameters.has_trailing_comma
+            || !self.react_detailed_html_props_identifier(method_name, method, "then")
+            || !self.awaited_exact_child_kind(method_return, method, SyntaxKind::AnyKeyword)
+        {
+            return None;
+        }
+
+        let inner_record = preflight_node(self.store, self.host, inner).ok()?;
+        let NodeData::ConditionalTypeNode(inner_data) = &inner_record.data else {
+            return None;
+        };
+        let inner_check = NodeRef::new(inner.arena, inner.file, inner_data.check_type);
+        let parenthesized = NodeRef::new(inner.arena, inner.file, inner_data.extends_type);
+        let awaited = NodeRef::new(inner.arena, inner.file, inner_data.true_type);
+        let never = NodeRef::new(inner.arena, inner.file, inner_data.false_type);
+        let parenthesized_record = preflight_node(self.store, self.host, parenthesized).ok()?;
+        let NodeData::ParenthesizedTypeNode(parenthesized_data) = &parenthesized_record.data else {
+            return None;
+        };
+        let function = NodeRef::new(
+            parenthesized.arena,
+            parenthesized.file,
+            parenthesized_data.type_,
+        );
+        let function_record = preflight_node(self.store, self.host, function).ok()?;
+        let NodeData::FunctionTypeNode(function_data) = &function_record.data else {
+            return None;
+        };
+        let [value, rest] = function_data.parameters.nodes.as_slice() else {
+            return None;
+        };
+        let value = NodeRef::new(function.arena, function.file, *value);
+        let rest = NodeRef::new(function.arena, function.file, *rest);
+        let function_return = function_data
+            .type_
+            .map(|node| NodeRef::new(function.arena, function.file, node))?;
+        let value_symbol = self.awaited_inferred_parameter(value, function, "value", "V", false)?;
+        self.awaited_inferred_parameter(rest, function, "args", "_", true)?;
+        let recursive_arguments =
+            self.prop_types_infer_props_reference(awaited, inner, "Awaited", alias, 1)?;
+        let [recursive_value] = recursive_arguments.as_slice() else {
+            return None;
+        };
+        if inner_record.kind != SyntaxKind::ConditionalType
+            || inner_record.flags.0 != 0
+            || inner_record.parent != Some(middle.node)
+            || !self.react_detailed_html_props_parameter_reference(
+                inner_check,
+                inner,
+                "F",
+                callback_symbol,
+            )
+            || parenthesized_record.kind != SyntaxKind::ParenthesizedType
+            || parenthesized_record.flags.0 != 0
+            || parenthesized_record.parent != Some(inner.node)
+            || function_record.kind != SyntaxKind::FunctionType
+            || function_record.flags.0 != 0
+            || function_record.parent != Some(parenthesized.node)
+            || function_data.full_signature.is_some()
+            || function_data.next_container.is_some()
+            || function_data.symbol.is_some()
+            || function_data.type_parameters.is_some()
+            || function_data.modifiers.is_some()
+            || function_data.parameters.has_trailing_comma
+            || !self.awaited_exact_child_kind(function_return, function, SyntaxKind::AnyKeyword)
+            || !self.react_detailed_html_props_parameter_reference(
+                *recursive_value,
+                awaited,
+                "V",
+                value_symbol,
+            )
+            || !self.awaited_exact_child_kind(never, inner, SyntaxKind::NeverKeyword)
+        {
+            return None;
+        }
+
+        Some(DefaultLibraryAwaitedPlan {
+            declaration,
+            parameter: parameter_symbol,
+        })
+    }
+
+    fn awaited_exact_child_kind(&self, node: NodeRef, parent: NodeRef, kind: SyntaxKind) -> bool {
+        preflight_node(self.store, self.host, node)
+            .ok()
+            .is_some_and(|record| {
+                record.kind == kind && record.flags.0 == 0 && record.parent == Some(parent.node)
+            })
+    }
+
+    fn awaited_inferred_parameter(
+        &self,
+        node: NodeRef,
+        parent: NodeRef,
+        expected_name: &str,
+        expected_inference: &str,
+        rest: bool,
+    ) -> Option<SemanticSymbolId> {
+        let record = preflight_node(self.store, self.host, node).ok()?;
+        let NodeData::ParameterDeclaration(parameter) = &record.data else {
+            return None;
+        };
+        let name = NodeRef::new(node.arena, node.file, parameter.name);
+        let inference = parameter
+            .type_
+            .map(|node_id| NodeRef::new(node.arena, node.file, node_id))?;
+        let inference_record = preflight_node(self.store, self.host, inference).ok()?;
+        let NodeData::InferTypeNode(infer) = &inference_record.data else {
+            return None;
+        };
+        let inferred = NodeRef::new(inference.arena, inference.file, infer.type_parameter);
+        let inferred_record = preflight_node(self.store, self.host, inferred).ok()?;
+        let NodeData::TypeParameterDeclaration(inferred_data) = &inferred_record.data else {
+            return None;
+        };
+        let inferred_name = NodeRef::new(inferred.arena, inferred.file, inferred_data.name);
+        let symbol = self
+            .host
+            .bound_file(inferred)
+            .and_then(|bound| bound.symbol(inferred))
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+        let owner = self.store.symbol(symbol)?;
+        let exact_rest = match parameter.dot_dot_dot_token {
+            Some(token) if rest => self.awaited_exact_child_kind(
+                NodeRef::new(node.arena, node.file, token),
+                node,
+                SyntaxKind::DotDotDotToken,
+            ),
+            None => !rest,
+            Some(_) => false,
+        };
+        (record.kind == SyntaxKind::Parameter
+            && record.flags.0 == 0
+            && record.parent == Some(parent.node)
+            && parameter.initializer.is_none()
+            && parameter.question_token.is_none()
+            && parameter.symbol.is_none()
+            && parameter.facts == 0
+            && parameter.modifiers.is_none()
+            && exact_rest
+            && self.react_detailed_html_props_identifier(name, node, expected_name)
+            && inference_record.kind == SyntaxKind::InferType
+            && inference_record.flags.0 == 0
+            && inference_record.parent == Some(node.node)
+            && inferred_record.kind == SyntaxKind::TypeParameter
+            && inferred_record.flags.0 == 0
+            && inferred_record.parent == Some(inference.node)
+            && inferred_data.constraint.is_none()
+            && inferred_data.default_type.is_none()
+            && inferred_data.expression.is_none()
+            && inferred_data.symbol.is_none()
+            && inferred_data.modifiers.is_none()
+            && owner.flags() == SymbolFlags::TYPE_PARAMETER
+            && owner.check_flags() == CheckFlags::NONE
+            && owner.name().as_utf8() == Some(expected_inference)
+            && owner.declarations() == Some(&[inferred])
+            && self.host.symbol_matches(self.store, inferred, symbol)
+            && self.react_detailed_html_props_identifier(
+                inferred_name,
+                inferred,
+                expected_inference,
+            ))
+        .then_some(symbol)
     }
 
     #[allow(clippy::too_many_lines)] // The utility declaration and every bound parameter are one proof.
@@ -11802,7 +12263,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .and_then(|symbol| symbol.declarations())
             .filter(|declarations| !declarations.is_empty())
             .ok_or_else(unsupported)?;
-        if self.global_symbol_has_name(symbol, "Promise")
+        if (self.global_symbol_has_name(symbol, "Promise")
+            || self.global_symbol_has_name(symbol, "PromiseLike"))
             && declarations.iter().any(|declaration| {
                 self.host
                     .bound_file(*declaration)
@@ -12074,7 +12536,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let owner = self.store.symbol(symbol).ok_or_else(&unsupported)?;
         let allowed_flags =
             SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
-        if !self.global_symbol_has_name(symbol, "Promise")
+        let expected_name = if self.global_symbol_has_name(symbol, "Promise") {
+            "Promise"
+        } else if self.global_symbol_has_name(symbol, "PromiseLike") {
+            "PromiseLike"
+        } else {
+            return Err(unsupported());
+        };
+        if owner.name().as_utf8() != Some(expected_name)
             || !owner.flags().contains(SymbolFlags::INTERFACE)
             || owner.flags().without(allowed_flags) != SymbolFlags::NONE
             || owner.parent().is_some()
@@ -12133,7 +12602,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         .and_then(|parameter| self.store.get_merged_symbol(parameter))
                         .ok_or_else(&unsupported)?;
                     let current_record = self.store.symbol(current).ok_or_else(&unsupported)?;
-                    if identifier.text != "Promise"
+                    if identifier.text != expected_name
                         || name_record.parent != Some(declaration.node)
                         || parameter_record.kind != SyntaxKind::TypeParameter
                         || parameter_record.parent != Some(declaration.node)
@@ -12165,9 +12634,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     if !owner
                         .flags()
                         .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                        || expected_name != "Promise"
                         || !matches!(
                             &name_record.data,
-                            NodeData::Identifier(identifier) if identifier.text == "Promise"
+                            NodeData::Identifier(identifier) if identifier.text == expected_name
                         )
                         || name_record.parent != Some(declaration.node)
                         || value_declaration.replace(declaration).is_some()
@@ -12182,6 +12652,107 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Err(unsupported());
         }
         Ok(())
+    }
+
+    fn preflight_awaited_type_argument(&self, node: NodeRef) -> Result<(), DeclaredTypeError> {
+        let Some(reference) = self.plan.references.get(&node) else {
+            return Ok(());
+        };
+        if self.global_symbol_has_name(reference.symbol, "Promise")
+            || self.global_symbol_has_name(reference.symbol, "PromiseLike")
+        {
+            self.preflight_default_library_promise_reference(
+                node,
+                reference.symbol,
+                reference.type_arguments.len(),
+            )?;
+        }
+        for argument in &reference.type_arguments {
+            self.preflight_awaited_type_argument(*argument)?;
+        }
+        Ok(())
+    }
+
+    fn canonical_awaited_type(
+        &self,
+        node: NodeRef,
+        mut type_: TypeId,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(type_) {
+                return Err(invalid());
+            }
+            let record = self.store.type_payload(type_).ok_or_else(&invalid)?;
+            let Some(symbol) = record
+                .symbol()
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+            else {
+                return Ok(type_);
+            };
+            let canonical_promise = self.global_symbol_has_name(symbol, "Promise")
+                || self.global_symbol_has_name(symbol, "PromiseLike");
+            let Ok(reference) = validate_direct_generic_reference(self.store, type_) else {
+                return if canonical_promise {
+                    Err(invalid())
+                } else {
+                    Ok(type_)
+                };
+            };
+            let [argument] = reference.type_arguments.as_slice() else {
+                return if canonical_promise {
+                    Err(invalid())
+                } else {
+                    Ok(type_)
+                };
+            };
+            if canonical_promise {
+                self.preflight_default_library_promise_reference(node, symbol, 1)?;
+                type_ = *argument;
+                continue;
+            }
+
+            let Some(TypeData::Interface(interface)) = self
+                .store
+                .type_payload(reference.target)
+                .map(TypeRecord::data)
+            else {
+                return Ok(type_);
+            };
+            let Some([base]) = interface.resolved_base_types.as_deref() else {
+                return Ok(type_);
+            };
+            let Some(base_symbol) = self
+                .store
+                .type_payload(*base)
+                .and_then(TypeRecord::symbol)
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+            else {
+                return Ok(type_);
+            };
+            if !self.global_symbol_has_name(base_symbol, "Promise")
+                && !self.global_symbol_has_name(base_symbol, "PromiseLike")
+            {
+                return Ok(type_);
+            }
+            self.preflight_default_library_promise_reference(node, base_symbol, 1)?;
+            let base_reference =
+                validate_direct_generic_reference(self.store, *base).map_err(|_| invalid())?;
+            let target_reference = validate_direct_generic_reference(self.store, reference.target)
+                .map_err(|_| invalid())?;
+            let [base_argument] = base_reference.type_arguments.as_slice() else {
+                return Err(invalid());
+            };
+            let [parameter] = target_reference.type_arguments.as_slice() else {
+                return Err(invalid());
+            };
+            type_ = if base_argument == parameter {
+                *argument
+            } else {
+                *base_argument
+            };
+        }
     }
 
     fn preflight_namespace_generic_reference_owner(
@@ -12658,6 +13229,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     ))?;
                 if !flags.contains(SymbolFlags::TYPE_ALIAS)
                     || !visited_aliases.insert(reference_symbol)
+                {
+                    return Ok(());
+                }
+                if self
+                    .plan
+                    .default_library_awaited_aliases
+                    .contains_key(&reference_symbol)
                 {
                     return Ok(());
                 }
@@ -19059,6 +19637,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     || reference.direct_generic
                     || plan.interfaces.contains_key(&reference.symbol)
                     || plan
+                        .default_library_awaited_aliases
+                        .contains_key(&reference.symbol)
+                    || plan
                         .default_library_non_nullable_aliases
                         .contains_key(&reference.symbol)
                     || is_instantiated_mapped_type(self.store, resolved_type)
@@ -19128,6 +19709,47 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         symbol,
                         reference.arity,
                         Some(target),
+                    )?;
+                    self.error_type()?
+                }
+            }
+        } else if let Some(awaited) = plan.default_library_awaited_aliases.get(&symbol) {
+            match reference.arity {
+                PlannedTypeReferenceArity::Valid => {
+                    let [argument] = reference.type_arguments.as_slice() else {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidTypeReference(node),
+                        ));
+                    };
+                    let argument = self.execute_type_node(*argument, plan, prepared)?;
+                    let planner = TypeQueryPlanner::new(
+                        self.store,
+                        self.host,
+                        self.array_type,
+                        self.global_types
+                            .as_ref()
+                            .map(CanonicalArrayTargets::from_global_types),
+                        self.options.strict_builtin_iterator_return,
+                        &self.type_reference_alias_targets,
+                    );
+                    if planner.authenticated_default_library_awaited_alias(symbol) != Some(*awaited)
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidTypeReference(node),
+                        ));
+                    }
+                    planner.canonical_awaited_type(node, argument)?
+                }
+                PlannedTypeReferenceArity::NotGeneric
+                | PlannedTypeReferenceArity::InvalidGeneric { .. } => {
+                    for argument in &reference.type_arguments {
+                        self.execute_type_node(*argument, plan, prepared)?;
+                    }
+                    self.issue_type_reference_arity_diagnostic(
+                        node,
+                        symbol,
+                        reference.arity,
+                        None,
                     )?;
                     self.error_type()?
                 }
@@ -31216,6 +31838,253 @@ mod tests {
                 "published checker state for: {declaration}",
             );
             assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn default_library_awaited_unwraps_nested_promises_without_resolving_its_body() {
+        let mut fixture = default_library_fixture(concat!(
+            "interface Promise<T> {} ",
+            "interface PromiseLike<T> {} ",
+            "type Awaited<T> = T extends null | undefined ? T : ",
+            "T extends object & { then(onfulfilled: infer F, ...args: infer _): any; } ? ",
+            "F extends ((value: infer V, ...args: infer _) => any) ? Awaited<V> : never : T; ",
+            "type Plain = Awaited<string>; ",
+            "type Nested = Awaited<Promise<Promise<string>>>; ",
+            "type Thenable = Awaited<PromiseLike<number>>; ",
+            "type Missing = Awaited<undefined>;",
+        ));
+        let awaited = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Awaited");
+        let awaited_body = alias_parts(&fixture, "Awaited").2;
+        let (string, number, undefined) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.undefined_type,
+            )
+        };
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let aliases = HashMap::new();
+        let proof = TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
+            .authenticated_default_library_awaited_alias(awaited)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .symbol(proof.parameter)
+                .and_then(|symbol| symbol.name().as_utf8()),
+            Some("T"),
+        );
+        drop(host);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let aliases = [
+            ("Plain", string),
+            ("Nested", string),
+            ("Thenable", number),
+            ("Missing", undefined),
+        ];
+        for (name, expected) in aliases {
+            let symbol = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected),
+                "{name}",
+            );
+        }
+        assert!(fixture.store.type_alias_links(awaited).is_none());
+        assert!(fixture.store.type_node_links(awaited_body).is_none());
+
+        let warm = store_state(&fixture.store);
+        for (name, expected) in aliases {
+            let symbol = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected),
+            );
+        }
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Bind independent library/source files and verify both warm identities.
+    fn cross_file_awaited_unwraps_default_library_promises_and_inherited_promise_like() {
+        let library = parse_source_file(concat!(
+            "interface Promise<T> {} ",
+            "interface PromiseLike<T> {} ",
+            "type Awaited<T> = T extends null | undefined ? T : ",
+            "T extends object & { then(onfulfilled: infer F, ...args: infer _): any; } ? ",
+            "F extends ((value: infer V, ...args: infer _) => any) ? Awaited<V> : never : T;",
+        ));
+        let source = parse_source_file(concat!(
+            "interface Thenable<T> extends PromiseLike<T> {} ",
+            "type Nested = Awaited<Promise<PromiseLike<string>>>; ",
+            "type Inherited = Awaited<Thenable<number>>;",
+        ));
+        let library_file = FileId::new(85);
+        let source_file = FileId::new(86);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, is_default_library) in [
+            (&library, library_file, true),
+            (&source, source_file, false),
+        ] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/awaited-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_default_library,
+                        is_default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        for (parsed, file) in [(&library, library_file), (&source, source_file)] {
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some()
+            );
+        }
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        for bound in files.values() {
+            let symbols = store
+                .symbol_table(bound.locals(bound.source_file()).unwrap())
+                .unwrap()
+                .iter()
+                .map(|(_, symbol)| symbol)
+                .collect::<Vec<_>>();
+            for symbol in symbols {
+                store.merge_global_symbol(globals, symbol).unwrap();
+            }
+        }
+        let source_bound = files.get(&source_file).unwrap();
+        let source_symbol = |name: &str| {
+            source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    (identifier_text(&source.arena, alias.name) == Some(name))
+                        .then(|| {
+                            source_bound.symbol(NodeRef::new(source.arena.id(), source_file, node))
+                        })
+                        .flatten()
+                })
+                .unwrap()
+        };
+        let nested = source_symbol("Nested");
+        let inherited = source_symbol("Inherited");
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&source.arena, source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for (symbol, expected) in [(nested, string), (inherited, number)] {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_declared_type_of_symbol(symbol),
+                Ok(expected),
+            );
+        }
+
+        let warm = store_state(&store);
+        for (symbol, expected) in [(nested, string), (inherited, number)] {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_declared_type_of_symbol(symbol),
+                Ok(expected),
+            );
+        }
+        assert_eq!(store_state(&store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn awaited_rejects_non_library_and_modified_library_aliases_before_publication() {
+        let canonical = concat!(
+            "interface Promise<T> {} ",
+            "type Awaited<T> = T extends null | undefined ? T : ",
+            "T extends object & { then(onfulfilled: infer F, ...args: infer _): any; } ? ",
+            "F extends ((value: infer V, ...args: infer _) => any) ? Awaited<V> : never : T; ",
+            "type Result = Awaited<Promise<string>>;",
+        );
+        let modified = concat!(
+            "interface Promise<T> {} ",
+            "type Awaited<T> = T extends null | undefined ? T : ",
+            "T extends object & { then(onfulfilled: infer F, ...args: infer _): any; } ? ",
+            "F extends ((value: infer V, ...args: infer _) => any) ? Awaited<V> : never : never; ",
+            "type Result = Awaited<Promise<string>>;",
+        );
+        for mut fixture in [fixture(canonical), default_library_fixture(modified)] {
+            let result = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Result");
+            let before = store_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            assert!(matches!(
+                query_declared(
+                    &mut fixture,
+                    result,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::GenericReferenceUnsupported { .. }
+                )),
+            ));
+            assert_eq!(store_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
         }
     }
 
