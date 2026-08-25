@@ -2376,10 +2376,19 @@ fn plan_source_callable_with_owner_shape(
         body_mode,
         array_targets,
     );
+    let array_filter_predicate_arrow = view.family == SourceCallableFamily::ArrowFunction
+        && view.return_type.is_some_and(|annotation| {
+            store.source_node_kind(NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                annotation,
+            )) == Some(SyntaxKind::TypePredicate)
+        })
+        && source_array_filter_predicate_arrow_is_exact(store, host, declaration)?;
     let implicit_any_arrow_shape = view.family == SourceCallableFamily::ArrowFunction
         && !view.parameters.nodes.is_empty()
         && !view.parameters.has_trailing_comma
-        && view.return_type.is_none()
+        && (view.return_type.is_none() || array_filter_predicate_arrow)
         && type_parameters.is_empty();
     let eligible_implicit_any_arrow = implicit_any_arrow_shape && view.parameters.nodes.len() == 1;
     let javascript_documented_multi_arrow = implicit_any_arrow_shape
@@ -2812,6 +2821,7 @@ fn plan_source_callable_with_owner_shape(
         let identity_node = peel_parenthesized_type(store, host, type_node)?;
         if preflight_node(store, host, identity_node)?.kind == SyntaxKind::TypePredicate {
             if view.family != SourceCallableFamily::FunctionDeclaration
+                && !array_filter_predicate_arrow
                 || matches!(owner_shape, SourceCallableOwnerShape::AmbientOverload(_))
             {
                 return Err(SourceCallableError::Unsupported(
@@ -2969,6 +2979,14 @@ fn plan_source_callable_with_owner_shape(
     };
     if javascript_direct_implicit_any_arrow {
         hydrate_warm_jsdoc_contextual_source_callable(store, host, &mut plan)?;
+    }
+    if array_filter_predicate_arrow
+        && let [parameter] = plan.parameters.as_mut_slice()
+        && let Some(type_) = store
+            .value_symbol_links(parameter.symbol)
+            .and_then(|links| links.resolved_type)
+    {
+        parameter.jsdoc_contextual_type = Some(type_);
     }
     if let Some((parameter, annotation)) = javascript_jsdoc_function_parameter {
         hydrate_warm_jsdoc_function_parameter(store, &mut plan, parameter, &annotation)?;
@@ -3387,6 +3405,63 @@ pub(super) fn source_prototype_assignment_function_is_exact(
             && plan.right == declaration
             && plan.prototype_symbol.is_some()
             && plan.property_symbol.is_some()
+    }))
+}
+
+/// Authenticates an annotated predicate arrow passed to a built-in filter overload.
+pub(super) fn source_array_filter_predicate_arrow_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> Result<bool, SourceCallableError> {
+    if !source_direct_call_argument_arrow_is_exact(store, host, declaration)? {
+        return Ok(false);
+    }
+    let Some(SourceNodeParent::Parent(call)) = store.source_node_parent(declaration) else {
+        return Ok(false);
+    };
+    let call_record = preflight_node(store, host, call)?;
+    let NodeData::CallExpression(call_data) = &call_record.data else {
+        return Ok(false);
+    };
+    if call_data.arguments.nodes.first().copied() != Some(declaration.node) {
+        return Ok(false);
+    }
+    let callee = NodeRef::new(call.arena, call.file, call_data.expression);
+    if super::source_calls::source_global_array_callback_method_name(host, callee).as_deref()
+        != Some("filter")
+    {
+        return Ok(false);
+    }
+    let Some(globals) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+    else {
+        return Ok(false);
+    };
+    Ok(["Array", "ReadonlyArray"].iter().any(|name| {
+        globals
+            .get_source(name)
+            .and_then(|owner| store.get_merged_symbol(owner))
+            .and_then(|owner| store.symbol(owner))
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("filter"))
+            .and_then(|method| store.symbol(method))
+            .and_then(ts_binder::semantic::Symbol::declarations)
+            .is_some_and(|declarations| {
+                !declarations.is_empty()
+                    && declarations.iter().all(|declaration| {
+                        host.bound_file(*declaration)
+                            .and_then(ts_binder::BoundFile::source_facts)
+                            .is_some_and(|facts| {
+                                facts.is_default_library()
+                                    && facts.is_declaration_file()
+                                    && !facts.is_javascript_file()
+                                    && !facts.is_external_or_common_js_module()
+                            })
+                    })
+            })
     }))
 }
 
@@ -7799,6 +7874,170 @@ pub(super) fn publish_jsdoc_contextual_source_callable(
         )));
     }
     Ok((pending.type_, contextual))
+}
+
+/// Publishes an annotated built-in filter predicate without inventing an inferred context.
+pub(super) fn publish_array_filter_predicate_source_callable(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceCallablePlan,
+    contextual_target: TypeId,
+    parameter_type: TypeId,
+    narrowed_type: TypeId,
+) -> Result<TypeId, SourceCallableError> {
+    let invalid = || invariant(SourceCallableInvariant::Publication(plan.declaration));
+    let Some(predicate) = plan.type_predicate else {
+        return Err(invalid());
+    };
+    let [parameter] = plan.parameters.as_slice() else {
+        return Err(invalid());
+    };
+    let StoredSingleCallableValidation::Valid {
+        callable: target, ..
+    } = validate_stored_single_callable(store, contextual_target)
+    else {
+        return Err(invalid());
+    };
+    let Some(target_signature) = store.signature(target.signature) else {
+        return Err(invalid());
+    };
+    let Some(source_parameter) = target.parameters.first().copied() else {
+        return Err(invalid());
+    };
+    let Some(narrowed_annotation) = predicate.narrowed_type else {
+        return Err(invalid());
+    };
+    let Some(boolean) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.boolean_type)
+    else {
+        return Err(invalid());
+    };
+    if !source_array_filter_predicate_arrow_is_exact(store, host, plan.declaration)?
+        || plan.family != SourceCallableFamily::ArrowFunction
+        || plan.body_mode != SourceCallableBodyMode::Present
+        || !plan.type_parameters.is_empty()
+        || plan.flags != SignatureFlags::NONE
+        || plan.min_argument_count != 1
+        || !parameter.implicit_any
+        || parameter.optional
+        || parameter.rest
+        || parameter.initializer.is_some()
+        || predicate.owner != plan.declaration
+        || predicate.parameter_symbol != parameter.symbol
+        || predicate.parameter_index != 0
+        || predicate.kind != TypePredicateKind::Identifier
+        || plan.return_type.annotation_identity() != Some((predicate.node, false))
+        || cached_annotation_identity(store, narrowed_annotation, false) != Some(narrowed_type)
+        || target_signature.resolved_type_predicate().is_none()
+        || !super::source_calls::authenticated_array_callback_contextual_target(
+            store,
+            contextual_target,
+            source_parameter,
+            parameter_type,
+        )
+    {
+        return Err(invalid());
+    }
+
+    let mut contextual = plan.clone();
+    contextual.parameters[0].jsdoc_contextual_type = Some(parameter_type);
+    match source_callable_state(store, &contextual, true)? {
+        SourceCallableState::Resolved { type_, signature }
+            if matches!(
+                validate_stored_source_callable(store, type_),
+                StoredSourceCallableValidation::Valid(_)
+            ) && store.signature(signature).is_some_and(|signature| {
+                signature.resolved_return_type() == Some(boolean)
+                    && valid_planned_callable_type_predicate(
+                        store,
+                        signature,
+                        Some(predicate.node),
+                        Some(predicate),
+                    )
+            }) =>
+        {
+            return Ok(type_);
+        }
+        SourceCallableState::Cold => {}
+        _ => return Err(invalid()),
+    }
+
+    let expected_type_links = TypeNodeLinks {
+        resolved_type: Some(boolean),
+        ..TypeNodeLinks::default()
+    };
+    let expected_symbol_links = SymbolNodeLinks {
+        resolved_symbol: Some(parameter.symbol),
+    };
+    let predicate_links = store.type_node_links(predicate.node);
+    let predicate_name_links = store.symbol_node_links(predicate.parameter_name);
+    let invalid_predicate_links = predicate_links
+        .is_some_and(|links| links != &TypeNodeLinks::default())
+        || predicate_name_links.is_some_and(|links| links != &SymbolNodeLinks::default());
+    let missing_predicate_links = usize::from(predicate_links.is_none());
+    let missing_predicate_name_links = usize::from(predicate_name_links.is_none());
+    if invalid_predicate_links
+        || !store.try_reserve_types(1)
+        || !store.try_reserve_signatures(1)
+        || !store.try_reserve_source_callable_provenance(1)
+        || !store.try_reserve_signature_links(usize::from(
+            store.signature_links(plan.declaration).is_none(),
+        ))
+        || !store.try_reserve_value_symbol_links(
+            usize::from(store.value_symbol_links(plan.owner_symbol).is_none())
+                + usize::from(store.value_symbol_links(parameter.symbol).is_none()),
+        )
+        || !store.try_reserve_function_signature_return_annotations(1)
+        || !store.try_reserve_callable_signature_parameter_types(1)
+        || !store.try_reserve_type_node_links(missing_predicate_links)
+        || !store.try_reserve_symbol_node_links(missing_predicate_name_links)
+    {
+        return Err(invariant(SourceCallableInvariant::Capacity(
+            plan.declaration,
+        )));
+    }
+
+    let pending = begin_source_callable(store, &contextual, &[])?
+        .map_err(|_| invariant(SourceCallableInvariant::InvalidTypeCache(plan.declaration)))?;
+    finalize_source_callable_structure(store, &contextual, pending)?;
+    if !store.set_callable_signature_parameter_types_batch(vec![(
+        pending.signature,
+        vec![parameter_type],
+    )]) || !store.set_value_symbol_links(
+        parameter.symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(parameter_type),
+            ..ValueSymbolLinks::default()
+        },
+    ) {
+        return Err(invalid());
+    }
+    let parameter_name = store
+        .symbol(parameter.symbol)
+        .and_then(|symbol| symbol.name().as_utf8())
+        .ok_or_else(invalid)?
+        .to_owned();
+    let identity = store
+        .alloc_type_predicate(
+            predicate.kind,
+            predicate.parameter_index,
+            parameter_name,
+            Some(narrowed_type),
+        )
+        .ok_or_else(invalid)?;
+    if !store.set_symbol_node_links(predicate.parameter_name, expected_symbol_links)
+        || !store.set_type_node_links(predicate.node, expected_type_links)
+        || !store.set_signature_resolved_type_predicate(pending.signature, Some(identity))
+        || !store.set_signature_resolved_return_type(pending.signature, Some(boolean))
+        || !matches!(
+            validate_stored_source_callable(store, pending.type_),
+            StoredSourceCallableValidation::Valid(_)
+        )
+    {
+        return Err(invalid());
+    }
+    Ok(pending.type_)
 }
 
 /// Publishes or validates one fully prepared contextually typed arrow.

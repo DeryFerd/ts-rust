@@ -168,10 +168,12 @@ use super::{
         SourceCallableReturnPlan, StoredSourceCallableValidation,
         materialize_anonymous_source_function_expression, materialize_global_wrapper_method,
         plan_javascript_duplicate_function_implementation, plan_source_callable,
+        publish_array_filter_predicate_source_callable,
         publish_contextual_direct_call_source_callable, publish_contextual_source_callable,
         publish_inferred_source_callable_return, publish_jsdoc_contextual_source_callable,
-        publish_jsdoc_parameterized_source_callable, source_direct_call_argument_arrow_is_exact,
-        source_object_property_arrow_symbol, source_promise_constructor_argument_arrow_is_exact,
+        publish_jsdoc_parameterized_source_callable, source_array_filter_predicate_arrow_is_exact,
+        source_direct_call_argument_arrow_is_exact, source_object_property_arrow_symbol,
+        source_promise_constructor_argument_arrow_is_exact,
         source_prototype_assignment_function_is_exact, validate_stored_source_callable,
     },
     source_calls::{
@@ -26940,8 +26942,22 @@ fn check_contextual_direct_call_arrow(
     if parameters.is_empty() {
         return Err(unsupported());
     }
+    let filter_predicate = match arrow.callable.type_predicate {
+        Some(predicate)
+            if source_array_filter_predicate_arrow_is_exact(
+                store,
+                host,
+                arrow.callable.declaration,
+            )
+            .map_err(SourcePlanner::callable_plan_error)? =>
+        {
+            Some(predicate)
+        }
+        _ => None,
+    };
     if parameters.iter().any(|parameter| {
-        !parameter.is_implicit_any()
+        (!parameter.is_implicit_any()
+            && !(filter_predicate.is_some() && parameter.explicit_type_node().is_none()))
             || parameter.optional
             || parameter.rest
             || parameter.initializer.is_some()
@@ -26959,7 +26975,7 @@ fn check_contextual_direct_call_arrow(
         || !arrow.parameter_initializers.is_empty()
         || arrow.expression_statement.is_some()
         || !arrow.callable.type_parameters.is_empty()
-        || !arrow.callable.return_type.is_inferred()
+        || !arrow.callable.return_type.is_inferred() && filter_predicate.is_none()
         || arrow.callable.flags != super::signatures::SignatureFlags::NONE
         || usize::try_from(arrow.callable.min_argument_count).ok() != Some(parameters.len())
     {
@@ -26992,6 +27008,11 @@ fn check_contextual_direct_call_arrow(
     } else {
         None
     };
+    if filter_predicate.is_some()
+        && (array_parameter_type.is_none() || signature.resolved_type_predicate().is_none())
+    {
+        return Err(unsupported());
+    }
     if !signature.type_parameters().is_empty()
         || signature.has_rest_parameter()
         || target.rest_parameter.is_some()
@@ -27098,6 +27119,47 @@ fn check_contextual_direct_call_arrow(
         }
         PlannedArrowBody::ReturnJsx { .. } => return Err(unsupported()),
     };
+    if let Some(predicate) = filter_predicate {
+        let narrowed = predicate.narrowed_type.ok_or_else(unsupported)?;
+        let narrowed_type = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_type_from_type_node(narrowed)?;
+        let boolean = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.boolean_type)
+            .ok_or_else(unsupported)?;
+        let parameter_type = array_parameter_type.ok_or_else(unsupported)?;
+        if !store
+            .is_type_assignable_to_with_global_types(return_type, boolean, global_types)
+            .map_err(SourceCheckError::RelationUnavailable)?
+            || !store
+                .is_type_assignable_to_with_global_types(
+                    narrowed_type,
+                    parameter_type,
+                    global_types,
+                )
+                .map_err(SourceCheckError::RelationUnavailable)?
+        {
+            return Err(unsupported());
+        }
+        let callable = publish_array_filter_predicate_source_callable(
+            store,
+            host,
+            &arrow.callable,
+            contextual_type,
+            parameter_type,
+            narrowed_type,
+        )
+        .map_err(SourcePlanner::callable_plan_error)?;
+        publish_expression_type(store, arrow.callable.declaration, callable)?;
+        return Ok(CheckedExpressionTypes::leaf(callable, callable));
+    }
     let callable = publish_contextual_direct_call_source_callable(
         store,
         &PreparedContextualDirectCallSourceCallable {

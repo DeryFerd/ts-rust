@@ -2477,6 +2477,23 @@ pub(super) fn source_call_argument_contextual_type(
     let Some(first) = parameter_types.first().copied() else {
         return Ok(None);
     };
+    if array_callback
+        && matches!(
+            &argument.kind,
+            PlannedExpressionKind::Arrow(arrow) if arrow.callable.type_predicate.is_some()
+        )
+    {
+        return Ok(parameter_types.into_iter().find(|context| {
+            let StoredSingleCallableValidation::Valid { callable, .. } =
+                validate_stored_single_callable(store, *context)
+            else {
+                return false;
+            };
+            store
+                .signature(callable.signature)
+                .is_some_and(|signature| signature.resolved_type_predicate().is_some())
+        }));
+    }
     if parameter_types.iter().all(|parameter| *parameter == first) {
         return Ok(Some(
             if matches!(argument.kind, PlannedExpressionKind::Arrow(_)) {
@@ -9073,6 +9090,109 @@ mod tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    fn array_filter_narrows_explicit_predicate_arrow_callbacks_cold_and_warm() {
+        let library = array_callback_default_library();
+        for (index, declaration) in [
+            concat!(
+                "declare const values: (boolean | string)[]; ",
+                "const filtered: boolean[] = ",
+                "values.filter((value): value is boolean => value !== null);",
+            ),
+            concat!(
+                "declare const values: ReadonlyArray<boolean | string>; ",
+                "const filtered: boolean[] = ",
+                "values.filter((value): value is boolean => value !== null);",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(declaration);
+            let library_file = FileId::new(4_932 + u32::try_from(index * 2).unwrap());
+            let source_file = FileId::new(4_933 + u32::try_from(index * 2).unwrap());
+            let mut context =
+                context_with_default_library(&library, library_file, &source, source_file);
+
+            context.check_source_file(source_file).unwrap();
+
+            assert!(
+                context.diagnostics().is_empty(),
+                "{:?}",
+                context.diagnostics()
+            );
+            let call_nodes = calls(&source, source_file);
+            let [call] = call_nodes.as_slice() else {
+                panic!("the source must retain one explicit predicate filter call")
+            };
+            let call = *call;
+            let result = context
+                .store()
+                .type_node_links(call)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let array = context
+                .store()
+                .canonical_array_reference(context.global_types(), result)
+                .unwrap()
+                .unwrap();
+            let boolean = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+            assert_eq!(array.element_type, boolean);
+            assert!(!array.readonly);
+
+            let arrow = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        source.arena.id(),
+                        source_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = context.file(source_file).unwrap().1.symbol(arrow).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .map(|provenance| provenance.signature)
+                .unwrap();
+            let record = context.store().signature(signature).unwrap();
+            let predicate = record
+                .resolved_type_predicate()
+                .and_then(|predicate| context.store().type_predicate(predicate))
+                .unwrap();
+            assert_eq!(predicate.kind(), TypePredicateKind::Identifier);
+            assert_eq!(predicate.parameter_index(), 0);
+            assert_eq!(predicate.parameter_name(), "value");
+            assert_eq!(predicate.type_id(), Some(boolean));
+            assert_eq!(record.resolved_return_type(), Some(boolean));
+
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().type_predicate_len(),
+                call_publication_state(&context, call),
+            );
+            context.recheck_source_file(source_file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().type_predicate_len(),
+                    call_publication_state(&context, call),
+                ),
+                warm,
+            );
+        }
     }
 
     #[test]
