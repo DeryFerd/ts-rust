@@ -504,8 +504,31 @@ fn plan_source_enum(
             NodeData::StringLiteral(_) if member_name_record.kind == SyntaxKind::StringLiteral => {
                 false
             }
+            NodeData::NumericLiteral(_)
+                if member_name_record.kind == SyntaxKind::NumericLiteral =>
+            {
+                false
+            }
             NodeData::BigIntLiteral(_) if member_name_record.kind == SyntaxKind::BigIntLiteral => {
                 false
+            }
+            NodeData::ComputedPropertyName(computed)
+                if member_name_record.kind == SyntaxKind::ComputedPropertyName =>
+            {
+                let expression =
+                    NodeRef::new(member_name.arena, member_name.file, computed.expression);
+                let expression_record = preflight_node(store, host, expression)?;
+                if expression_record.parent != Some(member_name.node)
+                    || !range_contains(member_name_record, expression_record)
+                {
+                    return Err(invariant(SourceEnumInvariant::InvalidIdentifier(
+                        member_name,
+                    )));
+                }
+                matches!(
+                    &expression_record.data,
+                    NodeData::Identifier(identifier) if identifier.flow_node.is_some()
+                )
             }
             _ => {
                 return Err(invariant(SourceEnumInvariant::InvalidIdentifier(
@@ -751,11 +774,8 @@ fn validate_materialization(
         && store
             .value_symbol_links(plan.owner_symbol)
             .is_some_and(|links| links.resolved_type == Some(result.value_type));
-    let valid_members = plan
-        .members
-        .iter()
-        .zip(&result.members)
-        .all(|(planned, materialized)| {
+    let valid_members = plan.members.iter().zip(&result.members).enumerate().all(
+        |(index, (planned, materialized))| {
             planned.declaration == materialized.declaration
                 && planned.symbol == materialized.symbol
                 && store.type_payload(materialized.regular_type).is_some()
@@ -770,10 +790,18 @@ fn validate_materialization(
                     .symbol(planned.symbol)
                     .and_then(|symbol| symbol.name().as_utf8())
                     .is_none_or(|name| {
-                        enums::enum_value_member_type(store, result.value_type, name)
-                            == Some((planned.symbol, materialized.fresh_type))
+                        match enums::enum_value_member_type(store, result.value_type, name) {
+                            Some((symbol, type_)) if symbol == planned.symbol => {
+                                type_ == materialized.fresh_type
+                            }
+                            Some((symbol, _)) => plan.members[..index]
+                                .iter()
+                                .any(|previous| previous.symbol == symbol),
+                            None => false,
+                        }
                     })
-        });
+        },
+    );
     if valid_header && valid_members {
         Ok(())
     } else {
@@ -1469,6 +1497,55 @@ mod tests {
 
         let result = execute_top_level_enum(&mut fixture.store, &host, &plan).unwrap();
         assert_eq!(result.members.len(), 1);
+    }
+
+    #[test]
+    fn computed_and_duplicate_member_names_preserve_diagnostics_and_detached_symbols() {
+        let mut fixture = fixture(
+            "enum Invalid { ['same'] = 1, ['same'] = 2, [3] = 3 }",
+            CanonicalModuleState::Script,
+            false,
+        );
+        let declaration = statement(&fixture, 0);
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let plan = plan_top_level_enum(&fixture.store, &host, declaration).unwrap();
+        assert_eq!(
+            plan.diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1164, 1164, 1164],
+        );
+        assert_ne!(plan.members[0].symbol, plan.members[1].symbol);
+        assert!(plan.members.iter().all(|member| {
+            fixture
+                .parsed
+                .arena
+                .get(member.name.node)
+                .is_some_and(|name| name.kind == SyntaxKind::ComputedPropertyName)
+        }));
+
+        let result = execute_top_level_enum(&mut fixture.store, &host, &plan).unwrap();
+        assert_eq!(result.members.len(), 3);
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            execute_top_level_enum(&mut fixture.store, &host, &plan),
+            Ok(result),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
     }
 
     #[test]

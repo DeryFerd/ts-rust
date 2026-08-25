@@ -15536,6 +15536,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && !comma
             && !assignment
             && !primitive_binary_operand_plan_is_supported(&left_plan)
+            && !self.is_enum_member_expression(&left_plan)?
         {
             return Err(self.unsupported(left, left_kind, SourceSyntaxRole::BinaryOperand));
         }
@@ -15550,6 +15551,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && !comma
             && !assignment
             && !primitive_binary_operand_plan_is_supported(&right_plan)
+            && !self.is_enum_member_expression(&right_plan)?
         {
             return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
         }
@@ -15998,7 +16000,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         );
         if const_assertion
             && !supported_const_operand
-            && !self.is_const_enum_member_operand(&operand)?
+            && !self.is_enum_member_expression(&operand)?
         {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::ConstAssertion(expression),
@@ -16014,7 +16016,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         ))
     }
 
-    fn is_const_enum_member_operand(
+    fn is_enum_member_expression(
         &self,
         operand: &PlannedExpression,
     ) -> Result<bool, SourceCheckError> {
@@ -19611,6 +19613,7 @@ fn check_expression_type(
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
     session.reset_query();
     emit_enum_use_before_declaration_diagnostics(store, host, options, diagnostics, expression)?;
+    issue_invalid_const_enum_value_diagnostic(store, host, diagnostics, expression)?;
     if options.intrinsic.strict_null_checks
         || host
             .bound_file(source.node_ref())
@@ -22075,6 +22078,53 @@ fn issue_node_diagnostic(
         },
     );
     Ok(())
+}
+
+fn issue_invalid_const_enum_value_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    expression: &PlannedExpression,
+) -> Result<(), SourceCheckError> {
+    let PlannedExpressionKind::Identifier(read) = &expression.kind else {
+        return Ok(());
+    };
+    if read.kind != PlannedIdentifierReadKind::DeclaredValue
+        || !store
+            .symbol(read.value_symbol)
+            .is_some_and(|symbol| symbol.flags() == SymbolFlags::CONST_ENUM)
+    {
+        return Ok(());
+    }
+
+    let mut current = expression.node;
+    loop {
+        let Some(parent) = host
+            .node(current)
+            .and_then(|record| record.parent)
+            .map(|node| NodeRef::new(current.arena, current.file, node))
+        else {
+            break;
+        };
+        let Some(record) = host.node(parent) else {
+            return Err(SourceCheckError::Enum(expression.node));
+        };
+        match &record.data {
+            NodeData::ParenthesizedExpression(parenthesized)
+                if parenthesized.expression == current.node =>
+            {
+                current = parent;
+            }
+            NodeData::PropertyAccessExpression(access) if access.expression == current.node => {
+                return Ok(());
+            }
+            NodeData::ElementAccessExpression(access) if access.expression == current.node => {
+                return Ok(());
+            }
+            _ => break,
+        }
+    }
+    issue_node_diagnostic(diagnostics, expression.node, 2475)
 }
 
 fn issue_source_enum_diagnostics(
@@ -40354,6 +40404,112 @@ mod tests {
                 .store()
                 .symbol_node_links(diagnostics[3].node.unwrap())
                 .is_none()
+        );
+        let warm = observable_state(&context, file);
+
+        context.recheck_source_file(file).unwrap();
+
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn const_enum_errors_preserve_forward_usage_index_and_arithmetic_diagnostics() {
+        let source = parsed(concat!(
+            "declare function runtime(): number; ",
+            "const enum Invalid { ",
+            "Forward = Later, ",
+            "Later = 1, ",
+            "Runtime = runtime(), ",
+            "Conditional = (true ? 1 : 2), ",
+            "Infinite = 1 / 0, ",
+            "NotNumber = 0 / 0, ",
+            "} ",
+            "const object = Invalid; ",
+            "const dynamic = Invalid[0]; ",
+            "const sum = Invalid.Later + Invalid.Later; ",
+            "const valid = Invalid['Later'];",
+        ));
+        let file = FileId::new(9_392);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2651, 2474, 2474, 2477, 2478, 2475, 2476],
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| node_text(&source, diagnostic.node.unwrap()))
+                .collect::<Vec<_>>(),
+            [
+                "Later",
+                "runtime()",
+                "(true ? 1 : 2)",
+                "1 / 0",
+                "0 / 0",
+                "Invalid",
+                "0",
+            ],
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "sum"),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        let warm = observable_state(&context, file);
+
+        context.recheck_source_file(file).unwrap();
+
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn computed_enum_names_publish_exact_ts1164_spans_and_static_members() {
+        let source = parsed(concat!(
+            "const key = 'dynamic'; ",
+            "enum Names { ",
+            "['first'] = 1, ",
+            "[`second`] = 2, ",
+            "[key] = 3, ",
+            "} ",
+            "const value = Names['first'];",
+        ));
+        let file = FileId::new(9_393);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [1164, 1164, 1164],
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| node_text(&source, diagnostic.node.unwrap()))
+                .collect::<Vec<_>>(),
+            ["['first']", "[`second`]", "[key]"],
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "value"))
+                .unwrap(),
+            "Names.first",
         );
         let warm = observable_state(&context, file);
 
