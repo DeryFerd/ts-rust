@@ -2125,7 +2125,7 @@ fn instantiated_function_member_owner(
             return None;
         }
         let receiver = store.map_type(object.mapper?, this_type)?;
-        let plan = plan_published_interface_method(store, targets, receiver, method).ok()?;
+        let plan = plan_published_interface_method(store, Some(targets), receiver, method).ok()?;
         if cached_published_interface_method(store, &plan, targets).ok()? != Some(method_type) {
             return None;
         }
