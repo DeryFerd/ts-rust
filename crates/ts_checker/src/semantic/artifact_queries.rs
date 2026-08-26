@@ -55,6 +55,7 @@ pub enum CanonicalArtifactQueryError {
     SourceCheck(SourceCheckError),
     DeclaredType(DeclaredTypeError),
     Alias(CanonicalAliasQueryError),
+    SymbolDisplay(super::SymbolDisplayError),
 }
 
 impl std::fmt::Display for CanonicalArtifactQueryError {
@@ -122,6 +123,7 @@ impl std::fmt::Display for CanonicalArtifactQueryError {
             Self::SourceCheck(error) => error.fmt(formatter),
             Self::DeclaredType(error) => error.fmt(formatter),
             Self::Alias(error) => error.fmt(formatter),
+            Self::SymbolDisplay(error) => error.fmt(formatter),
         }
     }
 }
@@ -132,6 +134,7 @@ impl std::error::Error for CanonicalArtifactQueryError {
             Self::SourceCheck(error) => Some(error),
             Self::DeclaredType(error) => Some(error),
             Self::Alias(error) => Some(error),
+            Self::SymbolDisplay(error) => Some(error),
             Self::MissingFile(_)
             | Self::ForeignNode(_)
             | Self::StaleFile { .. }
@@ -622,6 +625,105 @@ impl CanonicalCheckerContext<'_> {
         } else {
             format!("{prefix}.{name}")
         })
+    }
+
+    /// Renders a symbol with the shortest name visible at `enclosing`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for foreign source nodes, invalid symbol chains, or
+    /// alias targets that cannot be proved from their declarations.
+    pub fn symbol_to_string_at_location(
+        &mut self,
+        symbol: SemanticSymbolId,
+        enclosing: NodeRef,
+    ) -> Result<String, CanonicalArtifactQueryError> {
+        self.validated_artifact_node(enclosing)?;
+        self.get_symbol_declarations(symbol)?;
+        let record = self
+            .store()
+            .symbol(symbol)
+            .ok_or(CanonicalArtifactQueryError::ForeignSymbol(symbol))?;
+        let indexed = record
+            .check_flags()
+            .contains(ts_binder::CheckFlags::INDEX_SYMBOL);
+        let index_name = indexed.then(|| format!("[{}]", record.name().escaped_display()));
+        let chain_symbol = if indexed {
+            record.parent()
+        } else {
+            Some(symbol)
+        };
+        let chain = chain_symbol
+            .map(|symbol| self.artifact_symbol_chain(symbol, enclosing))
+            .transpose()
+            .map_err(CanonicalArtifactQueryError::SymbolDisplay)?
+            .unwrap_or_default();
+        let mut result = String::new();
+        for symbol in chain {
+            let (name, indexed) = self.artifact_symbol_name_as_written(symbol)?;
+            if !result.is_empty() && !indexed {
+                result.push('.');
+            }
+            result.push_str(&name);
+        }
+        if let Some(index) = index_name {
+            result.push_str(&index);
+        }
+        Ok(result)
+    }
+
+    fn artifact_symbol_name_as_written(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<(String, bool), CanonicalArtifactQueryError> {
+        let record = self
+            .store()
+            .symbol(symbol)
+            .ok_or(CanonicalArtifactQueryError::ForeignSymbol(symbol))?;
+        if record.name() == InternalSymbolName::Global.as_ref() {
+            return Ok(("global".to_owned(), false));
+        }
+        if let Some(name) = self.literal_artifact_symbol_name(symbol)? {
+            return Ok(name);
+        }
+        if let Some(name) = self.escaped_identifier_artifact_name(symbol)? {
+            let indexed = record.flags().intersects(
+                SymbolFlags::PROPERTY
+                    | SymbolFlags::METHOD
+                    | SymbolFlags::ACCESSOR
+                    | SymbolFlags::ENUM_MEMBER,
+            ) && record
+                .parent()
+                .and_then(|parent| self.store().symbol(parent))
+                .is_some_and(|parent| {
+                    parent
+                        .flags()
+                        .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE | SymbolFlags::ENUM)
+                });
+            return Ok((if indexed { format!("[{name}]") } else { name }, indexed));
+        }
+        for declaration in record.declarations().unwrap_or_default() {
+            let (arena, _, node) = self.validated_artifact_node(*declaration)?;
+            if declaration_name(&node.data).is_some() {
+                break;
+            }
+            if matches!(
+                node.kind,
+                SyntaxKind::FunctionExpression
+                    | SyntaxKind::ArrowFunction
+                    | SyntaxKind::ClassExpression
+            ) && let Some(NodeData::VariableDeclaration(variable)) = node
+                .parent
+                .and_then(|parent| arena.get(parent))
+                .map(|node| &node.data)
+                && variable.initializer == Some(declaration.node)
+                && let Some(NodeData::Identifier(name)) =
+                    arena.get(variable.name).map(|node| &node.data)
+            {
+                return Ok((name.text.clone(), false));
+            }
+        }
+        Ok((record.name().escaped_display().to_string(), false))
     }
 
     fn prepare_artifact_type_location(

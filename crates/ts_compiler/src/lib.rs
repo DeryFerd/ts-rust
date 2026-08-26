@@ -860,6 +860,12 @@ fn display_error_is_unsupported(error: &TypeDisplayUnavailable) -> bool {
         | TypeDisplayUnavailable::EmptyTupleType(_)
         | TypeDisplayUnavailable::SourceHost(_) => false,
         TypeDisplayUnavailable::ArrayType(error) => array_type_error_is_unsupported(error),
+        TypeDisplayUnavailable::SymbolDisplay(error) => matches!(
+            error,
+            ts_checker::semantic::SymbolDisplayError::MissingModuleSpecifier(_)
+                | ts_checker::semantic::SymbolDisplayError::CyclicAlias(_)
+                | ts_checker::semantic::SymbolDisplayError::Alias(_)
+        ),
     }
 }
 
@@ -1445,6 +1451,21 @@ impl CanonicalProgramQueries<'_> {
         self.context.type_to_string_with_flags(type_id, flags)
     }
 
+    /// Formats a canonical type using names visible at an exact Program node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for foreign nodes, invalid caches, or unavailable display.
+    pub fn type_to_string_at_location_with_flags(
+        &mut self,
+        type_id: CanonicalTypeId,
+        enclosing: NodeRef,
+        flags: CanonicalTypeFormatFlags,
+    ) -> Result<String, TypeDisplayUnavailable> {
+        self.context
+            .type_to_string_at_location_with_flags(type_id, enclosing, flags)
+    }
+
     /// Formats a canonical symbol name using the checker's escaped-name rules.
     ///
     /// # Errors
@@ -1455,6 +1476,19 @@ impl CanonicalProgramQueries<'_> {
         symbol: CanonicalSymbolId,
     ) -> Result<String, CanonicalArtifactQueryError> {
         self.context.symbol_to_string(symbol)
+    }
+
+    /// Formats a canonical symbol using names visible at an exact Program node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for foreign nodes, invalid caches, or unavailable names.
+    pub fn symbol_to_string_at_location(
+        &mut self,
+        symbol: CanonicalSymbolId,
+        enclosing: NodeRef,
+    ) -> Result<String, CanonicalArtifactQueryError> {
+        self.context.symbol_to_string_at_location(symbol, enclosing)
     }
 
     /// Returns the identity shared by this Program's canonical types and symbols.

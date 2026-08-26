@@ -281,8 +281,11 @@ fn artifact_line(
                 name.to_owned()
             } else {
                 queries
-                    .type_to_string_with_flags(
+                    .type_to_string_at_location_with_flags(
                         type_id,
+                        node.parent.map_or(reference, |parent| {
+                            NodeRef::new(reference.arena, reference.file, parent)
+                        }),
                         CanonicalTypeFormatFlags::NO_TRUNCATION
                             | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE,
                     )
@@ -296,7 +299,14 @@ fn artifact_line(
             else {
                 return Ok(None);
             };
-            render_symbol(program, queries, symbol)?
+            render_symbol(
+                program,
+                queries,
+                symbol,
+                node.parent.map_or(reference, |parent| {
+                    NodeRef::new(reference.arena, reference.file, parent)
+                }),
+            )?
         }
     };
 
@@ -352,11 +362,12 @@ fn uses_intrinsic_any_name(
 
 fn render_symbol(
     program: &Program,
-    queries: &CanonicalProgramQueries<'_>,
+    queries: &mut CanonicalProgramQueries<'_>,
     symbol: ts_compiler::CanonicalSymbolId,
+    enclosing: NodeRef,
 ) -> Result<String, String> {
     let name = queries
-        .symbol_to_string(symbol)
+        .symbol_to_string_at_location(symbol, enclosing)
         .map_err(|error| format!("semantic .symbols formatting failed: {error}"))?;
     let declarations = queries
         .get_symbol_declarations(symbol)

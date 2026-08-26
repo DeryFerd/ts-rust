@@ -100,6 +100,99 @@ fn canonical_program_exposes_original_type_and_symbol_queries() {
 }
 
 #[test]
+fn canonical_queries_display_shared_module_types_through_the_local_alias() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/model.d.ts",
+            "export function foo(): number; export function bar(): string;",
+        )
+        .unwrap();
+    filesystem
+        .write_file(
+            "/project/input.ts",
+            "import { default as Local } from './model'; Local.bar();",
+        )
+        .unwrap();
+    let options = CompilerOptions {
+        allow_synthetic_default_imports: true,
+        module: ModuleKind::CommonJs,
+        module_resolution: ModuleResolutionKind::Node10,
+        ..canonical_options()
+    };
+    let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+        &filesystem,
+        "/project",
+        &["input.ts".to_owned()],
+        options,
+        |program, queries| {
+            let location = identifiers(program, "/project/input.ts", "Local")[1];
+            let type_ = queries.get_type_at_location(location).unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    queries
+                        .type_to_string_at_location_with_flags(
+                            type_,
+                            location,
+                            CanonicalTypeFormatFlags::NO_TRUNCATION
+                        )
+                        .unwrap(),
+                    "typeof Local"
+                );
+            }
+            let bar = identifiers(program, "/project/input.ts", "bar")[0];
+            let symbol = queries.get_symbol_at_location(bar).unwrap().unwrap();
+            assert_eq!(
+                queries.symbol_to_string_at_location(symbol, bar).unwrap(),
+                "Local.bar"
+            );
+            assert_eq!(queries.symbol_to_string(symbol).unwrap(), "bar");
+        },
+    )
+    .unwrap();
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+    result.expect("canonical checker ran");
+}
+
+#[test]
+fn canonical_queries_name_an_anonymous_expando_owner_from_its_variable() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/input.ts",
+            "const foo = () => {}; foo.bar = 42; export {};",
+        )
+        .unwrap();
+    let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+        &filesystem,
+        "/project",
+        &["input.ts".to_owned()],
+        canonical_options(),
+        |program, queries| {
+            let location = identifiers(program, "/project/input.ts", "bar")[0];
+            let symbol = queries.get_symbol_at_location(location).unwrap().unwrap();
+            assert_eq!(
+                queries
+                    .symbol_to_string_at_location(symbol, location)
+                    .unwrap(),
+                "foo.bar"
+            );
+        },
+    )
+    .unwrap();
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+    result.expect("canonical checker ran");
+}
+
+#[test]
 fn canonical_queries_preserve_cross_file_identity_and_reject_foreign_nodes() {
     let filesystem = MemoryFileSystem::new(true);
     filesystem

@@ -51,6 +51,7 @@ use super::{
     },
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
+    symbol_display::{self, SymbolDisplayContext, SymbolDisplayError},
     tuple_types::TupleShape,
     type_nodes::authenticated_pending_recursive_arrow_display,
     type_records::{
@@ -177,6 +178,7 @@ pub enum TypeDisplayUnavailable {
         reason: FunctionTypeDisplayUnavailable,
     },
     SourceHost(DeclaredTypeHostError),
+    SymbolDisplay(SymbolDisplayError),
     Utf8TruncationBoundary {
         type_id: TypeId,
         boundary: usize,
@@ -237,6 +239,7 @@ impl std::fmt::Display for TypeDisplayUnavailable {
                 "function-shaped type {type_id:?} has unavailable display dependency {reason:?}"
             ),
             Self::SourceHost(error) => error.fmt(formatter),
+            Self::SymbolDisplay(error) => error.fmt(formatter),
             Self::Utf8TruncationBoundary { type_id, boundary } => write!(
                 formatter,
                 "pinned byte truncation for {type_id:?} splits UTF-8 at byte {boundary}"
@@ -251,6 +254,7 @@ impl std::error::Error for TypeDisplayUnavailable {
             Self::ArrayType(error) => Some(error),
             Self::EmptyTupleType(error) => Some(error),
             Self::SourceHost(error) => Some(error),
+            Self::SymbolDisplay(error) => Some(error),
             _ => None,
         }
     }
@@ -382,6 +386,32 @@ fn type_to_string_with_optional_context_and_flags(
         flags,
         &mut state,
         &mut visiting,
+    )?;
+    truncate_display(type_id, displayed, flags)
+}
+
+pub(super) fn type_to_string_at_location_with_flags(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    location: SymbolDisplayContext,
+) -> Result<String, TypeDisplayUnavailable> {
+    let mut state = DisplayState {
+        location: Some(location),
+        include_module_chain: !flags
+            .contains(CanonicalTypeFormatFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE),
+        ..DisplayState::default()
+    };
+    let displayed = display_type_worker(
+        store,
+        Some(host),
+        Some(global_types),
+        type_id,
+        flags,
+        &mut state,
+        &mut HashSet::new(),
     )?;
     truncate_display(type_id, displayed, flags)
 }
@@ -765,8 +795,7 @@ fn display_type_worker(
                     .find_map(|(parameter, symbol)| (*parameter == type_id).then_some(*symbol))
             })
             .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-        return display_symbol_name(store, type_id, symbol, state)
-            .ok_or(TypeDisplayUnavailable::MalformedType(type_id));
+        return display_symbol_name(store, host, type_id, symbol, state);
     }
     if type_flags.intersects(TypeFlags::CONDITIONAL) {
         return display_conditional_type_alias(
@@ -923,6 +952,8 @@ struct DisplayState {
     truncating: bool,
     // Fresh method parameters are named only while their validated signature is in scope.
     method_type_parameters: Vec<(TypeId, SemanticSymbolId)>,
+    location: Option<SymbolDisplayContext>,
+    include_module_chain: bool,
 }
 
 impl DisplayState {
@@ -1269,8 +1300,7 @@ fn display_validated_enum_value(
     {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
-    let name = display_symbol_name(store, type_id, owner, state)
-        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let name = display_symbol_name(store, Some(host), type_id, owner, state)?;
     state.add(7);
     Ok(Some(format!("typeof {name}")))
 }
@@ -1816,6 +1846,11 @@ fn display_validated_module_namespace(
         }
     }
 
+    if state.location.is_some() {
+        let name = display_location_symbol_name(store, host, owner, SymbolFlags::VALUE, state)?;
+        state.add(7);
+        return Ok(Some(format!("typeof {name}")));
+    }
     let quoted_path = owner_record
         .name()
         .as_utf8()
@@ -1919,8 +1954,7 @@ fn display_validated_class_type(
     {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
-    let name = display_symbol_name(store, type_id, symbol, state)
-        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let name = display_symbol_name(store, Some(host), type_id, symbol, state)?;
     if Some(type_id) == value {
         state.add(7);
         Ok(Some(format!("typeof {name}")))
@@ -2119,8 +2153,7 @@ fn display_mapped_type_alias(
         return display_alias_name(store, Some(host), type_id, alias, state);
     }
 
-    display_symbol_name(store, type_id, symbol, state)
-        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))
+    display_symbol_name(store, Some(host), type_id, symbol, state)
 }
 
 #[allow(clippy::too_many_arguments)] // Keep recursive formatter state explicit.
@@ -2776,8 +2809,7 @@ fn display_direct_generic_reference(
         return Err(TypeDisplayUnavailable::CyclicType(type_id));
     }
     let result = (|| {
-        let mut result = display_symbol_name(store, type_id, symbol, state)
-            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let mut result = display_symbol_name(store, Some(host), type_id, symbol, state)?;
         result.push('<');
         state.add(2);
         for (index, argument) in reference.type_arguments.iter().enumerate() {
@@ -3683,8 +3715,7 @@ fn display_interface_name(
     } else if interface != &super::type_records::InterfaceTypeData::default() {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
-    display_symbol_name(store, type_id, symbol_id, state)
-        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))
+    display_symbol_name(store, host, type_id, symbol_id, state)
 }
 
 fn valid_display_interface_owner(
@@ -4846,24 +4877,92 @@ fn validate_declared_property(
 
 fn display_symbol_name(
     store: &CanonicalTypeMapperStore,
-    _type_id: TypeId,
+    host: Option<&DeclaredTypeHost<'_>>,
+    type_id: TypeId,
     symbol: SemanticSymbolId,
     state: &mut DisplayState,
-) -> Option<String> {
-    let symbol = store.symbol(symbol)?;
+) -> Result<String, TypeDisplayUnavailable> {
+    if state.location.is_some()
+        && !store
+            .symbol(symbol)
+            .is_some_and(|record| record.flags().intersects(SymbolFlags::TYPE_PARAMETER))
+        && let Some(host) = host
+    {
+        let meaning = if store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links.resolved_type == Some(type_id))
+        {
+            SymbolFlags::VALUE
+        } else {
+            SymbolFlags::TYPE
+        };
+        return display_location_symbol_name(store, host, symbol, meaning, state);
+    }
+    let symbol = store
+        .symbol(symbol)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
     let escaped_name = symbol.name();
     if escaped_name.is_reserved_member_name()
         || escaped_name.is_internal()
         || escaped_name.is_private_identifier()
         || escaped_name.is_late_bound()
     {
-        return None;
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
     let name = escaped_name
         .as_utf8()
-        .filter(|name| is_identifier_text(name))?;
+        .filter(|name| is_identifier_text(name))
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
     state.add(name.len().saturating_add(1).saturating_mul(2));
-    Some(name.to_owned())
+    Ok(name.to_owned())
+}
+
+fn display_location_symbol_name(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    meaning: SymbolFlags,
+    state: &mut DisplayState,
+) -> Result<String, TypeDisplayUnavailable> {
+    let location = state
+        .location
+        .as_ref()
+        .expect("location-aware display has an enclosing node");
+    let chain = location
+        .symbol_chain(store, host, symbol, meaning, state.include_module_chain)
+        .map_err(TypeDisplayUnavailable::SymbolDisplay)?;
+    let mut result = String::new();
+    for (index, symbol) in chain.into_iter().enumerate() {
+        if index == 0
+            && symbol_display::is_external_module(store, host, symbol)
+                .map_err(TypeDisplayUnavailable::SymbolDisplay)?
+        {
+            let specifier = location
+                .module_specifier(symbol)
+                .map_err(TypeDisplayUnavailable::SymbolDisplay)?;
+            write!(result, "import({})", quote_string_literal(specifier, '"'))
+                .expect("writing a String cannot fail");
+            continue;
+        }
+        let record = store
+            .symbol(symbol)
+            .ok_or(TypeDisplayUnavailable::SymbolDisplay(
+                SymbolDisplayError::InvalidSymbol(symbol),
+            ))?;
+        let name = record
+            .name()
+            .as_utf8()
+            .filter(|name| is_identifier_text(name))
+            .ok_or(TypeDisplayUnavailable::SymbolDisplay(
+                SymbolDisplayError::InvalidSymbol(symbol),
+            ))?;
+        if !result.is_empty() {
+            result.push('.');
+        }
+        result.push_str(name);
+    }
+    state.add(result.len().saturating_add(1).saturating_mul(2));
+    Ok(result)
 }
 
 fn display_unique_symbol_reference(
@@ -5030,6 +5129,11 @@ fn display_alias_name(
     let symbol = alias_record
         .symbol()
         .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+    if state.location.is_some()
+        && let Some(host) = host
+    {
+        return display_location_symbol_name(store, host, symbol, SymbolFlags::TYPE, state);
+    }
     let qualified = host
         .filter(|_| {
             store
@@ -5043,8 +5147,8 @@ fn display_alias_name(
         state.add(name.len().saturating_add(1).saturating_mul(2));
         return Ok(name);
     }
-    display_symbol_name(store, type_id, symbol, state)
-        .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })
+    display_symbol_name(store, host, type_id, symbol, state)
+        .map_err(|_| TypeDisplayUnavailable::Alias { type_id, alias })
 }
 
 fn namespace_qualified_alias_name(

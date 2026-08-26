@@ -46,6 +46,7 @@ use super::{
     module_resolution::validate_module_resolution_manifest,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
     source,
+    symbol_display::{SymbolDisplayContext, SymbolDisplayError},
     type_nodes::CanonicalTypeQuery,
     types::{ObjectFlags, TypeFlags},
 };
@@ -660,6 +661,99 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             type_id,
             self.type_format_flags(flags),
         )
+    }
+
+    /// Formats a type using names visible at one exact source location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for foreign nodes, invalid alias caches, or a type
+    /// whose exact display is not supported.
+    pub fn type_to_string_at_location(
+        &mut self,
+        type_id: TypeId,
+        enclosing: NodeRef,
+    ) -> Result<String, TypeDisplayUnavailable> {
+        self.type_to_string_at_location_with_flags(
+            type_id,
+            enclosing,
+            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+        )
+    }
+
+    /// Formats a type with explicit flags and names visible at `enclosing`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::type_to_string_at_location`].
+    pub fn type_to_string_at_location_with_flags(
+        &mut self,
+        type_id: TypeId,
+        enclosing: NodeRef,
+        flags: CanonicalTypeFormatFlags,
+    ) -> Result<String, TypeDisplayUnavailable> {
+        if self.store.type_payload(type_id).is_none() {
+            return Err(TypeDisplayUnavailable::Type(type_id));
+        }
+        let location = self
+            .symbol_display_context(enclosing)
+            .map_err(TypeDisplayUnavailable::SymbolDisplay)?;
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )
+        .map_err(TypeDisplayUnavailable::SourceHost)?;
+        super::formatter::type_to_string_at_location_with_flags(
+            &self.store,
+            &host,
+            &self.global_types,
+            type_id,
+            self.type_format_flags(flags),
+            location,
+        )
+    }
+
+    fn symbol_display_context(
+        &mut self,
+        enclosing: NodeRef,
+    ) -> Result<SymbolDisplayContext, SymbolDisplayError> {
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )
+        .map_err(SymbolDisplayError::SourceHost)?;
+        let mut alias_host = ProductionAliasTargetHost::from_registry(
+            &self.store,
+            &self.files,
+            &self.module_resolutions,
+        )
+        .map_err(SymbolDisplayError::AliasHost)?;
+        SymbolDisplayContext::new(
+            &mut self.store,
+            &host,
+            &mut alias_host,
+            &self.module_resolutions,
+            self.globals,
+            &self.file_order,
+            enclosing,
+        )
+    }
+
+    pub(super) fn artifact_symbol_chain(
+        &mut self,
+        symbol: SemanticSymbolId,
+        enclosing: NodeRef,
+    ) -> Result<Vec<SemanticSymbolId>, SymbolDisplayError> {
+        let location = self.symbol_display_context(enclosing)?;
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )
+        .map_err(SymbolDisplayError::SourceHost)?;
+        location.symbol_chain(&self.store, &host, symbol, SymbolFlags::NONE, false)
     }
 
     /// Computes exact TS2322 source and target display arguments without

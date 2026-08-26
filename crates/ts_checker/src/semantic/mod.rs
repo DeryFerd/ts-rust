@@ -74,6 +74,7 @@ mod source_statements;
 mod spelling;
 mod store;
 mod structured_members;
+mod symbol_display;
 pub mod template_types;
 mod tuple_type_nodes;
 mod tuple_types;
@@ -172,6 +173,7 @@ pub use source::{
 };
 pub use source_functions::{SourceFunctionInvariant, SourceFunctionUnsupported};
 pub use store::SemanticStore;
+pub use symbol_display::SymbolDisplayError;
 pub use tuple_types::EmptyTupleTypeError;
 pub use type_nodes::TypeNodeUnavailable;
 pub use type_records::{CacheHashKey, CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};
