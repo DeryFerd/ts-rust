@@ -188,8 +188,7 @@ impl CanonicalCheckerContext<'_> {
         &mut self,
         node: NodeRef,
     ) -> Result<TypeId, CanonicalArtifactQueryError> {
-        let class = self.class_declaration_artifact_symbol(node)?;
-        self.prepare_artifact_location(node)?;
+        let class = self.prepare_artifact_type_location(node)?;
 
         if let Some(symbol) = class {
             let type_ = self.get_declared_type_of_symbol(symbol)?;
@@ -620,6 +619,28 @@ impl CanonicalCheckerContext<'_> {
         })
     }
 
+    fn prepare_artifact_type_location(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
+        let (_, bound, record) = self.validated_artifact_node(node)?;
+        if !supports_type_location(&record.data)
+            && bound.symbol(node).is_none()
+            && self.store().type_node_links(node).is_some_and(|links| {
+                links.resolved_type.is_some() || links.outer_type_parameters.is_some()
+            })
+        {
+            return Err(CanonicalArtifactQueryError::UnsupportedNode {
+                node,
+                kind: record.kind,
+            });
+        }
+        let class = self.class_declaration_artifact_symbol(node)?;
+        self.preflight_literal_annotation_nodes(node)?;
+        self.prepare_artifact_location(node)?;
+        Ok(class)
+    }
+
     fn prepare_artifact_location(
         &mut self,
         node: NodeRef,
@@ -747,6 +768,27 @@ impl CanonicalCheckerContext<'_> {
         &mut self,
         node: NodeRef,
     ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let Some((annotation, literal)) = self.preflight_literal_annotation_nodes(node)? else {
+            return Ok(None);
+        };
+        let type_ = self.get_type_from_type_node(annotation)?;
+        let type_ = if node != literal && node != annotation {
+            self.cached_literal_annotation_identity(node)?.ok_or(
+                CanonicalArtifactQueryError::MissingType {
+                    node,
+                    kind: self.validated_artifact_node(node)?.2.kind,
+                },
+            )?
+        } else {
+            type_
+        };
+        self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    fn preflight_literal_annotation_nodes(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<(NodeRef, NodeRef)>, CanonicalArtifactQueryError> {
         let Some((annotation, literal)) = self.literal_annotation_nodes(node)? else {
             return Ok(None);
         };
@@ -796,18 +838,7 @@ impl CanonicalCheckerContext<'_> {
                 });
             }
         }
-        let type_ = self.get_type_from_type_node(annotation)?;
-        let type_ = if let Some(operand) = operand {
-            self.cached_literal_annotation_identity(operand)?.ok_or(
-                CanonicalArtifactQueryError::MissingType {
-                    node: operand,
-                    kind: self.validated_artifact_node(operand)?.2.kind,
-                },
-            )?
-        } else {
-            type_
-        };
-        self.validate_artifact_type(node, type_).map(Some)
+        Ok(Some((annotation, literal)))
     }
 
     fn literal_annotation_nodes(
@@ -2391,7 +2422,7 @@ mod tests {
         let parsed = parse_source_file("interface Shape { first: 'ready'; second: 'wrong'; }");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(6_031);
-        let mut context = declaration_context(&parsed, file);
+        let mut context = context(&parsed, file);
         let annotations = parsed
             .arena
             .iter()
@@ -2406,7 +2437,7 @@ mod tests {
         let [first, second] = annotations.as_slice() else {
             panic!("expected two literal annotations")
         };
-        let wrong = context.get_type_at_location(*second).unwrap();
+        let wrong = context.get_type_from_type_node(*second).unwrap();
         assert!(context.store_mut_for_test().set_type_node_links(
             *first,
             TypeNodeLinks {
@@ -2418,6 +2449,10 @@ mod tests {
             context.store().type_len(),
             context.store().signature_len(),
             context.store().checker_link_allocated_lengths(),
+            context
+                .store()
+                .source_file_links(context.source_file(file).unwrap())
+                .cloned(),
             context.diagnostics().len(),
         );
         assert_eq!(
@@ -2432,6 +2467,10 @@ mod tests {
                 context.store().type_len(),
                 context.store().signature_len(),
                 context.store().checker_link_allocated_lengths(),
+                context
+                    .store()
+                    .source_file_links(context.source_file(file).unwrap())
+                    .cloned(),
                 context.diagnostics().len(),
             ),
             before,
@@ -2455,7 +2494,8 @@ mod tests {
             let parsed = parse_source_file(source);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
             let file = FileId::new(6_033);
-            let mut context = declaration_context(&parsed, file);
+            let mut context = context(&parsed, file);
+            let source_node = context.source_file(file).unwrap();
             let operand = parsed
                 .arena
                 .iter()
@@ -2479,6 +2519,7 @@ mod tests {
                 context.store().symbol_len(),
                 context.store().signature_len(),
                 context.store().checker_link_allocated_lengths(),
+                context.store().source_file_links(source_node).cloned(),
                 context.diagnostics().len(),
             );
             assert_eq!(
@@ -2494,6 +2535,7 @@ mod tests {
                     context.store().symbol_len(),
                     context.store().signature_len(),
                     context.store().checker_link_allocated_lengths(),
+                    context.store().source_file_links(source_node).cloned(),
                     context.diagnostics().len(),
                 ),
                 before,
@@ -2511,7 +2553,7 @@ mod tests {
     fn unsupported_type_locations_do_not_adopt_same_store_caches() {
         let parsed = parse_source_file("interface Shape { value: string; }");
         let file = FileId::new(6_032);
-        let mut context = declaration_context(&parsed, file);
+        let mut context = context(&parsed, file);
         let source = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
         let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
         assert!(context.store_mut_for_test().set_type_node_links(
@@ -2525,6 +2567,7 @@ mod tests {
             context.store().type_len(),
             context.store().symbol_len(),
             context.store().checker_link_allocated_lengths(),
+            context.store().source_file_links(source).cloned(),
             context.diagnostics().len(),
         );
         assert_eq!(
@@ -2539,6 +2582,7 @@ mod tests {
                 context.store().type_len(),
                 context.store().symbol_len(),
                 context.store().checker_link_allocated_lengths(),
+                context.store().source_file_links(source).cloned(),
                 context.diagnostics().len(),
             ),
             before,
