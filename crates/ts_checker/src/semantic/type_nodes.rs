@@ -11093,6 +11093,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         } else if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
             let local_count =
                 preflight_class_or_interface_reference(self.store, self.host, symbol, flags)?;
+            let global_jsx_element = local_count == 0
+                && flags.contains(SymbolFlags::INTERFACE)
+                && !flags.contains(SymbolFlags::CLASS)
+                && self.preflight_canonical_global_jsx_element(symbol)?;
             if union_constituent
                 && (flags.contains(SymbolFlags::CLASS)
                     || local_count != 0
@@ -11114,7 +11118,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     && self.selected_interface_method_owner != Some(symbol)
                     && !self.is_initialized_global_function(symbol)
                     && !self.is_default_library_template_strings_array(symbol)
-                    && !self.is_canonical_global_jsx_element(symbol)
+                    && !global_jsx_element
                     && !self.is_default_library_dom_interface_argument(node, symbol)
                 {
                     self.plan_property_interface(symbol)?;
@@ -15204,6 +15208,53 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && module_record.kind == SyntaxKind::ModuleDeclaration
             && module_data.body == Some(block.node)
             && self.host.symbol_matches(self.store, module, namespace)
+    }
+
+    /// Rejects a forged global JSX export before ordinary member planning.
+    fn preflight_canonical_global_jsx_element(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<bool, DeclaredTypeError> {
+        let namespace = self
+            .store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| self.store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("JSX"))
+            .and_then(|namespace| self.store.get_merged_symbol(namespace));
+        let exported = namespace.is_some_and(|namespace| {
+            [
+                self.store
+                    .symbol(namespace)
+                    .and_then(ts_binder::semantic::Symbol::exports),
+                self.store
+                    .module_symbol_links(namespace)
+                    .and_then(|links| links.resolved_exports),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|exports| {
+                self.store
+                    .symbol_table(exports)
+                    .and_then(|exports| exports.get_source("Element"))
+                    .and_then(|element| self.store.get_merged_symbol(element))
+                    == Some(symbol)
+            })
+        });
+        if !exported {
+            return Ok(false);
+        }
+        if self.is_canonical_global_jsx_element(symbol) {
+            return Ok(true);
+        }
+
+        let declaration = self
+            .store
+            .symbol(symbol)
+            .and_then(|record| record.declarations())
+            .and_then(|declarations| declarations.first())
+            .copied()
+            .ok_or(DeclaredTypeUnavailable::MissingDeclarations(symbol))?;
+        Err(DeclaredTypeUnavailable::InvalidInterfaceDeclaration(declaration).into())
     }
 
     #[allow(clippy::too_many_lines)] // Namespace and declaration checks form one identity proof.
@@ -21143,7 +21194,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 preflight_class_or_interface_reference(planner.store, planner.host, symbol, flags)?;
             if parameter_count == 0
                 && !planner.is_default_library_template_strings_array(symbol)
-                && !planner.is_canonical_global_jsx_element(symbol)
+                && !planner.preflight_canonical_global_jsx_element(symbol)?
                 && authenticated_merged_namespace_interface(planner.store, planner.host, symbol)
                     .is_none()
             {
@@ -43733,6 +43784,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Checks export and parent rejection before a valid retry.
     fn global_jsx_element_rejects_forged_namespace_exports_and_parents() {
         let mut fixture = fixture(concat!(
             "declare namespace React { interface ReactElement<Value> {} } ",
@@ -43740,10 +43792,12 @@ mod tests {
             "interface Element extends React.ReactElement<any> {} ",
             "interface Decoy {} ",
             "} ",
-            "type Rendered = JSX.Element;",
+            "type Rendered = JSX.Element; ",
+            "declare const rendered: JSX.Element;",
         ));
         let element = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Element");
         let decoy = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Decoy");
+        let rendered = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "rendered");
         let reference = alias_parts(&fixture, "Rendered").2;
         let namespace = fixture
             .store
@@ -43757,6 +43811,7 @@ mod tests {
             fixture.files.get(&fixture.file).unwrap(),
         );
         let aliases = HashMap::new();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
         assert!(
             TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
                 .is_canonical_global_jsx_element(element)
@@ -43776,6 +43831,20 @@ mod tests {
             !TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
                 .is_canonical_global_jsx_element(element)
         );
+        let forged = store_state(&fixture.store);
+        assert!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(reference)
+            .is_err()
+        );
+        assert_eq!(store_state(&fixture.store), forged);
+        assert!(diagnostics.is_empty());
         assert_eq!(
             fixture
                 .store
@@ -43803,9 +43872,20 @@ mod tests {
             !TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
                 .is_canonical_global_jsx_element(element)
         );
-        let mut diagnostics = CanonicalCheckerDiagnostics::default();
         let forged = store_state(&fixture.store);
         assert!(query_node(&mut fixture, reference, &mut diagnostics).is_err());
+        assert_eq!(store_state(&fixture.store), forged);
+        assert!(
+            query_declared(
+                &mut fixture,
+                element,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .is_err()
+        );
+        assert_eq!(store_state(&fixture.store), forged);
+        assert!(query_declared_value(&mut fixture, rendered, &mut diagnostics).is_err());
         assert_eq!(store_state(&fixture.store), forged);
         assert!(diagnostics.is_empty());
 
