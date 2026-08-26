@@ -31,7 +31,7 @@ use super::{
         single_callable_family, validate_stored_single_callable,
     },
     classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
-    declared::cached_ordinary_type_parameter_owner,
+    declared::{cached_class_type, cached_ordinary_type_parameter_owner},
     derived_types::DerivedObjectLiteralValidation,
     enums,
     functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
@@ -1783,14 +1783,27 @@ fn display_validated_class_type(
     else {
         return Ok(None);
     };
-    if validate_class_heritage_members(store, instance) != ClassHeritageMembersValidation::Valid {
-        return Ok(None);
-    }
-    let value = store
-        .value_symbol_links(symbol)
-        .and_then(|links| links.resolved_type)
-        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-    if type_id != instance && type_id != value {
+    let cold_instance = type_id == instance
+        && record.object_flags() == (ObjectFlags::CLASS | ObjectFlags::REFERENCE)
+        && matches!(record.data(), TypeData::Interface(interface)
+            if interface.outer_type_parameter_count == 0
+                && interface.reference.resolved_type_arguments.as_deref() == Some(&[]));
+    let value = if cold_instance {
+        validate_cold_class_instance_display(store, symbol, type_id, record)?;
+        None
+    } else {
+        if validate_class_heritage_members(store, instance) != ClassHeritageMembersValidation::Valid
+        {
+            return Ok(None);
+        }
+        Some(
+            store
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?,
+        )
+    };
+    if type_id != instance && Some(type_id) != value {
         return Ok(None);
     }
     let [declaration] = owner.declarations().unwrap_or_default() else {
@@ -1802,6 +1815,23 @@ fn display_validated_class_type(
     let NodeData::ClassDeclaration(class) = &declaration_node.data else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     };
+    if cold_instance
+        && (owner.flags() != SymbolFlags::CLASS
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || owner.value_declaration() != Some(*declaration)
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || class
+                .type_parameters
+                .as_ref()
+                .is_some_and(|parameters| !parameters.nodes.is_empty())
+            || host
+                .bound_file(*declaration)
+                .is_none_or(|bound| declaration_node.parent != Some(bound.source_file().node)))
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
     let name = class
         .name
         .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
@@ -1816,12 +1846,60 @@ fn display_validated_class_type(
     }
     let name = display_symbol_name(store, type_id, symbol, state)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-    if type_id == value {
+    if Some(type_id) == value {
         state.add(7);
         Ok(Some(format!("typeof {name}")))
     } else {
         Ok(Some(name))
     }
+}
+
+fn validate_cold_class_instance_display(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    type_id: TypeId,
+    record: &TypeRecord,
+) -> Result<(), TypeDisplayUnavailable> {
+    let TypeData::Interface(interface) = record.data() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    if cached_class_type(store, symbol) != Ok(Some(type_id))
+        || interface.outer_type_parameter_count != 0
+        || interface.reference.resolved_type_arguments.as_deref() != Some(&[])
+        || interface.base_types_resolved
+        || interface.resolved_base_constructor_type.is_some()
+        || interface.resolved_base_types.is_some()
+        || interface.declared_members_resolved
+        || interface.declared_members.is_some()
+        || interface.declared_call_signatures.is_some()
+        || interface.declared_construct_signatures.is_some()
+        || interface.declared_index_infos.is_some()
+        || interface.reference.object.structured
+            != super::type_records::StructuredTypeData::default()
+        || store.direct_class_heritage_provenance(type_id).is_some()
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let this = interface
+        .this_type
+        .and_then(|this| store.type_payload(this))
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let TypeData::TypeParameter(this) = this.data() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    if this
+        != &(super::type_records::TypeParameterData {
+            constraint: Some(type_id),
+            is_this_type: true,
+            ..super::type_records::TypeParameterData::default()
+        })
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    Ok(())
 }
 
 fn display_mapped_type_alias(
@@ -6472,6 +6550,146 @@ mod tests {
             context.type_to_string(aliases[0]),
             Err(TypeDisplayUnavailable::MalformedType(aliases[0])),
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check cold display and each stored class dependency together.
+    fn cold_class_instance_display_preserves_unresolved_members_and_rejects_cache_changes() {
+        let parsed = parse_source_file("declare class Model { value: string; method(): number; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(226);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/model.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let instance = context.get_declared_type_of_symbol(symbol).unwrap();
+        let TypeData::Interface(interface) = context.store().type_payload(instance).unwrap().data()
+        else {
+            panic!("the declared class retains its interface record")
+        };
+        assert!(!interface.declared_members_resolved);
+        let this = interface.this_type.unwrap();
+        assert!(context.store().value_symbol_links(symbol).is_none());
+        let cold = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            cold
+        );
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_interface_base_resolution(instance, true, None, None,)
+        );
+        assert_eq!(
+            context.type_to_string(instance),
+            Err(TypeDisplayUnavailable::MalformedType(instance))
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_interface_base_resolution(instance, false, None, None,)
+        );
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_parameter_resolution(
+            this,
+            Some(number),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            context.type_to_string(instance),
+            Err(TypeDisplayUnavailable::MalformedType(instance))
+        );
+        assert!(context.store_mut_for_test().set_type_parameter_resolution(
+            this,
+            Some(instance),
+            None,
+            None,
+            None,
+        ));
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            context.type_to_string(instance),
+            Err(TypeDisplayUnavailable::MalformedType(instance))
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(symbol, ValueSymbolLinks::default())
+        );
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+    }
+
+    #[test]
+    fn cold_generic_class_display_keeps_its_type_parameters() {
+        let parsed = parse_source_file("declare class Box<T> {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(227);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let instance = context.get_declared_type_of_symbol(symbol).unwrap();
+        assert_eq!(context.type_to_string(instance).unwrap(), "Box<T>");
     }
 
     #[test]
