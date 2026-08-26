@@ -1,6 +1,7 @@
 //! JSONC and project configuration foundations for tsconfig files.
 
 mod jsonc;
+mod observation;
 
 use std::{collections::BTreeMap, path::Path};
 
@@ -8,6 +9,12 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_vfs::{FileSystem, normalize_path};
 
 pub use jsonc::parse_jsonc;
+pub use observation::{
+    ConfigInputKind, ConfigObservationLimits, ConfigReadError, ConfigResolutionEvent,
+    ConfigResolutionObservation, ObservedConfigResolution,
+};
+
+use observation::ConfigObservationRecorder;
 
 /// A JSON value which retains compiler option values without interpreting them.
 #[derive(Clone, Debug, PartialEq)]
@@ -428,18 +435,42 @@ pub fn parse_config_file(
     file_system: &dyn FileSystem,
     file_name: &str,
 ) -> ParseResult<ProjectConfig> {
+    parse_config_file_observed(file_system, file_name, None)
+}
+
+fn parse_config_file_observed(
+    file_system: &dyn FileSystem,
+    file_name: &str,
+    observation: Option<&mut ConfigObservationRecorder>,
+) -> ParseResult<ProjectConfig> {
     let normalized = normalize_path(file_name);
     match file_system.read_file(&normalized) {
-        Ok(source) => parse_config_text(&normalized, &source),
-        Err(error) => ParseResult {
-            value: None,
-            diagnostics: vec![diagnostic(
-                &normalized,
-                0,
-                5012,
-                [normalized.clone(), error.to_string()],
-            )],
-        },
+        Ok(source) => {
+            if let Some(observation) = observation {
+                observation.read_text(&normalized, ConfigInputKind::Config, &source);
+            }
+            parse_config_text(&normalized, &source)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if let Some(observation) = observation {
+                observation.read_error(
+                    &normalized,
+                    ConfigInputKind::Config,
+                    error.kind(),
+                    &message,
+                );
+            }
+            ParseResult {
+                value: None,
+                diagnostics: vec![diagnostic(
+                    &normalized,
+                    0,
+                    5012,
+                    [normalized.clone(), message],
+                )],
+            }
+        }
     }
 }
 
@@ -453,8 +484,35 @@ pub fn resolve_config_file(
     file_system: &dyn FileSystem,
     file_name: &str,
 ) -> ParseResult<ProjectConfig> {
+    resolve_config_file_observed(file_system, file_name, None)
+}
+
+/// Resolves a config and records the reads, probes, and extends decisions that
+/// the normal resolver makes. Recording adds no filesystem calls. Repeated
+/// reads retain separate events, including each exact text passed to parsing.
+/// Hitting an observation limit does not stop or change config resolution.
+#[must_use]
+pub fn resolve_config_file_with_observation(
+    file_system: &dyn FileSystem,
+    file_name: &str,
+    limits: ConfigObservationLimits,
+) -> ObservedConfigResolution {
+    let mut recorder = ConfigObservationRecorder::new(limits);
+    let result = resolve_config_file_observed(file_system, file_name, Some(&mut recorder));
+    ObservedConfigResolution {
+        result,
+        observation: recorder.finish(),
+    }
+}
+
+fn resolve_config_file_observed(
+    file_system: &dyn FileSystem,
+    file_name: &str,
+    observation: Option<&mut ConfigObservationRecorder>,
+) -> ParseResult<ProjectConfig> {
     let mut state = ConfigResolutionState {
         file_system,
+        observation,
         stack: Vec::new(),
         diagnostics: Vec::new(),
     };
@@ -470,6 +528,7 @@ pub fn resolve_config_file(
 
 struct ConfigResolutionState<'a> {
     file_system: &'a dyn FileSystem,
+    observation: Option<&'a mut ConfigObservationRecorder>,
     stack: Vec<String>,
     diagnostics: Vec<ConfigDiagnostic>,
 }
@@ -486,18 +545,25 @@ impl ConfigResolutionState<'_> {
         }) {
             let mut cycle = self.stack[index..].to_vec();
             cycle.push(file_name.clone());
+            if let Some(observation) = self.observation.as_deref_mut() {
+                observation.cycle(&file_name, &cycle);
+            }
             self.diagnostics
                 .push(diagnostic(&file_name, 0, 18_000, [cycle.join(" -> ")]));
             return None;
         }
-        if !self.file_system.file_exists(&file_name) {
+        if !self.file_exists(&file_name) {
             self.diagnostics
                 .push(diagnostic(&file_name, 0, 5_083, [file_name.clone()]));
             return None;
         }
 
         self.stack.push(file_name.clone());
-        let parsed = parse_config_file(self.file_system, &file_name);
+        let parsed = parse_config_file_observed(
+            self.file_system,
+            &file_name,
+            self.observation.as_deref_mut(),
+        );
         self.diagnostics.extend(parsed.diagnostics);
         let Some(config) = parsed.value else {
             self.stack.pop();
@@ -508,9 +574,11 @@ impl ConfigResolutionState<'_> {
         let mut merged = None;
         if let Some(extends) = &config.extends {
             for extends_path in extends.paths() {
-                let Some(base_path) =
-                    resolve_base_config_path(self.file_system, &config.path, extends_path)
-                else {
+                let base_path = self.resolve_base_config_path(&config.path, extends_path);
+                if let Some(observation) = self.observation.as_deref_mut() {
+                    observation.extends(&config.path, extends_path, base_path.as_deref());
+                }
+                let Some(base_path) = base_path else {
                     self.diagnostics.push(diagnostic(
                         &config.path,
                         0,
@@ -532,6 +600,103 @@ impl ConfigResolutionState<'_> {
             Some(base) => merge_configs(base, config),
             None => without_extends(config),
         })
+    }
+
+    fn file_exists(&mut self, path: &str) -> bool {
+        let exists = self.file_system.file_exists(path);
+        if let Some(observation) = self.observation.as_deref_mut() {
+            observation.file_exists(path, exists);
+        }
+        exists
+    }
+
+    fn directory_exists(&mut self, path: &str) -> bool {
+        let exists = self.file_system.directory_exists(path);
+        if let Some(observation) = self.observation.as_deref_mut() {
+            observation.directory_exists(path, exists);
+        }
+        exists
+    }
+
+    fn read_package_json(&mut self, path: &str) -> Option<String> {
+        let result = self.file_system.read_file(path);
+        if let Some(observation) = self.observation.as_deref_mut() {
+            match &result {
+                Ok(source) => observation.read_text(path, ConfigInputKind::PackageJson, source),
+                Err(error) => observation.read_error(
+                    path,
+                    ConfigInputKind::PackageJson,
+                    error.kind(),
+                    &error.to_string(),
+                ),
+            }
+        }
+        result.ok()
+    }
+
+    fn resolve_base_config_path(
+        &mut self,
+        config_path: &str,
+        extends_path: &str,
+    ) -> Option<String> {
+        if is_relative_path(extends_path) || is_rooted_path(extends_path) {
+            let candidate = if is_relative_path(extends_path) {
+                resolve_relative(config_directory(config_path), extends_path)
+            } else {
+                normalize_path(extends_path)
+            };
+            return self.existing_config_candidate(&candidate);
+        }
+
+        let mut directory = config_directory(config_path).to_owned();
+        loop {
+            let candidate = resolve_relative(&directory, &format!("node_modules/{extends_path}"));
+            if let Some(path) = self.existing_config_candidate(&candidate) {
+                return Some(path);
+            }
+            let parent = parent_directory(&directory);
+            if parent == directory {
+                break;
+            }
+            directory = parent;
+        }
+        None
+    }
+
+    fn existing_config_candidate(&mut self, candidate: &str) -> Option<String> {
+        let candidate = normalize_path(candidate);
+        if self.file_exists(&candidate) {
+            return Some(candidate);
+        }
+        if Path::new(&candidate).extension().is_none() {
+            let json = format!("{candidate}.json");
+            if self.file_exists(&json) {
+                return Some(json);
+            }
+        }
+        if self.directory_exists(&candidate) {
+            let package_json = resolve_relative(&candidate, "package.json");
+            if self.file_exists(&package_json)
+                && let Some(source) = self.read_package_json(&package_json)
+                && let Some(value) = parse_jsonc(&package_json, &source).value
+                && let Some(tsconfig) = value
+                    .as_object()
+                    .and_then(|object| object.get("tsconfig"))
+                    .and_then(JsonValue::as_str)
+            {
+                let configured = resolve_relative(&candidate, tsconfig);
+                if configured != candidate
+                    && let Some(configured) = self.existing_config_candidate(&configured)
+                {
+                    return Some(configured);
+                }
+            }
+            let tsconfig = resolve_relative(&candidate, "tsconfig.json");
+            if self.file_exists(&tsconfig) {
+                return Some(tsconfig);
+            }
+        }
+        None
     }
 }
 
@@ -820,71 +985,6 @@ fn resolve_extends_path(
             candidate
         }
     }
-}
-
-fn resolve_base_config_path(
-    file_system: &dyn FileSystem,
-    config_path: &str,
-    extends_path: &str,
-) -> Option<String> {
-    if is_relative_path(extends_path) || is_rooted_path(extends_path) {
-        let candidate = if is_relative_path(extends_path) {
-            resolve_relative(config_directory(config_path), extends_path)
-        } else {
-            normalize_path(extends_path)
-        };
-        return existing_config_candidate(file_system, &candidate);
-    }
-
-    let mut directory = config_directory(config_path).to_owned();
-    loop {
-        let candidate = resolve_relative(&directory, &format!("node_modules/{extends_path}"));
-        if let Some(path) = existing_config_candidate(file_system, &candidate) {
-            return Some(path);
-        }
-        let parent = parent_directory(&directory);
-        if parent == directory {
-            break;
-        }
-        directory = parent;
-    }
-    None
-}
-
-fn existing_config_candidate(file_system: &dyn FileSystem, candidate: &str) -> Option<String> {
-    let candidate = normalize_path(candidate);
-    if file_system.file_exists(&candidate) {
-        return Some(candidate);
-    }
-    if Path::new(&candidate).extension().is_none() {
-        let json = format!("{candidate}.json");
-        if file_system.file_exists(&json) {
-            return Some(json);
-        }
-    }
-    if file_system.directory_exists(&candidate) {
-        let package_json = resolve_relative(&candidate, "package.json");
-        if file_system.file_exists(&package_json)
-            && let Ok(source) = file_system.read_file(&package_json)
-            && let Some(value) = parse_jsonc(&package_json, &source).value
-            && let Some(tsconfig) = value
-                .as_object()
-                .and_then(|object| object.get("tsconfig"))
-                .and_then(JsonValue::as_str)
-        {
-            let configured = resolve_relative(&candidate, tsconfig);
-            if configured != candidate
-                && let Some(configured) = existing_config_candidate(file_system, &configured)
-            {
-                return Some(configured);
-            }
-        }
-        let tsconfig = resolve_relative(&candidate, "tsconfig.json");
-        if file_system.file_exists(&tsconfig) {
-            return Some(tsconfig);
-        }
-    }
-    None
 }
 
 fn config_directory(path: &str) -> &str {
