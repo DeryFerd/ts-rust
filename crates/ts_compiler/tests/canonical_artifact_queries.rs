@@ -197,13 +197,14 @@ fn canonical_queries_use_package_exports_for_types_from_a_transitive_module() {
     let filesystem = MemoryFileSystem::new(true);
     for (path, source) in [
         (
-            "/project/node_modules/item-api/package.json",
-            r#"{"name":"item-api","exports":{".":"./index.d.ts"}}"#,
+            "/packages/items/package.json",
+            r#"{"name":"item-api","exports":{".":"./index.js"}}"#,
         ),
         (
-            "/project/node_modules/item-api/index.d.ts",
+            "/packages/items/index.d.ts",
             "export interface Item { value: number; }",
         ),
+        ("/packages/items/index.js", "export {};"),
         (
             "/project/re-export.d.ts",
             "export type { Item } from 'item-api';",
@@ -215,6 +216,7 @@ fn canonical_queries_use_package_exports_for_types_from_a_transitive_module() {
     ] {
         filesystem.write_file(path, source).unwrap();
     }
+    filesystem.add_directory_link("/packages/items", "/project/node_modules/item-api");
     let (program, result) = Program::try_new_with_canonical_checker_and_queries(
         &filesystem,
         "/project",
@@ -224,8 +226,7 @@ fn canonical_queries_use_package_exports_for_types_from_a_transitive_module() {
             ..canonical_options()
         },
         |program, queries| {
-            let declaration =
-                identifiers(program, "/project/node_modules/item-api/index.d.ts", "Item")[0];
+            let declaration = identifiers(program, "/packages/items/index.d.ts", "Item")[0];
             let source = program.source_file("/project/input.d.ts").unwrap();
             let location = source.node_ref(source.parse.source_file).unwrap();
             let type_ = queries.get_type_at_location(declaration).unwrap();

@@ -1870,12 +1870,12 @@ impl Program {
         let Some(exports) = exports.as_object() else {
             return;
         };
-        let directory = directory_path(package_json_path);
+        let directory = directory_path(&file_system.realpath(package_json_path));
         for (key, value) in exports {
             let Some(target) = package_export_string_target(value) else {
                 continue;
             };
-            let target = resolve_path(&directory, &[target]);
+            let target = file_system.realpath(&resolve_path(&directory, &[target]));
             let target = canonicalize(
                 ts_path::remove_file_extension(&target),
                 &self.current_directory,
