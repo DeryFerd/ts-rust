@@ -3,6 +3,7 @@
 use std::{error::Error, fmt, fmt::Write as _};
 
 use ts_ast::{Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
+use ts_checker::semantic::TypeDisplayUnavailable;
 use ts_compiler::{
     CanonicalArtifactQueryError, CanonicalProgramCheckError, CanonicalProgramCheckFailureClass,
     CanonicalProgramQueries, CanonicalSymbolId, CanonicalTypeFormatFlags, CanonicalTypeId, Program,
@@ -137,6 +138,13 @@ impl ArtifactRenderError {
                 CanonicalProgramCheckError::SourceCheck {
                     file_name: file_name.to_owned(),
                     error: error.into(),
+                }
+                .failure_class()
+            }
+            CanonicalArtifactQueryError::SymbolDisplay(error) => {
+                CanonicalProgramCheckError::SourceCheck {
+                    file_name: file_name.to_owned(),
+                    error: TypeDisplayUnavailable::SymbolDisplay(error).into(),
                 }
                 .failure_class()
             }
@@ -1018,15 +1026,16 @@ pub(super) fn declaration_name(parent: &Node) -> Option<NodeId> {
 #[cfg(test)]
 mod tests {
     use ts_ast::{NodeData, SyntaxKind};
-    use ts_compiler::Program;
+    use ts_checker::semantic::SymbolDisplayError;
+    use ts_compiler::{CanonicalArtifactQueryError, CanonicalProgramCheckFailureClass, Program};
     use ts_options::CompilerOptions;
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
     use crate::{Case, fixture_case_sensitive, virtual_harness_path, virtual_unit_path};
 
     use super::{
-        SemanticArtifactWalk, declaration_full_start, ecma_line_and_utf16_column, render_program,
-        source_files, walk_program,
+        ArtifactRenderError, SemanticArtifactWalk, declaration_full_start,
+        ecma_line_and_utf16_column, render_program, source_files, walk_program,
     };
 
     fn fixture_filesystem(case: &Case) -> MemoryFileSystem {
@@ -1092,6 +1101,63 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(sections, expected);
         }
+    }
+
+    #[test]
+    fn symbol_display_errors_keep_compiler_failure_classes() {
+        let filesystem = MemoryFileSystem::new(true);
+        filesystem
+            .write_file("/project/main.ts", "const value = 1;")
+            .unwrap();
+        let (_, result) = Program::try_new_with_canonical_checker_and_queries(
+            &filesystem,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                no_emit: true,
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                let source = program.source_file("/project/main.ts").unwrap();
+                let node = source
+                    .parse
+                    .arena
+                    .iter()
+                    .find_map(|(id, record)| {
+                        matches!(&record.data, NodeData::Identifier(_))
+                            .then(|| source.node_ref(id).unwrap())
+                    })
+                    .unwrap();
+                let symbol = queries.get_symbol_at_location(node).unwrap().unwrap();
+                for (error, expected) in [
+                    (
+                        SymbolDisplayError::MissingModuleSpecifier(symbol),
+                        CanonicalProgramCheckFailureClass::Unsupported {
+                            capability_code: "T07.TYPE_DISPLAY",
+                        },
+                    ),
+                    (
+                        SymbolDisplayError::InvalidSymbol(symbol),
+                        CanonicalProgramCheckFailureClass::Fatal {
+                            invariant_code: "INV.SOURCE.TYPE_DISPLAY",
+                        },
+                    ),
+                ] {
+                    assert_eq!(
+                        ArtifactRenderError::query(
+                            "symbol display",
+                            &source.file_name,
+                            CanonicalArtifactQueryError::SymbolDisplay(error),
+                        )
+                        .class,
+                        expected,
+                    );
+                }
+            },
+        )
+        .unwrap();
+        result.expect("canonical checker ran");
     }
 
     #[test]
