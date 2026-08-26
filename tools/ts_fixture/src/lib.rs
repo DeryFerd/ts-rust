@@ -6840,7 +6840,7 @@ mod tests {
                 "// @allowJs: true\n",
                 "// @noCheck: true\n",
                 "// @filename: tsconfig.json\n",
-                "{}\n",
+                "{\"files\":[\"input.js\"]}\n",
                 "// @filename: input.js\n",
                 "const value = 1;\n",
             ),
@@ -6947,7 +6947,7 @@ mod tests {
             ("inferredOverwrite.ts", "", true),
             (
                 "configuredOverwrite.ts",
-                "// @filename: tsconfig.json\n{}\n",
+                "// @filename: tsconfig.json\n{\"files\":[\"input.js\"]}\n",
                 false,
             ),
             (
