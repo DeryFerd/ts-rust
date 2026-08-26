@@ -3698,6 +3698,9 @@ fn display_interface_name(
     let declarations = symbol
         .declarations()
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if !interface_display_declarations_match(store, host, symbol_id, declarations) {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
     if store.get_merged_symbol(symbol_id) != Some(symbol_id)
         || symbol.check_flags() != CheckFlags::NONE
         || symbol.exports().is_some()
@@ -3722,7 +3725,7 @@ fn display_interface_name(
         validate_merged_interface_display_owner(store, host, type_id, symbol_id)?;
     }
     if resolved {
-        if validate_resolved_named_interface(store, type_id, symbol_id, interface).is_err()
+        if validate_resolved_named_interface(store, host, type_id, symbol_id, interface).is_err()
             && !keyof_types::plan_nongeneric_keyof_type(store, type_id).is_ok_and(|plan| {
                 plan.proof() == object_members::DeclaredPropertyObjectProof::Interface
             })
@@ -3750,6 +3753,58 @@ fn valid_display_interface_owner(
         }),
         _ => false,
     }
+}
+
+fn interface_display_declarations_match(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    owner: SemanticSymbolId,
+    declarations: &[NodeRef],
+) -> bool {
+    let Some(name) = store
+        .symbol(owner)
+        .and_then(|symbol| symbol.name().as_utf8())
+    else {
+        return false;
+    };
+    !declarations.is_empty()
+        && declarations.iter().all(|&declaration| {
+            if let Some(host) = host {
+                if !host.symbol_matches(store, declaration, owner) {
+                    return false;
+                }
+                let source_name = match host.node(declaration).map(|node| &node.data) {
+                    Some(NodeData::InterfaceDeclaration(interface)) => interface.name,
+                    Some(NodeData::VariableDeclaration(variable)) => variable.name,
+                    _ => return false,
+                };
+                return host
+                    .node(NodeRef::new(
+                        declaration.arena,
+                        declaration.file,
+                        source_name,
+                    ))
+                    .is_some_and(|node| {
+                        matches!(&node.data, NodeData::Identifier(identifier)
+                    if node.parent == Some(declaration.node) && identifier.text == name)
+                    });
+            }
+            if store.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
+                return false;
+            }
+            let mut names = (0..declaration.node.index()).filter_map(|index| {
+                let node = NodeRef::new(
+                    declaration.arena,
+                    declaration.file,
+                    ts_ast::NodeId::new(u32::try_from(index).ok()?),
+                );
+                (store.source_node_parent(node)
+                    == Some(super::store::SourceNodeParent::Parent(declaration)))
+                .then(|| store.source_identifier_text(node))
+                .flatten()
+            });
+            names.next() == Some(name) && names.next().is_none()
+        })
 }
 
 #[allow(clippy::too_many_lines)] // Validate both declaration meanings without resolving either one.
@@ -3870,139 +3925,7 @@ fn validate_merged_interface_display_owner(
     {
         return Err(invalid());
     }
-    validate_merged_interface_member_owners(store, host, type_id, owner, &interfaces)?;
-    let value_type = match store.value_symbol_links(owner) {
-        None => None,
-        Some(links) if links == &ValueSymbolLinks::default() => None,
-        Some(links) => {
-            let value_type = links.resolved_type.ok_or_else(invalid)?;
-            if values.is_empty()
-                || store.type_payload(value_type).is_none()
-                || links
-                    != &(ValueSymbolLinks {
-                        resolved_type: Some(value_type),
-                        ..ValueSymbolLinks::default()
-                    })
-            {
-                return Err(invalid());
-            }
-            Some(value_type)
-        }
-    };
-    for value in values {
-        let Some(NodeData::VariableDeclaration(variable)) = host.node(value).map(|node| &node.data)
-        else {
-            return Err(invalid());
-        };
-        let Some(annotation) = variable
-            .type_
-            .map(|node| NodeRef::new(value.arena, value.file, node))
-        else {
-            if value_type.is_some() {
-                return Err(invalid());
-            }
-            continue;
-        };
-        let cached = store
-            .type_node_links(annotation)
-            .and_then(|links| links.resolved_type);
-        let result = if Some(value) == symbol.value_declaration() {
-            value_type.or(cached)
-        } else {
-            cached
-        };
-        if cached
-            .zip(result)
-            .is_some_and(|(cached, actual)| cached != actual)
-            || !merged_interface_value_annotation_is_exact(store, host, annotation, result)
-        {
-            return Err(invalid());
-        }
-    }
-    Ok(())
-}
-
-fn merged_interface_value_annotation_is_exact(
-    store: &CanonicalTypeMapperStore,
-    host: &DeclaredTypeHost<'_>,
-    annotation: NodeRef,
-    result: Option<TypeId>,
-) -> bool {
-    if store.type_node_links(annotation).is_some_and(|links| {
-        links.outer_type_parameters.is_some()
-            || links
-                .resolved_type
-                .is_some_and(|cached| Some(cached) != result)
-    }) {
-        return false;
-    }
-    let Some(node) = host.node(annotation) else {
-        return false;
-    };
-    let NodeData::TypeReferenceNode(reference) = &node.data else {
-        return result.map_or_else(
-            || {
-                store
-                    .symbol_node_links(annotation)
-                    .is_none_or(|links| links.resolved_symbol.is_none())
-            },
-            |result| store.source_type_node_result_is_exact(annotation, result, &[]),
-        );
-    };
-    let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
-    let Some(NodeData::Identifier(identifier)) = host.node(name).map(|node| &node.data) else {
-        return false;
-    };
-    let Some(target) = store
-        .intrinsic_bootstrap()
-        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
-        .and_then(|globals| globals.get_source(&identifier.text))
-        .and_then(|symbol| store.get_merged_symbol(symbol))
-    else {
-        return false;
-    };
-    let Some(owner) = store.symbol(target) else {
-        return false;
-    };
-    if owner.name().as_utf8() != Some(identifier.text.as_str())
-        || owner.check_flags() != CheckFlags::NONE
-        || host
-            .node(name)
-            .is_none_or(|name| name.parent != Some(annotation.node))
-        || [annotation, name].into_iter().any(|node| {
-            store
-                .symbol_node_links(node)
-                .is_some_and(|links| links.resolved_symbol.is_some_and(|symbol| symbol != target))
-        })
-    {
-        return false;
-    }
-    let Some(result) = result else {
-        return true;
-    };
-    if reference.type_arguments.is_some() {
-        return store.source_named_generic_type_reference_is_exact(annotation, result, &[]);
-    }
-    let meaning = owner.flags() & SymbolFlags::TYPE;
-    if meaning == SymbolFlags::INTERFACE || meaning == SymbolFlags::CLASS {
-        store
-            .declared_type_links(target)
-            .and_then(|links| links.declared_type)
-            == Some(result)
-            && store.type_payload(result).is_some_and(|record| {
-                record.flags() == TypeFlags::OBJECT
-                    && record.symbol() == Some(target)
-                    && record.alias().is_none()
-                    && matches!(record.data(), TypeData::Interface(_))
-            })
-    } else if meaning == SymbolFlags::TYPE_ALIAS {
-        store
-            .type_alias_links(target)
-            .and_then(|links| links.declared_type)
-            == Some(result)
-    } else {
-        false
-    }
+    validate_merged_interface_member_owners(store, host, type_id, owner, &interfaces)
 }
 
 #[allow(clippy::too_many_lines)] // Check merged binder members without resolving their types.
@@ -4135,6 +4058,7 @@ fn validate_merged_interface_member_owners(
 
 fn validate_resolved_named_interface(
     store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
     type_id: TypeId,
     owner: SemanticSymbolId,
     interface: &super::type_records::InterfaceTypeData,
@@ -4152,6 +4076,36 @@ fn validate_resolved_named_interface(
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         }
         object_members::StoredDeclaredCallSetValidation::NotDeclaredCallSet => {}
+    }
+    if let Some(host) = host
+        && store
+            .symbol(owner)
+            .is_some_and(|symbol| symbol.flags() != SymbolFlags::INTERFACE)
+    {
+        let plan = object_members::plan_interface(store, host, owner)
+            .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+        let properties_match = plan.properties.iter().all(|property| {
+            store
+                .symbol(property.symbol)
+                .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD))
+                || store
+                    .value_symbol_links(property.symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|property_type| {
+                        store.source_direct_type_annotation_is_exact(
+                            property.type_node,
+                            property_type,
+                        )
+                    })
+        });
+        return match object_members::interface_state(store, &plan, type_id) {
+            Ok(object_members::PropertyObjectState::Resolved(resolved))
+                if resolved == type_id && properties_match =>
+            {
+                Ok(())
+            }
+            _ => Err(TypeDisplayUnavailable::MalformedType(type_id)),
+        };
     }
     match object_members::validate_resolved_declared_property_object(store, type_id) {
         object_members::DeclaredPropertyObjectValidation::Valid(
@@ -6245,7 +6199,6 @@ mod tests {
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
         bootstrap::UnionReduction,
-        links::{SymbolNodeLinks, TypeNodeLinks},
         production::GlobalMergeCompletion,
         tuple_types::CanonicalTupleTypeRequest,
         type_records::{ConstituentMapState, LiteralValue, RegularLiteralLink},
@@ -6967,6 +6920,80 @@ mod tests {
     }
 
     #[test]
+    fn merged_interface_display_ignores_cold_and_warm_value_annotations() {
+        for (index, annotation) in ["number | string", "(number)", "Values.Item"]
+            .into_iter()
+            .enumerate()
+        {
+            let parsed = parse_source_file(&format!(
+                "declare namespace Values {{ export type Item = number; }} \
+                 interface Clock {{ first: string; }} interface Clock {{ second: boolean; }} \
+                 declare var Clock: {annotation};"
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(1_911 + u32::try_from(index).unwrap());
+            let files = [(file, &parsed, false)];
+            let mut context = merged_interface_display_context(&files);
+            let owner = merged_interface_display_global(&context, "Clock");
+            let interface = merged_interface_display_identity(&mut context, &files, owner);
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(context.type_to_string(interface).unwrap(), "Clock");
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+            let node = variable_type_node(&parsed, file, "Clock");
+            let value = context.get_type_from_type_node(node).unwrap();
+            assert_ne!(value, interface);
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                owner,
+                ValueSymbolLinks {
+                    resolved_type: Some(value),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(context.type_to_string(interface).unwrap(), "Clock");
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                warm
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .declared_type_links(owner)
+                    .unwrap()
+                    .declared_type,
+                Some(interface)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(owner)
+                    .unwrap()
+                    .resolved_type,
+                Some(value)
+            );
+        }
+    }
+
+    #[test]
     fn merged_interface_display_preserves_resolved_member_proofs() {
         let parsed = parse_source_file(concat!(
             "interface Catalog { shared: string; } ",
@@ -7013,8 +7040,8 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)] // Check owner identity and paired value caches on one genuine merge.
-    fn merged_interface_display_rejects_owner_and_paired_value_cache_changes() {
+    #[allow(clippy::too_many_lines)] // Check declaration ownership and the interface's own type cache.
+    fn merged_interface_display_rejects_owner_and_declared_type_cache_changes() {
         let first = parse_source_file(concat!(
             "interface Clock { value: string; } ",
             "interface ClockConstructor { new(): Clock; } ",
@@ -7027,10 +7054,8 @@ mod tests {
         ];
         let mut context = merged_interface_display_context(&files);
         let owner = merged_interface_display_global(&context, "Clock");
-        let constructor = merged_interface_display_global(&context, "ClockConstructor");
         let other = merged_interface_display_global(&context, "Other");
         let instance = merged_interface_display_identity(&mut context, &files, owner);
-        let constructor_type = merged_interface_display_identity(&mut context, &files, constructor);
         let other_type = merged_interface_display_identity(&mut context, &files, other);
         assert_eq!(context.type_to_string(instance).unwrap(), "Clock");
         let (flags, declarations, value, members) = {
@@ -7057,7 +7082,7 @@ mod tests {
                 context.store().source_node_kind(*node) == Some(SyntaxKind::InterfaceDeclaration)
             })
             .unwrap();
-        for poison in 0..5 {
+        for poison in 0..6 {
             match poison {
                 0 => assert!(context.store_mut_for_test().set_symbol_flags(
                     owner,
@@ -7092,9 +7117,24 @@ mod tests {
                         ..declared_links.clone()
                     }
                 )),
+                5 => {
+                    assert!(context.store_mut_for_test().set_symbol_declarations(
+                        owner,
+                        Some(vec![other_declaration]),
+                        None
+                    ));
+                    assert!(context.store_mut_for_test().set_symbol_flags(
+                        owner,
+                        SymbolFlags::INTERFACE,
+                        CheckFlags::NONE
+                    ));
+                }
                 _ => unreachable!(),
             }
             assert_malformed_display_without_writes(&context, instance);
+            if poison == 5 {
+                assert!(type_to_string(context.store(), instance).is_err());
+            }
             assert!(
                 context
                     .store_mut_for_test()
@@ -7117,45 +7157,6 @@ mod tests {
             );
             assert_eq!(context.type_to_string(instance).unwrap(), "Clock");
         }
-        let annotation = variable_type_node(&first, files[0].0, "Clock");
-        assert_ne!(instance, constructor_type);
-        assert!(context.store_mut_for_test().set_value_symbol_links(
-            owner,
-            ValueSymbolLinks {
-                resolved_type: Some(instance),
-                ..ValueSymbolLinks::default()
-            }
-        ));
-        assert!(context.store_mut_for_test().set_type_node_links(
-            annotation,
-            TypeNodeLinks {
-                resolved_type: Some(instance),
-                ..TypeNodeLinks::default()
-            }
-        ));
-        assert!(context.store_mut_for_test().set_symbol_node_links(
-            annotation,
-            SymbolNodeLinks {
-                resolved_symbol: Some(constructor)
-            }
-        ));
-        assert_malformed_display_without_writes(&context, instance);
-        assert!(
-            context
-                .store_mut_for_test()
-                .set_value_symbol_links(owner, ValueSymbolLinks::default())
-        );
-        assert!(
-            context
-                .store_mut_for_test()
-                .set_type_node_links(annotation, TypeNodeLinks::default())
-        );
-        assert!(
-            context
-                .store_mut_for_test()
-                .set_symbol_node_links(annotation, SymbolNodeLinks::default())
-        );
-        assert_eq!(context.type_to_string(instance).unwrap(), "Clock");
     }
 
     #[test]
