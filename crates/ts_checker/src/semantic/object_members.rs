@@ -15,7 +15,8 @@
 //! Named interface and type-literal methods retain their own binder symbols,
 //! authenticated method type parameters, annotated required or optional
 //! parameters, and authenticated array, tuple, tuple-union, or inferred rest
-//! parameters. Selected default-library `Math` methods also retain their
+//! parameters. Flat array rest bindings retain their anonymous parameter and
+//! separate binding-element locals. Selected default-library `Math` methods also retain their
 //! numeric rest parameters.
 
 use std::collections::{HashMap, HashSet};
@@ -1025,7 +1026,7 @@ pub(super) struct PlannedIndexSignature {
     value_type_parameter: Option<SemanticSymbolId>,
 }
 
-/// One annotated identifier parameter in an admitted declared signature.
+/// One annotated value parameter in an admitted declared signature.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PlannedCallParameter {
     pub symbol: SemanticSymbolId,
@@ -1055,9 +1056,28 @@ pub(super) struct PlannedInterfaceMethod {
     pub symbol: SemanticSymbolId,
     pub type_parameters: Vec<PlannedInterfaceMethodTypeParameter>,
     pub parameters: Vec<PlannedCallParameter>,
+    locals: Option<SymbolTableId>,
+    binding_parameters: Vec<PlannedMethodBindingParameter>,
     pub return_type: NodeRef,
     pub flags: SignatureFlags,
     minimum_argument_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlannedMethodBindingParameter {
+    declaration: NodeRef,
+    pattern: NodeRef,
+    symbol: SemanticSymbolId,
+    index: usize,
+    bindings: Vec<PlannedMethodBindingElement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlannedMethodBindingElement {
+    declaration: NodeRef,
+    name_node: NodeRef,
+    symbol: SemanticSymbolId,
+    name: String,
 }
 
 /// One binder-owned getter or setter contributing to an interface property.
@@ -2257,26 +2277,30 @@ pub(super) fn declared_signature_parameter_is_rest(
             declaration.file,
             ts_ast::NodeId::new(u32::try_from(index).ok()?),
         );
-        (store.source_node_kind(node) == Some(SyntaxKind::Identifier)
-            && store.source_node_parent(node) == Some(SourceNodeParent::Parent(declaration)))
+        (matches!(
+            store.source_node_kind(node),
+            Some(SyntaxKind::Identifier | SyntaxKind::ArrayBindingPattern)
+        ) && store.source_node_parent(node) == Some(SourceNodeParent::Parent(declaration)))
         .then_some(node)
     })?;
-    let found = name
-        .node
-        .index()
-        .checked_sub(1)
-        .and_then(|index| u32::try_from(index).ok())
-        .map(|index| {
-            NodeRef::new(
+    let found = (0..name.node.index())
+        .rev()
+        .find_map(|index| {
+            let node = NodeRef::new(
                 declaration.arena,
                 declaration.file,
-                ts_ast::NodeId::new(index),
-            )
+                ts_ast::NodeId::new(u32::try_from(index).ok()?),
+            );
+            (store.source_node_parent(node) == Some(SourceNodeParent::Parent(declaration)))
+                .then_some(node)
         })
         .is_some_and(|token| {
             store.source_node_kind(token) == Some(SyntaxKind::DotDotDotToken)
                 && store.source_node_parent(token) == Some(SourceNodeParent::Parent(declaration))
         });
+    if store.source_node_kind(name) == Some(SyntaxKind::ArrayBindingPattern) && !found {
+        return None;
+    }
     if found
         && !matches!(
             store.source_node_kind(annotation),
@@ -3974,7 +3998,7 @@ fn authenticated_default_library_builtin_symbol_method(
     let valid_parameter = match (owner_name, method.parameters.nodes.as_slice()) {
         ("Symbol", [parameter]) => {
             let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
-            let Ok((planned, rest, optional)) = plan_interface_method_parameter(
+            let Ok((planned, rest, optional, _)) = plan_interface_method_parameter(
                 store,
                 host,
                 declaration,
@@ -8179,9 +8203,8 @@ fn plan_interface_method(
         return Err(unsupported());
     }
 
-    let locals = bound
-        .locals(declaration)
-        .and_then(|locals| store.symbol_table(locals));
+    let local_table = bound.locals(declaration);
+    let locals = local_table.and_then(|locals| store.symbol_table(locals));
     let type_parameters = plan_declared_signature_type_parameters(
         store,
         host,
@@ -8195,8 +8218,6 @@ fn plan_interface_method(
         if locals.is_some_and(|locals| !locals.is_empty()) {
             return Err(unsupported());
         }
-    } else if locals.is_none() {
-        return Err(unsupported());
     }
     let mut parameters = Vec::new();
     parameters
@@ -8206,6 +8227,7 @@ fn plan_interface_method(
     let mut previous_end = method.parameters.range.start;
     let mut minimum_argument_count = 0usize;
     let mut optional_parameter_seen = false;
+    let mut binding_parameters = Vec::new();
     let numeric_math_rest = matches!(identifier.text.as_str(), "max" | "min" | "hypot")
         && bound.source_facts().is_some_and(|facts| {
             facts.is_declaration_file()
@@ -8226,7 +8248,7 @@ fn plan_interface_method(
             return Err(unsupported());
         }
         previous_end = parameter_record.range.end;
-        let (planned, rest, optional) = plan_interface_method_parameter(
+        let (planned, rest, optional, binding) = plan_interface_method_parameter(
             store,
             host,
             declaration,
@@ -8247,30 +8269,38 @@ fn plan_interface_method(
             minimum_argument_count += 1;
         }
         let symbol = store.symbol(planned.symbol).ok_or_else(unsupported)?;
-        if locals.and_then(|locals| locals.get(symbol.name())) != Some(planned.symbol)
+        if binding.is_none()
+            && locals.and_then(|locals| locals.get(symbol.name())) != Some(planned.symbol)
             || parameters
                 .iter()
                 .any(|parameter: &PlannedCallParameter| parameter.symbol == planned.symbol)
         {
             return Err(unsupported());
         }
+        if let Some(binding) = binding {
+            binding_parameters.push(binding);
+        }
         parameters.push(planned);
     }
-    if locals.is_some_and(|locals| locals.len() != parameters.len() + type_parameters.len())
-        || i32::try_from(parameters.len()).is_err()
-    {
+    if i32::try_from(parameters.len()).is_err() {
         return Err(unsupported());
     }
 
-    Ok(PlannedInterfaceMethod {
+    let planned = PlannedInterfaceMethod {
         declaration,
         symbol,
         type_parameters,
         parameters,
+        locals: local_table,
+        binding_parameters,
         return_type,
         flags,
         minimum_argument_count,
-    })
+    };
+    if !valid_method_parameter_locals(store, &planned) {
+        return Err(unsupported());
+    }
+    Ok(planned)
 }
 
 #[allow(clippy::too_many_lines)] // Binder, syntax, constraints, and defaults share one proof.
@@ -8525,6 +8555,193 @@ fn valid_declared_rest_parameter_annotation(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // The anonymous parameter and its binding locals share one proof.
+fn plan_method_binding_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    method: NodeRef,
+    declaration: NodeRef,
+    pattern: NodeRef,
+    symbol: SemanticSymbolId,
+    index: usize,
+) -> Result<PlannedMethodBindingParameter, PropertyObjectError> {
+    let unsupported = || PropertyObjectError::UnsupportedMember {
+        node: method,
+        kind: SyntaxKind::MethodSignature,
+    };
+    let record = preflight_node(store, host, pattern).map_err(|_| unsupported())?;
+    let NodeData::BindingPattern(data) = &record.data else {
+        return Err(unsupported());
+    };
+    if record.kind != SyntaxKind::ArrayBindingPattern
+        || record.flags.0 != 0
+        || record.parent != Some(declaration.node)
+        || data.facts != 0
+        || data.elements.range.start < record.range.start
+        || data.elements.range.end > record.range.end
+    {
+        return Err(unsupported());
+    }
+    let bound = host.bound_file(declaration).ok_or_else(unsupported)?;
+    let mut bindings = Vec::new();
+    bindings
+        .try_reserve_exact(data.elements.nodes.len())
+        .map_err(|_| PropertyObjectError::Capacity(declaration))?;
+    let mut previous_end = data.elements.range.start;
+    for element in &data.elements.nodes {
+        let element = NodeRef::new(pattern.arena, pattern.file, *element);
+        let element_record = preflight_node(store, host, element).map_err(|_| unsupported())?;
+        if element_record.flags.0 != 0
+            || element_record.parent != Some(pattern.node)
+            || element_record.range.start < previous_end
+            || element_record.range.end > data.elements.range.end
+        {
+            return Err(unsupported());
+        }
+        previous_end = element_record.range.end;
+        if element_record.kind == SyntaxKind::OmittedExpression
+            && matches!(element_record.data, NodeData::OmittedExpression(_))
+        {
+            continue;
+        }
+        let NodeData::BindingElement(binding) = &element_record.data else {
+            return Err(unsupported());
+        };
+        let name = binding
+            .name
+            .map(|node| NodeRef::new(pattern.arena, pattern.file, node))
+            .ok_or_else(unsupported)?;
+        let name_record = preflight_node(store, host, name).map_err(|_| unsupported())?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(unsupported());
+        };
+        if element_record.kind != SyntaxKind::BindingElement
+            || binding.dot_dot_dot_token.is_some()
+            || binding.flow_node.is_some()
+            || binding.initializer.is_some()
+            || binding.local_symbol.is_some()
+            || binding.property_name.is_some()
+            || binding.symbol.is_some()
+            || binding.facts != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(element.node)
+            || name_record.range != element_record.range
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(unsupported());
+        }
+        let raw = bound.symbol(element).ok_or_else(unsupported)?;
+        let binding_symbol = store.get_merged_symbol(raw).ok_or_else(unsupported)?;
+        if raw != binding_symbol || !host.symbol_matches(store, element, binding_symbol) {
+            return Err(unsupported());
+        }
+        bindings.push(PlannedMethodBindingElement {
+            declaration: element,
+            name_node: name,
+            symbol: binding_symbol,
+            name: identifier.text.clone(),
+        });
+    }
+    Ok(PlannedMethodBindingParameter {
+        declaration,
+        pattern,
+        symbol,
+        index,
+        bindings,
+    })
+}
+
+fn valid_method_parameter_locals(
+    store: &CanonicalTypeMapperStore,
+    method: &PlannedInterfaceMethod,
+) -> bool {
+    let mut expected = method
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.symbol)
+        .collect::<Vec<_>>();
+    let mut anonymous = HashSet::new();
+    for binding in &method.binding_parameters {
+        let Some(parameter) = method.parameters.get(binding.index) else {
+            return false;
+        };
+        let Some(record) = store.symbol(binding.symbol) else {
+            return false;
+        };
+        if parameter.symbol != binding.symbol
+            || !anonymous.insert(binding.symbol)
+            || record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || record.check_flags() != CheckFlags::NONE
+            || record.name() != EscapedName::source(format!("__{}", binding.index)).as_ref()
+            || record.declarations() != Some(&[binding.declaration])
+            || record.value_declaration() != Some(binding.declaration)
+            || record.parent().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || store.get_merged_symbol(binding.symbol) != Some(binding.symbol)
+            || store.source_node_kind(binding.declaration) != Some(SyntaxKind::Parameter)
+            || store.source_node_parent(binding.declaration)
+                != Some(SourceNodeParent::Parent(method.declaration))
+            || store.source_node_kind(binding.pattern) != Some(SyntaxKind::ArrayBindingPattern)
+            || store.source_node_parent(binding.pattern)
+                != Some(SourceNodeParent::Parent(binding.declaration))
+            || declared_signature_parameter_is_rest(store, binding.declaration) != Some(true)
+        {
+            return false;
+        }
+        for local in &binding.bindings {
+            let Some(record) = store.symbol(local.symbol) else {
+                return false;
+            };
+            if record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                || record.check_flags() != CheckFlags::NONE
+                || record.name() != EscapedName::source(&local.name).as_ref()
+                || record.declarations() != Some(&[local.declaration])
+                || record.value_declaration() != Some(local.declaration)
+                || record.parent().is_some()
+                || record.members().is_some()
+                || record.exports().is_some()
+                || record.export_symbol().is_some()
+                || store.get_merged_symbol(local.symbol) != Some(local.symbol)
+                || store.source_node_kind(local.declaration) != Some(SyntaxKind::BindingElement)
+                || store.source_node_parent(local.declaration)
+                    != Some(SourceNodeParent::Parent(binding.pattern))
+                || store.source_node_kind(local.name_node) != Some(SyntaxKind::Identifier)
+                || store.source_node_parent(local.name_node)
+                    != Some(SourceNodeParent::Parent(local.declaration))
+                || store
+                    .value_symbol_links(local.symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+            {
+                return false;
+            }
+            expected.push(local.symbol);
+        }
+    }
+    expected.extend(
+        method
+            .parameters
+            .iter()
+            .filter(|parameter| !anonymous.contains(&parameter.symbol))
+            .map(|parameter| parameter.symbol),
+    );
+    let Some(locals) = method.locals.and_then(|locals| store.symbol_table(locals)) else {
+        return method.locals.is_none() && expected.is_empty();
+    };
+    let mut seen = HashSet::new();
+    locals.len() == expected.len()
+        && expected.into_iter().all(|symbol| {
+            seen.insert(symbol)
+                && !anonymous.contains(&symbol)
+                && store
+                    .symbol(symbol)
+                    .is_some_and(|record| locals.get(record.name()) == Some(symbol))
+        })
+}
+
 fn plan_interface_method_parameter(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -8532,7 +8749,15 @@ fn plan_interface_method_parameter(
     declaration: NodeRef,
     parameter_nodes: &NodeList,
     numeric_math_rest: bool,
-) -> Result<(PlannedCallParameter, bool, bool), PropertyObjectError> {
+) -> Result<
+    (
+        PlannedCallParameter,
+        bool,
+        bool,
+        Option<PlannedMethodBindingParameter>,
+    ),
+    PropertyObjectError,
+> {
     let unsupported = || PropertyObjectError::UnsupportedMember {
         node: method,
         kind: SyntaxKind::MethodSignature,
@@ -8573,17 +8798,33 @@ fn plan_interface_method_parameter(
 
     let name = NodeRef::new(declaration.arena, declaration.file, parameter.name);
     let name_record = preflight_node(store, host, name).map_err(|_| unsupported())?;
-    let NodeData::Identifier(identifier) = &name_record.data else {
-        return Err(unsupported());
+    let index = parameter_nodes
+        .nodes
+        .iter()
+        .position(|node| *node == declaration.node)
+        .ok_or_else(unsupported)?;
+    let expected_name = match &name_record.data {
+        NodeData::Identifier(identifier)
+            if name_record.kind == SyntaxKind::Identifier
+                && identifier.flow_node.is_none()
+                && !identifier.text.is_empty()
+                && identifier.text != "this" =>
+        {
+            identifier.text.clone()
+        }
+        NodeData::BindingPattern(pattern)
+            if name_record.kind == SyntaxKind::ArrayBindingPattern
+                && rest.is_some()
+                && pattern.facts == 0 =>
+        {
+            format!("__{index}")
+        }
+        _ => return Err(unsupported()),
     };
-    if name_record.kind != SyntaxKind::Identifier
-        || name_record.flags.0 != 0
+    if name_record.flags.0 != 0
         || name_record.parent != Some(declaration.node)
         || name_record.range.start < rest_end
         || name_record.range.end > record.range.end
-        || identifier.flow_node.is_some()
-        || identifier.text.is_empty()
-        || identifier.text == "this"
     {
         return Err(unsupported());
     }
@@ -8631,7 +8872,7 @@ fn plan_interface_method_parameter(
     if symbol != raw_symbol
         || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
         || symbol_record.check_flags() != CheckFlags::NONE
-        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.name() != EscapedName::source(expected_name).as_ref()
         || symbol_record.declarations() != Some(&[declaration])
         || symbol_record.value_declaration() != Some(declaration)
         || symbol_record.members().is_some()
@@ -8642,6 +8883,19 @@ fn plan_interface_method_parameter(
         return Err(unsupported());
     }
 
+    let binding = if name_record.kind == SyntaxKind::ArrayBindingPattern {
+        Some(plan_method_binding_parameter(
+            store,
+            host,
+            method,
+            declaration,
+            name,
+            symbol,
+            index,
+        )?)
+    } else {
+        None
+    };
     let identity_node = peel_parenthesized_type(store, host, type_node)?;
     Ok((
         PlannedCallParameter {
@@ -8654,6 +8908,7 @@ fn plan_interface_method_parameter(
         },
         rest.is_some(),
         optional,
+        binding,
     ))
 }
 
@@ -12828,6 +13083,7 @@ fn resolved_interface_method_value(
         let return_type = callable.resolved_return_type()?;
         let type_parameters = resolved_interface_method_type_parameters(store, method)?;
         if method.declaration != *declaration
+            || !valid_method_parameter_locals(store, method)
             || callable.flags() != method.flags
             || callable.declaration() != Some(method.declaration)
             || callable.type_parameters() != type_parameters.as_slice()
@@ -12984,10 +13240,11 @@ pub(super) fn publish_interface_method_values(
         .try_reserve(plan.methods.len())
         .map_err(|_| PropertyObjectError::Capacity(plan.node))?;
     for (index, (method, resolved_signature)) in plan.methods.iter().zip(resolved).enumerate() {
-        if plan
-            .properties
-            .iter()
-            .all(|property| property.symbol != method.symbol)
+        if !valid_method_parameter_locals(store, method)
+            || plan
+                .properties
+                .iter()
+                .all(|property| property.symbol != method.symbol)
             || resolved_signature.parameter_types.len() != method.parameters.len()
             || cached_planned_type_identity(store, method.return_type)
                 != Some(resolved_signature.return_type)
@@ -19997,6 +20254,248 @@ mod generic_publication_tests {
                 ),
                 before,
             );
+        }
+    }
+
+    #[test]
+    fn interface_rest_bindings_keep_anonymous_parameters_separate_from_locals() {
+        for (index, signature, names) in [
+            (
+                0,
+                "next(...[value]: [] | [T]): { value: T };",
+                vec!["value"],
+            ),
+            (
+                0,
+                "next(...[item, other]: [T, T]): T;",
+                vec!["item", "other"],
+            ),
+            (0, "next(...[, item]: [T, T]): T;", vec!["item"]),
+            (0, "next(...[]: []): T;", vec![]),
+            (0, "next(...[__0]: [T]): T;", vec!["__0"]),
+            (1, "next(first: number, ...[item]: [T]): T;", vec!["item"]),
+        ] {
+            let fixture = interface_fixture(&format!("interface I<T> {{ {signature} }}"), 3_926);
+            let host = host(&fixture.parsed, &fixture.bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+            let [method] = plan.methods.as_slice() else {
+                panic!("the interface has one method")
+            };
+            let [binding] = method.binding_parameters.as_slice() else {
+                panic!("the method has one destructured rest parameter")
+            };
+            assert_eq!(binding.index, index);
+            assert_eq!(binding.symbol, method.parameters[index].symbol);
+            assert_eq!(method.flags, SignatureFlags::HAS_REST_PARAMETER);
+            assert_eq!(method.minimum_argument_count, index);
+            assert_eq!(
+                fixture.store.symbol(binding.symbol).unwrap().name(),
+                EscapedName::source(format!("__{index}")).as_ref(),
+            );
+            assert_eq!(
+                binding
+                    .bindings
+                    .iter()
+                    .map(|binding| binding.name.as_str())
+                    .collect::<Vec<_>>(),
+                names
+            );
+            assert!(
+                binding
+                    .bindings
+                    .iter()
+                    .all(|local| local.symbol != binding.symbol)
+            );
+            assert!(valid_method_parameter_locals(&fixture.store, method));
+            assert_eq!(
+                declared_signature_parameter_is_rest(&fixture.store, binding.declaration),
+                Some(true)
+            );
+            assert_eq!(
+                plan_generic_interface(&fixture.store, &host, fixture.symbol),
+                Ok(plan)
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+        }
+    }
+
+    #[test]
+    fn interface_rest_binding_methods_publish_tuple_union_signatures_and_replay() {
+        let mut fixture = interface_fixture(
+            "interface I<T> { next(...[value]: [] | [T]): { value: T }; }",
+            3_927,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let [method] = plan.methods.as_slice() else {
+            panic!("the interface has one method")
+        };
+        let [binding] = method.binding_parameters.as_slice() else {
+            panic!("the method has one binding pattern")
+        };
+        let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+        let target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let returned = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(method.return_type)
+        .unwrap();
+        assert!(fixture.store.publish_interface_no_base_resolution(target));
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[returned]
+            ),
+            Ok(target),
+        );
+        let signature = fixture
+            .store
+            .signature_links(method.declaration)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let signature = fixture.store.signature(signature).unwrap();
+        assert_eq!(signature.parameters(), [binding.symbol]);
+        assert_eq!(signature.flags(), SignatureFlags::HAS_REST_PARAMETER);
+        assert_eq!(signature.min_argument_count(), 0);
+        assert_eq!(signature.resolved_return_type(), Some(returned));
+        let parameter_type = fixture
+            .store
+            .value_symbol_links(binding.symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert!(matches!(
+            fixture.store.type_payload(parameter_type).unwrap().data(),
+            TypeData::Union(_)
+        ));
+        assert!(
+            binding
+                .bindings
+                .iter()
+                .all(|local| fixture.store.value_symbol_links(local.symbol).is_none())
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &[returned]
+            ),
+            Ok(target),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths()
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn interface_rest_binding_plans_reject_wrong_local_ownership_before_publication() {
+        let mut fixture =
+            interface_fixture("interface I<T> { next(...[item]: [] | [T]): T; }", 3_928);
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let binding = &plan.methods[0].binding_parameters[0];
+        let local = binding.bindings[0].symbol;
+        assert!(fixture.store.set_symbol_relationships(
+            local,
+            None,
+            None,
+            Some(fixture.symbol),
+            None
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert!(!valid_method_parameter_locals(
+            &fixture.store,
+            &plan.methods[0]
+        ));
+        assert!(plan_generic_interface(&fixture.store, &host, fixture.symbol).is_err());
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths()
+            ),
+            poisoned
+        );
+        assert!(fixture.store.declared_type_links(fixture.symbol).is_none());
+        assert!(fixture.store.value_symbol_links(binding.symbol).is_none());
+    }
+
+    #[test]
+    fn unsupported_rest_binding_shapes_leave_interface_state_cold() {
+        for signature in [
+            "next([value]: [T]): T;",
+            "next(...[[value]]: [[T]]): T;",
+            "next(...[value = 1]: [T]): T;",
+            "next(...[...values]: T[]): T;",
+        ] {
+            let fixture = interface_fixture(&format!("interface I<T> {{ {signature} }}"), 3_929);
+            let host = host(&fixture.parsed, &fixture.bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert!(
+                plan_generic_interface(&fixture.store, &host, fixture.symbol).is_err(),
+                "{signature}"
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths()
+                ),
+                cold
+            );
+            assert!(fixture.store.declared_type_links(fixture.symbol).is_none());
         }
     }
 
