@@ -1,7 +1,7 @@
 //! Dependency-closed canonical semantic type display.
 //!
 //! This is the primitive, literal, canonical-union, global-array, empty-tuple,
-//! property-only object, and exact annotated function-type prefix of pinned
+//! property-only object, declared method, and exact annotated function-type prefix of pinned
 //! `internal/checker/printer.go::typeToString`,
 //! `internal/checker/nodebuilderimpl.go::typeToTypeNode`, and
 //! `internal/checker/relater.go::reportRelationError` at
@@ -21,6 +21,9 @@ use super::{
     ArrayTypeError, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
     DeclaredTypeHostError, EmptyTupleTypeError, IndexInfoId, SignatureId, TypeAliasId, TypeId,
     bootstrap::LiteralTypeCacheError,
+    callable_sets::{
+        CallableSetProjection, StoredCallableSetValidation, validate_stored_callable_set,
+    },
     callables::{
         CallableFamily, SingleCallableDisplayError, StoredSingleCallableValidation,
         ValidatedSingleCallSignatureDisplay, single_callable_display_projection,
@@ -748,6 +751,13 @@ fn display_type_worker(
     if type_flags.intersects(TypeFlags::TYPE_PARAMETER) {
         require_data_kind(type_id, record, TypeDataKind::TypeParameter)?;
         let symbol = cached_ordinary_type_parameter_owner(store, type_id)
+            .or_else(|| {
+                state
+                    .method_type_parameters
+                    .iter()
+                    .rev()
+                    .find_map(|(parameter, symbol)| (*parameter == type_id).then_some(*symbol))
+            })
             .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
         return display_symbol_name(store, type_id, symbol, state)
             .ok_or(TypeDisplayUnavailable::MalformedType(type_id));
@@ -843,6 +853,8 @@ fn display_index_type(
 struct DisplayState {
     approximate_length: usize,
     truncating: bool,
+    // Fresh method parameters are named only while their validated signature is in scope.
+    method_type_parameters: Vec<(TypeId, SemanticSymbolId)>,
 }
 
 impl DisplayState {
@@ -1010,6 +1022,20 @@ fn display_object_type(
             host,
             global_types,
             type_id,
+            flags,
+            state,
+            visiting,
+        );
+    }
+
+    if let Some(host) = host
+        && let Some(projection) = validated_declared_method_display(store, type_id, record)?
+    {
+        return display_declared_method_signatures(
+            store,
+            host,
+            global_types,
+            &projection,
             flags,
             state,
             visiting,
@@ -1295,6 +1321,313 @@ fn validated_class_method_return_type(
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
     Ok(Some(return_type))
+}
+
+fn validated_declared_method_display(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    record: &TypeRecord,
+) -> Result<Option<CallableSetProjection>, TypeDisplayUnavailable> {
+    let Some(method) = record.symbol().and_then(|symbol| store.symbol(symbol)) else {
+        return Ok(None);
+    };
+    if !method.flags().contains(SymbolFlags::METHOD) {
+        return Ok(None);
+    }
+    let Some(owner) = method
+        .parent()
+        .and_then(|owner| store.get_merged_symbol(owner))
+        .and_then(|owner| store.symbol(owner))
+    else {
+        return Ok(None);
+    };
+    if owner.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        && owner.flags() != SymbolFlags::TYPE_LITERAL
+    {
+        return Ok(None);
+    }
+    match validate_stored_callable_set(store, type_id) {
+        StoredCallableSetValidation::Valid { projection, .. }
+            if projection.owner == type_id
+                && !projection.call_signatures.is_empty()
+                && projection.construct_signatures.is_empty() =>
+        {
+            Ok(Some(projection))
+        }
+        _ => Err(TypeDisplayUnavailable::MalformedType(type_id)),
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Each signature uses the same recursive display state.
+fn display_declared_method_signatures(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    projection: &CallableSetProjection,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    let type_id = projection.owner;
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    let scope_length = state.method_type_parameters.len();
+    let result = (|| {
+        let overloaded = projection.call_signatures.len() > 1;
+        let mut result = if overloaded {
+            state.add(2);
+            String::from("{ ")
+        } else {
+            String::new()
+        };
+        for callable in &projection.call_signatures {
+            let signature = store
+                .signature(callable.signature)
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            let declaration = signature
+                .declaration()
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            let owner = store
+                .type_payload(type_id)
+                .and_then(TypeRecord::symbol)
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            if !host.symbol_matches(store, declaration, owner) {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+            let Some(NodeData::MethodSignatureDeclaration(method)) =
+                host.node(declaration).map(|node| &node.data)
+            else {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            };
+            if signature.this_parameter().is_some()
+                || signature.resolved_type_predicate().is_some()
+                || method.parameters.nodes.len() != signature.parameters().len()
+            {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+            state.add(3);
+            append_declared_method_type_parameters(
+                store,
+                host,
+                global_types,
+                type_id,
+                callable.signature,
+                flags,
+                state,
+                visiting,
+                &mut result,
+            )?;
+            let parameter_types = callable
+                .parameters
+                .iter()
+                .copied()
+                .chain(callable.rest_parameter)
+                .collect::<Vec<_>>();
+            append_validated_signature_parameters(
+                store,
+                host,
+                global_types,
+                type_id,
+                callable.signature,
+                &parameter_types,
+                flags,
+                state,
+                visiting,
+                &mut result,
+            )?;
+            result.push_str(if overloaded { ": " } else { " => " });
+            let return_type = callable
+                .return_type
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            result.push_str(&display_type_worker(
+                store,
+                Some(host),
+                global_types,
+                return_type,
+                flags,
+                state,
+                visiting,
+            )?);
+            if overloaded {
+                result.push_str("; ");
+            }
+            state.method_type_parameters.truncate(scope_length);
+        }
+        if overloaded {
+            result.push('}');
+        }
+        Ok(result)
+    })();
+    state.method_type_parameters.truncate(scope_length);
+    visiting.remove(&type_id);
+    result
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Check source names before admitting fresh parameters.
+fn append_declared_method_type_parameters(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    owner: TypeId,
+    signature: SignatureId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+    result: &mut String,
+) -> Result<(), TypeDisplayUnavailable> {
+    let signature_record = store
+        .signature(signature)
+        .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    let declaration = signature_record
+        .declaration()
+        .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    let Some(NodeData::MethodSignatureDeclaration(method)) =
+        host.node(declaration).map(|node| &node.data)
+    else {
+        return Err(TypeDisplayUnavailable::MalformedType(owner));
+    };
+    let declarations = method
+        .type_parameters
+        .as_ref()
+        .map_or(&[][..], |parameters| parameters.nodes.as_slice());
+    let original = signature_record
+        .target()
+        .and_then(|target| store.signature(target))
+        .unwrap_or(signature_record);
+    if declarations.len() != signature_record.type_parameters().len()
+        || declarations.len() != original.type_parameters().len()
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(owner));
+    }
+    for ((declaration_node, parameter), source) in declarations
+        .iter()
+        .zip(signature_record.type_parameters())
+        .zip(original.type_parameters())
+    {
+        let parameter_declaration =
+            NodeRef::new(declaration.arena, declaration.file, *declaration_node);
+        let symbol = cached_ordinary_type_parameter_owner(store, *source)
+            .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+        let parameter_record = store
+            .type_payload(*parameter)
+            .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+        let TypeData::TypeParameter(data) = parameter_record.data() else {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        };
+        let Some(NodeData::TypeParameterDeclaration(syntax)) =
+            host.node(parameter_declaration).map(|node| &node.data)
+        else {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        };
+        let source_name = NodeRef::new(declaration.arena, declaration.file, syntax.name);
+        let Some(NodeData::Identifier(name)) = host.node(source_name).map(|node| &node.data) else {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        };
+        let Some(TypeData::TypeParameter(source_data)) =
+            store.type_payload(*source).map(TypeRecord::data)
+        else {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        };
+        let fresh = parameter != source;
+        if !host.symbol_matches(store, parameter_declaration, symbol)
+            || host.node(parameter_declaration).is_none_or(|node| {
+                node.kind != SyntaxKind::TypeParameter || node.parent != Some(declaration.node)
+            })
+            || parameter_record.symbol() != Some(symbol)
+            || store
+                .symbol(symbol)
+                .is_none_or(|symbol| symbol.name().as_utf8() != Some(name.text.as_str()))
+            || parameter_record.flags() != TypeFlags::TYPE_PARAMETER
+            || parameter_record.alias().is_some()
+            || data.is_this_type
+            || data.target != fresh.then_some(*source)
+            || data.mapper
+                != if fresh {
+                    signature_record.mapper()
+                } else {
+                    None
+                }
+            || fresh && data.mapper.is_none()
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        }
+        for (annotation, type_) in [
+            (syntax.constraint, source_data.constraint),
+            (syntax.default_type, source_data.resolved_default_type),
+        ] {
+            if annotation.is_some() != type_.is_some()
+                || annotation.zip(type_).is_some_and(|(annotation, type_)| {
+                    !store.source_direct_type_annotation_is_exact(
+                        NodeRef::new(declaration.arena, declaration.file, annotation),
+                        type_,
+                    )
+                })
+            {
+                return Err(TypeDisplayUnavailable::MalformedType(owner));
+            }
+        }
+        state.method_type_parameters.push((*parameter, symbol));
+    }
+    if declarations.is_empty() {
+        return Ok(());
+    }
+    result.push('<');
+    state.add(2);
+    for (index, (declaration_node, parameter)) in declarations
+        .iter()
+        .zip(signature_record.type_parameters())
+        .enumerate()
+    {
+        let parameter_declaration =
+            NodeRef::new(declaration.arena, declaration.file, *declaration_node);
+        let Some(NodeData::TypeParameterDeclaration(syntax)) =
+            host.node(parameter_declaration).map(|node| &node.data)
+        else {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        };
+        let Some(TypeData::TypeParameter(data)) =
+            store.type_payload(*parameter).map(TypeRecord::data)
+        else {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        };
+        if index != 0 {
+            result.push_str(", ");
+            state.add(2);
+        }
+        result.push_str(&display_type_worker(
+            store,
+            Some(host),
+            global_types,
+            *parameter,
+            flags,
+            state,
+            visiting,
+        )?);
+        for (annotation, type_, prefix) in [
+            (syntax.constraint, data.constraint, " extends "),
+            (syntax.default_type, data.resolved_default_type, " = "),
+        ] {
+            if annotation.is_some() != type_.is_some() {
+                return Err(TypeDisplayUnavailable::MalformedType(owner));
+            }
+            if let Some(type_) = type_ {
+                result.push_str(prefix);
+                state.add(prefix.len());
+                result.push_str(&display_type_worker(
+                    store,
+                    Some(host),
+                    global_types,
+                    type_,
+                    flags,
+                    state,
+                    visiting,
+                )?);
+            }
+        }
+    }
+    result.push('>');
+    Ok(())
 }
 
 fn display_validated_module_namespace(
@@ -2011,12 +2344,43 @@ fn append_source_signature_parameters(
     visiting: &mut HashSet<TypeId>,
     result: &mut String,
 ) -> Result<(), TypeDisplayUnavailable> {
-    let signature_record = store
-        .signature(signature)
-        .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
     let parameter_types = store
         .callable_signature_parameter_types(signature)
         .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    append_validated_signature_parameters(
+        store,
+        host,
+        global_types,
+        owner,
+        signature,
+        parameter_types,
+        flags,
+        state,
+        visiting,
+        result,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Callers supply parameter types from a validated signature.
+fn append_validated_signature_parameters(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    owner: TypeId,
+    signature: SignatureId,
+    parameter_types: &[TypeId],
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+    result: &mut String,
+) -> Result<(), TypeDisplayUnavailable> {
+    let signature_record = store
+        .signature(signature)
+        .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    let original = signature_record
+        .target()
+        .and_then(|target| store.signature(target))
+        .unwrap_or(signature_record);
     if parameter_types.len() != signature_record.parameters().len() {
         return Err(TypeDisplayUnavailable::MalformedType(owner));
     }
@@ -2044,7 +2408,12 @@ fn append_source_signature_parameters(
         let Some(NodeData::Identifier(identifier)) = host.node(name).map(|node| &node.data) else {
             return Err(TypeDisplayUnavailable::MalformedType(owner));
         };
-        if !host.symbol_matches(store, declaration, *parameter)
+        let source_parameter = original
+            .parameters()
+            .get(index)
+            .copied()
+            .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+        if !host.symbol_matches(store, declaration, source_parameter)
             || symbol.name().as_utf8() != Some(identifier.text.as_str())
         {
             return Err(TypeDisplayUnavailable::MalformedType(owner));
@@ -6051,6 +6420,196 @@ mod tests {
         assert_eq!(
             context.type_to_string(callable),
             Err(TypeDisplayUnavailable::MalformedType(callable))
+        );
+    }
+
+    #[test]
+    fn declared_method_display_preserves_parameters_and_overload_order() {
+        let parsed = parse_source_file(concat!(
+            "interface Service { ",
+            "read(value: string): number; ",
+            "read(value: number): string; ",
+            "identity<T extends string = string>(value: T): T; ",
+            "} declare const service: Service; ",
+            "const read = service.read; const identity = service.identity;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(216);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        for (node, record) in parsed.arena.iter() {
+            let NodeData::PropertyAccessExpression(access) = &record.data else {
+                continue;
+            };
+            let NodeData::Identifier(name) = &parsed.arena.get(access.name).unwrap().data else {
+                panic!("test methods have identifier names")
+            };
+            let type_ = context
+                .store()
+                .type_node_links(NodeRef::new(parsed.arena.id(), file, node))
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let expected = match name.text.as_str() {
+                "read" => "{ (value: string): number; (value: number): string; }",
+                "identity" => "<T extends string = string>(value: T) => T",
+                _ => unreachable!(),
+            };
+            assert_eq!(context.type_to_string(type_).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn instantiated_method_display_names_only_validated_fresh_parameters() {
+        let parsed = parse_source_file(concat!(
+            "interface Box<T> { convert<U extends T = T>(value: U): U; } ",
+            "declare const box: Box<string>; const convert = box.convert;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(217);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let access = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let type_ = context
+            .store()
+            .type_node_links(access)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let signatures = context
+            .store()
+            .type_payload(type_)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .unwrap();
+        let [signature] = signatures else {
+            panic!("the converted method has one signature")
+        };
+        let signature = context.store().signature(*signature).unwrap();
+        let [parameter] = signature.type_parameters() else {
+            panic!("the converted method has one fresh parameter")
+        };
+        let parameter = *parameter;
+        let TypeData::TypeParameter(data) = context.store().type_payload(parameter).unwrap().data()
+        else {
+            panic!("the method parameter retains its source identity")
+        };
+        let (constraint, source, mapper, default_type) = (
+            data.constraint,
+            data.target,
+            data.mapper,
+            data.resolved_default_type,
+        );
+        assert!(source.is_some());
+        assert_eq!(
+            context.type_to_string(type_).unwrap(),
+            "<U extends string = string>(value: U) => U"
+        );
+        assert_eq!(
+            context.type_to_string(parameter),
+            Err(TypeDisplayUnavailable::MalformedType(parameter))
+        );
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_parameter_resolution(
+            parameter,
+            Some(number),
+            source,
+            mapper,
+            default_type,
+        ));
+        assert_eq!(
+            context.type_to_string(type_),
+            Err(TypeDisplayUnavailable::MalformedType(type_))
+        );
+        assert!(context.store_mut_for_test().set_type_parameter_resolution(
+            parameter,
+            constraint,
+            source,
+            mapper,
+            default_type,
+        ));
+        assert_eq!(
+            context.type_to_string(type_).unwrap(),
+            "<U extends string = string>(value: U) => U"
+        );
+    }
+
+    #[test]
+    fn array_method_display_rejects_paired_parameter_cache_changes() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> { ",
+            "map<U>(callbackfn: (value: T, index: number, array: T[]) => U, ",
+            "thisArg?: any): U[]; } interface ReadonlyArray<T> {} ",
+            "const mapped = [1].map(value => value);",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(218);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodSignature).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let method = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let type_ = context
+            .store()
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(type_).unwrap(),
+            concat!(
+                "<U>(callbackfn: (value: T, index: number, array: T[]) => U, ",
+                "thisArg?: any) => U[]",
+            )
+        );
+        let signature = context
+            .store()
+            .signature_links(declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let parameter = context.store().signature(signature).unwrap().parameters()[1];
+        let mut types = context
+            .store()
+            .callable_signature_parameter_types(signature)
+            .unwrap()
+            .to_vec();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        types[1] = number;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_callable_signature_parameter_types_batch(vec![(signature, types)])
+        );
+        assert_eq!(
+            context.type_to_string(type_),
+            Err(TypeDisplayUnavailable::MalformedType(type_))
         );
     }
 
