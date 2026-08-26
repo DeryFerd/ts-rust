@@ -750,14 +750,6 @@ fn validate_stored_instantiated_interface_method_callable_set(
     let family = CallableFamily::DeclaredCallSignatures;
 
     let authenticated = (|| {
-        let source_validation = validate_stored_declared_method_callable_set(store, source)?;
-        let StoredCallableSetValidation::Valid {
-            projection: original,
-            ..
-        } = source_validation
-        else {
-            return None;
-        };
         let method_record = store.symbol(method)?;
         let owner_record = store.symbol(owner)?;
         let declarations = method_record.declarations()?;
@@ -768,22 +760,25 @@ fn validate_stored_instantiated_interface_method_callable_set(
         let this_type = interface.this_type?;
         let receiver = store.map_type(mapper, this_type)?;
         let receiver_reference = validate_direct_generic_reference(store, receiver).ok()?;
-        let array_targets = if matches!(
+        let global_owner = matches!(
             owner_record.name().as_utf8(),
             Some("Array" | "ReadonlyArray")
-        ) {
+        )
+        .then(|| {
             let globals = store.intrinsic_bootstrap()?.globals;
-            let global_owner = store
+            store
                 .symbol_table(globals)?
                 .get(owner_record.name())
-                .and_then(|owner| store.get_merged_symbol(owner));
+                .and_then(|owner| store.get_merged_symbol(owner))
+        })
+        .flatten();
+        let array_targets = if global_owner == Some(owner) {
             let targets = CanonicalArrayTargets::for_single_target_validation(owner_type);
-            if global_owner != Some(owner)
-                || store
-                    .canonical_array_reference_with_targets(targets, receiver)
-                    .ok()
-                    .flatten()
-                    .is_none_or(|reference| reference.base_type != receiver)
+            if store
+                .canonical_array_reference_with_targets(targets, receiver)
+                .ok()
+                .flatten()
+                .is_none_or(|reference| reference.base_type != receiver)
             {
                 return None;
             }
@@ -791,6 +786,24 @@ fn validate_stored_instantiated_interface_method_callable_set(
         } else {
             None
         };
+        if !super::instantiated_members::published_interface_method_source_matches(
+            store,
+            receiver,
+            method,
+            source,
+            array_targets,
+        ) {
+            return None;
+        }
+        let original =
+            validate_stored_callable_set_projection_with(store, source, true, |signature| {
+                store
+                    .callable_signature_parameter_types(signature)
+                    .map(<[TypeId]>::to_vec)
+            })?;
+        if !original.construct_signatures.is_empty() {
+            return None;
+        }
         if parameters.is_empty()
             || receiver_reference.target != owner_type
             || receiver_reference.type_arguments.len() != parameters.len()
@@ -829,11 +842,6 @@ fn validate_stored_instantiated_interface_method_callable_set(
                 .is_some()
             || object.structured.call_signature_count != original.call_signatures.len()
             || declarations.len() != original.call_signatures.len()
-            || store.value_symbol_links(method)
-                != Some(&ValueSymbolLinks {
-                    resolved_type: Some(source),
-                    ..ValueSymbolLinks::default()
-                })
         {
             return None;
         }
