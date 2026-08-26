@@ -40,6 +40,7 @@ use super::{
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::CallableFamily,
+    classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
     declared::cached_ordinary_type_parameter_owner,
     derived_types::DerivedObjectLiteralValidation,
     functions::{self, PendingFunctionTypeProof},
@@ -3088,6 +3089,20 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredCallableSetValidation::NotCallable => {}
+                }
+                match validate_class_heritage_members(self, type_) {
+                    ClassHeritageMembersValidation::Valid => {
+                        return self.validate_cached_array_capability_worker(
+                            type_,
+                            array_validation,
+                            &mut HashSet::new(),
+                            allowed_pending,
+                        );
+                    }
+                    ClassHeritageMembersValidation::Malformed => {
+                        return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                    }
+                    ClassHeritageMembersValidation::NotClass => {}
                 }
                 if self.direct_interface_heritage_provenance(type_).is_some() {
                     if validate_interface_heritage_members(self, type_)

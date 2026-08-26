@@ -2550,6 +2550,7 @@ mod tests {
                 .declared_type_links(owner)
                 .and_then(|links| links.declared_type)
                 .unwrap();
+            assert_eq!(store.validate_union_constituent(instance), Ok(()));
             let StoredCallableSetValidation::Valid {
                 family,
                 projection,
@@ -2631,6 +2632,11 @@ mod tests {
             };
             let (value, signature) =
                 authenticated_class_constructor_value(context.store(), owner).unwrap();
+            let instance = context
+                .store()
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .unwrap();
             match poison {
                 0 => assert!(
                     context
@@ -2660,6 +2666,7 @@ mod tests {
                 }
             ));
             assert!(context.store().validate_union_constituent(value).is_err());
+            assert!(context.store().validate_union_constituent(instance).is_err());
             assert_eq!(
                 (
                     context.store().type_len(),
