@@ -80,6 +80,228 @@ fn constructions(parsed: &ParseResult, file: FileId) -> Vec<NodeRef> {
         .collect()
 }
 
+fn value_access(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef) {
+    parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::PropertyAccessExpression(access) = &record.data else {
+                return None;
+            };
+            let NodeData::Identifier(name) = &parsed.arena.get(access.name)?.data else {
+                return None;
+            };
+            (name.text == "value").then_some((
+                NodeRef::new(parsed.arena.id(), file, node),
+                NodeRef::new(parsed.arena.id(), file, access.name),
+            ))
+        })
+        .unwrap()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Each option checks errors, member identity, and source replay.
+fn parameter_property_reads_report_visibility_without_losing_type_or_symbol() {
+    for (visibility, code, message) in [
+        ("public", None, ""),
+        (
+            "private",
+            Some(2341),
+            "Property 'value' is private and only accessible within class 'Model'.",
+        ),
+        (
+            "protected",
+            Some(2445),
+            "Property 'value' is protected and only accessible within class 'Model' and its subclasses.",
+        ),
+    ] {
+        for parameter in ["value?: number", "readonly value: number = 1"] {
+            for exact_optional_property_types in [false, true] {
+                let parsed = parse_source_file(&format!(
+                    "class Model {{ constructor({visibility} {parameter}) {{}} }} \
+                     const model = new Model(); const copy = model.value;",
+                ));
+                assert!(parsed.diagnostics.is_empty());
+                let file = FileId::new(4_203);
+                let mut context = context(
+                    &parsed,
+                    file,
+                    IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        exact_optional_property_types,
+                    },
+                );
+                let owner = class_symbol(&parsed, file, &context, "Model");
+                let (access, name) = value_access(&parsed, file);
+                context.check_source_file(file).unwrap();
+                let members = context.get_nongeneric_class_members(owner).unwrap();
+                let [property] = members.declared_instance_properties() else {
+                    panic!("the constructor declares one parameter property")
+                };
+                let property = *property;
+                let expected_type = context
+                    .store()
+                    .value_symbol_links(property)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                assert_eq!(
+                    context
+                        .diagnostics()
+                        .as_slice()
+                        .iter()
+                        .map(|diagnostic| diagnostic.diagnostic.code())
+                        .collect::<Vec<_>>(),
+                    code.into_iter().collect::<Vec<_>>(),
+                );
+                if code.is_some() {
+                    let diagnostic = &context.diagnostics().as_slice()[0];
+                    assert_eq!(diagnostic.node, Some(name));
+                    assert_eq!(diagnostic.diagnostic.render().unwrap(), message);
+                }
+                assert_eq!(context.get_type_at_location(access).unwrap(), expected_type);
+                assert_eq!(context.get_type_at_location(name).unwrap(), expected_type);
+                assert_eq!(
+                    context
+                        .store()
+                        .symbol_node_links(access)
+                        .and_then(|links| links.resolved_symbol),
+                    Some(property),
+                );
+                let warm = (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                );
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().signature_len(),
+                        context.store().symbol_len(),
+                        context.store().checker_link_allocated_lengths(),
+                    ),
+                    warm,
+                );
+                assert_eq!(context.diagnostics().len(), usize::from(code.is_some()));
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Instance and static cases share the source and cache checks.
+fn inherited_field_visibility_uses_the_declaring_class_for_instance_and_static_reads() {
+    for (visibility, code, message) in [
+        ("public", None, ""),
+        (
+            "private",
+            Some(2341),
+            "Property 'value' is private and only accessible within class 'Base'.",
+        ),
+        (
+            "protected",
+            Some(2445),
+            "Property 'value' is protected and only accessible within class 'Base' and its subclasses.",
+        ),
+    ] {
+        for static_side in [false, true] {
+            let static_modifier = if static_side { "static" } else { "" };
+            let receiver = if static_side { "Derived" } else { "model" };
+            let parsed = parse_source_file(&format!(
+                "class Base {{ {visibility} {static_modifier} value = 1; }} \
+                 class Derived extends Base {{}} \
+                 const model = new Derived(); const copy = {receiver}.value;",
+            ));
+            assert!(parsed.diagnostics.is_empty());
+            let file = FileId::new(4_204);
+            let mut context = context(
+                &parsed,
+                file,
+                IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: true,
+                },
+            );
+            let (access, name) = value_access(&parsed, file);
+            context.check_source_file(file).unwrap();
+            assert_eq!(
+                context
+                    .diagnostics()
+                    .as_slice()
+                    .iter()
+                    .map(|diagnostic| diagnostic.diagnostic.code())
+                    .collect::<Vec<_>>(),
+                code.into_iter().collect::<Vec<_>>(),
+            );
+            if code.is_some() {
+                assert_eq!(context.diagnostics().as_slice()[0].node, Some(name));
+                assert_eq!(
+                    context.diagnostics().as_slice()[0]
+                        .diagnostic
+                        .render()
+                        .unwrap(),
+                    message,
+                );
+            }
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert_eq!(context.get_type_at_location(access).unwrap(), number);
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+            );
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                ),
+                warm,
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_visibility_overrides_stay_unsupported_before_class_publication() {
+    for static_modifier in ["", "static"] {
+        for (base_visibility, derived_visibility) in
+            [("private", "public"), ("public", "protected")]
+        {
+            let parsed = parse_source_file(&format!(
+                "class Base {{ {base_visibility} {static_modifier} value = 1; }} \
+                 class Derived extends Base {{ {derived_visibility} {static_modifier} value = 2; }}",
+            ));
+            assert!(parsed.diagnostics.is_empty());
+            let file = FileId::new(4_205);
+            let mut context = context(&parsed, file, IntrinsicBootstrapOptions::default());
+            let cold = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(_)),
+            ));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+}
+
 #[test]
 #[allow(clippy::too_many_lines)] // Each option proves source checking, type identity, and warm replay.
 fn optional_primitive_constructor_parameters_keep_annotation_and_value_types() {

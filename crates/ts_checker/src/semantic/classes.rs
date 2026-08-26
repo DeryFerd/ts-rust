@@ -129,6 +129,55 @@ pub(super) enum ClassConstructorVisibility {
     Private,
 }
 
+/// Reads visibility only after the caller validates the declaration's class graph.
+pub(super) fn class_member_visibility(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> ClassConstructorVisibility {
+    for index in 0..declaration.node.index() {
+        let index = u32::try_from(index).expect("source node indices fit in u32");
+        let modifier = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            ts_ast::NodeId::new(index),
+        );
+        if store.source_node_parent(modifier) != Some(SourceNodeParent::Parent(declaration)) {
+            continue;
+        }
+        match store.source_node_kind(modifier) {
+            Some(SyntaxKind::PrivateKeyword) => return ClassConstructorVisibility::Private,
+            Some(SyntaxKind::ProtectedKeyword) => return ClassConstructorVisibility::Protected,
+            _ => {}
+        }
+    }
+    ClassConstructorVisibility::Public
+}
+
+/// Tests declared class ancestry using the validated source heritage edges.
+pub(super) fn validated_class_derives_from(
+    store: &CanonicalTypeMapperStore,
+    class: TypeId,
+    base: TypeId,
+) -> Option<bool> {
+    if validate_class_heritage_members(store, class) != ClassHeritageMembersValidation::Valid
+        || validate_class_heritage_members(store, base) != ClassHeritageMembersValidation::Valid
+    {
+        return None;
+    }
+    let mut current = class;
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        if current == base {
+            return Some(true);
+        }
+        let Some(heritage) = store.direct_class_heritage_provenance(current) else {
+            return Some(false);
+        };
+        current = heritage.base_instance_type;
+    }
+    None
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ClassConstructorPlan {
     declaration: NodeRef,
@@ -1149,7 +1198,9 @@ fn class_property_modifiers(
             authenticate_class_property_decorator(store, host, declaration, name, kinds[0].0)?;
             (ClassPropertySide::Instance, false)
         }
-        [SyntaxKind::PublicKeyword] => (ClassPropertySide::Instance, false),
+        [SyntaxKind::PublicKeyword | SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword] => {
+            (ClassPropertySide::Instance, false)
+        }
         [SyntaxKind::AbstractKeyword] => {
             let declaration_record = preflight_node(store, host, declaration)?;
             let owner = declaration_record
@@ -1184,18 +1235,20 @@ fn class_property_modifiers(
             (ClassPropertySide::Instance, false)
         }
         [SyntaxKind::ReadonlyKeyword] => (ClassPropertySide::Instance, true),
-        [SyntaxKind::PublicKeyword, SyntaxKind::ReadonlyKeyword] => {
-            (ClassPropertySide::Instance, true)
-        }
+        [
+            SyntaxKind::PublicKeyword | SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword,
+            SyntaxKind::ReadonlyKeyword,
+        ] => (ClassPropertySide::Instance, true),
         [SyntaxKind::StaticKeyword] => (ClassPropertySide::Static, false),
-        [SyntaxKind::PublicKeyword, SyntaxKind::StaticKeyword] => {
-            (ClassPropertySide::Static, false)
-        }
+        [
+            SyntaxKind::PublicKeyword | SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword,
+            SyntaxKind::StaticKeyword,
+        ] => (ClassPropertySide::Static, false),
         [SyntaxKind::StaticKeyword, SyntaxKind::ReadonlyKeyword] => {
             (ClassPropertySide::Static, true)
         }
         [
-            SyntaxKind::PublicKeyword,
+            SyntaxKind::PublicKeyword | SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword,
             SyntaxKind::StaticKeyword,
             SyntaxKind::ReadonlyKeyword,
         ] => (ClassPropertySide::Static, true),
@@ -9739,6 +9792,64 @@ pub(super) fn plan_nongeneric_class_members(
     plan_class_members(store, host, class)
 }
 
+fn preflight_class_override_visibility(
+    store: &CanonicalTypeMapperStore,
+    class: &ClassDeclarationPlan,
+    base: &ClassDeclarationPlan,
+    heritage: NodeRef,
+) -> Result<(), ClassError> {
+    for (own, inherited) in [
+        (class.instance_members, base.instance_members),
+        (Some(class.static_members), Some(base.static_members)),
+    ] {
+        let (Some(own), Some(inherited)) = (own, inherited) else {
+            continue;
+        };
+        let own = store
+            .symbol_table(own)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class.symbol)))?;
+        let inherited = store
+            .symbol_table(inherited)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(base.symbol)))?;
+        for (name, property) in own.iter() {
+            let Some(base_property) = inherited.get(name) else {
+                continue;
+            };
+            let property = store
+                .symbol(property)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class.symbol)))?;
+            let base_property = store
+                .symbol(base_property)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(base.symbol)))?;
+            if !property
+                .flags()
+                .intersects(SymbolFlags::PROPERTY | SymbolFlags::METHOD | SymbolFlags::ACCESSOR)
+                || property.flags().contains(SymbolFlags::PROTOTYPE)
+            {
+                continue;
+            }
+            let (Some(declaration), Some(base_declaration)) = (
+                property.value_declaration(),
+                base_property.value_declaration(),
+            ) else {
+                continue;
+            };
+            let own_visibility = class_member_visibility(store, declaration);
+            let base_visibility = class_member_visibility(store, base_declaration);
+            if (own_visibility == ClassConstructorVisibility::Private
+                || base_visibility == ClassConstructorVisibility::Private)
+                && declaration != base_declaration
+                || own_visibility == ClassConstructorVisibility::Protected
+                    && base_visibility == ClassConstructorVisibility::Public
+            {
+                // The class diagnostic path does not yet emit TS2415/TS2417.
+                return Err(unsupported(ClassUnsupported::Heritage(heritage)));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Plans a class with no object base, including `extends null`, or one exact
 /// direct local base.
 ///
@@ -9754,6 +9865,7 @@ pub(super) fn plan_nongeneric_class_member_query(
         return plan_class_members(store, host, class).map(ClassMemberQueryPlan::Direct);
     };
     let base_plan = plan_nongeneric_class_members(store, host, base.symbol)?;
+    preflight_class_override_visibility(store, &class, &base_plan.class, base.expression)?;
     if base_plan.constructor_visibility() == ClassConstructorVisibility::Private
         || base_plan.class.null_base.is_some()
         || base_plan
@@ -24225,9 +24337,6 @@ mod tests {
     #[test]
     fn unsupported_decorated_constructor_parameters_leave_class_state_cold() {
         for source in [
-            "class Model { constructor(value: boolean) {} }",
-            "class Model { constructor(private value: number) {} }",
-            "class Model { constructor(protected value: number) {} }",
             "class Model { constructor(@missing value: string) {} }",
             concat!(
                 "declare function dec(target: any, key: string | symbol | undefined, ",

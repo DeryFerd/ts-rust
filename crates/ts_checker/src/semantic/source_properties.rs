@@ -12,6 +12,7 @@
 //! their export alias while reading the final value symbol. Validated class
 //! getter/setter pairs expose their shared accessor symbol. Private class
 //! members retain their owner-branded symbols and exact access diagnostics.
+//! Keyword-private and protected reads retain their declared types after an access error.
 //! Exact
 //! two-constituent
 //! unions of source-declared type literals reuse the canonical union-property
@@ -34,7 +35,7 @@ use super::{
     SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks,
     bootstrap::UnionReduction,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
-    classes::{self, ClassHeritageMembersValidation},
+    classes::{self, ClassConstructorVisibility, ClassHeritageMembersValidation},
     enums,
     formatter::type_to_string_with_host_global_types_and_flags,
     member_resolution::UnionPropertyError,
@@ -46,6 +47,7 @@ use super::{
         source_function_owner_expando_exports_are_valid, validate_stored_source_callable,
     },
     spelling::get_spelling_suggestion,
+    store::SourceNodeParent,
     type_records::{TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -154,7 +156,7 @@ pub(super) struct SourcePropertyPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourcePropertyPrivacy {
-    Public,
+    Identifier,
     Private { enclosing_class: Option<NodeRef> },
 }
 
@@ -209,6 +211,23 @@ pub(super) struct SourcePropertyDiagnostic {
     missing_type: Option<TypeId>,
     suggestion: Option<SemanticSymbolId>,
     private_owner: Option<SemanticSymbolId>,
+    accessibility: Option<ClassPropertyAccessDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClassPropertyAccessDiagnostic {
+    Private {
+        property: SemanticSymbolId,
+        owner: SemanticSymbolId,
+    },
+    Protected {
+        property: SemanticSymbolId,
+        owner: SemanticSymbolId,
+    },
+    ProtectedReceiver {
+        property: SemanticSymbolId,
+        enclosing_class: TypeId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -374,7 +393,7 @@ fn plan_direct_source_property_syntax_at(
                 && identifier.flow_node.is_none()
                 && !identifier.text.is_empty() =>
         {
-            (identifier.text.clone(), SourcePropertyPrivacy::Public)
+            (identifier.text.clone(), SourcePropertyPrivacy::Identifier)
         }
         NodeData::PrivateIdentifier(identifier)
             if name_record.kind == SyntaxKind::PrivateIdentifier
@@ -584,6 +603,7 @@ pub(super) fn check_direct_source_property(
                     missing_type: None,
                     suggestion: None,
                     private_owner: None,
+                    accessibility: None,
                 }),
             ),
             NamespaceProperty::Missing => {
@@ -626,6 +646,7 @@ pub(super) fn check_direct_source_property(
                     missing_type: Some(missing_type),
                     suggestion,
                     private_owner: None,
+                    accessibility: None,
                 }),
             )
         }
@@ -676,6 +697,16 @@ pub(super) fn check_direct_source_property(
             },
         },
     } {
+        let diagnostic =
+            class_property_accessibility(store, plan.name_node, receiver_type, property.symbol)?
+                .map(|accessibility| SourcePropertyDiagnostic {
+                    name_node: plan.name_node,
+                    receiver_type,
+                    missing_type: None,
+                    suggestion: None,
+                    private_owner: None,
+                    accessibility: Some(accessibility),
+                });
         if property.optional {
             if !plan.is_read() {
                 return Err(SourcePropertyError::Unsupported(
@@ -697,12 +728,12 @@ pub(super) fn check_direct_source_property(
                     &[property.type_, sentinel],
                     Some(property.symbol),
                 )?;
-                (type_, Some(property.symbol), None)
+                (type_, Some(property.symbol), diagnostic)
             } else {
-                (property.type_, Some(property.symbol), None)
+                (property.type_, Some(property.symbol), diagnostic)
             }
         } else {
-            (property.type_, Some(property.symbol), None)
+            (property.type_, Some(property.symbol), diagnostic)
         }
     } else {
         if !plan.is_read() {
@@ -722,6 +753,7 @@ pub(super) fn check_direct_source_property(
                 missing_type: None,
                 suggestion: direct_property_spelling_suggestion(store, plan, receiver_type)?,
                 private_owner: None,
+                accessibility: None,
             }),
         )
     };
@@ -740,6 +772,119 @@ pub(super) fn check_direct_source_property(
 
     publish_property_links(store, plan.node, property, type_)?;
     Ok(CheckedSourceProperty { type_, diagnostic })
+}
+
+fn class_property_accessibility(
+    store: &CanonicalTypeMapperStore,
+    name_node: NodeRef,
+    receiver_type: TypeId,
+    property: SemanticSymbolId,
+) -> Result<Option<ClassPropertyAccessDiagnostic>, SourcePropertyError> {
+    let invalid = || SourcePropertyError::InvalidCache(name_node);
+    let property_record = store.symbol(property).ok_or_else(invalid)?;
+    let Some(owner) = property_record.parent() else {
+        return Ok(None);
+    };
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    if !owner_record.flags().contains(SymbolFlags::CLASS) {
+        return Ok(None);
+    }
+    let Some(declaration) = property_record.value_declaration() else {
+        return Ok(None);
+    };
+    let visibility = classes::class_member_visibility(store, declaration);
+    if visibility == ClassConstructorVisibility::Public {
+        return Ok(None);
+    }
+    let declaring_class = store
+        .declared_type_links(owner)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(invalid)?;
+    let declaring_declaration = owner_record.value_declaration().ok_or_else(invalid)?;
+    let receiver = store.type_payload(receiver_type).ok_or_else(invalid)?;
+    let receiver_owner = receiver.symbol().ok_or_else(invalid)?;
+    let receiver_class = store
+        .declared_type_links(receiver_owner)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(invalid)?;
+    let static_side = store
+        .value_symbol_links(receiver_owner)
+        .and_then(|links| links.resolved_type)
+        == Some(receiver_type);
+    if store.source_node_kind(name_node) != Some(SyntaxKind::Identifier)
+        || !static_side && receiver_type != receiver_class
+        || classes::validated_class_derives_from(store, receiver_class, declaring_class)
+            != Some(true)
+        || receiver
+            .data()
+            .structured()
+            .and_then(|structured| structured.properties.as_deref())
+            .is_none_or(|properties| !properties.contains(&property))
+        || receiver
+            .data()
+            .structured()
+            .and_then(|structured| structured.members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(property_record.name()))
+            != Some(property)
+    {
+        return Err(invalid());
+    }
+
+    let mut current = name_node;
+    loop {
+        match store.source_node_parent(current).ok_or_else(invalid)? {
+            SourceNodeParent::Root => break,
+            SourceNodeParent::Parent(parent) => current = parent,
+        }
+        if !matches!(
+            store.source_node_kind(current),
+            Some(SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression)
+        ) {
+            continue;
+        }
+        if visibility == ClassConstructorVisibility::Private {
+            if current == declaring_declaration {
+                return Ok(None);
+            }
+            continue;
+        }
+        let enclosing_class = store
+            .types()
+            .find_map(|(type_, record)| {
+                let owner = record.symbol()?;
+                (record.object_flags().contains(ObjectFlags::CLASS)
+                    && matches!(record.data(), TypeData::Interface(_))
+                    && store.symbol(owner)?.value_declaration() == Some(current)
+                    && store.declared_type_links(owner)?.declared_type == Some(type_))
+                .then_some(type_)
+            })
+            .ok_or_else(|| unsupported_access(name_node))?;
+        if !classes::validated_class_derives_from(store, enclosing_class, declaring_class)
+            .ok_or_else(invalid)?
+        {
+            continue;
+        }
+        if static_side
+            || classes::validated_class_derives_from(store, receiver_class, enclosing_class)
+                .ok_or_else(invalid)?
+        {
+            return Ok(None);
+        }
+        return Ok(Some(ClassPropertyAccessDiagnostic::ProtectedReceiver {
+            property,
+            enclosing_class,
+        }));
+    }
+    Ok(Some(match visibility {
+        ClassConstructorVisibility::Private => {
+            ClassPropertyAccessDiagnostic::Private { property, owner }
+        }
+        ClassConstructorVisibility::Protected => {
+            ClassPropertyAccessDiagnostic::Protected { property, owner }
+        }
+        ClassConstructorVisibility::Public => unreachable!("public members returned earlier"),
+    }))
 }
 
 fn check_private_source_property(
@@ -908,6 +1053,7 @@ fn check_private_source_property(
                 missing_type: None,
                 suggestion: None,
                 private_owner: Some(private_owner),
+                accessibility: None,
             }),
         )
     };
@@ -2568,6 +2714,75 @@ pub(super) fn prepare_source_property_diagnostic(
         },
         _ => return Err(SourcePropertyError::InvalidCache(deferred.name_node)),
     };
+    if let Some(accessibility) = deferred.accessibility {
+        let property = match accessibility {
+            ClassPropertyAccessDiagnostic::Private { property, .. }
+            | ClassPropertyAccessDiagnostic::Protected { property, .. }
+            | ClassPropertyAccessDiagnostic::ProtectedReceiver { property, .. } => property,
+        };
+        if private_name
+            || deferred.private_owner.is_some()
+            || deferred.missing_type.is_some()
+            || deferred.suggestion.is_some()
+            || store
+                .symbol(property)
+                .and_then(|record| record.name().as_utf8())
+                != Some(name)
+            || class_property_accessibility(
+                store,
+                deferred.name_node,
+                deferred.receiver_type,
+                property,
+            )? != Some(accessibility)
+        {
+            return Err(SourcePropertyError::InvalidCache(deferred.name_node));
+        }
+        let (code, class, include_receiver) = match accessibility {
+            ClassPropertyAccessDiagnostic::Private { owner, .. }
+            | ClassPropertyAccessDiagnostic::Protected { owner, .. } => {
+                let class = store
+                    .declared_type_links(owner)
+                    .and_then(|links| links.declared_type)
+                    .ok_or(SourcePropertyError::InvalidCache(deferred.name_node))?;
+                let code = if matches!(accessibility, ClassPropertyAccessDiagnostic::Private { .. })
+                {
+                    2341
+                } else {
+                    2445
+                };
+                (code, class, false)
+            }
+            ClassPropertyAccessDiagnostic::ProtectedReceiver {
+                enclosing_class, ..
+            } => (2446, enclosing_class, true),
+        };
+        let class = type_to_string_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            class,
+            flags,
+        )?;
+        let mut arguments = vec![name.to_owned(), class];
+        if include_receiver {
+            arguments.push(type_to_string_with_host_global_types_and_flags(
+                store,
+                host,
+                global_types,
+                deferred.receiver_type,
+                flags,
+            )?);
+        }
+        return Ok(CanonicalCheckerDiagnostic {
+            node: Some(deferred.name_node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(code).ok_or(SourcePropertyError::MissingDiagnostic(code))?,
+                arguments,
+            ),
+            related_information: Vec::new(),
+        });
+    }
     if let Some(private_owner) = deferred.private_owner {
         if !private_name || deferred.missing_type.is_some() || deferred.suggestion.is_some() {
             return Err(SourcePropertyError::InvalidCache(deferred.name_node));
@@ -4820,6 +5035,67 @@ mod tests {
         );
         assert!(context.store().type_node_links(access).is_none());
         assert!(context.store().symbol_node_links(access).is_none());
+    }
+
+    #[test]
+    fn keyword_visibility_diagnostics_reject_a_forged_access_reason() {
+        let parsed = parsed("class Model { protected value = 1; } const result = model.value;");
+        let file = FileId::new(598);
+        let access = property_access(&parsed, file);
+        let (mut context, owner, instance, _) = published_class(&parsed, file, "Model");
+        let syntax =
+            plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+        let plan = finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, owner))
+            .unwrap();
+        let checked =
+            check_direct_source_property(context.store_mut_for_test(), None, &plan, instance)
+                .unwrap();
+        let deferred = checked.diagnostic.unwrap();
+        let Some(ClassPropertyAccessDiagnostic::Protected { property, owner }) =
+            deferred.accessibility
+        else {
+            panic!("the external read retains the protected member's declaring class")
+        };
+        assert_eq!(
+            checked.type_,
+            context.store().intrinsic_bootstrap().unwrap().number_type
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(property),
+        );
+        let (_, bound) = context.file(file).unwrap();
+        let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+        let forged = SourcePropertyDiagnostic {
+            accessibility: Some(ClassPropertyAccessDiagnostic::Private { property, owner }),
+            ..deferred
+        };
+        assert_eq!(
+            prepare_source_property_diagnostic(
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+                &forged,
+            ),
+            Err(SourcePropertyError::InvalidCache(plan.name_node)),
+        );
+        assert_eq!(
+            prepare_source_property_diagnostic(
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+                &deferred,
+            )
+            .unwrap()
+            .diagnostic
+            .code(),
+            2445,
+        );
     }
 
     #[test]

@@ -29,7 +29,8 @@ use super::{
     },
     classes::{
         ClassConstructorVisibility, ClassHeritageMembersValidation,
-        authenticated_class_constructor_value, validate_class_heritage_members,
+        authenticated_class_constructor_value, class_member_visibility,
+        validate_class_heritage_members, validated_class_derives_from,
     },
     declared::cached_ordinary_type_parameter_owner,
     derived_types::DerivedObjectLiteralValidation,
@@ -2513,8 +2514,8 @@ impl<'store> RelaterSession<'store> {
             return Ok(Some(Ternary::False));
         }
         if let (Some(source), Some(target)) = (source_declaration, target_declaration) {
-            let source = self.class_member_visibility(source);
-            let target = self.class_member_visibility(target);
+            let source = class_member_visibility(self.store, source);
+            let target = class_member_visibility(self.store, target);
             if !matches!(
                 (source, target),
                 (_, ClassConstructorVisibility::Private)
@@ -2579,24 +2580,6 @@ impl<'store> RelaterSession<'store> {
             call_signature: None,
             exact_callable: false,
         })
-    }
-
-    fn class_member_visibility(&self, declaration: NodeRef) -> ClassConstructorVisibility {
-        for index in 0..declaration.node.index() {
-            let index = u32::try_from(index).expect("source node indices fit in u32");
-            let modifier = NodeRef::new(declaration.arena, declaration.file, NodeId::new(index));
-            if self.store.source_node_parent(modifier)
-                != Some(SourceNodeParent::Parent(declaration))
-            {
-                continue;
-            }
-            match self.store.source_node_kind(modifier) {
-                Some(SyntaxKind::PrivateKeyword) => return ClassConstructorVisibility::Private,
-                Some(SyntaxKind::ProtectedKeyword) => return ClassConstructorVisibility::Protected,
-                _ => {}
-            }
-        }
-        ClassConstructorVisibility::Public
     }
 
     fn fixed_tuple_types_related_to(
@@ -3411,13 +3394,14 @@ impl<'store> RelaterSession<'store> {
 
         let mut result = Ternary::True;
         for source_property in &source_members.properties {
-            let (name, source_optional, source_readonly) = {
+            let (name, source_optional, source_readonly, source_declaration) = {
                 let source =
                     self.property_symbol(*source_property, source_members.property_origin)?;
                 (
                     source.name().to_owned(),
                     source.flags().intersects(SymbolFlags::OPTIONAL),
                     source.check_flags().contains(CheckFlags::READONLY),
+                    source.value_declaration(),
                 )
             };
             let target_property = self
@@ -3428,14 +3412,32 @@ impl<'store> RelaterSession<'store> {
             let Some(target_property) = target_property else {
                 return Ok(Ternary::False);
             };
-            let (target_optional, target_readonly) = {
+            let (target_optional, target_readonly, target_declaration) = {
                 let target =
                     self.property_symbol(target_property, target_members.property_origin)?;
                 (
                     target.flags().intersects(SymbolFlags::OPTIONAL),
                     target.check_flags().contains(CheckFlags::READONLY),
+                    target.value_declaration(),
                 )
             };
+            let visibility = |origin, declaration: Option<NodeRef>| {
+                if matches!(origin, ObjectPropertyOrigin::ValidatedClass) {
+                    declaration.map_or(ClassConstructorVisibility::Public, |declaration| {
+                        class_member_visibility(self.store, declaration)
+                    })
+                } else {
+                    ClassConstructorVisibility::Public
+                }
+            };
+            let source_visibility = visibility(source_members.property_origin, source_declaration);
+            let target_visibility = visibility(target_members.property_origin, target_declaration);
+            if source_visibility != target_visibility
+                || source_visibility != ClassConstructorVisibility::Public
+                    && *source_property != target_property
+            {
+                return Ok(Ternary::False);
+            }
             if source_optional != target_optional || source_readonly != target_readonly {
                 return Ok(Ternary::False);
             }
@@ -4020,31 +4022,68 @@ impl<'store> RelaterSession<'store> {
         target_property: SemanticSymbolId,
         target_origin: ObjectPropertyOrigin,
     ) -> Result<Ternary, RelationUnavailable> {
-        let (source_flags, source_readonly, source_declaration) = {
+        let (source_flags, source_readonly, source_declaration, source_owner) = {
             let source = self.property_symbol(source_property, source_origin)?;
             (
                 source.flags(),
                 source.check_flags().contains(CheckFlags::READONLY),
                 source.value_declaration(),
+                source.parent(),
             )
         };
-        let (target_flags, target_readonly, target_declaration) = {
+        let (target_flags, target_readonly, target_declaration, target_owner) = {
             let target = self.property_symbol(target_property, target_origin)?;
             (
                 target.flags(),
                 target.check_flags().contains(CheckFlags::READONLY),
                 target.value_declaration(),
+                target.parent(),
             )
         };
-        let source_private = matches!(source_origin, ObjectPropertyOrigin::ValidatedClass)
-            && source_declaration.is_some_and(|declaration| {
-                self.class_member_visibility(declaration) == ClassConstructorVisibility::Private
-            });
-        let target_private = matches!(target_origin, ObjectPropertyOrigin::ValidatedClass)
-            && target_declaration.is_some_and(|declaration| {
-                self.class_member_visibility(declaration) == ClassConstructorVisibility::Private
-            });
-        if (source_private || target_private) && source_declaration != target_declaration {
+        let visibility = |origin, declaration: Option<NodeRef>| {
+            if matches!(origin, ObjectPropertyOrigin::ValidatedClass) {
+                declaration.map_or(ClassConstructorVisibility::Public, |declaration| {
+                    class_member_visibility(self.store, declaration)
+                })
+            } else {
+                ClassConstructorVisibility::Public
+            }
+        };
+        let source_visibility = visibility(source_origin, source_declaration);
+        let target_visibility = visibility(target_origin, target_declaration);
+        if source_visibility == ClassConstructorVisibility::Private
+            || target_visibility == ClassConstructorVisibility::Private
+        {
+            if source_declaration != target_declaration {
+                return Ok(Ternary::False);
+            }
+        } else if target_visibility == ClassConstructorVisibility::Protected {
+            let Some(source_owner) = source_owner
+                .filter(|_| matches!(source_origin, ObjectPropertyOrigin::ValidatedClass))
+            else {
+                return Ok(Ternary::False);
+            };
+            let source_class = self
+                .store
+                .declared_type_links(source_owner)
+                .and_then(|links| links.declared_type)
+                .ok_or(RelationUnavailable::Symbol(source_owner))?;
+            let target_owner = target_owner.ok_or(RelationUnavailable::Symbol(target_property))?;
+            let target_class = self
+                .store
+                .declared_type_links(target_owner)
+                .and_then(|links| links.declared_type)
+                .ok_or(RelationUnavailable::Symbol(target_owner))?;
+            self.observe_symbol(source_owner);
+            self.observe_symbol(target_owner);
+            self.observe_type_surface(source_class);
+            self.observe_type_surface(target_class);
+            if !validated_class_derives_from(self.store, source_class, target_class)
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(source_class))?
+            {
+                return Ok(Ternary::False);
+            }
+        } else if source_visibility == ClassConstructorVisibility::Protected {
             return Ok(Ternary::False);
         }
         // Pinned `propertyRelatedTo`: readonly affects only strict subtype
@@ -9515,6 +9554,99 @@ mod tests {
             fixture.store.is_type_assignable_to(unknown_empty, target),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn protected_class_properties_require_declaring_class_ancestry() {
+        let mut fixture = function_relation_fixture(concat!(
+            "class Base { protected value: number; } ",
+            "class Inherited extends Base {} ",
+            "class Override extends Base { public value: number; } ",
+            "class Other { protected value: number; } ",
+            "class Public { value: number; }",
+        ));
+        let base = query_class_members(&mut fixture, "Base")
+            .shells()
+            .instance_type();
+        let inherited = query_class_members(&mut fixture, "Inherited")
+            .shells()
+            .instance_type();
+        let override_ = query_class_members(&mut fixture, "Override")
+            .shells()
+            .instance_type();
+        let other = query_class_members(&mut fixture, "Other")
+            .shells()
+            .instance_type();
+        let public = query_class_members(&mut fixture, "Public")
+            .shells()
+            .instance_type();
+
+        for (source, target, expected) in [
+            (base, other, false),
+            (other, base, false),
+            (public, base, false),
+            (base, public, false),
+            (override_, base, true),
+            (base, override_, false),
+            (inherited, base, true),
+            (base, inherited, true),
+            (override_, other, false),
+        ] {
+            for _ in 0..2 {
+                assert_eq!(
+                    fixture.store.is_type_assignable_to(source, target),
+                    Ok(expected)
+                );
+                assert_eq!(
+                    fixture.store.is_type_subtype_of(source, target),
+                    Ok(expected)
+                );
+            }
+        }
+        assert_eq!(fixture.store.is_type_identical_to(base, other), Ok(false));
+        assert_eq!(fixture.store.is_type_identical_to(base, public), Ok(false));
+        assert_eq!(
+            fixture.store.is_type_identical_to(base, override_),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture.store.is_type_identical_to(base, inherited),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn non_public_parameter_properties_are_not_structural_members() {
+        for visibility in ["private", "protected"] {
+            for optional in ["", "?"] {
+                let mut fixture = function_relation_fixture(&format!(
+                    "class Left {{ constructor({visibility} value{optional}: number) {{}} }} \
+                     class Right {{ constructor({visibility} value{optional}: number) {{}} }} \
+                     class Public {{ constructor(public value{optional}: number) {{}} }}",
+                ));
+                let left = query_class_members(&mut fixture, "Left")
+                    .shells()
+                    .instance_type();
+                let right = query_class_members(&mut fixture, "Right")
+                    .shells()
+                    .instance_type();
+                let public = query_class_members(&mut fixture, "Public")
+                    .shells()
+                    .instance_type();
+                for (source, target) in
+                    [(left, right), (right, left), (public, left), (left, public)]
+                {
+                    assert_eq!(
+                        fixture.store.is_type_assignable_to(source, target),
+                        Ok(false)
+                    );
+                    assert_eq!(
+                        fixture.store.is_type_identical_to(source, target),
+                        Ok(false)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
