@@ -13,8 +13,8 @@ use std::collections::HashSet;
 
 use ts_ast::SyntaxKind;
 use ts_binder::{
-    CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData, SymbolFlags,
-    SymbolTableId, semantic::PreparedSymbolTable,
+    CheckFlags, EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolData,
+    SymbolFlags, SymbolTableId, semantic::PreparedSymbolTable,
 };
 
 use super::{
@@ -356,7 +356,7 @@ impl CanonicalTypeMapperStore {
         resolve_members_with_array_targets(self, reference, array_targets)
     }
 
-    /// Selects one own property from a direct generic interface reference.
+    /// Selects one own or inherited property from a direct generic interface reference.
     ///
     /// A valid missing name returns `Ok(None)`. Invariant resolved properties
     /// reuse their declared symbol and type. The first successful lookup of a
@@ -372,6 +372,30 @@ impl CanonicalTypeMapperStore {
         &mut self,
         reference: TypeId,
         name: &str,
+        array_target: Option<GenericInterfaceArrayTarget>,
+    ) -> Result<Option<InstantiatedInterfaceProperty>, GenericInterfaceMemberError> {
+        self.resolve_generic_interface_property_by_key(
+            reference,
+            EscapedNameRef::source(name),
+            array_target,
+        )
+    }
+
+    /// Selects a source-name or symbol-key property from a direct reference.
+    ///
+    /// The key is byte-exact. Unique and well-known symbol names are not
+    /// converted to source text. This query uses the same member table and
+    /// lazy property type as [`Self::resolve_generic_interface_property`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenericInterfaceMemberError`] for an unsupported receiver,
+    /// an invalid declaration or cache, or allocation failure. A valid missing
+    /// key returns `Ok(None)`.
+    pub fn resolve_generic_interface_property_by_key(
+        &mut self,
+        reference: TypeId,
+        name: EscapedNameRef<'_>,
         array_target: Option<GenericInterfaceArrayTarget>,
     ) -> Result<Option<InstantiatedInterfaceProperty>, GenericInterfaceMemberError> {
         let array_targets = array_target
@@ -452,7 +476,7 @@ pub(super) fn validate_generic_interface_members(
 pub(super) fn resolve_property_with_array_targets(
     store: &mut CanonicalTypeMapperStore,
     reference: TypeId,
-    name: &str,
+    name: EscapedNameRef<'_>,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<InstantiatedInterfaceProperty>, GenericInterfaceMemberError> {
     let mut session = InstantiationSession::new(InstantiationLimits::default());
@@ -468,16 +492,18 @@ pub(super) fn resolve_property_with_array_targets(
 pub(super) fn resolve_property_with_array_targets_and_session(
     store: &mut CanonicalTypeMapperStore,
     reference: TypeId,
-    name: &str,
+    name: EscapedNameRef<'_>,
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
 ) -> Result<Option<InstantiatedInterfaceProperty>, GenericInterfaceMemberError> {
     let members = resolve_members_with_array_targets(store, reference, array_targets)?;
-    let Some(symbol) = members
-        .members
-        .and_then(|table| store.symbol_table(table))
-        .and_then(|table| table.get_source(name))
-    else {
+    let Some(table) = members.members else {
+        return Ok(None);
+    };
+    let table = store
+        .symbol_table(table)
+        .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(reference))?;
+    let Some(symbol) = table.get(name) else {
         return Ok(None);
     };
     let record = store
@@ -5656,16 +5682,25 @@ mod tests {
             }),
         );
 
-        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let selected = context
+            .store_mut_for_test()
+            .resolve_generic_interface_property_by_key(reference, key_name.as_ref(), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.symbol(), computed);
+        assert_eq!(selected.type_id(), string);
+        assert!(selected.is_optional());
+        assert!(!selected.is_readonly());
         assert_eq!(
-            demand_instantiated_property_type(
-                context.store_mut_for_test(),
-                reference,
-                computed,
-                None,
-                &mut session,
-            ),
-            Ok(string),
+            context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(
+                    reference,
+                    &key_name.escaped_display().to_string(),
+                    None,
+                ),
+            Ok(None),
+            "a displayed symbol name is not its byte-exact key",
         );
         let warm = (
             context.store().type_len(),
@@ -5673,6 +5708,28 @@ mod tests {
             context.store().symbol_len(),
             context.store().symbol_store().symbol_table_len(),
             context.store().checker_link_allocated_lengths(),
+        );
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        assert_eq!(
+            crate::semantic::object_members::resolve_object_property_by_key(
+                context.store_mut_for_test(),
+                None,
+                reference,
+                key_name.as_ref(),
+                &mut session,
+            ),
+            Ok(Some(crate::semantic::relater::ResolvedOwnProperty {
+                symbol: selected.symbol(),
+                type_: selected.type_id(),
+                optional: selected.is_optional(),
+                readonly: selected.is_readonly(),
+            })),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolve_generic_interface_property_by_key(reference, key_name.as_ref(), None),
+            Ok(Some(selected)),
         );
         assert_eq!(
             context
@@ -5789,6 +5846,17 @@ mod tests {
             assert_eq!(
                 validate_generic_interface_members(context.store(), reference, None),
                 Err(GenericInterfaceMemberError::InvalidMember(target.late)),
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_property_by_key(
+                        reference,
+                        EscapedNameRef::source("missing"),
+                        None,
+                    ),
+                Err(GenericInterfaceMemberError::InvalidMember(target.late)),
+                "a missing key cannot hide an invalid declaration cache",
             );
             assert_eq!(
                 (

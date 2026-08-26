@@ -14,7 +14,8 @@ use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
-    CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
+    CheckFlags, EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolFlags,
+    SymbolTableId,
 };
 
 use super::{
@@ -6112,14 +6113,33 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     /// Looks up one required-or-optional own property without synthesizing an
     /// apparent member, a global `Object` augmentation, or an index result.
     ///
-    /// The receiver must already be in the exact declared/fresh/derived
-    /// property-only object domain validated by structural relation. A valid
-    /// receiver with no such own property returns `None`; unsupported receiver
-    /// kinds and malformed warm state retain their typed relation failure.
+    /// Nongeneric receivers use the declared/fresh/derived object validation
+    /// from structural relation. Generic references use their declared member
+    /// table and resolve a selected lazy property type. A valid missing name
+    /// returns `None`. Unsupported receivers and invalid caches remain errors.
     pub(super) fn resolved_own_property(
         &mut self,
         type_id: TypeId,
         name: &str,
+    ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+        let mut session = super::instantiate::InstantiationSession::new(
+            super::instantiate::InstantiationLimits::default(),
+        );
+        super::object_members::resolve_object_property_by_key(
+            self,
+            None,
+            type_id,
+            EscapedNameRef::source(name),
+            &mut session,
+        )
+    }
+
+    /// Uses the validated property view for a byte-exact source or symbol key.
+    /// Inherited properties keep the symbol selected by member resolution.
+    pub(super) fn resolved_own_property_by_key(
+        &mut self,
+        type_id: TypeId,
+        name: EscapedNameRef<'_>,
     ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
         let bootstrap = self.relation_bootstrap_facts()?;
         let mut session = RelaterSession::new(self, RelationKind::Assignable, bootstrap);
@@ -6134,7 +6154,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .store
             .symbol_table(members)
             .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?
-            .get_source(name);
+            .get(name);
         let Some(property) = property else {
             return Ok(None);
         };
@@ -17355,6 +17375,98 @@ mod tests {
             }))
         );
         assert_eq!(store.resolved_own_property(object, "missing"), Ok(None));
+    }
+
+    #[test]
+    fn symbol_key_lookup_does_not_match_displayed_source_names_or_hide_invalid_caches() {
+        let library = parse_source_file("");
+        let source = parse_source_file("const row = { \"__@iterator\": 1 };\n");
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(96_480);
+        let mut context =
+            source_relation_context(&library, &source, file, CanonicalCheckerOptions::default());
+        let object =
+            source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::ObjectLiteralExpression(_))
+                        .then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .unwrap();
+        let receiver = context.get_type_at_location(object).unwrap();
+        let key = ts_binder::semantic::SymbolStore::known_symbol_name("iterator");
+        let store = context.store_mut_for_test();
+        let selected = store
+            .resolved_own_property(receiver, "__@iterator")
+            .unwrap()
+            .unwrap();
+        let warm = (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.symbol_store().symbol_table_len(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            store.resolved_own_property_by_key(receiver, key.as_ref()),
+            Ok(None),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.symbol_store().symbol_table_len(),
+                store.relation_state_snapshot(),
+            ),
+            warm,
+        );
+
+        let links = store.value_symbol_links(selected.symbol).unwrap().clone();
+        assert!(store.set_value_symbol_links(
+            selected.symbol,
+            ValueSymbolLinks {
+                name_type: Some(selected.type_),
+                ..links.clone()
+            },
+        ));
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.symbol_store().symbol_table_len(),
+            store.relation_state_snapshot(),
+        );
+        assert!(
+            store
+                .resolved_own_property_by_key(receiver, key.as_ref())
+                .is_err()
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.symbol_store().symbol_table_len(),
+                store.relation_state_snapshot(),
+            ),
+            before,
+        );
+        assert!(store.set_value_symbol_links(selected.symbol, links));
+        assert_eq!(
+            store.resolved_own_property(receiver, "__@iterator"),
+            Ok(Some(selected))
+        );
+
+        let foreign = initialized(false)
+            .intrinsic_bootstrap()
+            .unwrap()
+            .empty_type_literal_type;
+        assert_eq!(
+            store.resolved_own_property_by_key(foreign, key.as_ref()),
+            Err(RelationUnavailable::Type(foreign)),
+        );
     }
 
     #[test]

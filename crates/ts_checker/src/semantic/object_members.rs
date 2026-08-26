@@ -22,12 +22,13 @@ use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeData, NodeFlags, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
-    CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData, SymbolFlags,
-    SymbolTableId, semantic::PreparedSymbolTable,
+    CheckFlags, EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolData,
+    SymbolFlags, SymbolTableId, semantic::PreparedSymbolTable,
 };
 
 use super::{
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, SignatureId, TypeId,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
+    SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
     bootstrap::UnionReduction,
     declared::{
@@ -37,7 +38,8 @@ use super::{
     global_types::preflight_generic_global_type_target,
     instantiate::{InstantiationLimits, InstantiationSession},
     instantiated_members::{
-        demand_instantiated_property_type, resolve_members_with_array_targets,
+        GenericInterfaceMemberError, demand_instantiated_property_type,
+        resolve_members_with_array_targets, resolve_property_with_array_targets_and_session,
         validate_generic_interface_members,
     },
     interface_heritage::{
@@ -51,6 +53,7 @@ use super::{
     reference_types::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
     },
+    relater::ResolvedOwnProperty,
     signatures::{SignatureFlags, TypePredicateKind},
     source_callables::{
         CallableTypePredicatePlan, implicit_any_array_type, plan_callable_type_predicate,
@@ -68,6 +71,71 @@ use super::{
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
 const NODE_FLAG_HAS_ERROR: u32 = 1 << 15;
 const MAX_INTERFACE_PROPERTY_HERITAGE_DEPTH: usize = 16;
+
+/// Reads a source or symbol key through the receiver's validated member table.
+/// Generic references share the caller's session when a property needs its type.
+pub(super) fn resolve_object_property_by_key(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+    session: &mut InstantiationSession,
+) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+    let record = store
+        .type_payload(receiver)
+        .ok_or(RelationUnavailable::Type(receiver))?;
+    let target = match record.data() {
+        TypeData::TypeReference(reference) => reference.object.target,
+        TypeData::Interface(interface)
+            if record.object_flags().contains(ObjectFlags::REFERENCE) =>
+        {
+            interface.reference.object.target
+        }
+        _ => None,
+    };
+    if target.is_some_and(|target| {
+        store.type_payload(target).is_some_and(|target| {
+            matches!(target.data(), TypeData::Interface(_))
+                && !target.object_flags().contains(ObjectFlags::CLASS)
+        })
+    }) {
+        return resolve_property_with_array_targets_and_session(
+            store,
+            receiver,
+            name,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+            session,
+        )
+        .map(|property| {
+            property.map(|property| ResolvedOwnProperty {
+                symbol: property.symbol(),
+                type_: property.type_id(),
+                optional: property.is_optional(),
+                readonly: property.is_readonly(),
+            })
+        })
+        .map_err(|error| match error {
+            GenericInterfaceMemberError::UnsupportedTarget(type_)
+            | GenericInterfaceMemberError::UnsupportedPropertyType(type_) => {
+                RelationUnavailable::UnsupportedStructuredType(type_)
+            }
+            GenericInterfaceMemberError::UnsupportedMember(symbol) => {
+                RelationUnavailable::UnsupportedProperty(symbol)
+            }
+            GenericInterfaceMemberError::Capacity(type_) => {
+                RelationUnavailable::UnionValidationCapacity(type_)
+            }
+            GenericInterfaceMemberError::Reference(_)
+            | GenericInterfaceMemberError::InvalidTarget(_)
+            | GenericInterfaceMemberError::InvalidMember(_)
+            | GenericInterfaceMemberError::InvalidCachedMembers(_)
+            | GenericInterfaceMemberError::InvalidCachedProperty(_) => {
+                RelationUnavailable::InvalidStructuredMembers(receiver)
+            }
+        });
+    }
+    store.resolved_own_property_by_key(receiver, name)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PropertyObjectKind {
