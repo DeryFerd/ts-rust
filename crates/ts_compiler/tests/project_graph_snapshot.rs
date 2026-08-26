@@ -145,6 +145,7 @@ fn graph_snapshot_keeps_each_mode_and_unresolved_lookup() {
         ),
     ] {
         assert_eq!(resolution.request.mode, Some(mode));
+        assert_eq!(resolution.result.effective_mode, Some(mode));
         assert_eq!(resolution.request.kind, ProgramGraphResolutionKind::Module);
         assert_eq!(resolution.request.specifier, "pkg");
         assert!(resolution.request.range.is_some());
@@ -344,7 +345,7 @@ fn graph_snapshot_records_type_directives_runtime_and_reference_targets() {
         source.is_default_library && source.file_name == "/__typescript/lib/lib.es5.d.ts"
     }));
     assert!(
-        graph
+        !graph
             .missing_evidence
             .contains(&ProgramGraphMissingEvidence::ResolutionDefaultModes)
     );
@@ -398,6 +399,10 @@ fn graph_snapshot_keeps_terminal_realpath_and_names_missing_package_evidence() {
     let resolved = graph.resolutions[0].result.resolved.as_ref().unwrap();
     assert_eq!(resolved.resolved_file_name, "/packages/pkg/index.d.ts");
     assert_eq!(
+        resolved.original_file_name,
+        "/project/node_modules/pkg/index.d.ts"
+    );
+    assert_eq!(
         resolved.package_json.as_deref(),
         Some("/project/node_modules/pkg/package.json")
     );
@@ -407,7 +412,7 @@ fn graph_snapshot_keeps_terminal_realpath_and_names_missing_package_evidence() {
         resolved.resolved_file_name
     );
     assert!(
-        graph
+        !graph
             .missing_evidence
             .contains(&ProgramGraphMissingEvidence::ResolutionOriginalPaths)
     );
@@ -495,12 +500,53 @@ fn graph_snapshot_owns_on_disk_config_and_effective_options() {
     );
     assert!(graph.sources.iter().any(|source| source.is_default_library));
     assert!(
-        graph
+        !graph
             .missing_evidence
             .contains(&ProgramGraphMissingEvidence::ConfigExtendsInputs)
     );
     directory.write("tsconfig.json", "changed after loading");
     assert_eq!(program.project_graph_snapshot(), graph);
+}
+
+#[test]
+fn graph_snapshot_retains_decoded_config_parser_text_not_disk_bytes() {
+    let directory = ProjectDirectory::new();
+    directory.write("main.ts", "const value = 1;");
+    let text =
+        r#"{"files":["main.ts"],"compilerOptions":{"noCheck":true,"noEmit":true,"noLib":true}}"#;
+    let bytes = std::iter::once(0xfeff)
+        .chain(text.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let config_path = directory.0.join("tsconfig.json");
+    fs::write(&config_path, &bytes).unwrap();
+    let program = Program::from_config(&OsFileSystem::default(), config_path.to_str().unwrap());
+    let graph = program.project_graph_snapshot();
+    let observation = graph.config_resolution_observation.as_ref().unwrap();
+    assert!(observation.is_complete());
+    let parser_text = observation
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ts_config::ConfigResolutionEvent::ReadFile {
+                kind: ts_config::ConfigInputKind::Config,
+                result: Ok(text),
+                ..
+            } => Some(text),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(parser_text, text);
+    assert_ne!(parser_text.len(), bytes.len());
+    assert_eq!(
+        graph.config.as_ref().unwrap().source_text.as_deref(),
+        Some(text)
+    );
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
 }
 
 #[test]

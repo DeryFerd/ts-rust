@@ -37,7 +37,10 @@ use ts_checker::{
     CheckDiagnostic, CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue,
     ProgramSource, TypeId, TypeKind, check_program_with_paths, empty_check_result,
 };
-use ts_config::{ConfigDiagnostic, resolve_config_file};
+use ts_config::{
+    ConfigDiagnostic, ConfigObservationLimits, ConfigResolutionObservation,
+    resolve_config_file_with_observation,
+};
 use ts_core::{TextPos, TextRange};
 use ts_diagnostics::{Category, Diagnostic, FormatError, message_by_code};
 use ts_glob::{DiscoveryOptions, GlobPattern, discover_files};
@@ -1105,6 +1108,12 @@ struct ProgramConfigInputs {
     options: CompilerOptions,
     diagnostics: Vec<ProgramDiagnostic>,
     graph_config: ProgramGraphConfig,
+    config_resolution_observation: ConfigResolutionObservation,
+}
+
+struct ProgramConfigLoadError {
+    diagnostics: Vec<ProgramDiagnostic>,
+    config_resolution_observation: ConfigResolutionObservation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1437,6 +1446,7 @@ pub struct Program {
     graph_resolutions: Vec<ProgramGraphResolution>,
     graph_references: Vec<ProgramGraphReference>,
     graph_config: Option<ProgramGraphConfig>,
+    graph_config_resolution_observation: Option<ConfigResolutionObservation>,
     module_resolution_diagnostics: Vec<ProgramDiagnostic>,
     package_export_specifiers: BTreeMap<String, Vec<String>>,
     package_display_specifiers: BTreeMap<(FileId, String), String>,
@@ -2696,6 +2706,7 @@ impl Program {
             options,
             mut diagnostics,
             graph_config,
+            config_resolution_observation,
         } = match Self::load_config_inputs(
             file_system,
             config_path,
@@ -2703,11 +2714,15 @@ impl Program {
             None,
         ) {
             Ok(inputs) => inputs,
-            Err(diagnostics) => {
+            Err(ProgramConfigLoadError {
+                diagnostics,
+                config_resolution_observation,
+            }) => {
                 return Ok((
                     Self {
                         diagnostics,
                         config_file_path: Some(ts_path::normalize_path(config_path)),
+                        graph_config_resolution_observation: Some(config_resolution_observation),
                         checker: ProgramChecker::Canonical,
                         ..Self::default()
                     },
@@ -2727,6 +2742,7 @@ impl Program {
         );
         program.config_file_path = Some(config_path);
         program.graph_config = Some(graph_config);
+        program.graph_config_resolution_observation = Some(config_resolution_observation);
         program.load_remaining_program_graph(file_system);
         if let Some(diagnostic) = program.common_source_directory_diagnostic(file_system) {
             diagnostics.push(diagnostic);
@@ -2760,13 +2776,18 @@ impl Program {
             options,
             mut diagnostics,
             graph_config,
+            config_resolution_observation,
             ..
         } = match Self::load_config_inputs(file_system, config_path, overrides, command_line) {
             Ok(inputs) => inputs,
-            Err(diagnostics) => {
+            Err(ProgramConfigLoadError {
+                diagnostics,
+                config_resolution_observation,
+            }) => {
                 return Self {
                     diagnostics,
                     config_file_path: Some(ts_path::normalize_path(config_path)),
+                    graph_config_resolution_observation: Some(config_resolution_observation),
                     ..Self::default()
                 };
             }
@@ -2775,6 +2796,7 @@ impl Program {
             Self::new_with_options(file_system, &current_directory, &root_names, options);
         program.config_file_path = Some(config_path);
         program.graph_config = Some(graph_config);
+        program.graph_config_resolution_observation = Some(config_resolution_observation);
         if let Some(diagnostic) = program.common_source_directory_diagnostic(file_system) {
             diagnostics.push(diagnostic);
         }
@@ -2787,12 +2809,21 @@ impl Program {
         config_path: &str,
         overrides: ProgramOptionsOverride,
         command_line: Option<(&CompilerOptions, &BTreeSet<String>)>,
-    ) -> Result<ProgramConfigInputs, Vec<ProgramDiagnostic>> {
-        let parsed = resolve_config_file(file_system, config_path);
+    ) -> Result<ProgramConfigInputs, ProgramConfigLoadError> {
+        let observed = resolve_config_file_with_observation(
+            file_system,
+            config_path,
+            ConfigObservationLimits::default(),
+        );
+        let parsed = observed.result;
+        let config_resolution_observation = observed.observation;
         let mut config_diagnostics: Vec<_> =
             parsed.diagnostics.iter().map(config_diagnostic).collect();
         let Some(config) = parsed.value else {
-            return Err(config_diagnostics);
+            return Err(ProgramConfigLoadError {
+                diagnostics: config_diagnostics,
+                config_resolution_observation,
+            });
         };
         let config_directory = config
             .path
@@ -2941,6 +2972,7 @@ impl Program {
             options: options_result.options,
             diagnostics: config_diagnostics,
             graph_config,
+            config_resolution_observation,
         })
     }
 

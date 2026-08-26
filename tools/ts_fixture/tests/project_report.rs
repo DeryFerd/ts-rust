@@ -67,9 +67,18 @@ fn project_report_forces_replay_and_compares_owned_artifacts_and_identities() {
     assert_eq!(graph.evidence["options"]["no_emit"], true);
     assert_eq!(graph.evidence["options"]["no_lib"], true);
     assert!(
-        graph
+        !graph
             .missing_evidence
             .contains(&"config_extends_inputs".to_owned())
+    );
+    assert_eq!(
+        graph.evidence["configResolutionObservation"]["retentionComplete"],
+        true
+    );
+    assert!(
+        graph
+            .missing_evidence
+            .contains(&"source_real_paths".to_owned())
     );
     assert!(!project.0.join("index.js").exists());
     assert!(matches!(

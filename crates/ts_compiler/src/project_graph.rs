@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use ts_ast::FileId;
 use ts_checker::semantic::{CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode};
-use ts_config::ProjectConfig;
+use ts_config::{
+    ConfigInputKind, ConfigResolutionEvent, ConfigResolutionObservation, ProjectConfig,
+};
 use ts_core::TextRange;
 use ts_module::{ModuleFormat, ResolutionOptions, ResolutionResult};
 use ts_options::{CompilerOptions, ModuleKind};
@@ -34,7 +36,8 @@ pub struct ProgramGraphSource {
 /// Config data already read by the Program loader.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProgramGraphConfig {
-    /// The leaf text read for diagnostics, after config resolution.
+    /// VFS text from the leaf's later diagnostic read, not raw file bytes.
+    /// This can differ from the resolver's retained parser input.
     pub source_text: Option<String>,
     /// The existing typed config after inheritance and path resolution.
     pub resolved: ProjectConfig,
@@ -107,18 +110,17 @@ pub struct ProgramGraphReference {
 /// Evidence the current loader does not retain for a complete graph comparison.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProgramGraphMissingEvidence {
-    /// Config provenance alone does not include the config's source text.
+    /// The leaf config's VFS text was not retained.
     ConfigSourceText,
-    /// The config resolver omits its exact input bytes. The leaf is read again
-    /// for diagnostics, so its retained text is not proof of the first read.
+    /// The config resolver's parser inputs or read outcomes were not fully retained.
     ConfigParseInputs,
-    /// The config resolver does not return the inherited config paths or texts.
+    /// Config inheritance probes, decisions, or inputs were not fully retained.
     ConfigExtendsInputs,
-    /// Resolved module records omit the path passed to `realpath`.
+    /// A resolved module's original lookup path was not retained.
     ResolutionOriginalPaths,
     /// Root and path-reference loads do not record filesystem realpaths.
     SourceRealPaths,
-    /// Default-mode resolver calls omit the selected import/require condition.
+    /// A resolver call did not retain its selected import/require condition.
     ResolutionDefaultModes,
     /// A package JSON path is not a name, version, or peer-dependency identity.
     PackageIdentities,
@@ -139,6 +141,10 @@ pub struct ProgramGraphSnapshot {
     pub options: CompilerOptions,
     pub config_file_path: Option<String>,
     pub config: Option<ProgramGraphConfig>,
+    /// Observations from the same config resolution, including failed loads.
+    /// Read events retain VFS parser text, not raw disk bytes. Completeness
+    /// describes event retention, not config validity or a complete Program.
+    pub config_resolution_observation: Option<ConfigResolutionObservation>,
     pub resolution_options: Option<ResolutionOptions>,
     pub resolutions: Vec<ProgramGraphResolution>,
     pub references: Vec<ProgramGraphReference>,
@@ -218,6 +224,7 @@ impl Program {
             options: self.options.clone(),
             config_file_path: self.config_file_path.clone(),
             config: self.graph_config.clone(),
+            config_resolution_observation: self.graph_config_resolution_observation.clone(),
             resolution_options: self.graph_resolution_options.clone(),
             resolutions,
             references,
@@ -244,28 +251,42 @@ impl Program {
 
     fn project_graph_missing_evidence(&self) -> Vec<ProgramGraphMissingEvidence> {
         let mut missing = Vec::new();
-        if self.config_file_path.is_some() {
-            if self
+        if let Some(config_path) = &self.config_file_path {
+            let later_text_retained = self
                 .graph_config
                 .as_ref()
-                .is_none_or(|config| config.source_text.is_none())
-            {
+                .is_some_and(|config| config.source_text.is_some());
+            let parser_text_retained = self
+                .graph_config_resolution_observation
+                .as_ref()
+                .is_some_and(|observation| {
+                    observation.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            ConfigResolutionEvent::ReadFile {
+                                path,
+                                kind: ConfigInputKind::Config,
+                                result: Ok(_),
+                            } if path == config_path
+                        )
+                    })
+                });
+            if !later_text_retained && !parser_text_retained {
                 missing.push(ProgramGraphMissingEvidence::ConfigSourceText);
             }
-            missing.push(ProgramGraphMissingEvidence::ConfigParseInputs);
-            missing.push(ProgramGraphMissingEvidence::ConfigExtendsInputs);
+            if self
+                .graph_config_resolution_observation
+                .as_ref()
+                .is_none_or(|observation| !observation.is_complete())
+            {
+                missing.push(ProgramGraphMissingEvidence::ConfigParseInputs);
+                missing.push(ProgramGraphMissingEvidence::ConfigExtendsInputs);
+            }
         }
         if self
             .graph_resolutions
             .iter()
-            .any(|resolution| resolution.result.resolved.is_some())
-        {
-            missing.push(ProgramGraphMissingEvidence::ResolutionOriginalPaths);
-        }
-        if self
-            .graph_resolutions
-            .iter()
-            .any(|resolution| resolution.request.mode.is_none())
+            .any(|resolution| resolution.result.effective_mode.is_none())
         {
             missing.push(ProgramGraphMissingEvidence::ResolutionDefaultModes);
         }
@@ -279,5 +300,96 @@ impl Program {
             missing.push(ProgramGraphMissingEvidence::SourcePackageScopes);
         }
         missing
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_config::{ConfigObservationLimits, resolve_config_file_with_observation};
+    use ts_module::{ModuleFormat, ResolutionResult};
+    use ts_vfs::{FileSystem, MemoryFileSystem};
+
+    use super::{
+        Program, ProgramGraphMissingEvidence, ProgramGraphResolutionKind,
+        ProgramGraphResolutionRequest,
+    };
+
+    #[test]
+    fn config_evidence_gaps_follow_observation_retention() {
+        let filesystem = MemoryFileSystem::new(true);
+        let path = "/project/tsconfig.json";
+        filesystem
+            .write_file(
+                path,
+                r#"{"files":[],"compilerOptions":{"noCheck":true,"noEmit":true,"noLib":true}}"#,
+            )
+            .unwrap();
+        let mut program = Program::from_config(&filesystem, path);
+        let complete = program.graph_config_resolution_observation.clone().unwrap();
+        let limited = resolve_config_file_with_observation(
+            &filesystem,
+            path,
+            ConfigObservationLimits {
+                max_events: 1,
+                max_string_bytes: usize::MAX,
+            },
+        );
+        assert!(!limited.observation.is_complete());
+        program.graph_config_resolution_observation = Some(limited.observation);
+        let missing = program.project_graph_missing_evidence();
+        assert!(missing.contains(&ProgramGraphMissingEvidence::ConfigParseInputs));
+        assert!(missing.contains(&ProgramGraphMissingEvidence::ConfigExtendsInputs));
+        assert!(!missing.contains(&ProgramGraphMissingEvidence::ConfigSourceText));
+
+        program.graph_config.as_mut().unwrap().source_text = None;
+        assert!(
+            program
+                .project_graph_missing_evidence()
+                .contains(&ProgramGraphMissingEvidence::ConfigSourceText)
+        );
+        program.graph_config_resolution_observation = Some(complete);
+        assert!(
+            !program
+                .project_graph_missing_evidence()
+                .contains(&ProgramGraphMissingEvidence::ConfigSourceText)
+        );
+        assert!(
+            !program
+                .project_graph_missing_evidence()
+                .contains(&ProgramGraphMissingEvidence::ConfigParseInputs)
+        );
+        assert!(
+            !program
+                .project_graph_missing_evidence()
+                .contains(&ProgramGraphMissingEvidence::ConfigExtendsInputs)
+        );
+    }
+
+    #[test]
+    fn resolution_evidence_requires_an_observed_effective_mode() {
+        let mut program = Program::default();
+        program.record_graph_resolution(
+            ProgramGraphResolutionRequest {
+                kind: ProgramGraphResolutionKind::Module,
+                containing_file: "/project/main.ts".to_owned(),
+                range: None,
+                specifier: "pkg".to_owned(),
+                mode: Some(ModuleFormat::Esm),
+            },
+            &ResolutionResult::default(),
+            None,
+        );
+        assert!(
+            program
+                .project_graph_missing_evidence()
+                .contains(&ProgramGraphMissingEvidence::ResolutionDefaultModes)
+        );
+        program.graph_resolutions[0].request.mode = None;
+        program.graph_resolutions[0].result.effective_mode = Some(ModuleFormat::CommonJs);
+        assert!(
+            !program
+                .project_graph_missing_evidence()
+                .contains(&ProgramGraphMissingEvidence::ResolutionDefaultModes)
+        );
     }
 }

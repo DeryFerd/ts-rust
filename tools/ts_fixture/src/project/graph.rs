@@ -6,6 +6,7 @@ use ts_compiler::{
     CanonicalProgramCheckError, Program, ProgramGraphMissingEvidence, ProgramGraphReferenceKind,
     ProgramGraphResolutionKind,
 };
+use ts_config::{ConfigInputKind, ConfigResolutionEvent, ConfigResolutionObservation};
 use ts_module::{FailedLookupKind, ModuleFormat, ResolutionMode};
 use ts_options::ModuleResolutionKind;
 
@@ -49,6 +50,71 @@ const fn format_name(mode: ModuleFormat) -> &'static str {
         ModuleFormat::CommonJs => "commonjs",
         ModuleFormat::Esm => "esm",
     }
+}
+
+fn config_observation_report(observation: &ConfigResolutionObservation) -> Value {
+    let events = observation
+        .events
+        .iter()
+        .map(|event| match event {
+            ConfigResolutionEvent::FileExists { path, exists } => json!({
+                "kind": "file_exists",
+                "path": path_identity(path),
+                "exists": exists,
+            }),
+            ConfigResolutionEvent::DirectoryExists { path, exists } => json!({
+                "kind": "directory_exists",
+                "path": path_identity(path),
+                "exists": exists,
+            }),
+            ConfigResolutionEvent::ReadFile { path, kind, result } => {
+                let result = match result {
+                    Ok(text) => json!({
+                        "status": "read",
+                        "parserInputText": text,
+                        "parserInputTextUtf8ByteCount": text.len(),
+                        "parserInputTextDigest": stable_digest(text.as_bytes()),
+                        "digestAlgorithm": SCORECARD_DIGEST_ALGORITHM,
+                    }),
+                    Err(error) => json!({
+                        "status": "error",
+                        "errorKind": format!("{:?}", error.kind),
+                        "message": error.message,
+                    }),
+                };
+                json!({
+                    "kind": "read_file",
+                    "path": path_identity(path),
+                    "inputKind": match kind {
+                        ConfigInputKind::Config => "config",
+                        ConfigInputKind::PackageJson => "package_json",
+                    },
+                    "result": result,
+                })
+            }
+            ConfigResolutionEvent::Extends {
+                config_path,
+                specifier,
+                resolved_path,
+            } => json!({
+                "kind": "extends",
+                "configPath": path_identity(config_path),
+                "specifier": specifier,
+                "resolvedPath": resolved_path.as_deref().map(path_identity),
+            }),
+            ConfigResolutionEvent::Cycle { path, chain } => json!({
+                "kind": "cycle",
+                "path": path_identity(path),
+                "chain": chain.iter().map(|path| path_identity(path)).collect::<Vec<_>>(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "retentionComplete": observation.is_complete(),
+        "omittedEvents": observation.omitted_events,
+        "textRepresentation": "vfs_parser_input",
+        "events": events,
+    })
 }
 
 fn manifest_node_location(program: &Program, reference: NodeRef) -> Value {
@@ -197,6 +263,7 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
         let request = &resolution.request;
         let resolved = resolution.result.resolved.as_ref().map(|target| json!({
             "fileName": path_identity(&target.resolved_file_name),
+            "originalFileName": path_identity(&target.original_file_name),
             "extension": target.extension.map(ts_path::FileExtension::as_str),
             "resolvedUsingTsExtension": target.resolved_using_ts_extension,
             "externalLibraryImport": target.is_external_library_import,
@@ -226,6 +293,7 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
             "range": request.range.map(|range| json!({"startByte": range.start.get(), "endByte": range.end.get()})),
             "specifier": request.specifier,
             "mode": request.mode.map(format_name),
+            "effectiveMode": resolution.result.effective_mode.map(format_name),
             "resolved": resolved,
             "ambientTarget": resolution.ambient_target.as_deref().map(path_identity),
             "loadedTarget": target,
@@ -270,8 +338,8 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
     });
     let config = graph.config.as_ref().map(|config| json!({
         "fileName": graph.config_file_path,
-        "sourceDigest": config.source_text.as_deref().map(|text| stable_digest(text.as_bytes())),
-        "sourceByteCount": config.source_text.as_ref().map(String::len),
+        "diagnosticSourceTextDigest": config.source_text.as_deref().map(|text| stable_digest(text.as_bytes())),
+        "diagnosticSourceTextUtf8ByteCount": config.source_text.as_ref().map(String::len),
         "resolvedPath": config.resolved.path,
         "resolvedFiles": config.resolved.files,
         "resolvedInclude": config.resolved.include,
@@ -319,6 +387,7 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
         "options": normalized_options(&graph.options),
         "configFilePath": graph.config_file_path,
         "config": config,
+        "configResolutionObservation": graph.config_resolution_observation.as_ref().map(config_observation_report),
         "resolutionOptions": resolution_options,
         "resolutions": resolutions,
         "references": references,
@@ -396,12 +465,18 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use serde_json::{Value, json};
     use ts_compiler::Program;
+    use ts_config::{
+        ConfigInputKind, ConfigReadError, ConfigResolutionEvent, ConfigResolutionObservation,
+    };
     use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind};
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
-    use super::{ProjectStage, snapshot_report};
+    use super::{ProjectStage, config_observation_report, snapshot_report};
+    use crate::{SCORECARD_DIGEST_ALGORITHM, stable_digest};
 
     fn graph_options() -> CompilerOptions {
         CompilerOptions {
@@ -536,5 +611,195 @@ mod tests {
             }
             assert_eq!(serde_json::from_str::<Value>(detail).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn graph_report_retains_ordered_config_inputs_and_inheritance_outcomes() {
+        let filesystem = MemoryFileSystem::new(true);
+        let leaf = "{\r\n\"extends\":[\"preset\",\"./missing\"],\"files\":[\"main.ts\"],\"compilerOptions\":{\"noCheck\":true,\"noEmit\":true,\"noLib\":true}}\r\n";
+        let package = r#"{"tsconfig":"configs/base"}"#;
+        let base = r#"{"extends":"../../../tsconfig.json","compilerOptions":{"strict":true}}"#;
+        for (path, text) in [
+            ("/project/tsconfig.json", leaf),
+            ("/project/node_modules/preset/package.json", package),
+            ("/project/node_modules/preset/configs/base.json", base),
+            ("/project/main.ts", "const value = 1;"),
+        ] {
+            filesystem.write_file(path, text).unwrap();
+        }
+        let program = Program::from_config(&filesystem, "/project/tsconfig.json");
+        assert!(!program.diagnostics().is_empty());
+        let graph = snapshot_report(&program);
+        let observation = &graph.evidence["configResolutionObservation"];
+        assert_eq!(observation["retentionComplete"], true);
+        assert_eq!(observation["omittedEvents"], 0);
+        assert_eq!(observation["textRepresentation"], "vfs_parser_input");
+        let events = observation["events"].as_array().unwrap();
+        let reads = events
+            .iter()
+            .filter(|event| event["kind"] == "read_file")
+            .collect::<Vec<_>>();
+        for (read, path, kind, text) in [
+            (reads[0], "/project/tsconfig.json", "config", leaf),
+            (
+                reads[1],
+                "/project/node_modules/preset/package.json",
+                "package_json",
+                package,
+            ),
+            (
+                reads[2],
+                "/project/node_modules/preset/configs/base.json",
+                "config",
+                base,
+            ),
+        ] {
+            assert_eq!(read["path"], path);
+            assert_eq!(read["inputKind"], kind);
+            assert_eq!(
+                read["result"],
+                json!({
+                    "status": "read",
+                    "parserInputText": text,
+                    "parserInputTextUtf8ByteCount": text.len(),
+                    "parserInputTextDigest": stable_digest(text.as_bytes()),
+                    "digestAlgorithm": SCORECARD_DIGEST_ALGORITHM,
+                })
+            );
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| event["kind"] == "directory_exists")
+        );
+        assert!(events.iter().any(|event| event == &json!({
+            "kind": "cycle",
+            "path": "/project/tsconfig.json",
+            "chain": ["/project/tsconfig.json", "/project/node_modules/preset/configs/base.json", "/project/tsconfig.json"],
+        })));
+        assert!(events.iter().any(|event| event["kind"] == "extends"
+            && event["specifier"] == "./missing"
+            && event["resolvedPath"].is_null()));
+        assert_eq!(
+            graph.evidence["config"]["diagnosticSourceTextDigest"],
+            stable_digest(leaf.as_bytes()),
+        );
+        for gap in [
+            "source_real_paths",
+            "package_identities",
+            "source_package_scopes",
+        ] {
+            assert!(graph.missing_evidence.iter().any(|missing| missing == gap));
+        }
+        for gap in ["config_parse_inputs", "config_extends_inputs"] {
+            assert!(!graph.missing_evidence.iter().any(|missing| missing == gap));
+        }
+    }
+
+    #[test]
+    fn config_observation_retention_does_not_imply_a_loaded_config() {
+        for text in [None, Some("!")] {
+            let filesystem = MemoryFileSystem::new(true);
+            if let Some(text) = text {
+                filesystem
+                    .write_file("/project/tsconfig.json", text)
+                    .unwrap();
+            }
+            let program = Program::from_config(&filesystem, "/project/tsconfig.json");
+            let graph = snapshot_report(&program);
+            assert!(graph.evidence["config"].is_null());
+            assert_eq!(
+                graph.evidence["configResolutionObservation"]["retentionComplete"],
+                true
+            );
+            assert!(!program.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn config_observation_report_retains_read_errors_and_omission_count() {
+        let observation = ConfigResolutionObservation {
+            events: vec![ConfigResolutionEvent::ReadFile {
+                path: "/project/tsconfig.json".to_owned(),
+                kind: ConfigInputKind::Config,
+                result: Err(ConfigReadError {
+                    kind: io::ErrorKind::PermissionDenied,
+                    message: "denied".to_owned(),
+                }),
+            }],
+            omitted_events: 3,
+        };
+        assert_eq!(
+            config_observation_report(&observation),
+            json!({
+                "retentionComplete": false,
+                "omittedEvents": 3,
+                "textRepresentation": "vfs_parser_input",
+                "events": [{
+                    "kind": "read_file",
+                    "path": "/project/tsconfig.json",
+                    "inputKind": "config",
+                    "result": {"status": "error", "errorKind": "PermissionDenied", "message": "denied"},
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn graph_report_keeps_actual_original_paths_and_effective_default_modes() {
+        let filesystem = MemoryFileSystem::new(true);
+        for (path, text) in [
+            (
+                "/project/main.ts",
+                "/// <reference types='pkg' />\nconst value = 1;",
+            ),
+            (
+                "/packages/pkg/package.json",
+                r#"{"name":"@types/pkg","types":"index.d.ts"}"#,
+            ),
+            (
+                "/packages/pkg/index.d.ts",
+                "export declare const value: number;",
+            ),
+        ] {
+            filesystem.write_file(path, text).unwrap();
+        }
+        filesystem.add_directory_link("/packages/pkg", "/project/node_modules/@types/pkg");
+        let program = Program::new_with_options(
+            &filesystem,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::None,
+                module_resolution: ModuleResolutionKind::Node10,
+                types: Some(Vec::new()),
+                ..graph_options()
+            },
+        );
+        let graph = snapshot_report(&program);
+        let resolution = &graph.evidence["resolutions"][0];
+        assert_eq!(resolution["kind"], "type_reference");
+        assert!(resolution["mode"].is_null());
+        assert_eq!(resolution["effectiveMode"], "commonjs");
+        assert_eq!(
+            resolution["resolved"]["originalFileName"],
+            "/project/node_modules/@types/pkg/index.d.ts"
+        );
+        assert_eq!(
+            resolution["resolved"]["fileName"],
+            "/packages/pkg/index.d.ts"
+        );
+        assert!(
+            !graph
+                .missing_evidence
+                .iter()
+                .any(|gap| gap == "resolution_original_paths" || gap == "resolution_default_modes")
+        );
+        assert!(
+            graph
+                .missing_evidence
+                .iter()
+                .any(|gap| gap == "source_real_paths")
+        );
     }
 }
