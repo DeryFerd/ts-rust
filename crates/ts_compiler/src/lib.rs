@@ -1035,6 +1035,14 @@ pub struct ProgramOptionsOverride {
     pub no_lib: Option<bool>,
 }
 
+struct ProgramConfigInputs {
+    config_path: String,
+    current_directory: String,
+    root_names: Vec<String>,
+    options: CompilerOptions,
+    diagnostics: Vec<ProgramDiagnostic>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputFile {
     pub file_name: String,
@@ -2233,21 +2241,119 @@ impl Program {
         )
     }
 
+    /// Loads a tsconfig and checks its file graph with the canonical checker.
+    ///
+    /// The query callback uses the original canonical graph and can read config
+    /// diagnostics. It is not called when the config cannot be loaded or when
+    /// `noCheck` disables checking. This method never invokes the legacy checker
+    /// or emits files.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same construction failures as
+    /// [`Self::try_new_with_canonical_checker_and_queries`]. Config diagnostics
+    /// remain on the returned Program.
+    pub fn try_from_config_with_canonical_checker_and_queries<T>(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+        queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
+    ) -> Result<(Self, Option<T>), CanonicalProgramCheckError> {
+        let ProgramConfigInputs {
+            config_path,
+            current_directory,
+            root_names,
+            options,
+            mut diagnostics,
+        } = match Self::load_config_inputs(
+            file_system,
+            config_path,
+            ProgramOptionsOverride::default(),
+            None,
+        ) {
+            Ok(inputs) => inputs,
+            Err(diagnostics) => {
+                return Ok((
+                    Self {
+                        diagnostics,
+                        config_file_path: Some(ts_path::normalize_path(config_path)),
+                        checker: ProgramChecker::Canonical,
+                        ..Self::default()
+                    },
+                    None,
+                ));
+            }
+        };
+        let mut program = Self::new_unchecked_with_options_and_checker(
+            file_system,
+            &current_directory,
+            &root_names,
+            options,
+            ProgramChecker::Canonical,
+        );
+        program.config_file_path = Some(config_path);
+        program.load_remaining_program_graph(file_system);
+        if let Some(diagnostic) = program.common_source_directory_diagnostic(file_system) {
+            diagnostics.push(diagnostic);
+        }
+        let settings = program.options.printer_settings();
+        if settings.emit_javascript || settings.emit_declarations {
+            let output_diagnostics = program.canonical_output_diagnostics();
+            program.diagnostics.extend(output_diagnostics);
+        }
+        program.add_config_diagnostics(diagnostics);
+        let mut result = None;
+        if !program.options.no_check {
+            let (diagnostics, query_result) = program.check_program_canonical(queries)?;
+            program.diagnostics.extend(diagnostics);
+            result = Some(query_result);
+        }
+        program.diagnostics.sort_by(compare_program_diagnostics);
+        Ok((program, result))
+    }
+
     fn from_config_with_overrides(
         file_system: &dyn FileSystem,
         config_path: &str,
         overrides: ProgramOptionsOverride,
         command_line: Option<(&CompilerOptions, &BTreeSet<String>)>,
     ) -> Self {
+        let ProgramConfigInputs {
+            config_path,
+            current_directory,
+            root_names,
+            options,
+            mut diagnostics,
+        } = match Self::load_config_inputs(file_system, config_path, overrides, command_line) {
+            Ok(inputs) => inputs,
+            Err(diagnostics) => {
+                return Self {
+                    diagnostics,
+                    config_file_path: Some(ts_path::normalize_path(config_path)),
+                    ..Self::default()
+                };
+            }
+        };
+        let mut program =
+            Self::new_with_options(file_system, &current_directory, &root_names, options);
+        program.config_file_path = Some(config_path);
+        if let Some(diagnostic) = program.common_source_directory_diagnostic(file_system) {
+            diagnostics.push(diagnostic);
+        }
+        program.add_config_diagnostics(diagnostics);
+        program
+    }
+
+    fn load_config_inputs(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+        overrides: ProgramOptionsOverride,
+        command_line: Option<(&CompilerOptions, &BTreeSet<String>)>,
+    ) -> Result<ProgramConfigInputs, Vec<ProgramDiagnostic>> {
         let parsed = resolve_config_file(file_system, config_path);
         let mut config_diagnostics: Vec<_> =
             parsed.diagnostics.iter().map(config_diagnostic).collect();
         let Some(config) = parsed.value else {
-            return Self {
-                diagnostics: config_diagnostics,
-                config_file_path: Some(ts_path::normalize_path(config_path)),
-                ..Self::default()
-            };
+            return Err(config_diagnostics);
         };
         let config_directory = config
             .path
@@ -2354,18 +2460,19 @@ impl Program {
                     || json_patterns.iter().any(|pattern| pattern.matches(root))
             });
         }
-        let mut program = Self::new_with_options(
-            file_system,
-            config_directory,
-            &roots,
-            options_result.options,
-        );
-        program.config_file_path = Some(config.path);
-        if let Some(diagnostic) = program.common_source_directory_diagnostic(file_system) {
-            config_diagnostics.push(diagnostic);
-        }
+        options_result.options.normalize_strict_flags();
+        Ok(ProgramConfigInputs {
+            current_directory: config_directory.to_owned(),
+            config_path: config.path,
+            root_names: roots,
+            options: options_result.options,
+            diagnostics: config_diagnostics,
+        })
+    }
+
+    fn add_config_diagnostics(&mut self, mut config_diagnostics: Vec<ProgramDiagnostic>) {
         config_diagnostics.sort_by(compare_program_diagnostics);
-        program.diagnostics.retain(|diagnostic| {
+        self.diagnostics.retain(|diagnostic| {
             if diagnostic.file_name.is_some() {
                 return true;
             }
@@ -2374,9 +2481,8 @@ impl Program {
                     configured.code == diagnostic.code && configured.message == diagnostic.message
                 })
         });
-        config_diagnostics.append(&mut program.diagnostics);
-        program.diagnostics = config_diagnostics;
-        program
+        config_diagnostics.append(&mut self.diagnostics);
+        self.diagnostics = config_diagnostics;
     }
 
     #[must_use]
