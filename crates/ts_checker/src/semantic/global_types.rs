@@ -462,6 +462,16 @@ pub(super) fn global_iterable_type_requires_protocol(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
 ) -> Result<bool, CanonicalGlobalTypeInitializationError> {
+    optional_global_type_has_arity(store, host, "Iterable", 3)
+}
+
+/// Validates an optional global identity without publishing declaration caches.
+pub(super) fn optional_global_type_has_arity(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    name: &str,
+    expected_arity: usize,
+) -> Result<bool, CanonicalGlobalTypeInitializationError> {
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(CanonicalGlobalTypeInitializationError::MissingBootstrap)?;
@@ -475,7 +485,7 @@ pub(super) fn global_iterable_type_requires_protocol(
         resolve_global_name(
             store.symbol_store(),
             &mut resolver_host,
-            "Iterable",
+            name,
             SymbolFlags::TYPE,
             None,
             false,
@@ -578,7 +588,31 @@ pub(super) fn global_iterable_type_requires_protocol(
             symbol,
         ));
     }
-    Ok(arity == 3)
+    Ok(arity == expected_arity)
+}
+
+/// Resolves an optional global through the same kind and arity rules as initialization.
+pub(super) fn resolve_optional_global_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    name: &str,
+    arity: usize,
+) -> Result<Option<TypeId>, CanonicalGlobalTypeInitializationError> {
+    if !optional_global_type_has_arity(store, host, name, arity)? {
+        return Ok(None);
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(CanonicalGlobalTypeInitializationError::MissingBootstrap)?;
+    let mut resolver = GlobalTypeResolver {
+        globals: bootstrap.globals,
+        empty_object_type: bootstrap.empty_object_type,
+        empty_generic_type: bootstrap.empty_generic_type,
+        store,
+        host,
+        diagnostics: Vec::new(),
+    };
+    resolver.resolve(name, arity, false).map(Some)
 }
 
 /// Proves the pinned no-heritage `Object` fast path without resolving any
