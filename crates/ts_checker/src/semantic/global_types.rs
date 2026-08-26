@@ -455,6 +455,31 @@ pub(super) fn initialize_global_library_types(
     })
 }
 
+/// Resolves the optional three-parameter `Iterable` type used by iteration checking.
+pub(super) fn optional_global_iterable_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+) -> Result<Option<TypeId>, CanonicalGlobalTypeInitializationError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(CanonicalGlobalTypeInitializationError::MissingBootstrap)?;
+    let (globals, empty_object_type, empty_generic_type) = (
+        bootstrap.globals,
+        bootstrap.empty_object_type,
+        bootstrap.empty_generic_type,
+    );
+    let type_ = GlobalTypeResolver {
+        store,
+        host,
+        globals,
+        empty_object_type,
+        empty_generic_type,
+        diagnostics: Vec::new(),
+    }
+    .resolve("Iterable", 3, false)?;
+    Ok((type_ != empty_generic_type).then_some(type_))
+}
+
 /// Proves the pinned no-heritage `Object` fast path without resolving any
 /// heritage expressions. The proof is deliberately restricted to a real,
 /// non-generic merged interface; value-side `var Object` declarations do not

@@ -76,8 +76,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ts_ast::{
-    FileId, FlowFlags, FlowNodePayload, ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeId,
-    NodeRef, SyntaxKind,
+    FileId, ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind,
 };
 use ts_binder::{
     BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags, EscapedName,
@@ -1130,7 +1129,6 @@ enum PlannedArrowBody {
 enum PlannedFunctionBody {
     Ambient,
     Empty,
-    ArrayParameterAssignments(Vec<PlannedArrayParameterAssignment>),
     ObjectShorthandAssignment(Box<PlannedObjectShorthandAssignment>),
     Return {
         statement: NodeRef,
@@ -1205,14 +1203,6 @@ struct PlannedObjectShorthandAssignment {
     target: PlannedExpression,
     initializer: PlannedExpression,
     source: PlannedExpression,
-}
-
-#[derive(Clone, Debug)]
-struct PlannedArrayParameterAssignment {
-    expression: NodeRef,
-    target: NodeRef,
-    symbol: SemanticSymbolId,
-    value: PlannedExpression,
 }
 
 #[derive(Clone, Debug)]
@@ -10017,11 +10007,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             block.statements.nodes.clone()
         };
-        if let Some(assignments) =
-            self.plan_array_parameter_assignment_body(callable, &statements)?
-        {
-            return Ok(PlannedFunctionBody::ArrayParameterAssignments(assignments));
-        }
         if let [statement_id] = statements.as_slice()
             && self.node(self.reference(*statement_id))?.kind == SyntaxKind::IfStatement
         {
@@ -10129,211 +10114,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         Ok(PlannedFunctionBody::Empty)
-    }
-
-    fn plan_array_parameter_assignment_body(
-        &mut self,
-        callable: &SourceCallablePlan,
-        statements: &[NodeId],
-    ) -> Result<Option<Vec<PlannedArrayParameterAssignment>>, SourceCheckError> {
-        let [first_statement, second_statement] = statements else {
-            return Ok(None);
-        };
-        let [parameter] = callable.parameters.as_slice() else {
-            return Ok(None);
-        };
-        if callable.family != SourceCallableFamily::FunctionDeclaration
-            || !callable.return_type.is_inferred()
-            || !parameter.has_inferred_initializer_type()
-            || parameter.initializer.is_none()
-        {
-            return Ok(None);
-        }
-        let Some((store, host)) = self.semantic else {
-            return Ok(None);
-        };
-        let Some(bindings) = authenticated_function_array_parameter_bindings(
-            store,
-            host,
-            callable.declaration,
-            parameter.declaration,
-        ) else {
-            return Ok(None);
-        };
-        let [first_binding, second_binding, receiver_binding] = bindings.as_slice() else {
-            return Ok(None);
-        };
-        let graph = self.bound.flow_graph();
-        let Some(start) = graph.container_start(callable.declaration) else {
-            return Err(Self::unsupported_function_body(callable));
-        };
-        if graph.container_is_complete(callable.declaration) != Some(true)
-            || graph.container_end(callable.declaration).is_none()
-            || graph.container_return(callable.declaration).is_some()
-        {
-            return Err(Self::unsupported_function_body(callable));
-        }
-
-        let mut assignments = Vec::with_capacity(2);
-        let mut previous = start;
-        for (position, (statement, binding)) in [
-            (*first_statement, first_binding),
-            (*second_statement, second_binding),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let statement = self.reference(statement);
-            let statement_record = self.node(statement)?;
-            let NodeData::ExpressionStatement(statement_data) = &statement_record.data else {
-                return Err(Self::unsupported_function_body(callable));
-            };
-            let expression = self.reference(statement_data.expression);
-            let expression_record = self.node(expression)?;
-            let NodeData::BinaryExpression(binary) = &expression_record.data else {
-                return Err(Self::unsupported_function_body(callable));
-            };
-            let target = self.reference(binary.left);
-            let operator = self.reference(binary.operator_token);
-            let value = self.reference(binary.right);
-            let target_record = self.node(target)?;
-            let NodeData::Identifier(target_name) = &target_record.data else {
-                return Err(Self::unsupported_function_body(callable));
-            };
-            let operator_record = self.node(operator)?;
-            let value_record = self.node(value)?;
-            let NodeData::ElementAccessExpression(access) = &value_record.data else {
-                return Err(Self::unsupported_function_body(callable));
-            };
-            let receiver = self.reference(access.expression);
-            let receiver_record = self.node(receiver)?;
-            let NodeData::Identifier(receiver_name) = &receiver_record.data else {
-                return Err(Self::unsupported_function_body(callable));
-            };
-            let index = self.reference(access.argument_expression);
-            let index_record = self.node(index)?;
-            let NodeData::NumericLiteral(index_value) = &index_record.data else {
-                return Err(Self::unsupported_function_body(callable));
-            };
-            let expected_index = (position + 1).to_string();
-            if statement_record.kind != SyntaxKind::ExpressionStatement
-                || statement_record.flags.0 != 0
-                || statement_record.parent != Some(callable.body.node)
-                || statement_data.flow_node.is_some()
-                || expression_record.kind != SyntaxKind::BinaryExpression
-                || expression_record.flags.0 != 0
-                || expression_record.parent != Some(statement.node)
-                || binary.symbol.is_some()
-                || binary.type_.is_some()
-                || binary.facts != 0
-                || binary.modifiers.is_some()
-                || target_record.kind != SyntaxKind::Identifier
-                || target_record.flags.0 != 0
-                || target_record.parent != Some(expression.node)
-                || target_name.flow_node.is_some()
-                || operator_record.kind != SyntaxKind::EqualsToken
-                || operator_record.flags.0 != 0
-                || operator_record.parent != Some(expression.node)
-                || !matches!(operator_record.data, NodeData::Token(_))
-                || value_record.kind != SyntaxKind::ElementAccessExpression
-                || value_record.flags.0 != 0
-                || value_record.parent != Some(expression.node)
-                || access.flow_node.is_some()
-                || access.question_dot_token.is_some()
-                || access.facts != 0
-                || receiver_record.kind != SyntaxKind::Identifier
-                || receiver_record.flags.0 != 0
-                || receiver_record.parent != Some(value.node)
-                || receiver_name.flow_node.is_some()
-                || index_record.kind != SyntaxKind::NumericLiteral
-                || index_record.flags.0 != 0
-                || index_record.parent != Some(value.node)
-                || index_value.token_flags.0 != 0
-                || index_value.text != expected_index
-                || !self.source_spelling_matches(index, &expected_index)
-                || [statement, expression, target, value, receiver, index]
-                    .into_iter()
-                    .any(|node| {
-                        self.bound.container(node) != Some(callable.declaration)
-                            || self.bound.block_scope_container(node) != Some(callable.declaration)
-                    })
-                || self.bound.flow_container(statement) != Some(callable.declaration)
-                || self.bound.flow_at(statement) != Some(previous)
-            {
-                return Err(Self::unsupported_function_body(callable));
-            }
-            let target_name = target_name.text.clone();
-            let receiver_name = receiver_name.text.clone();
-            let target_read = plan_identifier_read(
-                self.arena,
-                self.bound,
-                store,
-                host,
-                &self.prior_variables,
-                &self.readable_variables,
-                target,
-                &target_name,
-            )
-            .map_err(Self::variable_plan_error)?;
-            if target_read.value_symbol != binding.1
-                || self
-                    .bound
-                    .locals(callable.declaration)
-                    .and_then(|locals| store.symbol_table(locals))
-                    .and_then(|locals| locals.get_source(&receiver_name))
-                    != Some(receiver_binding.1)
-                || target_read.value_symbol == receiver_binding.1
-            {
-                return Err(Self::unsupported_function_body(callable));
-            }
-            let next = if position == 0 {
-                self.bound
-                    .flow_at(self.reference(*second_statement))
-                    .ok_or_else(|| Self::unsupported_function_body(callable))?
-            } else {
-                self.bound
-                    .flow_graph()
-                    .container_end(callable.declaration)
-                    .ok_or_else(|| Self::unsupported_function_body(callable))?
-            };
-            let assignment = self
-                .bound
-                .flow_graph()
-                .nodes()
-                .get(next)
-                .ok_or_else(|| Self::unsupported_function_body(callable))?;
-            let kind = assignment.flags.bits()
-                & !(FlowFlags::REFERENCED.bits() | FlowFlags::SHARED.bits());
-            if kind != FlowFlags::ASSIGNMENT.bits()
-                || assignment.payload != Some(FlowNodePayload::Ast(target))
-                || assignment.antecedent != Some(previous)
-                || !assignment.antecedents.is_empty()
-            {
-                return Err(Self::unsupported_function_body(callable));
-            }
-            previous = next;
-            self.identifier_reads
-                .push((target, target_read.resolved_symbol));
-            let value = self.plan_expression(value)?;
-            let PlannedExpressionKind::Element(element) = &value.kind else {
-                return Err(Self::unsupported_function_body(callable));
-            };
-            if !matches!(
-                &element.receiver.kind,
-                PlannedExpressionKind::Identifier(read)
-                    if read.kind == PlannedIdentifierReadKind::Variable
-                        && read.value_symbol == receiver_binding.1
-            ) {
-                return Err(Self::unsupported_function_body(callable));
-            }
-            assignments.push(PlannedArrayParameterAssignment {
-                expression,
-                target,
-                symbol: binding.1,
-                value,
-            });
-        }
-        Ok(Some(assignments))
     }
 
     #[allow(clippy::too_many_lines)] // Keep the counted loop and lexical capture proofs together.
@@ -12203,11 +11983,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             &name,
         )
         .map_err(Self::variable_plan_error)?;
-        let Some(parameter) = callable
+        let parameter = callable
             .parameters
             .iter()
             .find(|parameter| parameter.symbol == read.value_symbol)
-        else {
+            .map(|parameter| parameter.declaration)
+            .or_else(|| {
+                callable.parameters.iter().find_map(|parameter| {
+                    authenticated_function_array_parameter_bindings(
+                        store,
+                        host,
+                        callable.declaration,
+                        parameter.declaration,
+                    )?
+                    .into_iter()
+                    .find_map(|(declaration, symbol)| {
+                        (symbol == read.value_symbol).then_some(declaration)
+                    })
+                })
+            });
+        let Some(parameter) = parameter else {
             return Err(Self::unsupported_function_body(callable));
         };
         self.identifier_reads.push((target, read.resolved_symbol));
@@ -12218,8 +12013,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             expression,
             flow: SourceFlowParameterAssignment {
                 target,
-                parameter: parameter.declaration,
-                symbol: parameter.symbol,
+                parameter,
+                symbol: read.value_symbol,
             },
             right,
         }))
@@ -23714,17 +23509,6 @@ fn preflight_inferred_function_return_dependencies(
         let body_supported = match &function.body {
             PlannedFunctionBody::Ambient => !function.callable.return_type.is_inferred(),
             PlannedFunctionBody::Empty | PlannedFunctionBody::ReturnJsx { .. } => true,
-            PlannedFunctionBody::ArrayParameterAssignments(assignments) => {
-                assignments.iter().all(|assignment| {
-                    locals.contains(&assignment.symbol)
-                        && expression_is_closed(
-                            &assignment.value,
-                            &function.callable.parameters,
-                            &locals,
-                            functions,
-                        )
-                })
-            }
             PlannedFunctionBody::ObjectShorthandAssignment(assignment) => {
                 locals.insert(assignment.local_symbol);
                 let source_is_closed = expression_is_closed(
@@ -30946,6 +30730,35 @@ fn format_expected_jsdoc_satisfies_signature(
     Ok(format!("({}) => {return_type}", parameters.join(", ")))
 }
 
+fn check_array_binding_iteration_support(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    pattern: NodeRef,
+    receiver: TypeId,
+) -> Result<(), SourceCheckError> {
+    let record = store
+        .type_payload(receiver)
+        .ok_or(RelationUnavailable::Type(receiver))?;
+    if record.flags().intersects(TypeFlags::ANY) {
+        return Ok(());
+    }
+    let iterable = super::global_types::optional_global_iterable_type(store, host).map_err(
+        |error| match error {
+            super::global_types::CanonicalGlobalTypeInitializationError::DeclaredType(error) => {
+                SourceCheckError::DeclaredType(error)
+            }
+            _ => SourceCheckError::Element(pattern),
+        },
+    )?;
+    // The pinned checker requires the iterator protocol when Iterable<T, R, N> resolves.
+    if iterable.is_some() {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Element(pattern),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Mirrors expression execution with an explicit flow scope.
 fn check_callable_parameter_initializers(
     store: &mut CanonicalTypeMapperStore,
@@ -31021,6 +30834,25 @@ fn check_callable_parameter_initializers(
         ) else {
             continue;
         };
+        let parameter_record = host
+            .node(parameter.declaration)
+            .ok_or_else(|| callable_parameter_execution_error(callable, parameter.declaration))?;
+        let NodeData::ParameterDeclaration(syntax) = &parameter_record.data else {
+            return Err(callable_parameter_execution_error(
+                callable,
+                parameter.declaration,
+            ));
+        };
+        check_array_binding_iteration_support(
+            store,
+            host,
+            NodeRef::new(
+                parameter.declaration.arena,
+                parameter.declaration.file,
+                syntax.name,
+            ),
+            body_type,
+        )?;
         let mut binding_types = Vec::with_capacity(bindings.len());
         for (declaration, symbol) in bindings {
             let checked = check_array_binding_element(
@@ -47938,49 +47770,6 @@ pub(super) fn check_source_file(
         )?;
         let (expression, return_flow_types) = match &function.body {
             PlannedFunctionBody::Empty => (None, body_flow_types),
-            PlannedFunctionBody::ArrayParameterAssignments(assignments) => {
-                let mut flow_types = body_flow_types;
-                for assignment in assignments {
-                    let declared_type = store
-                        .value_symbol_links(assignment.symbol)
-                        .and_then(|links| links.resolved_type)
-                        .ok_or(SourceCheckError::Variable(
-                            VariableInvariant::MissingCurrentFlowType(assignment.symbol),
-                        ))?;
-                    let checked = check_assignment_to_type(
-                        store,
-                        host,
-                        global_types,
-                        source,
-                        options,
-                        session,
-                        &mut function_diagnostics,
-                        &flow_types,
-                        &preflighted_type_import_value_uses,
-                        &mut deferred,
-                        declared_type,
-                        None,
-                        &assignment.value,
-                        assignment.target,
-                        Some(assignment.expression),
-                    )?;
-                    let current = current_flow_type_after_assignment(
-                        store,
-                        host,
-                        global_types,
-                        options,
-                        session,
-                        &mut function_diagnostics,
-                        checked,
-                    )?;
-                    if flow_types.insert(assignment.symbol, current).is_none() {
-                        return Err(SourceCheckError::Variable(
-                            VariableInvariant::MissingCurrentFlowType(assignment.symbol),
-                        ));
-                    }
-                }
-                (None, flow_types)
-            }
             PlannedFunctionBody::ObjectShorthandAssignment(assignment) => {
                 check_planned_object_shorthand_assignment(
                     store,
@@ -49351,7 +49140,6 @@ pub(super) fn check_source_file(
                 )?;
                 match &function.body {
                     PlannedFunctionBody::Ambient
-                    | PlannedFunctionBody::ArrayParameterAssignments(_)
                     | PlannedFunctionBody::VoidSwitch(_)
                     | PlannedFunctionBody::ObjectShorthandAssignment(_)
                     | PlannedFunctionBody::TypeofSwitch(_)
@@ -50127,6 +49915,12 @@ pub(super) fn check_source_file(
                         &array.initializer,
                         None,
                         &mut deferred,
+                    )?;
+                    check_array_binding_iteration_support(
+                        store,
+                        host,
+                        array.pattern,
+                        initializer.result,
                     )?;
                     let mut block_flow_types = current_flow_types.clone();
                     for element in &array.elements {
@@ -51294,6 +51088,7 @@ pub(super) fn check_source_file(
                     )?
                     .result
                 };
+                check_array_binding_iteration_support(store, host, variable.pattern, initializer)?;
                 let bootstrap =
                     store
                         .intrinsic_bootstrap()
@@ -87543,7 +87338,189 @@ class Foo2 {
     }
 
     #[test]
+    fn array_parameter_assignments_use_normal_linear_statement_flow() {
+        for (index, (parameters, body, assignment_count, returns_value)) in [
+            ("[, first, , text] = results", "first = text[0];", 1, false),
+            (
+                "[, first, , second, , text] = results",
+                "second = text[4]; first = text[0];",
+                2,
+                false,
+            ),
+            (
+                "[, first, , second, , text]: string[]",
+                "first = text[3]; first = text[0]; second = first;",
+                3,
+                false,
+            ),
+            ("[, first, , text] = results", "first; text;", 0, false),
+            (
+                "[, first, , text]: string[]",
+                "first = text[0]; return first;",
+                1,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let library = parsed("interface Array<T> { [index: number]: T; }");
+            let source = parsed(&format!(
+                "var results: string[]; function select({parameters}) {{ {body} }}",
+            ));
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(10_080 + offset);
+            let file = FileId::new(10_081 + offset);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions {
+                    no_implicit_any: true,
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (string, void) = (bootstrap.string_type, bootstrap.void_type);
+            let assignments = source
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::BinaryExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(assignments.len(), assignment_count);
+            for assignment in assignments {
+                assert_eq!(resolved_node_type(&context, assignment), string);
+            }
+            let owner = function_symbol(&context, &source, file, "select");
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(if returns_value { string } else { void }),
+            );
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn array_binding_iteration_uses_the_optional_global_iterable_type() {
+        for (index, (iterable, requires_protocol)) in [
+            ("", false),
+            ("interface Iterable<T> {}", false),
+            ("type Iterable<T, R, N> = T;", false),
+            ("interface Iterable<T, R, N> {}", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (parameter_index, parameter) in ["[, second]: string[]", "[, second] = results"]
+                .into_iter()
+                .enumerate()
+            {
+                let library = parsed(&format!(
+                    "interface Array<T> {{ [index: number]: T; }} {iterable}",
+                ));
+                let source = parsed(&format!(
+                    "var results: string[]; function select({parameter}) {{}}",
+                ));
+                let offset = u32::try_from(index * 4 + parameter_index * 2).unwrap();
+                let library_file = FileId::new(10_090 + offset);
+                let file = FileId::new(10_091 + offset);
+                let mut context = context(
+                    &[(library_file, &library), (file, &source)],
+                    CanonicalCheckerOptions::default(),
+                );
+                let pattern =
+                    source
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            (record.kind == SyntaxKind::ArrayBindingPattern)
+                                .then_some(NodeRef::new(source.arena.id(), file, node))
+                        })
+                        .unwrap();
+                let cold = observable_state(&context, file);
+
+                let result = context.check_source_file(file);
+
+                if requires_protocol {
+                    assert_eq!(
+                        result,
+                        Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Element(pattern),
+                        ))
+                    );
+                    assert_eq!(observable_state(&context, file), cold);
+                } else {
+                    result.unwrap();
+                    assert_eq!(
+                        object_binding_value_type(&context, &source, file, "second"),
+                        context.store().intrinsic_bootstrap().unwrap().string_type,
+                    );
+                    let warm = observable_state(&context, file);
+                    context.recheck_source_file(file).unwrap();
+                    assert_eq!(observable_state(&context, file), warm);
+                }
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn any_array_binding_parents_do_not_require_an_iterator() {
+        let library = parsed(concat!(
+            "interface Array<T> { [index: number]: T; } ",
+            "interface Iterable<T, R, N> {}",
+        ));
+        let source = parsed("declare var input: any; let [, value] = input;");
+        let library_file = FileId::new(10_106);
+        let file = FileId::new(10_107);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "value"),
+            context.store().intrinsic_bootstrap().unwrap().any_type,
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn omitted_array_binding_fixture_preserves_assignment_flow_and_one_source_diagnostic() {
+        // This checks the numeric fallback without the optional global Iterable type.
         let library = parsed("interface Array<T> { [index: number]: T; }");
         let source = parsed(concat!(
             "var results: string[];\n\n",
