@@ -1414,19 +1414,62 @@ pub struct Program {
 /// Scoped access to the original canonical checker graph of one Program.
 ///
 /// The checker borrows the Program's AST arenas, so this value can be used
-/// only inside [`Program::try_new_with_canonical_checker_and_queries`]. Query
-/// results must be converted to owned data before the callback returns.
+/// only inside Program's canonical query callbacks. Query results must be
+/// converted to owned data before the callback returns.
 #[derive(Debug)]
 pub struct CanonicalProgramQueries<'arena> {
     context: CanonicalCheckerContext<'arena>,
+    program: &'arena Program,
+    checked_sources: Vec<CanonicalCheckedSource<'arena>>,
+    bind_diagnostics: Vec<ProgramDiagnostic>,
+    cold_diagnostics: Vec<ProgramDiagnostic>,
     has_diagnostics: bool,
 }
 
 impl CanonicalProgramQueries<'_> {
-    /// Reports whether program diagnostics remain after comment suppression.
+    /// Reports whether diagnostics remain after the last completed check.
     #[must_use]
     pub fn has_diagnostics(&self) -> bool {
         self.has_diagnostics
+    }
+
+    /// Returns all cold Program diagnostics in their final output order.
+    ///
+    /// This includes loader, config, bind, and checker diagnostics with their
+    /// related records. Comment directives use the normal Program rules.
+    /// The owned snapshot does not change after queries or source replay.
+    #[must_use]
+    pub fn cold_diagnostic_snapshot(&self) -> Vec<ProgramDiagnostic> {
+        self.cold_diagnostics.clone()
+    }
+
+    /// Forces the original checked sources through the same checker again.
+    ///
+    /// Each source bypasses its completion flag and uses its original JSX
+    /// runtime facts. Files retain their original order and canonical graph.
+    /// The result owns the complete, sorted Program diagnostics after replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original source-checking or diagnostic conversion failure.
+    /// A failed replay does not return a partial diagnostic snapshot.
+    pub fn replay_sources(&mut self) -> Result<Vec<ProgramDiagnostic>, CanonicalProgramCheckError> {
+        for checked in &self.checked_sources {
+            self.context
+                .recheck_source_file_with_jsx_runtime(checked.source.id, checked.runtime.evidence())
+                .map_err(|error| CanonicalProgramCheckError::SourceCheck {
+                    file_name: checked.source.file_name.clone(),
+                    error,
+                })?;
+        }
+        let diagnostics = self.program.canonical_checker_diagnostics(
+            &self.context,
+            &self.bind_diagnostics,
+            &self.checked_sources,
+        )?;
+        let snapshot = self.program.canonical_diagnostic_snapshot(&diagnostics);
+        self.has_diagnostics = !snapshot.is_empty();
+        Ok(snapshot)
     }
 
     /// Returns the canonical type recorded for an exact Program node.
@@ -1552,6 +1595,79 @@ impl CanonicalProgramQueries<'_> {
     #[must_use]
     pub fn module_resolution(&self, specifier: NodeRef) -> CanonicalModuleResolutionLookup {
         self.context.module_resolution(specifier)
+    }
+}
+
+#[derive(Debug)]
+struct CanonicalCheckedSource<'arena> {
+    source: &'arena SourceFile,
+    runtime: CanonicalReplayJsxRuntime,
+}
+
+#[derive(Debug)]
+enum CanonicalReplayJsxRuntime {
+    Preserve,
+    Classic {
+        factory_namespace: String,
+        fragment_factory_namespace: String,
+        fragment_factory_required: bool,
+        fragment_factory_pragma_required: bool,
+    },
+    Automatic {
+        module_specifier: String,
+        resolved_module: Option<CanonicalSymbolId>,
+    },
+}
+
+impl CanonicalReplayJsxRuntime {
+    fn evidence(&self) -> CanonicalJsxRuntimeEvidence<'_> {
+        match self {
+            Self::Preserve => CanonicalJsxRuntimeEvidence::Preserve,
+            Self::Classic {
+                factory_namespace,
+                fragment_factory_namespace,
+                fragment_factory_required,
+                fragment_factory_pragma_required,
+            } => CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace,
+                fragment_factory_namespace,
+                fragment_factory_required: *fragment_factory_required,
+                fragment_factory_pragma_required: *fragment_factory_pragma_required,
+            },
+            Self::Automatic {
+                module_specifier,
+                resolved_module,
+            } => CanonicalJsxRuntimeEvidence::Automatic {
+                module_specifier,
+                resolved_module: *resolved_module,
+            },
+        }
+    }
+}
+
+impl From<CanonicalJsxRuntimeEvidence<'_>> for CanonicalReplayJsxRuntime {
+    fn from(runtime: CanonicalJsxRuntimeEvidence<'_>) -> Self {
+        match runtime {
+            CanonicalJsxRuntimeEvidence::Preserve => Self::Preserve,
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace,
+                fragment_factory_namespace,
+                fragment_factory_required,
+                fragment_factory_pragma_required,
+            } => Self::Classic {
+                factory_namespace: factory_namespace.to_owned(),
+                fragment_factory_namespace: fragment_factory_namespace.to_owned(),
+                fragment_factory_required,
+                fragment_factory_pragma_required,
+            },
+            CanonicalJsxRuntimeEvidence::Automatic {
+                module_specifier,
+                resolved_module,
+            } => Self::Automatic {
+                module_specifier: module_specifier.to_owned(),
+                resolved_module,
+            },
+        }
     }
 }
 
@@ -4400,7 +4516,7 @@ impl Program {
             })?;
         }
 
-        let mut diagnostics = Vec::new();
+        let mut bind_diagnostics = Vec::new();
         for source in &sources {
             // Keep declaration files bound so their symbols remain available
             // to importers, but mirror pinned SkipTypeChecking by suppressing
@@ -4417,7 +4533,7 @@ impl Program {
                 }
             })?;
             for diagnostic in bound.diagnostics() {
-                diagnostics.push(
+                bind_diagnostics.push(
                     self.canonical_program_diagnostic(
                         Some(diagnostic.node),
                         None,
@@ -4433,7 +4549,7 @@ impl Program {
                 .source_facts()
                 .is_some_and(CanonicalSourceFileFacts::is_external_or_common_js_module)
             {
-                diagnostics.extend(self.canonical_commonjs_object_collisions(source)?);
+                bind_diagnostics.extend(self.canonical_commonjs_object_collisions(source)?);
             }
         }
 
@@ -4566,14 +4682,70 @@ impl Program {
             context
                 .check_source_file_with_jsx_runtime(file, runtime)
                 .map_err(|error| CanonicalProgramCheckError::SourceCheck { file_name, error })?;
-            self.add_missing_jsx_option_diagnostics(source, &mut diagnostics);
-            self.add_erasable_import_assignment_diagnostics(source, &mut diagnostics);
-            self.add_missing_commonjs_import_helper_diagnostics(
+            checked_sources.push(CanonicalCheckedSource {
                 source,
-                &context,
+                runtime: runtime.into(),
+            });
+        }
+
+        let diagnostics =
+            self.canonical_checker_diagnostics(&context, &bind_diagnostics, &checked_sources)?;
+        let cold_diagnostics = self.canonical_diagnostic_snapshot(&diagnostics);
+        for ((enclosing, target), specifier) in &self.package_display_specifiers {
+            if let Some(source) = self
+                .source_file(target)
+                .filter(|source| source_is_external_module(source))
+                && let Some(enclosing) = self.source_file_by_id(*enclosing)
+            {
+                context
+                    .set_module_display_specifier(
+                        NodeRef::new(
+                            enclosing.parse.arena.id(),
+                            enclosing.id,
+                            enclosing.parse.source_file,
+                        ),
+                        NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file),
+                        specifier.clone(),
+                    )
+                    .map_err(|error| CanonicalProgramCheckError::SourceCheck {
+                        file_name: source.file_name.clone(),
+                        error: SourceCheckError::TypeDisplayUnavailable(
+                            TypeDisplayUnavailable::SymbolDisplay(error),
+                        ),
+                    })?;
+            }
+        }
+        let mut canonical_queries = CanonicalProgramQueries {
+            context,
+            program: self,
+            checked_sources,
+            bind_diagnostics,
+            has_diagnostics: !cold_diagnostics.is_empty(),
+            cold_diagnostics,
+        };
+        let result = queries(self, &mut canonical_queries);
+        Ok((diagnostics, result))
+    }
+
+    fn canonical_checker_diagnostics(
+        &self,
+        context: &CanonicalCheckerContext<'_>,
+        bind_diagnostics: &[ProgramDiagnostic],
+        checked_sources: &[CanonicalCheckedSource<'_>],
+    ) -> Result<Vec<ProgramDiagnostic>, CanonicalProgramCheckError> {
+        let mut diagnostics = bind_diagnostics.to_vec();
+        let checked_files = checked_sources
+            .iter()
+            .map(|checked| checked.source.id)
+            .collect::<Vec<_>>();
+        for checked in checked_sources {
+            self.add_missing_jsx_option_diagnostics(checked.source, &mut diagnostics);
+            self.add_erasable_import_assignment_diagnostics(checked.source, &mut diagnostics);
+            self.add_missing_commonjs_import_helper_diagnostics(
+                checked.source,
+                context,
                 &mut diagnostics,
             )?;
-            checked_sources.push(file);
         }
 
         // Program.GetGlobalDiagnostics skips checker diagnostics without source files.
@@ -4604,7 +4776,7 @@ impl Program {
             && (self.options.declaration || self.options.composite)
         {
             for source in &self.source_files {
-                if checked_sources.contains(&source.id) {
+                if checked_files.contains(&source.id) {
                     self.add_isolated_declaration_function_diagnostics(source, &mut diagnostics)?;
                 }
             }
@@ -4618,43 +4790,26 @@ impl Program {
                         .file_name
                         .as_deref()
                         .and_then(|file_name| self.source_file(file_name))
-                        .is_some_and(|source| checked_sources.contains(&source.id))
+                        .is_some_and(|source| checked_files.contains(&source.id))
                 })
                 .cloned(),
         );
-        self.apply_comment_directives(&mut diagnostics, &checked_sources);
+        self.apply_comment_directives(&mut diagnostics, &checked_files);
+        Ok(diagnostics)
+    }
 
-        for ((enclosing, target), specifier) in &self.package_display_specifiers {
-            if let Some(source) = self
-                .source_file(target)
-                .filter(|source| source_is_external_module(source))
-                && let Some(enclosing) = self.source_file_by_id(*enclosing)
-            {
-                context
-                    .set_module_display_specifier(
-                        NodeRef::new(
-                            enclosing.parse.arena.id(),
-                            enclosing.id,
-                            enclosing.parse.source_file,
-                        ),
-                        NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file),
-                        specifier.clone(),
-                    )
-                    .map_err(|error| CanonicalProgramCheckError::SourceCheck {
-                        file_name: source.file_name.clone(),
-                        error: SourceCheckError::TypeDisplayUnavailable(
-                            TypeDisplayUnavailable::SymbolDisplay(error),
-                        ),
-                    })?;
-            }
-        }
-
-        let mut canonical_queries = CanonicalProgramQueries {
-            context,
-            has_diagnostics: !self.diagnostics.is_empty() || !diagnostics.is_empty(),
-        };
-        let result = queries(self, &mut canonical_queries);
-        Ok((diagnostics, result))
+    fn canonical_diagnostic_snapshot(
+        &self,
+        checker_diagnostics: &[ProgramDiagnostic],
+    ) -> Vec<ProgramDiagnostic> {
+        let mut diagnostics = self
+            .diagnostics
+            .iter()
+            .chain(checker_diagnostics)
+            .cloned()
+            .collect::<Vec<_>>();
+        diagnostics.sort_by(compare_program_diagnostics);
+        diagnostics
     }
 
     fn add_isolated_declaration_function_diagnostics(
@@ -11690,6 +11845,91 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn canonical_project_replay_keeps_source_order_and_cache_lengths() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/z.tsx",
+            concat!(
+                "/** @jsxRuntime classic */\n",
+                "/** @jsx Custom.h */\n",
+                "declare const Custom: any;\n",
+                "const first = <div />;\n",
+                "const bad: string = null;\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/a.tsx",
+            "/** @jsxImportSource absent */\nconst second = <div />;\n",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/ignored.ts",
+            "// @ts-nocheck\nconst ignored: string = null;\n",
+        )
+        .unwrap();
+        let (program, cold) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &[
+                "z.tsx".to_owned(),
+                "a.tsx".to_owned(),
+                "ignored.ts".to_owned(),
+            ],
+            CompilerOptions {
+                strict: true,
+                no_implicit_any: false,
+                no_implicit_any_specified: true,
+                jsx: ts_options::JsxEmit::ReactJsx,
+                module: ModuleKind::EsNext,
+                module_specified: true,
+                module_resolution: ModuleResolutionKind::Bundler,
+                lib: Some(vec!["es5".to_owned()]),
+                no_emit: true,
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                assert_eq!(
+                    queries
+                        .checked_sources
+                        .iter()
+                        .map(|checked| checked.source.file_name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["/project/z.tsx", "/project/a.tsx"],
+                );
+                let lengths = |queries: &super::CanonicalProgramQueries<'_>| {
+                    (
+                        queries.context.store().type_len(),
+                        queries.context.store().symbol_len(),
+                        queries.context.store().signature_len(),
+                        queries.context.store().mapper_len(),
+                        queries.context.store().type_resolution_len(),
+                        queries.context.diagnostics().len(),
+                    )
+                };
+                let before = lengths(queries);
+                let cold = queries.cold_diagnostic_snapshot();
+                for _ in 0..2 {
+                    assert_eq!(queries.replay_sources().unwrap(), cold);
+                    assert_eq!(lengths(queries), before);
+                }
+                let ignored = program.source_file("/project/ignored.ts").unwrap().id;
+                let ignored = queries.context.source_file(ignored).unwrap();
+                assert!(
+                    queries
+                        .context
+                        .store()
+                        .source_file_links(ignored)
+                        .is_none_or(|links| !links.type_checked)
+                );
+                cold
+            },
+        )
+        .unwrap();
+        assert_eq!(program.diagnostics(), cold.unwrap());
     }
 
     #[test]
