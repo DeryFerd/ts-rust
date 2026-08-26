@@ -176,6 +176,60 @@ fn graph_snapshot_keeps_each_mode_and_unresolved_lookup() {
 }
 
 #[test]
+fn graph_snapshot_retains_package_aliases_and_location_choices() {
+    let file_system = MemoryFileSystem::new(true);
+    write_files(
+        &file_system,
+        &[
+            (
+                "/shared/package.json",
+                r#"{"name":"real-package","exports":{".":"./index.js"}}"#,
+            ),
+            (
+                "/shared/index.d.ts",
+                "export interface Item { value: number; }",
+            ),
+            ("/outside/use.ts", "export const outside = 1;"),
+        ],
+    );
+    for (directory, alias) in [("/one", "alias-one"), ("/two", "alias-two")] {
+        file_system.add_directory_link("/shared", &format!("{directory}/node_modules/{alias}"));
+        file_system
+            .write_file(
+                &format!("{directory}/use.ts"),
+                &format!("import type {{ Item }} from '{alias}';"),
+            )
+            .unwrap();
+    }
+    let program = Program::new_with_options(
+        &file_system,
+        "/",
+        &["/one/use.ts", "/two/use.ts", "/outside/use.ts"].map(str::to_owned),
+        graph_options(),
+    );
+    let graph = program.project_graph_snapshot();
+    assert_eq!(
+        graph.package_export_specifiers["/shared/index.d.ts"],
+        ["alias-one", "alias-two"],
+    );
+    for (file, expected) in [
+        ("/one/use.ts", Some("alias-one")),
+        ("/two/use.ts", Some("alias-two")),
+        ("/outside/use.ts", None),
+    ] {
+        let file_id = program.source_file(file).unwrap().id;
+        assert_eq!(
+            graph
+                .package_display_specifiers
+                .get(&(file_id, "/shared/index.d.ts".to_owned()))
+                .map(String::as_str),
+            expected,
+        );
+    }
+    assert_eq!(program.project_graph_snapshot(), graph);
+}
+
+#[test]
 fn graph_snapshot_distinguishes_ambient_fallback_from_a_resolver_hit() {
     let file_system = MemoryFileSystem::new(true);
     write_files(

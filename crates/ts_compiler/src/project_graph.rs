@@ -145,7 +145,8 @@ pub struct ProgramGraphSnapshot {
     /// The same manifest builder used at canonical checker construction.
     pub module_resolution_manifest:
         Result<CanonicalModuleResolutionManifestInput, CanonicalProgramCheckError>,
-    pub package_export_specifiers: BTreeMap<String, String>,
+    pub package_export_specifiers: BTreeMap<String, Vec<String>>,
+    pub package_display_specifiers: BTreeMap<(FileId, String), String>,
     pub missing_evidence: Vec<ProgramGraphMissingEvidence>,
 }
 
@@ -222,6 +223,7 @@ impl Program {
             references,
             module_resolution_manifest: self.canonical_module_resolution_manifest(),
             package_export_specifiers: self.package_export_specifiers.clone(),
+            package_display_specifiers: self.package_display_specifiers.clone(),
             missing_evidence: self.project_graph_missing_evidence(),
         }
     }
