@@ -6633,24 +6633,20 @@ mod tests {
                 .set_interface_base_resolution(instance, false, None, None,)
         );
         let number = context.store().intrinsic_bootstrap().unwrap().number_type;
-        assert!(context.store_mut_for_test().set_type_parameter_resolution(
-            this,
-            Some(number),
-            None,
-            None,
-            None,
-        ));
+        let alias = context
+            .store_mut_for_test()
+            .alloc_type_alias(Some(symbol))
+            .unwrap();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias(this, Some(alias))
+        );
         assert_eq!(
             context.type_to_string(instance),
             Err(TypeDisplayUnavailable::MalformedType(instance))
         );
-        assert!(context.store_mut_for_test().set_type_parameter_resolution(
-            this,
-            Some(instance),
-            None,
-            None,
-            None,
-        ));
+        assert!(context.store_mut_for_test().set_type_alias(this, None));
         assert!(context.store_mut_for_test().set_value_symbol_links(
             symbol,
             ValueSymbolLinks {
@@ -7083,30 +7079,77 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Use real library publication before testing both parameter caches.
     fn array_method_display_rejects_paired_parameter_cache_changes() {
-        let parsed = parse_source_file(concat!(
+        let library = parse_source_file(concat!(
             "interface Array<T> { ",
             "map<U>(callbackfn: (value: T, index: number, array: T[]) => U, ",
             "thisArg?: any): U[]; } interface ReadonlyArray<T> {} ",
-            "declare const values: number[]; const method = values.map;",
         ));
-        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let source = parse_source_file(concat!(
+            "declare const values: number[]; ",
+            "const mapped = values.map(value => \"mapped\");",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
         let file = FileId::new(218);
-        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let library_file = FileId::new(228);
+        let files = [(library_file, &library), (file, &source)];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in files {
+            let is_library = file == library_file;
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/formatter/{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_library,
+                        is_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, parsed) in files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
         context.check_source_file(file).unwrap();
-        assert!(context.diagnostics().is_empty());
-        let declaration = parsed
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let declaration = library
             .arena
             .iter()
             .find_map(|(node, record)| {
                 (record.kind == SyntaxKind::MethodSignature).then_some(NodeRef::new(
-                    parsed.arena.id(),
-                    file,
+                    library.arena.id(),
+                    library_file,
                     node,
                 ))
             })
             .unwrap();
-        let method = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let method = context
+            .file(library_file)
+            .unwrap()
+            .1
+            .symbol(declaration)
+            .unwrap();
         let type_ = context
             .store()
             .value_symbol_links(method)
@@ -7125,11 +7168,12 @@ mod tests {
             .and_then(|links| links.resolved_signature.signature())
             .unwrap();
         let parameter = context.store().signature(signature).unwrap().parameters()[1];
-        let mut types = context
+        let original_types = context
             .store()
             .callable_signature_parameter_types(signature)
             .unwrap()
             .to_vec();
+        let mut types = original_types.clone();
         let number = context.store().intrinsic_bootstrap().unwrap().number_type;
         types[1] = number;
         assert!(context.store_mut_for_test().set_value_symbol_links(
@@ -7139,10 +7183,30 @@ mod tests {
                 ..ValueSymbolLinks::default()
             },
         ));
+        // Signature parameter types cannot be replaced after publication.
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
         assert!(
-            context
+            !context
                 .store_mut_for_test()
                 .set_callable_signature_parameter_types_batch(vec![(signature, types)])
+        );
+        assert_eq!(
+            context
+                .store()
+                .callable_signature_parameter_types(signature),
+            Some(original_types.as_slice())
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before
         );
         assert_eq!(
             context.type_to_string(type_),
