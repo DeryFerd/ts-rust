@@ -404,7 +404,10 @@ mod tests {
     #[test]
     fn project_baselines_apply_pinned_path_rewrites_without_changing_program_text() {
         let project = TestProject::new();
-        let original = "const path = \"/.src/input.ts\";\n";
+        let original = concat!(
+            "const path = \"/.src/input.ts\";\n",
+            "const overlap = \"/.s/.ts/rc/value\";\n",
+        );
         let root = project.write("index.ts", original);
         let config = project.write(
             "tsconfig.json",
@@ -422,6 +425,8 @@ mod tests {
         assert_eq!(program.source_file(&root).unwrap().source_text, original);
         let text = artifacts.unwrap().unwrap().types.text.unwrap();
         assert!(text.contains("const path = \"input.ts\";"));
-        assert!(!text.contains("/.src/"));
+        assert!(text.contains("const overlap = \"/.src/value\";"));
+        assert!(text.contains(">overlap : \"/.src/value\""));
+        assert!(!text.contains("/.s/.ts/rc/"));
     }
 }
