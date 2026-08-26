@@ -2505,24 +2505,16 @@ impl<'store> RelaterSession<'store> {
             authenticated(target, target_owner)?;
         let source_members = self.class_constructor_static_members(source)?;
         let target_members = self.class_constructor_static_members(target)?;
-        let mut result = self.properties_related_to(source, &source_members, &target_members)?;
+        let result = self.properties_related_to(source, &source_members, &target_members)?;
         if result == Ternary::False {
             return Ok(Some(result));
         }
-
-        // The authenticated prototype and zero-argument return share the instance type.
-        result &= self.is_related_to_ex(
-            source_instance,
-            target_instance,
-            RecursionFlags::BOTH,
-            intersection_state,
-        )?;
-        if result == Ternary::False || source_abstract && !target_abstract {
+        if source_abstract && !target_abstract {
             return Ok(Some(Ternary::False));
         }
         if let (Some(source), Some(target)) = (source_declaration, target_declaration) {
-            let source = self.class_constructor_visibility(source);
-            let target = self.class_constructor_visibility(target);
+            let source = self.class_member_visibility(source);
+            let target = self.class_member_visibility(target);
             if !matches!(
                 (source, target),
                 (_, ClassConstructorVisibility::Private)
@@ -2535,7 +2527,14 @@ impl<'store> RelaterSession<'store> {
                 return Ok(Some(Ternary::False));
             }
         }
-        Ok(Some(result))
+
+        let returns = self.is_related_to_ex(
+            source_instance,
+            target_instance,
+            RecursionFlags::BOTH,
+            intersection_state,
+        )?;
+        Ok(Some(result & returns))
     }
 
     fn is_class_constructor_strict_subtype_pair(&self, source: TypeId, target: TypeId) -> bool {
@@ -2582,7 +2581,7 @@ impl<'store> RelaterSession<'store> {
         })
     }
 
-    fn class_constructor_visibility(&self, declaration: NodeRef) -> ClassConstructorVisibility {
+    fn class_member_visibility(&self, declaration: NodeRef) -> ClassConstructorVisibility {
         for index in 0..declaration.node.index() {
             let index = u32::try_from(index).expect("source node indices fit in u32");
             let modifier = NodeRef::new(declaration.arena, declaration.file, NodeId::new(index));
@@ -3463,12 +3462,20 @@ impl<'store> RelaterSession<'store> {
         source_members: &ResolvedObjectMembers,
         target_members: &ResolvedObjectMembers,
     ) -> Result<Ternary, RelationUnavailable> {
+        let require_optional_properties = matches!(
+            self.relation,
+            RelationKind::Subtype | RelationKind::StrictSubtype
+        ) && matches!(
+            source_members.property_origin,
+            ObjectPropertyOrigin::ValidatedClass
+        );
         // Preserve upstream's unmatched-property pass before comparing any
         // property types. This ordering is observable through relation caches.
         for target_property in &target_members.properties {
             let target_symbol =
                 self.property_symbol(*target_property, target_members.property_origin)?;
-            if !target_symbol.flags().intersects(SymbolFlags::OPTIONAL)
+            if (require_optional_properties
+                || !target_symbol.flags().intersects(SymbolFlags::OPTIONAL))
                 && self
                     .lookup_source_property(
                         source,
@@ -4013,20 +4020,33 @@ impl<'store> RelaterSession<'store> {
         target_property: SemanticSymbolId,
         target_origin: ObjectPropertyOrigin,
     ) -> Result<Ternary, RelationUnavailable> {
-        let (source_flags, source_readonly) = {
+        let (source_flags, source_readonly, source_declaration) = {
             let source = self.property_symbol(source_property, source_origin)?;
             (
                 source.flags(),
                 source.check_flags().contains(CheckFlags::READONLY),
+                source.value_declaration(),
             )
         };
-        let (target_flags, target_readonly) = {
+        let (target_flags, target_readonly, target_declaration) = {
             let target = self.property_symbol(target_property, target_origin)?;
             (
                 target.flags(),
                 target.check_flags().contains(CheckFlags::READONLY),
+                target.value_declaration(),
             )
         };
+        let source_private = matches!(source_origin, ObjectPropertyOrigin::ValidatedClass)
+            && source_declaration.is_some_and(|declaration| {
+                self.class_member_visibility(declaration) == ClassConstructorVisibility::Private
+            });
+        let target_private = matches!(target_origin, ObjectPropertyOrigin::ValidatedClass)
+            && target_declaration.is_some_and(|declaration| {
+                self.class_member_visibility(declaration) == ClassConstructorVisibility::Private
+            });
+        if (source_private || target_private) && source_declaration != target_declaration {
+            return Ok(Ternary::False);
+        }
         // Pinned `propertyRelatedTo`: readonly affects only strict subtype
         // ordering. Ordinary assignability remains intentionally symmetric.
         if self.relation == RelationKind::StrictSubtype && source_readonly && !target_readonly {
@@ -9947,6 +9967,10 @@ mod tests {
             "class Derived extends First { extra: string; } ",
             "class StaticNumber { static value: number; } ",
             "class StaticString { static value: string; } ",
+            "class OptionalStatic { static value?: number; } ",
+            "class PrivateFirst { private value: string; } ",
+            "class PrivateSecond { private value: string; } ",
+            "class PrivateDerived extends PrivateFirst { extra: string; } ",
             "class Public { public constructor() {} } ",
             "class Protected { protected constructor() {} } ",
             "class Private { private constructor() {} }",
@@ -9960,6 +9984,10 @@ mod tests {
             "Derived",
             "StaticNumber",
             "StaticString",
+            "OptionalStatic",
+            "PrivateFirst",
+            "PrivateSecond",
+            "PrivateDerived",
             "Public",
             "Protected",
             "Private",
@@ -9984,6 +10012,15 @@ mod tests {
             ("StaticString", "StaticNumber", false),
             ("StaticNumber", "Empty", true),
             ("Empty", "StaticNumber", false),
+            ("Empty", "OptionalStatic", false),
+            ("OptionalStatic", "Empty", true),
+            ("StaticNumber", "OptionalStatic", true),
+            ("OptionalStatic", "StaticNumber", false),
+            ("PrivateFirst", "PrivateSecond", false),
+            ("PrivateFirst", "First", false),
+            ("First", "PrivateFirst", false),
+            ("PrivateDerived", "PrivateFirst", true),
+            ("PrivateFirst", "PrivateDerived", false),
             ("Public", "Protected", true),
             ("Protected", "Public", false),
             ("Protected", "Private", true),
@@ -10012,6 +10049,49 @@ mod tests {
     }
 
     #[test]
+    fn class_constructor_rejections_do_not_compare_instance_returns() {
+        let mut fixture = function_relation_fixture(concat!(
+            "abstract class Abstract { value: number; } ",
+            "class Concrete { value: number; } ",
+            "class Hidden { private constructor() {} value: number; } ",
+            "class Visible { public constructor() {} value: number; }",
+        ));
+        for (source, target) in [("Abstract", "Concrete"), ("Hidden", "Visible")] {
+            let source = query_class_members(&mut fixture, source).shells();
+            let target = query_class_members(&mut fixture, target).shells();
+            let instance_key = fixture
+                .store
+                .relation_key_if_available(
+                    source.instance_type(),
+                    target.instance_type(),
+                    super::IntersectionState::NONE,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .key();
+            assert_eq!(
+                fixture
+                    .store
+                    .relation_cache_get(RelationKind::StrictSubtype, instance_key),
+                RelationComparisonResult::NONE,
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_strict_subtype_of(source.value_type(), target.value_type()),
+                Ok(false),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .relation_cache_get(RelationKind::StrictSubtype, instance_key),
+                RelationComparisonResult::NONE,
+            );
+        }
+    }
+
+    #[test]
     fn class_constructor_strict_subtypes_reject_forged_warm_graphs() {
         for poison in 0..3 {
             let mut fixture = function_relation_fixture(concat!(
@@ -10022,6 +10102,17 @@ mod tests {
             let target = query_class_members(&mut fixture, "Second");
             let source_type = source.shells().value_type();
             let target_type = target.shells().value_type();
+            let key = fixture
+                .store
+                .relation_key_if_available(
+                    source_type,
+                    target_type,
+                    super::IntersectionState::NONE,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .key();
             assert_eq!(
                 fixture
                     .store
@@ -10055,6 +10146,18 @@ mod tests {
                 }
                 _ => unreachable!("only signatures, static fields, and prototypes are changed"),
             }
+            assert_eq!(
+                fixture
+                    .store
+                    .relation_cache_get(RelationKind::StrictSubtype, key),
+                RelationComparisonResult::NONE,
+                "poison case {poison}",
+            );
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, source.shells().instance_type()),
+                ClassHeritageMembersValidation::Malformed,
+                "poison case {poison}",
+            );
             let state = fixture.store.relation_state_snapshot();
             assert_eq!(
                 fixture
