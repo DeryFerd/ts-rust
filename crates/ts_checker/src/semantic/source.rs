@@ -30975,6 +30975,36 @@ fn check_planned_switch_function_statements(
     Ok(return_types)
 }
 
+/// Checks the computed name separately from indexed access, as upstream does.
+fn issue_computed_binding_name_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    computed_name: NodeRef,
+    type_: TypeId,
+) -> Result<(), SourceCheckError> {
+    let flags = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?
+        .flags();
+    let valid_kinds = TypeFlags::ANY
+        | TypeFlags::NEVER
+        | TypeFlags::STRING_LIKE
+        | TypeFlags::NUMBER_LIKE
+        | TypeFlags::ES_SYMBOL_LIKE;
+    let property_keys = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?
+        .string_number_symbol_type;
+    if flags.intersects(TypeFlags::NULLABLE)
+        || !flags.intersects(valid_kinds)
+            && !store.is_type_assignable_to_with_global_types(type_, property_keys, global_types)?
+    {
+        issue_node_diagnostic(diagnostics, computed_name, 2464)?;
+    }
+    Ok(())
+}
+
 fn literal_computed_property_name(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -50132,6 +50162,13 @@ pub(super) fn check_source_file(
                             None,
                             &mut deferred,
                         )?;
+                        issue_computed_binding_name_diagnostic(
+                            store,
+                            global_types,
+                            diagnostics,
+                            binding.property,
+                            checked_key.result,
+                        )?;
                         if let Some(name) =
                             literal_computed_property_name(store, checked_key.result)
                         {
@@ -50524,6 +50561,13 @@ pub(super) fn check_source_file(
                     &variable.key,
                     None,
                     &mut deferred,
+                )?;
+                issue_computed_binding_name_diagnostic(
+                    store,
+                    global_types,
+                    diagnostics,
+                    variable.element.computed_name,
+                    key.result,
                 )?;
                 let (binding_type, diagnostic) = if let Some(name) =
                     literal_computed_property_name(store, key.result)
@@ -84789,6 +84833,169 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn computed_binding_defaults_use_missing_object_literal_properties() {
+        for (index, (binding, strict_null_checks, string_display, number_display)) in [
+            ("const", false, "\"fallback\"", "7"),
+            ("const", true, "\"fallback\"", "7"),
+            ("let", true, "string", "number"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(&format!(
+                "let key = 'missing'; let getKey = () => 'called'; \
+                 {binding} {{ [key]: direct = 'fallback', [getKey()]: called = 7 }} = {{}};",
+            ));
+            let file = FileId::new(10_403 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            assert!(context.diagnostics().is_empty());
+            for (name, expected) in [("direct", string_display), ("called", number_display)] {
+                assert_eq!(
+                    context
+                        .type_to_string(object_binding_value_type(&context, &source, file, name))
+                        .unwrap(),
+                    expected,
+                );
+            }
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn computed_binding_defaults_do_not_hide_missing_declared_indices() {
+        let source = parsed(concat!(
+            "let key = 'missing'; ",
+            "const { [key]: selected = 'fallback' }: {} = {};",
+        ));
+        let file = FileId::new(10_406);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected the declared type's missing-index diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2537);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "key");
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "selected"),
+            context.store().intrinsic_bootstrap().unwrap().error_type,
+        );
+    }
+
+    #[test]
+    fn computed_binding_any_indices_use_signatures_and_keep_any_recovery() {
+        let source = parsed(concat!(
+            "declare const key: any; ",
+            "declare const strings: { [name: string]: number }; ",
+            "declare const numbers: { [index: number]: string }; ",
+            "const { [key]: stringFirst, [key]: stringSecond } = strings; ",
+            "const { [key]: numberFirst, [key]: numberSecond } = numbers; ",
+            "const { [key]: missing } = {};",
+        ));
+        let file = FileId::new(10_407);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("only the object without an index signature should report TS2538")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2538);
+        assert_eq!(diagnostic.diagnostic.arguments, ["any"]);
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for (name, expected) in [
+            ("stringFirst", bootstrap.number_type),
+            ("stringSecond", bootstrap.number_type),
+            ("numberFirst", bootstrap.string_type),
+            ("numberSecond", bootstrap.string_type),
+            ("missing", bootstrap.any_type),
+        ] {
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, name),
+                expected,
+                "{name}",
+            );
+        }
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn computed_binding_invalid_keys_check_names_before_index_access() {
+        for (index, annotation) in ["boolean", "bigint", "unknown", "null", "undefined", "{}"]
+            .into_iter()
+            .enumerate()
+        {
+            let source = parsed(&format!(
+                "declare const key: {annotation}; \
+                 const {{ [key]: selected }} = {{}}; \
+                 const {{ [key]: fallback = 1 }} = {{}}; \
+                 const {{ [key]: dynamic }}: any = {{}};",
+            ));
+            let file = FileId::new(10_408 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let [name, index, default_name, any_name] = context.diagnostics().as_slice() else {
+                panic!("expected three invalid names and one invalid index for {annotation}")
+            };
+            for diagnostic in [name, default_name, any_name] {
+                assert_eq!(diagnostic.diagnostic.code(), 2464);
+                assert_eq!(node_text(&source, diagnostic.node.unwrap()), "[key]");
+            }
+            assert_eq!(index.diagnostic.code(), 2538);
+            assert_eq!(node_text(&source, index.node.unwrap()), "key");
+            assert_eq!(index.diagnostic.arguments, [annotation]);
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, "selected"),
+                bootstrap.error_type,
+            );
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, "dynamic"),
+                bootstrap.any_type,
+            );
+            assert_eq!(
+                context
+                    .type_to_string(object_binding_value_type(
+                        &context, &source, file, "fallback"
+                    ))
+                    .unwrap(),
+                "1",
+            );
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]

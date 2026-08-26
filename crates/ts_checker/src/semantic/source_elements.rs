@@ -753,7 +753,7 @@ fn array_index_signature_matches_parameter(
     Ok(true)
 }
 
-/// Checks a broad computed object-binding key without using element-access
+/// Checks a computed object-binding index without using element-access
 /// diagnostic policy or publishing expression caches owned by source checking.
 #[allow(clippy::too_many_arguments)] // Keeps the authenticated binding and type identities explicit.
 pub(super) fn check_computed_binding_element(
@@ -776,7 +776,7 @@ pub(super) fn check_computed_binding_element(
     )
 }
 
-#[allow(clippy::too_many_arguments)] // Unit tests omit production-owned global identities.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Preserve the indexed-access and recovery order.
 fn check_computed_binding_element_worker(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -786,14 +786,12 @@ fn check_computed_binding_element_worker(
     receiver_type: TypeId,
     index_type: TypeId,
 ) -> Result<CheckedSourceElement, SourceElementError> {
-    let index_node = computed_binding_index_node(store, host, binding, index_type)?;
+    let (index_node, allow_missing) = computed_binding_index(store, host, binding, index_type)?;
     let index = classify_index(store, index_type)?;
-    if !matches!(index.shape, IndexShape::String | IndexShape::Number) {
-        return Err(SourceElementError::Unsupported(
-            SourceElementUnsupported::IndexType(index_type),
-        ));
-    }
-
+    let index_flags = store
+        .type_payload(index_type)
+        .ok_or(SourceElementError::InvalidType(index_type))?
+        .flags();
     let receiver = store
         .type_payload(receiver_type)
         .ok_or(SourceElementError::InvalidType(receiver_type))?;
@@ -802,6 +800,8 @@ fn check_computed_binding_element_worker(
         .ok_or(RelationUnavailable::MissingBootstrap)?;
     let any = bootstrap.any_type;
     let error = bootstrap.error_type;
+    let undefined = bootstrap.undefined_type;
+    let never = bootstrap.never_type;
     if receiver_type == any || receiver_type == error {
         return Ok(CheckedSourceElement {
             type_: receiver_type,
@@ -813,12 +813,25 @@ fn check_computed_binding_element_worker(
             SourceElementUnsupported::IndexSignatureSurface(receiver_type),
         ));
     }
+    let object_flags = receiver.object_flags();
+    if index_flags.intersects(TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING) {
+        return Err(SourceElementError::Unsupported(
+            SourceElementUnsupported::IndexType(index_type),
+        ));
+    }
+    if matches!(index.shape, IndexShape::Literal { .. }) {
+        return Err(SourceElementError::Unsupported(
+            SourceElementUnsupported::IndexType(index_type),
+        ));
+    }
 
     if let Some(signatures) = resolved_index_signature_surface(store, receiver_type)? {
         let value = match index.shape {
             IndexShape::String => signatures.string,
-            IndexShape::Number => signatures.number.or(signatures.string),
-            _ => unreachable!("only broad string and number binding keys were admitted"),
+            IndexShape::Number | IndexShape::Any => signatures.number.or(signatures.string),
+            IndexShape::Invalid if index_type == never => signatures.number.or(signatures.string),
+            IndexShape::Invalid => None,
+            IndexShape::Literal { .. } => unreachable!("literal keys use property lookup"),
         };
         if let Some(value) = value {
             return Ok(CheckedSourceElement {
@@ -832,28 +845,71 @@ fn check_computed_binding_element_worker(
         store.resolved_own_property(receiver_type, "")?;
     }
 
-    let receiver = display_type(store, host, global_types, options, receiver_type)?;
-    let index = display_type(store, host, global_types, options, index_type)?;
+    if index_type == never {
+        return Ok(CheckedSourceElement {
+            type_: never,
+            diagnostic: None,
+        });
+    }
+    // Binding defaults permit absent properties only on object-literal types.
+    if allow_missing && object_flags.contains(ObjectFlags::OBJECT_LITERAL) {
+        return Ok(CheckedSourceElement {
+            type_: undefined,
+            diagnostic: None,
+        });
+    }
+    if object_flags.contains(ObjectFlags::JS_LITERAL) {
+        return Ok(CheckedSourceElement {
+            type_: any,
+            diagnostic: None,
+        });
+    }
+
+    let (code, arguments) = if matches!(index.shape, IndexShape::String | IndexShape::Number) {
+        (
+            2537,
+            vec![
+                display_type(store, host, global_types, options, receiver_type)?,
+                display_type(store, host, global_types, options, index_type)?,
+            ],
+        )
+    } else {
+        (
+            2538,
+            vec![display_type(
+                store,
+                host,
+                global_types,
+                options,
+                index_type,
+            )?],
+        )
+    };
     Ok(CheckedSourceElement {
-        type_: error,
+        type_: if matches!(index.shape, IndexShape::Any) {
+            index_type
+        } else {
+            error
+        },
         diagnostic: Some(CanonicalCheckerDiagnostic {
             node: Some(index_node),
             range_override: None,
             diagnostic: Diagnostic::with_arguments(
-                message_by_code(2537).ok_or(SourceElementError::MissingDiagnostic(2537))?,
-                [receiver, index],
+                message_by_code(code).ok_or(SourceElementError::MissingDiagnostic(code))?,
+                arguments,
             ),
             related_information: Vec::new(),
         }),
     })
 }
 
-fn computed_binding_index_node(
+#[allow(clippy::too_many_lines)] // Authenticate the binding, default, and key cache before access.
+fn computed_binding_index(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     binding: NodeRef,
     index_type: TypeId,
-) -> Result<NodeRef, SourceElementError> {
+) -> Result<(NodeRef, bool), SourceElementError> {
     let invalid = || SourceElementError::InvalidCache(binding);
     let (arena, bound) = host.source(binding).ok_or_else(invalid)?;
     let record = host.node(binding).ok_or_else(invalid)?;
@@ -865,7 +921,6 @@ fn computed_binding_index_node(
         || record.flags.0 != 0
         || element.dot_dot_dot_token.is_some()
         || element.flow_node.is_some()
-        || element.initializer.is_some()
         || element.local_symbol.is_some()
         || element.symbol.is_some()
         || element.facts != 0
@@ -932,6 +987,19 @@ fn computed_binding_index_node(
         return Err(unsupported_access(binding));
     }
 
+    if let Some(initializer) = element.initializer {
+        let initializer = NodeRef::new(binding.arena, binding.file, initializer);
+        let initializer_record = host.node(initializer).ok_or_else(invalid)?;
+        if store.source_node_kind(initializer) != Some(initializer_record.kind)
+            || store.source_node_parent(initializer) != Some(SourceNodeParent::Parent(binding))
+            || initializer_record.parent != Some(binding.node)
+            || name_record.range.end > initializer_record.range.start
+            || initializer_record.range.end != record.range.end
+        {
+            return Err(unsupported_access(binding));
+        }
+    }
+
     let index = NodeRef::new(binding.arena, binding.file, computed.expression);
     let index_record = host.node(index).ok_or_else(invalid)?;
     if !store.contains_node_ref(index)
@@ -956,7 +1024,7 @@ fn computed_binding_index_node(
     }) {
         return Err(SourceElementError::InvalidCache(index));
     }
-    Ok(index)
+    Ok((index, element.initializer.is_some()))
 }
 
 #[cfg(test)]
@@ -3048,14 +3116,19 @@ mod tests {
         let parsed = parse_fixture("let { [key()]: value } = {}; ");
         let file = FileId::new(641);
         let (mut store, bound, binding, _) = computed_binding_fixture(&parsed, file);
-        let (string, number) = {
+        let (string, number, any, error) = {
             let bootstrap = store.intrinsic_bootstrap().unwrap();
-            (bootstrap.string_type, bootstrap.number_type)
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.any_type,
+                bootstrap.error_type,
+            )
         };
         let object = index_object(&mut store, string, number);
         let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
 
-        for index in [string, number] {
+        for index in [string, number, any, error] {
             assert_eq!(
                 check_computed_binding_element_worker(
                     &mut store,
@@ -3075,8 +3148,117 @@ mod tests {
     }
 
     #[test]
+    fn computed_binding_any_keys_prefer_applicable_number_index_signatures() {
+        let parsed = parse_fixture("let { [key]: value } = {}; ");
+        let file = FileId::new(10_401);
+        let (mut store, bound, binding, _) = computed_binding_fixture(&parsed, file);
+        let (string, number, any) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.any_type,
+            )
+        };
+        let string_index = store
+            .alloc_index_info(string, any, false, None, Vec::new())
+            .unwrap();
+        let number_index = store
+            .alloc_index_info(number, number, false, None, Vec::new())
+            .unwrap();
+        let object = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            object,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![string_index, number_index]),
+        ));
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+
+        let checked = check_computed_binding_element_worker(
+            &mut store,
+            &host,
+            None,
+            CanonicalCheckerOptions::default(),
+            binding,
+            object,
+            any,
+        )
+        .unwrap();
+
+        assert_eq!(checked.type_, number);
+        assert!(checked.diagnostic.is_none());
+    }
+
+    #[test]
+    fn computed_binding_missing_indices_preserve_any_and_error_identity_without_writes() {
+        let parsed = parse_fixture("let { [key]: value } = {}; ");
+        let file = FileId::new(10_402);
+        let (mut store, bound, binding, index) = computed_binding_fixture(&parsed, file);
+        let (any, error, boolean, never) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.any_type,
+                bootstrap.error_type,
+                bootstrap.boolean_type,
+                bootstrap.never_type,
+            )
+        };
+        let object = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(object, None, None, None, None, None));
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        for (key, expected_type, display) in [
+            (any, any, Some("any")),
+            (error, error, Some("any")),
+            (boolean, error, Some("boolean")),
+            (never, never, None),
+        ] {
+            let checked = check_computed_binding_element_worker(
+                &mut store,
+                &host,
+                None,
+                CanonicalCheckerOptions::default(),
+                binding,
+                object,
+                key,
+            )
+            .unwrap();
+
+            assert_eq!(checked.type_, expected_type);
+            if let Some(display) = display {
+                let diagnostic = checked.diagnostic.unwrap();
+                assert_eq!(diagnostic.node, Some(index));
+                assert_eq!(diagnostic.diagnostic.code(), 2538);
+                assert_eq!(diagnostic.diagnostic.arguments, [display]);
+            } else {
+                assert!(checked.diagnostic.is_none());
+            }
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
     fn computed_binding_rejects_poisoned_key_caches_before_diagnostics() {
-        let parsed = parse_fixture("let { [key()]: value } = {}; ");
+        let parsed = parse_fixture("let { [key()]: value = 'fallback' } = {}; ");
         let file = FileId::new(642);
         let (mut store, bound, binding, index) = computed_binding_fixture(&parsed, file);
         let (string, number, receiver) = {
