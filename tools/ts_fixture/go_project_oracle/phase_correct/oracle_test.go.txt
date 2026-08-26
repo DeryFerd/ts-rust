@@ -530,6 +530,10 @@ func TestPhaseCorrectOracle(t *testing.T) {
 		}
 		projectOracleActiveObserver = nil
 		phaseOracleActiveQueryObserver = nil
+		if t.Failed() && report.Outcome != "oracle_error" {
+			report.Outcome = "invariant_error"
+			report.Failure = projectOracleString("the pinned baseline renderer rejected an invariant")
+		}
 		report.Trace = recorder.close()
 		report.CheckerBindings = recorder.bindings
 		report.Runtime = projectOracleRuntimeSnapshot(started)
