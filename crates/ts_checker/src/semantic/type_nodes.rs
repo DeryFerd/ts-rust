@@ -1769,12 +1769,14 @@ fn authenticated_recursive_arrow_name(
     }
 
     let aliases = HashMap::new();
-    let planner =
+    let mut planner =
         TypeQueryPlanner::new(store, host, None, provenance.array_targets, false, &aliases);
-    planner
-        .authenticated_recursive_arrow_type_query(query, declaration, arrow)
-        .is_ok_and(|authenticated| authenticated == Some(type_))
-        .then_some(variable_name)
+    planner.plan_value_type_query(query).ok()?;
+    let planned = planner.plan.type_queries.get(&query)?;
+    (planned.symbol == variable_symbol
+        && planned.source_node == Some(arrow)
+        && planned.type_ == Some(type_))
+    .then_some(variable_name)
 }
 
 struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
@@ -43340,7 +43342,14 @@ mod tests {
 
     #[test]
     fn recursive_arrow_return_recovery_rejects_poisoned_query_and_value_caches() {
-        for poison in ["query", "symbol", "value"] {
+        for poison in [
+            "query",
+            "symbol",
+            "value",
+            "initializer",
+            "initializer-metadata",
+            "query-symbol",
+        ] {
             let mut fixture = fixture("const value = () => 42 satisfies typeof value;");
             let declaration = named_node(&fixture, SyntaxKind::VariableDeclaration, "value");
             let variable = fixture
@@ -43392,10 +43401,47 @@ mod tests {
                         ..ValueSymbolLinks::default()
                     },
                 )),
+                "initializer" => assert!(fixture.store.set_type_node_links(
+                    arrow,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    },
+                )),
+                "initializer-metadata" => assert!(fixture.store.set_type_node_links(
+                    arrow,
+                    TypeNodeLinks {
+                        resolved_type: Some(callable),
+                        outer_type_parameters: Some(vec![wrong]),
+                    },
+                )),
+                "query-symbol" => assert!(fixture.store.set_symbol_node_links(
+                    query,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(variable),
+                    },
+                )),
                 _ => unreachable!(),
             }
 
             let before = store_state(&fixture.store);
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            assert_eq!(
+                type_to_string_with_host_and_flags(
+                    &fixture.store,
+                    &host,
+                    callable,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                ),
+                Err(TypeDisplayUnavailable::FunctionType {
+                    type_id: callable,
+                    reason: FunctionTypeDisplayUnavailable::PendingSignature,
+                }),
+                "poison: {poison}",
+            );
             assert_eq!(
                 query_signature_return(&mut fixture, signature, &mut diagnostics),
                 Err(DeclaredTypeError::TypeNodeUnavailable(
@@ -43430,6 +43476,73 @@ mod tests {
             )),
         );
         assert_eq!(store_state(&unrelated.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn recursive_arrow_return_recovery_rejects_forged_unsupported_type_query() {
+        let mut fixture = fixture("const value = () => 42 satisfies typeof value<string>;");
+        let declaration = named_node(&fixture, SyntaxKind::VariableDeclaration, "value");
+        let variable = fixture
+            .store
+            .get_merged_symbol(node_symbol(&fixture, declaration))
+            .unwrap();
+        let arrow = variable_initializer_node(&fixture, "value");
+        let owner = node_symbol(&fixture, arrow);
+        let query = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeQuery).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let name = type_query_name(&fixture, query);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = query_source_callable(&mut fixture, arrow, owner, &mut diagnostics).unwrap();
+        let signature = function_signature(&fixture.store, arrow);
+        assert!(fixture.store.set_type_node_links(
+            query,
+            TypeNodeLinks {
+                resolved_type: Some(callable),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_symbol_node_links(
+            name,
+            SymbolNodeLinks {
+                resolved_symbol: Some(variable),
+            },
+        ));
+
+        let before = store_state(&fixture.store);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        assert_eq!(
+            type_to_string_with_host_and_flags(
+                &fixture.store,
+                &host,
+                callable,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            ),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: callable,
+                reason: FunctionTypeDisplayUnavailable::PendingSignature,
+            }),
+        );
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(signature),
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), before);
         assert!(diagnostics.is_empty());
     }
 
