@@ -192,9 +192,9 @@ impl CanonicalCheckerContext<'_> {
         &mut self,
         node: NodeRef,
     ) -> Result<TypeId, CanonicalArtifactQueryError> {
-        let class = self.prepare_artifact_type_location(node)?;
+        let declaration = self.prepare_artifact_type_location(node)?;
 
-        if let Some(symbol) = class {
+        if let Some(symbol) = declaration {
             let type_ = self.get_declared_type_of_symbol(symbol)?;
             if let Some(cached) = self.cached_artifact_type(node)?
                 && cached != type_
@@ -776,10 +776,10 @@ impl CanonicalCheckerContext<'_> {
                 kind: record.kind,
             });
         }
-        let class = self.class_declaration_artifact_symbol(node)?;
+        let declaration = self.type_declaration_artifact_symbol(node)?;
         self.preflight_literal_annotation_nodes(node)?;
         self.prepare_artifact_location(node)?;
-        Ok(class)
+        Ok(declaration)
     }
 
     fn prepare_artifact_location(
@@ -905,21 +905,26 @@ impl CanonicalCheckerContext<'_> {
         Ok(Some(type_))
     }
 
-    fn class_declaration_artifact_symbol(
+    fn type_declaration_artifact_symbol(
         &self,
         node: NodeRef,
     ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
-        let symbol = {
+        let (symbol, is_enum) = {
             let (arena, bound, record) = self.validated_artifact_node(node)?;
-            let declaration = if matches!(record.data, NodeData::ClassDeclaration(_)) {
+            let declaration = if matches!(
+                record.data,
+                NodeData::ClassDeclaration(_) | NodeData::EnumDeclaration(_)
+            ) {
                 node
             } else if let Some(parent) = record.parent {
-                let Some(NodeData::ClassDeclaration(class)) =
-                    arena.get(parent).map(|record| &record.data)
-                else {
+                let Some(parent_record) = arena.get(parent) else {
                     return Ok(None);
                 };
-                if class.name != Some(node.node) {
+                if !matches!(
+                    parent_record.data,
+                    NodeData::ClassDeclaration(_) | NodeData::EnumDeclaration(_)
+                ) || declaration_name(&parent_record.data) != Some(node.node)
+                {
                     return Ok(None);
                 }
                 NodeRef::new(node.arena, node.file, parent)
@@ -933,9 +938,34 @@ impl CanonicalCheckerContext<'_> {
                         node,
                         kind: record.kind,
                     })?;
-            self.merged_artifact_symbol(node, symbol)?
+            (
+                self.merged_artifact_symbol(node, symbol)?,
+                matches!(
+                    self.validated_artifact_node(declaration)?.2.data,
+                    NodeData::EnumDeclaration(_)
+                ),
+            )
         };
-        if let Some(cached) = self.cached_artifact_type(node)?
+        let cached = self.cached_artifact_type(node)?;
+        if is_enum {
+            let declared = self
+                .store()
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type);
+            if self
+                .store()
+                .type_node_links(node)
+                .is_some_and(|links| links.outer_type_parameters.is_some())
+                || cached.is_some() && cached != declared
+            {
+                return Err(
+                    DeclaredTypeError::Enum(super::enums::EnumTypeError::Invariant(
+                        super::enums::EnumTypeInvariant::InvalidCache(symbol),
+                    ))
+                    .into(),
+                );
+            }
+        } else if let Some(cached) = cached
             && super::declared::cached_class_type(self.store(), symbol)? != Some(cached)
         {
             return Err(CanonicalArtifactQueryError::InvalidType {
@@ -2586,6 +2616,159 @@ mod tests {
                 poisoned,
                 "{poison}",
             );
+        }
+    }
+
+    #[test]
+    fn enum_declaration_queries_keep_declared_and_value_types_distinct() {
+        for source in [
+            "enum Kind {} const copy = Kind;",
+            "enum Kind { First = 1, Second = 2 } const copy = Kind;",
+            "declare namespace Names { enum Kind {} } const copy = Names.Kind;",
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(6_068);
+            let mut context = context(&parsed, file);
+            let (declaration, name) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, enumeration.name),
+                    ))
+                })
+                .unwrap();
+            let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let declared = context.get_type_at_location(name).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .declared_type_links(owner)
+                    .unwrap()
+                    .declared_type,
+                Some(declared),
+            );
+            let value = context
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_ne!(declared, value);
+            let reference = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (node != name.node
+                        && matches!(&record.data, NodeData::Identifier(identifier) if identifier.text == "Kind"))
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            for _ in 0..2 {
+                assert_eq!(context.get_type_at_location(declaration), Ok(declared));
+                assert_eq!(context.get_type_at_location(name), Ok(declared));
+                assert_eq!(context.get_type_at_location(reference), Ok(value));
+                assert_eq!(context.get_symbol_at_location(name), Ok(Some(owner)));
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn enum_declaration_queries_reject_bad_caches_before_source_checking() {
+        let parsed = parse_source_file("declare enum Kind { First = 1 }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_069);
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, enumeration.name),
+                ))
+            })
+            .unwrap();
+        for declaration_file in [false, true] {
+            for warm in [false, true] {
+                for location in [declaration, name] {
+                    for metadata_only in [false, true] {
+                        let mut context = context_with_source_kind(
+                            &parsed,
+                            file,
+                            CanonicalCheckerOptions::default(),
+                            declaration_file,
+                        );
+                        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+                        if warm {
+                            context.get_type_at_location(name).unwrap();
+                        }
+                        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+                        let links = TypeNodeLinks {
+                            resolved_type: (!metadata_only).then_some(wrong),
+                            outer_type_parameters: metadata_only.then(|| vec![wrong]),
+                        };
+                        assert!(
+                            context
+                                .store_mut_for_test()
+                                .set_type_node_links(location, links.clone())
+                        );
+                        let source = context.source_file(file).unwrap();
+                        let before = (
+                            context.store().type_len(),
+                            context.store().symbol_len(),
+                            context.store().checker_link_allocated_lengths(),
+                            context.store().source_file_links(source).cloned(),
+                            context.diagnostics().len(),
+                        );
+                        for _ in 0..2 {
+                            assert_eq!(
+                                context.get_type_at_location(location),
+                                Err(CanonicalArtifactQueryError::DeclaredType(
+                                    crate::semantic::DeclaredTypeError::Enum(
+                                        crate::semantic::enums::EnumTypeError::Invariant(
+                                            crate::semantic::enums::EnumTypeInvariant::InvalidCache(
+                                                owner
+                                            ),
+                                        ),
+                                    ),
+                                )),
+                            );
+                        }
+                        assert_eq!(context.store().type_node_links(location), Some(&links));
+                        assert_eq!(
+                            (
+                                context.store().type_len(),
+                                context.store().symbol_len(),
+                                context.store().checker_link_allocated_lengths(),
+                                context.store().source_file_links(source).cloned(),
+                                context.diagnostics().len(),
+                            ),
+                            before,
+                        );
+                    }
+                }
+            }
         }
     }
 
