@@ -12932,6 +12932,26 @@ mod tests {
         )
     }
 
+    fn declaration_fixture_with_array_library(source: &str) -> Fixture {
+        let parsed: &'static ParseResult = Box::leak(Box::new(parse_source_file(source)));
+        let library: &'static ParseResult = Box::leak(Box::new(parse_source_file(
+            "interface Array<Element> {} interface ReadonlyArray<Element> {}",
+        )));
+        let file = FileId::new(7_401);
+        let context = ambient_module_context(
+            &[
+                (FileId::new(7_400), library, CanonicalModuleState::Script),
+                (file, parsed, CanonicalModuleState::Script),
+            ],
+            None,
+        );
+        Fixture {
+            parsed,
+            file,
+            context,
+        }
+    }
+
     fn fixture_with_source_facts(
         source: &'static str,
         module_state: CanonicalModuleState,
@@ -19949,7 +19969,16 @@ mod tests {
 
     #[test]
     fn ambient_imported_variable_queries_preserve_parenthesized_and_array_types() {
-        for type_syntax in ["(string)", "((string))", "string[]", "(string[])"] {
+        for (type_syntax, producer_first) in [
+            ("(string)", true),
+            ("((string))", true),
+            ("string[]", true),
+            ("(string[])", true),
+            ("Array<string>", false),
+            ("Array<string>", true),
+            ("ReadonlyArray<string>", false),
+            ("ReadonlyArray<string>", true),
+        ] {
             let source = format!(
                 "declare module 'models' {{ export const value: {type_syntax}; }} \
                  declare module 'consumer' {{ \
@@ -19957,10 +19986,7 @@ mod tests {
                  interface View {{ value: typeof Models.value; }} \
                  }}"
             );
-            let mut fixture = declaration_fixture(
-                Box::leak(source.into_boxed_str()),
-                CanonicalModuleState::Script,
-            );
+            let mut fixture = declaration_fixture_with_array_library(&source);
             let producer = plan(&fixture, 0);
             let consumer = plan(&fixture, 1);
             let [
@@ -19971,13 +19997,9 @@ mod tests {
             else {
                 panic!("the producer must retain one annotated variable")
             };
-            assert!(execute(&mut fixture, &producer).unwrap().is_empty());
-            let expected = fixture
-                .context
-                .store()
-                .value_symbol_links(*symbol)
-                .and_then(|links| links.resolved_type)
-                .unwrap();
+            if producer_first {
+                assert!(execute(&mut fixture, &producer).unwrap().is_empty());
+            }
             if fixture.context.store().source_node_kind(*annotation)
                 == Some(SyntaxKind::ParenthesizedType)
             {
@@ -20002,6 +20024,22 @@ mod tests {
                 })
                 .unwrap();
             assert!(execute(&mut fixture, &consumer).unwrap().is_empty());
+            if !producer_first {
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .value_symbol_links(*symbol)
+                        .is_none()
+                );
+                assert!(execute(&mut fixture, &producer).unwrap().is_empty());
+            }
+            let expected = fixture
+                .context
+                .store()
+                .value_symbol_links(*symbol)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
             assert_eq!(
                 fixture
                     .context
@@ -20038,6 +20076,8 @@ mod tests {
             "Box<string>",
             "string[]",
             "(string[])",
+            "Array<string>",
+            "ReadonlyArray<string>",
         ] {
             let source = format!(
                 "declare module 'models' {{ \
@@ -20049,10 +20089,7 @@ mod tests {
                  interface View {{ value: typeof Models.value; }} \
                  }}"
             );
-            let mut fixture = declaration_fixture(
-                Box::leak(source.into_boxed_str()),
-                CanonicalModuleState::Script,
-            );
+            let mut fixture = declaration_fixture_with_array_library(&source);
             let namespace = plan(&fixture, 1);
             let imported_module = namespace.imports[0].ambient_target.unwrap();
             let imported = fixture

@@ -10061,7 +10061,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 == SyntaxKind::TypeReference
         {
             let target = self.resolve_uncached_type_reference_symbol(identity_node)?;
-            if self.store.symbol(target).is_some_and(|target| {
+            if let Some(array) = self.authoritative_global_array_target(target, identity_node)? {
+                validate_generic_global_type_instantiation(self.store, array, cached)
+                    .map_err(|_| invalid())?;
+            } else if self.store.symbol(target).is_some_and(|target| {
                 target
                     .flags()
                     .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
