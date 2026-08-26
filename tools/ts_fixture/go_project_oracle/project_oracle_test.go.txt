@@ -60,12 +60,12 @@ type projectOracleWalk struct {
 }
 
 type projectOraclePass struct {
-	Diagnostics []projectOracleDiagnostic `json:"diagnostics"`
-	ErrorsFileOrder []string               `json:"errors_file_order"`
-	Errors      projectOracleArtifact     `json:"errors"`
-	Types       projectOracleArtifact     `json:"types"`
-	Symbols     projectOracleArtifact     `json:"symbols"`
-	Walk        projectOracleWalk         `json:"walk"`
+	Diagnostics     []projectOracleDiagnostic `json:"diagnostics"`
+	ErrorsFileOrder []string                  `json:"errors_file_order"`
+	Errors          projectOracleArtifact     `json:"errors"`
+	Types           projectOracleArtifact     `json:"types"`
+	Symbols         projectOracleArtifact     `json:"symbols"`
+	Walk            projectOracleWalk         `json:"walk"`
 }
 
 type projectOracleReset struct {
@@ -214,9 +214,9 @@ func TestProjectOracle(t *testing.T) {
 
 func projectOracleValidateProvenance(data []byte) error {
 	var manifest struct {
-		State string `json:"state"`
+		State    string `json:"state"`
 		Upstream struct {
-			SHA string `json:"sha"`
+			SHA   string `json:"sha"`
 			Dirty string `json:"dirty"`
 		} `json:"upstream"`
 		Executable *struct {
@@ -230,9 +230,13 @@ func projectOracleValidateProvenance(data []byte) error {
 		return fmt.Errorf("build provenance does not describe a successful pinned oracle build")
 	}
 	executable, err := os.Executable()
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	binary, err := os.ReadFile(executable)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	if projectOracleHash(binary) != manifest.Executable.SHA256 {
 		return fmt.Errorf("oracle executable does not match build provenance")
 	}
@@ -243,8 +247,8 @@ func projectOracleNewReport(header string) *projectOracleReport {
 	return &projectOracleReport{
 		SchemaVersion: 1, Implementation: "typescript-go", UpstreamSHA: projectOracleUpstreamSHA,
 		Header: header, Outcome: "oracle_error", Provenance: json.RawMessage("null"),
-		Cold: projectOracleUnavailablePass("cold run did not complete"),
-		Warm: projectOracleUnavailablePass("forced replay did not complete"),
+		Cold:   projectOracleUnavailablePass("cold run did not complete"),
+		Warm:   projectOracleUnavailablePass("forced replay did not complete"),
 		Replay: projectOracleReplay{State: "unavailable", Sources: []projectOracleReset{}},
 	}
 }
@@ -372,7 +376,9 @@ func projectOracleErrorBaseline(t *testing.T, files []*harnessutil.TestFile, dia
 		}
 	}
 	names := make([]string, 0, len(extra))
-	for name := range extra { names = append(names, name) }
+	for name := range extra {
+		names = append(names, name)
+	}
 	slices.Sort(names)
 	for _, name := range names {
 		errorFiles = append(errorFiles, &harnessutil.TestFile{UnitName: name, Content: extra[name].Text()})
@@ -399,8 +405,8 @@ func projectOracleDiagnosticRecord(diagnostic diagnosticwriter.Diagnostic) proje
 	result := projectOracleDiagnostic{
 		File: file, Start: diagnostic.Pos(), Length: diagnostic.Len(), Code: diagnostic.Code(),
 		Category: diagnostic.Category().Name(),
-		Message: diagnosticwriter.FlattenDiagnosticMessage(diagnostic, "\n", locale.Default),
-		Related: []projectOracleDiagnostic{},
+		Message:  diagnosticwriter.FlattenDiagnosticMessage(diagnostic, "\n", locale.Default),
+		Related:  []projectOracleDiagnostic{},
 	}
 	if wrapped, ok := diagnostic.(*diagnosticwriter.ASTDiagnostic); ok {
 		result.Unnecessary = wrapped.ReportsUnnecessary()
@@ -456,10 +462,10 @@ func projectOracleRuntimeSnapshot(started time.Time) projectOracleRuntime {
 		GoVersion: runtime.Version(), OS: runtime.GOOS, Architecture: runtime.GOARCH,
 		CPUCount: runtime.NumCPU(), StartedAt: started.UTC().Format(time.RFC3339Nano),
 		ElapsedNanos: time.Since(started).Nanoseconds(), Arguments: slices.Clone(os.Args),
-		Environment: map[string]string{},
-		ProcessStatus: projectOracleReadOptional("/proc/self/status"),
-		ProcessLimits: projectOracleReadOptional("/proc/self/limits"),
-		CgroupMemoryMax: projectOracleReadOptional("/sys/fs/cgroup/memory.max"),
+		Environment:     map[string]string{},
+		ProcessStatus:   projectOracleReadOptional("/proc/self/status"),
+		ProcessLimits:   projectOracleReadOptional("/proc/self/limits"),
+		CgroupMemoryMax: projectOracleCgroupMemoryMax(),
 	}
 	for _, key := range []string{"GOTOOLCHAIN", "GOPROXY", "GOCACHE", "GOMODCACHE", "GOFLAGS", "GOMAXPROCS", "GOMEMLIMIT", "TS_RUST_ORACLE_PROJECT", "TS_RUST_ORACLE_OUTPUT", "TS_RUST_ORACLE_HEADER", "TS_RUST_ORACLE_PROVENANCE", "TS_RUST_ORACLE_RUN_ID"} {
 		if value, ok := os.LookupEnv(key); ok {
@@ -483,6 +489,19 @@ func projectOracleReadOptional(path string) *string {
 		return nil
 	}
 	return projectOracleString(string(data))
+}
+
+func projectOracleCgroupMemoryMax() *string {
+	groups := projectOracleReadOptional("/proc/self/cgroup")
+	if groups == nil {
+		return nil
+	}
+	for _, line := range strings.Split(*groups, "\n") {
+		if path, ok := strings.CutPrefix(line, "0::"); ok {
+			return projectOracleReadOptional(filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(path, "/"), "memory.max"))
+		}
+	}
+	return nil
 }
 
 func TestProjectOracleMetadata(t *testing.T) {
@@ -527,9 +546,9 @@ func TestProjectOracleOnDiskReplay(t *testing.T) {
 	config := `{"compilerOptions":{"strict":true,"noEmit":true,"skipLibCheck":true},"files":["second.ts","first.ts","ambient.d.ts"]}`
 	inputs := map[string]string{
 		"tsconfig.json": config,
-		"second.ts": "export const second: number = 2;\n",
-		"first.ts": "// @ts-expect-error\nexport const first: number = 'bad';\n",
-		"ambient.d.ts": "declare const projectAmbient: string;\n",
+		"second.ts":     "export const second: number = 2;\n",
+		"first.ts":      "// @ts-expect-error\nexport const first: number = 'bad';\n",
+		"ambient.d.ts":  "declare const projectAmbient: string;\n",
 	}
 	for name, content := range inputs {
 		if err := os.WriteFile(filepath.Join(project, name), []byte(content), 0o600); err != nil {

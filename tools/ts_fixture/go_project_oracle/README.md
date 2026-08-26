@@ -3,16 +3,29 @@
 This driver uses Go source overlays at upstream commit
 `dc37b5249ab60e2bbce936f71b883e6c8136167e`. It does not edit the upstream
 checkout or the project. The Go executable is an explicit helper argument.
-The helper does not download a toolchain, install packages, or change a config.
+The helper does not download a toolchain, install project packages, or change
+a config. Go module downloads require an explicit opt-in.
 
 ## Invocation contract
 
-`scripts/run-go-project-oracle.sh GO UPSTREAM CONFIG OUT [prepare|build|run]`
+`scripts/run-go-project-oracle.sh GO UPSTREAM CONFIG OUT [prepare|build|test|run]`
 requires absolute paths. `OUT` must not exist. The default mode is `run`.
 `prepare` writes overlays and provenance without invoking Go. `build` also
-builds the test executable. `run` then starts two fresh test processes.
+builds the test executable. `test` also runs the three focused instrumentation
+tests without checking the supplied project. `run` instead starts two fresh
+project oracle processes.
 Builds use `GOTOOLCHAIN=local`, `GOPROXY=off`, and an output-local Go cache.
 They retain the normal bundled libraries and do not use `-trimpath`.
+Python 3 records elapsed time, peak child-process RSS, and exit status on
+Linux. It uses the standard library and requires no package install.
+
+`TS_GO_ORACLE_DOWNLOAD_PINNED=1` permits a dependency download before the
+build. It selects only versions in the pinned `go.mod` and requires a content
+checksum for each in the pinned `go.sum`. The helper copies both files into
+the output directory, uses `-modfile`, and rejects any change to the copies.
+The build itself still uses `GOPROXY=off`. `GOMODCACHE` can name a cache under
+the caller's exclusive output directory. Otherwise the helper uses a cache
+inside `OUT`. No dependency download runs in `prepare` mode.
 
 The test executable reads these environment variables:
 

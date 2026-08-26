@@ -74,24 +74,24 @@ type projectOraclePackage struct {
 }
 
 type projectOracleResolution struct {
-	Kind                       string                    `json:"kind"`
-	Source                     string                    `json:"source"`
-	Specifier                  string                    `json:"specifier"`
-	Start                      *int                      `json:"start"`
-	End                        *int                      `json:"end"`
-	RequestMode                string                    `json:"request_mode"`
-	Resolved                   bool                      `json:"resolved"`
-	ResolvedPath               *string                   `json:"resolved_path"`
-	OriginalPath               *string                   `json:"original_path"`
-	AlternateResult            *string                   `json:"alternate_result"`
-	Primary                    *bool                     `json:"primary"`
-	LoadedTarget               *string                   `json:"loaded_target"`
-	TargetMode                 *string                   `json:"target_mode"`
-	Extension                  *string                   `json:"extension"`
-	ExternalLibrary            bool                      `json:"external_library"`
-	ResolvedUsingTSExtension    bool                      `json:"resolved_using_ts_extension"`
-	Package                    *projectOraclePackage     `json:"package"`
-	Diagnostics                []projectOracleDiagnostic `json:"diagnostics"`
+	Kind                     string                    `json:"kind"`
+	Source                   string                    `json:"source"`
+	Specifier                string                    `json:"specifier"`
+	Start                    *int                      `json:"start"`
+	End                      *int                      `json:"end"`
+	RequestMode              string                    `json:"request_mode"`
+	Resolved                 bool                      `json:"resolved"`
+	ResolvedPath             *string                   `json:"resolved_path"`
+	OriginalPath             *string                   `json:"original_path"`
+	AlternateResult          *string                   `json:"alternate_result"`
+	Primary                  *bool                     `json:"primary"`
+	LoadedTarget             *string                   `json:"loaded_target"`
+	TargetMode               *string                   `json:"target_mode"`
+	Extension                *string                   `json:"extension"`
+	ExternalLibrary          bool                      `json:"external_library"`
+	ResolvedUsingTSExtension bool                      `json:"resolved_using_ts_extension"`
+	Package                  *projectOraclePackage     `json:"package"`
+	Diagnostics              []projectOracleDiagnostic `json:"diagnostics"`
 }
 
 type projectOracleReference struct {
@@ -105,24 +105,24 @@ type projectOracleReference struct {
 }
 
 type projectOracleGraph struct {
-	ConfigPath       string                     `json:"config_path"`
-	CurrentDirectory string                     `json:"current_directory"`
-	CaseSensitive    bool                       `json:"case_sensitive"`
-	Roots            []projectOracleRoot        `json:"roots"`
-	Sources          []projectOracleSource      `json:"sources"`
-	ArtifactOrder    []string                   `json:"artifact_order"`
-	ConfigInputs     []projectOracleConfigInput `json:"config_inputs"`
-	FileReads        []projectOracleFileRead    `json:"file_reads"`
-	PackageJSONReads []projectOracleFileRead    `json:"package_json_reads"`
-	Lookups          []projectOracleLookup      `json:"lookups"`
-	Realpaths        []projectOracleRealpath    `json:"realpaths"`
-	SymlinkEntries   []string                   `json:"symlink_entries"`
-	Resolutions      []projectOracleResolution  `json:"resolutions"`
-	References       []projectOracleReference   `json:"references"`
-	CompilerOptions  json.RawMessage            `json:"compiler_options"`
-	EffectiveOptions map[string]any             `json:"effective_options"`
-	ProjectReferences json.RawMessage           `json:"project_references"`
-	MissingEvidence  []string                   `json:"missing_evidence"`
+	ConfigPath        string                     `json:"config_path"`
+	CurrentDirectory  string                     `json:"current_directory"`
+	CaseSensitive     bool                       `json:"case_sensitive"`
+	Roots             []projectOracleRoot        `json:"roots"`
+	Sources           []projectOracleSource      `json:"sources"`
+	ArtifactOrder     []string                   `json:"artifact_order"`
+	ConfigInputs      []projectOracleConfigInput `json:"config_inputs"`
+	FileReads         []projectOracleFileRead    `json:"file_reads"`
+	PackageJSONReads  []projectOracleFileRead    `json:"package_json_reads"`
+	Lookups           []projectOracleLookup      `json:"lookups"`
+	Realpaths         []projectOracleRealpath    `json:"realpaths"`
+	SymlinkEntries    []string                   `json:"symlink_entries"`
+	Resolutions       []projectOracleResolution  `json:"resolutions"`
+	References        []projectOracleReference   `json:"references"`
+	CompilerOptions   json.RawMessage            `json:"compiler_options"`
+	EffectiveOptions  map[string]any             `json:"effective_options"`
+	ProjectReferences json.RawMessage            `json:"project_references"`
+	MissingEvidence   []string                   `json:"missing_evidence"`
 }
 
 type projectOracleFS struct {
@@ -317,10 +317,21 @@ func projectOracleCopyReads(graph *projectOracleGraph, fs *projectOracleFS) {
 		graph.FileReads = append(graph.FileReads, read)
 	}
 	slices.SortFunc(graph.FileReads, func(left, right projectOracleFileRead) int {
-		if result := strings.Compare(left.Path, right.Path); result != 0 { return result }
-		if result := strings.Compare(left.Phase, right.Phase); result != 0 { return result }
-		if left.SHA256 == nil { if right.SHA256 == nil { return 0 }; return -1 }
-		if right.SHA256 == nil { return 1 }
+		if result := strings.Compare(left.Path, right.Path); result != 0 {
+			return result
+		}
+		if result := strings.Compare(left.Phase, right.Phase); result != 0 {
+			return result
+		}
+		if left.SHA256 == nil {
+			if right.SHA256 == nil {
+				return 0
+			}
+			return -1
+		}
+		if right.SHA256 == nil {
+			return 1
+		}
 		return strings.Compare(*left.SHA256, *right.SHA256)
 	})
 	for _, read := range graph.FileReads {
@@ -328,18 +339,36 @@ func projectOracleCopyReads(graph *projectOracleGraph, fs *projectOracleFS) {
 			graph.PackageJSONReads = append(graph.PackageJSONReads, read)
 		}
 	}
-	for lookup := range fs.lookups { graph.Lookups = append(graph.Lookups, lookup) }
+	for lookup := range fs.lookups {
+		graph.Lookups = append(graph.Lookups, lookup)
+	}
 	slices.SortFunc(graph.Lookups, func(left, right projectOracleLookup) int {
-		if result := strings.Compare(left.Path, right.Path); result != 0 { return result }
-		if result := strings.Compare(left.Operation, right.Operation); result != 0 { return result }
-		if left.Found == right.Found { return 0 }; if left.Found { return 1 }; return -1
+		if result := strings.Compare(left.Path, right.Path); result != 0 {
+			return result
+		}
+		if result := strings.Compare(left.Operation, right.Operation); result != 0 {
+			return result
+		}
+		if left.Found == right.Found {
+			return 0
+		}
+		if left.Found {
+			return 1
+		}
+		return -1
 	})
-	for realpath := range fs.realpaths { graph.Realpaths = append(graph.Realpaths, realpath) }
+	for realpath := range fs.realpaths {
+		graph.Realpaths = append(graph.Realpaths, realpath)
+	}
 	slices.SortFunc(graph.Realpaths, func(left, right projectOracleRealpath) int {
-		if result := strings.Compare(left.Path, right.Path); result != 0 { return result }
+		if result := strings.Compare(left.Path, right.Path); result != 0 {
+			return result
+		}
 		return strings.Compare(left.Result, right.Result)
 	})
-	for link := range fs.symlinks { graph.SymlinkEntries = append(graph.SymlinkEntries, link) }
+	for link := range fs.symlinks {
+		graph.SymlinkEntries = append(graph.SymlinkEntries, link)
+	}
 	slices.Sort(graph.SymlinkEntries)
 	if fs.unknownSymlinks {
 		graph.MissingEvidence = append(graph.MissingEvidence, "some directory reads did not expose symlink membership")
@@ -349,14 +378,18 @@ func projectOracleCopyReads(graph *projectOracleGraph, fs *projectOracleFS) {
 func projectOracleConfigRead(path, role string, reads []projectOracleFileRead) projectOracleConfigInput {
 	result := projectOracleConfigInput{Path: path, Role: role, Reads: []projectOracleFileRead{}}
 	for _, read := range reads {
-		if read.Path == path { result.Reads = append(result.Reads, read) }
+		if read.Path == path {
+			result.Reads = append(result.Reads, read)
+		}
 	}
 	return result
 }
 
 func projectOracleSourceResolutions(graph *projectOracleGraph, program *compiler.Program, file *ast.SourceFile) {
 	appendUsage := func(kind string, specifier *ast.Node) {
-		if specifier == nil || specifier.Text() == "" { return }
+		if specifier == nil || specifier.Text() == "" {
+			return
+		}
 		mode := program.GetModeForUsageLocation(file, specifier)
 		record := projectOracleModuleResolution(program, kind, string(file.Path()), specifier.Text(), mode, program.GetResolvedModule(file, specifier.Text(), mode))
 		start, end := specifier.Pos(), specifier.End()
@@ -366,9 +399,13 @@ func projectOracleSourceResolutions(graph *projectOracleGraph, program *compiler
 	appendUsage("import_helpers", program.GetImportHelpersImportSpecifier(file.Path()))
 	_, jsx := program.GetJSXRuntimeImportSpecifier(file.Path())
 	appendUsage("jsx_runtime", jsx)
-	for _, specifier := range file.Imports() { appendUsage("module", specifier) }
+	for _, specifier := range file.Imports() {
+		appendUsage("module", specifier)
+	}
 	for _, specifier := range file.ModuleAugmentations {
-		if specifier.Kind == ast.KindStringLiteral { appendUsage("module_augmentation", specifier) }
+		if specifier.Kind == ast.KindStringLiteral {
+			appendUsage("module_augmentation", specifier)
+		}
 	}
 }
 
@@ -377,7 +414,9 @@ func projectOracleModuleResolution(program *compiler.Program, kind, source, spec
 		Kind: kind, Source: projectOraclePath(source), Specifier: specifier, RequestMode: projectOracleMode(mode),
 		Diagnostics: []projectOracleDiagnostic{},
 	}
-	if resolved == nil { return record }
+	if resolved == nil {
+		return record
+	}
 	record.Resolved = resolved.IsResolved()
 	record.ResolvedPath = projectOracleNonemptyPath(resolved.ResolvedFileName)
 	record.OriginalPath = projectOracleNonemptyPath(resolved.OriginalPath)
@@ -395,7 +434,9 @@ func projectOracleTypeResolutions(graph *projectOracleGraph, program *compiler.P
 	records := []projectOracleResolution{}
 	program.ForEachResolvedTypeReferenceDirective(func(resolved *module.ResolvedTypeReferenceDirective, name string, mode core.ResolutionMode, path tspath.Path) {
 		kind := "type_reference"
-		if tspath.GetBaseFileName(string(path)) == module.InferredTypesContainingFile { kind = "automatic_type_directive" }
+		if tspath.GetBaseFileName(string(path)) == module.InferredTypesContainingFile {
+			kind = "automatic_type_directive"
+		}
 		record := projectOracleResolution{Kind: kind, Source: projectOraclePath(string(path)), Specifier: name, RequestMode: projectOracleMode(mode), Diagnostics: []projectOracleDiagnostic{}}
 		if resolved != nil {
 			record.Resolved = resolved.IsResolved()
@@ -412,7 +453,9 @@ func projectOracleTypeResolutions(graph *projectOracleGraph, program *compiler.P
 		if file := program.GetSourceFileByPath(path); file != nil {
 			for _, ref := range file.TypeReferenceDirectives {
 				refMode := ref.ResolutionMode
-				if refMode == core.ResolutionModeNone { refMode = program.GetDefaultResolutionModeForFile(file) }
+				if refMode == core.ResolutionModeNone {
+					refMode = program.GetDefaultResolutionModeForFile(file)
+				}
 				if ref.FileName == name && refMode == mode {
 					start, end := ref.Pos(), ref.End()
 					withRange := record
@@ -422,23 +465,44 @@ func projectOracleTypeResolutions(graph *projectOracleGraph, program *compiler.P
 				}
 			}
 		}
-		if !found { records = append(records, record) }
+		if !found {
+			records = append(records, record)
+		}
 	}, nil)
 	slices.SortFunc(records, func(left, right projectOracleResolution) int {
-		if result := strings.Compare(left.Source, right.Source); result != 0 { return result }
-		if result := strings.Compare(left.Specifier, right.Specifier); result != 0 { return result }
-		if result := strings.Compare(left.RequestMode, right.RequestMode); result != 0 { return result }
-		if left.Start == nil { if right.Start == nil { return 0 }; return -1 }
-		if right.Start == nil { return 1 }
-		if *left.Start < *right.Start { return -1 }
-		if *left.Start > *right.Start { return 1 }
+		if result := strings.Compare(left.Source, right.Source); result != 0 {
+			return result
+		}
+		if result := strings.Compare(left.Specifier, right.Specifier); result != 0 {
+			return result
+		}
+		if result := strings.Compare(left.RequestMode, right.RequestMode); result != 0 {
+			return result
+		}
+		if left.Start == nil {
+			if right.Start == nil {
+				return 0
+			}
+			return -1
+		}
+		if right.Start == nil {
+			return 1
+		}
+		if *left.Start < *right.Start {
+			return -1
+		}
+		if *left.Start > *right.Start {
+			return 1
+		}
 		return 0
 	})
 	graph.Resolutions = append(graph.Resolutions, records...)
 }
 
 func projectOracleResolutionTarget(program *compiler.Program, record *projectOracleResolution, path string) {
-	if path == "" { return }
+	if path == "" {
+		return
+	}
 	if target := program.GetSourceFileForResolvedModule(path); target != nil {
 		record.LoadedTarget = projectOracleString(projectOraclePath(target.FileName()))
 		record.TargetMode = projectOracleString(strings.ToLower(program.GetEmitModuleFormatOfFile(target).String()))
@@ -446,7 +510,9 @@ func projectOracleResolutionTarget(program *compiler.Program, record *projectOra
 }
 
 func projectOraclePackageID(id module.PackageId) *projectOraclePackage {
-	if id == (module.PackageId{}) { return nil }
+	if id == (module.PackageId{}) {
+		return nil
+	}
 	return &projectOraclePackage{Name: id.Name, SubModuleName: id.SubModuleName, Version: id.Version, PeerDependencies: id.PeerDependencies}
 }
 
@@ -454,7 +520,9 @@ func projectOracleSourceReferences(graph *projectOracleGraph, program *compiler.
 	for _, ref := range file.ReferencedFiles {
 		record := projectOracleReference{Kind: "path", Source: projectOraclePath(file.FileName()), Specifier: ref.FileName, Start: ref.Pos(), End: ref.End(), Skipped: program.Options().NoResolve.IsTrue(), Targets: []string{}}
 		if !record.Skipped {
-			if target := program.GetSourceFileFromReference(file, ref); target != nil { record.Targets = append(record.Targets, projectOraclePath(target.FileName())) }
+			if target := program.GetSourceFileFromReference(file, ref); target != nil {
+				record.Targets = append(record.Targets, projectOraclePath(target.FileName()))
+			}
 		}
 		graph.References = append(graph.References, record)
 	}
@@ -463,7 +531,9 @@ func projectOracleSourceReferences(graph *projectOracleGraph, program *compiler.
 		if !record.Skipped {
 			if name, ok := tsoptions.GetLibFileName(ref.FileName); ok {
 				for _, target := range program.SourceFiles() {
-					if lib := program.GetDefaultLibFile(target.Path()); lib != nil && lib.Name == name { record.Targets = append(record.Targets, projectOraclePath(target.FileName())) }
+					if lib := program.GetDefaultLibFile(target.Path()); lib != nil && lib.Name == name {
+						record.Targets = append(record.Targets, projectOraclePath(target.FileName()))
+					}
 				}
 			}
 		}
@@ -473,23 +543,33 @@ func projectOracleSourceReferences(graph *projectOracleGraph, program *compiler.
 
 func projectOracleMode(mode core.ResolutionMode) string {
 	switch mode {
-	case core.ResolutionModeNone: return "default"
-	case core.ResolutionModeCommonJS: return "require"
-	case core.ResolutionModeESM: return "import"
-	default: panic(fmt.Sprintf("unexpected resolution mode %d", mode))
+	case core.ResolutionModeNone:
+		return "default"
+	case core.ResolutionModeCommonJS:
+		return "require"
+	case core.ResolutionModeESM:
+		return "import"
+	default:
+		panic(fmt.Sprintf("unexpected resolution mode %d", mode))
 	}
 }
 
 func projectOracleNonempty(value string) *string {
-	if value == "" { return nil }
+	if value == "" {
+		return nil
+	}
 	return &value
 }
 
-func projectOracleNonemptyPath(path string) *string { return projectOracleNonempty(projectOraclePath(path)) }
+func projectOracleNonemptyPath(path string) *string {
+	return projectOracleNonempty(projectOraclePath(path))
+}
 
 func projectOracleUpstreamJSON(value any) json.RawMessage {
 	data, err := upstreamjson.Marshal(value, upstreamjson.Deterministic(true))
-	if err != nil { panic(err) }
+	if err != nil {
+		panic(err)
+	}
 	return json.RawMessage(data)
 }
 
@@ -498,12 +578,19 @@ func projectOracleEffectiveOptions(options *core.CompilerOptions) map[string]any
 	result := map[string]any{}
 	tsoptions.ForEachCompilerOptionValue(options, func(*tsoptions.CommandLineOption) bool { return true }, func(option *tsoptions.CommandLineOption, value reflect.Value, _ int) bool {
 		if tristate, ok := value.Interface().(core.Tristate); ok {
-			if tristate.IsUnknown() { result[option.Name] = nil } else { result[option.Name] = tristate.IsTrue() }
+			if tristate.IsUnknown() {
+				result[option.Name] = nil
+			} else {
+				result[option.Name] = tristate.IsTrue()
+			}
 		} else if enum := option.EnumMap(); enum != nil && value.CanInt() {
 			var name *string
 			for key, item := range enum.Entries() {
 				other := reflect.ValueOf(item)
-				if other.CanInt() && other.Int() == value.Int() { name = projectOracleString(key); break }
+				if other.CanInt() && other.Int() == value.Int() {
+					name = projectOracleString(key)
+					break
+				}
 			}
 			result[option.Name] = name
 		} else {
@@ -521,7 +608,9 @@ func projectOracleEffectiveOptions(options *core.CompilerOptions) map[string]any
 		"strictBindCallApply": options.StrictBindCallApply, "strictPropertyInitialization": options.StrictPropertyInitialization,
 		"strictBuiltinIteratorReturn": options.StrictBuiltinIteratorReturn, "noImplicitAny": options.NoImplicitAny,
 		"noImplicitThis": options.NoImplicitThis, "useUnknownInCatchVariables": options.UseUnknownInCatchVariables,
-	} { result[name] = options.GetStrictOptionValue(value) }
+	} {
+		result[name] = options.GetStrictOptionValue(value)
+	}
 	result["allowJs"] = options.GetAllowJS()
 	result["allowImportingTsExtensions"] = options.GetAllowImportingTsExtensions()
 	result["resolveJsonModule"] = options.GetResolveJsonModule()

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if (($# < 4 || $# > 5)); then
-  printf 'Usage: %s GO UPSTREAM CONFIG OUT [prepare|build|run]\n' "$0" >&2
+  printf 'Usage: %s GO UPSTREAM CONFIG OUT [prepare|build|test|run]\n' "$0" >&2
   exit 2
 fi
 go=$1
@@ -10,7 +10,9 @@ upstream=$2
 config=$3
 out=$4
 mode=${5:-run}
-case "$mode" in prepare|build|run) ;; *) printf 'Unknown mode: %s\n' "$mode" >&2; exit 2 ;; esac
+case "$mode" in prepare|build|test|run) ;; *) printf 'Unknown mode: %s\n' "$mode" >&2; exit 2 ;; esac
+download_pinned=${TS_GO_ORACLE_DOWNLOAD_PINNED:-0}
+case "$download_pinned" in 0|1) ;; *) printf 'TS_GO_ORACLE_DOWNLOAD_PINNED must be 0 or 1.\n' >&2; exit 2 ;; esac
 for path in "$go" "$upstream" "$config" "$out"; do
   if [[ "$path" != /* ]]; then
     printf 'Every path argument must be absolute: %s\n' "$path" >&2
@@ -54,8 +56,8 @@ fi
 
 # Use the Cargo queue so one Go build cannot overlap a large Rust build.
 if [[ "$mode" != prepare ]]; then
-  if [[ ! -x "$go" || ! -x /usr/bin/time ]]; then
-    printf 'Build and run modes require the Go executable and /usr/bin/time.\n' >&2
+  if [[ ! -x "$go" ]] || ! command -v python3 >/dev/null; then
+    printf 'Build and run modes require the Go executable and Python 3.\n' >&2
     exit 2
   fi
   if [[ "${TS_GO_ORACLE_CGROUP_ACTIVE:-0}" != 1 ]]; then
@@ -80,6 +82,8 @@ hash_file() {
 mkdir -p -- "$(dirname -- "$out")"
 mkdir -- "$out"
 mkdir -- "$out/overlay" "$out/go-cache" "$out/go-tmp"
+cp -- "$upstream/go.mod" "$out/go.mod"
+cp -- "$upstream/go.sum" "$out/go.sum"
 cp -- "$sources/checker_replay.go.txt" "$out/overlay/checker_replay.go"
 cp -- "$sources/baseline_hooks.go.txt" "$out/overlay/baseline_hooks.go"
 cp -- "$sources/project_oracle_test.go.txt" "$out/overlay/project_oracle_test.go"
@@ -110,8 +114,8 @@ while IFS=$'\t' read -r original replacement; do
     '{original_path:$original,replacement_path:$replacement,sha256:$sha256,original_sha256:$original_sha}'
 done < <(jq -r '.Replace | to_entries[] | [.key,.value] | @tsv' "$out/overlay.json") | jq -s . >"$out/overlay-sources.json"
 
-build_args=("$go" -C "$upstream" test -mod=readonly -c -p 1 -overlay "$out/overlay.json" -o "$out/project-oracle.test" ./internal/testutil/tsbaseline)
-build_env=(GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off GOWORK=off GOFLAGS= GOMAXPROCS=1 "GOMEMLIMIT=$((memory_kib * 3 / 4))KiB" "GOCACHE=$out/go-cache" "GOTMPDIR=$out/go-tmp")
+build_args=("$go" -C "$upstream" test -mod=readonly -modfile "$out/go.mod" -c -p 1 -overlay "$out/overlay.json" -o "$out/project-oracle.test" ./internal/testutil/tsbaseline)
+build_env=(GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off GOWORK=off GOFLAGS= GOMAXPROCS=1 "GOMEMLIMIT=$((memory_kib * 3 / 4))KiB" "GOCACHE=$out/go-cache" "GOTMPDIR=$out/go-tmp" "TMPDIR=$out/go-tmp" "GOMODCACHE=${GOMODCACHE:-$out/go-mod-cache}")
 args_json="$(jq -n --args '$ARGS.positional' -- "${build_args[@]}")"
 env_json="$(jq -n --args '$ARGS.positional' -- "${build_env[@]}")"
 rust_sha="$(git -C "$repo" rev-parse HEAD)"
@@ -134,6 +138,8 @@ if [[ -n "$project_dir" ]]; then
 fi
 jq -n --arg upstream "$upstream" --arg upstream_sha "$upstream_sha" --arg upstream_dirty "$upstream_dirty" \
   --arg helper "$script_dir/run-go-project-oracle.sh" --arg helper_sha "$(hash_file "$script_dir/run-go-project-oracle.sh")" \
+  --arg measurement_sha "$(hash_file "$sources/measure.py")" \
+  --arg mod_sha "$(hash_file "$out/go.mod")" --arg sum_sha "$(hash_file "$out/go.sum")" \
   --arg patch_sha "$(hash_file "$sources/baseline_hooks.patch")" --arg overlay_sha "$(hash_file "$out/overlay.json")" \
   --arg rust_sha "$rust_sha" --arg rust_dirty "$rust_dirty" --arg go "$go" --arg config "$config" \
   --argjson project_root "$project_root" --argjson project_sha "$project_sha" --argjson project_dirty "$project_dirty" \
@@ -141,12 +147,12 @@ jq -n --arg upstream "$upstream" --arg upstream_sha "$upstream_sha" --arg upstre
   --argjson arguments "$args_json" --argjson environment "$env_json" \
   --argjson memory_kib "$memory_kib" --argjson timeout_seconds "$timeout_seconds" \
   --slurpfile overlays "$out/overlay-sources.json" '{
-    schema_version:1,state:"prepared",upstream:{path:$upstream,sha:$upstream_sha,dirty:$upstream_dirty},
+    schema_version:1,state:"prepared",upstream:{path:$upstream,sha:$upstream_sha,dirty:$upstream_dirty,go_mod_sha256:$mod_sha,go_sum_sha256:$sum_sha},
     instrumentation:{rust_sha:$rust_sha,rust_dirty:$rust_dirty,helper_path:$helper,helper_sha256:$helper_sha,
-      patch_sha256:$patch_sha,overlay_manifest_sha256:$overlay_sha,overlays:$overlays[0]},
+      patch_sha256:$patch_sha,measurement_sha256:$measurement_sha,overlay_manifest_sha256:$overlay_sha,overlays:$overlays[0]},
     project:{root:$project_root,sha:$project_sha,dirty:$project_dirty,config_path:$config,metadata_inputs:$project_inputs},
     go:{executable:$go,version:null,sha256:null,environment:null},
-    build:{arguments:$arguments,environment:$environment,exit_code:null,resources:null},
+    dependency_download:null,build:{arguments:$arguments,environment:$environment,exit_code:null,resources:null},
     limits:{memory_kib:$memory_kib,timeout_seconds:$timeout_seconds},executable:null
   }' >"$out/build.json"
 if [[ "$mode" == prepare ]]; then
@@ -161,9 +167,40 @@ jq --arg version "$go_version" --arg sha256 "$(hash_file "$go")" --argjson envir
   '.state="building" | .go.version=$version | .go.sha256=$sha256 | .go.environment=$environment' \
   "$out/build.json" >"$out/build-next.json"
 mv -- "$out/build-next.json" "$out/build.json"
+if [[ "$download_pinned" == 1 ]]; then
+  env "${build_env[@]}" "$go" -C "$upstream" mod edit -json -modfile "$out/go.mod" >"$out/module-inputs.json"
+  jq -e '((.Replace // []) | length) == 0' "$out/module-inputs.json" >/dev/null
+  pinned_modules=()
+  while IFS=$'\t' read -r path version; do
+    if ! awk -v module="$path" -v version="$version" '$1 == module && $2 == version && $3 ~ /^h1:/ { found=1 } END { exit !found }' "$upstream/go.sum"; then
+      printf 'Missing pinned module content checksum: %s@%s\n' "$path" "$version" >&2
+      exit 2
+    fi
+    pinned_modules+=("$path@$version")
+  done < <(jq -r '.Require[] | [.Path,.Version] | @tsv' "$out/module-inputs.json")
+  dependency_args=("$go" -C "$upstream" mod download -modfile "$out/go.mod" -json "${pinned_modules[@]}")
+  dependency_env=("${build_env[@]}" GOPROXY=https://proxy.golang.org)
+  dependency_exit=0
+  timeout --signal=TERM --kill-after=10s "${timeout_seconds}s" \
+    python3 "$sources/measure.py" "$out/dependency-resources.json" \
+    env "${dependency_env[@]}" "${dependency_args[@]}" >"$out/dependencies.json" 2>"$out/dependencies.stderr.log" || dependency_exit=$?
+  if ! cmp -s "$upstream/go.mod" "$out/go.mod" || ! cmp -s "$upstream/go.sum" "$out/go.sum"; then
+    printf 'The copied module inputs changed during the pinned dependency download.\n' >&2
+    dependency_exit=1
+  fi
+  resources=null
+  if jq -e . "$out/dependency-resources.json" >/dev/null 2>&1; then resources="$(jq . "$out/dependency-resources.json")"; fi
+  dependency_args_json="$(jq -n --args '$ARGS.positional' -- "${dependency_args[@]}")"
+  dependency_env_json="$(jq -n --args '$ARGS.positional' -- "${dependency_env[@]}")"
+  jq --argjson code "$dependency_exit" --argjson arguments "$dependency_args_json" --argjson environment "$dependency_env_json" --argjson resources "$resources" \
+    '.dependency_download={exit_code:$code,arguments:$arguments,environment:$environment,resources:$resources} | if $code != 0 then .state="dependency_error" else . end' \
+    "$out/build.json" >"$out/build-next.json"
+  mv -- "$out/build-next.json" "$out/build.json"
+  if ((dependency_exit != 0)); then exit "$dependency_exit"; fi
+fi
 build_exit=0
 timeout --signal=TERM --kill-after=10s "${timeout_seconds}s" \
-  /usr/bin/time -q -f '{"elapsed_seconds":%e,"peak_rss_kib":%M,"exit_code":%x}' -o "$out/build-resources.json" \
+  python3 "$sources/measure.py" "$out/build-resources.json" \
   env "${build_env[@]}" "${build_args[@]}" >"$out/build.stdout.log" 2>"$out/build.stderr.log" || build_exit=$?
 resources=null
 if jq -e . "$out/build-resources.json" >/dev/null 2>&1; then resources="$(jq . "$out/build-resources.json")"; fi
@@ -185,6 +222,20 @@ if [[ "$mode" == build ]]; then
   printf 'Built oracle: %s\n' "$out/project-oracle.test"
   exit 0
 fi
+if [[ "$mode" == test ]]; then
+  test_args=("$out/project-oracle.test" -test.run '^TestProjectOracle(Metadata|OnDiskReplay|NoCheck)$' -test.count=1 -test.v "-test.timeout=${timeout_seconds}s")
+  test_exit=0
+  timeout --signal=TERM --kill-after=10s "${timeout_seconds}s" \
+    python3 "$sources/measure.py" "$out/focused-test-resources.json" \
+    env "${build_env[@]}" "${test_args[@]}" >"$out/focused-tests.stdout.log" 2>"$out/focused-tests.stderr.log" || test_exit=$?
+  resources=null
+  if jq -e . "$out/focused-test-resources.json" >/dev/null 2>&1; then resources="$(jq . "$out/focused-test-resources.json")"; fi
+  test_args_json="$(jq -n --args '$ARGS.positional' -- "${test_args[@]}")"
+  jq -n --argjson code "$test_exit" --argjson arguments "$test_args_json" --argjson environment "$env_json" --argjson resources "$resources" \
+    '{scope:"instrumentation_only",exit_code:$code,arguments:$arguments,environment:$environment,resources:$resources}' >"$out/focused-tests.json"
+  printf 'Focused Go oracle test status: %s. See %s.\n' "$test_exit" "$out/focused-tests.stdout.log"
+  exit "$test_exit"
+fi
 
 all_ok=1
 for run in go-a go-b; do
@@ -193,7 +244,7 @@ for run in go-a go-b; do
     "TS_RUST_ORACLE_HEADER=${TS_RUST_ORACLE_HEADER:-project}" "TS_RUST_ORACLE_PROVENANCE=$out/build.json" "TS_RUST_ORACLE_RUN_ID=$run")
   run_exit=0
   timeout --signal=TERM --kill-after=10s "${timeout_seconds}s" \
-    /usr/bin/time -q -f '{"elapsed_seconds":%e,"peak_rss_kib":%M,"exit_code":%x}' -o "$out/$run-resources.json" \
+    python3 "$sources/measure.py" "$out/$run-resources.json" \
     env "${run_env[@]}" "${run_args[@]}" >"$out/$run.stdout.log" 2>"$out/$run.stderr.log" || run_exit=$?
   resources=null
   if jq -e . "$out/$run-resources.json" >/dev/null 2>&1; then resources="$(jq . "$out/$run-resources.json")"; fi
