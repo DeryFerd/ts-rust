@@ -5932,7 +5932,9 @@ impl<'store> RelaterSession<'store> {
             }
         }
         match structured.members {
-            None if properties.is_empty() && property_origin.is_declared() => {}
+            None if properties.is_empty()
+                && (property_origin.is_declared()
+                    || matches!(property_origin, ObjectPropertyOrigin::GenericReference(_))) => {}
             None => return Err(RelationUnavailable::InvalidStructuredMembers(type_id)),
             Some(members) => {
                 self.observe_symbol_table(members);

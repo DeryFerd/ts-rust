@@ -9,8 +9,8 @@ use ts_binder::{
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore, DeclaredTypeLinks,
     DirectGenericReferenceError, GenericInterfaceArrayTarget, GenericInterfaceMemberError,
-    IntrinsicBootstrapOptions, TypeData, TypeId, ValueSymbolLinks, type_records::CacheHashKey,
-    types::ObjectFlags,
+    IntrinsicBootstrapOptions, RelationUnavailable, TypeData, TypeId, ValueSymbolLinks,
+    type_records::CacheHashKey, types::ObjectFlags,
 };
 use ts_parser::{ParseResult, parse_source_file};
 use xxhash_rust::xxh3::Xxh3;
@@ -1025,6 +1025,133 @@ fn invariant_and_empty_generic_interfaces_resolve_without_transient_properties()
             Ok(members),
         );
         assert_eq!(counts(&fixture.store), warm_state);
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One fixture checks valid empty caches and rejected table shapes.
+fn empty_generic_interface_relations_validate_member_table_shapes() {
+    let mut fixture = Fixture::new(
+        "interface Empty<T> {} interface Label<T> { label: string }",
+        FileId::new(2_110),
+    );
+    let empty = fixture.initialize_target("Empty");
+    let label = fixture.initialize_target("Label");
+    let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+    fixture.resolve_declared_properties(&empty, &HashMap::new());
+    fixture.resolve_declared_properties(&label, &HashMap::from([("label", string)]));
+    let empty_reference = fixture
+        .store
+        .create_direct_generic_reference_type(empty.type_, &[string])
+        .unwrap();
+    let label_reference = fixture
+        .store
+        .create_direct_generic_reference_type(label.type_, &[string])
+        .unwrap();
+    for reference in [empty.type_, empty_reference, label_reference] {
+        fixture
+            .store
+            .resolve_generic_interface_members(reference, None)
+            .unwrap();
+    }
+    let before = counts(&fixture.store);
+    for reference in [empty.type_, empty_reference] {
+        for _ in 0..2 {
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_assignable_to(label_reference, reference),
+                Ok(true)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_assignable_to(reference, label_reference),
+                Ok(false)
+            );
+        }
+        let members = fixture
+            .store
+            .resolve_generic_interface_members(reference, None)
+            .unwrap();
+        assert!(members.properties().is_empty());
+        assert_eq!(members.members(), None);
+        assert_eq!(members.mapper(), None);
+    }
+    assert_eq!(counts(&fixture.store), before);
+
+    let TypeData::TypeReference(label_data) =
+        fixture.store.type_payload(label_reference).unwrap().data()
+    else {
+        panic!("Label must retain its generic reference")
+    };
+    let label_members = label_data.object.structured.clone();
+    let empty_table = fixture.store.alloc_symbol_table();
+    for (reference, members, properties) in [
+        (empty_reference, Some(empty_table), None),
+        (empty_reference, label_members.members, None),
+        (empty_reference, None, Some(Vec::new())),
+        (empty_reference, None, label_members.properties.clone()),
+        (label_reference, None, label_members.properties.clone()),
+        (label_reference, None, None),
+    ] {
+        let TypeData::TypeReference(reference_data) =
+            fixture.store.type_payload(reference).unwrap().data()
+        else {
+            panic!("the tested member cache belongs to a generic reference")
+        };
+        let original = reference_data.object.structured.clone();
+        assert!(
+            fixture
+                .store
+                .set_structured_type_members(reference, members, properties, None, None, None,)
+        );
+        let other = if reference == empty_reference {
+            label_reference
+        } else {
+            empty_reference
+        };
+        let before = (
+            counts(&fixture.store),
+            fixture.store.relation_state_snapshot(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                fixture.store.is_type_assignable_to(reference, other),
+                Err(RelationUnavailable::InvalidStructuredMembers(reference))
+            );
+            assert_eq!(
+                fixture.store.is_type_assignable_to(other, reference),
+                Err(RelationUnavailable::InvalidStructuredMembers(reference))
+            );
+        }
+        assert_eq!(
+            (
+                counts(&fixture.store),
+                fixture.store.relation_state_snapshot()
+            ),
+            before
+        );
+        assert!(fixture.store.set_structured_type_members(
+            reference,
+            original.members,
+            original.properties,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(label_reference, empty_reference),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(empty_reference, label_reference),
+            Ok(false)
+        );
     }
 }
 
