@@ -49143,6 +49143,261 @@ mod tests {
         }
     }
 
+    fn selected_interface_method_return(
+        fixture: &Fixture,
+        interface: &str,
+        name: &str,
+    ) -> (SemanticSymbolId, NodeRef) {
+        let owner = canonical_fixture_symbol(fixture, SyntaxKind::InterfaceDeclaration, interface);
+        let symbol = fixture
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source(name))
+            .unwrap();
+        let declaration = fixture
+            .store
+            .symbol(symbol)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let NodeData::MethodSignatureDeclaration(method) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the selected member must be a method")
+        };
+        (
+            symbol,
+            NodeRef::new(declaration.arena, declaration.file, method.type_.unwrap()),
+        )
+    }
+
+    #[test]
+    fn selected_generic_interface_method_ignores_unsupported_siblings() {
+        let mut fixture = fixture(concat!(
+            "interface Box<Outer> { ",
+            "select<Value>(value: Value): Value; ",
+            "ignored(); (): void; ",
+            "}",
+        ));
+        let owner = canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Box");
+        let (_, annotation) = selected_interface_method_return(&fixture, "Box", "select");
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        assert!(object_members::plan_generic_interface(&fixture.store, &host, owner).is_err());
+        let methods = object_members::plan_enclosing_generic_interface_methods(
+            &fixture.store,
+            &host,
+            annotation,
+        )
+        .unwrap();
+        let [method] = methods.as_slice() else {
+            panic!("only the selected method must be planned")
+        };
+        let parameter = method.type_parameters[0].symbol;
+        let signatures = fixture.store.signature_len();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let result = query_node(&mut fixture, annotation, &mut diagnostics).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .declared_type_links(parameter)
+                .unwrap()
+                .declared_type,
+            Some(result),
+        );
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(method.symbol).is_none());
+        assert_eq!(fixture.store.signature_len(), signatures);
+        let warm = function_store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, annotation, &mut diagnostics),
+            Ok(result)
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn selected_generic_interface_method_accepts_merged_library_value_owner() {
+        let mut fixture = default_library_fixture(concat!(
+            "declare var Array: ArrayConstructor; ",
+            "interface ArrayConstructor {} ",
+            "interface Array<Element> { select(value: Element): Element; ignored(); }",
+        ));
+        let owner = canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Array");
+        assert!(
+            fixture
+                .store
+                .symbol(owner)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        );
+        let (_, annotation) = selected_interface_method_return(&fixture, "Array", "select");
+        let parameter = canonical_fixture_symbol(&fixture, SyntaxKind::TypeParameter, "Element");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let result = query_node(&mut fixture, annotation, &mut diagnostics).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .declared_type_links(parameter)
+                .unwrap()
+                .declared_type,
+            Some(result),
+        );
+        assert!(fixture.store.value_symbol_links(owner).is_none());
+        let warm = function_store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, annotation, &mut diagnostics),
+            Ok(result)
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn selected_generic_interface_method_keeps_all_overloads() {
+        let mut fixture = fixture(concat!(
+            "interface Box<Outer> { select<First>(value: First): First; ignored(); } ",
+            "interface Box<Outer> { select<Second>(value: Second, other: Second): Second; }",
+        ));
+        let (symbol, annotation) = selected_interface_method_return(&fixture, "Box", "select");
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let methods = object_members::plan_enclosing_generic_interface_methods(
+            &fixture.store,
+            &host,
+            annotation,
+        )
+        .unwrap();
+        assert_eq!(methods.len(), 2);
+        assert_eq!(
+            methods
+                .iter()
+                .map(|method| method.declaration)
+                .collect::<Vec<_>>(),
+            fixture
+                .store
+                .symbol(symbol)
+                .unwrap()
+                .declarations()
+                .unwrap(),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let result = query_node(&mut fixture, annotation, &mut diagnostics).unwrap();
+        for method in &methods {
+            let parameter = fixture
+                .store
+                .declared_type_links(method.type_parameters[0].symbol)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(method.return_type)
+                    .and_then(|links| links.resolved_type),
+                Some(parameter),
+            );
+        }
+        let warm = function_store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, annotation, &mut diagnostics),
+            Ok(result)
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn selected_generic_interface_method_rejects_changed_declaration_sets() {
+        for mutation in 0..4 {
+            let mut fixture = fixture(concat!(
+                "interface Box<Outer> { ",
+                "select<First>(value: First): First; ",
+                "select<Second>(value: Second, other: Second): Second; ",
+                "} ",
+                "interface Other<Foreign> { select<Value>(value: Value): Value; }",
+            ));
+            let owner = canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Box");
+            let other =
+                canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Other");
+            let (selected, annotation) =
+                selected_interface_method_return(&fixture, "Box", "select");
+            let (borrowed, _) = selected_interface_method_return(&fixture, "Other", "select");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            query_node(&mut fixture, annotation, &mut diagnostics).unwrap();
+            let changed = if mutation == 2 {
+                owner
+            } else if mutation == 3 {
+                canonical_fixture_symbol(&fixture, SyntaxKind::TypeParameter, "Outer")
+            } else {
+                selected
+            };
+            if mutation == 3 {
+                query_declared(
+                    &mut fixture,
+                    changed,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap();
+            }
+            let mut declarations = fixture
+                .store
+                .symbol(changed)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            match mutation {
+                0 => declarations.truncate(1),
+                1 => declarations.extend_from_slice(
+                    fixture
+                        .store
+                        .symbol(borrowed)
+                        .unwrap()
+                        .declarations()
+                        .unwrap(),
+                ),
+                2 => declarations.extend_from_slice(
+                    fixture.store.symbol(other).unwrap().declarations().unwrap(),
+                ),
+                3 => declarations.push(named_node(&fixture, SyntaxKind::TypeParameter, "Foreign")),
+                _ => unreachable!(),
+            }
+            let value = fixture.store.symbol(changed).unwrap().value_declaration();
+            assert!(
+                fixture
+                    .store
+                    .set_symbol_declarations(changed, Some(declarations), value)
+            );
+            let before = (
+                function_store_state(&fixture.store),
+                fixture.store.symbol_len(),
+            );
+            assert!(
+                query_node(&mut fixture, annotation, &mut diagnostics).is_err(),
+                "mutation {mutation}",
+            );
+            assert_eq!(
+                (
+                    function_store_state(&fixture.store),
+                    fixture.store.symbol_len()
+                ),
+                before,
+                "mutation {mutation}",
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
     #[test]
     fn interface_method_annotations_support_named_reference_parameters_and_returns() {
         let mut fixture = fixture(concat!(

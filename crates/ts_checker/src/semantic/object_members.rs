@@ -8387,12 +8387,214 @@ pub(super) fn plan_enclosing_generic_interface_methods(
             node: declaration,
             kind: SyntaxKind::MethodSignature,
         })?;
-    let plan = plan_generic_interface(store, host, owner_symbol)?;
-    Ok(plan
-        .methods
+    plan_selected_generic_interface_methods(store, host, owner_symbol, method_symbol)
+}
+
+/// Checks the interface owner and selects one complete source overload set.
+#[allow(clippy::too_many_lines)] // Merged declarations, parameters, and overload ownership share one proof.
+fn plan_selected_generic_interface_methods(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    selected: SemanticSymbolId,
+) -> Result<Vec<PlannedInterfaceMethod>, PropertyObjectError> {
+    let invalid = || PropertyObjectError::InvalidInterfaceSymbol(owner);
+    let symbol = store.symbol(owner).ok_or_else(invalid)?;
+    let declarations = symbol.declarations().ok_or_else(invalid)?;
+    let members = symbol
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(invalid)?;
+    let method = store.symbol(selected).ok_or_else(invalid)?;
+    let overloads = method.declarations().ok_or_else(invalid)?;
+    let allowed =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    if declarations.is_empty()
+        || overloads.is_empty()
+        || !symbol.flags().contains(SymbolFlags::INTERFACE)
+        || symbol.flags().without(allowed) != SymbolFlags::NONE
+        || symbol.check_flags() != CheckFlags::NONE
+        || symbol.exports().is_some()
+        || symbol.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store.get_merged_symbol(selected) != Some(selected)
+        || store.get_parent_of_symbol(selected) != Some(owner)
+        || members
+            .get(method.name())
+            .and_then(|member| store.get_merged_symbol(member))
+            != Some(selected)
+    {
+        return Err(invalid());
+    }
+
+    let mut seen = HashSet::new();
+    let mut parameters = None;
+    let mut value_declarations = Vec::new();
+    let mut selected_declarations = Vec::new();
+    let mut checked_parameters = HashSet::new();
+    let mut parameter_declarations = HashMap::<SemanticSymbolId, Vec<NodeRef>>::new();
+    for &declaration in declarations {
+        let record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+        let parent = record
+            .parent
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            .ok_or_else(invalid)?;
+        let parent_record = preflight_node(store, host, parent).map_err(|_| invalid())?;
+        let mut occurrences = 0;
+        parent_record.for_each_child(|node| occurrences += usize::from(node == declaration.node));
+        if !seen.insert(declaration)
+            || !host.symbol_matches(store, declaration, owner)
+            || occurrences != 1
+            || store.source_node_parent(declaration) != Some(SourceNodeParent::Parent(parent))
+        {
+            return Err(invalid());
+        }
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            let NodeData::VariableDeclaration(variable) = &record.data else {
+                return Err(invalid());
+            };
+            let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+            let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+            if record.kind != SyntaxKind::VariableDeclaration
+                || record.flags.0 != 0
+                || parent_record.kind != SyntaxKind::VariableDeclarationList
+                || parent_record.flags.0 != 0
+                || name_record.parent != Some(declaration.node)
+                || name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || !matches!(&name_record.data, NodeData::Identifier(name)
+                    if name.flow_node.is_none()
+                        && symbol.name().as_utf8() == Some(name.text.as_str()))
+            {
+                return Err(invalid());
+            }
+            value_declarations.push(declaration);
+            continue;
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
+        let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(invalid());
+        };
+        let parent = declared_type_declaration_parent(
+            store,
+            host,
+            declaration,
+            owner,
+            name,
+            interface.modifiers.as_ref(),
+        )
+        .map_err(|()| invalid())?;
+        let type_parameters = interface.type_parameters.as_ref().ok_or_else(invalid)?;
+        if record.kind != SyntaxKind::InterfaceDeclaration
+            || record.flags.0 != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || symbol.name().as_utf8() != Some(identifier.text.as_str())
+            || symbol.parent().is_some() != parent.is_some()
+            || store.get_parent_of_symbol(owner) != parent
+            || interface.flow_node.is_some()
+            || interface.local_symbol.is_some()
+            || interface.symbol.is_some()
+            || interface.members.has_trailing_comma
+            || interface.members.range.start < record.range.start
+            || interface.members.range.end != record.range.end
+            || type_parameters.nodes.is_empty()
+            || type_parameters.has_trailing_comma
+        {
+            return Err(invalid());
+        }
+
+        let mut current_parameters = Vec::with_capacity(type_parameters.nodes.len());
+        for &parameter in &type_parameters.nodes {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, parameter);
+            let parameter_record = preflight_node(store, host, parameter).map_err(|_| invalid())?;
+            let NodeData::TypeParameterDeclaration(data) = &parameter_record.data else {
+                return Err(invalid());
+            };
+            let parameter_name = NodeRef::new(parameter.arena, parameter.file, data.name);
+            let parameter_name_record =
+                preflight_node(store, host, parameter_name).map_err(|_| invalid())?;
+            let parameter_symbol = bound_symbol(store, host, parameter).ok_or_else(invalid)?;
+            let parameter_owner = store.symbol(parameter_symbol).ok_or_else(invalid)?;
+            preflight_type_parameter_symbol(store, host, parameter_symbol, &mut checked_parameters)
+                .map_err(|_| invalid())?;
+            if parameter_record.kind != SyntaxKind::TypeParameter
+                || parameter_record.flags.0 != 0
+                || parameter_record.parent != Some(declaration.node)
+                || parameter_name_record.kind != SyntaxKind::Identifier
+                || parameter_name_record.flags.0 != 0
+                || parameter_name_record.parent != Some(parameter.node)
+                || !matches!(&parameter_name_record.data, NodeData::Identifier(name)
+                    if name.flow_node.is_none()
+                        && parameter_owner.name().as_utf8() == Some(name.text.as_str()))
+                || parameter_owner.check_flags() != CheckFlags::NONE
+                || store.get_parent_of_symbol(parameter_symbol) != Some(owner)
+                || members
+                    .get(parameter_owner.name())
+                    .and_then(|parameter| store.get_merged_symbol(parameter))
+                    != Some(parameter_symbol)
+                || current_parameters.contains(&parameter_symbol)
+            {
+                return Err(invalid());
+            }
+            current_parameters.push(parameter_symbol);
+            parameter_declarations
+                .entry(parameter_symbol)
+                .or_default()
+                .push(parameter);
+        }
+        match &parameters {
+            Some(expected) if expected != &current_parameters => return Err(invalid()),
+            None => parameters = Some(current_parameters),
+            Some(_) => {}
+        }
+
+        let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+        for &member in &interface.members.nodes {
+            let member = NodeRef::new(declaration.arena, declaration.file, member);
+            if bound
+                .symbol(member)
+                .and_then(|member| store.get_merged_symbol(member))
+                == Some(selected)
+            {
+                selected_declarations.push((declaration, member));
+            }
+        }
+    }
+    let expected_flags = SymbolFlags::INTERFACE
+        | if value_declarations.is_empty() {
+            SymbolFlags::NONE
+        } else {
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        };
+    if parameters.is_none()
+        || symbol.flags().without(SymbolFlags::TRANSIENT) != expected_flags
+        || match symbol.value_declaration() {
+            Some(value) => !value_declarations.contains(&value),
+            None => !value_declarations.is_empty(),
+        }
+        || parameter_declarations
+            .iter()
+            .any(|(parameter, declarations)| {
+                store
+                    .symbol(*parameter)
+                    .and_then(ts_binder::semantic::Symbol::declarations)
+                    != Some(declarations.as_slice())
+            })
+        || !selected_declarations
+            .iter()
+            .map(|(_, declaration)| declaration)
+            .eq(overloads.iter())
+    {
+        return Err(invalid());
+    }
+    selected_declarations
         .into_iter()
-        .filter(|method| method.symbol == method_symbol)
-        .collect())
+        .map(|(declaration, method)| plan_interface_method(store, host, declaration, owner, method))
+        .collect()
 }
 
 fn valid_declared_rest_parameter_annotation(
