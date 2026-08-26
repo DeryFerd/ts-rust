@@ -5,7 +5,7 @@
 //! unsupported namespace member as a successful check.
 //! An exported class can merge with one namespace that exports its constructor.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use ts_ast::{ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
@@ -256,6 +256,7 @@ struct SourceNamespaceRecursiveClassState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecursiveNamespaceClassCacheState {
     Cold,
+    NamespaceIdentityOnly(TypeId),
     Warm(SourceNamespaceRecursiveClassState),
 }
 
@@ -291,7 +292,23 @@ struct ModuleValuePlan {
     declarations: Box<[NodeRef]>,
     value_declaration: Option<NodeRef>,
     exports: Option<SymbolTableId>,
+    export_members: Box<[ModuleValueExport]>,
     parent: Option<SemanticSymbolId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModuleValueExport {
+    name: EscapedName,
+    symbol: SemanticSymbolId,
+    declarations: Box<[NodeRef]>,
+    flags: SymbolFlags,
+    value_declaration: Option<NodeRef>,
+}
+
+struct ModuleExportDeclaration {
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+    flags: SymbolFlags,
 }
 
 /// The declaration proof retained when a module's value identity is created.
@@ -321,6 +338,201 @@ pub(super) fn has_pure_module_flags(flags: SymbolFlags) -> bool {
         && flags.without(
             SymbolFlags::MODULE | SymbolFlags::CONST_ENUM_ONLY_MODULE | SymbolFlags::TRANSIENT,
         ) == SymbolFlags::NONE
+}
+
+fn module_value_declaration_is_exported(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    node: NodeRef,
+) -> bool {
+    if bound.local_symbol(node).is_some() {
+        return true;
+    }
+    match arena.get(node.node).map(|record| &record.data) {
+        Some(
+            NodeData::ExportSpecifier(_)
+            | NodeData::NamespaceExport(_)
+            | NodeData::ExportAssignment(_),
+        ) => true,
+        Some(NodeData::ExportDeclaration(export)) => export.export_clause.is_none(),
+        Some(NodeData::ImportEqualsDeclaration(_)) => {
+            canonical_has_syntactic_modifier(arena, node.node, SyntaxKind::ExportKeyword)
+        }
+        Some(NodeData::FunctionDeclaration(function)) if function.name.is_none() => {
+            canonical_has_syntactic_modifier(arena, node.node, SyntaxKind::DefaultKeyword)
+        }
+        Some(NodeData::ClassDeclaration(class)) if class.name.is_none() => {
+            canonical_has_syntactic_modifier(arena, node.node, SyntaxKind::DefaultKeyword)
+        }
+        _ => false,
+    }
+}
+
+fn module_value_declaration_parent(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    node: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+    if !module_value_declaration_is_exported(arena, bound, node) {
+        return Ok(None);
+    }
+    let invalid =
+        || SourceCheckError::Provenance(SourceCheckProvenanceError::MissingDeclarationSymbol(node));
+    let container = bound.container(node).ok_or_else(invalid)?;
+    let record = owned_node(arena, bound, store, container)?;
+    if !matches!(
+        record.data,
+        NodeData::ModuleDeclaration(_) | NodeData::SourceFile(_)
+    ) {
+        return Err(invalid());
+    }
+    bound
+        .symbol(container)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .map(Some)
+        .ok_or_else(invalid)
+}
+
+fn module_value_export_declaration(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    node: NodeRef,
+) -> Result<(EscapedName, ModuleExportDeclaration), SourceCheckError> {
+    let record = owned_node(arena, bound, store, node)?;
+    let unsupported = || unsupported(node, record.kind, SourceSyntaxRole::Statement);
+    let (name, flags) = match &record.data {
+        NodeData::VariableDeclaration(data) => (Some(data.name), SymbolFlags::VARIABLE),
+        NodeData::BindingElement(data) => (data.name, SymbolFlags::VARIABLE),
+        NodeData::FunctionDeclaration(data) => (data.name, SymbolFlags::FUNCTION),
+        NodeData::ClassDeclaration(data) => (data.name, SymbolFlags::CLASS),
+        NodeData::InterfaceDeclaration(data) => (Some(data.name), SymbolFlags::INTERFACE),
+        NodeData::TypeAliasDeclaration(data) => (Some(data.name), SymbolFlags::TYPE_ALIAS),
+        NodeData::EnumDeclaration(data) => (Some(data.name), SymbolFlags::ENUM),
+        NodeData::ModuleDeclaration(data) => (Some(data.name), SymbolFlags::MODULE),
+        NodeData::ImportEqualsDeclaration(data) => (Some(data.name), SymbolFlags::ALIAS),
+        NodeData::ExportSpecifier(data) => (Some(data.name), SymbolFlags::ALIAS),
+        NodeData::NamespaceExport(data) => (Some(data.name), SymbolFlags::ALIAS),
+        NodeData::ExportAssignment(_) => (None, SymbolFlags::ALIAS | SymbolFlags::PROPERTY),
+        NodeData::ExportDeclaration(_) => (None, SymbolFlags::EXPORT_STAR),
+        _ => return Err(unsupported()),
+    };
+    let name = if canonical_has_syntactic_modifier(arena, node.node, SyntaxKind::DefaultKeyword) {
+        EscapedName::internal(InternalSymbolName::Default)
+    } else if let NodeData::ExportAssignment(assignment) = &record.data {
+        EscapedName::internal(if assignment.is_export_equals {
+            InternalSymbolName::ExportEquals
+        } else {
+            InternalSymbolName::Default
+        })
+    } else if matches!(record.data, NodeData::ExportDeclaration(_)) {
+        EscapedName::internal(InternalSymbolName::ExportStar)
+    } else {
+        let name = child(node, name.ok_or_else(unsupported)?);
+        let name_record = owned_node(arena, bound, store, name)?;
+        if name_record.parent != Some(node.node) {
+            return Err(invalid_parent(name, node, name_record.parent));
+        }
+        match &name_record.data {
+            NodeData::Identifier(name) => EscapedName::source(&name.text),
+            NodeData::StringLiteral(name) => EscapedName::source(&name.text),
+            NodeData::NoSubstitutionTemplateLiteral(name) => EscapedName::source(&name.text),
+            NodeData::NumericLiteral(name) => EscapedName::source(&name.text),
+            _ => return Err(unsupported()),
+        }
+    };
+    let symbol = bound.symbol(node).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(node),
+    ))?;
+    Ok((
+        name,
+        ModuleExportDeclaration {
+            node,
+            symbol,
+            flags,
+        },
+    ))
+}
+
+fn module_value_exports(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declarations: &[NodeRef],
+    exports: Option<SymbolTableId>,
+) -> Result<Box<[ModuleValueExport]>, SourceCheckError> {
+    let invalid = || SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(owner));
+    let mut expected = BTreeMap::<EscapedName, Vec<ModuleExportDeclaration>>::new();
+    for &declaration in declarations {
+        let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+        for node in bound.traversal_order() {
+            if bound.container(node) != Some(declaration)
+                || bound.symbol(node).is_none()
+                || !module_value_declaration_is_exported(arena, bound, node)
+            {
+                continue;
+            }
+            let (name, export) = module_value_export_declaration(store, arena, bound, node)?;
+            expected.entry(name).or_default().push(export);
+        }
+    }
+    let Some(exports) = exports else {
+        return if expected.is_empty() {
+            Ok(Box::default())
+        } else {
+            Err(invalid())
+        };
+    };
+    let table = store.symbol_table(exports).ok_or_else(invalid)?;
+    if table.len() != expected.len() {
+        return Err(invalid());
+    }
+    let mut members = Vec::with_capacity(expected.len());
+    for (name, symbol) in table.iter() {
+        let source = expected.get(&name.to_owned()).ok_or_else(invalid)?;
+        let record = store.symbol(symbol).ok_or_else(invalid)?;
+        let Some(actual) = record.declarations() else {
+            return Err(invalid());
+        };
+        let mut allowed_flags = source
+            .iter()
+            .fold(SymbolFlags::TRANSIENT, |flags, export| flags | export.flags);
+        if allowed_flags.intersects(SymbolFlags::MODULE) {
+            allowed_flags |= SymbolFlags::CONST_ENUM_ONLY_MODULE;
+        }
+        if record.name() != name
+            || record.check_flags() != CheckFlags::NONE
+            || record.flags().without(allowed_flags) != SymbolFlags::NONE
+            || record.flags().contains(SymbolFlags::TRANSIENT)
+                && source.iter().all(|export| export.symbol == symbol)
+            || record
+                .parent()
+                .and_then(|parent| store.get_merged_symbol(parent))
+                != Some(owner)
+            || actual.len() != source.len()
+            || actual.iter().collect::<HashSet<_>>().len() != source.len()
+            || source.iter().any(|export| {
+                !actual.contains(&export.node)
+                    || !record.flags().intersects(export.flags)
+                    || store.get_merged_symbol(export.symbol) != store.get_merged_symbol(symbol)
+            })
+            || record
+                .value_declaration()
+                .is_some_and(|node| !actual.contains(&node))
+            || record.flags().intersects(SymbolFlags::VALUE) && record.value_declaration().is_none()
+        {
+            return Err(invalid());
+        }
+        members.push(ModuleValueExport {
+            name: name.to_owned(),
+            symbol,
+            declarations: actual.into(),
+            flags: record.flags(),
+            value_declaration: record.value_declaration(),
+        });
+    }
+    Ok(members.into_boxed_slice())
 }
 
 fn plan_module_value(
@@ -362,6 +574,7 @@ fn plan_module_value(
     }
     let mut seen = HashSet::new();
     let mut merged_declaration = false;
+    let mut expected_parent = None;
     for &declaration in declarations {
         let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
         let record = owned_node(arena, bound, store, declaration)?;
@@ -380,6 +593,17 @@ fn plan_module_value(
         {
             return Err(invalid());
         }
+        let parent = module_value_declaration_parent(store, arena, bound, declaration)?;
+        if expected_parent.is_some_and(|expected| expected != parent)
+            || owner
+                .parent()
+                .and_then(|parent| store.get_merged_symbol(parent))
+                != parent
+            || store.get_parent_of_symbol(symbol) != parent
+        {
+            return Err(invalid());
+        }
+        expected_parent = Some(parent);
         merged_declaration |= bound
             .symbol(declaration)
             .is_some_and(|raw| raw != symbol && store.get_merged_symbol(raw) == Some(symbol));
@@ -421,13 +645,15 @@ fn plan_module_value(
     if owner.flags().contains(SymbolFlags::TRANSIENT) && !merged_declaration {
         return Err(invalid());
     }
+    let export_members = module_value_exports(store, host, symbol, declarations, exports)?;
     Ok(ModuleValuePlan {
         symbol,
         flags: owner.flags(),
         declarations: declarations.into(),
         value_declaration: owner.value_declaration(),
         exports,
-        parent: store.get_parent_of_symbol(symbol),
+        export_members,
+        parent: expected_parent.flatten(),
     })
 }
 
@@ -496,22 +722,11 @@ fn module_value_type_matches(
     {
         return false;
     }
-    let Some(exports) = plan.exports.and_then(|exports| store.symbol_table(exports)) else {
-        return object
-            .structured
-            .properties
-            .as_deref()
-            .unwrap_or_default()
-            .is_empty();
-    };
-    let properties = exports
+    let properties = plan
+        .export_members
         .iter()
-        .filter_map(|(_, symbol)| {
-            store
-                .symbol(symbol)
-                .filter(|record| record.flags().intersects(SymbolFlags::VALUE))
-                .map(|_| symbol)
-        })
+        .filter(|export| export.flags.intersects(SymbolFlags::VALUE))
+        .map(|export| export.symbol)
         .collect::<Vec<_>>();
     object.structured.properties.as_deref().unwrap_or_default() == properties
 }
@@ -9917,15 +10132,18 @@ fn plan_recursive_namespace_class(
         receiver,
         property,
     };
-    recursive_namespace_class_state(store, namespace_symbol, &plan)?;
+    let host = DeclaredTypeHost::new([(arena, bound)]).ok()?;
+    recursive_namespace_class_state(store, &host, namespace_symbol, &plan)?;
     Some(plan)
 }
 
 fn recursive_namespace_class_state(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     namespace: SemanticSymbolId,
     class: &SourceNamespaceRecursiveClassPlan,
 ) -> Option<RecursiveNamespaceClassCacheState> {
+    plan_module_value(store, host, namespace).ok()?;
     let exact_value = |symbol| {
         let Some(links) = store.value_symbol_links(symbol) else {
             return Some(None);
@@ -9964,7 +10182,7 @@ fn recursive_namespace_class_state(
         variable_type,
         instance,
     ) {
-        (None, None, None, None, None) => {
+        (namespace_type, None, None, None, None) => {
             if [class.receiver, class.initializer].iter().any(|node| {
                 store
                     .type_node_links(*node)
@@ -9975,7 +10193,21 @@ fn recursive_namespace_class_state(
             }) {
                 return None;
             }
-            return Some(RecursiveNamespaceClassCacheState::Cold);
+            return match store.module_value_identity(namespace) {
+                None if namespace_type.is_none() => Some(RecursiveNamespaceClassCacheState::Cold),
+                Some(identity)
+                    if namespace_type.is_none_or(|type_| type_ == identity.type_)
+                        && store.type_payload(identity.type_).is_some_and(|record| {
+                            record.object_flags() == ObjectFlags::ANONYMOUS
+                        }) =>
+                {
+                    validate_module_value_identity(store, host, identity.type_).ok()?;
+                    Some(RecursiveNamespaceClassCacheState::NamespaceIdentityOnly(
+                        identity.type_,
+                    ))
+                }
+                _ => None,
+            };
         }
         (Some(namespace_type), Some(class_type), Some(local), Some(variable), Some(instance))
             if local == class_type && variable == class_type =>
@@ -9986,6 +10218,7 @@ fn recursive_namespace_class_state(
     };
 
     let namespace_exports = store.symbol(namespace)?.exports()?;
+    validate_module_value_identity(store, host, namespace_type).ok()?;
     let namespace_record = store.type_payload(namespace_type)?;
     let TypeData::Object(namespace_data) = namespace_record.data() else {
         return None;
@@ -12142,8 +12375,8 @@ fn execute_recursive_namespace_class(
     {
         return Err(invalid());
     }
-    let state =
-        recursive_namespace_class_state(store, namespace.symbol, class).ok_or_else(invalid)?;
+    let state = recursive_namespace_class_state(store, host, namespace.symbol, class)
+        .ok_or_else(invalid)?;
     if matches!(state, RecursiveNamespaceClassCacheState::Warm(_)) {
         return Ok(());
     }
@@ -12183,11 +12416,16 @@ fn execute_recursive_namespace_class(
         .iter()
         .filter(|node| store.symbol_node_links(**node).is_none())
         .count();
-    if !store.try_reserve_types(4)
+    let namespace_exists = matches!(
+        state,
+        RecursiveNamespaceClassCacheState::NamespaceIdentityOnly(_)
+    );
+    if !store.try_reserve_types(if namespace_exists { 3 } else { 4 })
         || !store.try_reserve_signatures(1)
         || !store.try_reserve_value_symbol_links(missing_values)
         || !store.try_reserve_type_node_links(missing_types)
         || !store.try_reserve_symbol_node_links(missing_symbols)
+        || !store.try_reserve_module_value_identities(usize::from(!namespace_exists))
     {
         return Err(invalid());
     }
@@ -12196,9 +12434,12 @@ fn execute_recursive_namespace_class(
     let class_type = store
         .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(class.class_symbol))
         .ok_or_else(invalid)?;
-    let namespace_type = store
-        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(namespace.symbol))
-        .ok_or_else(invalid)?;
+    let namespace_type = prepare_module_value_identity(store, host, namespace.symbol)?;
+    if let RecursiveNamespaceClassCacheState::NamespaceIdentityOnly(expected) = state
+        && namespace_type != expected
+    {
+        return Err(invalid());
+    }
     let signature = store
         .alloc_signature(
             SignatureFlags::CONSTRUCT,
@@ -12276,7 +12517,7 @@ fn execute_recursive_namespace_class(
         }
     }
 
-    (recursive_namespace_class_state(store, namespace.symbol, class)
+    (recursive_namespace_class_state(store, host, namespace.symbol, class)
         == Some(RecursiveNamespaceClassCacheState::Warm(
             SourceNamespaceRecursiveClassState {
                 instance,
@@ -13381,6 +13622,16 @@ mod tests {
         plan_source_namespace(arena, bound, fixture.context.store(), declaration).unwrap()
     }
 
+    fn recursive_state(
+        fixture: &Fixture,
+        namespace: SemanticSymbolId,
+        class: &SourceNamespaceRecursiveClassPlan,
+    ) -> Option<RecursiveNamespaceClassCacheState> {
+        let (arena, bound) = fixture.context.file(fixture.file)?;
+        let host = DeclaredTypeHost::new([(arena, bound)]).ok()?;
+        recursive_namespace_class_state(fixture.context.store(), &host, namespace, class)
+    }
+
     fn execute(
         fixture: &mut Fixture,
         plan: &SourceNamespacePlan,
@@ -13656,6 +13907,254 @@ mod tests {
             ))
         );
         assert_eq!(fixture.context.store().type_len(), before);
+    }
+
+    #[test]
+    fn lazy_module_values_reject_cold_export_table_substitution_and_correlated_edits() {
+        for warm in [false, true] {
+            let mut fixture = declaration_fixture(
+                "declare namespace Left { export const same: Missing; } declare namespace Right { export const same: string; }",
+                CanonicalModuleState::Script,
+            );
+            let declarations = [declaration(&fixture, 0), declaration(&fixture, 1)];
+            let symbols = declarations.map(|node| {
+                fixture
+                    .context
+                    .get_symbol_at_location(node)
+                    .unwrap()
+                    .unwrap()
+            });
+            let tables = symbols.map(|symbol| {
+                fixture
+                    .context
+                    .store()
+                    .symbol(symbol)
+                    .unwrap()
+                    .exports()
+                    .unwrap()
+            });
+            let members = tables.map(|table| {
+                fixture
+                    .context
+                    .store()
+                    .symbol_table(table)
+                    .unwrap()
+                    .get_source("same")
+                    .unwrap()
+            });
+            let type_ = warm.then(|| {
+                fixture
+                    .context
+                    .get_type_of_module_value(symbols[0])
+                    .unwrap()
+            });
+            if let Some(type_) = type_ {
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_structured_type_members(
+                            type_,
+                            Some(tables[0]),
+                            Some(vec![members[0]]),
+                            None,
+                            None,
+                            None
+                        )
+                );
+                assert_eq!(
+                    fixture
+                        .context
+                        .get_type_of_module_value(symbols[0])
+                        .unwrap(),
+                    type_
+                );
+                assert_eq!(
+                    fixture.context.store_mut_for_test().insert_symbol(
+                        tables[0],
+                        EscapedName::source("same"),
+                        members[1]
+                    ),
+                    Some(Some(members[0]))
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_structured_type_members(
+                            type_,
+                            Some(tables[0]),
+                            Some(vec![members[1]]),
+                            None,
+                            None,
+                            None
+                        )
+                );
+            } else {
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_symbol_relationships(symbols[0], None, Some(tables[1]), None, None)
+                );
+            }
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            assert!(
+                fixture
+                    .context
+                    .get_type_of_module_value(symbols[0])
+                    .is_err()
+            );
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+            if let Some(type_) = type_ {
+                assert_eq!(
+                    fixture.context.store_mut_for_test().insert_symbol(
+                        tables[0],
+                        EscapedName::source("same"),
+                        members[0]
+                    ),
+                    Some(Some(members[1]))
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_structured_type_members(
+                            type_,
+                            Some(tables[0]),
+                            Some(vec![members[0]]),
+                            None,
+                            None,
+                            None
+                        )
+                );
+                assert_eq!(
+                    fixture
+                        .context
+                        .get_type_of_module_value(symbols[0])
+                        .unwrap(),
+                    type_
+                );
+            } else {
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .module_value_identity(symbols[0])
+                        .is_none()
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_symbol_relationships(symbols[0], None, Some(tables[0]), None, None)
+                );
+                fixture
+                    .context
+                    .get_type_of_module_value(symbols[0])
+                    .unwrap();
+            }
+            for (node, record) in fixture.parsed.arena.iter() {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    continue;
+                };
+                let annotation = NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    variable.type_.unwrap(),
+                );
+                let declaration = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+                let member = fixture
+                    .context
+                    .file(fixture.file)
+                    .unwrap()
+                    .1
+                    .symbol(declaration)
+                    .unwrap();
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .type_node_links(annotation)
+                        .is_none()
+                );
+                assert!(fixture.context.store().value_symbol_links(member).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_module_values_authenticate_exported_namespace_parents_before_publication() {
+        let mut fixture = declaration_fixture(
+            "declare namespace A { export namespace B { export const value: Missing; } }",
+            CanonicalModuleState::Script,
+        );
+        let declaration = fixture.parsed.arena.iter().find_map(|(node, record)| {
+            let NodeData::ModuleDeclaration(module) = &record.data else { return None; };
+            matches!(&fixture.parsed.arena.get(module.name)?.data, NodeData::Identifier(name) if name.text == "B")
+                .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+        }).unwrap();
+        let symbol = fixture
+            .context
+            .get_symbol_at_location(declaration)
+            .unwrap()
+            .unwrap();
+        let record = fixture.context.store().symbol(symbol).unwrap().clone();
+        assert!(record.parent().is_some());
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_symbol_relationships(
+                    symbol,
+                    record.members(),
+                    record.exports(),
+                    None,
+                    record.export_symbol()
+                )
+        );
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(fixture.context.get_type_of_module_value(symbol).is_err());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .module_value_identity(symbol)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_symbol_relationships(
+                    symbol,
+                    record.members(),
+                    record.exports(),
+                    record.parent(),
+                    record.export_symbol()
+                )
+        );
+        let type_ = fixture.context.get_type_of_module_value(symbol).unwrap();
+        assert_eq!(fixture.context.type_to_string(type_).unwrap(), "typeof A.B");
     }
 
     #[test]
@@ -14023,6 +14522,150 @@ mod tests {
     }
 
     #[test]
+    fn recursive_exported_namespace_classes_share_module_identity_in_both_query_orders() {
+        for queried_first in [false, true] {
+            let mut fixture = fixture(
+                "namespace M { export class C {} export namespace C { export var C = M.C; } }",
+                CanonicalModuleState::Script,
+            );
+            let namespace = plan(&fixture, 0);
+            let class = namespace.recursive_class.as_ref().unwrap().clone();
+            let first = queried_first.then(|| {
+                fixture
+                    .context
+                    .get_type_of_module_value(namespace.symbol)
+                    .unwrap()
+            });
+            if let Some(first) = first {
+                assert_eq!(
+                    recursive_state(&fixture, namespace.symbol, &class),
+                    Some(RecursiveNamespaceClassCacheState::NamespaceIdentityOnly(
+                        first
+                    ))
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .declared_type_links(class.class_symbol)
+                        .is_none()
+                );
+            }
+            fixture.context.check_source_file(fixture.file).unwrap();
+            let type_ = fixture
+                .context
+                .get_type_of_module_value(namespace.symbol)
+                .unwrap();
+            if let Some(first) = first {
+                assert_eq!(type_, first);
+            }
+            let Some(RecursiveNamespaceClassCacheState::Warm(state)) =
+                recursive_state(&fixture, namespace.symbol, &class)
+            else {
+                panic!("the recursive namespace must retain its complete graph")
+            };
+            assert_eq!(type_, state.namespace_type);
+            assert_eq!(fixture.context.type_to_string(type_).unwrap(), "typeof M");
+            for symbol in [class.class_symbol, class.class_local, class.variable_symbol] {
+                assert_eq!(
+                    fixture
+                        .context
+                        .store()
+                        .value_symbol_links(symbol)
+                        .unwrap()
+                        .resolved_type,
+                    Some(state.class_type)
+                );
+            }
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .declared_type_links(class.class_symbol)
+                    .unwrap()
+                    .declared_type,
+                Some(state.instance)
+            );
+            assert!(matches!(
+                fixture.context.get_type_of_module_value(class.class_symbol),
+                Err(SourceCheckError::Unsupported(_))
+            ));
+            let warm = (
+                fixture.context.store().type_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            for _ in 0..2 {
+                fixture.context.recheck_source_file(fixture.file).unwrap();
+                assert_eq!(
+                    fixture
+                        .context
+                        .get_type_of_module_value(namespace.symbol)
+                        .unwrap(),
+                    type_
+                );
+                assert_eq!(
+                    recursive_state(&fixture, namespace.symbol, &class),
+                    Some(RecursiveNamespaceClassCacheState::Warm(state))
+                );
+                assert_eq!(
+                    (
+                        fixture.context.store().type_len(),
+                        fixture.context.store().signature_len(),
+                        fixture.context.store().checker_link_allocated_lengths()
+                    ),
+                    warm
+                );
+            }
+            assert!(fixture.context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn recursive_exported_namespace_classes_reject_unproven_namespace_identities() {
+        let mut fixture = fixture(
+            "namespace M { export class C {} export namespace C { export var C = M.C; } }",
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let class = namespace.recursive_class.as_ref().unwrap().clone();
+        let forged = fixture
+            .context
+            .store_mut_for_test()
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(namespace.symbol))
+            .unwrap();
+        assert!(fixture.context.store_mut_for_test().set_value_symbol_links(
+            namespace.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(forged),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert_eq!(recursive_state(&fixture, namespace.symbol, &class), None);
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().signature_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(fixture.context.check_source_file(fixture.file).is_err());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .module_value_identity(namespace.symbol)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn recursive_exported_namespace_classes_preserve_merged_constructor_identity() {
         let mut fixture = fixture(
             concat!(
@@ -14084,7 +14727,7 @@ mod tests {
         assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
 
         let Some(RecursiveNamespaceClassCacheState::Warm(state)) =
-            recursive_namespace_class_state(fixture.context.store(), namespace.symbol, &class)
+            recursive_state(&fixture, namespace.symbol, &class)
         else {
             panic!("the completed recursive class must retain its exact warm graph");
         };
@@ -14314,7 +14957,7 @@ mod tests {
         let namespace = plan(&fixture, 0);
         let class = namespace.recursive_class.as_ref().unwrap();
         assert!(matches!(
-            recursive_namespace_class_state(fixture.context.store(), namespace.symbol, class,),
+            recursive_state(&fixture, namespace.symbol, class),
             Some(RecursiveNamespaceClassCacheState::Warm(_)),
         ));
         let warm = (
