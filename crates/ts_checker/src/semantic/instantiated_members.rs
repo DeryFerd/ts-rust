@@ -3110,19 +3110,12 @@ fn validate_declared_target(
                     .into_iter()
                     .chain(std::iter::once(return_type))
                 {
+                    // Signature mapping reads reference identities, not their member tables.
                     property.requires_proxy |= member_type_requires_instantiation(
                         store,
                         type_,
                         &signature_parameters,
                         array_targets,
-                    )?;
-                    validate_nested_reference_targets(
-                        store,
-                        type_,
-                        array_targets,
-                        active,
-                        validated,
-                        &mut HashSet::new(),
                     )?;
                 }
             }
@@ -6359,6 +6352,88 @@ mod tests {
             Err(GenericInterfaceMemberError::UnsupportedPropertyType(
                 unregistered
             )),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn generic_method_tuple_reference_result_keeps_unread_members_cold() {
+        let parsed = parse_source_file(concat!(
+            "interface Result<T> { value: T; } ",
+            "interface Base<T> { read(...args: [] | [T]): Result<T>; } ",
+            "interface Derived extends Base<string> {}",
+        ));
+        let file = FileId::new(6_272);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let derived = source_symbol(&parsed, file, &context, "Derived");
+        let result = source_symbol(&parsed, file, &context, "Result");
+        let target = context.get_declared_type_of_symbol(derived).unwrap();
+        let TypeData::Interface(interface) = context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("Derived must retain its interface target")
+        };
+        let base = interface.resolved_base_types.as_ref().unwrap()[0];
+        let store = context.store_mut_for_test();
+        let result_target = store
+            .declared_type_links(result)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let method = store
+            .resolve_generic_interface_property(base, "read", None)
+            .unwrap()
+            .unwrap();
+        let signature = store
+            .type_payload(method.type_id())
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        let return_type = store
+            .signature(signature)
+            .unwrap()
+            .resolved_return_type()
+            .unwrap();
+        let reference = validate_direct_generic_reference(store, return_type).unwrap();
+        assert_eq!(reference.target, result_target);
+        assert_eq!(
+            reference.type_arguments,
+            [store.intrinsic_bootstrap().unwrap().string_type]
+        );
+        let TypeData::Interface(interface) = store.type_payload(result_target).unwrap().data()
+        else {
+            panic!("Result must retain its generic interface target")
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(!interface.base_types_resolved);
+        assert_eq!(
+            interface.reference.object.structured,
+            StructuredTypeData::default()
+        );
+        assert!(matches!(
+            super::super::callable_sets::validate_stored_callable_set(store, method.type_id()),
+            StoredCallableSetValidation::Valid { .. }
+        ));
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+        );
+        assert_eq!(
+            store.resolve_generic_interface_property(base, "read", None),
+            Ok(Some(method))
         );
         assert_eq!(
             (
