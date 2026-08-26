@@ -4231,7 +4231,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Ok(Some(*type_));
         }
         let plan = match self.normalize_union_members(types, UnionReduction::Literal)? {
-            UnionMembersPlan::Existing(type_) => UnionPlan::Existing(type_),
+            UnionMembersPlan::Existing(existing) => UnionPlan::Existing(existing),
             UnionMembersPlan::Members {
                 types: normalized,
                 includes,
@@ -4245,7 +4245,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             )?,
         };
         match plan {
-            UnionPlan::Existing(type_) => Ok(Some(type_)),
+            UnionPlan::Existing(existing) => Ok(Some(existing)),
             UnionPlan::Union {
                 types,
                 alias,
@@ -4259,7 +4259,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         UnionOriginPlan::DenormalizedUnion(types) => {
                             UnionOriginCacheKey::DenormalizedUnion(types)
                         }
-                        UnionOriginPlan::ExistingIndex(type_) => UnionOriginCacheKey::Index(type_),
+                        UnionOriginPlan::ExistingIndex(index) => UnionOriginCacheKey::Index(index),
                     }),
                 };
                 let cached = self
@@ -4477,7 +4477,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         synthesize_origin: bool,
     ) -> Result<UnionPlan, LiteralTypeCacheError> {
         let (mut normalized, includes) = match self.normalize_union_members(types, reduction)? {
-            UnionMembersPlan::Existing(type_) => return Ok(UnionPlan::Existing(type_)),
+            UnionMembersPlan::Existing(existing) => return Ok(UnionPlan::Existing(existing)),
             UnionMembersPlan::Members { types, includes } => (types, includes),
         };
         if reduction == UnionReduction::Subtype {

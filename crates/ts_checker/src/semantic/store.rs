@@ -6043,10 +6043,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .signature_return_provenance
             .iter()
             .filter_map(|(signature, provenance)| {
-                let cycle = match provenance {
-                    SignatureReturnProvenance::RecoveredInferred(cycle)
-                    | SignatureReturnProvenance::InvalidatedRecovery(cycle) => cycle,
-                    _ => return None,
+                let (SignatureReturnProvenance::RecoveredInferred(cycle)
+                | SignatureReturnProvenance::InvalidatedRecovery(cycle)) = provenance
+                else {
+                    return None;
                 };
                 if node == cycle.declaration && published_type == Some(cycle.callable) {
                     return None;
@@ -6089,10 +6089,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .signature_return_provenance
             .iter()
             .filter_map(|(signature, provenance)| {
-                let cycle = match provenance {
-                    SignatureReturnProvenance::RecoveredInferred(cycle)
-                    | SignatureReturnProvenance::InvalidatedRecovery(cycle) => cycle,
-                    _ => return None,
+                let (SignatureReturnProvenance::RecoveredInferred(cycle)
+                | SignatureReturnProvenance::InvalidatedRecovery(cycle)) = provenance
+                else {
+                    return None;
                 };
                 let owner = self
                     .source_callable_provenance

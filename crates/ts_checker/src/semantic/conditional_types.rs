@@ -2170,7 +2170,9 @@ fn deferred_conditional(
         return Err(ConditionalTypeError::Capacity);
     }
     let alias = if let Some(identity) = alias {
-        let root_alias = store.conditional_root(root).and_then(|root| root.alias());
+        let root_alias = store
+            .conditional_root(root)
+            .and_then(super::type_records::ConditionalRoot::alias);
         if root_alias.is_some_and(|alias| stored_alias_identity(store, alias) == Ok(identity)) {
             root_alias
         } else {
