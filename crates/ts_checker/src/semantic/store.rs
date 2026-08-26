@@ -20,6 +20,9 @@ use ts_parser::{IsolatedEntityName, parse_isolated_entity_name};
 use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::IntrinsicBootstrap,
+    conditional_types::{
+        ConditionalQueryKey, ConditionalQueryProduction, ConditionalTypeProduction,
+    },
     derived_types::DerivedTypeCaches,
     ids::{
         ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
@@ -479,6 +482,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     index_infos: IndexInfoArena,
     type_aliases: TypedArena<TypeAliasId, TypeAlias>,
     conditional_roots: TypedArena<ConditionalRootId, ConditionalRoot>,
+    conditional_type_productions: HashMap<TypeId, ConditionalTypeProduction>,
+    conditional_query_productions: HashMap<ConditionalQueryKey, ConditionalQueryProduction>,
     entity_names: Vec<EntityNameNode>,
     source_files: BTreeMap<FileId, SourceFileRef>,
     source_files_by_arena: BTreeMap<NodeArenaId, SourceFileRef>,
@@ -577,6 +582,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             index_infos: IndexInfoArena::new(id),
             type_aliases: TypedArena::new(id),
             conditional_roots: TypedArena::new(id),
+            conditional_type_productions: HashMap::new(),
+            conditional_query_productions: HashMap::new(),
             entity_names: Vec::new(),
             source_files: BTreeMap::new(),
             source_files_by_arena: BTreeMap::new(),
@@ -930,6 +937,81 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     pub(super) fn conditional_root_len_internal(&self) -> usize {
         self.conditional_roots.len()
+    }
+
+    pub(super) fn conditional_type_production(
+        &self,
+        type_: TypeId,
+    ) -> Option<&ConditionalTypeProduction> {
+        self.conditional_type_productions.get(&type_)
+    }
+
+    pub(super) fn conditional_query_production(
+        &self,
+        key: ConditionalQueryKey,
+    ) -> Option<&ConditionalQueryProduction> {
+        self.conditional_query_productions.get(&key)
+    }
+
+    pub(super) fn try_reserve_conditional_productions(
+        &mut self,
+        types: usize,
+        queries: usize,
+    ) -> bool {
+        self.conditional_type_productions.try_reserve(types).is_ok()
+            && self
+                .conditional_query_productions
+                .try_reserve(queries)
+                .is_ok()
+    }
+
+    pub(super) fn publish_conditional_type_production(
+        &mut self,
+        proof: ConditionalTypeProduction,
+    ) -> bool {
+        let type_ = proof.type_id();
+        if self.types.get(type_).is_none()
+            || self.conditional_roots.get(proof.root()).is_none()
+            || self.conditional_type_productions.contains_key(&type_)
+        {
+            return false;
+        }
+        self.conditional_type_productions.insert(type_, proof);
+        true
+    }
+
+    pub(super) fn publish_conditional_query_production(
+        &mut self,
+        proof: ConditionalQueryProduction,
+    ) -> bool {
+        let key = proof.key();
+        let Some(root) = self.conditional_roots.get(proof.root()) else {
+            return false;
+        };
+        let valid_key = match key {
+            ConditionalQueryKey::Node(node) => root.node() == node,
+            ConditionalQueryKey::Instantiation(root, _) => root == proof.root(),
+            ConditionalQueryKey::AliasReference(node) => {
+                self.source_node_kind(node) == Some(SyntaxKind::TypeReference)
+            }
+            ConditionalQueryKey::AliasDeclaration(symbol) => self.symbols.contains_symbol(symbol),
+        };
+        if !valid_key
+            || self.types.get(proof.result()).is_none()
+            || self.conditional_query_productions.contains_key(&key)
+        {
+            return false;
+        }
+        self.conditional_query_productions.insert(key, proof);
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn conditional_production_lengths(&self) -> (usize, usize) {
+        (
+            self.conditional_type_productions.len(),
+            self.conditional_query_productions.len(),
+        )
     }
 
     #[must_use]

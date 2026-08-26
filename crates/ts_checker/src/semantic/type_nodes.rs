@@ -26,8 +26,10 @@ use super::{
     conditional_types::{
         ConditionalAliasIdentity, ConditionalTypeBranches, ConditionalTypeInstantiation,
         ConditionalTypeRequest, conditional_alias_projection, conditional_check_is_assignable,
-        conditional_operands_have_disjoint_primitive_domains, get_conditional_type_instantiation,
-        get_type_from_conditional_type,
+        conditional_operands_have_disjoint_primitive_domains, conditional_query_alias,
+        get_conditional_type_instantiation, get_type_from_conditional_type,
+        record_conditional_alias_declaration, validate_conditional_alias_declaration,
+        validate_conditional_reference_result,
     },
     declared::{
         cached_ordinary_type_parameter_owner, execute_type_parameter,
@@ -658,6 +660,73 @@ struct PlannedTypeReference {
     direct_generic: bool,
     direct_generic_constraints: Vec<PlannedDirectGenericConstraint>,
     direct_generic_defaults: Vec<PlannedDirectGenericDefault>,
+}
+
+/// Only a checked source reference can request a different conditional alias.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ConditionalAliasReferenceProof {
+    reference: NodeRef,
+    conditional_type: TypeId,
+    root_type_arguments: Vec<TypeId>,
+    alias_symbol: Option<SemanticSymbolId>,
+    alias_arguments: Vec<TypeId>,
+}
+
+impl ConditionalAliasReferenceProof {
+    pub(super) fn identity(&self) -> Option<ConditionalAliasIdentity<'_>> {
+        self.alias_symbol.map(|symbol| ConditionalAliasIdentity {
+            symbol,
+            type_arguments: &self.alias_arguments,
+        })
+    }
+
+    pub(super) const fn reference(&self) -> NodeRef {
+        self.reference
+    }
+
+    pub(super) fn matches_request(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        conditional_type: TypeId,
+        type_arguments: &[TypeId],
+    ) -> bool {
+        self.conditional_type == conditional_type
+            && self.root_type_arguments == type_arguments
+            && store.source_node_kind(self.reference) == Some(SyntaxKind::TypeReference)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ConditionalAliasDeclarationProof {
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    result: TypeId,
+    type_parameters: Vec<TypeId>,
+}
+
+impl ConditionalAliasDeclarationProof {
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.symbol
+    }
+    pub(super) const fn declaration(&self) -> NodeRef {
+        self.declaration
+    }
+    pub(super) const fn result(&self) -> TypeId {
+        self.result
+    }
+    pub(super) fn type_parameters(&self) -> &[TypeId] {
+        &self.type_parameters
+    }
+    pub(super) fn matches_source(&self, store: &CanonicalTypeMapperStore) -> bool {
+        store
+            .symbol(self.symbol)
+            .and_then(|symbol| symbol.declarations())
+            == Some(&[self.declaration][..])
+            && matches!(
+                store.source_node_kind(self.declaration),
+                Some(SyntaxKind::TypeAliasDeclaration | SyntaxKind::JsTypeAliasDeclaration)
+            )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1477,6 +1546,8 @@ fn cached_type_alias(
         }
         return Ok(None);
     };
+    validate_conditional_alias_declaration(store, symbol, declared_type)
+        .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(symbol)))?;
 
     let expected_parameter_symbols = cached_alias_parameter_symbols(store, host, symbol)?;
     let mut missing_generic_metadata = false;
@@ -2307,21 +2378,24 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         node: NodeRef,
         alias_symbol: Option<SemanticSymbolId>,
     ) -> Result<(), DeclaredTypeError> {
-        let Some(cached) = self
+        let Some(_) = self
             .store
             .type_node_links(node)
             .and_then(|links| links.resolved_type)
-            .filter(|cached| {
-                matches!(
-                    self.store.type_payload(*cached).map(TypeRecord::data),
-                    Some(TypeData::Conditional(_))
-                )
-            })
         else {
             return Ok(());
         };
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
-        let identity = conditional_alias_projection(self.store, cached).map_err(|_| invalid())?;
+        let identity = conditional_query_alias(self.store, node)
+            .map_err(|_| invalid())?
+            .map(|alias| {
+                let record = self.store.type_alias(alias).ok_or_else(invalid)?;
+                Ok::<_, DeclaredTypeError>(ConditionalAliasIdentity {
+                    symbol: record.symbol().ok_or_else(invalid)?,
+                    type_arguments: record.type_arguments().unwrap_or_default(),
+                })
+            })
+            .transpose()?;
         if identity.map(|identity| identity.symbol) != alias_symbol {
             return Err(invalid());
         }
@@ -8385,6 +8459,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     return Ok(());
                 }
                 CachedTypeAliasRhs::TypeReference(reference) => {
+                    validate_conditional_reference_result(self.store, reference, declared_type)
+                        .map_err(|_| {
+                            type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(
+                                root_symbol,
+                            ))
+                        })?;
                     if self
                         .store
                         .type_node_links(reference)
@@ -10323,6 +10403,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         union_constituent: bool,
     ) -> Result<(), DeclaredTypeError> {
         let record = preflight_node(self.store, self.host, node)?;
+        if let Some(cached) = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+        {
+            validate_conditional_reference_result(self.store, node, cached).map_err(|_| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+            })?;
+        }
         let (name_id, arguments, record_heritage) = match &record.data {
             NodeData::TypeReferenceNode(reference) if record.kind == SyntaxKind::TypeReference => (
                 reference.type_name,
@@ -21407,6 +21496,44 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let published = links
             .declared_type
             .expect("the alias declared type was just initialized");
+        if matches!(
+            self.store.type_payload(published).map(TypeRecord::data),
+            Some(TypeData::Conditional(_))
+        ) {
+            let declaration = self
+                .store
+                .symbol(symbol)
+                .and_then(|symbol| symbol.declarations())
+                .and_then(|declarations| declarations.first())
+                .copied()
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeAliasSymbol(symbol))
+                })?;
+            let source =
+                authenticated_type_alias_declaration(self.store, self.host, declaration, symbol)?
+                    .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeAliasDeclaration(
+                        declaration,
+                    ))
+                })?;
+            if NodeRef::new(declaration.arena, declaration.file, source.type_) != alias.type_node {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeAliasDeclaration(declaration),
+                ));
+            }
+            record_conditional_alias_declaration(
+                self.store,
+                &ConditionalAliasDeclarationProof {
+                    symbol,
+                    declaration,
+                    result: published,
+                    type_parameters: links.type_parameters.clone().unwrap_or_default(),
+                },
+            )
+            .map_err(|_| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(symbol))
+            })?;
+        }
         if !self.store.set_type_alias_links(symbol, links) {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidTypeAliasSymbol(symbol),
@@ -22198,17 +22325,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         type_arguments: &[TypeId],
     ) -> Result<Option<super::TypeAliasId>, DeclaredTypeError> {
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
-        if let Some(cached) = self
+        if self
             .store
             .type_node_links(node)
             .and_then(|links| links.resolved_type)
+            .is_some()
         {
-            let record = self.store.type_payload(cached).ok_or_else(invalid)?;
-            let TypeData::Conditional(data) = record.data() else {
-                return Ok(None);
-            };
-            let root = self.store.conditional_root(data.root).ok_or_else(invalid)?;
-            let alias = root.alias();
+            let alias = conditional_query_alias(self.store, node).map_err(|_| invalid())?;
             let identity = alias
                 .map(|alias| self.store.type_alias(alias).ok_or_else(invalid))
                 .transpose()?;
@@ -24363,6 +24486,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                                 || alias_parameter_count.is_some_and(|count| count != 0))
                         {
                             self.execute_generic_alias_instantiation(
+                                node,
                                 &reference,
                                 declared_type,
                                 plan,
@@ -25089,8 +25213,70 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         false
     }
 
+    #[allow(clippy::too_many_arguments)] // The source proof binds one reference, owner, and argument list.
+    fn prove_conditional_alias_reference(
+        &self,
+        node: NodeRef,
+        reference: &PlannedTypeReference,
+        declared_type: TypeId,
+        root_arguments: &[TypeId],
+        alias: Option<&(SemanticSymbolId, Vec<TypeId>)>,
+        plan: &TypeQueryPlan,
+    ) -> Result<ConditionalAliasReferenceProof, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let expected = plan.references.get(&node).ok_or_else(invalid)?;
+        if expected.symbol != reference.symbol
+            || expected.alias_owner != reference.alias_owner
+            || expected.type_arguments != reference.type_arguments
+            || expected.arity != PlannedTypeReferenceArity::Valid
+            || self
+                .store
+                .type_alias_links(reference.symbol)
+                .and_then(|links| links.declared_type)
+                != Some(declared_type)
+            || self.store.source_node_kind(node) != Some(SyntaxKind::TypeReference)
+            || alias.map(|(symbol, _)| *symbol) != reference.alias_owner
+        {
+            return Err(invalid());
+        }
+        if let Some((symbol, arguments)) = alias {
+            let planner = TypeQueryPlanner::new(
+                self.store,
+                self.host,
+                self.array_type,
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+                self.options.strict_builtin_iterator_return,
+                &self.type_reference_alias_targets,
+            );
+            let owner = plan.aliases.get(symbol).ok_or_else(invalid)?;
+            if planner.direct_type_alias_owner(node)? != Some(*symbol)
+                || owner.type_parameters.len() != arguments.len()
+                || owner
+                    .type_parameters
+                    .iter()
+                    .zip(arguments)
+                    .any(|(parameter, argument)| {
+                        cached_ordinary_type_parameter_owner(self.store, *argument)
+                            != Some(parameter.symbol)
+                    })
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(ConditionalAliasReferenceProof {
+            reference: node,
+            conditional_type: declared_type,
+            root_type_arguments: root_arguments.to_vec(),
+            alias_symbol: alias.map(|(symbol, _)| *symbol),
+            alias_arguments: alias.map_or_else(Vec::new, |(_, arguments)| arguments.clone()),
+        })
+    }
+
     fn execute_generic_alias_instantiation(
         &mut self,
+        node: NodeRef,
         reference: &PlannedTypeReference,
         declared_type: TypeId,
         plan: &TypeQueryPlan,
@@ -25499,18 +25685,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             };
             let branches =
                 self.resolve_conditional_branches(&conditional, demand, plan, prepared)?;
+            let source_proof = self.prove_conditional_alias_reference(
+                node,
+                reference,
+                declared_type,
+                &root_arguments,
+                alias_identity.as_ref(),
+                plan,
+            )?;
             get_conditional_type_instantiation(
                 self.store,
                 ConditionalTypeInstantiation {
                     conditional_type: declared_type,
                     type_arguments: &root_arguments,
                     branches,
-                    alias: alias_identity.as_ref().map(|(symbol, arguments)| {
-                        ConditionalAliasIdentity {
-                            symbol: *symbol,
-                            type_arguments: arguments,
-                        }
-                    }),
+                    alias: Some(&source_proof),
                     for_constraint: false,
                 },
                 self.global_types.as_ref(),

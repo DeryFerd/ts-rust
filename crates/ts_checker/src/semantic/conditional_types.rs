@@ -21,12 +21,13 @@ use super::{
         InstantiationError, InstantiationLimits, InstantiationSession, canonical_anonymous_union,
         instantiate_type_with_session, instantiate_type_with_vector_and_session,
     },
-    mapper::{CanonicalTypeMapperStore, TypeMapperKind},
+    mapper::CanonicalTypeMapperStore,
     object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
     signatures::{ElementFlags, SignatureFlags, TupleElementInfo},
     store::SourceNodeParent,
     template_types::{TemplateTypeError, split_first_template_code_point},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
+    type_nodes::{ConditionalAliasDeclarationProof, ConditionalAliasReferenceProof},
     type_records::{
         CacheHashKey, ConditionalTypeData, LiteralValue, TypeCacheState, TypeData, TypeRecord,
     },
@@ -61,7 +62,7 @@ pub(super) struct ConditionalTypeInstantiation<'a> {
     pub conditional_type: TypeId,
     pub type_arguments: &'a [TypeId],
     pub branches: ConditionalTypeBranches,
-    pub alias: Option<ConditionalAliasIdentity<'a>>,
+    pub alias: Option<&'a ConditionalAliasReferenceProof>,
     pub for_constraint: bool,
 }
 
@@ -70,6 +71,93 @@ pub(super) struct ConditionalTypeInstantiation<'a> {
 pub(super) struct ConditionalAliasIdentity<'a> {
     pub symbol: SemanticSymbolId,
     pub type_arguments: &'a [TypeId],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetainedConditionalAlias {
+    id: TypeAliasId,
+    symbol: SemanticSymbolId,
+    type_arguments: Vec<TypeId>,
+}
+
+impl RetainedConditionalAlias {
+    fn identity(&self) -> ConditionalAliasIdentity<'_> {
+        ConditionalAliasIdentity {
+            symbol: self.symbol,
+            type_arguments: &self.type_arguments,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConditionalDefinition {
+    root: ConditionalRootId,
+    node: NodeRef,
+    check_type: TypeId,
+    extends_type: TypeId,
+    is_distributive: bool,
+    infer_type_parameters: Vec<TypeId>,
+    outer_type_parameters: Vec<TypeId>,
+    alias: Option<RetainedConditionalAlias>,
+}
+
+/// Only conditional evaluation can create this immutable production record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ConditionalTypeProduction {
+    type_: TypeId,
+    definition: ConditionalDefinition,
+    check_type: TypeId,
+    extends_type: TypeId,
+    mapper: Option<TypeMapperId>,
+    mapped_parameters: Vec<TypeId>,
+    type_arguments: Vec<TypeId>,
+    alias: Option<RetainedConditionalAlias>,
+    alias_reference: Option<NodeRef>,
+}
+
+impl ConditionalTypeProduction {
+    pub(super) const fn type_id(&self) -> TypeId {
+        self.type_
+    }
+
+    pub(super) const fn root(&self) -> ConditionalRootId {
+        self.definition.root
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum ConditionalQueryKey {
+    Node(NodeRef),
+    Instantiation(ConditionalRootId, CacheHashKey),
+    AliasReference(NodeRef),
+    AliasDeclaration(SemanticSymbolId),
+}
+
+/// Mutable checker caches must agree with this retained query result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ConditionalQueryProduction {
+    key: ConditionalQueryKey,
+    definition: ConditionalDefinition,
+    type_arguments: Vec<TypeId>,
+    alias: Option<(SemanticSymbolId, Vec<TypeId>)>,
+    for_constraint: bool,
+    result: TypeId,
+    source_declaration: Option<NodeRef>,
+    result_alias: Option<RetainedConditionalAlias>,
+}
+
+impl ConditionalQueryProduction {
+    pub(super) const fn key(&self) -> ConditionalQueryKey {
+        self.key
+    }
+
+    pub(super) const fn root(&self) -> ConditionalRootId {
+        self.definition.root
+    }
+
+    pub(super) const fn result(&self) -> TypeId {
+        self.result
+    }
 }
 
 /// Missing dependencies, invalid canonical records, or bounded evaluation.
@@ -82,6 +170,7 @@ pub(super) enum ConditionalTypeError {
     DuplicateTypeParameter(TypeId),
     InvalidAlias(TypeAliasId),
     InvalidAliasSymbol(SemanticSymbolId),
+    Capacity,
     InvalidRoot(ConditionalRootId),
     InvalidConditional(TypeId),
     InvalidMapper(TypeMapperId),
@@ -118,6 +207,7 @@ impl std::fmt::Display for ConditionalTypeError {
             Self::InvalidAliasSymbol(symbol) => {
                 write!(formatter, "invalid conditional alias symbol {symbol:?}")
             }
+            Self::Capacity => formatter.write_str("conditional type capacity is unavailable"),
             Self::InvalidRoot(root) => write!(formatter, "invalid conditional root {root:?}"),
             Self::InvalidConditional(type_) => {
                 write!(formatter, "type {type_:?} is not a valid conditional")
@@ -228,6 +318,16 @@ pub(super) fn get_type_from_conditional_type(
     {
         return validate_cached_conditional(store, request, cached);
     }
+    let query_key = ConditionalQueryKey::Node(request.node);
+    if store.conditional_query_production(query_key).is_some() {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(request.node));
+    }
+    if !store.try_reserve_conditional_productions(0, 1)
+        || !store
+            .try_reserve_type_node_links(usize::from(store.type_node_links(request.node).is_none()))
+    {
+        return Err(ConditionalTypeError::Capacity);
+    }
 
     let distributive = matches!(
         store.type_payload(request.check_type).map(TypeRecord::data),
@@ -246,6 +346,7 @@ pub(super) fn get_type_from_conditional_type(
             request.alias,
         )
         .ok_or(ConditionalTypeError::InvalidNode(request.node))?;
+    let definition = conditional_definition(store, root)?;
 
     let mut session = InstantiationSession::new(InstantiationLimits::default());
     let result = evaluate_conditional(
@@ -270,6 +371,20 @@ pub(super) fn get_type_from_conditional_type(
             return Err(ConditionalTypeError::InvalidInstantiationCache(root));
         }
     }
+    let proof = ConditionalQueryProduction {
+        key: query_key,
+        definition,
+        type_arguments: request.outer_type_parameters.to_vec(),
+        alias: None,
+        for_constraint: false,
+        result,
+        source_declaration: None,
+        result_alias: retain_result_alias(store, result)?,
+    };
+    validate_query_production(store, &proof)?;
+    if !store.publish_conditional_query_production(proof) {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(request.node));
+    }
 
     let mut links = store
         .type_node_links(request.node)
@@ -289,7 +404,71 @@ pub(super) fn get_conditional_type_instantiation(
     global_types: Option<&CanonicalGlobalTypes>,
     session: Option<&mut InstantiationSession>,
 ) -> Result<TypeId, ConditionalTypeError> {
-    get_conditional_type_instantiation_with_tail_count(store, request, global_types, session, 0)
+    let source_query = if let Some(source) = request.alias {
+        if request.for_constraint
+            || !source.matches_request(store, request.conditional_type, request.type_arguments)
+        {
+            return Err(ConditionalTypeError::InvalidTypeNodeCache(
+                source.reference(),
+            ));
+        }
+        let definition = validated_conditional_production(store, request.conditional_type)?
+            .definition
+            .clone();
+        let key = ConditionalQueryKey::AliasReference(source.reference());
+        let alias = source
+            .identity()
+            .map(|alias| (alias.symbol, alias.type_arguments.to_vec()));
+        if let Some(proof) = store.conditional_query_production(key) {
+            if proof.definition != definition
+                || proof.type_arguments != request.type_arguments
+                || proof.alias != alias
+                || proof.for_constraint
+            {
+                return Err(ConditionalTypeError::InvalidTypeNodeCache(
+                    source.reference(),
+                ));
+            }
+            validate_query_production(store, proof)?;
+        } else if !store.try_reserve_conditional_productions(0, 1) {
+            return Err(ConditionalTypeError::Capacity);
+        }
+        Some((key, definition, alias))
+    } else {
+        None
+    };
+    let result = get_conditional_type_instantiation_with_tail_count(
+        store,
+        request,
+        global_types,
+        session,
+        0,
+    )?;
+    if let Some((key, definition, alias)) = source_query {
+        if let Some(proof) = store.conditional_query_production(key) {
+            if proof.result != result {
+                return Err(ConditionalTypeError::InvalidInstantiationCache(
+                    definition.root,
+                ));
+            }
+        } else {
+            let proof = ConditionalQueryProduction {
+                key,
+                definition,
+                type_arguments: request.type_arguments.to_vec(),
+                alias,
+                for_constraint: false,
+                result,
+                source_declaration: None,
+                result_alias: retain_result_alias(store, result)?,
+            };
+            validate_query_production(store, &proof)?;
+            if !store.publish_conditional_query_production(proof) {
+                return Err(ConditionalTypeError::InvalidConditional(result));
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// Returns authenticated alias data without evaluating conditional branches.
@@ -297,82 +476,331 @@ pub(super) fn conditional_alias_projection(
     store: &CanonicalTypeMapperStore,
     conditional: TypeId,
 ) -> Result<Option<ConditionalAliasIdentity<'_>>, ConditionalTypeError> {
-    let data = conditional_snapshot(store, conditional)?;
+    let proof = validated_conditional_production(store, conditional)?;
+    Ok(proof.alias.as_ref().map(RetainedConditionalAlias::identity))
+}
+
+/// A reduced conditional keeps its source root's alias separate from its result.
+pub(super) fn conditional_query_alias(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+) -> Result<Option<TypeAliasId>, ConditionalTypeError> {
+    let proof = store
+        .conditional_query_production(ConditionalQueryKey::Node(node))
+        .ok_or(ConditionalTypeError::InvalidTypeNodeCache(node))?;
+    validate_query_production(store, proof)?;
+    if store
+        .type_node_links(node)
+        .and_then(|links| links.resolved_type)
+        != Some(proof.result)
+    {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(node));
+    }
+    Ok(proof.definition.alias.as_ref().map(|alias| alias.id))
+}
+
+pub(super) fn validate_conditional_reference_result(
+    store: &CanonicalTypeMapperStore,
+    reference: NodeRef,
+    result: TypeId,
+) -> Result<bool, ConditionalTypeError> {
+    let Some(proof) =
+        store.conditional_query_production(ConditionalQueryKey::AliasReference(reference))
+    else {
+        return Ok(false);
+    };
+    if proof.result != result {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(reference));
+    }
+    validate_query_production(store, proof)?;
+    Ok(true)
+}
+
+pub(super) fn record_conditional_alias_declaration(
+    store: &mut CanonicalTypeMapperStore,
+    source: &ConditionalAliasDeclarationProof,
+) -> Result<(), ConditionalTypeError> {
+    if !source.matches_source(store) {
+        return Err(ConditionalTypeError::InvalidAliasSymbol(source.symbol()));
+    }
+    let definition = validated_conditional_production(store, source.result())?
+        .definition
+        .clone();
+    let key = ConditionalQueryKey::AliasDeclaration(source.symbol());
+    if let Some(proof) = store.conditional_query_production(key) {
+        if proof.result != source.result()
+            || proof.definition != definition
+            || proof.source_declaration != Some(source.declaration())
+            || proof.type_arguments != source.type_parameters()
+        {
+            return Err(ConditionalTypeError::InvalidAliasSymbol(source.symbol()));
+        }
+        return validate_query_production(store, proof);
+    }
+    if !store.try_reserve_conditional_productions(0, 1) {
+        return Err(ConditionalTypeError::Capacity);
+    }
+    let proof = ConditionalQueryProduction {
+        key,
+        definition,
+        type_arguments: source.type_parameters().to_vec(),
+        alias: None,
+        for_constraint: false,
+        result: source.result(),
+        source_declaration: Some(source.declaration()),
+        result_alias: retain_result_alias(store, source.result())?,
+    };
+    if !store.publish_conditional_query_production(proof) {
+        return Err(ConditionalTypeError::InvalidAliasSymbol(source.symbol()));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_conditional_alias_declaration(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    result: TypeId,
+) -> Result<(), ConditionalTypeError> {
+    let Some(proof) =
+        store.conditional_query_production(ConditionalQueryKey::AliasDeclaration(symbol))
+    else {
+        return if matches!(
+            store.type_payload(result).map(TypeRecord::data),
+            Some(TypeData::Conditional(_))
+        ) {
+            Err(ConditionalTypeError::InvalidAliasSymbol(symbol))
+        } else {
+            Ok(())
+        };
+    };
+    if proof.result != result {
+        return Err(ConditionalTypeError::InvalidAliasSymbol(symbol));
+    }
+    validate_query_production(store, proof)
+}
+
+fn retain_conditional_alias(
+    store: &CanonicalTypeMapperStore,
+    alias: Option<TypeAliasId>,
+) -> Result<Option<RetainedConditionalAlias>, ConditionalTypeError> {
+    alias
+        .map(|id| {
+            let identity = stored_alias_identity(store, id)?;
+            validate_alias_identity(store, identity, &mut HashSet::new())?;
+            Ok(RetainedConditionalAlias {
+                id,
+                symbol: identity.symbol,
+                type_arguments: identity.type_arguments.to_vec(),
+            })
+        })
+        .transpose()
+}
+
+fn retain_result_alias(
+    store: &CanonicalTypeMapperStore,
+    result: TypeId,
+) -> Result<Option<RetainedConditionalAlias>, ConditionalTypeError> {
     let record = store
-        .type_payload(conditional)
-        .ok_or(ConditionalTypeError::InvalidConditional(conditional))?;
-    if record.flags() != TypeFlags::CONDITIONAL {
-        return Err(ConditionalTypeError::InvalidConditional(conditional));
+        .type_payload(result)
+        .ok_or(ConditionalTypeError::InvalidType(result))?;
+    record
+        .alias()
+        .map(|id| {
+            let alias = stored_alias_identity(store, id)?;
+            Ok(RetainedConditionalAlias {
+                id,
+                symbol: alias.symbol,
+                type_arguments: alias.type_arguments.to_vec(),
+            })
+        })
+        .transpose()
+}
+
+fn conditional_definition(
+    store: &CanonicalTypeMapperStore,
+    root: ConditionalRootId,
+) -> Result<ConditionalDefinition, ConditionalTypeError> {
+    let record = store
+        .conditional_root(root)
+        .ok_or(ConditionalTypeError::InvalidRoot(root))?;
+    Ok(ConditionalDefinition {
+        root,
+        node: record.node(),
+        check_type: record.check_type(),
+        extends_type: record.extends_type(),
+        is_distributive: record.is_distributive(),
+        infer_type_parameters: record.infer_type_parameters().unwrap_or_default().to_vec(),
+        outer_type_parameters: record.outer_type_parameters().unwrap_or_default().to_vec(),
+        alias: retain_conditional_alias(store, record.alias())?,
+    })
+}
+
+fn validate_conditional_definition(
+    store: &CanonicalTypeMapperStore,
+    definition: &ConditionalDefinition,
+) -> Result<(), ConditionalTypeError> {
+    if conditional_definition(store, definition.root)? != *definition {
+        return Err(ConditionalTypeError::InvalidRoot(definition.root));
+    }
+    validate_root_alias(
+        store,
+        definition.node,
+        &definition.outer_type_parameters,
+        definition.alias.as_ref().map(|alias| alias.id),
+    )
+}
+
+fn validated_conditional_production(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+) -> Result<&ConditionalTypeProduction, ConditionalTypeError> {
+    let invalid = || ConditionalTypeError::InvalidConditional(conditional);
+    let proof = store
+        .conditional_type_production(conditional)
+        .ok_or_else(invalid)?;
+    let record = store.type_payload(conditional).ok_or_else(invalid)?;
+    let TypeData::Conditional(data) = record.data() else {
+        return Err(invalid());
+    };
+    if record.flags() != TypeFlags::CONDITIONAL
+        || record.symbol().is_some()
+        || data.root != proof.definition.root
+        || data.check_type != proof.check_type
+        || data.extends_type != proof.extends_type
+        || data.mapper != proof.mapper
+        || retain_conditional_alias(store, record.alias())? != proof.alias
+    {
+        return Err(invalid());
+    }
+    validate_conditional_definition(store, &proof.definition)?;
+    if let Some(reference) = proof.alias_reference {
+        let alias = proof.alias.as_ref().ok_or_else(invalid)?;
+        validate_conditional_alias_reference_owner(store, reference, alias.symbol)?;
+    }
+    if let Some(mapper) = proof.mapper {
+        if store.type_mapper_has_exact_endpoints(
+            mapper,
+            &proof.mapped_parameters,
+            &proof.type_arguments,
+        ) != Some(true)
+        {
+            return Err(ConditionalTypeError::InvalidMapper(mapper));
+        }
+    } else if proof.mapped_parameters != proof.type_arguments {
+        return Err(invalid());
+    }
+    Ok(proof)
+}
+
+fn validate_query_production(
+    store: &CanonicalTypeMapperStore,
+    proof: &ConditionalQueryProduction,
+) -> Result<(), ConditionalTypeError> {
+    validate_conditional_definition(store, &proof.definition)?;
+    if let ConditionalQueryKey::AliasReference(reference) = proof.key
+        && let Some((symbol, _)) = proof.alias.as_ref()
+    {
+        validate_conditional_alias_reference_owner(store, reference, *symbol)?;
+    }
+    if retain_result_alias(store, proof.result)? != proof.result_alias {
+        return Err(ConditionalTypeError::InvalidInstantiationCache(
+            proof.definition.root,
+        ));
+    }
+    let result =
+        store
+            .type_payload(proof.result)
+            .ok_or(ConditionalTypeError::InvalidInstantiationCache(
+                proof.definition.root,
+            ))?;
+    if matches!(result.data(), TypeData::Conditional(_)) {
+        validated_conditional_production(store, proof.result)?;
     }
     let root = store
-        .conditional_root(data.root)
-        .ok_or(ConditionalTypeError::InvalidRoot(data.root))?;
-    let parameters = root.outer_type_parameters().unwrap_or_default();
-    match root.instantiations() {
-        TypeCacheState::Allocated(cache) if !parameters.is_empty() => {
-            let identity_key = conditional_type_key_parts(parameters, None, false);
-            let declared = store
-                .type_node_links(root.node())
-                .and_then(|links| links.resolved_type);
-            if declared.is_none() || cache.get(&identity_key).copied() != declared {
-                return Err(ConditionalTypeError::InvalidInstantiationCache(data.root));
+        .conditional_root(proof.definition.root)
+        .ok_or(ConditionalTypeError::InvalidRoot(proof.definition.root))?;
+    let cache_key = match proof.key {
+        ConditionalQueryKey::AliasDeclaration(symbol) => {
+            validate_alias_identity(
+                store,
+                ConditionalAliasIdentity {
+                    symbol,
+                    type_arguments: &proof.type_arguments,
+                },
+                &mut HashSet::new(),
+            )?;
+            let Some(declaration) = proof.source_declaration else {
+                return Err(ConditionalTypeError::InvalidAliasSymbol(symbol));
+            };
+            if store
+                .symbol(symbol)
+                .and_then(|symbol| symbol.declarations())
+                != Some(&[declaration][..])
+                || store
+                    .type_alias_links(symbol)
+                    .and_then(|links| links.type_parameters.as_deref())
+                    .unwrap_or_default()
+                    != proof.type_arguments
+            {
+                return Err(ConditionalTypeError::InvalidAliasSymbol(symbol));
             }
+            return Ok(());
         }
-        TypeCacheState::Unallocated if parameters.is_empty() => {}
-        _ => return Err(ConditionalTypeError::InvalidInstantiationCache(data.root)),
-    }
-    if let Some(mapper) = data.mapper
-        && !matches!(
-            store.mapper_payload(mapper).map(|mapper| mapper.kind()),
-            Some(TypeMapperKind::Simple | TypeMapperKind::Array)
-        )
+        ConditionalQueryKey::Node(_) | ConditionalQueryKey::AliasReference(_)
+            if proof.definition.outer_type_parameters.is_empty() =>
+        {
+            return if root.instantiations() == &TypeCacheState::Unallocated {
+                Ok(())
+            } else {
+                Err(ConditionalTypeError::InvalidInstantiationCache(
+                    proof.definition.root,
+                ))
+            };
+        }
+        ConditionalQueryKey::Node(_) => {
+            conditional_type_key_parts(&proof.definition.outer_type_parameters, None, false)
+        }
+        ConditionalQueryKey::Instantiation(_, key) => key,
+        ConditionalQueryKey::AliasReference(_) => {
+            let alias = proof
+                .alias
+                .as_ref()
+                .map(|(symbol, arguments)| {
+                    store
+                        .symbol_store()
+                        .assigned_global_symbol_id(*symbol)
+                        .map(|symbol| (symbol, arguments.as_slice()))
+                        .ok_or(ConditionalTypeError::InvalidAliasSymbol(*symbol))
+                })
+                .transpose()?;
+            conditional_type_key_parts(&proof.type_arguments, alias, proof.for_constraint)
+        }
+    };
+    if !matches!(root.instantiations(), TypeCacheState::Allocated(cache) if cache.get(&cache_key) == Some(&proof.result))
     {
-        return Err(ConditionalTypeError::InvalidMapper(mapper));
+        return Err(ConditionalTypeError::InvalidInstantiationCache(
+            proof.definition.root,
+        ));
     }
-    let arguments = parameters
-        .iter()
-        .map(|parameter| match data.mapper {
-            Some(mapper) => store
-                .map_type(mapper, *parameter)
-                .ok_or(ConditionalTypeError::InvalidMapper(mapper)),
-            None => Ok(*parameter),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let alias = record
-        .alias()
-        .map(|alias| stored_alias_identity(store, alias))
-        .transpose()?;
-    let mapped_alias = mapped_root_alias(store, data.root, parameters, &arguments)?;
-    let default_alias = mapped_alias
-        .as_ref()
-        .map(|(symbol, arguments)| ConditionalAliasIdentity {
-            symbol: *symbol,
-            type_arguments: arguments,
-        });
-    if alias != default_alias {
-        let Some(alias) = alias else {
-            return Err(ConditionalTypeError::InvalidConditional(conditional));
-        };
-        let global_symbol = store
-            .symbol_store()
-            .assigned_global_symbol_id(alias.symbol)
-            .ok_or(ConditionalTypeError::InvalidAliasSymbol(alias.symbol))?;
-        let TypeCacheState::Allocated(cache) = root.instantiations() else {
-            return Err(ConditionalTypeError::InvalidInstantiationCache(data.root));
-        };
-        if ![false, true].into_iter().any(|for_constraint| {
-            let key = conditional_type_key_parts(
-                &arguments,
-                Some((global_symbol, alias.type_arguments)),
-                for_constraint,
-            );
-            cache.get(&key) == Some(&conditional)
-        }) {
-            return Err(ConditionalTypeError::InvalidInstantiationCache(data.root));
-        }
+    Ok(())
+}
+
+fn validate_conditional_alias_reference_owner(
+    store: &CanonicalTypeMapperStore,
+    reference: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<(), ConditionalTypeError> {
+    let declaration = conditional_alias_declaration(store, reference)
+        .ok_or(ConditionalTypeError::InvalidAliasSymbol(symbol))?;
+    if store.source_node_kind(reference) != Some(SyntaxKind::TypeReference)
+        || store
+            .symbol(symbol)
+            .and_then(|symbol| symbol.declarations())
+            != Some(&[declaration][..])
+    {
+        return Err(ConditionalTypeError::InvalidAliasSymbol(symbol));
     }
-    validate_cached_instantiation(store, data.root, conditional, parameters, &arguments, alias)?;
-    Ok(alias)
+    Ok(())
 }
 
 /// Resolves the true branch only when its canonical lazy cache is requested.
@@ -692,6 +1120,9 @@ fn conditional_snapshot(
     store: &CanonicalTypeMapperStore,
     conditional: TypeId,
 ) -> Result<ConditionalTypeData, ConditionalTypeError> {
+    if store.conditional_type_production(conditional).is_some() {
+        validated_conditional_production(store, conditional)?;
+    }
     match store.type_payload(conditional).map(TypeRecord::data) {
         Some(TypeData::Conditional(data)) => {
             let root = store
@@ -764,8 +1195,26 @@ fn get_conditional_type_instantiation_with_tail_count(
             limit: CONDITIONAL_TAIL_RECURSION_LIMIT,
         });
     }
+    let definition = validated_conditional_production(store, request.conditional_type)?
+        .definition
+        .clone();
     validate_branch_types(store, request.branches)?;
-    if let Some(alias) = request.alias {
+    if let Some(proof) = request.alias
+        && !proof.matches_request(store, request.conditional_type, request.type_arguments)
+    {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(
+            proof.reference(),
+        ));
+    }
+    let alias = request
+        .alias
+        .and_then(ConditionalAliasReferenceProof::identity);
+    let alias_source = request.alias.and_then(|proof| {
+        proof
+            .identity()
+            .map(|identity| (identity, proof.reference()))
+    });
+    if let Some(alias) = alias {
         validate_alias_identity(store, alias, &mut HashSet::new())?;
     }
 
@@ -816,22 +1265,26 @@ fn get_conditional_type_instantiation_with_tail_count(
         validate_conditional_operand(store, *argument, &mut visiting)?;
     }
 
-    let key = conditional_type_key(
-        store,
-        request.type_arguments,
-        request.alias,
-        request.for_constraint,
-    )?;
+    let key = conditional_type_key(store, request.type_arguments, alias, request.for_constraint)?;
     if let Some(cached) = cached_values.get(&key).copied() {
         validate_cached_instantiation(
             store,
             root,
+            key,
             cached,
             &outer_parameters,
             request.type_arguments,
-            request.alias,
+            alias,
+            request.for_constraint,
         )?;
         return Ok(cached);
+    }
+    let query_key = ConditionalQueryKey::Instantiation(root, key);
+    if store.conditional_query_production(query_key).is_some() {
+        return Err(ConditionalTypeError::InvalidInstantiationCache(root));
+    }
+    if !store.try_reserve_conditional_productions(0, 1) {
+        return Err(ConditionalTypeError::Capacity);
     }
 
     let mut owned_session = InstantiationSession::new(InstantiationLimits::default());
@@ -872,7 +1325,7 @@ fn get_conditional_type_instantiation_with_tail_count(
                         tail_count,
                     )?);
                 }
-                union_result(store, &results, global_types)?
+                union_result_with_alias(store, &results, global_types, alias)?
             }
             Some(_) if is_never(store, mapped_check)? => mapped_check,
             Some(_) => evaluate_conditional(
@@ -883,7 +1336,7 @@ fn get_conditional_type_instantiation_with_tail_count(
                 request.type_arguments,
                 global_types,
                 request.for_constraint,
-                request.alias,
+                alias_source,
                 session,
                 tail_count,
             )?,
@@ -898,7 +1351,7 @@ fn get_conditional_type_instantiation_with_tail_count(
             request.type_arguments,
             global_types,
             request.for_constraint,
-            request.alias,
+            alias_source,
             session,
             tail_count,
         )?
@@ -922,6 +1375,20 @@ fn get_conditional_type_instantiation_with_tail_count(
     if !store.set_conditional_root_instantiations(root, TypeCacheState::Allocated(cache)) {
         return Err(ConditionalTypeError::InvalidInstantiationCache(root));
     }
+    let proof = ConditionalQueryProduction {
+        key: query_key,
+        definition,
+        type_arguments: request.type_arguments.to_vec(),
+        alias: alias.map(|alias| (alias.symbol, alias.type_arguments.to_vec())),
+        for_constraint: request.for_constraint,
+        result,
+        source_declaration: None,
+        result_alias: retain_result_alias(store, result)?,
+    };
+    validate_query_production(store, &proof)?;
+    if !store.publish_conditional_query_production(proof) {
+        return Err(ConditionalTypeError::InvalidInstantiationCache(root));
+    }
     Ok(result)
 }
 
@@ -934,7 +1401,7 @@ fn evaluate_conditional(
     type_arguments: &[TypeId],
     global_types: Option<&CanonicalGlobalTypes>,
     for_constraint: bool,
-    alias: Option<ConditionalAliasIdentity<'_>>,
+    alias: Option<(ConditionalAliasIdentity<'_>, NodeRef)>,
     session: &mut InstantiationSession,
     tail_count: usize,
 ) -> Result<TypeId, ConditionalTypeError> {
@@ -1674,8 +2141,11 @@ fn deferred_conditional(
     extends_type: TypeId,
     parameters: &[TypeId],
     arguments: &[TypeId],
-    alias: Option<ConditionalAliasIdentity<'_>>,
+    alias: Option<(ConditionalAliasIdentity<'_>, NodeRef)>,
 ) -> Result<TypeId, ConditionalTypeError> {
+    let alias_reference = alias.map(|(_, reference)| reference);
+    let alias = alias.map(|(identity, _)| identity);
+    let definition = conditional_definition(store, root)?;
     let mapped_alias = mapped_root_alias(store, root, parameters, arguments)?;
     let alias = alias.or_else(|| {
         mapped_alias
@@ -1685,8 +2155,19 @@ fn deferred_conditional(
                 type_arguments: arguments,
             })
     });
-    let alias = if let Some(identity) = alias {
+    if let Some(identity) = alias {
         validate_alias_identity(store, identity, &mut HashSet::new())?;
+    }
+    if !store.try_reserve_conditional_productions(1, 0)
+        || !store.try_reserve_types(1)
+        || !store.try_reserve_type_aliases(usize::from(alias.is_some()))
+        || !store.try_reserve_mappers(usize::from(
+            !parameters.is_empty() && parameters != arguments,
+        ))
+    {
+        return Err(ConditionalTypeError::Capacity);
+    }
+    let alias = if let Some(identity) = alias {
         let root_alias = store.conditional_root(root).and_then(|root| root.alias());
         if root_alias.is_some_and(|alias| stored_alias_identity(store, alias) == Ok(identity)) {
             root_alias
@@ -1718,6 +2199,20 @@ fn deferred_conditional(
         .alloc_conditional_type(root, check_type, extends_type, mapper, None)
         .ok_or(ConditionalTypeError::InvalidRoot(root))?;
     if !store.set_type_alias(conditional, alias) {
+        return Err(ConditionalTypeError::InvalidConditional(conditional));
+    }
+    let proof = ConditionalTypeProduction {
+        type_: conditional,
+        definition,
+        check_type,
+        extends_type,
+        mapper,
+        mapped_parameters: parameters.to_vec(),
+        type_arguments: arguments.to_vec(),
+        alias: retain_conditional_alias(store, alias)?,
+        alias_reference,
+    };
+    if !store.publish_conditional_type_production(proof) {
         return Err(ConditionalTypeError::InvalidConditional(conditional));
     }
     Ok(conditional)
@@ -1889,74 +2384,63 @@ fn validate_cached_conditional(
     request: ConditionalTypeRequest<'_>,
     cached: TypeId,
 ) -> Result<TypeId, ConditionalTypeError> {
-    let record = store
-        .type_payload(cached)
+    let proof = store
+        .conditional_query_production(ConditionalQueryKey::Node(request.node))
         .ok_or(ConditionalTypeError::InvalidTypeNodeCache(request.node))?;
-    if let TypeData::Conditional(data) = record.data() {
-        let root = store
-            .conditional_root(data.root)
-            .ok_or(ConditionalTypeError::InvalidTypeNodeCache(request.node))?;
-        if root.node() != request.node
-            || root.check_type() != request.check_type
-            || root.extends_type() != request.extends_type
-            || root.infer_type_parameters().unwrap_or_default() != request.infer_type_parameters
-            || root.outer_type_parameters().unwrap_or_default() != request.outer_type_parameters
-            || root.alias() != request.alias
-            || record.alias() != request.alias
-            || data.check_type != request.check_type
-            || data.extends_type != request.extends_type
-            || data.mapper.is_some()
-        {
-            return Err(ConditionalTypeError::InvalidTypeNodeCache(request.node));
-        }
+    if proof.result != cached
+        || proof.definition.check_type != request.check_type
+        || proof.definition.extends_type != request.extends_type
+        || proof.definition.infer_type_parameters != request.infer_type_parameters
+        || proof.definition.outer_type_parameters != request.outer_type_parameters
+        || proof.definition.alias != retain_conditional_alias(store, request.alias)?
+    {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(request.node));
     }
+    validate_query_production(store, proof)?;
     Ok(cached)
 }
 
+#[allow(clippy::too_many_arguments)] // The retained query must match each cache-key input.
 fn validate_cached_instantiation(
     store: &CanonicalTypeMapperStore,
     root: ConditionalRootId,
+    key: CacheHashKey,
     cached: TypeId,
     parameters: &[TypeId],
     arguments: &[TypeId],
     alias: Option<ConditionalAliasIdentity<'_>>,
+    for_constraint: bool,
 ) -> Result<(), ConditionalTypeError> {
-    let record = store
-        .type_payload(cached)
+    let proof = store
+        .conditional_query_production(ConditionalQueryKey::Instantiation(root, key))
+        .or_else(|| {
+            if parameters != arguments
+                || alias.is_some()
+                || for_constraint
+                || key != conditional_type_key_parts(parameters, None, false)
+            {
+                return None;
+            }
+            let node = store.conditional_root(root)?.node();
+            store.conditional_query_production(ConditionalQueryKey::Node(node))
+        })
         .ok_or(ConditionalTypeError::InvalidInstantiationCache(root))?;
-    if let TypeData::Conditional(data) = record.data() {
-        if data.root != root {
-            return Err(ConditionalTypeError::InvalidInstantiationCache(root));
-        }
-        if let Some(mapper) = data.mapper
-            && store.type_mapper_has_exact_endpoints(mapper, parameters, arguments) != Some(true)
-        {
-            return Err(ConditionalTypeError::InvalidInstantiationCache(root));
-        }
-        if data.mapper.is_none() && parameters != arguments {
-            return Err(ConditionalTypeError::InvalidInstantiationCache(root));
-        }
-        let mapped_alias = mapped_root_alias(store, root, parameters, arguments)?;
-        let expected_alias = alias.or_else(|| {
-            mapped_alias
-                .as_ref()
-                .map(|(symbol, arguments)| ConditionalAliasIdentity {
-                    symbol: *symbol,
-                    type_arguments: arguments,
-                })
+    let retained_alias = proof
+        .alias
+        .as_ref()
+        .map(|(symbol, arguments)| ConditionalAliasIdentity {
+            symbol: *symbol,
+            type_arguments: arguments,
         });
-        let actual_alias = record
-            .alias()
-            .map(|alias| stored_alias_identity(store, alias))
-            .transpose()?;
-        if actual_alias != expected_alias {
-            return Err(ConditionalTypeError::InvalidInstantiationCache(root));
-        }
-        if let Some(actual_alias) = actual_alias {
-            validate_alias_identity(store, actual_alias, &mut HashSet::new())?;
-        }
+    if proof.definition.root != root
+        || proof.result != cached
+        || proof.type_arguments != arguments
+        || retained_alias != alias
+        || proof.for_constraint != for_constraint
+    {
+        return Err(ConditionalTypeError::InvalidInstantiationCache(root));
     }
-    Ok(())
+    validate_query_production(store, proof)
 }
 
 fn validate_owned_type(
@@ -1973,8 +2457,19 @@ fn validate_branch_types(
     store: &CanonicalTypeMapperStore,
     branches: ConditionalTypeBranches,
 ) -> Result<(), ConditionalTypeError> {
-    validate_owned_type(store, branches.true_type)?;
-    validate_owned_type(store, branches.false_type)
+    for branch in [branches.true_type, branches.false_type] {
+        validate_owned_type(store, branch)?;
+        let record = store
+            .type_payload(branch)
+            .ok_or(ConditionalTypeError::InvalidType(branch))?;
+        if let Some(alias) = record.alias() {
+            stored_alias_identity(store, alias)?;
+        }
+        if matches!(record.data(), TypeData::Conditional(_)) {
+            validated_conditional_production(store, branch)?;
+        }
+    }
+    Ok(())
 }
 
 fn conditional_type_key(
@@ -3426,6 +3921,24 @@ fn union_result(
     }
 }
 
+fn union_result_with_alias(
+    store: &mut CanonicalTypeMapperStore,
+    types: &[TypeId],
+    global_types: Option<&CanonicalGlobalTypes>,
+    alias: Option<ConditionalAliasIdentity<'_>>,
+) -> Result<TypeId, ConditionalTypeError> {
+    let Some(alias) = alias else {
+        return union_result(store, types, global_types);
+    };
+    store
+        .literal_union_type_with_alias_and_array_targets(
+            types,
+            Some((alias.symbol, alias.type_arguments)),
+            global_types.map(CanonicalArrayTargets::from_global_types),
+        )
+        .map_err(Into::into)
+}
+
 /// Compares conditional operands, including concrete fixed tuple wrappers.
 pub(super) fn conditional_check_is_assignable(
     store: &mut CanonicalTypeMapperStore,
@@ -3592,8 +4105,8 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerDiagnostics, CanonicalCheckerOptions, DeclaredTypeHost, DeclaredTypeLinks,
-        IntrinsicBootstrapOptions, SemanticStore, ValueSymbolLinks,
+        CanonicalCheckerDiagnostics, CanonicalCheckerOptions, DeclaredTypeError, DeclaredTypeHost,
+        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore, ValueSymbolLinks,
         declared::execute_type_parameter,
         mapper::TypeMapper,
         production::GlobalMergeCompletion,
@@ -3704,9 +4217,8 @@ mod tests {
             execute_type_parameter(&mut self.store, symbol)
         }
 
-        fn alias_symbol(&self, expected: &str) -> SemanticSymbolId {
-            let declaration = self
-                .parsed
+        fn alias_declaration(&self, expected: &str) -> NodeRef {
+            self.parsed
                 .arena
                 .iter()
                 .find_map(|(node, record)| {
@@ -3723,13 +4235,20 @@ mod tests {
                         node,
                     ))
                 })
-                .unwrap_or_else(|| panic!("missing type alias {expected}"));
+                .unwrap_or_else(|| panic!("missing type alias {expected}"))
+        }
+
+        fn alias_symbol(&self, expected: &str) -> SemanticSymbolId {
             self.bound
-                .symbol(declaration)
+                .symbol(self.alias_declaration(expected))
                 .unwrap_or_else(|| panic!("missing type-alias symbol {expected}"))
         }
 
         fn declared_alias(&mut self, expected: &str) -> TypeId {
+            self.try_declared_alias(expected).unwrap()
+        }
+
+        fn try_declared_alias(&mut self, expected: &str) -> Result<TypeId, DeclaredTypeError> {
             let symbol = self.alias_symbol(expected);
             let host = DeclaredTypeHost::new_after_global_merge(
                 [(&self.parsed.arena, &self.bound)],
@@ -3744,8 +4263,7 @@ mod tests {
                 &mut diagnostics,
             )
             .unwrap()
-            .get_declared_type_of_symbol(symbol)
-            .unwrap();
+            .get_declared_type_of_symbol(symbol);
             assert!(diagnostics.is_empty());
             result
         }
@@ -5630,12 +6148,13 @@ mod tests {
 
     fn conditional_allocation_counts(
         store: &CanonicalTypeMapperStore,
-    ) -> (usize, usize, usize, usize) {
+    ) -> (usize, usize, usize, usize, (usize, usize)) {
         (
             store.type_len(),
             store.conditional_root_len(),
             store.type_alias_len(),
             store.mapper_len(),
+            store.conditional_production_lengths(),
         )
     }
 
@@ -5717,7 +6236,236 @@ mod tests {
     }
 
     #[test]
-    fn conditional_alias_instantiations_map_default_arguments_and_keep_alias_cache_keys() {
+    fn conditional_alias_reduced_outer_keeps_inner_identity_on_warm_queries() {
+        let mut fixture = Fixture::new(concat!(
+            "type Inner<T> = T extends string ? number : boolean; ",
+            "type Outer<U> = string extends string ? Inner<U> : never; ",
+            "type Result = Outer<string>;",
+        ));
+        let outer = fixture.declared_alias("Outer");
+        let parameter = fixture.type_parameter("U");
+        assert_eq!(
+            conditional_alias_projection(&fixture.store, outer),
+            Ok(Some(ConditionalAliasIdentity {
+                symbol: fixture.alias_symbol("Inner"),
+                type_arguments: &[parameter],
+            }))
+        );
+        let declaration = fixture.alias_declaration("Outer");
+        let NodeData::TypeAliasDeclaration(source) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!();
+        };
+        let node = NodeRef::new(declaration.arena, declaration.file, source.type_);
+        let alias = conditional_query_alias(&fixture.store, node)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fixture.store.type_alias(alias).unwrap().symbol(),
+            Some(fixture.alias_symbol("Outer"))
+        );
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(fixture.declared_alias("Result"), number);
+        let warm = conditional_allocation_counts(&fixture.store);
+        assert_eq!(fixture.declared_alias("Outer"), outer);
+        assert_eq!(fixture.declared_alias("Result"), number);
+        assert_eq!(conditional_allocation_counts(&fixture.store), warm);
+    }
+
+    #[test]
+    fn conditional_alias_distribution_retains_the_requested_union_alias() {
+        let mut fixture = Fixture::new(concat!(
+            "type Select<T> = T extends string ? 1 : 2; ",
+            "type Result = Select<string | number>; type Other = boolean;",
+        ));
+        let result = fixture.declared_alias("Result");
+        let record = fixture.store.type_payload(result).unwrap();
+        let TypeData::Union(union) = record.data() else {
+            panic!("distribution must preserve both literal results");
+        };
+        assert_eq!(union.union.types.len(), 2);
+        let alias = fixture.store.type_alias(record.alias().unwrap()).unwrap();
+        assert_eq!(alias.symbol(), Some(fixture.alias_symbol("Result")));
+        assert!(alias.type_arguments().unwrap_or_default().is_empty());
+        let warm = conditional_allocation_counts(&fixture.store);
+        assert_eq!(fixture.declared_alias("Result"), result);
+        assert_eq!(conditional_allocation_counts(&fixture.store), warm);
+
+        let declaration = fixture.alias_declaration("Result");
+        let NodeData::TypeAliasDeclaration(source) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!();
+        };
+        let reference = NodeRef::new(declaration.arena, declaration.file, source.type_);
+        let other = fixture.alias_symbol("Other");
+        let alias = fixture.store.alloc_type_alias(Some(other)).unwrap();
+        assert!(fixture.store.set_type_alias(result, Some(alias)));
+        let before = conditional_allocation_counts(&fixture.store);
+        assert!(validate_conditional_reference_result(&fixture.store, reference, result).is_err());
+        assert_eq!(conditional_allocation_counts(&fixture.store), before);
+    }
+
+    #[test]
+    fn conditional_alias_projection_rejects_uncached_clones_with_matching_aliases() {
+        let mut fixture = Fixture::new("type Select<T> = T extends string ? number : boolean;");
+        let original = fixture.declared_alias("Select");
+        let data = conditional_snapshot(&fixture.store, original).unwrap();
+        let original_alias = fixture.store.type_payload(original).unwrap().alias();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        for check in [data.check_type, number] {
+            let clone = fixture
+                .store
+                .alloc_conditional_type(data.root, check, data.extends_type, None, None)
+                .unwrap();
+            assert!(fixture.store.set_type_alias(clone, original_alias));
+            let before = conditional_allocation_counts(&fixture.store);
+            assert!(conditional_alias_projection(&fixture.store, clone).is_err());
+            assert!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: clone,
+                        type_arguments: &[number],
+                        branches: branches(number, number),
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None
+                )
+                .is_err()
+            );
+            assert_eq!(conditional_allocation_counts(&fixture.store), before);
+        }
+        let proof = fixture
+            .store
+            .conditional_type_production(original)
+            .unwrap()
+            .clone();
+        let before = conditional_allocation_counts(&fixture.store);
+        assert!(!fixture.store.publish_conditional_type_production(proof));
+        assert_eq!(conditional_allocation_counts(&fixture.store), before);
+    }
+
+    #[test]
+    fn conditional_alias_source_rejects_an_unrelated_owner_and_matching_cache_entry() {
+        let mut fixture = Fixture::new(concat!(
+            "type Select<T> = T extends string ? number : boolean; ",
+            "type Forward<U> = Select<U>; type Other<V> = V;",
+        ));
+        let forwarded = fixture.declared_alias("Forward");
+        let parameter = fixture.type_parameter("U");
+        let root = conditional_snapshot(&fixture.store, forwarded)
+            .unwrap()
+            .root;
+        let other = fixture.alias_symbol("Other");
+        let alias = fixture.store.alloc_type_alias(Some(other)).unwrap();
+        assert!(
+            fixture
+                .store
+                .set_type_alias_arguments(alias, Some(vec![parameter]))
+        );
+        assert!(fixture.store.set_type_alias(forwarded, Some(alias)));
+        let key = conditional_type_key(
+            &mut fixture.store,
+            &[parameter],
+            Some(ConditionalAliasIdentity {
+                symbol: other,
+                type_arguments: &[parameter],
+            }),
+            false,
+        )
+        .unwrap();
+        let TypeCacheState::Allocated(mut cache) = fixture
+            .store
+            .conditional_root(root)
+            .unwrap()
+            .instantiations()
+            .clone()
+        else {
+            unreachable!();
+        };
+        cache.insert(key, forwarded);
+        assert!(
+            fixture
+                .store
+                .set_conditional_root_instantiations(root, TypeCacheState::Allocated(cache))
+        );
+        let before = conditional_allocation_counts(&fixture.store);
+        assert!(conditional_alias_projection(&fixture.store, forwarded).is_err());
+        assert!(fixture.try_declared_alias("Forward").is_err());
+        assert_eq!(conditional_allocation_counts(&fixture.store), before);
+    }
+
+    #[test]
+    fn conditional_alias_source_rejects_swapped_arguments_and_matching_cache_entry() {
+        let mut fixture = Fixture::new(concat!(
+            "type Select<T, U> = T extends string ? U : boolean; ",
+            "type Forward<Left, Right> = Select<Right, Left>;",
+        ));
+        let forwarded = fixture.declared_alias("Forward");
+        let left = fixture.type_parameter("Left");
+        let right = fixture.type_parameter("Right");
+        let symbol = fixture.alias_symbol("Forward");
+        assert_eq!(
+            conditional_alias_projection(&fixture.store, forwarded),
+            Ok(Some(ConditionalAliasIdentity {
+                symbol,
+                type_arguments: &[left, right],
+            }))
+        );
+        let warm = conditional_allocation_counts(&fixture.store);
+        assert_eq!(fixture.declared_alias("Forward"), forwarded);
+        assert_eq!(conditional_allocation_counts(&fixture.store), warm);
+        let root = conditional_snapshot(&fixture.store, forwarded)
+            .unwrap()
+            .root;
+        let alias = fixture
+            .store
+            .type_payload(forwarded)
+            .unwrap()
+            .alias()
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_type_alias_arguments(alias, Some(vec![right, left]))
+        );
+        let key = conditional_type_key(
+            &mut fixture.store,
+            &[right, left],
+            Some(ConditionalAliasIdentity {
+                symbol,
+                type_arguments: &[right, left],
+            }),
+            false,
+        )
+        .unwrap();
+        let TypeCacheState::Allocated(mut cache) = fixture
+            .store
+            .conditional_root(root)
+            .unwrap()
+            .instantiations()
+            .clone()
+        else {
+            unreachable!();
+        };
+        cache.insert(key, forwarded);
+        assert!(
+            fixture
+                .store
+                .set_conditional_root_instantiations(root, TypeCacheState::Allocated(cache))
+        );
+        let before = conditional_allocation_counts(&fixture.store);
+        assert!(conditional_alias_projection(&fixture.store, forwarded).is_err());
+        assert!(fixture.try_declared_alias("Forward").is_err());
+        assert_eq!(conditional_allocation_counts(&fixture.store), before);
+    }
+
+    #[test]
+    fn conditional_alias_instantiations_map_default_arguments_and_keep_warm_identity() {
         let mut fixture = Fixture::new(concat!(
             "type Select<T> = T extends string ? number : boolean; ",
             "type Other<U> = U;",
@@ -5743,41 +6491,10 @@ mod tests {
                 type_arguments: &arguments,
             })),
         );
-        let other = ConditionalAliasIdentity {
-            symbol: fixture.alias_symbol("Other"),
-            type_arguments: &arguments,
-        };
-        let overridden = get_conditional_type_instantiation(
-            &mut fixture.store,
-            ConditionalTypeInstantiation {
-                alias: Some(other),
-                ..request
-            },
-            None,
-            None,
-        )
-        .unwrap();
-        assert_ne!(mapped, overridden);
-        assert_eq!(
-            conditional_alias_projection(&fixture.store, overridden),
-            Ok(Some(other))
-        );
         let warm = conditional_allocation_counts(&fixture.store);
         assert_eq!(
             get_conditional_type_instantiation(&mut fixture.store, request, None, None),
             Ok(mapped)
-        );
-        assert_eq!(
-            get_conditional_type_instantiation(
-                &mut fixture.store,
-                ConditionalTypeInstantiation {
-                    alias: Some(other),
-                    ..request
-                },
-                None,
-                None,
-            ),
-            Ok(overridden)
         );
         assert_eq!(conditional_allocation_counts(&fixture.store), warm);
     }
@@ -5870,25 +6587,18 @@ mod tests {
 
         let declared = fixture.declared_alias("Select");
         let foreign_argument = foreign.store.intrinsic_bootstrap().unwrap().number_type;
-        for alias in [
-            ConditionalAliasIdentity {
-                symbol: wrong_owner,
-                type_arguments: &[foreign_argument],
-            },
-            ConditionalAliasIdentity {
-                symbol: foreign.alias_symbol("Foreign"),
-                type_arguments: &[],
-            },
-        ] {
+        for (conditional_type, argument) in
+            [(declared, foreign_argument), (foreign_argument, parameter)]
+        {
             let before = conditional_allocation_counts(&fixture.store);
             assert!(
                 get_conditional_type_instantiation(
                     &mut fixture.store,
                     ConditionalTypeInstantiation {
-                        conditional_type: declared,
-                        type_arguments: &[parameter],
+                        conditional_type,
+                        type_arguments: &[argument],
                         branches: branches(number, boolean),
-                        alias: Some(alias),
+                        alias: None,
                         for_constraint: false,
                     },
                     None,
