@@ -2324,13 +2324,6 @@ impl Program {
         {
             self.diagnostics.push(emit_declaration_only_diagnostic());
         }
-        if self
-            .source_files
-            .iter()
-            .any(|source| has_no_default_lib_directive(&source.source_text))
-        {
-            self.options.no_lib = true;
-        }
         let resolution_options = self.options.module_resolution_options();
         if !self.options.no_check && !self.root_file_names.is_empty() {
             self.load_default_libraries();
@@ -5963,6 +5956,7 @@ impl Program {
                     });
                 }
                 ReferenceKind::Types if self.options.no_resolve => {}
+                ReferenceKind::Lib if self.options.no_lib => {}
                 ReferenceKind::Path => {
                     let unresolved_file_name = resolve_path(
                         &directory_path(&containing_file),
@@ -6321,20 +6315,6 @@ fn has_preserved_reference_directive(source: &str) -> bool {
             && trimmed.contains("<reference")
             && (trimmed.contains("preserve=\"true\"") || trimmed.contains("preserve='true'"))
     })
-}
-
-fn has_no_default_lib_directive(source: &str) -> bool {
-    source.lines().any(|line| {
-        line.trim_start()
-            .strip_prefix("///")
-            .and_then(|line| line.trim_start().strip_prefix("<reference"))
-            .and_then(|reference| reference_attribute(reference, "no-default-lib"))
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-    })
-}
-
-fn reference_attribute(reference: &str, name: &str) -> Option<String> {
-    reference_attribute_value(reference, name).map(|(value, _)| value.to_owned())
 }
 
 fn reference_attribute_value<'source>(
@@ -14028,7 +14008,7 @@ mod tests {
             "/project",
             &["main.ts".to_owned()],
             CompilerOptions {
-                no_lib: true,
+                lib: Some(Vec::new()),
                 no_resolve: true,
                 ..CompilerOptions::default()
             },
@@ -14082,7 +14062,7 @@ mod tests {
             "/project",
             &["main.ts".to_owned()],
             CompilerOptions {
-                no_lib: true,
+                lib: Some(Vec::new()),
                 ..CompilerOptions::default()
             },
         );
@@ -14112,12 +14092,16 @@ mod tests {
             &["no-default.ts".to_owned()],
             CompilerOptions::default(),
         );
-        assert!(no_default.options().no_lib);
+        assert!(!no_default.options().no_lib);
         assert!(
             no_default
-                .diagnostics()
-                .iter()
-                .any(|diagnostic| diagnostic.code == Some(2304))
+                .source_file("/__typescript/lib/lib.d.ts")
+                .is_some()
+        );
+        assert!(
+            no_default.diagnostics().is_empty(),
+            "{:?}",
+            no_default.diagnostics()
         );
     }
 
