@@ -10143,7 +10143,7 @@ fn recursive_namespace_class_state(
     namespace: SemanticSymbolId,
     class: &SourceNamespaceRecursiveClassPlan,
 ) -> Option<RecursiveNamespaceClassCacheState> {
-    plan_module_value(store, host, namespace).ok()?;
+    let namespace_plan = plan_module_value(store, host, namespace).ok()?;
     let exact_value = |symbol| {
         let Some(links) = store.value_symbol_links(symbol) else {
             return Some(None);
@@ -10194,7 +10194,11 @@ fn recursive_namespace_class_state(
                 return None;
             }
             return match store.module_value_identity(namespace) {
-                None if namespace_type.is_none() => Some(RecursiveNamespaceClassCacheState::Cold),
+                None if namespace_type.is_none()
+                    && module_value_node_caches_match(store, host, &namespace_plan, None) =>
+                {
+                    Some(RecursiveNamespaceClassCacheState::Cold)
+                }
                 Some(identity)
                     if namespace_type.is_none_or(|type_| type_ == identity.type_)
                         && store.type_payload(identity.type_).is_some_and(|record| {
@@ -14618,6 +14622,130 @@ mod tests {
                 );
             }
             assert!(fixture.context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn recursive_exported_namespace_classes_reject_cold_namespace_node_caches_before_allocation() {
+        for poison_name in [false, true] {
+            let mut fixture = fixture(
+                "namespace M { export class C {} export namespace C { export var C = M.C; } }",
+                CanonicalModuleState::Script,
+            );
+            let namespace = plan(&fixture, 0);
+            let class = namespace.recursive_class.as_ref().unwrap().clone();
+            let node = if poison_name {
+                namespace.name
+            } else {
+                namespace.declaration
+            };
+            let poisoned = TypeNodeLinks {
+                resolved_type: Some(
+                    fixture
+                        .context
+                        .store()
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .any_type,
+                ),
+                ..TypeNodeLinks::default()
+            };
+            assert!(
+                fixture
+                    .context
+                    .store_mut_for_test()
+                    .set_type_node_links(node, poisoned.clone())
+            );
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+                fixture.context.diagnostics().len(),
+            );
+            for _ in 0..2 {
+                assert_eq!(recursive_state(&fixture, namespace.symbol, &class), None);
+                assert!(fixture.context.check_source_file(fixture.file).is_err());
+                assert_eq!(
+                    (
+                        fixture.context.store().type_len(),
+                        fixture.context.store().symbol_len(),
+                        fixture.context.store().signature_len(),
+                        fixture.context.store().checker_link_allocated_lengths(),
+                        fixture.context.diagnostics().len(),
+                    ),
+                    before
+                );
+                assert_eq!(
+                    fixture.context.store().type_node_links(node),
+                    Some(&poisoned)
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .declared_type_links(class.class_symbol)
+                        .is_none()
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .module_value_identity(namespace.symbol)
+                        .is_none()
+                );
+                for symbol in [
+                    namespace.symbol,
+                    class.class_symbol,
+                    class.class_local,
+                    class.variable_symbol,
+                ] {
+                    assert!(fixture.context.store().value_symbol_links(symbol).is_none());
+                }
+            }
+            assert!(
+                fixture
+                    .context
+                    .store_mut_for_test()
+                    .set_type_node_links(node, TypeNodeLinks::default())
+            );
+            assert_eq!(
+                recursive_state(&fixture, namespace.symbol, &class),
+                Some(RecursiveNamespaceClassCacheState::Cold)
+            );
+            fixture.context.check_source_file(fixture.file).unwrap();
+            let Some(RecursiveNamespaceClassCacheState::Warm(state)) =
+                recursive_state(&fixture, namespace.symbol, &class)
+            else {
+                panic!("clearing the poisoned node must permit a cold retry")
+            };
+            assert_eq!(
+                fixture
+                    .context
+                    .get_type_of_module_value(namespace.symbol)
+                    .unwrap(),
+                state.namespace_type
+            );
+            let warm = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            fixture.context.recheck_source_file(fixture.file).unwrap();
+            assert_eq!(
+                recursive_state(&fixture, namespace.symbol, &class),
+                Some(RecursiveNamespaceClassCacheState::Warm(state))
+            );
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().signature_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                ),
+                warm
+            );
         }
     }
 
