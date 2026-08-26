@@ -92,8 +92,8 @@ use super::{
     CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DerivedTypeError,
     ProductionAliasTargetHost, RelationUnavailable, SignatureId, SourceFileLinks, SourceFileRef,
-    SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks,
-    VariableInvariant, VariableUnsupported,
+    SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks, TypeResolutionTarget,
+    TypeSystemPropertyName, ValueSymbolLinks, VariableInvariant, VariableUnsupported,
     alias::CanonicalAliasResolver,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
@@ -280,9 +280,8 @@ use super::{
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_nodes::{
         CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, TypeNodeUnavailable,
-        authenticated_pending_recursive_arrow_display,
-        authenticated_recovered_recursive_arrow_return, normalize_bigint_literal,
-        normalize_numeric_separators,
+        authenticated_active_recursive_arrow_query, authenticated_recovered_recursive_arrow_return,
+        normalize_bigint_literal, normalize_numeric_separators,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -29562,6 +29561,65 @@ fn conditional_assignment_detail(
     Ok(None)
 }
 
+/// Relates a checked source to the active zero-parameter arrow without demanding its return.
+fn non_circular_recursive_arrow_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    source: TypeId,
+    target: TypeId,
+) -> Result<Option<bool>, SourceCheckError> {
+    if source == target {
+        return Ok(Some(true));
+    }
+    let flags = store
+        .type_payload(source)
+        .map(TypeRecord::flags)
+        .ok_or(RelationUnavailable::Type(source))?;
+    if flags
+        .intersects(TypeFlags::ANY | TypeFlags::NEVER | TypeFlags::PRIMITIVE | TypeFlags::UNKNOWN)
+    {
+        store.validate_union_constituent_with_global_types(global_types, source)?;
+        return Ok(Some(
+            flags.intersects(TypeFlags::ANY | TypeFlags::NEVER)
+                || !options.intrinsic.strict_null_checks
+                    && flags.intersects(TypeFlags::NULL | TypeFlags::UNDEFINED),
+        ));
+    }
+    let StoredSingleCallableValidation::Valid { callable, .. } =
+        validate_stored_single_callable(store, source)
+    else {
+        return Ok(None);
+    };
+    if store
+        .signature(callable.signature)
+        .is_some_and(|signature| signature.flags().contains(SignatureFlags::CONSTRUCT))
+    {
+        return Ok(Some(false));
+    }
+    if callable.min_argument_count == 0 {
+        return Ok(Some(true));
+    }
+    let resolution = super::calls::resolve_direct_call(
+        store,
+        global_types,
+        options.strict_function_types,
+        super::calls::DirectCallRequest {
+            form: super::calls::DirectCallForm::Call,
+            optional_chain: false,
+            type_argument_count: 0,
+            has_spread_argument: false,
+            callee: source,
+            arguments: &[],
+        },
+    )
+    .map_err(|_| RelationUnavailable::StructuredSignatures(source))?;
+    Ok(Some(matches!(
+        resolution.applicability,
+        super::calls::DirectCallApplicability::Applicable
+    )))
+}
+
 #[allow(clippy::too_many_arguments)] // Reuses the caller's checker state and instantiation session.
 fn source_type_is_assignable_to(
     store: &mut CanonicalTypeMapperStore,
@@ -29573,6 +29631,44 @@ fn source_type_is_assignable_to(
     source: TypeId,
     target: TypeId,
 ) -> Result<bool, SourceCheckError> {
+    if authenticated_active_recursive_arrow_query(store, host, target) {
+        store
+            .claim_strict_function_types(options.strict_function_types)
+            .map_err(
+                |established| RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                    established,
+                    requested: options.strict_function_types,
+                },
+            )?;
+        let assignable =
+            non_circular_recursive_arrow_assignment(store, global_types, options, source, target)?
+                .ok_or(RelationUnavailable::UnresolvedFunctionType(target))?;
+        if !assignable {
+            let signature = store
+                .source_callable_provenance(target)
+                .map(|provenance| provenance.signature)
+                .ok_or(RelationUnavailable::UnresolvedFunctionType(target))?;
+            if store
+                .signature(signature)
+                .is_some_and(|signature| signature.resolved_return_type().is_none())
+            {
+                // Formatting the failed assignment requires the active return.
+                let mut resolution_diagnostics = CanonicalCheckerDiagnostics::default();
+                let resolved = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut resolution_diagnostics,
+                )?
+                .get_return_type_of_signature(signature);
+                merge_retry_diagnostics(diagnostics, resolution_diagnostics);
+                resolved?;
+            }
+        }
+        return Ok(assignable);
+    }
     let mut resolved_signatures = HashSet::new();
     let mut resolved_members = HashSet::new();
     let mut resolved_properties = HashSet::new();
@@ -29584,39 +29680,9 @@ fn source_type_is_assignable_to(
             options.strict_function_types,
         ) {
             Ok(assignable) => return Ok(assignable),
-            Err(
-                error @ (RelationUnavailable::UnresolvedSignatureReturn(_)
-                | RelationUnavailable::UnresolvedFunctionType(_)),
-            ) => {
-                let signature = match error {
-                    RelationUnavailable::UnresolvedSignatureReturn(signature) => signature,
-                    RelationUnavailable::UnresolvedFunctionType(type_)
-                        if authenticated_pending_recursive_arrow_display(store, host, type_) =>
-                    {
-                        // Simple assignments do not read the pending return type.
-                        if type_ == target
-                            && store.intrinsic_bootstrap().is_some_and(|bootstrap| {
-                                source == bootstrap.any_type
-                                    || source == bootstrap.error_type
-                                    || source == bootstrap.never_type
-                                    || !options.strict_null_checks
-                                        && (source == bootstrap.null_type
-                                            || source == bootstrap.undefined_type
-                                            || source == bootstrap.null_widening_type
-                                            || source == bootstrap.undefined_widening_type)
-                            })
-                        {
-                            return Ok(true);
-                        }
-                        store
-                            .source_callable_provenance(type_)
-                            .map(|provenance| provenance.signature)
-                            .ok_or(error)?
-                    }
-                    _ => return Err(error.into()),
-                };
+            Err(RelationUnavailable::UnresolvedSignatureReturn(signature)) => {
                 if !resolved_signatures.insert(signature) {
-                    return Err(error.into());
+                    return Err(RelationUnavailable::UnresolvedSignatureReturn(signature).into());
                 }
                 let mut resolution_diagnostics = CanonicalCheckerDiagnostics::default();
                 let resolved = CanonicalTypeQuery::new_with_global_types_and_session(
@@ -36202,42 +36268,62 @@ fn publish_checked_source_callable_return(
     signature: SignatureId,
     expression: Option<&PlannedExpression>,
 ) -> Result<TypeId, SourceCheckError> {
-    let inferred = match expression {
-        Some(expression) => {
-            let checked = check_expression_type(
-                store,
-                host,
-                global_types,
-                source,
-                options,
-                session,
-                diagnostics,
-                flow_types,
-                preflighted_type_import_value_uses,
-                expression,
-                None,
-                deferred,
-            )?;
-            let widened_literal = widened_fresh_literal_type(store, checked.result)?;
-            store.get_widened_type_with_global_types(widened_literal, global_types)?
-        }
-        None => {
-            store
-                .intrinsic_bootstrap()
-                .ok_or(DerivedTypeError::BootstrapUninitialized)?
-                .void_type
-        }
-    };
-    let inferred = source_callable_inferred_return_type(
-        store,
-        host,
-        global_types,
-        options,
-        session,
-        diagnostics,
-        callable,
-        inferred,
-    )?;
+    let _ = super::source_callables::validate_inferred_source_callable_return(
+        store, callable, signature,
+    )
+    .map_err(SourcePlanner::callable_plan_error)?;
+    if !store
+        .push_type_resolution(
+            TypeResolutionTarget::Signature(signature),
+            TypeSystemPropertyName::ResolvedReturnType,
+        )
+        .map_err(DeclaredTypeError::from)?
+    {
+        return Err(SourceCheckError::Arrow(callable.declaration));
+    }
+    let inferred = (|| {
+        let inferred = match expression {
+            Some(expression) => {
+                let checked = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    flow_types,
+                    preflighted_type_import_value_uses,
+                    expression,
+                    None,
+                    deferred,
+                )?;
+                let widened_literal = widened_fresh_literal_type(store, checked.result)?;
+                store.get_widened_type_with_global_types(widened_literal, global_types)?
+            }
+            None => {
+                store
+                    .intrinsic_bootstrap()
+                    .ok_or(DerivedTypeError::BootstrapUninitialized)?
+                    .void_type
+            }
+        };
+        let inferred = source_callable_inferred_return_type(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            callable,
+            inferred,
+        )?;
+        Ok::<_, SourceCheckError>(inferred)
+    })();
+    let cycle_free = store
+        .pop_type_resolution()
+        .ok_or(SourceCheckError::Arrow(callable.declaration))?;
+    let inferred = inferred?;
     if let Some(type_) = store.source_callable_type_for_signature(signature)
         && authenticated_recovered_recursive_arrow_return(store, host, type_, signature)
     {
@@ -36245,6 +36331,9 @@ fn publish_checked_source_callable_return(
             .signature(signature)
             .and_then(super::signatures::Signature::resolved_return_type)
             .ok_or(SourceCheckError::Arrow(callable.declaration));
+    }
+    if !cycle_free {
+        return Err(SourceCheckError::Arrow(callable.declaration));
     }
     publish_inferred_source_callable_return(store, callable, signature, inferred)
         .map_err(SourcePlanner::callable_plan_error)
@@ -68219,7 +68308,7 @@ mod tests {
                 Some(any),
             );
             assert!(
-                !context
+                context
                     .store()
                     .signature_has_circular_return_type(signature)
             );
@@ -68313,41 +68402,233 @@ mod tests {
 
     #[test]
     fn recursive_arrow_satisfies_does_not_force_returns_for_simple_assignments() {
-        for (index, (operand, strict_null_checks, expected_return)) in [
-            ("(42 as any)", true, "any"),
-            ("(42 as never)", true, "never"),
-            ("null", false, "any"),
-            ("undefined", false, "any"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let source = parsed(&format!(
-                "const value = () => {operand} satisfies typeof value;"
-            ));
-            let file = FileId::new(9_781 + u32::try_from(index).unwrap());
-            let mut context = context(
-                &[(file, &source)],
-                CanonicalCheckerOptions {
-                    no_implicit_any: true,
-                    strict_null_checks,
-                    ..CanonicalCheckerOptions::default()
-                },
-            );
+        let library = parsed("interface Array<T> {}");
+        let library_file = FileId::new(9_780);
+        for no_implicit_any in [false, true] {
+            for (index, (operand, strict_null_checks, expected_return)) in [
+                ("(42 as any)", true, "any"),
+                ("(42 as never)", true, "never"),
+                ("[][0]", true, "never"),
+                ("g", true, "() => number"),
+                ("null", false, "any"),
+                ("undefined", false, "any"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let source = parsed(&format!(
+                    "const g = () => 1; const value = () => {operand} satisfies typeof value;"
+                ));
+                let file = FileId::new(9_781 + u32::try_from(index).unwrap());
+                let mut context = context(
+                    &[(library_file, &library), (file, &source)],
+                    CanonicalCheckerOptions {
+                        no_implicit_any,
+                        no_unchecked_indexed_access: false,
+                        intrinsic: IntrinsicBootstrapOptions {
+                            strict_null_checks,
+                            ..IntrinsicBootstrapOptions::default()
+                        },
+                        ..CanonicalCheckerOptions::default()
+                    },
+                );
 
+                context.check_source_file(file).unwrap();
+
+                let callable = variable_value_type(&context, &source, file, "value");
+                let signature = context
+                    .store()
+                    .source_callable_provenance(callable)
+                    .unwrap()
+                    .signature;
+                assert_eq!(
+                    context.type_to_string(callable).unwrap(),
+                    format!("() => {expected_return}"),
+                    "operand: {operand}, noImplicitAny: {no_implicit_any}",
+                );
+                assert!(context.diagnostics().is_empty(), "operand: {operand}");
+                assert!(
+                    context
+                        .store()
+                        .inferred_source_return_cycle(signature)
+                        .is_none()
+                );
+
+                let warm = observable_state(&context, file);
+                mark_source_unchecked(&mut context, file);
+                context.check_source_file(file).unwrap();
+                assert_eq!(observable_state(&context, file), warm, "operand: {operand}");
+                assert_eq!(
+                    context.type_to_string(callable).unwrap(),
+                    format!("() => {expected_return}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_arrow_replay_rejects_any_without_return_cycle_provenance() {
+        for no_implicit_any in [false, true] {
+            for operand in ["(42 as never)", "g"] {
+                let source = parsed(&format!(
+                    "const g = () => 1; const value = () => {operand} satisfies typeof value;"
+                ));
+                let file = FileId::new(9_790);
+                let mut context = context(
+                    &[(file, &source)],
+                    CanonicalCheckerOptions {
+                        no_implicit_any,
+                        intrinsic: IntrinsicBootstrapOptions {
+                            strict_null_checks: true,
+                            ..IntrinsicBootstrapOptions::default()
+                        },
+                        ..CanonicalCheckerOptions::default()
+                    },
+                );
+                context.check_source_file(file).unwrap();
+                let callable = variable_value_type(&context, &source, file, "value");
+                let signature = context
+                    .store()
+                    .source_callable_provenance(callable)
+                    .unwrap()
+                    .signature;
+                let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_resolved_return_type(signature, Some(any))
+                );
+                assert!(
+                    context
+                        .store()
+                        .inferred_source_return_cycle(signature)
+                        .is_none()
+                );
+                mark_source_unchecked(&mut context, file);
+
+                assert!(
+                    context.check_source_file(file).is_err(),
+                    "operand: {operand}"
+                );
+                assert!(!is_type_checked(&context, file));
+                assert!(context.diagnostics().is_empty());
+                assert_eq!(
+                    context
+                        .store()
+                        .signature(signature)
+                        .unwrap()
+                        .resolved_return_type(),
+                    Some(any)
+                );
+                assert!(
+                    context
+                        .store()
+                        .inferred_source_return_cycle(signature)
+                        .is_none()
+                );
+                assert!(context.store().type_resolution_is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_arrow_recovery_is_cleared_when_source_links_change() {
+        for poison in [
+            "signature",
+            "query",
+            "query-name",
+            "body",
+            "arrow",
+            "value",
+            "owner",
+        ] {
+            let source = parsed("const value = () => 42 satisfies typeof value;");
+            let file = FileId::new(9_791);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
             context.check_source_file(file).unwrap();
-
             let callable = variable_value_type(&context, &source, file, "value");
-            assert_eq!(
-                context.type_to_string(callable).unwrap(),
-                format!("() => {expected_return}"),
-                "operand: {operand}",
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let cycle = context
+                .store()
+                .inferred_source_return_cycle(signature)
+                .unwrap();
+            let query_links = context
+                .store()
+                .type_node_links(cycle.query)
+                .cloned()
+                .unwrap();
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(cycle.query, query_links)
             );
-            assert!(context.diagnostics().is_empty(), "operand: {operand}");
-
-            let warm = observable_state(&context, file);
-            context.recheck_source_file(file).unwrap();
-            assert_eq!(observable_state(&context, file), warm, "operand: {operand}");
+            assert_eq!(
+                context.store().inferred_source_return_cycle(signature),
+                Some(cycle)
+            );
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let any = bootstrap.any_type;
+            let wrong = bootstrap.string_type;
+            match poison {
+                "signature" => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_resolved_return_type(signature, Some(any))
+                ),
+                "query" | "body" | "arrow" => {
+                    let node = match poison {
+                        "query" => cycle.query,
+                        "body" => cycle.body,
+                        "arrow" => cycle.declaration,
+                        _ => unreachable!(),
+                    };
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        node,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                }
+                "query-name" => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(cycle.query_name, SymbolNodeLinks::default())
+                ),
+                "value" => assert!(context.store_mut_for_test().set_value_symbol_links(
+                    cycle.variable,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    }
+                )),
+                "owner" => assert!(context.store_mut_for_test().set_symbol_flags(
+                    cycle.variable,
+                    SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                    CheckFlags::READONLY
+                )),
+                _ => unreachable!(),
+            }
+            assert!(
+                context
+                    .store()
+                    .inferred_source_return_cycle(signature)
+                    .is_none(),
+                "poison: {poison}"
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                (poison == "signature").then_some(any),
+                "poison: {poison}",
+            );
         }
     }
 

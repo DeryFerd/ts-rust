@@ -80,7 +80,7 @@ use super::{
     },
     source_namespaces::authenticated_merged_namespace_interface,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
-    store::SourceNodeParent,
+    store::{SourceCallableInferredReturnCycle, SourceNodeParent},
     structured_members,
     template_types::{StringMappingKind, TemplateTypeError},
     tuple_type_nodes::{self, TupleTypeNodeError, TupleTypeNodePlan, validate_warm_tuple_elements},
@@ -1640,7 +1640,24 @@ fn cached_alias_parameter_symbols(
     .map(Some)
 }
 
-/// Authenticates the bounded display fallback for a cached recursive arrow query.
+/// Checks the query used by an arrow whose return is currently being inferred or replayed.
+pub(super) fn authenticated_active_recursive_arrow_query(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+) -> bool {
+    store
+        .source_callable_provenance(type_)
+        .is_some_and(|provenance| store.is_signature_return_inference_active(provenance.signature))
+        && matches!(
+            source_callables::validate_stored_source_callable(store, type_),
+            source_callables::StoredSourceCallableValidation::Pending
+                | source_callables::StoredSourceCallableValidation::Valid(_)
+        )
+        && authenticated_recursive_arrow_name(store, host, type_).is_some()
+}
+
+/// Authenticates the display fallback while a recursive arrow return is pending.
 pub(super) fn authenticated_pending_recursive_arrow_display(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1648,6 +1665,9 @@ pub(super) fn authenticated_pending_recursive_arrow_display(
 ) -> bool {
     source_callables::validate_stored_source_callable(store, type_)
         == source_callables::StoredSourceCallableValidation::Pending
+        && store
+            .source_callable_provenance(type_)
+            .is_some_and(|provenance| store.is_signature_return_resolving(provenance.signature))
         && authenticated_recursive_arrow_name(store, host, type_).is_some()
 }
 
@@ -1658,19 +1678,50 @@ pub(super) fn authenticated_recovered_recursive_arrow_return(
     type_: TypeId,
     signature: SignatureId,
 ) -> bool {
-    store.intrinsic_bootstrap().is_some_and(|bootstrap| {
-        store
-            .signature(signature)
-            .and_then(Signature::resolved_return_type)
-            == Some(bootstrap.any_type)
-    }) && store
-        .source_callable_provenance(type_)
-        .is_some_and(|provenance| provenance.signature == signature)
+    source_callables::validate_stored_inferred_return_cycle(store, signature)
+        .is_some_and(|cycle| cycle.callable == type_)
+        && store
+            .source_callable_provenance(type_)
+            .is_some_and(|provenance| provenance.signature == signature)
         && matches!(
             source_callables::validate_stored_source_callable(store, type_),
             source_callables::StoredSourceCallableValidation::Valid(_)
         )
         && authenticated_recursive_arrow_name(store, host, type_).is_some()
+}
+
+fn authenticated_recursive_arrow_cycle(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+) -> Option<SourceCallableInferredReturnCycle> {
+    authenticated_recursive_arrow_name(store, host, type_)?;
+    let provenance = store.source_callable_provenance(type_)?;
+    let NodeData::ArrowFunction(arrow) = &host.node(provenance.declaration)?.data else {
+        return None;
+    };
+    let body = NodeRef::new(
+        provenance.declaration.arena,
+        provenance.declaration.file,
+        arrow.body,
+    );
+    let NodeData::SatisfiesExpression(satisfaction) = &host.node(body)?.data else {
+        return None;
+    };
+    let query = NodeRef::new(body.arena, body.file, satisfaction.type_);
+    let NodeData::TypeQueryNode(query_data) = &host.node(query)?.data else {
+        return None;
+    };
+    let query_name = NodeRef::new(query.arena, query.file, query_data.expr_name);
+    Some(SourceCallableInferredReturnCycle {
+        callable: type_,
+        declaration: provenance.declaration,
+        body,
+        body_type: store.type_node_links(body)?.resolved_type?,
+        query,
+        query_name,
+        variable: store.symbol_node_links(query_name)?.resolved_symbol?,
+    })
 }
 
 fn authenticated_recursive_arrow_name(
@@ -19744,15 +19795,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             else {
                 return Err(invalid());
             };
-            let any = self
-                .store
-                .intrinsic_bootstrap()
-                .map(|bootstrap| bootstrap.any_type)
-                .ok_or(DeclaredTypeError::Unavailable(
-                    DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
-                ))?;
-            let return_type = source_callables::publish_inferred_source_callable_return(
-                self.store, &callable, signature, any,
+            let cycle = authenticated_recursive_arrow_cycle(self.store, self.host, type_)
+                .ok_or_else(&invalid)?;
+            let return_type = source_callables::publish_circular_inferred_source_callable_return(
+                self.store, &callable, signature, cycle,
             )
             .map_err(|error| source_callable_signature_error(error, callable.family, signature))?;
             if self.options.no_implicit_any {
@@ -43177,8 +43223,19 @@ mod tests {
                 .resolved_return_type()
                 .is_none()
         );
-        let display_state = store_state(&fixture.store);
-        {
+        for active in [false, true] {
+            if active {
+                assert!(
+                    fixture
+                        .store
+                        .push_type_resolution(
+                            TypeResolutionTarget::Signature(signature),
+                            TypeSystemPropertyName::ResolvedReturnType,
+                        )
+                        .unwrap()
+                );
+            }
+            let display_state = store_state(&fixture.store);
             let host = post_global_host(
                 &fixture.parsed.arena,
                 fixture.files.get(&fixture.file).unwrap(),
@@ -43190,10 +43247,17 @@ mod tests {
                     expected,
                     CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
                 ),
-                Ok("() => any".to_owned()),
+                if active {
+                    Ok("() => any".to_owned())
+                } else {
+                    Err(TypeDisplayUnavailable::FunctionType {
+                        type_id: expected,
+                        reason: FunctionTypeDisplayUnavailable::PendingSignature,
+                    })
+                },
             );
+            assert_eq!(store_state(&fixture.store), display_state);
         }
-        assert_eq!(store_state(&fixture.store), display_state);
 
         let warm = store_state(&fixture.store);
         assert_eq!(
@@ -43237,6 +43301,7 @@ mod tests {
             );
         }
         assert_eq!(store_state(&fixture.store), poisoned);
+        assert_eq!(fixture.store.pop_type_resolution(), Some(true));
         assert!(diagnostics.is_empty());
     }
 
@@ -43284,6 +43349,25 @@ mod tests {
                 query_node(&mut fixture, query, &mut diagnostics),
                 Ok(callable)
             );
+            let body = NodeRef::new(
+                query.arena,
+                query.file,
+                fixture
+                    .parsed
+                    .arena
+                    .get(query.node)
+                    .unwrap()
+                    .parent
+                    .unwrap(),
+            );
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            assert!(fixture.store.set_type_node_links(
+                body,
+                TypeNodeLinks {
+                    resolved_type: Some(number),
+                    ..TypeNodeLinks::default()
+                }
+            ));
             let options = CanonicalTypeQueryOptions {
                 no_implicit_any,
                 ..CanonicalTypeQueryOptions::default()
@@ -43291,6 +43375,31 @@ mod tests {
             let host = post_global_host(
                 &fixture.parsed.arena,
                 fixture.files.get(&fixture.file).unwrap(),
+            );
+            let staged = store_state(&fixture.store);
+            assert_eq!(
+                CanonicalTypeQuery::new(&mut fixture.store, &host, options, &mut diagnostics)
+                    .unwrap()
+                    .get_return_type_of_signature(signature),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                )),
+            );
+            assert_eq!(store_state(&fixture.store), staged);
+            assert!(
+                fixture
+                    .store
+                    .inferred_source_return_cycle(signature)
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .store
+                    .push_type_resolution(
+                        TypeResolutionTarget::Signature(signature),
+                        TypeSystemPropertyName::ResolvedReturnType,
+                    )
+                    .unwrap()
             );
             let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
             assert_eq!(
@@ -43311,7 +43420,12 @@ mod tests {
                 validate_stored_source_callable(&fixture.store, callable),
                 StoredSourceCallableValidation::Valid(_),
             ));
-            assert!(!fixture.store.signature_has_circular_return_type(signature));
+            assert!(fixture.store.signature_has_circular_return_type(signature));
+            assert!(
+                source_callables::validate_stored_inferred_return_cycle(&fixture.store, signature,)
+                    .is_some()
+            );
+            assert_eq!(fixture.store.pop_type_resolution(), Some(false));
             let variable = fixture
                 .store
                 .get_merged_symbol(node_symbol(&fixture, declaration))
@@ -43380,6 +43494,33 @@ mod tests {
                 Ok(callable)
             );
             let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            let body = NodeRef::new(
+                query.arena,
+                query.file,
+                fixture
+                    .parsed
+                    .arena
+                    .get(query.node)
+                    .unwrap()
+                    .parent
+                    .unwrap(),
+            );
+            assert!(fixture.store.set_type_node_links(
+                body,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            assert!(
+                fixture
+                    .store
+                    .push_type_resolution(
+                        TypeResolutionTarget::Signature(signature),
+                        TypeSystemPropertyName::ResolvedReturnType,
+                    )
+                    .unwrap()
+            );
             match poison {
                 "query" => assert!(fixture.store.set_type_node_links(
                     query,
@@ -43460,6 +43601,7 @@ mod tests {
                 "poison: {poison}",
             );
             assert!(diagnostics.is_empty(), "poison: {poison}");
+            assert_eq!(fixture.store.pop_type_resolution(), Some(true));
         }
 
         let mut unrelated = fixture("const value = () => 42;");
@@ -43519,6 +43661,34 @@ mod tests {
             },
         ));
 
+        let body = NodeRef::new(
+            query.arena,
+            query.file,
+            fixture
+                .parsed
+                .arena
+                .get(query.node)
+                .unwrap()
+                .parent
+                .unwrap(),
+        );
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_type_node_links(
+            body,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        assert!(
+            fixture
+                .store
+                .push_type_resolution(
+                    TypeResolutionTarget::Signature(signature),
+                    TypeSystemPropertyName::ResolvedReturnType,
+                )
+                .unwrap()
+        );
         let before = store_state(&fixture.store);
         let host = post_global_host(
             &fixture.parsed.arena,
@@ -43543,6 +43713,7 @@ mod tests {
             )),
         );
         assert_eq!(store_state(&fixture.store), before);
+        assert_eq!(fixture.store.pop_type_resolution(), Some(true));
         assert!(diagnostics.is_empty());
     }
 
