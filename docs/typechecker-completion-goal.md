@@ -134,6 +134,21 @@ and base/local join identity restoration.
 
 ### Execution checkpoint: 2026-08-26
 
+Code checkpoint `c440602d` passes all 6,001 workspace tests and strict Clippy
+for all targets. The semantic smoke report has 37 exact results in 95 executed
+variants, five more than wave 125. The diagnostics-only milestone has 397
+exact results in 511 executed variants, two more than wave 125. Neither report
+lost an exact match or produced a fatal invariant.
+
+Semantic smoke still has 50 unsupported variants and eight artifact
+mismatches. Two previously blocked queries now expose existing display gaps.
+Full upstream semantic parity and the modern-project rings remain incomplete.
+
+See [`typechecker-wave126-status.md`](typechecker-wave126-status.md) for the
+verified code, evidence, separate branches, and build rules.
+
+### Earlier wave 125 checkpoint: 2026-08-26
+
 Code checkpoint `5e2f9e37` passes the full repository verification script.
 The semantic smoke report has 32 exact results in 95 executed variants, eight
 more than the previous batch, with no exact losses or fatal invariants. The
