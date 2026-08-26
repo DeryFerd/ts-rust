@@ -5407,7 +5407,7 @@ mod tests {
                     context
                         .store()
                         .type_payload(*type_)
-                        .and_then(|record| record.symbol())
+                        .and_then(super::super::type_records::TypeRecord::symbol)
                         .and_then(|symbol| context.store().symbol(symbol))
                         .and_then(|symbol| symbol.name().as_utf8())
                 })
