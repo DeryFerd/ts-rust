@@ -35593,7 +35593,7 @@ pub(super) fn source_iterator_key(
             Ok(key) => return Ok(key),
             Err(KnownSymbolKeyError::NeedsValueType {
                 symbol,
-                annotation: Some(annotation),
+                annotation: Some(_),
             }) => {
                 if !demanded.insert(symbol) {
                     return Err(SourceCheckError::Unsupported(
@@ -35608,8 +35608,8 @@ pub(super) fn source_iterator_key(
                     session,
                     diagnostics,
                 )?;
-                query.preflight_type_from_type_node(annotation)?;
-                query.get_type_from_type_node(annotation)?;
+                query.preflight_type_of_declared_value(symbol)?;
+                query.get_type_of_declared_value(symbol)?;
             }
             Err(KnownSymbolKeyError::NeedsValueType {
                 annotation: None, ..

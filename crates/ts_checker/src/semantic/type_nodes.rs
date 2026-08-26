@@ -37,6 +37,7 @@ use super::{
         malformed_alias_merge, preflight_class_or_interface_reference, preflight_node,
         preflight_type_parameter_symbol, type_list_key,
     },
+    declared_values::{plan_declared_value, publish_declared_value},
     enums::{self, CanonicalEnumSemantics},
     formatter::{
         get_type_names_for_assignability_error_with_host_and_flags,
@@ -1961,6 +1962,7 @@ struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     active_tuple_aliases: Vec<SemanticSymbolId>,
     function_indirection_depth: usize,
     intersection_planning_depth: usize,
+    lazy_interface_values: bool,
 }
 
 impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
@@ -1989,6 +1991,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             active_tuple_aliases: Vec::new(),
             function_indirection_depth: 0,
             intersection_planning_depth: 0,
+            lazy_interface_values: false,
         }
     }
 
@@ -10732,6 +10735,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
 
         if !union_constituent
+            && !self.lazy_interface_values
             && self.intersection_planning_depth == 0
             && exact_import.is_none()
             && cached_type.is_some()
@@ -10833,7 +10837,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
             }
             canonical
-        } else if let Some(symbol) = cached_symbol.filter(|_| !source_parameter_constraint) {
+        } else if let Some(symbol) =
+            cached_symbol.filter(|_| !source_parameter_constraint && !self.lazy_interface_values)
+        {
             self.store.get_merged_symbol(symbol).ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidCachedSymbol { node, symbol })
             })?
@@ -11055,6 +11061,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             if local_count == 0 {
                 if flags.contains(SymbolFlags::INTERFACE)
                     && !flags.contains(SymbolFlags::CLASS)
+                    && !self.lazy_interface_values
                     && type_arguments.is_empty()
                     && !self.is_initialized_global_function(symbol)
                     && !self.is_default_library_template_strings_array(symbol)
@@ -11123,6 +11130,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 if flags.contains(SymbolFlags::INTERFACE)
                     && !flags.contains(SymbolFlags::CLASS)
+                    && !self.lazy_interface_values
                     && type_arguments.len() == local_count
                     && !lazy_react_html_factory
                     && self.has_generic_interface_heritage(symbol)?
@@ -19628,6 +19636,64 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
         })();
         self.complete_type_query(result, &plan, &mut prepared)
+    }
+
+    /// Checks one annotated value without resolving interface member types.
+    pub(super) fn preflight_type_of_declared_value(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        self.plan_declared_value_type(symbol).map(|_| ())
+    }
+
+    fn plan_declared_value_type(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<(super::declared_values::DeclaredValuePlan, TypeQueryPlan), DeclaredTypeError> {
+        if !self.pending_function_parameters.is_empty() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidPreparedTypeQuery,
+            ));
+        }
+        let value = plan_declared_value(self.store, self.host, symbol)?;
+        self.require_type_reference_alias_root_capability(value.annotation)?;
+        let mut planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        )
+        .with_jsdoc_import_type_target(self.jsdoc_import_type_target);
+        planner.lazy_interface_values = true;
+        planner.plan_type_node(value.annotation)?;
+        Ok((value, planner.finish()))
+    }
+
+    /// Resolves an annotated variable or ordinary property by declared identity.
+    /// Member lookup can then demand one property without expanding its siblings.
+    pub(super) fn get_type_of_declared_value(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let (value, plan) = self.plan_declared_value_type(symbol)?;
+        if !self.store.try_reserve_value_symbol_links(1)
+            || !self.store.try_reserve_declared_value_provenance(1)
+        {
+            return Err(Self::literal_cache_error(LiteralTypeCacheError::Capacity));
+        }
+        let mut prepared = self.prepare_literal_types(&plan)?;
+        if let Err(error) = self.seed_pending_function_parameters(&plan, &mut prepared) {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(error);
+        }
+        let result = self.execute_type_node(value.annotation, &plan, &mut prepared);
+        let type_ = self.complete_type_query(result, &plan, &mut prepared)?;
+        publish_declared_value(self.store, value, type_)
     }
 
     fn execute_interface_method_type_parameters(
@@ -46474,6 +46540,430 @@ mod tests {
         );
         assert_eq!(store_state(&fixture.store), before);
         assert_eq!(fixture.store.pop_type_resolution(), Some(true));
+        assert!(diagnostics.is_empty());
+    }
+
+    fn query_declared_value(
+        fixture: &mut Fixture,
+        symbol: SemanticSymbolId,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            diagnostics,
+        )?
+        .get_type_of_declared_value(symbol)
+    }
+
+    #[test]
+    fn lazy_declared_values_resolve_one_property_without_sibling_types() {
+        let mut fixture = fixture(concat!(
+            "interface Catalog { (value?: string | number): symbol; ",
+            "readonly key: unique symbol; ignored: Missing; } ",
+            "declare var catalog: Catalog;",
+        ));
+        let variable = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "catalog");
+        let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Catalog");
+        let members = fixture.store.symbol(owner).unwrap().members().unwrap();
+        let property = fixture
+            .store
+            .symbol_table(members)
+            .unwrap()
+            .get_source("key")
+            .unwrap();
+        let ignored = fixture
+            .store
+            .symbol_table(members)
+            .unwrap()
+            .get_source("ignored")
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = union_state(&fixture.store);
+        let signature_count = fixture.store.signature_len();
+        {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let query = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            query.preflight_type_of_declared_value(variable).unwrap();
+            query.preflight_type_of_declared_value(property).unwrap();
+        }
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(fixture.store.declared_value_provenance(variable).is_none());
+        assert!(fixture.store.declared_value_provenance(property).is_none());
+        let receiver = query_declared_value(&mut fixture, variable, &mut diagnostics).unwrap();
+        assert_eq!(
+            fixture.store.type_payload(receiver).unwrap().symbol(),
+            Some(owner)
+        );
+        assert_eq!(
+            fixture.store.resolved_own_property(receiver, "key"),
+            Err(super::super::RelationUnavailable::UnresolvedPropertyType(
+                property
+            )),
+        );
+        let type_ = query_declared_value(&mut fixture, property, &mut diagnostics).unwrap();
+        let selected = fixture
+            .store
+            .resolved_own_property(receiver, "key")
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.symbol, property);
+        assert_eq!(selected.type_, type_);
+        assert!(selected.readonly);
+        assert!(!selected.optional);
+        let TypeData::Interface(interface) = fixture.store.type_payload(receiver).unwrap().data()
+        else {
+            panic!("the value must retain its declared interface")
+        };
+        assert!(!interface.declared_members_resolved);
+        assert_eq!(
+            interface.reference.object.structured,
+            StructuredTypeData::default()
+        );
+        assert!(fixture.store.value_symbol_links(ignored).is_none());
+        assert_eq!(fixture.store.signature_len(), signature_count);
+        let before = union_state(&fixture.store);
+        assert_eq!(
+            query_declared_value(&mut fixture, variable, &mut diagnostics),
+            Ok(receiver)
+        );
+        assert_eq!(
+            query_declared_value(&mut fixture, property, &mut diagnostics),
+            Ok(type_)
+        );
+        assert_eq!(
+            fixture.store.resolved_own_property(receiver, "absent"),
+            Ok(None)
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lazy_declared_values_reject_selected_unsupported_types_before_publication() {
+        let mut fixture = fixture(concat!(
+            "interface Catalog { selected: Missing; supported: number; } ",
+            "declare var catalog: Catalog;",
+        ));
+        let variable = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "catalog");
+        let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Catalog");
+        let members = fixture.store.symbol(owner).unwrap().members().unwrap();
+        let property = fixture
+            .store
+            .symbol_table(members)
+            .unwrap()
+            .get_source("selected")
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        query_declared_value(&mut fixture, variable, &mut diagnostics).unwrap();
+        let before = union_state(&fixture.store);
+        assert!(query_declared_value(&mut fixture, property, &mut diagnostics).is_err());
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(fixture.store.value_symbol_links(property).is_none());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lazy_declared_values_reject_changed_property_caches_without_repairing_them() {
+        let mut fixture = fixture(concat!(
+            "interface Catalog { readonly key: unique symbol; ignored: Missing; } ",
+            "declare var catalog: Catalog;",
+        ));
+        let variable = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "catalog");
+        let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Catalog");
+        let members = fixture.store.symbol(owner).unwrap().members().unwrap();
+        let property = fixture
+            .store
+            .symbol_table(members)
+            .unwrap()
+            .get_source("key")
+            .unwrap();
+        let annotation = fixture
+            .store
+            .source_direct_type_annotation(
+                fixture
+                    .store
+                    .symbol(property)
+                    .unwrap()
+                    .value_declaration()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let receiver = query_declared_value(&mut fixture, variable, &mut diagnostics).unwrap();
+        query_declared_value(&mut fixture, property, &mut diagnostics).unwrap();
+        let original = fixture.store.value_symbol_links(property).unwrap().clone();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let before = union_state(&fixture.store);
+        assert!(query_declared_value(&mut fixture, property, &mut diagnostics).is_err());
+        assert!(
+            fixture
+                .store
+                .resolved_own_property(receiver, "key")
+                .is_err()
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(property)
+                .unwrap()
+                .resolved_type,
+            Some(string)
+        );
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(property, original.clone())
+        );
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let before = union_state(&fixture.store);
+        assert!(query_declared_value(&mut fixture, property, &mut diagnostics).is_err());
+        assert!(
+            fixture
+                .store
+                .resolved_own_property(receiver, "key")
+                .is_err()
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: original.resolved_type,
+                ..TypeNodeLinks::default()
+            }
+        ));
+        assert!(fixture.store.set_source_property_readonly(property, false));
+        let before = union_state(&fixture.store);
+        assert!(query_declared_value(&mut fixture, property, &mut diagnostics).is_err());
+        assert!(
+            fixture
+                .store
+                .resolved_own_property(receiver, "key")
+                .is_err()
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lazy_declared_values_recheck_reference_names_on_warm_value_queries() {
+        let mut fixture = fixture(concat!(
+            "interface Catalog { key: number; } interface Other { key: string; } ",
+            "declare var catalog: Catalog; declare var other: Other;",
+        ));
+        let variable = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "catalog");
+        let other = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "other");
+        let other_owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Other");
+        let annotation = variable_type_node(&fixture, "catalog");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        query_declared_value(&mut fixture, variable, &mut diagnostics).unwrap();
+        let other_type = query_declared_value(&mut fixture, other, &mut diagnostics).unwrap();
+        assert!(fixture.store.set_value_symbol_links(
+            variable,
+            ValueSymbolLinks {
+                resolved_type: Some(other_type),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(other_type),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        assert!(fixture.store.set_symbol_node_links(
+            annotation,
+            SymbolNodeLinks {
+                resolved_symbol: Some(other_owner),
+            }
+        ));
+        let before = union_state(&fixture.store);
+        assert!(query_declared_value(&mut fixture, variable, &mut diagnostics).is_err());
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lazy_declared_values_reject_missing_member_tables_and_accept_empty_interfaces() {
+        let mut fixture = fixture(concat!(
+            "interface Catalog { key: number; } interface Empty {} ",
+            "declare var catalog: Catalog; declare var empty: Empty;",
+        ));
+        let catalog = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "catalog");
+        let empty = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "empty");
+        let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Catalog");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let receiver = query_declared_value(&mut fixture, catalog, &mut diagnostics).unwrap();
+        let empty = query_declared_value(&mut fixture, empty, &mut diagnostics).unwrap();
+        assert_eq!(fixture.store.resolved_own_property(empty, "key"), Ok(None));
+        assert!(
+            fixture
+                .store
+                .set_symbol_relationships(owner, None, None, None, None)
+        );
+        let before = union_state(&fixture.store);
+        assert!(
+            fixture
+                .store
+                .resolved_own_property(receiver, "absent")
+                .is_err()
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lazy_declared_values_allow_complete_member_demand_after_selected_publication() {
+        let mut fixture = fixture(concat!(
+            "interface Catalog { readonly key: number; other: string; } ",
+            "declare var catalog: Catalog;",
+        ));
+        let variable = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "catalog");
+        let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Catalog");
+        let members = fixture.store.symbol(owner).unwrap().members().unwrap();
+        let key = fixture
+            .store
+            .symbol_table(members)
+            .unwrap()
+            .get_source("key")
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let receiver = query_declared_value(&mut fixture, variable, &mut diagnostics).unwrap();
+        let key_type = query_declared_value(&mut fixture, key, &mut diagnostics).unwrap();
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                owner,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(receiver)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .resolved_own_property(receiver, "key")
+                .unwrap()
+                .unwrap()
+                .type_,
+            key_type
+        );
+        assert_eq!(
+            fixture
+                .store
+                .resolved_own_property(receiver, "other")
+                .unwrap()
+                .unwrap()
+                .type_,
+            fixture.store.intrinsic_bootstrap().unwrap().string_type
+        );
+        let before = union_state(&fixture.store);
+        assert_eq!(
+            query_declared_value(&mut fixture, variable, &mut diagnostics),
+            Ok(receiver)
+        );
+        assert_eq!(
+            query_declared_value(&mut fixture, key, &mut diagnostics),
+            Ok(key_type)
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lazy_declared_values_reject_paired_literal_cache_changes() {
+        let mut fixture = fixture(concat!(
+            "interface Catalog { key: 'expected'; other: 'wrong'; } ",
+            "declare var catalog: Catalog;",
+        ));
+        let variable = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "catalog");
+        let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Catalog");
+        let members = fixture.store.symbol(owner).unwrap().members().unwrap();
+        let key = fixture
+            .store
+            .symbol_table(members)
+            .unwrap()
+            .get_source("key")
+            .unwrap();
+        let other = fixture
+            .store
+            .symbol_table(members)
+            .unwrap()
+            .get_source("other")
+            .unwrap();
+        let annotation = fixture
+            .store
+            .source_direct_type_annotation(
+                fixture
+                    .store
+                    .symbol(key)
+                    .unwrap()
+                    .value_declaration()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let receiver = query_declared_value(&mut fixture, variable, &mut diagnostics).unwrap();
+        let expected = query_declared_value(&mut fixture, key, &mut diagnostics).unwrap();
+        let wrong = query_declared_value(&mut fixture, other, &mut diagnostics).unwrap();
+        assert_ne!(expected, wrong);
+        let provenance = fixture.store.declared_value_provenance(key).unwrap();
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        assert!(fixture.store.set_value_symbol_links(
+            key,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let before = union_state(&fixture.store);
+        assert!(
+            fixture
+                .store
+                .resolved_own_property(receiver, "key")
+                .is_err()
+        );
+        assert!(query_declared_value(&mut fixture, key, &mut diagnostics).is_err());
+        assert_eq!(union_state(&fixture.store), before);
+        assert_eq!(
+            fixture.store.declared_value_provenance(key),
+            Some(provenance)
+        );
         assert!(diagnostics.is_empty());
     }
 

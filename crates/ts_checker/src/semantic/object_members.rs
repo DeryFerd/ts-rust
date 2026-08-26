@@ -84,6 +84,19 @@ pub(super) fn resolve_object_property_by_key(
     name: EscapedNameRef<'_>,
     session: &mut InstantiationSession,
 ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+    if let Some(selected) =
+        super::declared_values::selected_declared_property(store, receiver, name)?
+    {
+        return match selected {
+            super::declared_values::SelectedDeclaredProperty::Missing => Ok(None),
+            super::declared_values::SelectedDeclaredProperty::Unresolved(symbol) => {
+                Err(RelationUnavailable::UnresolvedPropertyType(symbol))
+            }
+            super::declared_values::SelectedDeclaredProperty::Resolved(property) => {
+                Ok(Some(property))
+            }
+        };
+    }
     let record = store
         .type_payload(receiver)
         .ok_or(RelationUnavailable::Type(receiver))?;
@@ -325,6 +338,12 @@ fn known_symbol_key(
         .resolved_type
         .or(annotation_type)
         .ok_or(KnownSymbolKeyError::NeedsValueType { symbol, annotation })?;
+    if store
+        .declared_value_provenance(symbol)
+        .is_some_and(|provenance| !provenance.is_current(store, symbol))
+    {
+        return Err(KnownSymbolKeyError::InvalidSymbol(symbol));
+    }
     let value = store
         .type_payload(value_type)
         .ok_or(KnownSymbolKeyError::InvalidType(value_type))?;
@@ -335,9 +354,6 @@ fn known_symbol_key(
             && value.symbol() != Some(symbol)
     {
         return Err(KnownSymbolKeyError::InvalidSymbol(symbol));
-    }
-    if value.flags().intersects(TypeFlags::ANY) {
-        return Ok(fallback());
     }
     if let Some(annotation) = annotation
         .filter(|annotation| store.source_node_kind(*annotation) == Some(SyntaxKind::TypeReference))
@@ -379,6 +395,9 @@ fn known_symbol_key(
             return Err(KnownSymbolKeyError::InvalidSymbol(symbol));
         }
     }
+    if value.flags().intersects(TypeFlags::ANY) {
+        return Ok(fallback());
+    }
     let signatures = value
         .data()
         .structured()
@@ -397,7 +416,18 @@ fn known_symbol_key(
         EscapedNameRef::source(name),
         &mut session,
     )
-    .map_err(KnownSymbolKeyError::Relation)?;
+    .map_err(|error| match error {
+        RelationUnavailable::UnresolvedPropertyType(symbol) => {
+            KnownSymbolKeyError::NeedsValueType {
+                symbol,
+                annotation: store
+                    .symbol(symbol)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    .and_then(|declaration| store.source_direct_type_annotation(declaration)),
+            }
+        }
+        error => KnownSymbolKeyError::Relation(error),
+    })?;
     if property.is_none() {
         if let Some(global_types) = global_types {
             let function = if signatures.0 != 0 {
@@ -9737,7 +9767,7 @@ pub(super) fn plan_index_signature(
     })
 }
 
-fn missing_signature_initializer(
+pub(super) fn missing_signature_initializer(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     member: NodeRef,
@@ -9759,7 +9789,7 @@ fn missing_signature_initializer(
     )
 }
 
-fn preflight_readonly_modifier(
+pub(super) fn preflight_readonly_modifier(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     member: NodeRef,
@@ -12782,6 +12812,27 @@ fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyOb
                     });
         }
         let expected = source_property_check_flags(property.readonly);
+        if plan.kind == PropertyObjectKind::Interface
+            && store
+                .value_symbol_links(property.symbol)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+        {
+            let Some(receiver) = store
+                .declared_type_links(plan.symbol)
+                .and_then(|links| links.declared_type)
+            else {
+                return false;
+            };
+            return matches!(
+                super::declared_values::selected_declared_property(
+                    store, receiver, EscapedNameRef::source(&property.name),
+                ),
+                Ok(Some(super::declared_values::SelectedDeclaredProperty::Resolved(selected)))
+                    if selected.symbol == property.symbol
+                        && selected.optional == property.optional
+                        && selected.readonly == property.readonly
+            );
+        }
         (record.check_flags() == CheckFlags::NONE || record.check_flags() == expected)
             && store
                 .value_symbol_links(property.symbol)

@@ -438,6 +438,7 @@ mod tests {
         let mut session = crate::semantic::instantiate::InstantiationSession::new(
             crate::semantic::instantiate::InstantiationLimits::default(),
         );
+        let signature_count = store.signature_len();
         let key = crate::semantic::source::source_iterator_key(
             store,
             &host,
@@ -464,6 +465,35 @@ mod tests {
             .and_then(|members| store.symbol_table(members))
             .and_then(|members| members.get_source("iterator"))
             .unwrap();
+        let constructor_type = store
+            .declared_type_links(constructor)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(constructor_data) =
+            store.type_payload(constructor_type).unwrap().data()
+        else {
+            panic!("the constructor value keeps its declared interface")
+        };
+        assert!(!constructor_data.declared_members_resolved);
+        assert!(constructor_data.declared_call_signatures.is_none());
+        assert_eq!(store.signature_len(), signature_count);
+        let sibling_properties = store
+            .symbol(constructor)
+            .unwrap()
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for sibling in sibling_properties {
+            if sibling != iterator {
+                assert!(
+                    store.value_symbol_links(sibling).is_none(),
+                    "an unselected member stays cold"
+                );
+            }
+        }
         let key_type = store
             .value_symbol_links(iterator)
             .unwrap()
@@ -501,6 +531,56 @@ mod tests {
                 store.checker_link_allocated_lengths(),
             ),
             state,
+        );
+        let original_links = store.value_symbol_links(iterator).unwrap().clone();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(store.set_value_symbol_links(
+            iterator,
+            crate::semantic::ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..crate::semantic::ValueSymbolLinks::default()
+            }
+        ));
+        let corrupted_state = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert!(
+            crate::semantic::source::source_iterator_key(
+                store,
+                &host,
+                &global_types,
+                options,
+                &mut session,
+                &mut diagnostics,
+                node,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            corrupted_state
+        );
+        assert!(store.set_value_symbol_links(iterator, original_links));
+        assert_eq!(
+            crate::semantic::source::source_iterator_key(
+                store,
+                &host,
+                &global_types,
+                options,
+                &mut session,
+                &mut diagnostics,
+                node,
+            )
+            .unwrap(),
+            key
         );
     }
 

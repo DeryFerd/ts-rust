@@ -23,6 +23,7 @@ use super::{
     conditional_types::{
         ConditionalQueryKey, ConditionalQueryProduction, ConditionalTypeProduction,
     },
+    declared_values::DeclaredValueProvenance,
     derived_types::DerivedTypeCaches,
     ids::{
         ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
@@ -498,6 +499,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     declared_call_set_types_by_signature: HashMap<SignatureId, TypeId>,
     direct_interface_heritage_provenance: HashMap<TypeId, DirectInterfaceHeritageProvenance>,
     direct_class_heritage_provenance: HashMap<TypeId, DirectClassHeritageProvenance>,
+    declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
     source_callable_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_callable_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
@@ -601,6 +603,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             declared_call_set_types_by_signature: HashMap::new(),
             direct_interface_heritage_provenance: HashMap::new(),
             direct_class_heritage_provenance: HashMap::new(),
+            declared_value_provenance: HashMap::new(),
             source_callable_provenance: HashMap::new(),
             source_callable_types_by_declaration: HashMap::new(),
             source_callable_types_by_owner: HashMap::new(),
@@ -5869,6 +5872,44 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.links.value_symbol.try_reserve(additional)
     }
 
+    pub(super) fn try_reserve_declared_value_provenance(&mut self, additional: usize) -> bool {
+        self.declared_value_provenance
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    pub(super) fn declared_value_provenance(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<DeclaredValueProvenance> {
+        self.declared_value_provenance.get(&symbol).copied()
+    }
+
+    pub(super) fn publish_declared_value_provenance(
+        &mut self,
+        symbol: SemanticSymbolId,
+        provenance: DeclaredValueProvenance,
+    ) -> bool {
+        if self.symbol(symbol).is_none()
+            || self.type_payload(provenance.type_).is_none()
+            || !self.contains_node_ref(provenance.annotation)
+            || self
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                != Some(provenance.type_)
+            || !self.source_direct_type_annotation_is_exact(provenance.annotation, provenance.type_)
+        {
+            return false;
+        }
+        match self.declared_value_provenance.entry(symbol) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get() == provenance,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(provenance);
+                true
+            }
+        }
+    }
+
     pub(super) fn try_reserve_function_signature_return_annotations(
         &mut self,
         additional: usize,
@@ -6707,6 +6748,30 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return None;
         }
         facts.identifier_text.as_deref()
+    }
+
+    pub(super) fn source_type_operator(&self, node: NodeRef) -> Option<SyntaxKind> {
+        self.source_node_fact(node)?.type_operator
+    }
+
+    pub(super) fn source_direct_children(&self, parent: NodeRef) -> Option<Vec<NodeRef>> {
+        self.source_node_fact(parent)?;
+        self.source_node_facts
+            .get(&parent.arena)?
+            .iter()
+            .enumerate()
+            .filter_map(|(index, facts)| {
+                let facts = facts.as_ref()?;
+                (facts.parent == Some(parent.node)).then_some(index)
+            })
+            .map(|index| {
+                Some(NodeRef::new(
+                    parent.arena,
+                    parent.file,
+                    NodeId::new(u32::try_from(index).ok()?),
+                ))
+            })
+            .collect()
     }
 
     /// Returns the registered parent of a source-reachable node. The outer
