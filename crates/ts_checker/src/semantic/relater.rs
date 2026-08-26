@@ -5869,6 +5869,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     Err(RelationUnavailable::StructuredSignatures(type_))
                 }
             }
+            StoredSingleCallableValidation::Malformed {
+                family: CallableFamily::DeclaredCallSignatures,
+            } if self
+                .type_payload(type_)
+                .filter(|record| matches!(record.data(), TypeData::Object(_)))
+                .and_then(TypeRecord::symbol)
+                .and_then(|owner| self.symbol(owner))
+                .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS)) =>
+            {
+                Err(RelationUnavailable::InvalidStructuredMembers(type_))
+            }
             StoredSingleCallableValidation::Malformed { .. } => {
                 Err(RelationUnavailable::MalformedFunctionType(type_))
             }
