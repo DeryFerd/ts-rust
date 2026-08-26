@@ -1,5 +1,14 @@
 //! Compiler Program and source-file graph foundations.
 
+mod project_graph;
+
+pub use project_graph::{
+    ProgramGraphConfig, ProgramGraphMissingEvidence, ProgramGraphReference,
+    ProgramGraphReferenceKind, ProgramGraphReferenceTarget, ProgramGraphResolution,
+    ProgramGraphResolutionKind, ProgramGraphResolutionRequest, ProgramGraphRoot,
+    ProgramGraphSnapshot, ProgramGraphSource, ProgramGraphTarget,
+};
+
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -1095,6 +1104,7 @@ struct ProgramConfigInputs {
     has_project_references: bool,
     options: CompilerOptions,
     diagnostics: Vec<ProgramDiagnostic>,
+    graph_config: ProgramGraphConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1384,7 +1394,12 @@ pub struct Program {
     source_files: Vec<SourceFile>,
     file_index: BTreeMap<String, usize>,
     root_file_names: BTreeSet<String>,
+    ordered_root_file_names: Vec<String>,
     resolved_modules: BTreeMap<(String, String), String>,
+    graph_resolution_options: Option<ResolutionOptions>,
+    graph_resolutions: Vec<ProgramGraphResolution>,
+    graph_references: Vec<ProgramGraphReference>,
+    graph_config: Option<ProgramGraphConfig>,
     module_resolution_diagnostics: Vec<ProgramDiagnostic>,
     package_export_specifiers: BTreeMap<String, Vec<String>>,
     package_display_specifiers: BTreeMap<(FileId, String), String>,
@@ -1596,6 +1611,7 @@ impl Program {
         let current_directory = ts_path::normalize_path(current_directory);
         let mut program = Self {
             current_directory: current_directory.clone(),
+            ordered_root_file_names: root_names.to_vec(),
             case_sensitivity,
             options,
             checker,
@@ -1658,6 +1674,7 @@ impl Program {
         file_system: &dyn FileSystem,
         resolution_options: ResolutionOptions,
     ) {
+        self.graph_resolution_options = Some(resolution_options.clone());
         let resolver = Resolver::new(file_system, resolution_options);
         let mut ambient_modules = BTreeMap::new();
         for source_file in &self.source_files {
@@ -1701,63 +1718,86 @@ impl Program {
                 })
             }
             .flatten();
-            if let Some(specifier) = implicit_jsx_runtime
-                && let Some(resolved) = resolver
-                    .resolve_with_mode(&specifier, &containing_file, ModuleFormat::Esm)
-                    .resolved
-            {
-                if let Some(package_json) = resolved.package_json.as_deref() {
-                    self.register_package_export_specifiers(
-                        file_system,
-                        &resolver,
-                        package_json,
+            if let Some(specifier) = implicit_jsx_runtime {
+                let result =
+                    resolver.resolve_with_mode(&specifier, &containing_file, ModuleFormat::Esm);
+                self.record_graph_resolution(
+                    ProgramGraphResolutionRequest {
+                        kind: ProgramGraphResolutionKind::JsxRuntime,
+                        containing_file: containing_file.clone(),
+                        range: None,
+                        specifier: specifier.clone(),
+                        mode: Some(ModuleFormat::Esm),
+                    },
+                    &result,
+                    None,
+                );
+                if let Some(resolved) = result.resolved {
+                    if let Some(package_json) = resolved.package_json.as_deref() {
+                        self.register_package_export_specifiers(
+                            file_system,
+                            &resolver,
+                            package_json,
+                            &containing_file,
+                            CanonicalModuleResolutionMode::Esm,
+                        );
+                    }
+                    let containing = canonicalize(
                         &containing_file,
-                        CanonicalModuleResolutionMode::Esm,
+                        &self.current_directory,
+                        self.case_sensitivity,
                     );
+                    let target = canonicalize(
+                        &resolved.resolved_file_name,
+                        &self.current_directory,
+                        self.case_sensitivity,
+                    );
+                    self.resolved_modules
+                        .insert((containing, specifier), target);
+                    self.load_file(file_system, &resolved.resolved_file_name, false);
                 }
-                let containing = canonicalize(
-                    &containing_file,
-                    &self.current_directory,
-                    self.case_sensitivity,
-                );
-                let target = canonicalize(
-                    &resolved.resolved_file_name,
-                    &self.current_directory,
-                    self.case_sensitivity,
-                );
-                self.resolved_modules
-                    .insert((containing, specifier), target);
-                self.load_file(file_system, &resolved.resolved_file_name, false);
             }
             if !self
                 .canonical_commonjs_import_helpers(&self.source_files[file_index])
                 .is_empty()
-                && let Some(resolved) = resolver
-                    .resolve_with_mode("tslib", &containing_file, ModuleFormat::CommonJs)
-                    .resolved
             {
-                if let Some(package_json) = resolved.package_json.as_deref() {
-                    self.register_package_export_specifiers(
-                        file_system,
-                        &resolver,
-                        package_json,
+                let result =
+                    resolver.resolve_with_mode("tslib", &containing_file, ModuleFormat::CommonJs);
+                self.record_graph_resolution(
+                    ProgramGraphResolutionRequest {
+                        kind: ProgramGraphResolutionKind::ImportHelpers,
+                        containing_file: containing_file.clone(),
+                        range: None,
+                        specifier: "tslib".to_owned(),
+                        mode: Some(ModuleFormat::CommonJs),
+                    },
+                    &result,
+                    None,
+                );
+                if let Some(resolved) = result.resolved {
+                    if let Some(package_json) = resolved.package_json.as_deref() {
+                        self.register_package_export_specifiers(
+                            file_system,
+                            &resolver,
+                            package_json,
+                            &containing_file,
+                            CanonicalModuleResolutionMode::CommonJs,
+                        );
+                    }
+                    let containing = canonicalize(
                         &containing_file,
-                        CanonicalModuleResolutionMode::CommonJs,
+                        &self.current_directory,
+                        self.case_sensitivity,
                     );
+                    let target = canonicalize(
+                        &resolved.resolved_file_name,
+                        &self.current_directory,
+                        self.case_sensitivity,
+                    );
+                    self.resolved_modules
+                        .insert((containing, "tslib".to_owned()), target);
+                    self.load_file(file_system, &resolved.resolved_file_name, false);
                 }
-                let containing = canonicalize(
-                    &containing_file,
-                    &self.current_directory,
-                    self.case_sensitivity,
-                );
-                let target = canonicalize(
-                    &resolved.resolved_file_name,
-                    &self.current_directory,
-                    self.case_sensitivity,
-                );
-                self.resolved_modules
-                    .insert((containing, "tslib".to_owned()), target);
-                self.load_file(file_system, &resolved.resolved_file_name, false);
             }
             let source_mode = self.canonical_emit_module_mode(&self.source_files[file_index]);
             let usage_modes = canonical_static_module_specifiers(&self.source_files[file_index])
@@ -1793,6 +1833,29 @@ impl Program {
                         resolver.resolve(&specifier, &containing_file)
                     }
                 };
+                let ambient_target = if result.resolved.is_none()
+                    && can_resolve_ambient
+                    && !module_name_is_relative(&specifier)
+                {
+                    ambient_modules.get(&specifier).cloned()
+                } else {
+                    None
+                };
+                self.record_graph_resolution(
+                    ProgramGraphResolutionRequest {
+                        kind: ProgramGraphResolutionKind::Module,
+                        containing_file: containing_file.clone(),
+                        range: Some(range),
+                        specifier: specifier.clone(),
+                        mode: match mode {
+                            CanonicalModuleResolutionMode::CommonJs => Some(ModuleFormat::CommonJs),
+                            CanonicalModuleResolutionMode::Esm => Some(ModuleFormat::Esm),
+                            CanonicalModuleResolutionMode::None => None,
+                        },
+                    },
+                    &result,
+                    ambient_target.as_deref(),
+                );
                 if let Some(resolved) = result.resolved {
                     if self.checker == ProgramChecker::Canonical
                         && !self.options.no_check
@@ -1846,17 +1909,14 @@ impl Program {
                             &mut ambient_modules,
                         );
                     }
-                } else if can_resolve_ambient
-                    && !module_name_is_relative(&specifier)
-                    && let Some(target) = ambient_modules.get(&specifier)
-                {
+                } else if let Some(target) = ambient_target {
                     let containing = canonicalize(
                         &containing_file,
                         &self.current_directory,
                         self.case_sensitivity,
                     );
                     self.resolved_modules
-                        .insert((containing, specifier.clone()), target.clone());
+                        .insert((containing, specifier.clone()), target);
                 } else if !(self.options.no_check
                     || side_effect_only && !self.options.no_unchecked_side_effect_imports
                     || self.options.skip_lib_check
@@ -2430,6 +2490,7 @@ impl Program {
             has_project_references,
             options,
             mut diagnostics,
+            graph_config,
         } = match Self::load_config_inputs(
             file_system,
             config_path,
@@ -2460,6 +2521,7 @@ impl Program {
             ProgramChecker::Canonical,
         );
         program.config_file_path = Some(config_path);
+        program.graph_config = Some(graph_config);
         program.load_remaining_program_graph(file_system);
         if let Some(diagnostic) = program.common_source_directory_diagnostic(file_system) {
             diagnostics.push(diagnostic);
@@ -2492,6 +2554,7 @@ impl Program {
             root_names,
             options,
             mut diagnostics,
+            graph_config,
             ..
         } = match Self::load_config_inputs(file_system, config_path, overrides, command_line) {
             Ok(inputs) => inputs,
@@ -2506,6 +2569,7 @@ impl Program {
         let mut program =
             Self::new_with_options(file_system, &current_directory, &root_names, options);
         program.config_file_path = Some(config_path);
+        program.graph_config = Some(graph_config);
         if let Some(diagnostic) = program.common_source_directory_diagnostic(file_system) {
             diagnostics.push(diagnostic);
         }
@@ -2531,6 +2595,10 @@ impl Program {
             .map_or(".", |(directory, _)| directory);
         let mut options_result = parse_project_options(&config);
         let config_source = file_system.read_file(&config.path).ok();
+        let graph_config = ProgramGraphConfig {
+            source_text: config_source.clone(),
+            resolved: config.clone(),
+        };
         let empty_files = config
             .raw
             .get("files")
@@ -2667,6 +2735,7 @@ impl Program {
             has_project_references: !config.references.is_empty(),
             options: options_result.options,
             diagnostics: config_diagnostics,
+            graph_config,
         })
     }
 
@@ -5694,10 +5763,19 @@ impl Program {
         let containing_file =
             resolve_path(&self.current_directory, &["__inferred type names__.ts"]);
         for name in names {
-            if let Some(resolved) = resolver
-                .resolve_type_reference(&name, &containing_file)
-                .resolved
-            {
+            let result = resolver.resolve_type_reference(&name, &containing_file);
+            self.record_graph_resolution(
+                ProgramGraphResolutionRequest {
+                    kind: ProgramGraphResolutionKind::AutomaticTypeDirective,
+                    containing_file: containing_file.clone(),
+                    range: None,
+                    specifier: name.clone(),
+                    mode: None,
+                },
+                &result,
+                None,
+            );
+            if let Some(resolved) = result.resolved {
                 self.load_file(file_system, &resolved.resolved_file_name, false);
             } else if resolution_options
                 .types
@@ -5719,7 +5797,17 @@ impl Program {
         let directives = reference_directives(&self.source_files[file_index].source_text);
         for directive in directives {
             match directive.kind {
-                ReferenceKind::Path | ReferenceKind::Types if self.options.no_resolve => {}
+                ReferenceKind::Path if self.options.no_resolve => {
+                    self.graph_references.push(ProgramGraphReference {
+                        containing_file: containing_file.clone(),
+                        range: directive.range,
+                        specifier: directive.value,
+                        kind: ProgramGraphReferenceKind::Path,
+                        skipped: true,
+                        targets: Vec::new(),
+                    });
+                }
+                ReferenceKind::Types if self.options.no_resolve => {}
                 ReferenceKind::Path => {
                     let unresolved_file_name = resolve_path(
                         &directory_path(&containing_file),
@@ -5731,13 +5819,34 @@ impl Program {
                         self.options.allow_js,
                     )
                     .unwrap_or(unresolved_file_name);
+                    self.graph_references.push(ProgramGraphReference {
+                        containing_file: containing_file.clone(),
+                        range: directive.range,
+                        specifier: directive.value,
+                        kind: ProgramGraphReferenceKind::Path,
+                        skipped: false,
+                        targets: vec![ProgramGraphReferenceTarget {
+                            file_name: file_name.clone(),
+                            file_id: None,
+                        }],
+                    });
                     self.load_file(file_system, &file_name, true);
                 }
                 ReferenceKind::Types => {
-                    if let Some(resolved) = resolver
-                        .resolve_type_reference(&directive.value, &containing_file)
-                        .resolved
-                    {
+                    let result =
+                        resolver.resolve_type_reference(&directive.value, &containing_file);
+                    self.record_graph_resolution(
+                        ProgramGraphResolutionRequest {
+                            kind: ProgramGraphResolutionKind::TypeReference,
+                            containing_file: containing_file.clone(),
+                            range: Some(directive.range),
+                            specifier: directive.value.clone(),
+                            mode: None,
+                        },
+                        &result,
+                        None,
+                    );
+                    if let Some(resolved) = result.resolved {
                         self.load_file(file_system, &resolved.resolved_file_name, false);
                     } else if !source_ignores_processing_diagnostic(
                         &self.source_files[file_index],
@@ -5751,7 +5860,22 @@ impl Program {
                 }
                 ReferenceKind::Lib => {
                     let library_name = bundled_library_name(&directive.value);
-                    for dependency in ts_bundled::library_closure(&library_name) {
+                    let dependencies = ts_bundled::library_closure(&library_name);
+                    self.graph_references.push(ProgramGraphReference {
+                        containing_file: containing_file.clone(),
+                        range: directive.range,
+                        specifier: directive.value,
+                        kind: ProgramGraphReferenceKind::Library,
+                        skipped: false,
+                        targets: dependencies
+                            .iter()
+                            .map(|dependency| ProgramGraphReferenceTarget {
+                                file_name: format!("/__typescript/lib/{dependency}"),
+                                file_id: None,
+                            })
+                            .collect(),
+                    });
+                    for dependency in dependencies {
                         self.load_bundled_library(dependency);
                     }
                 }
