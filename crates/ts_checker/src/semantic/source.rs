@@ -36229,7 +36229,7 @@ fn publish_checked_source_callable_return(
         return store
             .signature(signature)
             .and_then(super::signatures::Signature::resolved_return_type)
-            .ok_or_else(|| SourceCheckError::Arrow(callable.declaration));
+            .ok_or(SourceCheckError::Arrow(callable.declaration));
     }
     publish_inferred_source_callable_return(store, callable, signature, inferred)
         .map_err(SourcePlanner::callable_plan_error)
