@@ -10069,6 +10069,7 @@ pub(super) fn source_callable_display_projection(
                 name: identifier.text.clone(),
                 value_type: *value_type,
                 optional: parameter_data.question_token.is_some(),
+                rest: false,
             });
         }
         return Ok(ValidatedSingleCallSignatureDisplay {
@@ -10186,6 +10187,7 @@ pub(super) fn source_callable_display_projection(
             name,
             value_type,
             optional,
+            rest: parameter_data.dot_dot_dot_token.is_some(),
         });
     }
     Ok(ValidatedSingleCallSignatureDisplay {

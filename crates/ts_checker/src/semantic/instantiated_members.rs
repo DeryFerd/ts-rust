@@ -2228,6 +2228,7 @@ pub(super) fn instantiated_function_member_display(
                         name: source.name,
                         value_type,
                         optional: source.optional,
+                        rest: source.rest,
                     },
                 )
                 .collect(),

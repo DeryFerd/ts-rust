@@ -945,14 +945,12 @@ fn plan_fixed_tuple_rest_annotation(
             let cached = planned.cached_type().ok_or_else(invalid_cache)?;
             let mut base_types = Vec::with_capacity(planned.elements().len());
             for element in planned.elements() {
-                let identity = peel_parenthesized_type(store, host, element.type_node())?;
-                let null_literal = is_null_literal_type(store, host, identity)?;
-                let base = cached_annotation_identity(store, identity, null_literal)
-                    .ok_or_else(invalid_cache)?;
-                if !store.source_direct_type_annotation_is_exact(identity, base) {
-                    return Err(invalid_cache());
-                }
-                base_types.push(base);
+                base_types.push(cached_fixed_tuple_rest_element_type(
+                    store,
+                    host,
+                    parameter,
+                    element.type_node(),
+                )?);
             }
             validate_warm_tuple_elements(store, array_targets, &planned, &base_types)
                 .map_err(|_| invalid_cache())?;
@@ -977,6 +975,65 @@ fn plan_fixed_tuple_rest_annotation(
         }
     }
     Ok(true)
+}
+
+fn cached_fixed_tuple_rest_element_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    parameter: NodeRef,
+    annotation: NodeRef,
+) -> Result<TypeId, FunctionTypeError> {
+    let invalid = || invariant(FunctionTypeInvariant::InvalidParameterCache(parameter));
+    let identity = peel_parenthesized_type(store, host, annotation)?;
+    let record = preflight_node(store, host, identity)?;
+    if let NodeData::InferTypeNode(inferred) = &record.data {
+        let declaration = NodeRef::new(identity.arena, identity.file, inferred.type_parameter);
+        let declaration_record = preflight_node(store, host, declaration)?;
+        if record.kind != SyntaxKind::InferType
+            || store.source_node_kind(identity) != Some(SyntaxKind::InferType)
+            || declaration_record.kind != SyntaxKind::TypeParameter
+            || store.source_node_kind(declaration) != Some(SyntaxKind::TypeParameter)
+            || declaration_record.parent != Some(identity.node)
+            || store.source_node_parent(declaration) != Some(SourceNodeParent::Parent(identity))
+            || !matches!(
+                declaration_record.data,
+                NodeData::TypeParameterDeclaration(_)
+            )
+        {
+            return Err(invalid());
+        }
+        let symbol = host
+            .bound_file(declaration)
+            .and_then(|bound| bound.symbol(declaration))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        if !host.symbol_matches(store, declaration, symbol) {
+            return Err(invalid());
+        }
+        preflight_type_parameter_symbol(store, host, symbol, &mut HashSet::new())?;
+        let type_ = store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .filter(|type_| cached_ordinary_type_parameter_owner(store, *type_) == Some(symbol))
+            .ok_or_else(invalid)?;
+        // Nested infer nodes keep their type on the declaration, without an annotation cache.
+        if store.type_node_links(identity).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|cached| cached != type_)
+        }) || store
+            .symbol_node_links(identity)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return Err(invalid());
+        }
+        return Ok(type_);
+    }
+    let null_literal = is_null_literal_type(store, host, identity)?;
+    let base = cached_annotation_identity(store, identity, null_literal).ok_or_else(invalid)?;
+    if !store.source_direct_type_annotation_is_exact(identity, base) {
+        return Err(invalid());
+    }
+    Ok(base)
 }
 
 fn plan_explicit_any_array_rest_parameter(
@@ -1898,10 +1955,38 @@ pub(super) fn function_type_display_projection(
         let NodeData::Identifier(identifier) = &name_node.data else {
             return Err(FunctionTypeDisplayError::Malformed);
         };
+        let rest = signature.has_rest_parameter() && index + 1 == plan.parameters.len();
+        if rest
+            && let Some(tuple) = store
+                .canonical_tuple_shape(value_type)
+                .map_err(|_| FunctionTypeDisplayError::Malformed)?
+        {
+            // Pinned getExpandedParameters expands a tuple, but not a union of tuples.
+            for (element_index, (element, info)) in tuple
+                .element_types()
+                .iter()
+                .zip(tuple.element_infos())
+                .enumerate()
+            {
+                if info.flags() != ElementFlags::REQUIRED || info.labeled_declaration().is_some() {
+                    return Err(FunctionTypeDisplayError::Unsupported(
+                        FunctionTypeUnsupported::RestParameter(parameter.declaration),
+                    ));
+                }
+                parameters.push(ValidatedSingleCallParameterDisplay {
+                    name: format!("{}_{element_index}", identifier.text),
+                    value_type: *element,
+                    optional: false,
+                    rest: false,
+                });
+            }
+            continue;
+        }
         parameters.push(ValidatedSingleCallParameterDisplay {
             name: identifier.text.clone(),
             value_type,
             optional: parameter.optional,
+            rest,
         });
     }
     Ok(ValidatedSingleCallSignatureDisplay {
@@ -1968,6 +2053,7 @@ fn source_jsdoc_function_type_display_projection(
                 name: parameter.name().to_owned(),
                 value_type: *value_type,
                 optional: parameter.is_optional(),
+                rest: parameter.is_rest(),
             },
         )
         .collect();
@@ -3846,6 +3932,7 @@ mod tests {
             DirectCallApplicability, DirectCallForm, DirectCallRequest, get_min_argument_count,
             get_parameter_count, has_effective_rest_parameter, resolve_direct_call,
         },
+        formatter::{CanonicalTypeFormatFlags, type_to_string_with_host_global_types_and_flags},
         global_types::initialize_global_library_types,
         production::GlobalMergeCompletion,
         type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions, TypeNodeUnavailable},
@@ -5996,6 +6083,307 @@ mod tests {
                 );
             }
         }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn fixed_tuple_rest_display_expands_tuples_and_preserves_other_rests() {
+        for (index, (source, expected, has_rest)) in [
+            ("(...values: []) => number", "() => number", false),
+            ("(...values: [] | []) => number", "() => number", false),
+            (
+                "(...values: [number]) => number",
+                "(values_0: number) => number",
+                false,
+            ),
+            (
+                "(...values: [void]) => number",
+                "(values_0: void) => number",
+                false,
+            ),
+            (
+                "(head: string, ...values: [number, string]) => number",
+                "(head: string, values_0: number, values_1: string) => number",
+                false,
+            ),
+            (
+                "(...values: [] | [string]) => number",
+                "(...values: [] | [string]) => number",
+                true,
+            ),
+            (
+                "(...values: number[]) => number",
+                "(...values: number[]) => number",
+                true,
+            ),
+            (
+                "(...values: [item: number]) => number",
+                "(item: number) => number",
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut fixture, global_types) = fixed_tuple_rest_fixture(
+                source,
+                FileId::new(95_070 + u32::try_from(index).unwrap()),
+            );
+            let function = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let type_ = CanonicalTypeQuery::new_with_global_types(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap();
+            let signature = fixture
+                .store
+                .signature_links(function)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            CanonicalTypeQuery::new_with_global_types(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature)
+            .unwrap();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            for _ in 0..2 {
+                let display = function_type_display_projection(
+                    &fixture.store,
+                    &host,
+                    type_,
+                    Some(CanonicalArrayTargets::from_global_types(&global_types)),
+                )
+                .unwrap();
+                assert_eq!(
+                    display.parameters.iter().any(|parameter| parameter.rest),
+                    has_rest,
+                    "{source}"
+                );
+                assert_eq!(
+                    type_to_string_with_host_global_types_and_flags(
+                        &fixture.store,
+                        &host,
+                        &global_types,
+                        type_,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION,
+                    )
+                    .unwrap(),
+                    expected,
+                    "{source}",
+                );
+            }
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths()
+                ),
+                before,
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn fixed_tuple_rest_nested_infer_replays_without_annotation_links() {
+        let mut fixture = fixture(
+            concat!(
+                "type Extract<Input> = Input extends ",
+                "((value: infer Value, ...rest: [] | [infer Rest]) => any) ",
+                "? Value : never;",
+            ),
+            FileId::new(95_078),
+        );
+        let function = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let alias = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .and_then(|node| fixture.bound.symbol(node))
+            .unwrap();
+        let infer = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::InferTypeNode(infer) = &record.data else {
+                    return None;
+                };
+                let declaration = fixture.parsed.arena.get(infer.type_parameter)?;
+                let NodeData::TypeParameterDeclaration(parameter) = &declaration.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.parsed.arena.get(parameter.name)?.data
+                else {
+                    return None;
+                };
+                (name.text == "Rest").then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(alias)
+        .unwrap();
+        let type_ = fixture
+            .store
+            .type_node_links(function)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert!(fixture.store.type_node_links(infer).is_none());
+        let NodeData::InferTypeNode(infer_data) = &host.node(infer).unwrap().data else {
+            unreachable!()
+        };
+        let declaration = NodeRef::new(infer.arena, infer.file, infer_data.type_parameter);
+        let symbol = fixture.bound.symbol(declaration).unwrap();
+        let correct_links = fixture.store.declared_type_links(symbol).unwrap().clone();
+        let inferred = correct_links.declared_type.unwrap();
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&fixture.store, inferred),
+            Some(symbol)
+        );
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function),
+            Ok(type_),
+        );
+        assert!(fixture.store.type_node_links(infer).is_none());
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths()
+            ),
+            before,
+        );
+        let signature = fixture
+            .store
+            .signature_links(function)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let other = fixture
+            .store
+            .callable_signature_parameter_types(signature)
+            .unwrap()[0];
+        assert_ne!(inferred, other);
+        let mut forged = correct_links.clone();
+        forged.declared_type = Some(other);
+        assert!(fixture.store.set_declared_type_links(symbol, forged));
+        let corrupted = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .is_err()
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths()
+            ),
+            corrupted,
+        );
+        assert!(fixture.store.set_declared_type_links(symbol, correct_links));
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function),
+            Ok(type_),
+        );
         assert!(diagnostics.is_empty());
     }
 
