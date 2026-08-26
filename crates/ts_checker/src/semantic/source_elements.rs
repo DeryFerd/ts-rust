@@ -19,8 +19,9 @@ use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags, S
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
-    ArrayTypeError, CanonicalCheckerDiagnostic, CanonicalCheckerOptions, CanonicalGlobalTypes,
-    CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
+    ArrayTypeError, CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics,
+    CanonicalCheckerOptions, CanonicalGlobalTypes, CanonicalTypeFormatFlags,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, RelationUnavailable,
     SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
@@ -29,8 +30,11 @@ use super::{
         type_to_string_with_host_and_flags, type_to_string_with_host_global_types_and_flags,
     },
     member_resolution::UnionPropertyError,
+    object_members::{self, PropertyObjectState},
     source::PlannedExpression,
+    source_callables::cached_annotation_identity,
     store::SourceNodeParent,
+    type_nodes::CanonicalTypeQuery,
     type_records::{LiteralValue, StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -59,6 +63,7 @@ pub(super) enum SourceElementError {
     InvalidType(TypeId),
     Relation(RelationUnavailable),
     Array(ArrayTypeError),
+    Declared(DeclaredTypeError),
     Literal(LiteralTypeCacheError),
     Display(TypeDisplayUnavailable),
     MissingDiagnostic(u32),
@@ -73,6 +78,12 @@ impl From<RelationUnavailable> for SourceElementError {
 impl From<ArrayTypeError> for SourceElementError {
     fn from(error: ArrayTypeError) -> Self {
         Self::Array(error)
+    }
+}
+
+impl From<DeclaredTypeError> for SourceElementError {
+    fn from(error: DeclaredTypeError) -> Self {
+        Self::Declared(error)
     }
 }
 
@@ -102,6 +113,7 @@ impl std::fmt::Display for SourceElementError {
             }
             Self::Relation(error) => error.fmt(formatter),
             Self::Array(error) => error.fmt(formatter),
+            Self::Declared(error) => error.fmt(formatter),
             Self::Literal(error) => write!(formatter, "source element literal failed: {error:?}"),
             Self::Display(error) => error.fmt(formatter),
             Self::MissingDiagnostic(code) => {
@@ -116,6 +128,7 @@ impl std::error::Error for SourceElementError {
         match self {
             Self::Relation(error) => Some(error),
             Self::Array(error) => Some(error),
+            Self::Declared(error) => Some(error),
             Self::Display(error) => Some(error),
             Self::Unsupported(_)
             | Self::InvalidCache(_)
@@ -802,6 +815,14 @@ fn check_computed_binding_element_worker(
     let error = bootstrap.error_type;
     let undefined = bootstrap.undefined_type;
     let never = bootstrap.never_type;
+    if index_flags.intersects(TypeFlags::ANY) {
+        store.validate_union_constituent(index_type)?;
+        if index_type != any && index_type != error {
+            return Err(SourceElementError::Unsupported(
+                SourceElementUnsupported::IndexType(index_type),
+            ));
+        }
+    }
     if receiver_type == any || receiver_type == error {
         return Ok(CheckedSourceElement {
             type_: receiver_type,
@@ -826,6 +847,15 @@ fn check_computed_binding_element_worker(
     }
 
     if let Some(signatures) = resolved_index_signature_surface(store, receiver_type)? {
+        if matches!(index.shape, IndexShape::Any) {
+            validate_computed_binding_index_annotations(
+                store,
+                host,
+                global_types,
+                options,
+                receiver_type,
+            )?;
+        }
         let value = match index.shape {
             IndexShape::String => signatures.string,
             IndexShape::Number | IndexShape::Any => signatures.number.or(signatures.string),
@@ -876,13 +906,14 @@ fn check_computed_binding_element_worker(
     } else {
         (
             2538,
-            vec![display_type(
-                store,
-                host,
-                global_types,
-                options,
-                index_type,
-            )?],
+            vec![if host
+                .node(index_node)
+                .is_some_and(|node| node.kind == SyntaxKind::BigIntLiteral)
+            {
+                "bigint".to_owned()
+            } else {
+                display_type(store, host, global_types, options, index_type)?
+            }],
         )
     };
     Ok(CheckedSourceElement {
@@ -901,6 +932,112 @@ fn check_computed_binding_element_worker(
             related_information: Vec::new(),
         }),
     })
+}
+
+fn validate_computed_binding_index_annotations(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    options: CanonicalCheckerOptions,
+    receiver: TypeId,
+) -> Result<(), SourceElementError> {
+    let invalid = || SourceElementError::InvalidType(receiver);
+    let record = store.type_payload(receiver).ok_or_else(invalid)?;
+    let Some(owner) = record.symbol() else {
+        let indexes = record
+            .data()
+            .structured()
+            .and_then(|structured| structured.index_infos.as_deref())
+            .ok_or_else(invalid)?;
+        if record.alias().is_some()
+            || indexes.iter().any(|index| {
+                store.index_info(*index).is_none_or(|info| {
+                    info.declaration().is_some()
+                        || info.index_symbol().is_some()
+                        || !info.components().is_empty()
+                })
+            })
+        {
+            return Err(invalid());
+        }
+        return Ok(());
+    };
+    let Some([declaration]) = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::declarations)
+    else {
+        return Err(invalid());
+    };
+    let declaration = *declaration;
+    let alias = match record.alias() {
+        Some(alias) => Some(
+            store
+                .type_alias(alias)
+                .and_then(super::type_records::TypeAlias::symbol)
+                .ok_or_else(invalid)?,
+        ),
+        None => None,
+    };
+    let plan = object_members::plan_type_literal(store, host, declaration, alias)
+        .map_err(|_| invalid())?;
+    if object_members::type_literal_state(store, &plan).map_err(|_| invalid())?
+        != Some(PropertyObjectState::Resolved(receiver))
+    {
+        return Err(invalid());
+    }
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+    let query = match global_types {
+        Some(global_types) => CanonicalTypeQuery::new_with_global_types(
+            store,
+            host,
+            global_types,
+            options,
+            &mut diagnostics,
+        )?,
+        None => CanonicalTypeQuery::new(store, host, options, &mut diagnostics)?,
+    };
+    for (key, value) in plan.index_type_nodes() {
+        query.preflight_type_from_type_node(key)?;
+        query.preflight_type_from_type_node(value)?;
+    }
+    drop(query);
+    let index_types = plan
+        .index_type_nodes()
+        .map(|(key, value)| {
+            Ok((
+                computed_binding_annotation_identity(store, host, key)?,
+                computed_binding_annotation_identity(store, host, value)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, SourceElementError>>()?;
+    object_members::validate_resolved_declared_member_types(store, &plan, &[], &index_types, &[])
+        .map_err(|_| invalid())
+}
+
+fn computed_binding_annotation_identity(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    mut node: NodeRef,
+) -> Result<TypeId, SourceElementError> {
+    while let NodeData::ParenthesizedTypeNode(parenthesized) = &host
+        .node(node)
+        .ok_or(SourceElementError::InvalidCache(node))?
+        .data
+    {
+        node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+    }
+    let null_literal = match &host
+        .node(node)
+        .ok_or(SourceElementError::InvalidCache(node))?
+        .data
+    {
+        NodeData::LiteralTypeNode(literal) => host
+            .node(NodeRef::new(node.arena, node.file, literal.literal))
+            .is_some_and(|literal| literal.kind == SyntaxKind::NullKeyword),
+        _ => false,
+    };
+    cached_annotation_identity(store, node, null_literal)
+        .ok_or(SourceElementError::InvalidCache(node))
 }
 
 #[allow(clippy::too_many_lines)] // Authenticate the binding, default, and key cache before access.
@@ -3245,6 +3382,55 @@ mod tests {
             } else {
                 assert!(checked.diagnostic.is_none());
             }
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn computed_binding_rejects_counterfeit_any_before_receiver_lookup() {
+        let parsed = parse_fixture("let { [key]: value } = {}; ");
+        let file = FileId::new(10_414);
+        let (mut store, bound, binding, _) = computed_binding_fixture(&parsed, file);
+        let (any, string, number, empty) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.any_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.empty_object_type,
+            )
+        };
+        let counterfeit = store.alloc_intrinsic_type(TypeFlags::ANY, "any").unwrap();
+        let indexed = index_object(&mut store, string, number);
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        for receiver in [any, empty, indexed] {
+            assert_eq!(
+                check_computed_binding_element_worker(
+                    &mut store,
+                    &host,
+                    None,
+                    CanonicalCheckerOptions::default(),
+                    binding,
+                    receiver,
+                    counterfeit,
+                ),
+                Err(SourceElementError::Literal(
+                    LiteralTypeCacheError::UnsupportedUnionConstituent(counterfeit),
+                )),
+            );
             assert_eq!(
                 (
                     store.type_len(),

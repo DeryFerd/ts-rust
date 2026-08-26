@@ -7469,6 +7469,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             SourceElementError::InvalidType(_) => SourceCheckError::Element(access),
             SourceElementError::Relation(error) => SourceCheckError::RelationUnavailable(error),
             SourceElementError::Array(error) => SourceCheckError::ArrayType(error),
+            SourceElementError::Declared(error) => SourceCheckError::DeclaredType(error),
             SourceElementError::Literal(error) => error.into(),
             SourceElementError::Display(error) => SourceCheckError::TypeDisplayUnavailable(error),
             SourceElementError::MissingDiagnostic(code) => {
@@ -16751,6 +16752,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             NodeData::NumericLiteral(literal) if key_record.kind == SyntaxKind::NumericLiteral => {
                 literal.token_flags.0 == 0
             }
+            NodeData::BigIntLiteral(literal) if key_record.kind == SyntaxKind::BigIntLiteral => {
+                literal.token_flags.0 == 0
+            }
             NodeData::NoSubstitutionTemplateLiteral(literal)
                 if key_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral =>
             {
@@ -16771,7 +16775,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             PlannedExpressionKind::Identifier(read) => {
                 read.kind == PlannedIdentifierReadKind::Variable
             }
-            PlannedExpressionKind::String(_) | PlannedExpressionKind::Number { .. } => true,
+            PlannedExpressionKind::String(_)
+            | PlannedExpressionKind::Number { .. }
+            | PlannedExpressionKind::BigInt { .. } => true,
             _ => false,
         };
         if !valid_key {
@@ -35031,6 +35037,7 @@ fn object_binding_property_type(
     receiver: TypeId,
     property_node: NodeRef,
     property_name: &str,
+    allow_missing: bool,
 ) -> Result<TypeId, SourceCheckError> {
     let (any, error, undefined, unknown) = store
         .intrinsic_bootstrap()
@@ -35109,6 +35116,17 @@ fn object_binding_property_type(
         } else {
             Ok(property.type_)
         };
+    }
+
+    if allow_missing
+        && store
+            .type_payload(receiver)
+            .is_some_and(|record| record.object_flags().contains(ObjectFlags::OBJECT_LITERAL))
+    {
+        return Ok(store
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?
+            .undefined_type);
     }
 
     let receiver = super::formatter::type_to_string_with_host_global_types_and_flags(
@@ -50142,6 +50160,7 @@ pub(super) fn check_source_file(
                             receiver,
                             parent.property,
                             &parent.property_name,
+                            false,
                         )?;
                     }
 
@@ -50181,6 +50200,7 @@ pub(super) fn check_source_file(
                                 receiver,
                                 key.node,
                                 &name,
+                                element.initializer.is_some(),
                             )?
                         } else {
                             let checked = check_computed_binding_element(
@@ -50210,6 +50230,7 @@ pub(super) fn check_source_file(
                             receiver,
                             binding.property,
                             &binding.property_name,
+                            false,
                         )?
                     };
                     if let Some(default) = &element.initializer {
@@ -84901,6 +84922,77 @@ class Foo2 {
     }
 
     #[test]
+    fn computed_binding_literal_defaults_allow_missing_object_properties() {
+        for (index, strict_null_checks) in [false, true].into_iter().enumerate() {
+            let source = parsed(concat!(
+                "const key = 'missing'; ",
+                "const { [key]: selected = 1 } = {}; ",
+                "const { ['direct']: direct = 'fallback', [42]: numeric = 2 } = {};",
+            ));
+            let file = FileId::new(10_415 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            assert!(context.diagnostics().is_empty());
+            for (name, expected) in [
+                ("selected", "1"),
+                ("direct", "\"fallback\""),
+                ("numeric", "2"),
+            ] {
+                assert_eq!(
+                    context
+                        .type_to_string(object_binding_value_type(&context, &source, file, name))
+                        .unwrap(),
+                    expected,
+                );
+            }
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn computed_binding_bigint_literals_use_the_primitive_index_diagnostic_name() {
+        let source = parsed(concat!(
+            "const { [1n]: direct } = {}; ",
+            "const key = 1n; const { [key]: indirect } = {};",
+        ));
+        let file = FileId::new(10_417);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [direct_name, direct_index, indirect_name, indirect_index] =
+            context.diagnostics().as_slice()
+        else {
+            panic!("expected a computed-name and index diagnostic for each bigint key")
+        };
+        assert_eq!(direct_name.diagnostic.code(), 2464);
+        assert_eq!(node_text(&source, direct_name.node.unwrap()), "[1n]");
+        assert_eq!(direct_index.diagnostic.code(), 2538);
+        assert_eq!(node_text(&source, direct_index.node.unwrap()), "1n");
+        assert_eq!(direct_index.diagnostic.arguments, ["bigint"]);
+        assert_eq!(indirect_name.diagnostic.code(), 2464);
+        assert_eq!(node_text(&source, indirect_name.node.unwrap()), "[key]");
+        assert_eq!(indirect_index.diagnostic.code(), 2538);
+        assert_eq!(indirect_index.diagnostic.arguments, ["1n"]);
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn computed_binding_any_indices_use_signatures_and_keep_any_recovery() {
         let source = parsed(concat!(
             "declare const key: any; ",
@@ -84937,6 +85029,116 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn computed_binding_any_indices_reject_changed_source_annotations() {
+        for (index, (annotation, change_key, change_annotation_cache)) in [
+            ("number", false, false),
+            ("number", true, false),
+            ("Value", false, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(&format!(
+                "type Value = number; declare const key: any; \
+                 declare const input: {{ [name: string]: {annotation} }}; \
+                 const {{ [key]: first, [key]: second }} = input;",
+            ));
+            let file = FileId::new(10_418 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let receiver = variable_value_type(&context, &source, file, "input");
+            let binding = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::BindingElement).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let (members, properties, declaration) = {
+                let structured = context
+                    .store()
+                    .type_payload(receiver)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap();
+                let [index] = structured.index_infos.as_deref().unwrap() else {
+                    panic!("expected the declared string index")
+                };
+                (
+                    structured.members,
+                    structured.properties.clone(),
+                    context.store().index_info(*index).unwrap().declaration(),
+                )
+            };
+            let (any, string, number) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.any_type,
+                    bootstrap.string_type,
+                    bootstrap.number_type,
+                )
+            };
+            let replacement = context
+                .store_mut_for_test()
+                .alloc_index_info(
+                    if change_key { number } else { string },
+                    if change_key { number } else { string },
+                    false,
+                    declaration,
+                    Vec::new(),
+                )
+                .unwrap();
+            assert!(context.store_mut_for_test().set_structured_type_members(
+                receiver,
+                members,
+                properties,
+                None,
+                None,
+                Some(vec![replacement]),
+            ));
+            if change_annotation_cache {
+                let declaration = declaration.unwrap();
+                let NodeData::IndexSignatureDeclaration(signature) =
+                    &source.arena.get(declaration.node).unwrap().data
+                else {
+                    unreachable!()
+                };
+                let value = NodeRef::new(source.arena.id(), file, signature.type_);
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    value,
+                    TypeNodeLinks {
+                        resolved_type: Some(string),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+            }
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new([(&source.arena, &bound)]).unwrap();
+            let globals = context.global_types().clone();
+            let before = observable_state(&context, file);
+
+            assert!(
+                check_computed_binding_element(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    CanonicalCheckerOptions::default(),
+                    binding,
+                    receiver,
+                    any,
+                )
+                .is_err()
+            );
+            assert_eq!(observable_state(&context, file), before);
+        }
     }
 
     #[test]
