@@ -19,7 +19,7 @@ use ts_binder::{
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
-    DeclaredTypeUnavailable, SignatureId, TypeId,
+    DeclaredTypeUnavailable, SignatureId, TypeId, TypeResolutionTarget, TypeSystemPropertyName,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     callables::{
@@ -44,8 +44,8 @@ use super::{
     signatures::{ElementFlags, Signature, SignatureFlags, TypePredicateKind},
     store::{
         PreparedSourceGenericCallablePublication, ResolvedSourceCallableTypeParameter,
-        SemanticStore, SourceCallableProvenance, SourceCallableReturnProvenance,
-        SourceCallableTypeParameterProvenance, SourceNodeParent,
+        SemanticStore, SourceCallableInferredReturnCycle, SourceCallableProvenance,
+        SourceCallableReturnProvenance, SourceCallableTypeParameterProvenance, SourceNodeParent,
     },
     type_records::{
         ConstrainedTypeData, InterfaceTypeData, StructuredTypeData, TypeCacheState, TypeData,
@@ -9606,6 +9606,144 @@ pub(super) fn publish_inferred_source_callable_return(
     }
 }
 
+fn inferred_return_cycle_graph_is_exact(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    cycle: SourceCallableInferredReturnCycle,
+) -> bool {
+    let Some(provenance) = store.source_callable_provenance(cycle.callable) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(variable)) = store.source_node_parent(cycle.declaration)
+    else {
+        return false;
+    };
+    let Some(variable_symbol) = store.symbol(cycle.variable) else {
+        return false;
+    };
+    provenance.family == SourceCallableFamily::ArrowFunction
+        && provenance.declaration == cycle.declaration
+        && provenance.signature == signature
+        && provenance.owner_symbol != cycle.variable
+        && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+        && provenance.contextual_target.is_none()
+        && provenance.contextual_variable.is_none()
+        && store.source_callable_type_for_signature(signature) == Some(cycle.callable)
+        && store.source_callable_type_for_declaration(cycle.declaration) == Some(cycle.callable)
+        && store.source_callable_type_for_owner(provenance.owner_symbol) == Some(cycle.callable)
+        && store.source_node_kind(cycle.declaration) == Some(SyntaxKind::ArrowFunction)
+        && store.source_node_kind(variable) == Some(SyntaxKind::VariableDeclaration)
+        && variable_symbol.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+        && variable_symbol.check_flags() == CheckFlags::NONE
+        && variable_symbol.declarations() == Some(&[variable])
+        && variable_symbol.value_declaration() == Some(variable)
+        && variable_symbol.members().is_none()
+        && variable_symbol.exports().is_none()
+        && variable_symbol.parent().is_none()
+        && variable_symbol.export_symbol().is_none()
+        && store.get_merged_symbol(cycle.variable) == Some(cycle.variable)
+        && store.source_node_kind(cycle.body) == Some(SyntaxKind::SatisfiesExpression)
+        && store.source_node_parent(cycle.body) == Some(SourceNodeParent::Parent(cycle.declaration))
+        && store.source_node_kind(cycle.query) == Some(SyntaxKind::TypeQuery)
+        && store.source_node_parent(cycle.query) == Some(SourceNodeParent::Parent(cycle.body))
+        && store.source_node_kind(cycle.query_name) == Some(SyntaxKind::Identifier)
+        && store.source_node_parent(cycle.query_name) == Some(SourceNodeParent::Parent(cycle.query))
+        && cycle.body_type != cycle.callable
+        && store.type_payload(cycle.body_type).is_some()
+        && store.type_node_links(cycle.body)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(cycle.body_type),
+                ..TypeNodeLinks::default()
+            })
+        && store.type_node_links(cycle.query)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(cycle.callable),
+                ..TypeNodeLinks::default()
+            })
+        && store
+            .symbol_node_links(cycle.query)
+            .is_none_or(|links| links == &SymbolNodeLinks::default())
+        && store.symbol_node_links(cycle.query_name)
+            == Some(&SymbolNodeLinks {
+                resolved_symbol: Some(cycle.variable),
+            })
+        && store
+            .type_node_links(cycle.declaration)
+            .is_none_or(|links| {
+                links == &TypeNodeLinks::default()
+                    || links
+                        == &(TypeNodeLinks {
+                            resolved_type: Some(cycle.callable),
+                            ..TypeNodeLinks::default()
+                        })
+            })
+        && store
+            .value_symbol_links(cycle.variable)
+            .is_none_or(|links| {
+                links == &ValueSymbolLinks::default()
+                    || links
+                        == &(ValueSymbolLinks {
+                            resolved_type: Some(cycle.callable),
+                            ..ValueSymbolLinks::default()
+                        })
+            })
+}
+
+/// Checks the retained source links for an inferred return recovered after a cycle.
+pub(super) fn validate_stored_inferred_return_cycle(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+) -> Option<SourceCallableInferredReturnCycle> {
+    let cycle = store.inferred_source_return_cycle(signature)?;
+    (store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+        store
+            .signature(signature)
+            .and_then(Signature::resolved_return_type)
+            == Some(bootstrap.any_type)
+    }) && inferred_return_cycle_graph_is_exact(store, signature, cycle))
+    .then_some(cycle)
+}
+
+/// Publishes recovery only when a nested demand reaches an active inferred return.
+pub(super) fn publish_circular_inferred_source_callable_return(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &SourceCallablePlan,
+    signature: SignatureId,
+    cycle: SourceCallableInferredReturnCycle,
+) -> Result<TypeId, SourceCallableError> {
+    let invalid = || {
+        invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        ))
+    };
+    if validate_inferred_source_callable_return(store, plan, signature)?.is_some()
+        || !store.is_signature_return_resolving(signature)
+        || !plan.type_parameters.is_empty()
+        || !plan.parameters.is_empty()
+        || plan.declaration != cycle.declaration
+        || plan.body != cycle.body
+        || !inferred_return_cycle_graph_is_exact(store, signature, cycle)
+        || !store.try_reserve_circular_return_signatures(1)
+    {
+        return Err(invalid());
+    }
+    let any = store.intrinsic_bootstrap().ok_or_else(&invalid)?.any_type;
+    if store
+        .push_type_resolution(
+            TypeResolutionTarget::Signature(signature),
+            TypeSystemPropertyName::ResolvedReturnType,
+        )
+        .map_err(DeclaredTypeError::from)?
+    {
+        let _ = store.pop_type_resolution();
+        return Err(invalid());
+    }
+    if !store.set_source_callable_circular_inferred_return_type(signature, cycle) {
+        return Err(invalid());
+    }
+    Ok(any)
+}
+
 pub(super) fn source_callable_display_projection(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -9902,7 +10040,8 @@ pub(super) fn validate_stored_source_callable(
                             &type_parameter_edges,
                         ))
                 && provenance.generic_return_type_parameter.is_none()
-                && !store.signature_has_circular_return_type(signature)
+                && (!store.signature_has_circular_return_type(signature)
+                    || validate_stored_inferred_return_cycle(store, signature).is_some())
         }
     };
     let mut edges =
@@ -10229,6 +10368,9 @@ pub(super) fn validate_stored_source_callable(
             && !super::enums::is_canonical_enum_union(store, return_type)
         {
             edges.push(return_type);
+        }
+        if let Some(cycle) = validate_stored_inferred_return_cycle(store, signature) {
+            edges.push(cycle.body_type);
         }
         return StoredSourceCallableValidation::Valid(edges);
     }
@@ -11258,6 +11400,8 @@ fn validate_cached_return_type(
         });
         let valid = stored_annotation.is_none()
             && circular_annotation.is_none()
+            && (!store.signature_has_circular_return_type(signature)
+                || validate_stored_inferred_return_cycle(store, signature).is_some())
             && (plan.type_parameters.is_empty()
                 || valid_inferred_generic_source_callable(store, plan))
             && resolved_valid;

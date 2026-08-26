@@ -166,6 +166,24 @@ pub(super) enum SourceCallableReturnProvenance {
     Inferred,
 }
 
+/// Source links retained when a real inferred-return cycle recovers to `any`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableInferredReturnCycle {
+    pub(super) callable: TypeId,
+    pub(super) declaration: NodeRef,
+    pub(super) body: NodeRef,
+    pub(super) body_type: TypeId,
+    pub(super) query: NodeRef,
+    pub(super) query_name: NodeRef,
+    pub(super) variable: SemanticSymbolId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CircularReturnProvenance {
+    Annotation(TypeId),
+    Inferred(SourceCallableInferredReturnCycle),
+}
+
 impl SourceCallableFamily {
     pub(super) const fn syntax_kind(self) -> SyntaxKind {
         match self {
@@ -490,7 +508,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     properties_types: HashMap<PropertiesTypeCacheKey, TypeId>,
     function_signature_return_annotations: HashMap<SignatureId, (NodeRef, bool)>,
     callable_signature_parameter_types: HashMap<SignatureId, Vec<TypeId>>,
-    circular_return_signatures: HashMap<SignatureId, TypeId>,
+    circular_return_signatures: HashMap<SignatureId, CircularReturnProvenance>,
     canonical_tuple_targets: HashMap<CanonicalTupleTargetKey, CanonicalTupleTargetProvenance>,
     canonical_empty_tuple: Option<CanonicalEmptyTupleProvenance>,
     pub(super) intersection_types: HashMap<IntersectionTypeCacheKey, TypeId>,
@@ -2300,6 +2318,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         type_: TypeId,
         replacement: Option<SourceCallableProvenance>,
     ) -> Option<SourceCallableProvenance> {
+        if self.source_callable_provenance.get(&type_).copied() != replacement
+            && let Some(provenance) = self.source_callable_provenance.get(&type_).copied()
+        {
+            self.invalidate_inferred_return_cycles_for_node(provenance.declaration, None);
+        }
         match replacement {
             Some(replacement) => self.source_callable_provenance.insert(type_, replacement),
             None => self.source_callable_provenance.remove(&type_),
@@ -2312,6 +2335,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         declaration: NodeRef,
         replacement: Option<TypeId>,
     ) -> Option<TypeId> {
+        if self
+            .source_callable_types_by_declaration
+            .get(&declaration)
+            .copied()
+            != replacement
+        {
+            self.invalidate_inferred_return_cycles_for_node(declaration, None);
+        }
         match replacement {
             Some(replacement) => self
                 .source_callable_types_by_declaration
@@ -3569,6 +3600,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         symbol: SemanticSymbolId,
     ) -> Option<Option<SemanticSymbolId>> {
         let previous = self.symbols.insert_symbol(table, name, symbol)?;
+        if let Some(previous) = previous.filter(|previous| *previous != symbol) {
+            self.invalidate_inferred_return_cycles_for_symbol(previous, None);
+        }
         if self.relation_observable_symbol_tables.contains(&table) && previous != Some(symbol) {
             self.mark_relation_inputs_dirty();
         }
@@ -3588,12 +3622,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         flags: SymbolFlags,
         check_flags: CheckFlags,
     ) -> bool {
-        let relation_dirty = self.relation_observable_symbols.contains(&symbol)
-            && self.symbol(symbol).is_some_and(|current| {
-                current.flags() != flags || current.check_flags() != check_flags
-            });
+        let changed = self.symbol(symbol).is_some_and(|current| {
+            current.flags() != flags || current.check_flags() != check_flags
+        });
+        let relation_dirty = self.relation_observable_symbols.contains(&symbol) && changed;
         if !self.symbols.set_symbol_flags(symbol, flags, check_flags) {
             return false;
+        }
+        if changed {
+            self.invalidate_inferred_return_cycles_for_symbol(symbol, None);
         }
         if relation_dirty {
             self.mark_relation_inputs_dirty();
@@ -3631,16 +3668,19 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         declarations: Option<Vec<NodeRef>>,
         value_declaration: Option<NodeRef>,
     ) -> bool {
-        let relation_dirty = self.relation_observable_symbols.contains(&symbol)
-            && self.symbol(symbol).is_some_and(|current| {
-                current.declarations() != declarations.as_deref()
-                    || current.value_declaration() != value_declaration
-            });
+        let changed = self.symbol(symbol).is_some_and(|current| {
+            current.declarations() != declarations.as_deref()
+                || current.value_declaration() != value_declaration
+        });
+        let relation_dirty = self.relation_observable_symbols.contains(&symbol) && changed;
         if !self
             .symbols
             .set_symbol_declarations(symbol, declarations, value_declaration)
         {
             return false;
+        }
+        if changed {
+            self.invalidate_inferred_return_cycles_for_symbol(symbol, None);
         }
         if relation_dirty {
             self.mark_relation_inputs_dirty();
@@ -3659,18 +3699,21 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         parent: Option<SemanticSymbolId>,
         export_symbol: Option<SemanticSymbolId>,
     ) -> bool {
-        let relation_dirty = self.relation_observable_symbols.contains(&symbol)
-            && self.symbol(symbol).is_some_and(|current| {
-                current.members() != members
-                    || current.exports() != exports
-                    || current.parent() != parent
-                    || current.export_symbol() != export_symbol
-            });
+        let changed = self.symbol(symbol).is_some_and(|current| {
+            current.members() != members
+                || current.exports() != exports
+                || current.parent() != parent
+                || current.export_symbol() != export_symbol
+        });
+        let relation_dirty = self.relation_observable_symbols.contains(&symbol) && changed;
         if !self
             .symbols
             .set_symbol_relationships(symbol, members, exports, parent, export_symbol)
         {
             return false;
+        }
+        if changed {
+            self.invalidate_inferred_return_cycles_for_symbol(symbol, None);
         }
         if relation_dirty {
             self.mark_relation_inputs_dirty();
@@ -3738,6 +3781,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .is_none_or(|current| current != &links);
         let relation_dirty = self.relation_observable_nodes.contains(&node) && changed;
         self.links.symbol_node.replace_key(node, links);
+        if changed {
+            self.invalidate_inferred_return_cycles_for_node(node, None);
+        }
         if relation_dirty {
             self.mark_relation_inputs_dirty();
         }
@@ -3776,7 +3822,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         });
         let relation_dirty = self.relation_observable_nodes.contains(&node) && changed;
         let dirty = self.node_has_callable_ancestor(node) && published && changed;
+        let published_type = links
+            .outer_type_parameters
+            .is_none()
+            .then_some(links.resolved_type)
+            .flatten();
         self.links.type_node.replace_key(node, links);
+        if changed {
+            self.invalidate_inferred_return_cycles_for_node(node, published_type);
+        }
         if relation_dirty {
             self.mark_relation_inputs_dirty();
         }
@@ -3868,6 +3922,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             && published
             && changed;
         self.links.signature.replace_key(node, links);
+        if changed {
+            self.invalidate_inferred_return_cycles_for_node(node, None);
+        }
         if relation_dirty {
             self.mark_relation_inputs_dirty();
         }
@@ -3954,7 +4011,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || self.symbol_is_source_callable_owner(symbol))
             && published
             && changed;
+        let published_type = links.resolved_type.filter(|type_| {
+            links
+                == (ValueSymbolLinks {
+                    resolved_type: Some(*type_),
+                    ..ValueSymbolLinks::default()
+                })
+        });
         self.links.value_symbol.replace_key(symbol, links);
+        if changed {
+            self.invalidate_inferred_return_cycles_for_symbol(symbol, published_type);
+        }
         if relation_dirty {
             self.mark_relation_inputs_dirty();
         }
@@ -5676,7 +5743,129 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     pub(super) fn circular_return_annotation_type(&self, id: SignatureId) -> Option<TypeId> {
         self.observe_relation_signature_read(id);
-        self.circular_return_signatures.get(&id).copied()
+        match self.circular_return_signatures.get(&id)? {
+            CircularReturnProvenance::Annotation(type_) => Some(*type_),
+            CircularReturnProvenance::Inferred(_) => None,
+        }
+    }
+
+    pub(super) fn inferred_source_return_cycle(
+        &self,
+        id: SignatureId,
+    ) -> Option<SourceCallableInferredReturnCycle> {
+        self.observe_relation_signature_read(id);
+        match self.circular_return_signatures.get(&id)? {
+            CircularReturnProvenance::Inferred(cycle) => Some(*cycle),
+            CircularReturnProvenance::Annotation(_) => None,
+        }
+    }
+
+    fn invalidate_inferred_return_cycles_for_node(
+        &mut self,
+        node: NodeRef,
+        published_type: Option<TypeId>,
+    ) {
+        let signatures = self
+            .circular_return_signatures
+            .iter()
+            .filter_map(|(signature, provenance)| {
+                let CircularReturnProvenance::Inferred(cycle) = provenance else {
+                    return None;
+                };
+                if node == cycle.declaration && published_type == Some(cycle.callable) {
+                    return None;
+                }
+                let mut current = Some(node);
+                while let Some(candidate) = current {
+                    if candidate == cycle.declaration {
+                        return Some(*signature);
+                    }
+                    current = match self.source_node_parent(candidate) {
+                        Some(SourceNodeParent::Parent(parent)) => Some(parent),
+                        _ => None,
+                    };
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_inferred_return_cycles(&signatures);
+    }
+
+    fn invalidate_inferred_return_cycles(&mut self, signatures: &[SignatureId]) {
+        for signature in signatures {
+            self.circular_return_signatures.remove(signature);
+            let cleared = self.signatures.set_resolved_return_type(*signature, None);
+            debug_assert!(cleared, "a retained cycle owns its signature");
+        }
+        if !signatures.is_empty() {
+            self.mark_relation_inputs_dirty();
+            self.mark_union_cache_validation_dirty();
+        }
+    }
+
+    fn invalidate_inferred_return_cycles_for_symbol(
+        &mut self,
+        symbol: SemanticSymbolId,
+        published_type: Option<TypeId>,
+    ) {
+        let signatures = self
+            .circular_return_signatures
+            .iter()
+            .filter_map(|(signature, provenance)| {
+                let CircularReturnProvenance::Inferred(cycle) = provenance else {
+                    return None;
+                };
+                let owner = self
+                    .source_callable_provenance
+                    .get(&cycle.callable)
+                    .map(|provenance| provenance.owner_symbol);
+                ((cycle.variable == symbol || owner == Some(symbol))
+                    && published_type != Some(cycle.callable))
+                .then_some(*signature)
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_inferred_return_cycles(&signatures);
+    }
+
+    pub(super) fn set_source_callable_circular_inferred_return_type(
+        &mut self,
+        id: SignatureId,
+        cycle: SourceCallableInferredReturnCycle,
+    ) -> bool {
+        let Some(any) = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .map(|bootstrap| bootstrap.any_type)
+        else {
+            return false;
+        };
+        let valid = self.signature_is_callable(id)
+            && !self.function_signature_return_annotations.contains_key(&id)
+            && self.types.get(cycle.body_type).is_some()
+            && self
+                .source_callable_provenance
+                .get(&cycle.callable)
+                .is_some_and(|provenance| {
+                    provenance.signature == id
+                        && provenance.declaration == cycle.declaration
+                        && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                })
+            && self
+                .signature(id)
+                .is_some_and(|signature| signature.resolved_return_type().is_none())
+            && !self.circular_return_signatures.contains_key(&id);
+        if !valid {
+            return false;
+        }
+        self.circular_return_signatures
+            .insert(id, CircularReturnProvenance::Inferred(cycle));
+        let published = self.signatures.set_resolved_return_type(id, Some(any));
+        debug_assert!(published, "the inferred source signature was validated");
+        if self.relation_signature_is_observable(id) {
+            self.mark_relation_inputs_dirty();
+        }
+        self.mark_union_cache_validation_dirty();
+        true
     }
 
     pub(super) fn set_function_signature_circular_return_type(
@@ -5699,7 +5888,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !valid {
             return false;
         }
-        let previous = self.circular_return_signatures.insert(id, annotation_type);
+        let previous = self
+            .circular_return_signatures
+            .insert(id, CircularReturnProvenance::Annotation(annotation_type));
         assert!(
             previous.is_none(),
             "the circular-return marker was checked absent"
@@ -8470,6 +8661,34 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             })
     }
 
+    pub(super) fn is_signature_return_resolving(&self, signature: SignatureId) -> bool {
+        self.signature(signature)
+            .is_some_and(|record| record.resolved_return_type().is_none())
+            && self
+                .type_resolutions
+                .find_cycle_start_index(
+                    TypeResolutionTarget::Signature(signature),
+                    TypeSystemPropertyName::ResolvedReturnType,
+                    |target, property| {
+                        canonical_resolution_has_property_readonly(
+                            &self.links,
+                            &self.types,
+                            &self.signatures,
+                            target,
+                            property,
+                        )
+                    },
+                )
+                .is_ok_and(|index| index.is_some())
+    }
+
+    pub(super) fn is_signature_return_inference_active(&self, signature: SignatureId) -> bool {
+        self.type_resolutions.contains(
+            TypeResolutionTarget::Signature(signature),
+            TypeSystemPropertyName::ResolvedReturnType,
+        )
+    }
+
     fn validate_canonical_resolution_target(
         &self,
         target: TypeResolutionTarget,
@@ -8558,6 +8777,51 @@ fn canonical_resolution_has_property(
                 .contains(super::links::NodeCheckFlags::INITIALIZER_IS_UNDEFINED_COMPUTED)
         }
         _ => unreachable!("target/property pairing was validated before stack mutation"),
+    }
+}
+
+fn canonical_resolution_has_property_readonly(
+    links: &CheckerLinkStores,
+    types: &TypedArena<TypeId, TypeRecord>,
+    signatures: &SignatureArena,
+    target: TypeResolutionTarget,
+    property: TypeSystemPropertyName,
+) -> bool {
+    match (target, property) {
+        (TypeResolutionTarget::Symbol(symbol), TypeSystemPropertyName::Type) => links
+            .value_symbol
+            .try_get(&symbol)
+            .is_some_and(|links| links.resolved_type.is_some()),
+        (TypeResolutionTarget::Symbol(symbol), TypeSystemPropertyName::DeclaredType) => links
+            .type_alias
+            .try_get(&symbol)
+            .is_some_and(|links| links.declared_type.is_some()),
+        (TypeResolutionTarget::Symbol(symbol), TypeSystemPropertyName::WriteType) => links
+            .value_symbol
+            .try_get(&symbol)
+            .is_some_and(|links| links.write_type.is_some()),
+        (TypeResolutionTarget::Symbol(symbol), TypeSystemPropertyName::AliasTarget) => links
+            .alias_symbol
+            .try_get(&symbol)
+            .is_some_and(|links| links.alias_target.has_property()),
+        (TypeResolutionTarget::Type(type_id), property) => types
+            .get(type_id)
+            .and_then(|record| canonical_type_resolution_property(record.data(), property))
+            .unwrap_or(false),
+        (
+            TypeResolutionTarget::Signature(signature),
+            TypeSystemPropertyName::ResolvedReturnType,
+        ) => signatures
+            .get(signature)
+            .is_some_and(|record| record.resolved_return_type().is_some()),
+        (TypeResolutionTarget::Node(node), TypeSystemPropertyName::InitializerIsUndefined) => {
+            links.node.try_get(&node).is_some_and(|links| {
+                links
+                    .flags
+                    .contains(super::links::NodeCheckFlags::INITIALIZER_IS_UNDEFINED_COMPUTED)
+            })
+        }
+        _ => false,
     }
 }
 

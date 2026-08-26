@@ -1154,6 +1154,16 @@ impl TypeResolutionStack {
         self.entries.is_empty()
     }
 
+    pub(super) fn contains(
+        &self,
+        target: TypeResolutionTarget,
+        property: TypeSystemPropertyName,
+    ) -> bool {
+        self.entries[self.resolution_start..]
+            .iter()
+            .any(|entry| entry.target == target && entry.property == property)
+    }
+
     #[must_use]
     pub(super) const fn resolution_start(&self) -> usize {
         self.resolution_start
