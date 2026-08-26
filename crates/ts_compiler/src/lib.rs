@@ -1388,6 +1388,17 @@ fn bundle_detached_comment(source: &SourceFile) -> Option<(String, u32)> {
     Some((format!("{comment}\n"), excluded_end))
 }
 
+// Matches the dependency phases in pinned parseTask.load and import resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SourceDependencyOrder {
+    PathReference(TextPos),
+    TypeReference(TextPos),
+    ImportHelper,
+    JsxRuntime,
+    StaticImport(TextPos),
+    DynamicImport(TextPos),
+}
+
 /// A compilation's parsed source-file graph.
 #[derive(Debug, Default)]
 pub struct Program {
@@ -1395,6 +1406,7 @@ pub struct Program {
     file_index: BTreeMap<String, usize>,
     root_file_names: BTreeSet<String>,
     ordered_root_file_names: Vec<String>,
+    source_dependencies: BTreeMap<FileId, Vec<(SourceDependencyOrder, FileId)>>,
     resolved_modules: BTreeMap<(String, String), String>,
     graph_resolution_options: Option<ResolutionOptions>,
     graph_resolutions: Vec<ProgramGraphResolution>,
@@ -1824,6 +1836,7 @@ impl Program {
                 &mut ambient_modules,
             );
             let containing_file = self.source_files[file_index].file_name.clone();
+            let containing_id = self.source_files[file_index].id;
             let implicit_jsx_runtime = {
                 let source = &self.source_files[file_index];
                 source_contains_jsx(&source.parse).then(|| {
@@ -1871,6 +1884,11 @@ impl Program {
                     self.resolved_modules
                         .insert((containing, specifier), target);
                     self.load_file(file_system, &resolved.resolved_file_name, false);
+                    self.record_source_dependency(
+                        containing_id,
+                        &resolved.resolved_file_name,
+                        SourceDependencyOrder::JsxRuntime,
+                    );
                 }
             }
             if !self
@@ -1913,6 +1931,11 @@ impl Program {
                     self.resolved_modules
                         .insert((containing, "tslib".to_owned()), target);
                     self.load_file(file_system, &resolved.resolved_file_name, false);
+                    self.record_source_dependency(
+                        containing_id,
+                        &resolved.resolved_file_name,
+                        SourceDependencyOrder::ImportHelper,
+                    );
                 }
             }
             let source_mode = self.canonical_emit_module_mode(&self.source_files[file_index]);
@@ -1931,7 +1954,14 @@ impl Program {
                 &self.source_files[file_index].parse,
                 is_javascript_file_name(&containing_file),
             );
-            for (specifier, range, can_resolve_ambient, side_effect_only) in specifiers {
+            for ModuleSpecifier {
+                text: specifier,
+                range,
+                can_resolve_ambient,
+                side_effect_only,
+                dependency_order,
+            } in specifiers
+            {
                 let mode = usage_modes
                     .iter()
                     .find_map(|(candidate, mode)| (*candidate == range).then_some(*mode))
@@ -2017,6 +2047,13 @@ impl Program {
                         .insert((containing, specifier.clone()), target);
                     let source_count_before_import = self.source_files.len();
                     self.load_file(file_system, &resolved.resolved_file_name, false);
+                    if let Some(order) = dependency_order {
+                        self.record_source_dependency(
+                            containing_id,
+                            &resolved.resolved_file_name,
+                            order,
+                        );
+                    }
                     for source_file in &self.source_files[source_count_before_import..] {
                         register_ambient_external_modules(
                             source_file,
@@ -2047,7 +2084,28 @@ impl Program {
             }
             file_index += 1;
         }
+        for dependencies in self.source_dependencies.values_mut() {
+            dependencies.sort_by_key(|(order, _)| *order);
+        }
         self.resolve_package_display_specifiers(&resolver);
+    }
+
+    fn record_source_dependency(
+        &mut self,
+        containing: FileId,
+        target: &str,
+        order: SourceDependencyOrder,
+    ) {
+        if self.options.no_resolve {
+            return;
+        }
+        let Some(target) = self.source_file(target).map(|source| source.id) else {
+            return;
+        };
+        self.source_dependencies
+            .entry(containing)
+            .or_default()
+            .push((order, target));
     }
 
     fn register_package_export_specifiers(
@@ -4457,17 +4515,45 @@ impl Program {
     }
 
     fn canonical_semantic_sources(&self) -> Vec<&SourceFile> {
-        let mut sources = self.source_files.iter().collect::<Vec<_>>();
+        let mut sources = self
+            .source_files
+            .iter()
+            .filter(|source| source.is_default_library)
+            .collect::<Vec<_>>();
         // Sort after graph loading so explicit roots and later reference-lib
         // dependencies share one priority order without changing file identities.
         sources.sort_by_key(|source| {
-            let priority = if source.is_default_library {
-                ts_bundled::library_priority(ts_path::base_file_name(&source.file_name))
-            } else {
-                0
-            };
-            (!source.is_default_library, priority)
+            ts_bundled::library_priority(ts_path::base_file_name(&source.file_name))
         });
+
+        let mut visited = vec![false; self.source_files.len()];
+        for source in &sources {
+            visited[source.id.index()] = true;
+        }
+        // Ordinary storage starts with explicit roots and automatic type roots.
+        // Mark before walking dependencies so shared imports and cycles stop.
+        let mut pending = Vec::new();
+        for root in &self.source_files {
+            pending.push((root.id, false));
+            while let Some((file, complete)) = pending.pop() {
+                if complete {
+                    sources.push(&self.source_files[file.index()]);
+                    continue;
+                }
+                if std::mem::replace(&mut visited[file.index()], true) {
+                    continue;
+                }
+                pending.push((file, true));
+                if let Some(dependencies) = self.source_dependencies.get(&file) {
+                    pending.extend(
+                        dependencies
+                            .iter()
+                            .rev()
+                            .map(|(_, target)| (*target, false)),
+                    );
+                }
+            }
+        }
         sources
     }
 
@@ -5942,6 +6028,7 @@ impl Program {
         file_index: usize,
     ) {
         let containing_file = self.source_files[file_index].file_name.clone();
+        let containing_id = self.source_files[file_index].id;
         let directives = reference_directives(&self.source_files[file_index].source_text);
         for directive in directives {
             match directive.kind {
@@ -5980,6 +6067,11 @@ impl Program {
                         }],
                     });
                     self.load_file(file_system, &file_name, true);
+                    self.record_source_dependency(
+                        containing_id,
+                        &file_name,
+                        SourceDependencyOrder::PathReference(directive.range.start),
+                    );
                 }
                 ReferenceKind::Types => {
                     let result =
@@ -5997,6 +6089,11 @@ impl Program {
                     );
                     if let Some(resolved) = result.resolved {
                         self.load_file(file_system, &resolved.resolved_file_name, false);
+                        self.record_source_dependency(
+                            containing_id,
+                            &resolved.resolved_file_name,
+                            SourceDependencyOrder::TypeReference(directive.range.start),
+                        );
                     } else if !source_ignores_processing_diagnostic(
                         &self.source_files[file_index],
                         directive.range,
@@ -9159,72 +9256,106 @@ fn javascript_require_module_specifier(parse: &ParseResult, statement: &Node) ->
     .then_some(*specifier)
 }
 
-fn module_specifiers(
+struct ModuleSpecifier {
+    text: String,
+    range: TextRange,
+    can_resolve_ambient: bool,
+    side_effect_only: bool,
+    dependency_order: Option<SourceDependencyOrder>,
+}
+
+fn parsed_module_specifier(
     parse: &ParseResult,
+    node: &Node,
     include_javascript_requires: bool,
-) -> Vec<(String, TextRange, bool, bool)> {
+) -> Option<ModuleSpecifier> {
+    let (text, range, can_resolve_ambient, side_effect_only) = match &node.data {
+        NodeData::ImportDeclaration(data) => string_literal(&parse.arena, data.module_specifier)
+            .map(|(specifier, range)| (specifier, range, true, data.import_clause.is_none())),
+        NodeData::ImportEqualsDeclaration(data) => parse
+            .arena
+            .get(data.module_reference)
+            .and_then(|reference| match &reference.data {
+                NodeData::ExternalModuleReference(reference) => {
+                    string_literal(&parse.arena, reference.expression)
+                }
+                _ => None,
+            })
+            .map(|(specifier, range)| (specifier, range, true, false)),
+        NodeData::ExportDeclaration(data) => data
+            .module_specifier
+            .and_then(|specifier| string_literal(&parse.arena, specifier))
+            .map(|(specifier, range)| (specifier, range, true, false)),
+        NodeData::ImportTypeNode(data) => {
+            let argument = match parse.arena.get(data.argument).map(|node| &node.data) {
+                Some(NodeData::LiteralTypeNode(literal)) => literal.literal,
+                _ => data.argument,
+            };
+            string_literal(&parse.arena, argument)
+                .map(|(specifier, range)| (specifier, range, true, false))
+        }
+        NodeData::CallExpression(data)
+            if matches!(
+                parse.arena.get(data.expression).map(|node| &node.data),
+                Some(NodeData::Identifier(identifier)) if identifier.text == "import"
+            ) =>
+        {
+            data.arguments
+                .nodes
+                .first()
+                .and_then(|argument| string_literal(&parse.arena, *argument))
+                .map(|(specifier, range)| (specifier, range, true, false))
+        }
+        NodeData::VariableStatement(_) if include_javascript_requires => {
+            javascript_require_module_specifier(parse, node)
+                .and_then(|specifier| string_literal(&parse.arena, specifier))
+                .map(|(specifier, range)| (specifier, range, true, false))
+        }
+        _ => None,
+    }?;
+    let dependency_order = if matches!(
+        node.data,
+        NodeData::ImportDeclaration(_)
+            | NodeData::ImportEqualsDeclaration(_)
+            | NodeData::ExportDeclaration(_)
+    ) {
+        SourceDependencyOrder::StaticImport(range.start)
+    } else {
+        SourceDependencyOrder::DynamicImport(range.start)
+    };
+    Some(ModuleSpecifier {
+        text,
+        range,
+        can_resolve_ambient,
+        side_effect_only,
+        dependency_order: Some(dependency_order),
+    })
+}
+
+fn module_specifiers(parse: &ParseResult, is_javascript: bool) -> Vec<ModuleSpecifier> {
     let mut specifiers = parse
         .arena
         .iter()
-        .filter_map(|(_, node)| match &node.data {
-            NodeData::ImportDeclaration(data) => {
-                string_literal(&parse.arena, data.module_specifier).map(|(specifier, range)| {
-                    (specifier, range, true, data.import_clause.is_none())
-                })
-            }
-            NodeData::ImportEqualsDeclaration(data) => parse
-                .arena
-                .get(data.module_reference)
-                .and_then(|reference| match &reference.data {
-                    NodeData::ExternalModuleReference(reference) => {
-                        string_literal(&parse.arena, reference.expression)
-                    }
-                    _ => None,
-                })
-                .map(|(specifier, range)| (specifier, range, true, false)),
-            NodeData::ExportDeclaration(data) => data
-                .module_specifier
-                .and_then(|specifier| string_literal(&parse.arena, specifier))
-                .map(|(specifier, range)| (specifier, range, true, false)),
-            NodeData::ImportTypeNode(data) => {
-                let argument = match parse.arena.get(data.argument).map(|node| &node.data) {
-                    Some(NodeData::LiteralTypeNode(literal)) => literal.literal,
-                    _ => data.argument,
-                };
-                string_literal(&parse.arena, argument)
-                    .map(|(specifier, range)| (specifier, range, true, false))
-            }
-            NodeData::CallExpression(data)
-                if matches!(
-                    parse.arena.get(data.expression).map(|node| &node.data),
-                    Some(NodeData::Identifier(identifier)) if identifier.text == "import"
-                ) =>
-            {
-                data.arguments
-                    .nodes
-                    .first()
-                    .and_then(|argument| string_literal(&parse.arena, *argument))
-                    .map(|(specifier, range)| (specifier, range, true, false))
-            }
-            NodeData::VariableStatement(_) if include_javascript_requires => {
-                javascript_require_module_specifier(parse, node)
-                    .and_then(|specifier| string_literal(&parse.arena, specifier))
-                    .map(|(specifier, range)| (specifier, range, true, false))
-            }
-            _ => None,
-        })
+        .filter_map(|(_, node)| parsed_module_specifier(parse, node, is_javascript))
         .collect::<Vec<_>>();
     if let Some(source) = parse.arena.source_text() {
         for (specifier, range, can_resolve_ambient, side_effect_only) in
             jsdoc_import_specifiers(source)
         {
-            let already_parsed = specifiers.iter().any(|(existing, existing_range, _, _)| {
-                existing == &specifier
-                    && existing_range.start <= range.start
-                    && existing_range.end >= range.end
+            let already_parsed = specifiers.iter().any(|existing| {
+                existing.text == specifier
+                    && existing.range.start <= range.start
+                    && existing.range.end >= range.end
             });
             if !already_parsed {
-                specifiers.push((specifier, range, can_resolve_ambient, side_effect_only));
+                specifiers.push(ModuleSpecifier {
+                    text: specifier,
+                    range,
+                    can_resolve_ambient,
+                    side_effect_only,
+                    dependency_order: is_javascript
+                        .then_some(SourceDependencyOrder::DynamicImport(range.start)),
+                });
             }
         }
     }
@@ -13530,8 +13661,295 @@ mod tests {
                         "lib.es2015.symbol.wellknown.d.ts",
                         "lib.decorators.d.ts",
                         "lib.decorators.legacy.d.ts",
+                        "dependency.ts",
                         "input.ts",
                         "other.ts",
+                    ],
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Some(()));
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+    }
+
+    fn canonical_source_order_options() -> CompilerOptions {
+        CompilerOptions {
+            lib: Some(vec!["es5".to_owned()]),
+            module: ModuleKind::EsNext,
+            module_resolution: ModuleResolutionKind::Bundler,
+            ..CompilerOptions::default()
+        }
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_follows_imports_and_repeated_roots() {
+        let fs = MemoryFileSystem::new(true);
+        for (name, text) in [
+            ("input.ts", "import './z'; import './a'; export {};"),
+            ("other.ts", "export {};"),
+            ("z.ts", "import './shared'; export {};"),
+            ("a.ts", "import './shared'; export {};"),
+            ("shared.ts", "export {};"),
+        ] {
+            fs.write_file(&format!("/project/{name}"), text).unwrap();
+        }
+        for (roots, expected) in [
+            (
+                vec!["input.ts", "other.ts", "input.ts", "z.ts"],
+                ["shared.ts", "z.ts", "a.ts", "input.ts", "other.ts"],
+            ),
+            (
+                vec!["other.ts", "a.ts", "input.ts", "z.ts", "a.ts"],
+                ["other.ts", "shared.ts", "a.ts", "z.ts", "input.ts"],
+            ),
+        ] {
+            let roots = roots.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+                &fs,
+                "/project",
+                &roots,
+                canonical_source_order_options(),
+                |program, queries| {
+                    let expected = [
+                        "lib.es5.d.ts",
+                        "lib.decorators.d.ts",
+                        "lib.decorators.legacy.d.ts",
+                    ]
+                    .into_iter()
+                    .chain(expected)
+                    .collect::<Vec<_>>();
+                    assert_canonical_semantic_order(program, queries, &expected);
+                },
+            )
+            .unwrap();
+            assert_eq!(result, Some(()));
+            assert!(
+                program.diagnostics().is_empty(),
+                "{:?}",
+                program.diagnostics()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_stops_import_cycles_on_first_visit() {
+        let fs = MemoryFileSystem::new(true);
+        for (name, text) in [
+            (
+                "a.ts",
+                "import './b'; import './c'; import './a'; export {};",
+            ),
+            ("b.ts", "import './c'; import './a'; export {};"),
+            ("c.ts", "import './b'; export {};"),
+            ("other.ts", "import './c'; export {};"),
+        ] {
+            fs.write_file(&format!("/project/{name}"), text).unwrap();
+        }
+        let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["a.ts".to_owned(), "other.ts".to_owned(), "b.ts".to_owned()],
+            canonical_source_order_options(),
+            |program, queries| {
+                assert_canonical_semantic_order(
+                    program,
+                    queries,
+                    &[
+                        "lib.es5.d.ts",
+                        "lib.decorators.d.ts",
+                        "lib.decorators.legacy.d.ts",
+                        "c.ts",
+                        "b.ts",
+                        "a.ts",
+                        "other.ts",
+                    ],
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Some(()));
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_groups_path_and_type_references_before_imports() {
+        let fs = MemoryFileSystem::new(true);
+        for (name, text) in [
+            (
+                "input.ts",
+                concat!(
+                    "/// <reference types=\"sample\" />\n",
+                    "/// <reference path=\"path-first\" />\n",
+                    "/// <reference path=\"path-second.ts\" />\n",
+                    "import './imported'; export {};",
+                ),
+            ),
+            ("other.ts", "export {};"),
+            (
+                "path-first.ts",
+                "/// <reference path=\"shared.ts\" />\nexport {};",
+            ),
+            ("path-second.ts", "import './shared'; export {};"),
+            ("shared.ts", "export {};"),
+            ("imported.ts", "export {};"),
+            ("node_modules/@types/sample/index.d.ts", "export {};"),
+        ] {
+            fs.write_file(&format!("/project/{name}"), text).unwrap();
+        }
+        let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["input.ts".to_owned(), "other.ts".to_owned()],
+            CompilerOptions {
+                types: Some(Vec::new()),
+                ..canonical_source_order_options()
+            },
+            |program, queries| {
+                assert_canonical_semantic_order(
+                    program,
+                    queries,
+                    &[
+                        "lib.es5.d.ts",
+                        "lib.decorators.d.ts",
+                        "lib.decorators.legacy.d.ts",
+                        "shared.ts",
+                        "path-first.ts",
+                        "path-second.ts",
+                        "index.d.ts",
+                        "imported.ts",
+                        "input.ts",
+                        "other.ts",
+                    ],
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Some(()));
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_visits_automatic_types_after_explicit_roots() {
+        let fs = MemoryFileSystem::new(true);
+        for (name, text) in [
+            ("input.ts", "import './dependency'; export {};"),
+            ("dependency.ts", "export {};"),
+            (
+                "node_modules/@types/sample/index.d.ts",
+                "/// <reference path=\"nested.d.ts\" />\nexport {};",
+            ),
+            ("node_modules/@types/sample/nested.d.ts", "export {};"),
+        ] {
+            fs.write_file(&format!("/project/{name}"), text).unwrap();
+        }
+        let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["input.ts".to_owned()],
+            CompilerOptions {
+                types: Some(vec!["sample".to_owned()]),
+                ..canonical_source_order_options()
+            },
+            |program, queries| {
+                assert_canonical_semantic_order(
+                    program,
+                    queries,
+                    &[
+                        "lib.es5.d.ts",
+                        "lib.decorators.d.ts",
+                        "lib.decorators.legacy.d.ts",
+                        "dependency.ts",
+                        "input.ts",
+                        "nested.d.ts",
+                        "index.d.ts",
+                    ],
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Some(()));
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_keeps_ambient_matches_out_of_dependency_edges() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.ts", "import 'ambient'; export {};")
+            .unwrap();
+        fs.write_file("/project/ambient.d.ts", "declare module 'ambient' {}")
+            .unwrap();
+        let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["input.ts".to_owned(), "ambient.d.ts".to_owned()],
+            CompilerOptions {
+                skip_lib_check: true,
+                ..canonical_source_order_options()
+            },
+            |program, queries| {
+                assert_canonical_semantic_order(
+                    program,
+                    queries,
+                    &[
+                        "lib.es5.d.ts",
+                        "lib.decorators.d.ts",
+                        "lib.decorators.legacy.d.ts",
+                        "input.ts",
+                        "ambient.d.ts",
+                    ],
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Some(()));
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_preserves_roots_with_no_resolve() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.ts", "import './dependency'; export {};")
+            .unwrap();
+        fs.write_file("/project/dependency.ts", "export {};")
+            .unwrap();
+        let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["input.ts".to_owned(), "dependency.ts".to_owned()],
+            CompilerOptions {
+                no_resolve: true,
+                ..canonical_source_order_options()
+            },
+            |program, queries| {
+                assert_canonical_semantic_order(
+                    program,
+                    queries,
+                    &[
+                        "lib.es5.d.ts",
+                        "lib.decorators.d.ts",
+                        "lib.decorators.legacy.d.ts",
+                        "input.ts",
                         "dependency.ts",
                     ],
                 );
@@ -13544,6 +13962,209 @@ mod tests {
             "{:?}",
             program.diagnostics()
         );
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_controls_merged_declarations() {
+        let fs = MemoryFileSystem::new(true);
+        for (name, text) in [
+            (
+                "input.d.ts",
+                "/// <reference path=\"dependency.d.ts\" />\ninterface Merged {}",
+            ),
+            ("other.d.ts", "interface Merged {}"),
+            ("dependency.d.ts", "interface Merged {}"),
+        ] {
+            fs.write_file(&format!("/project/{name}"), text).unwrap();
+        }
+        let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["input.d.ts".to_owned(), "other.d.ts".to_owned()],
+            CompilerOptions {
+                skip_lib_check: true,
+                ..canonical_source_order_options()
+            },
+            |program, queries| {
+                assert_canonical_semantic_order(
+                    program,
+                    queries,
+                    &[
+                        "lib.es5.d.ts",
+                        "lib.decorators.d.ts",
+                        "lib.decorators.legacy.d.ts",
+                        "dependency.d.ts",
+                        "input.d.ts",
+                        "other.d.ts",
+                    ],
+                );
+                let symbol = queries
+                    .context
+                    .store()
+                    .symbol_table(queries.context.globals())
+                    .unwrap()
+                    .get_source("Merged")
+                    .unwrap();
+                let files = queries
+                    .get_symbol_declarations(symbol)
+                    .unwrap()
+                    .iter()
+                    .map(|declaration| {
+                        assert!(program.node(*declaration).is_some());
+                        let source = program.source_file_by_id(declaration.file).unwrap();
+                        ts_path::base_file_name(&source.file_name)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(files, ["dependency.d.ts", "input.d.ts", "other.d.ts"]);
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Some(()));
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_places_helpers_before_jsx_and_explicit_imports() {
+        let fs = MemoryFileSystem::new(true);
+        for (name, text) in [
+            (
+                "input.tsx",
+                concat!(
+                    "import chosen from './dependency'; export const value = chosen;\n",
+                    "export const view = <div />;",
+                ),
+            ),
+            ("dependency.ts", "export default 1;"),
+            ("node_modules/tslib/index.d.ts", "export {};"),
+            ("node_modules/react/jsx-runtime.d.ts", "export {};"),
+        ] {
+            fs.write_file(&format!("/project/{name}"), text).unwrap();
+        }
+        let mut program = Program::new_unchecked_with_options_and_checker(
+            &fs,
+            "/project",
+            &["input.tsx".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::CommonJs,
+                module_resolution: ModuleResolutionKind::Node10,
+                jsx: ts_options::JsxEmit::ReactJsx,
+                import_helpers: true,
+                es_module_interop: true,
+                ..canonical_source_order_options()
+            },
+            super::ProgramChecker::Canonical,
+        );
+        program.load_remaining_program_graph(&fs);
+        let semantic = program
+            .canonical_semantic_sources()
+            .into_iter()
+            .map(|source| ts_path::base_file_name(&source.file_name))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            semantic,
+            [
+                "lib.es5.d.ts",
+                "lib.decorators.d.ts",
+                "lib.decorators.legacy.d.ts",
+                "index.d.ts",
+                "jsx-runtime.d.ts",
+                "dependency.ts",
+                "input.tsx",
+            ]
+        );
+        let storage = program
+            .source_files()
+            .iter()
+            .filter(|source| !source.is_default_library)
+            .map(|source| ts_path::base_file_name(&source.file_name))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            storage,
+            [
+                "input.tsx",
+                "jsx-runtime.d.ts",
+                "index.d.ts",
+                "dependency.ts"
+            ]
+        );
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_groups_static_and_dynamic_imports() {
+        for (input, text, roots, expected) in [
+            (
+                "input.ts",
+                concat!(
+                    "/** @typedef {import('./ignored').Ignored} Ignored */\n",
+                    "const early = import('./dynamic');\n",
+                    "import './static';\n",
+                    "type Loaded = import('./types').Item; export {};",
+                ),
+                vec!["input.ts", "ignored.ts"],
+                vec![
+                    "static.ts",
+                    "dynamic.ts",
+                    "types.ts",
+                    "input.ts",
+                    "ignored.ts",
+                ],
+            ),
+            (
+                "input.js",
+                concat!(
+                    "/** @typedef {import('./doc').Doc} Doc */\n",
+                    "const value = require('./required');\n",
+                    "import './static';",
+                ),
+                vec!["input.js"],
+                vec!["static.ts", "doc.ts", "required.ts", "input.js"],
+            ),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file(&format!("/project/{input}"), text).unwrap();
+            for (name, contents) in [
+                ("static.ts", "export {};"),
+                ("dynamic.ts", "export {};"),
+                ("types.ts", "export interface Item {}"),
+                ("ignored.ts", "export interface Ignored {}"),
+                ("doc.ts", "export interface Doc {}"),
+                ("required.ts", "export const value = 1;"),
+            ] {
+                fs.write_file(&format!("/project/{name}"), contents)
+                    .unwrap();
+            }
+            let roots = roots.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let mut program = Program::new_unchecked_with_options_and_checker(
+                &fs,
+                "/project",
+                &roots,
+                CompilerOptions {
+                    allow_js: input.ends_with(".js"),
+                    ..canonical_source_order_options()
+                },
+                super::ProgramChecker::Canonical,
+            );
+            program.load_remaining_program_graph(&fs);
+            let semantic = program
+                .canonical_semantic_sources()
+                .into_iter()
+                .map(|source| ts_path::base_file_name(&source.file_name))
+                .collect::<Vec<_>>();
+            let expected = [
+                "lib.es5.d.ts",
+                "lib.decorators.d.ts",
+                "lib.decorators.legacy.d.ts",
+            ]
+            .into_iter()
+            .chain(expected)
+            .collect::<Vec<_>>();
+            assert_eq!(semantic, expected, "{input}");
+            assert_eq!(program.source_files()[0].id, FileId::new(0));
+        }
     }
 
     #[test]
