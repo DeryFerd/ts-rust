@@ -25484,6 +25484,26 @@ mod generic_publication_tests {
             .store
             .create_direct_generic_reference_type(base, &parameters)
             .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for argument in plan
+            .heritage
+            .as_ref()
+            .unwrap()
+            .bases
+            .iter()
+            .flat_map(|base| &base.type_arguments)
+        {
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(*argument)
+            .unwrap();
+        }
+        assert!(diagnostics.is_empty());
         assert!(fixture.store.set_interface_base_resolution(
             target,
             true,
@@ -26563,6 +26583,24 @@ mod generic_publication_tests {
             .store
             .create_direct_generic_reference_type(dom_target, &[parameter])
             .unwrap();
+        for argument in plan
+            .heritage
+            .as_ref()
+            .unwrap()
+            .bases
+            .iter()
+            .flat_map(|base| &base.type_arguments)
+        {
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(*argument)
+            .unwrap();
+        }
         assert!(fixture.store.set_interface_base_resolution(
             target,
             true,
