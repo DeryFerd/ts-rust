@@ -1261,6 +1261,7 @@ pub(super) fn exact_global_date_initializer(
         .and_then(ts_binder::semantic::Symbol::members)
         .and_then(|members| store.symbol_table(members))
         .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+        .and_then(|signature| store.get_merged_symbol(signature))
     else {
         return false;
     };
@@ -1685,7 +1686,7 @@ fn plan_global_date_constructor(
         || annotation_name_record.kind != SyntaxKind::Identifier
         || annotation_name_record.parent != Some(annotation.node)
         || annotation_identifier.text != "DateConstructor"
-        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
         || owner_record.check_flags() != CheckFlags::NONE
         || owner_record.name().as_utf8() != Some("DateConstructor")
         || owner_record.parent().is_some()
@@ -5712,7 +5713,7 @@ pub(super) fn authenticated_global_date_constructor_return(
             != Some(&SymbolNodeLinks {
                 resolved_symbol: Some(owner),
             })
-        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
         || owner_record.check_flags() != CheckFlags::NONE
         || owner_record.name().as_utf8() != Some("DateConstructor")
         || owner_record
@@ -8216,6 +8217,7 @@ mod tests {
             authenticated_global_date_constructor_return(store, signature),
             Some(instance),
         );
+        assert!(exact_global_date_initializer(store, expression, instance));
         assert_eq!(
             store
                 .symbol(constructor_symbol)
@@ -8566,7 +8568,7 @@ mod tests {
 
         context.check_source_file(source_file).unwrap();
 
-        let (annotation, signature, instance, constructor, model_type) = {
+        let (owner, annotation, signature, instance, constructor, model_type) = {
             let store = context.store();
             let globals = store
                 .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
@@ -8600,12 +8602,20 @@ mod tests {
                 .declared_type_links(model)
                 .and_then(|links| links.declared_type)
                 .unwrap();
-            (annotation, signature, instance, constructor, model_type)
+            (
+                owner,
+                annotation,
+                signature,
+                instance,
+                constructor,
+                model_type,
+            )
         };
         let alias = context.store_mut_for_test().alloc_type_alias(None).unwrap();
+        let owner_flags = context.store().symbol(owner).unwrap().flags();
         assert_ne!(instance, constructor);
 
-        for poison in 0..3 {
+        for poison in 0..4 {
             match poison {
                 0 => assert!(context.store_mut_for_test().set_type_node_links(
                     annotation,
@@ -8624,6 +8634,11 @@ mod tests {
                         .store_mut_for_test()
                         .set_type_alias(constructor, Some(alias))
                 ),
+                3 => assert!(context.store_mut_for_test().set_symbol_flags(
+                    owner,
+                    owner_flags | SymbolFlags::CLASS,
+                    CheckFlags::NONE,
+                )),
                 _ => unreachable!("Date provider poison cases are bounded"),
             }
             let before = (
@@ -8674,6 +8689,11 @@ mod tests {
                         .store_mut_for_test()
                         .set_type_alias(constructor, None)
                 ),
+                3 => assert!(context.store_mut_for_test().set_symbol_flags(
+                    owner,
+                    owner_flags,
+                    CheckFlags::NONE,
+                )),
                 _ => unreachable!("Date provider poison cases are bounded"),
             }
             assert_eq!(
