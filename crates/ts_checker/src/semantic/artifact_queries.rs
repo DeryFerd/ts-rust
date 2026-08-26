@@ -215,6 +215,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some(type_) = self.declaration_method_artifact_type(node)? {
+            return Ok(type_);
+        }
+
         if supports_type_location(&self.validated_artifact_node(node)?.2.data)
             && let Some(type_) = self.cached_artifact_type(node)?
         {
@@ -242,7 +246,7 @@ impl CanonicalCheckerContext<'_> {
 
         if is_type_node {
             return self
-                .get_type_from_type_node(node)
+                .type_node_artifact_type(node)
                 .map_err(CanonicalArtifactQueryError::from)
                 .and_then(|type_| self.validate_artifact_type(node, type_));
         }
@@ -265,7 +269,7 @@ impl CanonicalCheckerContext<'_> {
                     LocationParent::TypeReference(_) | LocationParent::TypeQuery(_)
                 ) {
                     return self
-                        .get_type_from_type_node(parent_node)
+                        .type_node_artifact_type(parent_node)
                         .map_err(CanonicalArtifactQueryError::from)
                         .and_then(|type_| self.validate_artifact_type(node, type_));
                 }
@@ -399,6 +403,13 @@ impl CanonicalCheckerContext<'_> {
             Some(LocationParent::TypeReference(reference)) => {
                 if let Some(symbol) = self.cached_artifact_symbol(reference)? {
                     return Ok(Some(symbol));
+                }
+                if matches!(
+                    self.validated_artifact_node(node)?.2.data,
+                    NodeData::Identifier(_)
+                ) {
+                    return self
+                        .lexical_artifact_symbol(node, SymbolFlags::TYPE | SymbolFlags::ALIAS);
                 }
                 self.get_type_from_type_node(reference)?;
                 self.cached_artifact_symbol(reference)
@@ -1883,6 +1894,79 @@ impl CanonicalCheckerContext<'_> {
         Ok(None)
     }
 
+    fn type_node_artifact_type(&mut self, node: NodeRef) -> Result<TypeId, DeclaredTypeError> {
+        if self.store().source_node_kind(node) == Some(SyntaxKind::TypeReference) {
+            self.artifact_type_reference_identity(node)
+        } else {
+            self.get_type_from_type_node(node)
+        }
+    }
+
+    fn declaration_method_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let symbol = {
+            let (arena, bound, record) = self.validated_artifact_node(node)?;
+            if !bound
+                .source_facts()
+                .is_some_and(|facts| facts.is_declaration_file() || facts.is_default_library())
+            {
+                return Ok(None);
+            }
+            let declaration = if record.kind == SyntaxKind::MethodSignature {
+                node
+            } else {
+                let Some(parent) = record.parent else {
+                    return Ok(None);
+                };
+                let Some(parent_record) = arena.get(parent) else {
+                    return Err(CanonicalArtifactQueryError::ForeignNode(node));
+                };
+                if !matches!(&parent_record.data,
+                    NodeData::MethodSignatureDeclaration(method) if method.name == node.node)
+                {
+                    return Ok(None);
+                }
+                NodeRef::new(node.arena, node.file, parent)
+            };
+            bound
+                .symbol(declaration)
+                .ok_or(CanonicalArtifactQueryError::UnsupportedNode {
+                    node: declaration,
+                    kind: SyntaxKind::MethodSignature,
+                })?
+        };
+        let symbol = self.merged_artifact_symbol(node, symbol)?;
+        let selected = self
+            .store()
+            .late_bound_links(symbol)
+            .and_then(|links| links.late_symbol)
+            .unwrap_or(symbol);
+        if let Some(links) = self.store().type_node_links(node)
+            && links != &TypeNodeLinks::default()
+        {
+            let type_ =
+                links
+                    .resolved_type
+                    .ok_or(CanonicalArtifactQueryError::UnsupportedNode {
+                        node,
+                        kind: SyntaxKind::MethodSignature,
+                    })?;
+            if links.outer_type_parameters.is_some()
+                || self
+                    .store()
+                    .value_symbol_links(selected)
+                    .and_then(|value| value.resolved_type)
+                    != Some(type_)
+            {
+                return Err(CanonicalArtifactQueryError::InvalidType { node, type_ });
+            }
+        }
+        let type_ = self.artifact_interface_method_type(symbol)?;
+        self.validate_artifact_type(node, type_).map(Some)
+    }
+
     fn object_literal_property_type(
         &self,
         node: NodeRef,
@@ -1992,7 +2076,7 @@ impl CanonicalCheckerContext<'_> {
         let Some(annotation) = annotation else {
             return Ok(None);
         };
-        let type_ = self.get_type_from_type_node(annotation)?;
+        let type_ = self.type_node_artifact_type(annotation)?;
         self.validate_artifact_type(node, type_).map(Some)
     }
 
@@ -2334,6 +2418,70 @@ mod tests {
             .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
         CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
+    }
+
+    #[test]
+    fn declaration_method_location_rejects_cold_and_warm_cache_changes() {
+        for warm in [false, true] {
+            for paired in [false, true] {
+                let parsed = parse_source_file("interface Shape { run(): string; ignored(); }");
+                let file = FileId::new(6_130);
+                let mut context = declaration_context(&parsed, file);
+                let (declaration, name) = parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+                            return None;
+                        };
+                        let NodeData::Identifier(name) = &parsed.arena.get(method.name)?.data
+                        else {
+                            return None;
+                        };
+                        (name.text == "run").then_some((
+                            NodeRef::new(parsed.arena.id(), file, node),
+                            NodeRef::new(parsed.arena.id(), file, method.name),
+                        ))
+                    })
+                    .unwrap();
+                let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+                if warm {
+                    context.get_type_at_location(name).unwrap();
+                }
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    name,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+                if paired {
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(number),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                let before = (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                );
+                assert!(context.get_type_at_location(name).is_err());
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().signature_len(),
+                        context.store().checker_link_allocated_lengths(),
+                    ),
+                    before,
+                );
+                assert!(context.diagnostics().is_empty());
+            }
+        }
     }
 
     #[test]

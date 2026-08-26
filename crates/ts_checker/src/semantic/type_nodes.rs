@@ -20090,6 +20090,27 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         node: NodeRef,
     ) -> Result<TypeId, DeclaredTypeError> {
+        self.get_type_from_type_node_worker(node, false)
+    }
+
+    /// Resolves a reference identity without demanding interface member types.
+    pub(super) fn get_type_identity_from_type_reference(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        if preflight_node(self.store, self.host, node)?.kind != SyntaxKind::TypeReference {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        self.get_type_from_type_node_worker(node, true)
+    }
+
+    fn get_type_from_type_node_worker(
+        &mut self,
+        node: NodeRef,
+        lazy_interface_values: bool,
+    ) -> Result<TypeId, DeclaredTypeError> {
         self.require_type_reference_alias_root_capability(node)?;
         if !self.pending_function_parameters.is_empty() {
             return Err(type_node_unavailable(
@@ -20107,6 +20128,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             &self.type_reference_alias_targets,
         )
         .with_jsdoc_import_type_target(self.jsdoc_import_type_target);
+        planner.lazy_interface_values = lazy_interface_values;
         let direct_alias = planner.direct_type_alias_owner(node)?;
         if direct_alias.is_some() && !self.type_reference_alias_targets.is_empty() {
             self.reject_type_reference_alias_capabilities()?;
@@ -20238,6 +20260,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
         );
+        planner.lazy_interface_values = true;
         match method.kind {
             object_members::PropertyObjectKind::Interface => {
                 preflight_class_or_interface_reference(

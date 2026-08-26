@@ -994,6 +994,48 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             .map_err(SourceCheckError::from)
     }
 
+    pub(super) fn artifact_type_reference_identity(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        self.instantiation_session.reset_query();
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )?;
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            &mut self.store,
+            &host,
+            &self.global_types,
+            self.options,
+            &mut self.instantiation_session,
+            &mut self.diagnostics,
+        )?
+        .get_type_identity_from_type_reference(node)
+    }
+
+    pub(super) fn artifact_interface_method_type(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        self.instantiation_session.reset_query();
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )?;
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            &mut self.store,
+            &host,
+            &self.global_types,
+            self.options,
+            &mut self.instantiation_session,
+            &mut self.diagnostics,
+        )?
+        .get_type_of_interface_method(symbol)
+    }
+
     /// The immutable, checker-owned module-resolution capability.
     #[must_use]
     pub const fn module_resolutions(&self) -> &CanonicalModuleResolutionManifest {
