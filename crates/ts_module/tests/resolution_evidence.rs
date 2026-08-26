@@ -114,16 +114,16 @@ fn resolution_evidence_records_the_selected_symlink_candidate() {
     );
     let result = resolver.resolve("./node_modules/pkg/entry.js", "/app/main.ts");
     assert_eq!(result.effective_mode, Some(ModuleFormat::CommonJs));
-    let resolved = result.resolved.unwrap();
+    let entry = result.resolved.unwrap();
     assert_eq!(
-        resolved.original_file_name,
+        entry.original_file_name,
         "/app/node_modules/pkg/entry.ios.d.ts"
     );
-    assert_eq!(resolved.resolved_file_name, "/real/pkg/entry.ios.d.ts");
-    assert!(resolved.is_external_library_import);
+    assert_eq!(entry.resolved_file_name, "/real/pkg/entry.ios.d.ts");
+    assert!(entry.is_external_library_import);
     assert_eq!(
         *filesystem.realpaths.lock().unwrap(),
-        [(resolved.original_file_name, resolved.resolved_file_name)]
+        [(entry.original_file_name, entry.resolved_file_name)]
     );
     assert_eq!(
         result
@@ -166,12 +166,12 @@ fn resolution_evidence_records_unchanged_realpath_results() {
             .add_file_link("/real/entry.ts", "/app/alias.ts");
         filesystem.return_input_from_realpath = return_input;
         let resolver = Resolver::new(&filesystem, ResolutionOptions::default());
-        let resolved = resolver
+        let entry = resolver
             .resolve(specifier, "/app/main.ts")
             .resolved
             .unwrap();
-        assert_eq!(resolved.original_file_name, candidate);
-        assert_eq!(resolved.resolved_file_name, candidate);
+        assert_eq!(entry.original_file_name, candidate);
+        assert_eq!(entry.resolved_file_name, candidate);
         assert_eq!(
             *filesystem.realpaths.lock().unwrap(),
             [(candidate.to_owned(), candidate.to_owned())]
@@ -265,18 +265,15 @@ fn resolution_evidence_retains_modes_and_paths_for_type_references() {
     ] {
         let result = resolver.resolve_type_reference("pkg", containing_file);
         assert_eq!(result.effective_mode, Some(mode));
-        let resolved = result.resolved.unwrap();
+        let entry = result.resolved.unwrap();
         assert_eq!(
-            resolved.original_file_name,
+            entry.original_file_name,
             format!("/app/node_modules/pkg/{target}")
         );
-        assert_eq!(
-            resolved.resolved_file_name,
-            format!("/packages/pkg/{target}")
-        );
+        assert_eq!(entry.resolved_file_name, format!("/packages/pkg/{target}"));
         assert_eq!(
             filesystem.realpaths.lock().unwrap().last(),
-            Some(&(resolved.original_file_name, resolved.resolved_file_name))
+            Some(&(entry.original_file_name, entry.resolved_file_name))
         );
     }
     assert_eq!(filesystem.realpaths.lock().unwrap().len(), 2);
@@ -305,12 +302,12 @@ fn resolution_evidence_cache_hits_keep_original_observations() {
     resolver.clear_cache();
     let fresh = resolver.resolve("pkg", "/app/main.ts");
     assert_eq!(fresh.effective_mode, Some(ModuleFormat::CommonJs));
-    let resolved = fresh.resolved.unwrap();
+    let entry = fresh.resolved.unwrap();
     assert_eq!(
-        resolved.original_file_name,
+        entry.original_file_name,
         "/app/node_modules/pkg/commonjs.d.cts"
     );
-    assert_eq!(resolved.resolved_file_name, "/packages/pkg/commonjs.d.cts");
+    assert_eq!(entry.resolved_file_name, "/packages/pkg/commonjs.d.cts");
     assert_eq!(filesystem.realpaths.lock().unwrap().len(), 2);
 }
 
