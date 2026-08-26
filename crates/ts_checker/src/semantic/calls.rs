@@ -981,7 +981,7 @@ fn parameter_position_union(
 ) -> Result<Option<TypeId>, DirectCallError> {
     match types {
         [] => Ok(None),
-        [type_] => Ok(Some(*type_)),
+        [single] => Ok(Some(*single)),
         _ => {
             let result = match global_types {
                 Some(globals) => store.expression_union_type_with_global_types(
