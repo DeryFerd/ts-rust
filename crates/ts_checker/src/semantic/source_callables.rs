@@ -71,6 +71,7 @@ pub(super) struct SourceCallableParameterPlan {
     identity_node: NodeRef,
     null_literal_identity: bool,
     implicit_any: bool,
+    inferred_initializer: bool,
     jsdoc_function: bool,
     jsdoc_contextual_type: Option<TypeId>,
     pub(super) optional: bool,
@@ -83,7 +84,7 @@ impl SourceCallableParameterPlan {
         (self.identity_node, self.null_literal_identity)
     }
 
-    /// Returns the written type node, or `None` for an implicit `any`.
+    /// Returns the annotation used by this parameter, including its initializer source.
     pub(super) const fn explicit_type_node(self) -> Option<NodeRef> {
         if self.implicit_any {
             None
@@ -110,6 +111,10 @@ impl SourceCallableParameterPlan {
 
     pub(super) const fn is_implicit_any(self) -> bool {
         self.implicit_any && self.jsdoc_contextual_type.is_none()
+    }
+
+    pub(super) const fn has_inferred_initializer_type(self) -> bool {
+        self.inferred_initializer
     }
 
     pub(super) const fn has_jsdoc_function_type(self) -> bool {
@@ -2697,13 +2702,24 @@ fn plan_source_callable_with_owner_shape(
                         SourceCallableUnsupported::MissingParameterType(parameter),
                     ));
                 }
+                let inferred_annotation = if initialized_array_binding {
+                    Some(
+                        function_array_parameter_type_node(store, host, declaration, parameter)
+                            .ok_or_else(|| {
+                                invariant(SourceCallableInvariant::InvalidParameter(parameter))
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                let identity = inferred_annotation.unwrap_or(name);
                 (
-                    name,
+                    identity,
                     parameter_record.range.end,
                     name_record.range.end,
-                    name,
+                    identity,
                     false,
-                    true,
+                    inferred_annotation.is_none(),
                 )
             };
         let optional = validate_optional_token(
@@ -2816,6 +2832,7 @@ fn plan_source_callable_with_owner_shape(
             identity_node,
             null_literal_identity,
             implicit_any,
+            inferred_initializer: initialized_array_binding,
             jsdoc_function: javascript_jsdoc_function_parameter
                 .as_ref()
                 .is_some_and(|(declaration, _)| *declaration == parameter),
@@ -3586,14 +3603,13 @@ pub(super) fn source_promise_constructor_argument_arrow_is_exact(
         }))
 }
 
-/// Authenticates omitted positions in typed or default-inferred function array parameters.
-pub(super) fn authenticated_function_array_parameter_bindings(
+fn function_array_parameter_type_node(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
     parameter: NodeRef,
-) -> Option<Vec<(NodeRef, SemanticSymbolId)>> {
-    let (arena, bound) = host.source(declaration)?;
+) -> Option<NodeRef> {
+    let (_, bound) = host.source(declaration)?;
     let function_record = host.node(declaration)?;
     let NodeData::FunctionDeclaration(function) = &function_record.data else {
         return None;
@@ -3657,6 +3673,26 @@ pub(super) fn authenticated_function_array_parameter_bindings(
         }
         annotation
     };
+    Some(annotation)
+}
+
+/// Authenticates omitted positions in typed or default-inferred function array parameters.
+pub(super) fn authenticated_function_array_parameter_bindings(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameter: NodeRef,
+) -> Option<Vec<(NodeRef, SemanticSymbolId)>> {
+    let (arena, bound) = host.source(declaration)?;
+    let function_record = host.node(declaration)?;
+    let NodeData::FunctionDeclaration(function) = &function_record.data else {
+        return None;
+    };
+    let parameter_record = host.node(parameter)?;
+    let NodeData::ParameterDeclaration(syntax) = &parameter_record.data else {
+        return None;
+    };
+    let annotation = function_array_parameter_type_node(store, host, declaration, parameter)?;
     let annotation_record = host.node(annotation)?;
     let pattern = NodeRef::new(parameter.arena, parameter.file, syntax.name);
     let pattern_record = host.node(pattern)?;
@@ -10091,7 +10127,7 @@ pub(super) fn source_callable_display_projection(
             .ok_or(SourceCallableDisplayError::Malformed)?;
         let name = match &name_node.data {
             NodeData::Identifier(identifier) => identifier.text.clone(),
-            NodeData::BindingPattern(_)
+            NodeData::BindingPattern(pattern)
                 if authenticated_function_array_parameter_bindings(
                     store,
                     host,
@@ -10100,11 +10136,35 @@ pub(super) fn source_callable_display_projection(
                 )
                 .is_some() =>
             {
-                store
-                    .symbol(parameter.symbol)
-                    .and_then(|symbol| symbol.name().as_utf8())
-                    .map(str::to_owned)
-                    .ok_or(SourceCallableDisplayError::Malformed)?
+                let mut display = String::from("[");
+                for (index, element) in pattern.elements.nodes.iter().enumerate() {
+                    if index != 0 {
+                        display.push_str(", ");
+                    }
+                    let element = NodeRef::new(name.arena, name.file, *element);
+                    let record = host
+                        .node(element)
+                        .ok_or(SourceCallableDisplayError::Malformed)?;
+                    if let NodeData::BindingElement(binding) = &record.data {
+                        let binding_name = NodeRef::new(
+                            name.arena,
+                            name.file,
+                            binding.name.ok_or(SourceCallableDisplayError::Malformed)?,
+                        );
+                        let record = host
+                            .node(binding_name)
+                            .ok_or(SourceCallableDisplayError::Malformed)?;
+                        let NodeData::Identifier(identifier) = &record.data else {
+                            return Err(SourceCallableDisplayError::Malformed);
+                        };
+                        display.push_str(&identifier.text);
+                    }
+                }
+                if pattern.elements.has_trailing_comma {
+                    display.push(',');
+                }
+                display.push(']');
+                display
             }
             _ => return Err(SourceCallableDisplayError::Malformed),
         };
@@ -15526,7 +15586,17 @@ mod tests {
         let [parameter] = plan.parameters.as_slice() else {
             panic!("expected one initialized array binding parameter")
         };
-        assert!(parameter.is_implicit_any());
+        assert!(!parameter.is_implicit_any());
+        assert!(parameter.has_inferred_initializer_type());
+        let annotation = parameter.explicit_type_node().unwrap();
+        assert_eq!(
+            fixture.parsed.arena.get(annotation.node).unwrap().kind,
+            SyntaxKind::ArrayType,
+        );
+        assert_ne!(
+            fixture.parsed.arena.get(annotation.node).unwrap().parent,
+            Some(parameter.declaration.node),
+        );
         assert!(parameter.initializer.is_some());
         assert_eq!(plan.min_argument_count, 0);
         assert_eq!(
