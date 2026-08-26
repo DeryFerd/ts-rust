@@ -5685,7 +5685,7 @@ mod tests {
             else {
                 panic!("{source}: expected a valid callable")
             };
-            let [callable] = projection.call_signatures.as_slice() else {
+            let [callable] = projection.call_signatures.as_ref() else {
                 panic!("{source}: expected one call signature")
             };
             assert_eq!(
@@ -5794,7 +5794,7 @@ mod tests {
         else {
             panic!("expected the source function to publish a callable")
         };
-        let [callable] = projection.call_signatures.as_slice() else {
+        let [callable] = projection.call_signatures.as_ref() else {
             panic!("expected one call signature")
         };
         assert!(callable.parameters.is_empty());
