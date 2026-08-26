@@ -5804,18 +5804,19 @@ fn prepare_legacy_source_call_diagnostic(
                     .element_infos()
                     .iter()
                     .any(|info| info.flags() != ElementFlags::REQUIRED)
-                || tuple
-                    .element_types()
-                    .iter()
-                    .zip(arguments)
-                    .any(|(element, argument)| {
-                        let expected = match store.type_payload(*argument).map(TypeRecord::data) {
-                            Some(TypeData::Literal(literal)) => literal.regular_type,
-                            _ => *argument,
-                        };
-                        *element != expected
-                    })
             {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            let elements = tuple.element_types().to_vec();
+            let expected = super::calls::rest_argument_types(
+                store,
+                Some(global_types),
+                resolution.signature,
+                parameter_type,
+                arguments,
+            )
+            .map_err(|_| SourceCheckError::Call(plan.node))?;
+            if elements != expected {
                 return Err(SourceCheckError::Call(plan.node));
             }
             let node = if arguments.len() == 1 {
@@ -12175,6 +12176,68 @@ mod tests {
                 .and_then(|links| links.resolved_type)
                 == Some(string)
         }));
+    }
+
+    #[test]
+    fn rest_tuple_diagnostics_widen_fresh_literals_for_object_contexts() {
+        let source = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface API { ",
+            "f(...args: [value: object] | [value: object, extra: object]): void; ",
+            "g(...args: [] | [value: string]): void; } ",
+            "declare const api: API; ",
+            "api.f(\"bad\"); api.g(); api.g(\"ok\"); ",
+            "api.g(undefined); api.g(\"x\", \"y\");",
+        ));
+        let file = FileId::new(49_620);
+        let mut context = context_with_options(
+            &source,
+            file,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2345, 2345, 2345]
+        );
+        assert!(
+            diagnostics[0].diagnostic.render().unwrap().starts_with(
+                "Argument of type '[string]' is not assignable to parameter of type '",
+            )
+        );
+        assert!(diagnostics[1].diagnostic.render().unwrap().starts_with(
+            "Argument of type '[undefined]' is not assignable to parameter of type '",
+        ));
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            diagnostics.to_vec(),
+        );
+
+        context.recheck_source_file(file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            warm
+        );
     }
 
     #[test]

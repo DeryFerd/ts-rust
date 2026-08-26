@@ -20,6 +20,7 @@ use super::{
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::ValidatedSingleCallable,
+    instantiate::canonical_anonymous_union,
     signatures::{ElementFlags, Signature, SignatureFlags, TupleElementInfo},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_records::{TypeData, TypeRecord},
@@ -988,7 +989,7 @@ fn parameter_position_union(
                     types,
                     UnionReduction::Literal,
                 ),
-                None => store.expression_union_type(types, UnionReduction::Literal),
+                None => canonical_anonymous_union(store, types),
             };
             result.map(Some).map_err(|error| match error {
                 LiteralTypeCacheError::Capacity => {
@@ -1068,6 +1069,14 @@ fn project_validated_direct_call(
 
     let minimum_argument_count =
         get_min_argument_count(store, global_types, callable, MinArgumentCountFlags::NONE)?;
+    if has_effective_rest {
+        validate_argument_literal_identities(
+            store,
+            global_types,
+            callable.signature,
+            request.arguments,
+        )?;
+    }
     let non_array_rest = non_array_rest_target(store, global_types, callable, rest.as_ref())?;
     let fixed_arguments = non_array_rest
         .as_ref()
@@ -1095,6 +1104,7 @@ fn project_validated_direct_call(
                 store,
                 global_types,
                 callable.signature,
+                parameter_type,
                 &request.arguments[fixed_arguments..],
             )?;
             Ok::<_, DirectCallError>(DirectCallArgumentTarget {
@@ -1196,20 +1206,13 @@ fn argument_tuple_type(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
     signature: SignatureId,
+    rest_type: TypeId,
     arguments: &[TypeId],
 ) -> Result<TypeId, DirectCallError> {
     let required = store
         .create_tuple_element_info(ElementFlags::REQUIRED, None)
         .ok_or(DirectCallInvariant::ParameterProjectionCapacity(signature))?;
-    let types = arguments
-        .iter()
-        .map(
-            |&type_| match store.type_payload(type_).map(TypeRecord::data) {
-                Some(TypeData::Literal(literal)) => literal.regular_type,
-                _ => type_,
-            },
-        )
-        .collect::<Vec<_>>();
+    let types = rest_argument_types(store, global_types, signature, rest_type, arguments)?;
     let infos = vec![required; types.len()];
     let request = CanonicalTupleTypeRequest::new(&types, &infos, false);
     let request = global_types.map_or(request, |globals| {
@@ -1218,6 +1221,284 @@ fn argument_tuple_type(
     store
         .create_canonical_tuple_type(request)
         .map_err(|error| tuple_projection_error(signature, error))
+}
+
+fn validate_argument_literal_identities(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    signature: SignatureId,
+    arguments: &[TypeId],
+) -> Result<(), DirectCallError> {
+    for &argument in arguments {
+        let record = store
+            .type_payload(argument)
+            .ok_or(DirectCallInvariant::InvalidParameterProjection(signature))?;
+        if matches!(record.data(), TypeData::Literal(_) | TypeData::Union(_)) {
+            let valid = match global_types {
+                Some(globals) => store.validate_union_constituent_with_array_targets(
+                    CanonicalArrayTargets::from_global_types(globals),
+                    argument,
+                ),
+                None => store.validate_union_constituent(argument),
+            };
+            valid.map_err(|error| match error {
+                LiteralTypeCacheError::UnsupportedUnionConstituent(_) => {
+                    DirectCallUnsupported::RestSignature(signature).into()
+                }
+                LiteralTypeCacheError::Capacity => {
+                    DirectCallInvariant::ParameterProjectionCapacity(signature).into()
+                }
+                _ => DirectCallError::Invariant(DirectCallInvariant::InvalidParameterProjection(
+                    signature,
+                )),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Uses the rest parameter's contextual element type to preserve or widen literals.
+pub(super) fn rest_argument_types(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    signature: SignatureId,
+    rest_type: TypeId,
+    arguments: &[TypeId],
+) -> Result<Vec<TypeId>, DirectCallError> {
+    let rest = rest_parameter_shape(
+        store,
+        global_types,
+        signature,
+        rest_type,
+        &mut HashSet::new(),
+    )?;
+    validate_argument_literal_identities(store, global_types, signature, arguments)?;
+    let contexts = (0..arguments.len())
+        .map(|position| {
+            let mut types = Vec::new();
+            contextual_rest_position_types(
+                store,
+                global_types,
+                signature,
+                &rest,
+                position,
+                arguments.len(),
+                false,
+                &mut types,
+            )?;
+            let absorbs = types.iter().any(|type_| {
+                store
+                    .type_payload(*type_)
+                    .is_some_and(|record| record.flags().intersects(TypeFlags::ANY_OR_UNKNOWN))
+            });
+            let mut primitive = false;
+            for type_ in types {
+                primitive |=
+                    primitive_contextual_type(store, signature, type_, &mut HashSet::new())?;
+            }
+            Ok::<_, DirectCallError>(primitive && !absorbs)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    arguments
+        .iter()
+        .zip(contexts)
+        .map(|(&argument, preserve)| {
+            contextual_literal_argument_type(store, global_types, signature, argument, preserve)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)] // Indexed union contexts and length-aware tuple contexts follow separate upstream paths.
+fn contextual_rest_position_types(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    signature: SignatureId,
+    rest: &RestParameterShape,
+    position: usize,
+    length: usize,
+    indexed: bool,
+    result: &mut Vec<TypeId>,
+) -> Result<(), DirectCallError> {
+    match rest {
+        RestParameterShape::Array { element, .. } => result.push(*element),
+        RestParameterShape::Intrinsic(type_) => result.push(*type_),
+        RestParameterShape::Union { members, .. } => {
+            for member in members {
+                contextual_rest_position_types(
+                    store,
+                    global_types,
+                    signature,
+                    member,
+                    position,
+                    length,
+                    true,
+                    result,
+                )?;
+            }
+        }
+        RestParameterShape::Tuple {
+            elements,
+            infos,
+            fixed_length,
+            combined_flags,
+            ..
+        } => {
+            if position < *fixed_length {
+                result.push(elements[position]);
+            } else if indexed {
+                collect_rest_position_types(
+                    store,
+                    global_types,
+                    signature,
+                    rest,
+                    None,
+                    result,
+                    &mut HashSet::new(),
+                )?;
+            } else {
+                let fixed_end = if combined_flags.intersects(ElementFlags::VARIABLE) {
+                    infos
+                        .iter()
+                        .rev()
+                        .take_while(|info| info.flags().intersects(ElementFlags::FIXED))
+                        .count()
+                } else {
+                    0
+                };
+                let offset = length - position;
+                if offset <= fixed_end {
+                    result.push(elements[elements.len() - offset]);
+                } else {
+                    for index in *fixed_length..elements.len() - fixed_end {
+                        if infos[index].flags().contains(ElementFlags::VARIADIC) {
+                            let nested = rest_parameter_shape(
+                                store,
+                                global_types,
+                                signature,
+                                elements[index],
+                                &mut HashSet::new(),
+                            )?;
+                            collect_rest_position_types(
+                                store,
+                                global_types,
+                                signature,
+                                &nested,
+                                None,
+                                result,
+                                &mut HashSet::new(),
+                            )?;
+                        } else {
+                            result.push(elements[index]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn primitive_contextual_type(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    type_: TypeId,
+    active: &mut HashSet<TypeId>,
+) -> Result<bool, DirectCallError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(DirectCallInvariant::InvalidParameterProjection(signature))?;
+    if record.flags().intersects(
+        TypeFlags::PRIMITIVE
+            | TypeFlags::INDEX
+            | TypeFlags::TEMPLATE_LITERAL
+            | TypeFlags::STRING_MAPPING,
+    ) {
+        return Ok(true);
+    }
+    let constituents = match record.data() {
+        TypeData::Union(union) => &union.union.types,
+        TypeData::Intersection(intersection) => &intersection.intersection.types,
+        _ => return Ok(false),
+    };
+    if !active.insert(type_) {
+        return Err(DirectCallInvariant::InvalidParameterProjection(signature).into());
+    }
+    let mut primitive = false;
+    for &constituent in constituents {
+        primitive |= primitive_contextual_type(store, signature, constituent, active)?;
+    }
+    active.remove(&type_);
+    Ok(primitive)
+}
+
+fn contextual_literal_argument_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    signature: SignatureId,
+    type_: TypeId,
+    preserve: bool,
+) -> Result<TypeId, DirectCallError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(DirectCallInvariant::InvalidParameterProjection(signature))?;
+    match record.data() {
+        TypeData::Literal(literal) => {
+            if preserve {
+                return Ok(literal.regular_type);
+            }
+            if literal.fresh_type != Some(type_) || literal.regular_type == type_ {
+                return Ok(type_);
+            }
+            if record.flags().intersects(TypeFlags::ENUM_LIKE) {
+                let owner = super::enums::canonical_enum_type_owner(store, type_)
+                    .ok_or(DirectCallInvariant::InvalidParameterProjection(signature))?;
+                return store
+                    .declared_type_links(owner)
+                    .and_then(|links| links.declared_type)
+                    .filter(|declared| {
+                        super::enums::canonical_enum_type_owner(store, *declared) == Some(owner)
+                    })
+                    .ok_or_else(|| {
+                        DirectCallInvariant::InvalidParameterProjection(signature).into()
+                    });
+            }
+            let bootstrap = store
+                .intrinsic_bootstrap()
+                .ok_or(DirectCallInvariant::InvalidParameterProjection(signature))?;
+            Ok(match &literal.value {
+                super::type_records::LiteralValue::String(_) => bootstrap.string_type,
+                super::type_records::LiteralValue::Number(_) => bootstrap.number_type,
+                super::type_records::LiteralValue::BigInt(_) => bootstrap.bigint_type,
+                super::type_records::LiteralValue::Boolean(_) => bootstrap.boolean_type,
+                super::type_records::LiteralValue::ComputedEnum => {
+                    return Err(DirectCallInvariant::InvalidParameterProjection(signature).into());
+                }
+            })
+        }
+        TypeData::Union(union) => {
+            let original = union.union.types.clone();
+            let mapped = original
+                .iter()
+                .map(|&member| {
+                    contextual_literal_argument_type(
+                        store,
+                        global_types,
+                        signature,
+                        member,
+                        preserve,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if mapped == original {
+                Ok(type_)
+            } else {
+                parameter_position_union(store, global_types, signature, &mapped)?.ok_or_else(
+                    || DirectCallInvariant::InvalidParameterProjection(signature).into(),
+                )
+            }
+        }
+        _ => Ok(type_),
+    }
 }
 
 fn tuple_projection_error(signature: SignatureId, error: TupleTypeError) -> DirectCallError {
@@ -1867,6 +2148,193 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn signature_positions_rest_literal_treatment_uses_primitive_contexts() {
+        let parsed = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let mut context = array_context(&parsed);
+        let globals = context.global_types().clone();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (object, string, number, any) = (
+            bootstrap.non_primitive_type,
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.any_type,
+        );
+        let store = context.store_mut_for_test();
+        let empty = tuple(store, &[]);
+        let object_one = tuple(store, &[(object, ElementFlags::REQUIRED)]);
+        let object_two = tuple(
+            store,
+            &[
+                (object, ElementFlags::REQUIRED),
+                (object, ElementFlags::REQUIRED),
+            ],
+        );
+        let string_one = tuple(store, &[(string, ElementFlags::REQUIRED)]);
+        let any_one = tuple(store, &[(any, ElementFlags::REQUIRED)]);
+        let object_rest = store
+            .expression_union_type_with_global_types(
+                &globals,
+                &[object_one, object_two],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let primitive_rest = store
+            .expression_union_type_with_global_types(
+                &globals,
+                &[empty, string_one],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let mixed_rest = store
+            .expression_union_type_with_global_types(
+                &globals,
+                &[object_one, string_one],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let any_rest = store
+            .expression_union_type_with_global_types(
+                &globals,
+                &[any_one, string_one],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let regular = store.regular_string_literal_type("bad".to_owned()).unwrap();
+        let fresh = store.fresh_type_of_literal_type(regular).unwrap();
+        let signature = callable(
+            store,
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[object_rest],
+            0,
+            Some(number),
+        );
+        let before = (store.type_len(), store.signature_len(), store.mapper_len());
+
+        for _ in 0..2 {
+            assert_eq!(
+                rest_argument_types(
+                    store,
+                    Some(&globals),
+                    signature.signature,
+                    object_rest,
+                    &[fresh]
+                ),
+                Ok(vec![string])
+            );
+            assert_eq!(
+                rest_argument_types(
+                    store,
+                    Some(&globals),
+                    signature.signature,
+                    object_rest,
+                    &[regular]
+                ),
+                Ok(vec![regular])
+            );
+            assert_eq!(
+                rest_argument_types(
+                    store,
+                    Some(&globals),
+                    signature.signature,
+                    primitive_rest,
+                    &[fresh]
+                ),
+                Ok(vec![regular])
+            );
+            assert_eq!(
+                rest_argument_types(
+                    store,
+                    Some(&globals),
+                    signature.signature,
+                    mixed_rest,
+                    &[fresh]
+                ),
+                Ok(vec![regular])
+            );
+            assert_eq!(
+                rest_argument_types(
+                    store,
+                    Some(&globals),
+                    signature.signature,
+                    any_rest,
+                    &[fresh]
+                ),
+                Ok(vec![string])
+            );
+        }
+        assert_eq!(
+            (store.type_len(), store.signature_len(), store.mapper_len()),
+            before
+        );
+    }
+
+    #[test]
+    fn signature_positions_reject_unregistered_fresh_literals_before_tuple_writes() {
+        let parsed = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let mut context = array_context(&parsed);
+        let globals = context.global_types().clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let store = context.store_mut_for_test();
+        let regular = store.regular_string_literal_type("x".to_owned()).unwrap();
+        let canonical_fresh = store.fresh_type_of_literal_type(regular).unwrap();
+        let empty = tuple(store, &[]);
+        let one = tuple(store, &[(regular, ElementFlags::REQUIRED)]);
+        let rest = store
+            .expression_union_type_with_global_types(
+                &globals,
+                &[empty, one],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let signature = callable(
+            store,
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[rest],
+            0,
+            Some(number),
+        );
+        let forged = store
+            .alloc_literal_type(
+                TypeFlags::STRING_LITERAL,
+                crate::semantic::type_records::LiteralValue::String("x".into()),
+                crate::semantic::type_records::RegularLiteralLink::Type(regular),
+            )
+            .unwrap();
+        assert!(store.set_literal_links(forged, Some(forged), regular));
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.mapper_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        for _ in 0..2 {
+            assert!(matches!(
+                project_validated_direct_call(
+                    store,
+                    Some(&globals),
+                    request(signature.owner, &[forged]),
+                    &signature
+                ),
+                Err(DirectCallError::Invariant(
+                    DirectCallInvariant::InvalidParameterProjection(_)
+                ))
+            ));
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.checker_link_allocated_lengths()
+                ),
+                before
+            );
+        }
+        assert_eq!(store.validate_union_constituent(regular), Ok(()));
+        assert_eq!(store.validate_union_constituent(canonical_fresh), Ok(()));
     }
 
     #[test]
