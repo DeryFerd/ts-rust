@@ -720,33 +720,14 @@ impl CanonicalCheckerContext<'_> {
         &mut self,
         node: NodeRef,
     ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
-        let (annotation, literal) = {
-            let (_, _, record) = self.validated_artifact_node(node)?;
-            if let NodeData::LiteralTypeNode(literal) = &record.data {
-                let literal = NodeRef::new(node.arena, node.file, literal.literal);
-                if self.validated_artifact_node(literal)?.2.parent != Some(node.node) {
-                    return Err(CanonicalArtifactQueryError::ForeignNode(literal));
-                }
-                (node, literal)
-            } else {
-                let Some(parent) = record.parent else {
-                    return Ok(None);
-                };
-                let parent = NodeRef::new(node.arena, node.file, parent);
-                let (_, _, parent_record) = self.validated_artifact_node(parent)?;
-                let NodeData::LiteralTypeNode(literal) = &parent_record.data else {
-                    return Ok(None);
-                };
-                if literal.literal != node.node {
-                    return Err(CanonicalArtifactQueryError::ForeignNode(node));
-                }
-                (parent, node)
-            }
+        let Some((annotation, literal)) = self.literal_annotation_nodes(node)? else {
+            return Ok(None);
         };
+        let operand = (node != literal && node != annotation).then_some(node);
 
         // Type-node queries cache the annotation, not its literal child.
         // Check both against the literal table before resolving a cold query.
-        for location in [literal, annotation] {
+        for location in [literal, annotation].into_iter().chain(operand) {
             let cached = self.cached_artifact_type(location)?;
             if self
                 .store()
@@ -758,8 +739,13 @@ impl CanonicalCheckerContext<'_> {
                     kind: self.validated_artifact_node(location)?.2.kind,
                 });
             }
+            let identity = if Some(location) == operand {
+                location
+            } else {
+                literal
+            };
             if let Some(cached) = cached
-                && (self.cached_literal_annotation_identity(literal)? != Some(cached)
+                && (self.cached_literal_annotation_identity(identity)? != Some(cached)
                     || self.store().validate_union_constituent(cached).is_err())
             {
                 return Err(CanonicalArtifactQueryError::InvalidType {
@@ -768,8 +754,75 @@ impl CanonicalCheckerContext<'_> {
                 });
             }
         }
+        if let Some(operand) = operand {
+            if let Some(type_) = self.cached_literal_annotation_identity(operand)? {
+                if self.store().validate_union_constituent(type_).is_err() {
+                    return Err(CanonicalArtifactQueryError::InvalidType {
+                        node: operand,
+                        type_,
+                    });
+                }
+            } else if self.cached_artifact_type(annotation)?.is_some() {
+                return Err(CanonicalArtifactQueryError::MissingType {
+                    node: operand,
+                    kind: self.validated_artifact_node(operand)?.2.kind,
+                });
+            }
+        }
         let type_ = self.get_type_from_type_node(annotation)?;
+        let type_ = if let Some(operand) = operand {
+            self.cached_literal_annotation_identity(operand)?.ok_or(
+                CanonicalArtifactQueryError::MissingType {
+                    node: operand,
+                    kind: self.validated_artifact_node(operand)?.2.kind,
+                },
+            )?
+        } else {
+            type_
+        };
         self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    fn literal_annotation_nodes(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<(NodeRef, NodeRef)>, CanonicalArtifactQueryError> {
+        let (_, _, record) = self.validated_artifact_node(node)?;
+        if let NodeData::LiteralTypeNode(literal) = &record.data {
+            let literal = NodeRef::new(node.arena, node.file, literal.literal);
+            if self.validated_artifact_node(literal)?.2.parent != Some(node.node) {
+                return Err(CanonicalArtifactQueryError::ForeignNode(literal));
+            }
+            return Ok(Some((node, literal)));
+        }
+        let Some(parent) = record.parent else {
+            return Ok(None);
+        };
+        let parent = NodeRef::new(node.arena, node.file, parent);
+        let (_, _, parent_record) = self.validated_artifact_node(parent)?;
+        let (annotation, literal) = if let NodeData::PrefixUnaryExpression(prefix) =
+            &parent_record.data
+            && prefix.operator == SyntaxKind::MinusToken
+            && prefix.operand == node.node
+            && matches!(
+                record.data,
+                NodeData::NumericLiteral(_) | NodeData::BigIntLiteral(_)
+            ) {
+            let Some(annotation) = parent_record.parent else {
+                return Ok(None);
+            };
+            (NodeRef::new(node.arena, node.file, annotation), parent)
+        } else {
+            (parent, node)
+        };
+        let (_, _, annotation_record) = self.validated_artifact_node(annotation)?;
+        let NodeData::LiteralTypeNode(data) = &annotation_record.data else {
+            return Ok(None);
+        };
+        if data.literal != literal.node {
+            return Err(CanonicalArtifactQueryError::ForeignNode(literal));
+        }
+        Ok(Some((annotation, literal)))
     }
 
     fn cached_literal_annotation_identity(
@@ -2288,6 +2341,67 @@ mod tests {
         let ready = context.get_type_at_location(*first).unwrap();
         assert_ne!(ready, wrong);
         assert_eq!(context.type_to_string(ready).unwrap(), "\"ready\"");
+    }
+
+    #[test]
+    fn negative_literal_operand_cache_failures_leave_cold_annotations_unchanged() {
+        for source in [
+            "interface Negative { value: -2; }",
+            "interface Negative { value: -23n; }",
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(6_033);
+            let mut context = declaration_context(&parsed, file);
+            let operand = parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::PrefixUnaryExpression(prefix) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(parsed.arena.id(), file, prefix.operand))
+                })
+                .unwrap();
+            let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+            assert!(context.store_mut_for_test().set_type_node_links(
+                operand,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            );
+            assert_eq!(
+                context.get_type_at_location(operand),
+                Err(CanonicalArtifactQueryError::InvalidType {
+                    node: operand,
+                    type_: wrong,
+                }),
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                ),
+                before,
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(operand, TypeNodeLinks::default()),
+            );
+            assert!(context.get_type_at_location(operand).is_ok());
+        }
     }
 
     #[test]

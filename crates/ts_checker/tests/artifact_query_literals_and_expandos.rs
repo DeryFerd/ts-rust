@@ -102,6 +102,59 @@ fn literal_annotation_tokens_use_their_production_type_without_checking_declarat
 }
 
 #[test]
+fn negative_literal_operands_reuse_positive_types_in_cold_and_warm_queries() {
+    let parsed = parse_source_file("interface Negative { value: -2; big: -23n; }");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(4_103);
+    let literals = parsed
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            let NodeData::PrefixUnaryExpression(prefix) = &record.data else {
+                return None;
+            };
+            Some((
+                NodeRef::new(parsed.arena.id(), file, node),
+                NodeRef::new(parsed.arena.id(), file, prefix.operand),
+            ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(literals.len(), 2);
+    for warm in [false, true] {
+        let mut context = context(&parsed, file, true, CanonicalModuleState::Script);
+        for ((literal, operand), (negative, positive)) in
+            literals.iter().zip([("-2", "2"), ("-23n", "23n")])
+        {
+            if warm {
+                context.get_type_at_location(*literal).unwrap();
+            }
+            let positive_type = context.get_type_at_location(*operand).unwrap();
+            assert_eq!(context.type_to_string(positive_type).unwrap(), positive);
+            let negative_type = context.get_type_at_location(*literal).unwrap();
+            assert_eq!(context.type_to_string(negative_type).unwrap(), negative);
+            assert_ne!(positive_type, negative_type);
+            assert_eq!(context.get_symbol_at_location(*operand), Ok(None));
+            assert!(context.store().type_node_links(*operand).is_none());
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+            );
+            assert_eq!(context.get_type_at_location(*operand), Ok(positive_type));
+            assert_eq!(context.get_type_at_location(*literal), Ok(negative_type));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                ),
+                before,
+            );
+        }
+    }
+}
+
+#[test]
 fn expando_assignment_accesses_reuse_properties_without_exposing_expression_symbols() {
     for source in [
         "const foo = () => {}; foo.bar = 42; export {};",
