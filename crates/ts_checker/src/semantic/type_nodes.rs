@@ -38726,7 +38726,11 @@ mod tests {
             declaration.file,
             parameter_data.default_type.unwrap(),
         );
-        let original = context.store().type_node_links(default).cloned().unwrap();
+        let original = context
+            .store()
+            .type_node_links(default)
+            .cloned()
+            .unwrap_or_default();
         let number = context.store().intrinsic_bootstrap().unwrap().number_type;
         assert!(context.store_mut_for_test().set_type_node_links(
             default,
