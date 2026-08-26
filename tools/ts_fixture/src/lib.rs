@@ -2852,10 +2852,7 @@ impl DiagnosticTextContext<'_> {
     fn header_library(self, file_name: &str) -> bool {
         match self {
             Self::Fixture(_) => is_default_library_file(file_name),
-            Self::Project => {
-                let lower = file_name.to_ascii_lowercase();
-                lower.starts_with("lib") && lower.ends_with(".d.ts")
-            }
+            Self::Project => false,
         }
     }
 

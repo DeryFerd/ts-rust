@@ -187,19 +187,21 @@ fn ordering(program: &Program, diagnostic: &ProgramDiagnostic) -> CompilationDia
     }
 }
 
-// Keep newlines inside message arguments. Only message-chain separators use CRLF.
+// A recovered root message proves its arguments, not flattened child boundaries.
 fn flattened_message(
     diagnostic: &ProgramDiagnostic,
     ordering: &CompilationDiagnosticOrdering,
 ) -> Result<String, ErrorTextFailure> {
     if let Some(structured) = &ordering.diagnostic {
-        let mut text = ts_diagnostics::message_by_code(structured.code())
+        if !structured.details.is_empty() {
+            return Err(ErrorTextFailure::Unavailable(format!(
+                "Diagnostic TS{} retains flattened chain text without child argument boundaries.",
+                structured.code(),
+            )));
+        }
+        let text = ts_diagnostics::message_by_code(structured.code())
             .and_then(|message| message.format(&structured.arguments).ok())
             .expect("recovered diagnostics retain a valid catalog message");
-        for detail in &structured.details {
-            text.push_str(HARNESS_NEW_LINE);
-            text.push_str(detail);
-        }
         return Ok(text);
     }
     if diagnostic.message.contains(['\r', '\n']) {
@@ -271,6 +273,66 @@ fn comparison_key(name: &str) -> String {
         .collect()
 }
 
+// Match Go's (?im)^(lib.*\.d\.ts)\([0-9]+,[0-9]+\) over the full summary.
+fn mask_library_summary_locations(summary: &str) -> String {
+    let mut output = String::with_capacity(summary.len());
+    for line in summary.split_inclusive('\n') {
+        let mut location = None;
+        if line
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("lib"))
+        {
+            for (start, character) in line.char_indices() {
+                if character != '(' || !ends_with_dts_ignore_case(&line[..start]) {
+                    continue;
+                }
+                if let Some(length) = numeric_location_length(&line[start..]) {
+                    // The pinned regexp's greedy group selects the last valid location.
+                    location = Some((start, start + length));
+                }
+            }
+        }
+        if let Some((start, end)) = location {
+            output.push_str(&line[..start]);
+            output.push_str("(--,--)");
+            output.push_str(&line[end..]);
+        } else {
+            output.push_str(line);
+        }
+    }
+    output
+}
+
+fn ends_with_dts_ignore_case(text: &str) -> bool {
+    let mut suffix = text.chars().rev();
+    // Unicode simple folding adds long s to the ASCII s/S pair.
+    matches!(suffix.next(), Some('s' | 'S' | '\u{017f}'))
+        && matches!(suffix.next(), Some('t' | 'T'))
+        && suffix.next() == Some('.')
+        && matches!(suffix.next(), Some('d' | 'D'))
+        && suffix.next() == Some('.')
+}
+
+fn numeric_location_length(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let row_length = bytes
+        .get(1..)?
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if row_length == 0 || bytes.get(1 + row_length) != Some(&b',') {
+        return None;
+    }
+    let column_start = row_length + 2;
+    let column_length = bytes
+        .get(column_start..)?
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    let end = column_start + column_length;
+    (column_length != 0 && bytes.get(end) == Some(&b')')).then_some(end + 1)
+}
+
 #[allow(clippy::too_many_lines)] // Preserve the pinned global, file, and count sequence.
 fn render_nonempty(
     program: &Program,
@@ -295,7 +357,8 @@ fn render_nonempty(
     }
     let context = DiagnosticTextContext::Project;
     let mut unsupported = Vec::new();
-    let mut text = render_diagnostic_header_with_context(context, &ordered, &mut unsupported);
+    let summary = render_diagnostic_header_with_context(context, &ordered, &mut unsupported);
+    let mut text = mask_library_summary_locations(&summary);
     text.push_str(HARNESS_NEW_LINE);
     text.push_str(HARNESS_NEW_LINE);
     let mut annotations = String::new();
@@ -388,7 +451,9 @@ mod tests {
     use ts_options::CompilerOptions;
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
-    use super::{collect_inputs, go_file_name, primary_record, render};
+    use super::{
+        collect_inputs, go_file_name, mask_library_summary_locations, primary_record, render,
+    };
     use crate::{Case, project::ProjectStage, render_error_baseline};
 
     fn program(files: &[(&str, &str)]) -> Program {
@@ -619,5 +684,73 @@ mod tests {
         ));
         let text = text(render(&program, &[error]).output);
         assert!(text.contains("!!! related TS1005 /case/main.ts:1:14: 'b' expected."));
+    }
+
+    #[test]
+    fn project_errors_do_not_invent_boundaries_inside_flattened_chain_arguments() {
+        let program = program(&[("/case/main.ts", "const value = 1;\n")]);
+        let error = diagnostic(
+            None,
+            None,
+            2769,
+            "No overload matches this call.\n  Cannot find name 'first\nsecond'.",
+        );
+        let output = render(&program, &[error]);
+        assert!(
+            matches!(&output.output, ProjectStage::Unavailable { detail }
+            if detail.contains("child argument boundaries"))
+        );
+        let encoded = serde_json::to_value(output.output).unwrap();
+        assert_eq!(encoded["status"], "unavailable");
+        assert!(encoded.get("value").is_none());
+        assert!(encoded.get("digest").is_none());
+    }
+
+    #[test]
+    fn project_errors_mask_library_locations_in_the_summary_but_not_annotations() {
+        let program = program(&[("/case/main.ts", "const value = 1;\n")]);
+        let error = diagnostic(
+            None,
+            None,
+            6053,
+            "File '/missing\nlib.custom.d.ts(3,4)' not found.",
+        );
+        let actual = text(render(&program, &[error]).output);
+        let expected = concat!(
+            "error TS6053: File '/missing\nlib.custom.d.ts(--,--)' not found.\r\n\r\n\r\n",
+            "!!! error TS6053: File '/missing\r\n",
+            "!!! error TS6053: lib.custom.d.ts(3,4)' not found.\r\n",
+            "==== /case/main.ts (0 errors) ====\r\n",
+            "    const value = 1;\r\n",
+            "    ",
+        );
+        assert_eq!(actual.as_bytes(), expected.as_bytes());
+    }
+
+    #[test]
+    fn project_library_summary_mask_keeps_pinned_regex_rules() {
+        for (input, expected) in [
+            (
+                "lib.a.d.ts(1,2) and lib.b.d.ts(30,40)\r\n",
+                "lib.a.d.ts(1,2) and lib.b.d.ts(--,--)\r\n",
+            ),
+            (
+                "xlib.a.d.ts(1,2)\n lib.a.d.ts(1,2)\nLiB.x.D.TS(9,8)\n",
+                "xlib.a.d.ts(1,2)\n lib.a.d.ts(1,2)\nLiB.x.D.TS(--,--)\n",
+            ),
+            (
+                "lib.a.d.ts(\u{0661},2)\nlib.a.d.ts(,2)\nlib.a.d.ts(1,)\n",
+                "lib.a.d.ts(\u{0661},2)\nlib.a.d.ts(,2)\nlib.a.d.ts(1,)\n",
+            ),
+            (
+                "lib.\u{1f642}.d.t\u{017f}(1,2)\n",
+                "lib.\u{1f642}.d.t\u{017f}(--,--)\n",
+            ),
+        ] {
+            assert_eq!(
+                mask_library_summary_locations(input).as_bytes(),
+                expected.as_bytes()
+            );
+        }
     }
 }
