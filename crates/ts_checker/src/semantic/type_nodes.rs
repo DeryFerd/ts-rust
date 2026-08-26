@@ -1852,41 +1852,29 @@ fn authenticated_recursive_arrow_name(
     host: &DeclaredTypeHost<'_>,
     type_: TypeId,
 ) -> Option<NodeRef> {
-    let Some(provenance) = store.source_callable_provenance(type_) else {
-        return None;
-    };
+    let provenance = store.source_callable_provenance(type_)?;
     let arrow = provenance.declaration;
-    let Some(record) = host.node(arrow) else {
-        return None;
-    };
+    let record = host.node(arrow)?;
     let NodeData::ArrowFunction(function) = &record.data else {
         return None;
     };
-    let Some(declaration) = record
+    let declaration = record
         .parent
-        .map(|parent| NodeRef::new(arrow.arena, arrow.file, parent))
-    else {
-        return None;
-    };
+        .map(|parent| NodeRef::new(arrow.arena, arrow.file, parent))?;
     let Some(NodeData::VariableDeclaration(variable)) =
         host.node(declaration).map(|record| &record.data)
     else {
         return None;
     };
     let variable_name = NodeRef::new(declaration.arena, declaration.file, variable.name);
-    let Some(variable_name_record) = host.node(variable_name) else {
-        return None;
-    };
+    let variable_name_record = host.node(variable_name)?;
     let NodeData::Identifier(variable_identifier) = &variable_name_record.data else {
         return None;
     };
-    let Some(variable_symbol) = host
+    let variable_symbol = host
         .bound_file(declaration)
         .and_then(|bound| bound.symbol(declaration))
-        .and_then(|symbol| store.get_merged_symbol(symbol))
-    else {
-        return None;
-    };
+        .and_then(|symbol| store.get_merged_symbol(symbol))?;
     let body = NodeRef::new(arrow.arena, arrow.file, function.body);
     let Some(NodeData::SatisfiesExpression(satisfaction)) =
         host.node(body).map(|record| &record.data)
@@ -1902,9 +1890,7 @@ fn authenticated_recursive_arrow_name(
     let Some(NodeData::Identifier(identifier)) = host.node(name).map(|record| &record.data) else {
         return None;
     };
-    let Some(owner) = store.symbol(variable_symbol) else {
-        return None;
-    };
+    let owner = store.symbol(variable_symbol)?;
     if provenance.family != SourceCallableFamily::ArrowFunction
         || provenance.owner_symbol == variable_symbol
         || variable.initializer != Some(arrow.node)
@@ -1946,10 +1932,10 @@ fn authenticated_recursive_arrow_name(
     let mut planner =
         TypeQueryPlanner::new(store, host, None, provenance.array_targets, false, &aliases);
     planner.plan_value_type_query(query).ok()?;
-    let planned = planner.plan.type_queries.get(&query)?;
-    (planned.symbol == variable_symbol
-        && planned.source_node == Some(arrow)
-        && planned.type_ == Some(type_))
+    let query_plan = planner.plan.type_queries.get(&query)?;
+    (query_plan.symbol == variable_symbol
+        && query_plan.source_node == Some(arrow)
+        && query_plan.type_ == Some(type_))
     .then_some(variable_name)
 }
 
@@ -18282,7 +18268,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             let root_node = self
                 .store
                 .conditional_root(conditional.root)
-                .map(|root| root.node())
+                .map(super::type_records::ConditionalRoot::node)
                 .ok_or_else(|| {
                     type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(symbol))
                 })?;
@@ -24322,11 +24308,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 let mut nested =
                     CanonicalTypeQuery::new(self.store, self.host, self.options, self.diagnostics)?;
                 nested.array_type = self.array_type;
-                nested.global_types = self.global_types.clone();
+                nested.global_types.clone_from(&self.global_types);
                 nested.instantiation_session = self.instantiation_session.as_deref_mut();
-                nested.resolving_property_interfaces = self.resolving_property_interfaces.clone();
-                nested.resolving_instantiated_signatures =
-                    self.resolving_instantiated_signatures.clone();
+                nested
+                    .resolving_property_interfaces
+                    .clone_from(&self.resolving_property_interfaces);
+                nested
+                    .resolving_instantiated_signatures
+                    .clone_from(&self.resolving_instantiated_signatures);
                 nested.get_type_of_source_callable(callable.declaration, callable.owner_symbol)
             })
             .transpose()?;
@@ -25837,7 +25826,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             if !matches!(
                                 self.store
                                     .mapper_payload(mapper)
-                                    .map(|mapper| mapper.kind()),
+                                    .map(super::mapper::TypeMapper::kind),
                                 Some(
                                     super::mapper::TypeMapperKind::Simple
                                         | super::mapper::TypeMapperKind::Array
