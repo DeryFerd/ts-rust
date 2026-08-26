@@ -4611,6 +4611,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let assignable_mutable_variables = self.assignable_mutable_variables.clone();
         let result = (|| {
             let initializer = self.plan_expression(syntax.initializer)?;
+            self.preflight_array_binding_iteration(syntax.pattern, None, Some(&initializer))?;
             if !matches!(
                 initializer.kind,
                 PlannedExpressionKind::Identifier(PlannedIdentifierRead {
@@ -9906,14 +9907,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         };
         if callable.family == SourceCallableFamily::FunctionDeclaration {
-            return authenticated_function_array_parameter_bindings(
+            let bindings = authenticated_function_array_parameter_bindings(
                 store,
                 host,
                 callable.declaration,
                 parameter.declaration,
             )
-            .map(|bindings| bindings.into_iter().map(|(_, symbol)| symbol).collect())
-            .ok_or_else(|| callable_parameter_execution_error(callable, parameter.declaration));
+            .ok_or_else(|| callable_parameter_execution_error(callable, parameter.declaration))?;
+            self.preflight_array_binding_iteration(name, parameter.explicit_type_node(), None)?;
+            return Ok(bindings.into_iter().map(|(_, symbol)| symbol).collect());
         }
         if name_record.kind != SyntaxKind::ArrayBindingPattern
             || !super::source_calls::is_authenticated_sort_tuple_binding(
@@ -16933,6 +16935,44 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(circular)
     }
 
+    fn preflight_array_binding_iteration(
+        &self,
+        pattern: NodeRef,
+        annotation: Option<NodeRef>,
+        initializer: Option<&PlannedExpression>,
+    ) -> Result<(), SourceCheckError> {
+        let Some((store, host)) = self.semantic else {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Element(pattern),
+            ));
+        };
+        let parent_is_any = match annotation {
+            Some(annotation) => array_binding_annotation_is_any(store, host, annotation)?,
+            None => initializer
+                .map(|initializer| array_binding_expression_is_any(store, host, initializer))
+                .transpose()?
+                .unwrap_or(false),
+        };
+        if parent_is_any {
+            return Ok(());
+        }
+        let requires_protocol = super::global_types::global_iterable_type_requires_protocol(
+            store, host,
+        )
+        .map_err(|error| match error {
+            super::global_types::CanonicalGlobalTypeInitializationError::DeclaredType(error) => {
+                SourceCheckError::DeclaredType(error)
+            }
+            _ => SourceCheckError::Element(pattern),
+        })?;
+        if requires_protocol {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Element(pattern),
+            ));
+        }
+        Ok(())
+    }
+
     fn plan_array_variable_declaration(
         &mut self,
         list: NodeRef,
@@ -17003,6 +17043,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         )
         .map_err(Self::variable_plan_error)?;
         let initializer = self.plan_expression(initializer)?;
+        self.preflight_array_binding_iteration(pattern, type_node, Some(&initializer))?;
         let mut elements = Vec::with_capacity(bindings.len());
         for element in bindings {
             if element.declaration != declaration
@@ -30730,33 +30771,141 @@ fn format_expected_jsdoc_satisfies_signature(
     Ok(format!("({}) => {return_type}", parameters.join(", ")))
 }
 
-fn check_array_binding_iteration_support(
-    store: &mut CanonicalTypeMapperStore,
+fn array_binding_annotation_is_any(
+    store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
-    pattern: NodeRef,
-    receiver: TypeId,
-) -> Result<(), SourceCheckError> {
-    let record = store
-        .type_payload(receiver)
-        .ok_or(RelationUnavailable::Type(receiver))?;
-    if record.flags().intersects(TypeFlags::ANY) {
-        return Ok(());
-    }
-    let iterable = super::global_types::optional_global_iterable_type(store, host).map_err(
-        |error| match error {
-            super::global_types::CanonicalGlobalTypeInitializationError::DeclaredType(error) => {
-                SourceCheckError::DeclaredType(error)
+    annotation: NodeRef,
+) -> Result<bool, SourceCheckError> {
+    let mut current = annotation;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return Err(SourceCheckError::Element(annotation));
+        }
+        let record = super::declared::preflight_node(store, host, current)?;
+        if record.flags.0 != 0 {
+            return Ok(false);
+        }
+        match &record.data {
+            NodeData::ParenthesizedTypeNode(parenthesized)
+                if record.kind == SyntaxKind::ParenthesizedType =>
+            {
+                let child = NodeRef::new(current.arena, current.file, parenthesized.type_);
+                if super::declared::preflight_node(store, host, child)?.parent != Some(current.node)
+                {
+                    return Err(SourceCheckError::Element(annotation));
+                }
+                current = child;
             }
-            _ => SourceCheckError::Element(pattern),
-        },
-    )?;
-    // The pinned checker requires the iterator protocol when Iterable<T, R, N> resolves.
-    if iterable.is_some() {
-        return Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Element(pattern),
-        ));
+            NodeData::KeywordTypeNode(_) if record.kind == SyntaxKind::AnyKeyword => break,
+            _ => return Ok(false),
+        }
     }
-    Ok(())
+    let any = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?
+        .any_type;
+    for node in visited {
+        preflight_source_expression_cache(store, node, any)?;
+    }
+    Ok(true)
+}
+
+fn array_binding_expression_is_any(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: &PlannedExpression,
+) -> Result<bool, SourceCheckError> {
+    if expression.jsdoc_type.is_some() {
+        return Ok(false);
+    }
+    let any = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?
+        .any_type;
+    let is_any = match &expression.kind {
+        PlannedExpressionKind::Parenthesized(inner) => {
+            array_binding_expression_is_any(store, host, inner)?
+        }
+        PlannedExpressionKind::Assertion {
+            type_node,
+            const_assertion: false,
+            ..
+        } => array_binding_annotation_is_any(store, host, *type_node)?,
+        PlannedExpressionKind::Identifier(read)
+            if matches!(
+                read.kind,
+                PlannedIdentifierReadKind::Variable | PlannedIdentifierReadKind::DeclaredValue
+            ) =>
+        {
+            let owner = store
+                .symbol(read.value_symbol)
+                .ok_or(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbol(read.value_symbol),
+                ))?;
+            let declaration = owner.value_declaration().ok_or(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(read.value_symbol),
+            ))?;
+            if !host.symbol_matches(store, declaration, read.value_symbol) {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(read.value_symbol),
+                ));
+            }
+            let record = super::declared::preflight_node(store, host, declaration)?;
+            let annotation = match &record.data {
+                NodeData::VariableDeclaration(variable) => variable.type_,
+                NodeData::ParameterDeclaration(parameter) => parameter.type_,
+                _ => None,
+            };
+            let Some(annotation) = annotation else {
+                return Ok(false);
+            };
+            let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+            if super::declared::preflight_node(store, host, annotation)?.parent
+                != Some(declaration.node)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(read.value_symbol),
+                ));
+            }
+            if !array_binding_annotation_is_any(store, host, annotation)? {
+                return Ok(false);
+            }
+            if let Some(links) = store.value_symbol_links(read.value_symbol) {
+                if links
+                    != &(ValueSymbolLinks {
+                        resolved_type: links.resolved_type,
+                        ..ValueSymbolLinks::default()
+                    })
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::InvalidValueLinks(read.value_symbol),
+                    ));
+                }
+                if let Some(cached) = links.resolved_type
+                    && cached != any
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::CachedValueTypeMismatch {
+                            symbol: read.value_symbol,
+                            cached,
+                            expected: any,
+                        },
+                    ));
+                }
+            }
+            true
+        }
+        _ => false,
+    };
+    if is_any {
+        preflight_source_expression_cache(store, expression.node, any)?;
+    }
+    Ok(is_any)
 }
 
 #[allow(clippy::too_many_arguments)] // Mirrors expression execution with an explicit flow scope.
@@ -30834,25 +30983,6 @@ fn check_callable_parameter_initializers(
         ) else {
             continue;
         };
-        let parameter_record = host
-            .node(parameter.declaration)
-            .ok_or_else(|| callable_parameter_execution_error(callable, parameter.declaration))?;
-        let NodeData::ParameterDeclaration(syntax) = &parameter_record.data else {
-            return Err(callable_parameter_execution_error(
-                callable,
-                parameter.declaration,
-            ));
-        };
-        check_array_binding_iteration_support(
-            store,
-            host,
-            NodeRef::new(
-                parameter.declaration.arena,
-                parameter.declaration.file,
-                syntax.name,
-            ),
-            body_type,
-        )?;
         let mut binding_types = Vec::with_capacity(bindings.len());
         for (declaration, symbol) in bindings {
             let checked = check_array_binding_element(
@@ -49916,12 +50046,6 @@ pub(super) fn check_source_file(
                         None,
                         &mut deferred,
                     )?;
-                    check_array_binding_iteration_support(
-                        store,
-                        host,
-                        array.pattern,
-                        initializer.result,
-                    )?;
                     let mut block_flow_types = current_flow_types.clone();
                     for element in &array.elements {
                         if element.initializer.is_some()
@@ -51088,7 +51212,6 @@ pub(super) fn check_source_file(
                     )?
                     .result
                 };
-                check_array_binding_iteration_support(store, host, variable.pattern, initializer)?;
                 let bootstrap =
                     store
                         .intrinsic_bootstrap()
@@ -87466,6 +87589,14 @@ class Foo2 {
                         })
                         .unwrap();
                 let cold = observable_state(&context, file);
+                let iterable_symbol = context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .and_then(|bootstrap| context.store().symbol_table(bootstrap.globals))
+                    .and_then(|globals| globals.get_source("Iterable"))
+                    .and_then(|symbol| context.store().get_merged_symbol(symbol));
+                let iterable_links = iterable_symbol
+                    .and_then(|symbol| context.store().declared_type_links(symbol).cloned());
 
                 let result = context.check_source_file(file);
 
@@ -87487,6 +87618,11 @@ class Foo2 {
                     context.recheck_source_file(file).unwrap();
                     assert_eq!(observable_state(&context, file), warm);
                 }
+                assert_eq!(
+                    iterable_symbol
+                        .and_then(|symbol| context.store().declared_type_links(symbol).cloned()),
+                    iterable_links,
+                );
                 assert!(context.diagnostics().is_empty());
             }
         }
@@ -87494,28 +87630,154 @@ class Foo2 {
 
     #[test]
     fn any_array_binding_parents_do_not_require_an_iterator() {
-        let library = parsed(concat!(
-            "interface Array<T> { [index: number]: T; } ",
-            "interface Iterable<T, R, N> {}",
-        ));
-        let source = parsed("declare var input: any; let [, value] = input;");
-        let library_file = FileId::new(10_106);
-        let file = FileId::new(10_107);
-        let mut context = context(
-            &[(library_file, &library), (file, &source)],
-            CanonicalCheckerOptions::default(),
-        );
+        for (index, text) in [
+            "declare var input: any; let [, value] = input;",
+            "declare var input: any; { let [, value] = input; }",
+            "declare var input: number[]; let [, value]: any = input;",
+            "declare var input: number[]; let [, value] = input as any;",
+            "declare var input: any; let [, value] = (input);",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let library = parsed(concat!(
+                "interface Array<T> { [index: number]: T; } ",
+                "interface Iterable<T, R, N> {}",
+            ));
+            let source = parsed(text);
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(10_130 + offset);
+            let file = FileId::new(10_131 + offset);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
 
-        context.check_source_file(file).unwrap();
+            context.check_source_file(file).unwrap();
 
-        assert_eq!(
-            object_binding_value_type(&context, &source, file, "value"),
-            context.store().intrinsic_bootstrap().unwrap().any_type,
-        );
-        assert!(context.diagnostics().is_empty());
-        let warm = observable_state(&context, file);
-        context.recheck_source_file(file).unwrap();
-        assert_eq!(observable_state(&context, file), warm);
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, "value"),
+                context.store().intrinsic_bootstrap().unwrap().any_type,
+            );
+            assert!(context.diagnostics().is_empty());
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn array_iteration_preflight_rejects_before_callable_or_initializer_publication() {
+        for (index, text) in [
+            "function prior(value: number = 1): void {} function select([, value]: number[]): void {}",
+            "var input: number[]; function select([, value] = input) {}",
+            "function prior(value: number = 1): void {} declare var input: number[]; { let [, value] = input; }",
+            "function prior(value: number = 1): void {} declare var input: number[]; let [, value] = input;",
+        ].into_iter().enumerate() {
+            let library = parsed(concat!(
+                "interface Array<T> { [index: number]: T; } ",
+                "interface Iterable<T, R, N> {}",
+            ));
+            let source = parsed(text);
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(10_110 + offset);
+            let file = FileId::new(10_111 + offset);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+            let pattern = source.arena.iter().find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrayBindingPattern)
+                    .then_some(NodeRef::new(source.arena.id(), file, node))
+            }).unwrap();
+            let cold = observable_state(&context, file);
+
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Element(pattern))),
+            );
+
+            assert_eq!(observable_state(&context, file), cold);
+            for (node, record) in source.arena.iter() {
+                let node = NodeRef::new(source.arena.id(), file, node);
+                if record.kind == SyntaxKind::FunctionDeclaration {
+                    let symbol = context.file(file).unwrap().1.symbol(node).unwrap();
+                    assert!(context.store().source_callable_type_for_owner(symbol).is_none());
+                } else if record.kind == SyntaxKind::Parameter {
+                    let symbol = context.file(file).unwrap().1.symbol(node).unwrap();
+                    assert!(context.store().value_symbol_links(symbol).is_none());
+                }
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn array_iteration_preflight_validates_warm_iterable_identity_and_arity() {
+        #[derive(Clone, Copy)]
+        enum Cache {
+            Valid,
+            WrongType,
+            WrongArity,
+        }
+        for (index, cache) in [Cache::Valid, Cache::WrongType, Cache::WrongArity]
+            .into_iter()
+            .enumerate()
+        {
+            let library = parsed(concat!(
+                "interface Array<T> { [index: number]: T; } ",
+                "interface Iterable<T, R, N> {}",
+            ));
+            let source = parsed("function select([, value]: number[]): void {}");
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(10_120 + offset);
+            let file = FileId::new(10_121 + offset);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+            let iterable = global_symbol(&context, "Iterable");
+            let cached = match cache {
+                Cache::Valid => context.get_declared_type_of_symbol(iterable).unwrap(),
+                Cache::WrongType => context.store().intrinsic_bootstrap().unwrap().number_type,
+                Cache::WrongArity => context
+                    .store_mut_for_test()
+                    .alloc_interface_type(ObjectFlags::INTERFACE, Some(iterable))
+                    .unwrap(),
+            };
+            assert!(context.store_mut_for_test().set_declared_type_links(
+                iterable,
+                crate::semantic::DeclaredTypeLinks {
+                    declared_type: Some(cached),
+                    ..crate::semantic::DeclaredTypeLinks::default()
+                },
+            ));
+            let before = observable_state(&context, file);
+
+            let result = context.check_source_file(file);
+
+            match cache {
+                Cache::Valid => assert!(matches!(
+                    result,
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Element(_)
+                    ))
+                )),
+                Cache::WrongType | Cache::WrongArity => assert!(matches!(
+                    result,
+                    Err(SourceCheckError::DeclaredType(_) | SourceCheckError::Element(_))
+                )),
+            }
+            assert_eq!(observable_state(&context, file), before);
+            assert_eq!(
+                context
+                    .store()
+                    .declared_type_links(iterable)
+                    .and_then(|links| links.declared_type),
+                Some(cached)
+            );
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
