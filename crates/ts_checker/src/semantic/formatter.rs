@@ -2481,8 +2481,9 @@ fn display_tuple_type(
                 state.add(2);
             }
             let rest = info.flags().contains(ElementFlags::REST);
+            let variable = info.flags().intersects(ElementFlags::VARIABLE);
             let optional = info.flags().contains(ElementFlags::OPTIONAL);
-            if rest {
+            if variable {
                 result.push_str("...");
                 state.add(3);
             }
@@ -2494,7 +2495,7 @@ fn display_tuple_type(
                 let NodeData::NamedTupleMember(member) = &record.data else {
                     return Err(TypeDisplayUnavailable::MalformedType(tuple.type_()));
                 };
-                if member.dot_dot_dot_token.is_some() != rest
+                if member.dot_dot_dot_token.is_some() != variable
                     || member.question_token.is_some() != optional
                 {
                     return Err(TypeDisplayUnavailable::MalformedType(tuple.type_()));
@@ -6102,6 +6103,105 @@ mod tests {
                 .unwrap();
             assert_eq!(context.type_to_string(type_).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn infer_rest_tuple_short_source_preserves_variadic_signature_display() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "function f<T extends [string]>(args: [...string[], ...T]) {} f([]);",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(222);
+        let mut context = parsed_context(
+            &parsed,
+            file,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let callable = context
+            .store()
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(callable).unwrap(),
+            "<T extends [string]>(args: [...string[], ...T]) => void"
+        );
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let tuple = context
+            .store()
+            .callable_signature_parameter_types(signature)
+            .unwrap()[0];
+        assert_eq!(
+            context.type_to_string(tuple).unwrap(),
+            "[...string[], ...T]"
+        );
+    }
+
+    #[test]
+    fn labeled_variadic_tuple_display_keeps_the_spread_without_an_array_suffix() {
+        let parsed = parse_source_file("declare function labeled<T>(args: [...tail: T]): void;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(223);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let parameter = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeParameter).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let label = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NamedTupleMember).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
+        let parameter_type = context.get_declared_type_of_symbol(symbol).unwrap();
+        let info = context
+            .store()
+            .create_tuple_element_info(ElementFlags::VARIADIC, Some(label))
+            .unwrap();
+        let tuple = context
+            .store_mut_for_test()
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[parameter_type],
+                &[info],
+                false,
+            ))
+            .unwrap();
+        assert_eq!(context.type_to_string(tuple).unwrap(), "[...tail: T]");
     }
 
     #[test]
