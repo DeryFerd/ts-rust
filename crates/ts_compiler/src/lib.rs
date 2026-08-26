@@ -13890,13 +13890,17 @@ mod tests {
             super::ProgramChecker::Canonical,
         );
         program.load_remaining_program_graph(&fs);
-        assert_eq!(
-            program
-                .resolved_modules
-                .get(&(input_path.clone(), specifier.to_owned())),
-            Some(&target_path),
-            "resolution changed for {input}"
-        );
+        let targets = program
+            .resolved_modules
+            .iter()
+            .filter_map(|(key, target)| {
+                (key.containing_file == input_path && key.specifier == specifier).then_some(target)
+            })
+            .collect::<Vec<_>>();
+        assert!(!targets.is_empty(), "resolution missing for {input}");
+        for target in targets {
+            assert_eq!(target, &target_path, "resolution changed for {input}");
+        }
         assert_eq!(
             program.source_file_by_id(FileId::new(0)).unwrap().file_name,
             input_path
