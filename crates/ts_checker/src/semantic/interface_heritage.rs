@@ -3816,6 +3816,30 @@ mod tests {
         let mut context = checker_context(&parsed, file);
         let iterator = interface_symbol(&parsed, file, &context, "Iterator");
         let derived = interface_symbol(&parsed, file, &context, "Derived");
+        assert_concrete_iterator_next(&mut context, iterator, derived);
+    }
+
+    #[test]
+    fn bundled_iterator_heritage_retains_inherited_next_mapper() {
+        let library = parse_source_file(include_str!(
+            "../../../ts_bundled/libs/lib.es2015.iterable.d.ts"
+        ));
+        let source =
+            parse_source_file("interface Derived extends Iterator<number, void, string> {}");
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let (mut context, library_file, source_file) =
+            default_library_heritage_context(&library, &source, true);
+        let iterator = interface_symbol(&library, library_file, &context, "Iterator");
+        let derived = interface_symbol(&source, source_file, &context, "Derived");
+        assert_concrete_iterator_next(&mut context, iterator, derived);
+    }
+
+    fn assert_concrete_iterator_next(
+        context: &mut CanonicalCheckerContext<'_>,
+        iterator: SemanticSymbolId,
+        derived: SemanticSymbolId,
+    ) {
         let original_next = context
             .store()
             .symbol(iterator)
@@ -3841,11 +3865,28 @@ mod tests {
             reference.type_arguments,
             [bootstrap.number_type, bootstrap.void_type, string],
         );
+        let inherited_next = data
+            .reference
+            .object
+            .structured
+            .members
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("next"))
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .value_symbol_links(inherited_next)
+                .unwrap()
+                .resolved_type
+                .is_none()
+        );
         let next = context
             .store_mut_for_test()
             .resolve_generic_interface_property(base, "next", None)
             .unwrap()
             .unwrap();
+        assert_eq!(next.symbol(), inherited_next);
         let links = context.store().value_symbol_links(next.symbol()).unwrap();
         assert_eq!(links.target, Some(original_next));
         assert_eq!(

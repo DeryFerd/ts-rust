@@ -3182,14 +3182,32 @@ pub(super) fn plan_interface(
             Vec::<Vec<PlannedProperty>>::with_capacity(heritage.bases.len());
         for base in &heritage.bases {
             if !base.type_arguments.is_empty() {
-                plan_generic_interface(store, host, base.symbol)?;
+                let base_plan = plan_generic_interface(store, host, base.symbol)?;
                 if authenticated_react_portal_interface(store, host, &plan)? {
                     return Ok(plan);
                 }
-                return Err(PropertyObjectError::UnsupportedMember {
-                    node: base.node,
-                    kind: SyntaxKind::ExpressionWithTypeArguments,
+                let constrained = base_plan.declarations.iter().any(|declaration| {
+                    let Some(record) = host.node(*declaration) else { return true; };
+                    let NodeData::InterfaceDeclaration(interface) = &record.data else { return true; };
+                    interface.type_parameters.as_ref().is_none_or(|parameters| parameters.nodes.iter().any(|parameter| {
+                        !matches!(host.node(NodeRef::new(declaration.arena, declaration.file, *parameter)).map(|record| &record.data),
+                            Some(NodeData::TypeParameterDeclaration(parameter)) if parameter.constraint.is_none())
+                    }))
                 });
+                if heritage.bases.len() != 1
+                    || constrained
+                    || !plan.call_signatures.is_empty()
+                    || !base_plan.call_signatures.is_empty()
+                {
+                    return Err(PropertyObjectError::UnsupportedMember {
+                        node: base.node,
+                        kind: SyntaxKind::ExpressionWithTypeArguments,
+                    });
+                }
+                // Generic member types are compared after the base arguments are applied.
+                effective_base_properties.push(Vec::new());
+                base_plans.push(base_plan);
+                continue;
             }
             let base_plan = plan_interface(store, host, base.symbol)?;
             if let Some(index) = base_plan.indexes.first() {

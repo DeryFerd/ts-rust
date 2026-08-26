@@ -1,4 +1,4 @@
-//! Structured-member publication for direct, nongeneric interface bases.
+//! Structured-member publication for direct interface bases.
 //!
 //! One or two direct bases preserve declaration and source-base order. A
 //! single base can also provide authenticated index or call signatures.
@@ -16,6 +16,7 @@ use ts_binder::{
 
 use super::{
     CanonicalTypeMapperStore, IndexInfoId, SignatureId, TypeId,
+    instantiated_members::validate_generic_interface_members,
     links::{
         MembersOrExportsResolutionKind, ResolvedSignatureState, SignatureLinks, ValueSymbolLinks,
     },
@@ -26,6 +27,7 @@ use super::{
         publish_declared_members, publish_prepared_direct_interface_declared_properties,
         resolved_computed_member_key, validate_stored_declared_call_set,
     },
+    reference_types::validate_direct_generic_reference,
     relater::ResolvedOwnProperty,
     signatures::SignatureFlags,
     store::{DirectInterfaceHeritageProvenance, SourceNodeParent},
@@ -103,8 +105,8 @@ fn matching_inherited_property_contract(
 /// Resolves and publishes one or two direct interface bases.
 ///
 /// `base_types` must match the canonical symbols retained by the syntax plan.
-/// Each base must be a fully resolved, nongeneric interface. One direct base
-/// may also provide authenticated index signatures.
+/// Generic bases retain their instantiated property symbols and lazy types.
+/// One direct base may also provide authenticated index signatures.
 /// All allocations and sparse-link slots are staged before semantic mutation.
 pub(super) fn resolve_direct_interface_members(
     store: &mut CanonicalTypeMapperStore,
@@ -164,7 +166,9 @@ pub(super) fn resolve_direct_interface_members(
             });
         }
         let inherited_base = store.direct_interface_heritage_provenance(base).is_some();
-        let surface = if inherited_base {
+        let surface = if !planned.type_arguments.is_empty() {
+            validate_generic_base_property_interface(store, base)
+        } else if inherited_base {
             validate_direct_heritage_property_interface(store, base)
         } else {
             validate_no_heritage_property_interface(store, base)
@@ -646,6 +650,25 @@ pub(super) fn validate_planned_interface_heritage_members(
                 .type_payload(*type_)
                 .and_then(super::type_records::TypeRecord::symbol)
                 != Some(base.symbol)
+                || !base.type_arguments.is_empty()
+                    && !validate_direct_generic_reference(store, *type_).is_ok_and(|reference| {
+                        reference.type_arguments.len() == base.type_arguments.len()
+                            && reference
+                                .type_arguments
+                                .iter()
+                                .zip(&base.type_arguments)
+                                .all(|(argument, node)| {
+                                    super::object_members::cached_planned_type_identity(
+                                        store, *node,
+                                    ) == Some(*argument)
+                                })
+                            && base.defaults.iter().all(|default| {
+                                super::interface_heritage::validate_heritage_default_cache(
+                                    store, default, true,
+                                )
+                                .is_ok()
+                            })
+                    })
         })
     {
         return false;
@@ -723,6 +746,32 @@ fn validate_no_heritage_property_interface(
     validate_property_interface(store, type_, false)
 }
 
+fn validate_generic_base_property_interface(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<ValidatedInterfaceSurface> {
+    let reference = validate_direct_generic_reference(store, type_).ok()?;
+    let members = validate_generic_interface_members(store, type_, None).ok()??;
+    let record = store.type_payload(type_)?;
+    let owner = record.symbol()?;
+    let structured = record.data().structured()?;
+    if members.target() != reference.target
+        || record.alias().is_some()
+        || structured.signatures.is_some()
+        || structured.call_signature_count != 0
+    {
+        return None;
+    }
+    Some(ValidatedInterfaceSurface {
+        owner,
+        declared_properties: Vec::new(),
+        properties: members.properties().to_vec(),
+        index_infos: structured.index_infos.clone().unwrap_or_default(),
+        declared_call_signatures: Vec::new(),
+        call_signatures: Vec::new(),
+    })
+}
+
 fn validate_direct_heritage_property_interface(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -775,6 +824,11 @@ fn validate_property_interface_worker(
         return None;
     }
     let record = store.type_payload(type_)?;
+    if record.object_flags().contains(ObjectFlags::REFERENCE) {
+        let result = validate_generic_base_property_interface(store, type_);
+        assert!(active.remove(&type_));
+        return result;
+    }
     let TypeData::Interface(interface) = record.data() else {
         return None;
     };

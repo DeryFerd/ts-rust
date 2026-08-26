@@ -62,7 +62,9 @@ use super::{
         InstantiationLimits, InstantiationSession, instantiate_type_with_session,
         instantiate_type_with_vector_and_session,
     },
-    interface_heritage::{DirectInterfaceBaseKind, DirectInterfaceHeritagePlan},
+    interface_heritage::{
+        DirectInterfaceBaseKind, DirectInterfaceBasePlan, DirectInterfaceHeritagePlan,
+    },
     intersection_types::IntersectionTypeError,
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
@@ -826,6 +828,7 @@ struct TypeQueryPlan {
     type_literals: BTreeMap<NodeRef, PropertyObjectPlan>,
     interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
     generic_interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
+    generic_member_plans: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
     generic_interface_identities:
         BTreeMap<SemanticSymbolId, object_members::GenericInterfaceIdentityPlan>,
     functions: BTreeMap<NodeRef, FunctionTypePlan>,
@@ -6256,8 +6259,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         let result = (|| {
             if !has_lazy_default_library_interface_base(&planned) {
-                for base in planned.heritage_base_symbols() {
-                    self.plan_property_interface(base)?;
+                if let Some(heritage) = &planned.heritage {
+                    for base in &heritage.bases {
+                        if base.type_arguments.is_empty() {
+                            self.plan_property_interface(base.symbol)?;
+                        } else {
+                            self.plan_concrete_generic_interface_base(base)?;
+                        }
+                    }
                 }
             }
             for property in planned.property_type_nodes() {
@@ -6274,6 +6283,53 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         })();
         assert!(self.planning_interfaces.remove(&symbol));
         result
+    }
+
+    fn plan_concrete_generic_interface_base(
+        &mut self,
+        base: &DirectInterfaceBasePlan,
+    ) -> Result<(), DeclaredTypeError> {
+        if !self.plan.generic_member_plans.contains_key(&base.symbol) {
+            let members =
+                object_members::plan_generic_interface(self.store, self.host, base.symbol)
+                    .map_err(property_object_error)?;
+            self.plan
+                .generic_member_plans
+                .insert(base.symbol, members.clone());
+            if self.has_generic_interface_heritage(base.symbol)? {
+                self.plan_generic_interface_heritage(base.symbol)?;
+            }
+            if let Some(heritage) = &members.heritage {
+                for inherited in &heritage.bases {
+                    if inherited.type_arguments.is_empty() {
+                        self.plan_property_interface(inherited.symbol)?;
+                    } else {
+                        self.plan_concrete_generic_interface_base(inherited)?;
+                    }
+                }
+            }
+            for property in members.property_type_nodes() {
+                self.plan_type_node_in_context(property, None, false)?;
+            }
+            for (key, value) in members.index_type_nodes() {
+                self.plan_type_node_in_context(key, None, false)?;
+                self.plan_type_node_in_context(value, None, false)?;
+            }
+            for annotation in members.call_type_nodes() {
+                self.plan_type_node_in_context(annotation, None, false)?;
+            }
+        }
+        for argument in &base.type_arguments {
+            self.plan_type_node_in_context(*argument, None, false)?;
+        }
+        for default in &base.defaults {
+            self.plan_type_node_in_context(default.node, None, false)?;
+            super::interface_heritage::validate_heritage_default_cache(self.store, default, false)
+                .map_err(|_| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(default.node))
+                })?;
+        }
+        Ok(())
     }
 
     /// Authenticates one React namespace export without publishing semantic state.
@@ -21419,68 +21475,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             if base.kind != DirectInterfaceBaseKind::Interface || base.symbol == symbol {
                 return Err(invalid());
             }
-            let base_target = self.execute_declared_type(base.symbol, plan, prepared)?;
-            let mut arguments = Vec::with_capacity(base.type_arguments.len());
-            for argument in &base.type_arguments {
-                arguments.push(self.execute_type_node(*argument, plan, prepared)?);
-            }
-            if !base.defaults.is_empty() {
-                let reference = PlannedTypeReference {
-                    symbol: base.symbol,
-                    import_alias: None,
-                    type_arguments: base.type_arguments.clone(),
-                    alias_owner: None,
-                    arity: PlannedTypeReferenceArity::Valid,
-                    global_array_target: None,
-                    direct_generic: true,
-                    direct_generic_constraints: Vec::new(),
-                    direct_generic_defaults: base
-                        .defaults
-                        .iter()
-                        .map(|default| PlannedDirectGenericDefault {
-                            parameter: default.parameter,
-                            node: default.node,
-                            earlier_parameter: default.earlier_parameter,
-                        })
-                        .collect(),
-                };
-                self.resolve_direct_generic_reference_defaults(
-                    base.node,
-                    &reference,
-                    base_target,
-                    &mut arguments,
-                    plan,
-                    prepared,
-                )?;
-                for default in &base.defaults {
-                    super::interface_heritage::validate_heritage_default_cache(
-                        self.store, default, true,
-                    )
-                    .map_err(|_| invalid())?;
-                }
-            }
-            let reference = if arguments.is_empty() {
-                if !matches!(
-                    object_members::validate_resolved_declared_property_object(
-                        self.store,
-                        base_target,
-                    ),
-                    object_members::DeclaredPropertyObjectValidation::Valid(
-                        object_members::DeclaredPropertyObjectProof::Interface,
-                    )
-                ) {
-                    return Err(invalid());
-                }
-                base_target
-            } else {
-                create_direct_generic_reference(
-                    self.store,
-                    base_target,
-                    &arguments,
-                    ObjectFlags::NONE,
-                )
-                .map_err(|_| invalid())?
-            };
+            let reference = self.execute_direct_interface_base_type(base, plan, prepared)?;
             if reference == target || bases.contains(&reference) {
                 return Err(invalid());
             }
@@ -21509,6 +21504,190 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Err(invalid());
         }
         Ok(target)
+    }
+
+    fn execute_direct_interface_base_type(
+        &mut self,
+        base: &DirectInterfaceBasePlan,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(base.node));
+        let target = self.execute_declared_type(base.symbol, plan, prepared)?;
+        let mut arguments = Vec::with_capacity(base.type_arguments.len());
+        for argument in &base.type_arguments {
+            arguments.push(self.execute_type_node(*argument, plan, prepared)?);
+        }
+        if !base.defaults.is_empty() {
+            let reference = PlannedTypeReference {
+                symbol: base.symbol,
+                import_alias: None,
+                type_arguments: base.type_arguments.clone(),
+                alias_owner: None,
+                arity: PlannedTypeReferenceArity::Valid,
+                global_array_target: None,
+                direct_generic: true,
+                direct_generic_constraints: Vec::new(),
+                direct_generic_defaults: base
+                    .defaults
+                    .iter()
+                    .map(|default| PlannedDirectGenericDefault {
+                        parameter: default.parameter,
+                        node: default.node,
+                        earlier_parameter: default.earlier_parameter,
+                    })
+                    .collect(),
+            };
+            self.resolve_direct_generic_reference_defaults(
+                base.node,
+                &reference,
+                target,
+                &mut arguments,
+                plan,
+                prepared,
+            )?;
+            for default in &base.defaults {
+                super::interface_heritage::validate_heritage_default_cache(
+                    self.store, default, true,
+                )
+                .map_err(|_| invalid())?;
+            }
+        }
+        if arguments.is_empty() {
+            if !matches!(
+                object_members::validate_resolved_declared_property_object(self.store, target),
+                object_members::DeclaredPropertyObjectValidation::Valid(
+                    object_members::DeclaredPropertyObjectProof::Interface
+                )
+            ) {
+                return Err(invalid());
+            }
+            Ok(target)
+        } else {
+            create_direct_generic_reference(self.store, target, &arguments, ObjectFlags::NONE)
+                .map_err(|_| invalid())
+        }
+    }
+
+    fn execute_concrete_generic_interface_base(
+        &mut self,
+        base: &DirectInterfaceBasePlan,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let reference = self.execute_direct_interface_base_type(base, plan, prepared)?;
+        let projection =
+            validate_direct_generic_reference(self.store, reference).map_err(|_| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(base.node))
+            })?;
+        self.execute_generic_interface_declared_members(
+            base.symbol,
+            projection.target,
+            plan,
+            prepared,
+        )?;
+        super::instantiated_members::resolve_members_with_array_targets(
+            self.store,
+            reference,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+        )
+        .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(base.node)))?;
+        Ok(reference)
+    }
+
+    fn execute_generic_interface_declared_members(
+        &mut self,
+        symbol: SemanticSymbolId,
+        target: TypeId,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || {
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                symbol,
+                declared_type: target,
+            })
+        };
+        let members = plan
+            .generic_member_plans
+            .get(&symbol)
+            .cloned()
+            .ok_or_else(invalid)?;
+        if let Some(heritage) = &members.heritage {
+            for base in &heritage.bases {
+                if base.type_arguments.is_empty() {
+                    self.execute_declared_type(base.symbol, plan, prepared)?;
+                } else {
+                    self.execute_concrete_generic_interface_base(base, plan, prepared)?;
+                }
+            }
+        }
+        self.execute_interface_method_type_parameters(
+            &members.methods,
+            &members.call_signatures,
+            plan,
+            prepared,
+        )?;
+        for annotation in members.call_type_nodes() {
+            self.execute_type_node(annotation, plan, prepared)?;
+        }
+        for (key, value) in members.index_type_nodes() {
+            self.execute_type_node(key, plan, prepared)?;
+            self.execute_type_node(value, plan, prepared)?;
+        }
+        let mut types = Vec::with_capacity(members.properties.len());
+        for property in &members.properties {
+            let mut type_ = self.execute_type_node(property.type_node, plan, prepared)?;
+            if property.optional
+                && self
+                    .store
+                    .intrinsic_bootstrap()
+                    .ok_or_else(invalid)?
+                    .options
+                    .strict_null_checks
+            {
+                let sentinel = self
+                    .store
+                    .intrinsic_bootstrap()
+                    .ok_or_else(invalid)?
+                    .undefined_or_missing_type;
+                let record = self.store.type_payload(type_).ok_or_else(invalid)?;
+                if !record
+                    .flags()
+                    .intersects(TypeFlags::ANY_OR_UNKNOWN | TypeFlags::UNDEFINED)
+                    && !matches!(record.data(), TypeData::Union(union) if union.union.types.contains(&sentinel))
+                {
+                    type_ = match self.global_types.as_ref() {
+                        Some(globals) => self.store.expression_union_type_with_global_types(
+                            globals,
+                            &[type_, sentinel],
+                            UnionReduction::Literal,
+                        ),
+                        None => super::instantiate::canonical_anonymous_union(
+                            self.store,
+                            &[type_, sentinel],
+                        ),
+                    }
+                    .map_err(Self::literal_cache_error)?;
+                }
+            }
+            types.push(type_);
+        }
+        let resolved = matches!(self.store.type_payload(target).map(TypeRecord::data), Some(TypeData::Interface(interface)) if interface.base_types_resolved);
+        if !resolved
+            && (members.heritage.is_some()
+                || !self.store.publish_interface_no_base_resolution(target))
+        {
+            return Err(invalid());
+        }
+        object_members::publish_generic_interface_declared_members(
+            self.store, &members, target, &types,
+        )
+        .map_err(property_object_error)?;
+        Ok(())
     }
 
     fn execute_property_interface(
@@ -21588,6 +21767,67 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             unreachable!("the active-interface check and insertion are adjacent")
         }
         let result = (|| {
+            let mut base_types = Vec::new();
+            if let Some(heritage) = &interface.heritage {
+                base_types.reserve(heritage.bases.len());
+                for base in &heritage.bases {
+                    let type_ = if base.type_arguments.is_empty() {
+                        self.execute_declared_type(base.symbol, plan, prepared)?
+                    } else {
+                        self.execute_concrete_generic_interface_base(base, plan, prepared)?
+                    };
+                    if !base.type_arguments.is_empty() {
+                        let targets = self
+                            .global_types
+                            .as_ref()
+                            .map(CanonicalArrayTargets::from_global_types);
+                        let members =
+                            super::instantiated_members::validate_generic_interface_members(
+                                self.store, type_, targets,
+                            )
+                            .map_err(|_| {
+                                property_object_error(PropertyObjectError::InvalidCachedInterface {
+                                    symbol: base.symbol,
+                                    type_: type_,
+                                })
+                            })?
+                            .ok_or_else(|| {
+                                property_object_error(PropertyObjectError::InvalidCachedInterface {
+                                    symbol: base.symbol,
+                                    type_: type_,
+                                })
+                            })?;
+                        for property in &interface.properties {
+                            let inherited = members
+                                .members()
+                                .and_then(|members| self.store.symbol_table(members))
+                                .and_then(|members| members.get_source(&property.name));
+                            if let Some(inherited) = inherited {
+                                let mut fallback =
+                                    InstantiationSession::new(InstantiationLimits::default());
+                                super::instantiated_members::demand_instantiated_property_type(
+                                    self.store,
+                                    type_,
+                                    inherited,
+                                    targets,
+                                    self.instantiation_session
+                                        .as_deref_mut()
+                                        .unwrap_or(&mut fallback),
+                                )
+                                .map_err(|_| {
+                                    property_object_error(
+                                        PropertyObjectError::InvalidCachedInterface {
+                                            symbol: base.symbol,
+                                            type_: type_,
+                                        },
+                                    )
+                                })?;
+                            }
+                        }
+                    }
+                    base_types.push(type_);
+                }
+            }
             self.execute_interface_method_type_parameters(
                 &interface.methods,
                 &interface.call_signatures,
@@ -21697,10 +21937,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 types[property] = value;
             }
             if interface.heritage.is_some() {
-                let mut base_types = Vec::with_capacity(interface.heritage_base_symbols().len());
-                for base in interface.heritage_base_symbols() {
-                    base_types.push(self.execute_declared_type(base, plan, prepared)?);
-                }
                 return if call_types.is_empty() {
                     structured_members::resolve_direct_interface_members(
                         self.store,
@@ -22574,6 +22810,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .interfaces
             .values()
             .chain(plan.generic_interfaces.values())
+            .chain(plan.generic_member_plans.values())
             .chain(plan.type_literals.values())
             .any(|object| {
                 object.call_signatures.iter().any(|signature| {
