@@ -23,6 +23,7 @@ use xxhash_rust::xxh3::xxh3_128;
 
 mod artifacts;
 mod oracle;
+pub mod project;
 
 use artifacts::{GeneratedSemanticArtifacts, SemanticArtifactKind};
 
