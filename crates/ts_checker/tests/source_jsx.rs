@@ -704,6 +704,244 @@ fn production_source_checker_matches_upstream_multiline_jsx_diagnostics() {
     );
 }
 
+fn jsx_symbol_context<'a>(
+    sources: impl IntoIterator<Item = (FileId, &'a ParseResult, CanonicalSourceFileFacts)>,
+) -> CanonicalCheckerContext<'a> {
+    let mut binder = CanonicalBinder::new();
+    let mut arenas = Vec::new();
+    for (file, parsed, facts) in sources {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        binder
+            .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        arenas.push((file, &parsed.arena));
+    }
+    CanonicalCheckerContext::new(binder.finish(), arenas, CanonicalCheckerOptions::default())
+        .unwrap()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Compare cold and checked queries on the same source graph.
+fn intrinsic_jsx_symbol_display_uses_the_tag_location_without_rebinding() {
+    let library = parse_jsx_source_file("interface Promise<T> {}");
+    let parsed = parse_jsx_source_file(concat!(
+        "declare namespace JSX {\n",
+        "  interface IntrinsicElements { div: any; }\n",
+        "}\n",
+        "async function f() { return <div arguments={42} />; }\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3_721);
+    let property = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            matches!(record.data, NodeData::PropertyDeclaration(_)).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    let (opening, tag) = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::JsxSelfClosingElement(element) = &record.data else {
+                return None;
+            };
+            Some((
+                NodeRef::new(parsed.arena.id(), file, node),
+                NodeRef::new(parsed.arena.id(), file, element.tag_name),
+            ))
+        })
+        .unwrap();
+
+    for check_first in [false, true] {
+        let mut context = jsx_symbol_context([
+            (
+                FileId::new(3_726),
+                &library,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source("\"/project/lib.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            ),
+            (
+                file,
+                &parsed,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/test.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            ),
+        ]);
+        let bound_symbol = context.file(file).unwrap().1.symbol(property).unwrap();
+        if check_first {
+            context.check_source_file(file).unwrap();
+        }
+        assert_eq!(
+            context
+                .symbol_to_string_at_location(bound_symbol, opening)
+                .unwrap(),
+            "JSX.IntrinsicElements.div"
+        );
+
+        let tag_symbol = context.get_symbol_at_location(tag).unwrap().unwrap();
+        assert_eq!(tag_symbol, bound_symbol);
+        assert_eq!(
+            context.get_symbol_declarations(tag_symbol).unwrap(),
+            [property]
+        );
+        assert_eq!(
+            context
+                .symbol_to_string_at_location(bound_symbol, property)
+                .unwrap(),
+            "IntrinsicElements.div"
+        );
+
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        );
+        assert_eq!(
+            context.get_symbol_at_location(tag).unwrap(),
+            Some(bound_symbol)
+        );
+        assert_eq!(
+            context
+                .symbol_to_string_at_location(tag_symbol, opening)
+                .unwrap(),
+            "JSX.IntrinsicElements.div"
+        );
+        assert_eq!(
+            context.file(file).unwrap().1.symbol(property),
+            Some(bound_symbol)
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.diagnostics().clone(),
+            ),
+            warm
+        );
+    }
+}
+
+#[test]
+fn intrinsic_jsx_symbol_display_keeps_cross_file_global_namespace_ownership() {
+    for (index, declaration_source, module) in [
+        (
+            0,
+            "declare namespace JSX { interface IntrinsicElements { panel: any; } }",
+            CanonicalModuleState::Script,
+        ),
+        (
+            1,
+            "export {}; declare global { namespace JSX { interface IntrinsicElements { panel: any; } } }",
+            CanonicalModuleState::External,
+        ),
+    ] {
+        let declarations = parse_jsx_source_file(declaration_source);
+        let source = parse_jsx_source_file(
+            "export {}; const first = <panel></panel>; const second = <panel />;",
+        );
+        let declaration_file = FileId::new(3_722 + index * 2);
+        let source_file = FileId::new(3_723 + index * 2);
+        let mut context = jsx_symbol_context([
+            (
+                declaration_file,
+                &declarations,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/jsx.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    module,
+                ),
+            ),
+            (
+                source_file,
+                &source,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/view.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            ),
+        ]);
+        let property = declarations
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::PropertyDeclaration(_)).then_some(NodeRef::new(
+                    declarations.arena.id(),
+                    declaration_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let bound_symbol = context
+            .file(declaration_file)
+            .unwrap()
+            .1
+            .symbol(property)
+            .unwrap();
+        let tags = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let tag = match &record.data {
+                    NodeData::JsxOpeningElement(element) => element.tag_name,
+                    NodeData::JsxClosingElement(element) => element.tag_name,
+                    NodeData::JsxSelfClosingElement(element) => element.tag_name,
+                    _ => return None,
+                };
+                Some((
+                    NodeRef::new(source.arena.id(), source_file, node),
+                    NodeRef::new(source.arena.id(), source_file, tag),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tags.len(), 3);
+
+        for (element, tag) in tags.iter().rev().chain(&tags) {
+            assert_eq!(
+                context.get_symbol_at_location(*tag).unwrap(),
+                Some(bound_symbol)
+            );
+            assert_eq!(
+                context
+                    .symbol_to_string_at_location(bound_symbol, *element)
+                    .unwrap(),
+                "JSX.IntrinsicElements.panel"
+            );
+            assert_eq!(
+                context.get_symbol_declarations(bound_symbol).unwrap(),
+                [property]
+            );
+        }
+        assert_eq!(
+            context
+                .symbol_to_string_at_location(bound_symbol, property)
+                .unwrap(),
+            "IntrinsicElements.panel"
+        );
+    }
+}
+
 #[test]
 fn production_source_checker_resolves_staged_ambient_jsx_components() {
     for (index, source) in [
