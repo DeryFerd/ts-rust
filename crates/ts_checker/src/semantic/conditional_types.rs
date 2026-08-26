@@ -4245,7 +4245,8 @@ mod tests {
         }
 
         fn declared_alias(&mut self, expected: &str) -> TypeId {
-            self.try_declared_alias(expected).unwrap()
+            self.try_declared_alias(expected)
+                .unwrap_or_else(|error| panic!("type alias {expected} failed: {error:?}"))
         }
 
         fn try_declared_alias(&mut self, expected: &str) -> Result<TypeId, DeclaredTypeError> {

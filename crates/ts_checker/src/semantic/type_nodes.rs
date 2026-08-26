@@ -18225,6 +18225,27 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 type_parameters,
             },
         );
+        if let Some(cached) = cached
+            && let Some(TypeData::Conditional(conditional)) = self
+                .store
+                .type_payload(cached.declared_type)
+                .map(TypeRecord::data)
+        {
+            let root_node = self
+                .store
+                .conditional_root(conditional.root)
+                .map(|root| root.node())
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(symbol))
+                })?;
+            match self.direct_type_alias_owner(root_node)? {
+                Some(owner) if owner != symbol => {
+                    self.plan_type_alias(owner, false)?;
+                }
+                None => self.plan_type_node_in_context(root_node, None, false)?,
+                Some(_) => {}
+            }
+        }
         if planned_parameters.is_empty()
             && let Some(recovered) =
                 self.authenticated_recursive_indexed_alias(symbol, type_node)?
