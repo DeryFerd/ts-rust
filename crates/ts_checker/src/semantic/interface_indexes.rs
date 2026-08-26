@@ -50,6 +50,8 @@ impl From<PropertyObjectError> for InterfaceIndexError {
 ///
 /// A missing own index returns `None`. The query resolves only the selected
 /// key and value annotations. It does not publish interface members or indexes.
+/// `None` does not prove array identity or validate inherited indexes. The caller
+/// must resolve and validate a base before it uses an inherited element type.
 pub(super) fn resolve_own_numeric_interface_index(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -72,6 +74,11 @@ pub(super) fn resolve_own_numeric_interface_index(
     let Some(plan) = selected else {
         return Ok(None);
     };
+    for annotation in [plan.key_type_node, plan.value_type_node] {
+        if let Some(expected) = intrinsic_annotation_type(store, annotation) {
+            validate_annotation_cache(store, annotation, expected, plan.declaration)?;
+        }
+    }
     validate_cached_index_lists(store, receiver, &plans, plan)?;
     let mut query = match global_types {
         Some(global_types) => CanonicalTypeQuery::new_with_global_types(
@@ -87,6 +94,8 @@ pub(super) fn resolve_own_numeric_interface_index(
     query.preflight_type_from_type_node(plan.value_type_node)?;
     let key_type = query.get_type_from_type_node(plan.key_type_node)?;
     let value_type = query.get_type_from_type_node(plan.value_type_node)?;
+    validate_annotation_cache(store, plan.key_type_node, key_type, plan.declaration)?;
+    validate_annotation_cache(store, plan.value_type_node, value_type, plan.declaration)?;
     validate_cached_index_lists(store, receiver, &plans, plan)?;
     Ok(Some(InterfaceIndexView {
         key_type,
@@ -300,18 +309,62 @@ fn validate_cached_index(
         || info.is_readonly() != plan.readonly
         || info.index_symbol().is_some()
         || !info.components().is_empty()
-        || store.type_node_links(plan.key_type_node)
-            != Some(&TypeNodeLinks {
-                resolved_type: Some(info.key_type()),
-                ..TypeNodeLinks::default()
-            })
-        || store.type_node_links(plan.value_type_node)
-            != Some(&TypeNodeLinks {
-                resolved_type: Some(info.value_type()),
-                ..TypeNodeLinks::default()
-            })
+        || annotation_type_identity(store, plan.key_type_node) != Some(info.key_type())
+        || annotation_type_identity(store, plan.value_type_node) != Some(info.value_type())
     {
         return Err(invalid());
+    }
+    validate_annotation_cache(store, plan.key_type_node, info.key_type(), plan.declaration)?;
+    validate_annotation_cache(
+        store,
+        plan.value_type_node,
+        info.value_type(),
+        plan.declaration,
+    )?;
+    Ok(())
+}
+
+fn intrinsic_annotation_type(store: &CanonicalTypeMapperStore, node: NodeRef) -> Option<TypeId> {
+    let bootstrap = store.intrinsic_bootstrap()?;
+    Some(match store.source_node_kind(node)? {
+        SyntaxKind::AnyKeyword => bootstrap.any_type,
+        SyntaxKind::UnknownKeyword => bootstrap.unknown_type,
+        SyntaxKind::NeverKeyword => bootstrap.never_type,
+        SyntaxKind::VoidKeyword => bootstrap.void_type,
+        SyntaxKind::UndefinedKeyword => bootstrap.undefined_type,
+        SyntaxKind::NumberKeyword => bootstrap.number_type,
+        SyntaxKind::StringKeyword => bootstrap.string_type,
+        SyntaxKind::BooleanKeyword => bootstrap.boolean_type,
+        SyntaxKind::BigIntKeyword => bootstrap.bigint_type,
+        SyntaxKind::SymbolKeyword => bootstrap.es_symbol_type,
+        SyntaxKind::ObjectKeyword => bootstrap.non_primitive_type,
+        _ => return None,
+    })
+}
+
+fn annotation_type_identity(store: &CanonicalTypeMapperStore, node: NodeRef) -> Option<TypeId> {
+    intrinsic_annotation_type(store, node).or_else(|| {
+        store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+    })
+}
+
+fn validate_annotation_cache(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    expected: TypeId,
+    declaration: NodeRef,
+) -> Result<(), InterfaceIndexError> {
+    if store.type_node_links(node).is_some_and(|links| {
+        links != &TypeNodeLinks::default()
+            && links
+                != &TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    ..TypeNodeLinks::default()
+                }
+    }) {
+        return Err(InterfaceIndexError::InvalidIndexCache(declaration));
     }
     Ok(())
 }
