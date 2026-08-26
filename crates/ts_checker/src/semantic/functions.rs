@@ -205,9 +205,17 @@ pub(super) struct PendingFunctionType {
 pub(super) struct PendingFunctionTypeProof {
     store: SemanticStoreId,
     type_: TypeId,
-    signature: SignatureId,
     array_targets: Option<CanonicalArrayTargets>,
-    plan: FunctionTypePlan,
+    source: PendingCallableSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingCallableSource {
+    Function {
+        signature: SignatureId,
+        plan: Box<FunctionTypePlan>,
+    },
+    DeclaredMethod(Box<super::object_members::PendingDeclaredMethodTypeProof>),
 }
 
 impl PendingFunctionTypeProof {
@@ -221,6 +229,20 @@ impl PendingFunctionTypeProof {
 
     pub(super) const fn array_targets(&self) -> Option<CanonicalArrayTargets> {
         self.array_targets
+    }
+
+    pub(super) fn declared_method(
+        store: &CanonicalTypeMapperStore,
+        type_: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+        proof: super::object_members::PendingDeclaredMethodTypeProof,
+    ) -> Self {
+        Self {
+            store: store.id(),
+            type_,
+            array_targets,
+            source: PendingCallableSource::DeclaredMethod(Box::new(proof)),
+        }
     }
 }
 
@@ -2304,9 +2326,11 @@ pub(super) fn pending_function_type_proof(
             Ok(Some(PendingFunctionTypeProof {
                 store: store.id(),
                 type_,
-                signature,
                 array_targets: plan.array_targets,
-                plan: plan.clone(),
+                source: PendingCallableSource::Function {
+                    signature,
+                    plan: Box::new(plan.clone()),
+                },
             }))
         }
         FunctionTypeState::Cold | FunctionTypeState::Resolved { .. } => Ok(None),
@@ -2317,13 +2341,27 @@ pub(super) fn validate_pending_function_type_proof(
     store: &CanonicalTypeMapperStore,
     proof: &PendingFunctionTypeProof,
 ) -> bool {
-    proof.store == store.id()
-        && matches!(
-            function_type_state(store, &proof.plan, true),
+    if proof.store != store.id() {
+        return false;
+    }
+    match &proof.source {
+        PendingCallableSource::Function {
+            signature: expected,
+            plan,
+        } => matches!(
+            function_type_state(store, plan, true),
             Ok(FunctionTypeState::ActiveBarrier { type_, signature }
                 | FunctionTypeState::ActiveParameters { type_, signature })
-                if type_ == proof.type_ && signature == proof.signature
-        )
+                if type_ == proof.type_ && signature == *expected
+        ),
+        PendingCallableSource::DeclaredMethod(method) => {
+            super::object_members::validate_pending_declared_method_type_proof(
+                store,
+                method,
+                proof.type_,
+            )
+        }
+    }
 }
 
 pub(super) fn validate_lazy_return_signature(

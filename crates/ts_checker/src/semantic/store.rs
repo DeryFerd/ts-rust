@@ -2723,6 +2723,55 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .then_some(*source)
     }
 
+    /// Checks the method's optional flag against each source declaration.
+    pub(super) fn declared_method_optional_flag(&self, symbol: SemanticSymbolId) -> Option<bool> {
+        let method = self.symbol(symbol)?;
+        let source = if method.flags().contains(SymbolFlags::TRANSIENT)
+            || method.check_flags().contains(CheckFlags::LATE)
+            || method.name().is_late_bound()
+        {
+            self.late_bound_method_source(symbol)?
+        } else {
+            symbol
+        };
+        let source_method = self.symbol(source)?;
+        if source_method.flags() != method.flags().without(SymbolFlags::TRANSIENT)
+            || source_method.declarations() != method.declarations()
+            || source_method.value_declaration() != method.value_declaration()
+            || source_method.check_flags() != CheckFlags::NONE
+        {
+            return None;
+        }
+        let method = source_method;
+        if method.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::METHOD {
+            return None;
+        }
+        let declarations = method.declarations()?;
+        let optional = method.flags().contains(SymbolFlags::OPTIONAL);
+        if declarations.is_empty()
+            || declarations.iter().any(|declaration| {
+                self.source_node_kind(*declaration) != Some(SyntaxKind::MethodSignature)
+                    || self
+                        .source_node_facts
+                        .get(&declaration.arena)
+                        .is_none_or(|facts| {
+                            facts
+                                .iter()
+                                .flatten()
+                                .filter(|facts| {
+                                    facts.parent == Some(declaration.node)
+                                        && facts.kind == SyntaxKind::QuestionToken
+                                })
+                                .count()
+                                != usize::from(optional)
+                        })
+            })
+        {
+            return None;
+        }
+        Some(optional)
+    }
+
     /// Authenticates a declared or late-bound method against its interface owner.
     pub(super) fn authenticated_interface_method_owner(
         &self,
@@ -2808,6 +2857,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         SymbolFlags::NONE
                     },
             ) != SymbolFlags::NONE
+            || self.declared_method_optional_flag(symbol).is_none()
             || method.check_flags()
                 != if late {
                     CheckFlags::LATE
@@ -2874,7 +2924,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let links = self.type_node_links(owner_declaration)?;
         let literal_type = links.resolved_type?;
         if declarations.is_empty()
-            || method.flags() != SymbolFlags::METHOD
+            || self.declared_method_optional_flag(symbol).is_none()
             || method.check_flags() != CheckFlags::NONE
             || method.name().is_reserved_member_name()
             || method.name().is_private_identifier()
@@ -3230,6 +3280,49 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 let parameter_type = parameter_links.resolved_type?;
                 let parameter_annotation =
                     self.source_direct_type_annotation(parameter_declaration)?;
+                let optional = facts.iter().flatten().any(|facts| {
+                    facts.kind == SyntaxKind::QuestionToken
+                        && facts.parent == Some(parameter_declaration.node)
+                });
+                let bootstrap = self.intrinsic_bootstrap.as_ref()?;
+                let annotation_matches = if optional && bootstrap.options.strict_null_checks {
+                    let base = self
+                        .type_node_links(parameter_annotation)
+                        .and_then(|links| links.resolved_type)
+                        .or_else(|| {
+                            [
+                                bootstrap.any_type,
+                                bootstrap.unknown_type,
+                                bootstrap.string_type,
+                                bootstrap.number_type,
+                                bootstrap.bigint_type,
+                                bootstrap.boolean_type,
+                                bootstrap.es_symbol_type,
+                                bootstrap.void_type,
+                                bootstrap.undefined_type,
+                                bootstrap.null_type,
+                                bootstrap.never_type,
+                                bootstrap.non_primitive_type,
+                            ]
+                            .into_iter()
+                            .find(|type_| {
+                                self.source_direct_type_annotation_is_exact(
+                                    parameter_annotation,
+                                    *type_,
+                                )
+                            })
+                        });
+                    base.is_some_and(|base| {
+                        self.source_direct_type_annotation_is_exact(parameter_annotation, base)
+                            && bootstrap.cached_optional_parameter_type(base)
+                                == Some(parameter_type)
+                    })
+                } else {
+                    self.source_direct_type_annotation_is_exact(
+                        parameter_annotation,
+                        parameter_type,
+                    )
+                };
                 let expected_parameter = facts
                     .iter()
                     .enumerate()
@@ -3258,20 +3351,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                             ..ValueSymbolLinks::default()
                         })
                     || self.types.get(parameter_type).is_none()
-                    || !self.source_direct_type_annotation_is_exact(
-                        parameter_annotation,
-                        parameter_type,
-                    )
+                    || !annotation_matches
                 {
                     return None;
                 }
 
                 let rest = facts.iter().flatten().any(|facts| {
                     facts.kind == SyntaxKind::DotDotDotToken
-                        && facts.parent == Some(parameter_declaration.node)
-                });
-                let optional = facts.iter().flatten().any(|facts| {
-                    facts.kind == SyntaxKind::QuestionToken
                         && facts.parent == Some(parameter_declaration.node)
                 });
                 if rest && (has_rest || index + 1 != signature.parameters().len()) {

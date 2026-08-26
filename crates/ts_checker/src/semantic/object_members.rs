@@ -15,9 +15,10 @@
 //! Named interface and type-literal methods retain their own binder symbols,
 //! authenticated method type parameters, annotated required or optional
 //! parameters, and authenticated array, tuple, tuple-union, or inferred rest
-//! parameters. Flat array rest bindings retain their anonymous parameter and
-//! separate binding-element locals. Selected default-library `Math` methods also retain their
-//! numeric rest parameters.
+//! parameters. Strict optional methods keep a canonical union value separate
+//! from their callable object. Flat array rest bindings retain their anonymous
+//! parameter and separate binding-element locals. Selected default-library
+//! `Math` methods also retain their numeric rest parameters.
 
 use std::collections::{HashMap, HashSet};
 
@@ -31,11 +32,12 @@ use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
     SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
-    bootstrap::UnionReduction,
+    bootstrap::{PreparedTypeQueryTypes, UnionReduction},
     declared::{
         cached_ordinary_type_parameter_owner, preflight_node, preflight_type_parameter_symbol,
         type_list_key,
     },
+    functions::PendingFunctionTypeProof,
     global_types::preflight_generic_global_type_target,
     instantiate::{InstantiationLimits, InstantiationSession},
     instantiated_members::{
@@ -1033,7 +1035,7 @@ pub(super) struct PlannedCallParameter {
     pub type_node: NodeRef,
     identity_node: NodeRef,
     null_literal_identity: bool,
-    optional: bool,
+    pub(super) optional: bool,
     pub(super) implicit_any_rest: bool,
 }
 
@@ -1060,7 +1062,18 @@ pub(super) struct PlannedInterfaceMethod {
     binding_parameters: Vec<PlannedMethodBindingParameter>,
     pub return_type: NodeRef,
     pub flags: SignatureFlags,
+    optional: bool,
     minimum_argument_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PendingDeclaredMethodTypeProof {
+    store: super::ids::SemanticStoreId,
+    type_: TypeId,
+    symbol: SemanticSymbolId,
+    owner: SemanticSymbolId,
+    kind: PropertyObjectKind,
+    methods: Vec<PlannedInterfaceMethod>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1914,11 +1927,16 @@ fn validate_declared_call_set_member_edges(
         let record = store.symbol(*property)?;
         let declarations = record.declarations()?;
         let declaration = *declarations.first()?;
-        let method = record.flags() == SymbolFlags::METHOD;
+        let method = record.flags().without(SymbolFlags::OPTIONAL) == SymbolFlags::METHOD;
         let accessor = record.flags().intersects(SymbolFlags::ACCESSOR);
         let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::ACCESSOR;
         if !seen_properties.insert(*property)
-            || (method || accessor)
+            || method
+                && !matches!(
+                    store.source_node_kind(owner_declaration),
+                    Some(SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral)
+                )
+            || accessor
                 && store.source_node_kind(owner_declaration)
                     != Some(SyntaxKind::InterfaceDeclaration)
             || !method
@@ -1985,16 +2003,22 @@ fn validate_declared_call_set_member_edges(
                         !store.source_direct_type_annotation_is_exact(annotation, property_type)
                     })
             || method
-                && (store.authenticated_interface_method_owner(*property) != Some((owner, type_))
+                && ((if store.source_node_kind(owner_declaration)
+                    == Some(SyntaxKind::InterfaceDeclaration)
+                {
+                    store.authenticated_interface_method_owner(*property)
+                } else {
+                    store.authenticated_type_literal_method_owner(*property)
+                }) != Some((owner, type_))
                     || !matches!(
-                        super::callable_sets::validate_stored_declared_method_callable_set(
-                            store,
-                            property_type,
-                        ),
-                        Some(super::callable_sets::StoredCallableSetValidation::Valid {
+                        declared_method_value_types(store, *property).and_then(|(callable, _)| {
+                            super::callable_sets::validate_stored_declared_method_callable_set(store, callable)
+                                .map(|validation| (callable, validation))
+                        }),
+                        Some((callable, super::callable_sets::StoredCallableSetValidation::Valid {
                             projection,
                             ..
-                        }) if projection.owner == property_type
+                        })) if projection.owner == callable
                             && projection.call_signatures.iter().any(|callable| {
                                 store
                                     .signature(callable.signature)
@@ -7067,14 +7091,14 @@ fn plan_members(
                     symbol: method.symbol,
                     name_node: NodeRef::new(member.arena, member.file, declaration.name),
                     type_node: method.return_type,
-                    optional: false,
+                    optional: method.optional,
                     readonly: false,
                     name: property_name,
                 });
             } else if !properties.iter().any(|property| {
                 property.symbol == method.symbol
                     && property.name == property_name
-                    && !property.optional
+                    && property.optional == method.optional
                     && !property.readonly
                     && store.source_node_kind(property.declaration)
                         == Some(SyntaxKind::MethodSignature)
@@ -7833,284 +7857,6 @@ fn plan_interface_accessor(
     })
 }
 
-/// Authenticates only React Mixin's two optional, deferred parameter-returning methods.
-#[allow(clippy::too_many_lines)] // Ambient React ownership, method syntax, and forwarded return identity form one proof.
-fn authenticated_react_mixin_optional_method(
-    store: &CanonicalTypeMapperStore,
-    host: &DeclaredTypeHost<'_>,
-    owner: NodeRef,
-    owner_symbol: SemanticSymbolId,
-    declaration: NodeRef,
-) -> bool {
-    let Some(bound) = host.bound_file(owner) else {
-        return false;
-    };
-    let Some(facts) = bound.source_facts() else {
-        return false;
-    };
-    let Some(owner_record) = store.symbol(owner_symbol) else {
-        return false;
-    };
-    let Some(namespace) = store.get_parent_of_symbol(owner_symbol) else {
-        return false;
-    };
-    let Some(namespace_record) = store.symbol(namespace) else {
-        return false;
-    };
-    let Some(exports) = namespace_record
-        .exports()
-        .and_then(|exports| store.symbol_table(exports))
-    else {
-        return false;
-    };
-    let Ok(interface_record) = preflight_node(store, host, owner) else {
-        return false;
-    };
-    let NodeData::InterfaceDeclaration(interface) = &interface_record.data else {
-        return false;
-    };
-    let Some([props, state]) = interface
-        .type_parameters
-        .as_ref()
-        .map(|parameters| parameters.nodes.as_slice())
-    else {
-        return false;
-    };
-    let Ok(method_record) = preflight_node(store, host, declaration) else {
-        return false;
-    };
-    let NodeData::MethodSignatureDeclaration(method) = &method_record.data else {
-        return false;
-    };
-    let name = NodeRef::new(declaration.arena, declaration.file, method.name);
-    let Ok(name_record) = preflight_node(store, host, name) else {
-        return false;
-    };
-    let NodeData::Identifier(identifier) = &name_record.data else {
-        return false;
-    };
-    let (expected_parameter, expected_name) = match identifier.text.as_str() {
-        "getDefaultProps" => (*props, "P"),
-        "getInitialState" => (*state, "S"),
-        _ => return false,
-    };
-    let parameter = NodeRef::new(owner.arena, owner.file, expected_parameter);
-    let Some(parameter_symbol) = bound
-        .symbol(parameter)
-        .and_then(|symbol| store.get_merged_symbol(symbol))
-    else {
-        return false;
-    };
-    let Some(parameter_owner) = store.symbol(parameter_symbol) else {
-        return false;
-    };
-    let Some(token) = method
-        .postfix_token
-        .map(|token| NodeRef::new(declaration.arena, declaration.file, token))
-    else {
-        return false;
-    };
-    let Ok(token_record) = preflight_node(store, host, token) else {
-        return false;
-    };
-    let Some(return_type) = method
-        .type_
-        .map(|type_| NodeRef::new(declaration.arena, declaration.file, type_))
-    else {
-        return false;
-    };
-    let Ok(return_record) = preflight_node(store, host, return_type) else {
-        return false;
-    };
-    let NodeData::TypeReferenceNode(reference) = &return_record.data else {
-        return false;
-    };
-    let return_name = NodeRef::new(return_type.arena, return_type.file, reference.type_name);
-    let Ok(return_name_record) = preflight_node(store, host, return_name) else {
-        return false;
-    };
-    let NodeData::Identifier(return_identifier) = &return_name_record.data else {
-        return false;
-    };
-    let Some(method_symbol) = bound
-        .symbol(declaration)
-        .and_then(|symbol| store.get_merged_symbol(symbol))
-    else {
-        return false;
-    };
-    let Some(method_owner) = store.symbol(method_symbol) else {
-        return false;
-    };
-    let Some(namespace_block) = interface_record
-        .parent
-        .map(|parent| NodeRef::new(owner.arena, owner.file, parent))
-    else {
-        return false;
-    };
-    let Ok(namespace_block_record) = preflight_node(store, host, namespace_block) else {
-        return false;
-    };
-    let Some(namespace_declaration) = namespace_block_record
-        .parent
-        .map(|parent| NodeRef::new(namespace_block.arena, namespace_block.file, parent))
-    else {
-        return false;
-    };
-    let Ok(namespace_declaration_record) = preflight_node(store, host, namespace_declaration)
-    else {
-        return false;
-    };
-    let NodeData::ModuleDeclaration(namespace_data) = &namespace_declaration_record.data else {
-        return false;
-    };
-    let Some(module_block) = namespace_declaration_record.parent.map(|parent| {
-        NodeRef::new(
-            namespace_declaration.arena,
-            namespace_declaration.file,
-            parent,
-        )
-    }) else {
-        return false;
-    };
-    let Ok(module_block_record) = preflight_node(store, host, module_block) else {
-        return false;
-    };
-    let Some(module) = module_block_record
-        .parent
-        .map(|parent| NodeRef::new(module_block.arena, module_block.file, parent))
-    else {
-        return false;
-    };
-    let Ok(module_record) = preflight_node(store, host, module) else {
-        return false;
-    };
-    let NodeData::ModuleDeclaration(module_data) = &module_record.data else {
-        return false;
-    };
-    let module_name = NodeRef::new(module.arena, module.file, module_data.name);
-    let Ok(module_name_record) = preflight_node(store, host, module_name) else {
-        return false;
-    };
-    let NodeData::StringLiteral(module_literal) = &module_name_record.data else {
-        return false;
-    };
-
-    if !facts.is_declaration_file()
-        || facts.is_default_library()
-        || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
-        || owner_record.check_flags() != CheckFlags::NONE
-        || owner_record.name().as_utf8() != Some("Mixin")
-        || owner_record.declarations() != Some(&[owner])
-        || !host.symbol_matches(store, owner, owner_symbol)
-        || namespace_record.name().as_utf8() != Some("React")
-        || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
-        || namespace_record.check_flags() != CheckFlags::NONE
-        || store.get_merged_symbol(namespace) != Some(namespace)
-        || exports
-            .get_source("Mixin")
-            .and_then(|symbol| store.get_merged_symbol(symbol))
-            != Some(owner_symbol)
-        || exports
-            .get_source("ComponentLifecycle")
-            .and_then(|symbol| store.get_merged_symbol(symbol))
-            .and_then(|symbol| store.symbol(symbol))
-            .is_none_or(|symbol| {
-                symbol.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
-                    || symbol.check_flags() != CheckFlags::NONE
-                    || symbol.name().as_utf8() != Some("ComponentLifecycle")
-            })
-        || interface_record.kind != SyntaxKind::InterfaceDeclaration
-        || interface_record.flags.0 != 0
-        || interface.heritage_clauses.is_none()
-        || method_record.kind != SyntaxKind::MethodSignature
-        || method_record.flags.0 != 0
-        || method_record.parent != Some(owner.node)
-        || method.type_parameters.is_some()
-        || !method.parameters.nodes.is_empty()
-        || name_record.kind != SyntaxKind::Identifier
-        || name_record.flags.0 != 0
-        || name_record.parent != Some(declaration.node)
-        || identifier.flow_node.is_some()
-        || token_record.kind != SyntaxKind::QuestionToken
-        || token_record.flags.0 != 0
-        || token_record.parent != Some(declaration.node)
-        || !matches!(token_record.data, NodeData::Token(_))
-        || return_record.kind != SyntaxKind::TypeReference
-        || return_record.flags.0 != 0
-        || return_record.parent != Some(declaration.node)
-        || reference.type_arguments.is_some()
-        || return_name_record.kind != SyntaxKind::Identifier
-        || return_name_record.flags.0 != 0
-        || return_name_record.parent != Some(return_type.node)
-        || return_identifier.flow_node.is_some()
-        || return_identifier.text != expected_name
-        || store
-            .symbol_node_links(return_type)
-            .and_then(|links| links.resolved_symbol)
-            .is_some_and(|cached| store.get_merged_symbol(cached) != Some(parameter_symbol))
-        || store.type_node_links(return_type).is_some_and(|links| {
-            links.outer_type_parameters.is_some()
-                || links.resolved_type.is_some_and(|cached| {
-                    store
-                        .declared_type_links(parameter_symbol)
-                        .and_then(|parameter| parameter.declared_type)
-                        != Some(cached)
-                })
-        })
-        || parameter_owner.flags() != SymbolFlags::TYPE_PARAMETER
-        || parameter_owner.check_flags() != CheckFlags::NONE
-        || parameter_owner.name().as_utf8() != Some(expected_name)
-        || store.get_parent_of_symbol(parameter_symbol) != Some(owner_symbol)
-        || owner_record
-            .members()
-            .and_then(|members| store.symbol_table(members))
-            .and_then(|members| members.get_source(expected_name))
-            != Some(parameter_symbol)
-        || method_owner.flags() != SymbolFlags::METHOD | SymbolFlags::OPTIONAL
-        || method_owner.check_flags() != CheckFlags::NONE
-        || method_owner.name().as_utf8() != Some(identifier.text.as_str())
-        || method_owner.declarations() != Some(&[declaration])
-        || method_owner.value_declaration() != Some(declaration)
-        || store.get_parent_of_symbol(method_symbol) != Some(owner_symbol)
-        || owner_record
-            .members()
-            .and_then(|members| store.symbol_table(members))
-            .and_then(|members| members.get_source(&identifier.text))
-            != Some(method_symbol)
-        || store
-            .value_symbol_links(method_symbol)
-            .is_some_and(|links| links != &ValueSymbolLinks::default())
-        || store
-            .signature_links(declaration)
-            .is_some_and(|links| links != &SignatureLinks::default())
-        || namespace_block_record.kind != SyntaxKind::ModuleBlock
-        || namespace_declaration_record.kind != SyntaxKind::ModuleDeclaration
-        || namespace_data.keyword != SyntaxKind::NamespaceKeyword
-        || namespace_data.body != Some(namespace_block.node)
-        || !host.symbol_matches(store, namespace_declaration, namespace)
-        || module_block_record.kind != SyntaxKind::ModuleBlock
-        || module_record.kind != SyntaxKind::ModuleDeclaration
-        || module_record.parent != Some(bound.source_file().node)
-        || module_data.keyword != SyntaxKind::ModuleKeyword
-        || module_data.body != Some(module_block.node)
-        || module_name_record.kind != SyntaxKind::StringLiteral
-        || module_name_record.parent != Some(module.node)
-        || module_literal.text != "react"
-    {
-        return false;
-    }
-
-    let Ok(mut resolver) = host.name_resolver_host(store) else {
-        return false;
-    };
-    resolver
-        .resolve_entity_name(return_name, SymbolFlags::TYPE)
-        .ok()
-        .flatten()
-        .and_then(|symbol| store.get_merged_symbol(symbol))
-        == Some(parameter_symbol)
-}
-
 fn plan_interface_method(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -8126,14 +7872,12 @@ fn plan_interface_method(
     let NodeData::MethodSignatureDeclaration(method) = &record.data else {
         return Err(unsupported());
     };
-    let optional_react_mixin = method.postfix_token.is_some()
-        && authenticated_react_mixin_optional_method(store, host, owner, owner_symbol, declaration);
+    let optional = method.postfix_token.is_some();
     if record.kind != SyntaxKind::MethodSignature
         || record.flags.0 != 0
         || record.parent != Some(owner.node)
         || method.full_signature.is_some()
         || method.next_container.is_some()
-        || method.postfix_token.is_some() && !optional_react_mixin
         || method.symbol.is_some()
         || method.modifiers.is_some()
         || method.parameters.has_trailing_comma
@@ -8157,6 +7901,20 @@ fn plan_interface_method(
         || identifier.text.is_empty()
     {
         return Err(unsupported());
+    }
+
+    if let Some(token) = method.postfix_token {
+        let token = NodeRef::new(declaration.arena, declaration.file, token);
+        let token_record = preflight_node(store, host, token).map_err(|_| unsupported())?;
+        if token_record.kind != SyntaxKind::QuestionToken
+            || token_record.flags.0 != 0
+            || token_record.parent != Some(declaration.node)
+            || token_record.range.start < name_record.range.end
+            || token_record.range.end > method.parameters.range.start
+            || !matches!(token_record.data, NodeData::Token(_))
+        {
+            return Err(unsupported());
+        }
     }
 
     let return_type = method
@@ -8183,7 +7941,7 @@ fn plan_interface_method(
         || !host.symbol_matches(store, declaration, symbol)
         || method_symbol.flags()
             != SymbolFlags::METHOD
-                | if optional_react_mixin {
+                | if optional {
                     SymbolFlags::OPTIONAL
                 } else {
                     SymbolFlags::NONE
@@ -8295,6 +8053,7 @@ fn plan_interface_method(
         binding_parameters,
         return_type,
         flags,
+        optional,
         minimum_argument_count,
     };
     if !valid_method_parameter_locals(store, &planned) {
@@ -13077,25 +12836,73 @@ fn resolved_interface_method_value(
     plan: &PropertyObjectPlan,
     symbol: SemanticSymbolId,
 ) -> Option<TypeId> {
+    let (callable, value) = declared_method_value_types(store, symbol)?;
+    validate_interface_method_callable(
+        store,
+        plan.kind,
+        plan.symbol,
+        &plan.methods,
+        symbol,
+        callable,
+    )?;
+    Some(value)
+}
+
+pub(super) fn validate_pending_declared_method_type_proof(
+    store: &CanonicalTypeMapperStore,
+    proof: &PendingDeclaredMethodTypeProof,
+    type_: TypeId,
+) -> bool {
+    proof.store == store.id()
+        && proof.type_ == type_
+        && store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| bootstrap.options.strict_null_checks)
+        && store
+            .symbol(proof.symbol)
+            .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::OPTIONAL))
+        && store
+            .value_symbol_links(proof.symbol)
+            .is_none_or(|links| links == &ValueSymbolLinks::default())
+        && validate_interface_method_callable(
+            store,
+            proof.kind,
+            proof.owner,
+            &proof.methods,
+            proof.symbol,
+            type_,
+        )
+        .is_some()
+}
+
+fn validate_interface_method_callable(
+    store: &CanonicalTypeMapperStore,
+    kind: PropertyObjectKind,
+    owner_symbol: SemanticSymbolId,
+    methods: &[PlannedInterfaceMethod],
+    symbol: SemanticSymbolId,
+    type_: TypeId,
+) -> Option<()> {
+    let owner = match kind {
+        PropertyObjectKind::Interface => store.authenticated_interface_method_owner(symbol),
+        PropertyObjectKind::TypeLiteral => store.authenticated_type_literal_method_owner(symbol),
+        PropertyObjectKind::ObjectLiteral => None,
+    }?;
+    if owner.0 != owner_symbol {
+        return None;
+    }
     let method_record = store.symbol(symbol)?;
     let declarations = method_record.declarations()?;
-    let links = store.value_symbol_links(symbol)?;
-    let (type_, value) = declared_method_value_types(store, symbol)?;
     let record = store.type_payload(type_)?;
     let TypeData::Object(object) = record.data() else {
         return None;
     };
     let signatures = object.structured.signatures.as_deref()?;
-    if method_record.flags() != SymbolFlags::METHOD
+    if method_record.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::METHOD
         || method_record.check_flags() != CheckFlags::NONE
         || declarations.is_empty()
         || method_record.value_declaration() != declarations.first().copied()
-        || store.get_parent_of_symbol(symbol) != Some(plan.symbol)
-        || links
-            != &(ValueSymbolLinks {
-                resolved_type: Some(value),
-                ..ValueSymbolLinks::default()
-            })
+        || store.get_parent_of_symbol(symbol) != Some(owner_symbol)
         || record.flags() != TypeFlags::OBJECT
         || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
         || record.symbol() != Some(symbol)
@@ -13112,8 +12919,7 @@ fn resolved_interface_method_value(
             .is_some()
         || signatures.len() != declarations.len()
         || signatures.len()
-            != plan
-                .methods
+            != methods
                 .iter()
                 .filter(|method| method.symbol == symbol)
                 .count()
@@ -13121,8 +12927,7 @@ fn resolved_interface_method_value(
         return None;
     }
 
-    for ((method, declaration), signature) in plan
-        .methods
+    for ((method, declaration), signature) in methods
         .iter()
         .filter(|method| method.symbol == symbol)
         .zip(declarations)
@@ -13133,6 +12938,7 @@ fn resolved_interface_method_value(
         let return_type = callable.resolved_return_type()?;
         let type_parameters = resolved_interface_method_type_parameters(store, method)?;
         if method.declaration != *declaration
+            || method.optional != method_record.flags().contains(SymbolFlags::OPTIONAL)
             || !valid_method_parameter_locals(store, method)
             || callable.flags() != method.flags
             || callable.declaration() != Some(method.declaration)
@@ -13170,11 +12976,7 @@ fn resolved_interface_method_value(
             let links = store.value_symbol_links(*parameter)?;
             let parameter_type = links.resolved_type?;
             if planned.symbol != *parameter
-                || cached_annotation_identity(
-                    store,
-                    planned.identity_node,
-                    planned.null_literal_identity,
-                ) != Some(parameter_type)
+                || !method_parameter_value_type_matches(store, planned, parameter_type)
                 || links
                     != &(ValueSymbolLinks {
                         resolved_type: Some(parameter_type),
@@ -13188,7 +12990,32 @@ fn resolved_interface_method_value(
             }
         }
     }
-    Some(value)
+    Some(())
+}
+
+fn method_parameter_value_type_matches(
+    store: &CanonicalTypeMapperStore,
+    parameter: &PlannedCallParameter,
+    type_: TypeId,
+) -> bool {
+    let Some(base) = cached_annotation_identity(
+        store,
+        parameter.identity_node,
+        parameter.null_literal_identity,
+    ) else {
+        return false;
+    };
+    if parameter.optional
+        && store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| bootstrap.options.strict_null_checks)
+    {
+        store
+            .validate_optional_parameter_type_metadata(base, type_)
+            .is_ok()
+    } else {
+        base == type_
+    }
 }
 
 fn resolved_interface_method_type_parameters(
@@ -13246,6 +13073,53 @@ pub(super) fn publish_interface_method_values(
     plan: &PropertyObjectPlan,
     resolved: &[ResolvedCallSignatureTypes],
 ) -> Result<Vec<TypeId>, PropertyObjectError> {
+    let count = if store
+        .intrinsic_bootstrap()
+        .is_some_and(|bootstrap| bootstrap.options.strict_null_checks)
+    {
+        optional_method_union_operations(plan).ok_or(PropertyObjectError::Capacity(plan.node))?
+    } else {
+        0
+    };
+    if count == 0 {
+        return publish_interface_method_values_worker(store, plan, resolved, None);
+    }
+    let mut preparation = store
+        .prepare_type_query_types(&[], &[], &[], count, 0)
+        .map_err(|_| PropertyObjectError::Capacity(plan.node))?;
+    publish_interface_method_values_worker(store, plan, resolved, Some((&mut preparation, None)))
+}
+
+pub(super) fn optional_method_union_operations(plan: &PropertyObjectPlan) -> Option<usize> {
+    plan.methods.iter().try_fold(0usize, |count, method| {
+        count
+            .checked_add(usize::from(method.optional))?
+            .checked_add(
+                method
+                    .parameters
+                    .iter()
+                    .filter(|parameter| parameter.optional)
+                    .count(),
+            )
+    })
+}
+
+pub(super) fn publish_interface_method_values_prepared(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    resolved: &[ResolvedCallSignatureTypes],
+    preparation: &mut PreparedTypeQueryTypes,
+    globals: Option<&CanonicalGlobalTypes>,
+) -> Result<Vec<TypeId>, PropertyObjectError> {
+    publish_interface_method_values_worker(store, plan, resolved, Some((preparation, globals)))
+}
+
+fn publish_interface_method_values_worker(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    resolved: &[ResolvedCallSignatureTypes],
+    mut query_preparation: Option<(&mut PreparedTypeQueryTypes, Option<&CanonicalGlobalTypes>)>,
+) -> Result<Vec<TypeId>, PropertyObjectError> {
     struct PreparedMethodGroup {
         symbol: SemanticSymbolId,
         indexes: Vec<usize>,
@@ -13272,6 +13146,24 @@ pub(super) fn publish_interface_method_values(
     if resolved.len() != plan.methods.len() {
         return Err(invalid_cache(plan, owner_type));
     }
+    let owner_record = store
+        .type_payload(owner_type)
+        .ok_or_else(|| invalid_cache(plan, owner_type))?;
+    let valid_owner = owner_record.symbol() == Some(plan.symbol)
+        && match plan.kind {
+            PropertyObjectKind::Interface => {
+                matches!(owner_record.data(), TypeData::Interface(_))
+                    && owner_record.object_flags().contains(ObjectFlags::INTERFACE)
+            }
+            PropertyObjectKind::TypeLiteral => {
+                matches!(owner_record.data(), TypeData::Object(_))
+                    && owner_record.object_flags().contains(ObjectFlags::ANONYMOUS)
+            }
+            PropertyObjectKind::ObjectLiteral => false,
+        };
+    if !valid_owner {
+        return Err(invalid_cache(plan, owner_type));
+    }
 
     let placeholder = store
         .intrinsic_bootstrap()
@@ -13290,7 +13182,18 @@ pub(super) fn publish_interface_method_values(
         .try_reserve(plan.methods.len())
         .map_err(|_| PropertyObjectError::Capacity(plan.node))?;
     for (index, (method, resolved_signature)) in plan.methods.iter().zip(resolved).enumerate() {
-        if !valid_method_parameter_locals(store, method)
+        let owner = match plan.kind {
+            PropertyObjectKind::Interface => {
+                store.authenticated_interface_method_owner(method.symbol)
+            }
+            PropertyObjectKind::TypeLiteral => {
+                store.authenticated_type_literal_method_owner(method.symbol)
+            }
+            PropertyObjectKind::ObjectLiteral => None,
+        };
+        if owner != Some((plan.symbol, owner_type))
+            || store.declared_method_optional_flag(method.symbol) != Some(method.optional)
+            || !valid_method_parameter_locals(store, method)
             || plan
                 .properties
                 .iter()
@@ -13412,11 +13315,12 @@ pub(super) fn publish_interface_method_values(
                         .parameters
                         .iter()
                         .zip(&resolved_signature.parameter_types)
-                        .any(|(parameter, parameter_type)| {
-                            store.value_symbol_links(parameter.symbol)
-                                != Some(&ValueSymbolLinks {
-                                    resolved_type: Some(*parameter_type),
-                                    ..ValueSymbolLinks::default()
+                        .any(|(parameter, _)| {
+                            store
+                                .value_symbol_links(parameter.symbol)
+                                .and_then(|links| links.resolved_type)
+                                .is_none_or(|type_| {
+                                    !method_parameter_value_type_matches(store, parameter, type_)
                                 })
                         })
                 {
@@ -13471,6 +13375,62 @@ pub(super) fn publish_interface_method_values(
         }
     }
 
+    let (strict, undefined, optional_member) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| {
+            (
+                bootstrap.options.strict_null_checks,
+                bootstrap.undefined_type,
+                bootstrap.undefined_or_missing_type,
+            )
+        })
+        .ok_or_else(|| invalid_cache(plan, owner_type))?;
+    if strict {
+        let needed = prepared
+            .iter()
+            .filter(|group| group.warm.is_none())
+            .try_fold(0usize, |count, group| {
+                let count =
+                    count.checked_add(usize::from(plan.methods[group.indexes[0]].optional))?;
+                group.indexes.iter().try_fold(count, |count, index| {
+                    count.checked_add(
+                        plan.methods[*index]
+                            .parameters
+                            .iter()
+                            .filter(|parameter| parameter.optional)
+                            .count(),
+                    )
+                })
+            })
+            .ok_or(PropertyObjectError::Capacity(plan.node))?;
+        if needed != 0 {
+            let (preparation, globals) = query_preparation
+                .as_ref()
+                .ok_or_else(|| invalid_cache(plan, owner_type))?;
+            preparation
+                .preflight_union_operations(
+                    store,
+                    globals.map(CanonicalArrayTargets::from_global_types),
+                    needed,
+                )
+                .map_err(|_| invalid_cache(plan, owner_type))?;
+        }
+        for group in prepared.iter().filter(|group| group.warm.is_none()) {
+            for (index, bases) in group.indexes.iter().zip(&group.parameter_types) {
+                for (parameter, base) in plan.methods[*index].parameters.iter().zip(bases) {
+                    if parameter.optional {
+                        let (preparation, globals) = query_preparation
+                            .as_ref()
+                            .ok_or_else(|| invalid_cache(plan, owner_type))?;
+                        store
+                            .preflight_prepared_union_constituent(*base, preparation, *globals)
+                            .map_err(|_| invalid_cache(plan, owner_type))?;
+                    }
+                }
+            }
+        }
+    }
+
     let mut parameter_batches = Vec::new();
     parameter_batches
         .try_reserve_exact(cold_signatures)
@@ -13482,6 +13442,34 @@ pub(super) fn publish_interface_method_values(
         || !store.try_reserve_callable_signature_parameter_types(cold_signatures)
     {
         return Err(PropertyObjectError::Capacity(plan.node));
+    }
+
+    if strict {
+        for group in prepared.iter_mut().filter(|group| group.warm.is_none()) {
+            for (index, types) in group.indexes.iter().zip(&mut group.parameter_types) {
+                for (parameter, type_) in plan.methods[*index].parameters.iter().zip(types) {
+                    if parameter.optional {
+                        let (preparation, globals) = query_preparation
+                            .as_mut()
+                            .ok_or_else(|| invalid_cache(plan, owner_type))?;
+                        *type_ = match *globals {
+                            Some(globals) => store.literal_union_type_prepared_with_global_types(
+                                globals,
+                                &[*type_, undefined],
+                                None,
+                                preparation,
+                            ),
+                            None => store.literal_union_type_prepared(
+                                &[*type_, undefined],
+                                None,
+                                preparation,
+                            ),
+                        }
+                        .map_err(|_| invalid_cache(plan, owner_type))?;
+                    }
+                }
+            }
+        }
     }
 
     for mut group in prepared {
@@ -13522,11 +13510,7 @@ pub(super) fn publish_interface_method_values(
                     ..SignatureLinks::default()
                 },
             ));
-            for (parameter, parameter_type) in method
-                .parameters
-                .iter()
-                .zip(&resolved_signature.parameter_types)
-            {
+            for (parameter, parameter_type) in method.parameters.iter().zip(&parameter_types) {
                 assert!(store.set_value_symbol_links(
                     parameter.symbol,
                     ValueSymbolLinks {
@@ -13536,15 +13520,7 @@ pub(super) fn publish_interface_method_values(
                 ));
             }
             parameter_batches.push((signature, parameter_types));
-            published[*index] = callable_type;
         }
-        assert!(store.set_value_symbol_links(
-            group.symbol,
-            ValueSymbolLinks {
-                resolved_type: Some(callable_type),
-                ..ValueSymbolLinks::default()
-            },
-        ));
         assert!(store.set_structured_type_members(
             callable_type,
             None,
@@ -13553,6 +13529,68 @@ pub(super) fn publish_interface_method_values(
             None,
             None,
         ));
+        let value = if strict && plan.methods[group.indexes[0]].optional {
+            let (preparation, globals) = query_preparation
+                .as_mut()
+                .ok_or_else(|| invalid_cache(plan, owner_type))?;
+            let proof = PendingFunctionTypeProof::declared_method(
+                store,
+                callable_type,
+                globals.map(CanonicalArrayTargets::from_global_types),
+                PendingDeclaredMethodTypeProof {
+                    store: store.id(),
+                    type_: callable_type,
+                    symbol: group.symbol,
+                    owner: plan.symbol,
+                    kind: plan.kind,
+                    methods: group
+                        .indexes
+                        .iter()
+                        .map(|index| plan.methods[*index].clone())
+                        .collect(),
+                },
+            );
+            preparation
+                .authorize_pending_function(store, &proof)
+                .map_err(|_| invalid_cache(plan, owner_type))?;
+            let value = match *globals {
+                Some(globals) => store.literal_union_type_prepared_with_global_types(
+                    globals,
+                    &[callable_type, optional_member],
+                    None,
+                    preparation,
+                ),
+                None => store.literal_union_type_prepared(
+                    &[callable_type, optional_member],
+                    None,
+                    preparation,
+                ),
+            };
+            preparation
+                .finish_pending_function(&proof)
+                .map_err(|_| invalid_cache(plan, owner_type))?;
+            let value = value.map_err(|_| invalid_cache(plan, owner_type))?;
+            assert!(store.set_value_symbol_links(
+                group.symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(value),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            value
+        } else {
+            assert!(store.set_value_symbol_links(
+                group.symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(callable_type),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            callable_type
+        };
+        for index in &group.indexes {
+            published[*index] = value;
+        }
     }
     if !parameter_batches.is_empty()
         && !store.set_callable_signature_parameter_types_batch(parameter_batches)
@@ -14133,6 +14171,52 @@ pub(super) fn publish_generic_interface_declared_members(
     target: TypeId,
     property_types: &[TypeId],
 ) -> Result<TypeId, PropertyObjectError> {
+    publish_generic_interface_declared_members_worker(store, plan, target, property_types, None)
+}
+
+pub(super) fn publish_generic_interface_declared_members_with_global_types(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    target: TypeId,
+    property_types: &[TypeId],
+    globals: &CanonicalGlobalTypes,
+) -> Result<TypeId, PropertyObjectError> {
+    let count = if store
+        .intrinsic_bootstrap()
+        .is_some_and(|bootstrap| bootstrap.options.strict_null_checks)
+    {
+        optional_method_union_operations(plan).ok_or(PropertyObjectError::Capacity(plan.node))?
+    } else {
+        0
+    };
+    if count == 0 {
+        return publish_generic_interface_declared_members_worker(
+            store,
+            plan,
+            target,
+            property_types,
+            None,
+        );
+    }
+    let mut preparation = store
+        .prepare_type_query_types_with_global_types(&[], &[], &[], count, 0, globals)
+        .map_err(|_| PropertyObjectError::Capacity(plan.node))?;
+    publish_generic_interface_declared_members_worker(
+        store,
+        plan,
+        target,
+        property_types,
+        Some((&mut preparation, Some(globals))),
+    )
+}
+
+fn publish_generic_interface_declared_members_worker(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    target: TypeId,
+    property_types: &[TypeId],
+    preparation: Option<(&mut PreparedTypeQueryTypes, Option<&CanonicalGlobalTypes>)>,
+) -> Result<TypeId, PropertyObjectError> {
     let invalid = || PropertyObjectError::InvalidCachedInterface {
         symbol: plan.symbol,
         type_: target,
@@ -14252,7 +14336,16 @@ pub(super) fn publish_generic_interface_declared_members(
     {
         return Err(PropertyObjectError::Capacity(plan.node));
     }
-    let method_values = publish_interface_method_values(store, plan, &method_types)?;
+    let method_values = match preparation {
+        Some((preparation, globals)) => publish_interface_method_values_prepared(
+            store,
+            plan,
+            &method_types,
+            preparation,
+            globals,
+        )?,
+        None => publish_interface_method_values(store, plan, &method_types)?,
+    };
     let declared_members = prepared.map(|table| store.alloc_prepared_symbol_table(table));
     let index_infos = plan
         .indexes
@@ -14599,6 +14692,11 @@ fn valid_generic_publication_target(
         let method = record.flags().contains(SymbolFlags::METHOD);
         let expected_flags = if method {
             SymbolFlags::METHOD
+                | if property.optional {
+                    SymbolFlags::OPTIONAL
+                } else {
+                    SymbolFlags::NONE
+                }
         } else {
             SymbolFlags::PROPERTY
                 | if property.optional {
@@ -14610,7 +14708,7 @@ fn valid_generic_publication_target(
         let expected_checks = source_property_check_flags(property.readonly);
         if record.flags() != expected_flags
             || record.check_flags() != CheckFlags::NONE && record.check_flags() != expected_checks
-            || method && (property.optional || property.readonly)
+            || method && property.readonly
             || method
                 != plan
                     .methods
@@ -14714,6 +14812,13 @@ fn valid_generic_property_types(
         .iter()
         .zip(property_types)
         .all(|(property, type_)| {
+            if plan
+                .methods
+                .iter()
+                .any(|method| method.symbol == property.symbol)
+            {
+                return true;
+            }
             if !bootstrap.options.strict_null_checks || !property.optional {
                 return true;
             }
@@ -20391,6 +20496,249 @@ mod generic_publication_tests {
                 }
             ));
             assert_eq!(declared_method_value_types(&fixture.store, method), None);
+        }
+    }
+
+    #[test]
+    fn pending_optional_method_unions_require_the_exact_scoped_proof() {
+        let mut fixture = interface_fixture_with_bootstrap(
+            "interface I { maybe?(): void; }",
+            3_932,
+            CanonicalModuleState::Script,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: true,
+            },
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let owner = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            SymbolFlags::INTERFACE,
+        )
+        .unwrap()
+        .unwrap();
+        let method = &plan.methods[0];
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (void, sentinel) = (bootstrap.void_type, bootstrap.undefined_or_missing_type);
+        let mut preparation = fixture
+            .store
+            .prepare_type_query_types(&[], &[], &[], 1, 0)
+            .unwrap();
+        let callable = fixture
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method.symbol))
+            .unwrap();
+        let signature = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(method.declaration),
+                vec![],
+                None,
+                vec![],
+                Some(void),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(fixture.store.set_signature_links(
+            method.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_structured_type_members(
+            callable,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        let method_proof = PendingDeclaredMethodTypeProof {
+            store: fixture.store.id(),
+            type_: callable,
+            symbol: method.symbol,
+            owner: plan.symbol,
+            kind: plan.kind,
+            methods: plan.methods.clone(),
+        };
+        let wrong_type = PendingFunctionTypeProof::declared_method(
+            &fixture.store,
+            owner,
+            None,
+            method_proof.clone(),
+        );
+        assert!(
+            preparation
+                .authorize_pending_function(&fixture.store, &wrong_type)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .store
+                .preflight_prepared_union_constituent(callable, &preparation, None)
+                .is_err()
+        );
+        let proof =
+            PendingFunctionTypeProof::declared_method(&fixture.store, callable, None, method_proof);
+        preparation
+            .authorize_pending_function(&fixture.store, &proof)
+            .unwrap();
+        let value = fixture
+            .store
+            .literal_union_type_prepared(&[callable, sentinel], None, &mut preparation)
+            .unwrap();
+        assert!(fixture.store.value_symbol_links(method.symbol).is_none());
+        preparation.finish_pending_function(&proof).unwrap();
+        assert!(
+            fixture
+                .store
+                .preflight_prepared_union_constituent(callable, &preparation, None)
+                .is_err()
+        );
+        assert!(preparation.finish_pending_function(&proof).is_err());
+        assert!(fixture.store.set_value_symbol_links(
+            method.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(value),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            declared_method_value_types(&fixture.store, method.symbol),
+            Some((callable, value))
+        );
+        assert!(
+            preparation
+                .authorize_pending_function(&fixture.store, &proof)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn optional_method_publication_rejects_short_budgets_and_poisoned_links_before_writes() {
+        let mut fixture = interface_fixture_with_bootstrap(
+            "interface I { first?(value?: string): void; second?(value?: string): void; }",
+            3_933,
+            CanonicalModuleState::Script,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let owner = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            SymbolFlags::INTERFACE,
+        )
+        .unwrap()
+        .unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (string, void) = (bootstrap.string_type, bootstrap.void_type);
+        let resolved = plan
+            .methods
+            .iter()
+            .map(|_| ResolvedCallSignatureTypes {
+                parameter_types: vec![string],
+                return_type: void,
+            })
+            .collect::<Vec<_>>();
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.signature_len(),
+                state(store, &plan, owner),
+            )
+        };
+        let mut short = fixture
+            .store
+            .prepare_type_query_types(&[], &[], &[], 3, 0)
+            .unwrap();
+        let before = snapshot(&fixture.store);
+        assert!(
+            publish_interface_method_values_prepared(
+                &mut fixture.store,
+                &plan,
+                &resolved,
+                &mut short,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(snapshot(&fixture.store), before);
+        for method in &plan.methods {
+            assert!(fixture.store.value_symbol_links(method.symbol).is_none());
+            assert!(fixture.store.signature_links(method.declaration).is_none());
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(method.parameters[0].symbol)
+                    .is_none()
+            );
+        }
+        let poisoned = ValueSymbolLinks {
+            resolved_type: Some(string),
+            ..ValueSymbolLinks::default()
+        };
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(plan.methods[1].parameters[0].symbol, poisoned.clone())
+        );
+        let mut sufficient = fixture
+            .store
+            .prepare_type_query_types(&[], &[], &[], 4, 0)
+            .unwrap();
+        let before = snapshot(&fixture.store);
+        assert!(
+            publish_interface_method_values_prepared(
+                &mut fixture.store,
+                &plan,
+                &resolved,
+                &mut sufficient,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(snapshot(&fixture.store), before);
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.methods[0].parameters[0].symbol)
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(plan.methods[1].parameters[0].symbol),
+            Some(&poisoned)
+        );
+        assert!(fixture.store.set_value_symbol_links(
+            plan.methods[1].parameters[0].symbol,
+            ValueSymbolLinks::default(),
+        ));
+        let values = publish_interface_method_values_prepared(
+            &mut fixture.store,
+            &plan,
+            &resolved,
+            &mut sufficient,
+            None,
+        )
+        .unwrap();
+        assert_eq!(values.len(), 2);
+        for (method, value) in plan.methods.iter().zip(values) {
+            assert_eq!(
+                declared_method_value_types(&fixture.store, method.symbol).map(|(_, value)| value),
+                Some(value)
+            );
         }
     }
 

@@ -48787,7 +48787,13 @@ pub(super) fn check_source_file(
                     .get_type_from_type_node(property.type_node);
                     merge_retry_diagnostics(diagnostics, property_diagnostics);
                     let mut property_type = property_type?;
-                    if options.intrinsic.strict_null_checks && property.optional {
+                    if options.intrinsic.strict_null_checks
+                        && property.optional
+                        && !interface
+                            .methods
+                            .iter()
+                            .any(|method| method.symbol == property.symbol)
+                    {
                         let bootstrap =
                             store
                                 .intrinsic_bootstrap()
@@ -48831,11 +48837,12 @@ pub(super) fn check_source_file(
                         },
                     ));
                 }
-                super::object_members::publish_generic_interface_declared_members(
+                super::object_members::publish_generic_interface_declared_members_with_global_types(
                     store,
                     &interface,
                     target,
                     &property_types,
+                    global_types,
                 )
                 .map_err(|_| {
                     SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {

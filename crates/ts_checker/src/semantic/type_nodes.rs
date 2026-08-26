@@ -20381,12 +20381,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .symbol(declaration)
             .and_then(|symbol| self.store.get_merged_symbol(symbol))
             .ok_or_else(invalid)?;
-        let callable = self
-            .store
-            .value_symbol_links(method_symbol)
-            .and_then(|links| links.resolved_type)
-            .ok_or_else(invalid)?;
-        let linked_callable = match (
+        let (callable, value) =
+            object_members::declared_method_value_types(self.store, method_symbol)
+                .ok_or_else(invalid)?;
+        let linked_value = match (
             self.store
                 .authenticated_interface_method_owner(method_symbol),
             self.store
@@ -20400,7 +20398,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if !self
             .host
             .symbol_matches(self.store, declaration, method_symbol)
-            || linked_callable != Some(callable)
+            || linked_value != Some(value)
             || self
                 .store
                 .signature_links(declaration)
@@ -21039,6 +21037,24 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .len()
             .checked_add(optional_parameter_unions)
             .and_then(|count| count.checked_add(optional_tuple_unions))
+            .and_then(|count| {
+                if !self
+                    .store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| bootstrap.options.strict_null_checks)
+                {
+                    return Some(count);
+                }
+                plan.interfaces
+                    .values()
+                    .chain(plan.generic_interfaces.values())
+                    .chain(plan.type_literals.values())
+                    .try_fold(count, |count, interface| {
+                        count.checked_add(object_members::optional_method_union_operations(
+                            interface,
+                        )?)
+                    })
+            })
             .and_then(|count| count.checked_add(tuple_preflight.length_union_operations()))
             .and_then(|count| count.checked_add(additional_union_operations))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
@@ -21553,10 +21569,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     return_type,
                 });
             }
-            let method_values = object_members::publish_interface_method_values(
+            let method_values = object_members::publish_interface_method_values_prepared(
                 self.store,
                 &interface,
                 &method_types,
+                prepared,
+                self.global_types.as_ref(),
             )
             .map_err(property_object_error)?;
             for (method, value) in interface.methods.iter().zip(method_values) {
@@ -24052,9 +24070,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 return_type,
             });
         }
-        let method_values =
-            object_members::publish_interface_method_values(self.store, &literal, &method_types)
-                .map_err(property_object_error)?;
+        let method_values = object_members::publish_interface_method_values_prepared(
+            self.store,
+            &literal,
+            &method_types,
+            prepared,
+            self.global_types.as_ref(),
+        )
+        .map_err(property_object_error)?;
         for (method, value) in literal.methods.iter().zip(method_values) {
             let property = literal
                 .properties
