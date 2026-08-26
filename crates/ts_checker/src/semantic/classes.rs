@@ -20613,6 +20613,22 @@ fn stored_class_parts(
     let exports = owner.exports()?;
     validate_prototype(store, symbol, exports).ok()?;
     let prototype = store.symbol_table(exports)?.get_source(PROTOTYPE_NAME)?;
+    if instance
+        .reference
+        .resolved_type_arguments
+        .as_deref()
+        .is_some_and(|arguments| arguments.is_empty())
+        && store.value_symbol_links(prototype).is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && links
+                    != &(ValueSymbolLinks {
+                        resolved_type: Some(instance_type),
+                        ..ValueSymbolLinks::default()
+                    })
+        })
+    {
+        return None;
+    }
     let constructor = stored_class_constructor(store, symbol, declaration, owner.members())?;
     let index = match stored_class_index(
         store,

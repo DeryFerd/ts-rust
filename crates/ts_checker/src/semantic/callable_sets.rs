@@ -2574,6 +2574,24 @@ mod tests {
                     },
             );
             values.push(value);
+
+            let prototype = store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get_source("prototype"))
+                .unwrap();
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                prototype,
+                ValueSymbolLinks {
+                    resolved_type: Some(instance),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            assert_eq!(
+                authenticated_class_constructor_value(context.store(), owner),
+                Some((value, signature)),
+            );
         }
 
         let union = context
