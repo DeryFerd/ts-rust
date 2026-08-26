@@ -10982,8 +10982,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         TypeNodeUnavailable::TypeArgumentsUnsupported(node),
                     ));
                 }
-                let target =
-                    self.preflight_direct_generic_reference_target(node, symbol, local_count)?;
+                let target = self.preflight_direct_generic_reference_target(
+                    node,
+                    symbol,
+                    local_count,
+                    type_arguments.len(),
+                )?;
                 let minimum_type_arguments = target.minimum_type_arguments;
                 if union_constituent
                     && !(minimum_type_arguments..=local_count).contains(&type_arguments.len())
@@ -15342,6 +15346,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         node: NodeRef,
         symbol: SemanticSymbolId,
         local_type_parameter_count: usize,
+        provided_type_argument_count: usize,
     ) -> Result<PlannedDirectGenericTarget, DeclaredTypeError> {
         let unsupported = || {
             type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol })
@@ -15484,7 +15489,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             })
             .transpose()?;
         let mut constraints = Vec::new();
-        let mut defaults = Vec::new();
+        let mut default_nodes = Vec::new();
+        let mut default_seen = false;
         let mut previous_parameters = Vec::new();
         let mut minimum_type_arguments = 0;
         let mut previous_parameter_end = parameters.range.start;
@@ -15757,24 +15763,40 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             if let Some(default) = parameter_data.default_type {
                 let default = NodeRef::new(declaration.arena, declaration.file, default);
-                defaults.push(self.preflight_direct_generic_default(
-                    node,
-                    symbol,
-                    parameter,
-                    parameter_symbol,
-                    default,
-                    &previous_parameters,
-                    react_interface_defaults,
-                    ordinary_interface,
-                )?);
+                self.preflight_direct_generic_default_owner(node, symbol, parameter, default)?;
+                if index >= provided_type_argument_count {
+                    default_nodes.push((index, parameter, parameter_symbol, default));
+                }
+                default_seen = true;
             } else {
-                if (react_interface_defaults || ordinary_interface) && !defaults.is_empty() {
+                if (react_interface_defaults || ordinary_interface) && default_seen {
                     return Err(unsupported());
                 }
                 minimum_type_arguments = index + 1;
             }
             previous_parameters.push(parameter_symbol);
         }
+        let defaults = if (minimum_type_arguments..=local_type_parameter_count)
+            .contains(&provided_type_argument_count)
+        {
+            default_nodes
+                .into_iter()
+                .map(|(index, parameter, parameter_symbol, default)| {
+                    self.preflight_direct_generic_default(
+                        node,
+                        symbol,
+                        parameter,
+                        parameter_symbol,
+                        default,
+                        &previous_parameters[..index],
+                        react_interface_defaults,
+                        ordinary_interface,
+                    )
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            Vec::new()
+        };
         Ok(PlannedDirectGenericTarget {
             constraints,
             defaults,
@@ -15918,6 +15940,34 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(())
     }
 
+    fn preflight_direct_generic_default_owner(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+        parameter: NodeRef,
+        default: NodeRef,
+    ) -> Result<(), DeclaredTypeError> {
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol })
+        };
+        let parameter_record = preflight_node(self.store, self.host, parameter)?;
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Err(unsupported());
+        };
+        let default_record = preflight_node(self.store, self.host, default)?;
+        if parameter_record.kind != SyntaxKind::TypeParameter
+            || parameter_data.default_type != Some(default.node)
+            || !default.is_for(parameter.arena, parameter.file)
+            || default_record.flags.0 != 0
+            || default_record.parent != Some(parameter.node)
+            || default_record.range.start < parameter_record.range.start
+            || default_record.range.end != parameter_record.range.end
+        {
+            return Err(unsupported());
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // Default syntax retains the authenticated declaration owner.
     fn preflight_direct_generic_default(
         &self,
@@ -15934,15 +15984,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol })
         };
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
-        let parameter_record = preflight_node(self.store, self.host, parameter)?;
+        self.preflight_direct_generic_default_owner(node, symbol, parameter, default)?;
         let default_record = preflight_node(self.store, self.host, default)?;
-        if default_record.flags.0 != 0
-            || default_record.parent != Some(parameter.node)
-            || default_record.range.start < parameter_record.range.start
-            || default_record.range.end != parameter_record.range.end
-        {
-            return Err(unsupported());
-        }
 
         let (earlier_parameter, expected) = match &default_record.data {
             NodeData::KeywordTypeNode(_)
@@ -16508,6 +16551,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             reference,
             target_symbol,
             local_type_parameter_count,
+            argument_nodes.len(),
         )?;
         if !(generic.minimum_type_arguments..=local_type_parameter_count)
             .contains(&argument_nodes.len())
@@ -38195,7 +38239,7 @@ mod tests {
     fn named_reference_boundaries_are_typed_and_atomic_without_diagnostics() {
         let cases = [
             ("type Bad = Missing;", 1),
-            ("class Box<T = string> {} type Bad = Box<string>;", 3),
+            ("class Box<T = string> {} type Bad = Box;", 3),
         ];
 
         for (source, expected) in cases {
@@ -38609,7 +38653,7 @@ mod tests {
     #[test]
     fn direct_generic_interface_defaults_forward_parameters_without_library_name_rules() {
         let library = parse_source_file(concat!(
-            "interface Channel<Value, Result = unknown, Next = Value> {} ",
+            "interface Channel<Value = number[], Result = unknown, Next = Value> {} ",
             "interface Empty<Value = {}> {} ",
             "interface Scalar<Value = string, Other = number, Last = undefined> {}",
         ));
@@ -38681,6 +38725,135 @@ mod tests {
         assert_eq!(context.get_type_from_type_node(nodes["scalar"]), Ok(scalar));
         assert_eq!(store_state(context.store()), warm);
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn direct_generic_interface_supplied_arguments_leave_compound_defaults_cold() {
+        for default in ["number[]", "{ nested: number[] }", "number | string"] {
+            let mut fixture = fixture(&format!(
+                "interface Box<Value = {default}> {{}} \
+                 let value: Box<string>; type Wrapped = Box<string>;"
+            ));
+            let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Box");
+            let wrapped = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Wrapped");
+            let node = variable_type_node(&fixture, "value");
+            let parameter = named_node(&fixture, SyntaxKind::TypeParameter, "Value");
+            let NodeData::TypeParameterDeclaration(parameter_data) =
+                &fixture.parsed.arena.get(parameter.node).unwrap().data
+            else {
+                panic!("the interface must retain its type parameter")
+            };
+            let default = NodeRef::new(
+                parameter.arena,
+                parameter.file,
+                parameter_data.default_type.unwrap(),
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let resolved = query_node(&mut fixture, node, &mut diagnostics).unwrap();
+            let reference = validate_direct_generic_reference(&fixture.store, resolved).unwrap();
+            let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            assert_eq!(reference.type_arguments, [string]);
+            assert_eq!(
+                fixture
+                    .store
+                    .declared_type_links(owner)
+                    .unwrap()
+                    .declared_type,
+                Some(reference.target),
+            );
+            let parameter = validate_direct_generic_reference(&fixture.store, reference.target)
+                .unwrap()
+                .type_arguments[0];
+            let TypeData::TypeParameter(parameter) =
+                fixture.store.type_payload(parameter).unwrap().data()
+            else {
+                panic!("the reference must retain its declaration-owned parameter")
+            };
+            assert!(parameter.resolved_default_type.is_none());
+            assert!(fixture.store.type_node_links(default).is_none());
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    wrapped,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(resolved),
+            );
+
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                query_node(&mut fixture, node, &mut diagnostics),
+                Ok(resolved)
+            );
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    wrapped,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(resolved),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+            assert!(fixture.store.type_node_links(default).is_none());
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn direct_generic_interface_unused_defaults_do_not_replace_arity_errors() {
+        for (source, minimum, maximum) in [
+            (
+                "interface Box<Value = number[]> {} let value: Box<string, number>;",
+                "0",
+                "1",
+            ),
+            (
+                "interface Box<Value, Result = number[]> {} let value: Box;",
+                "1",
+                "2",
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let node = variable_type_node(&fixture, "value");
+            let error = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert_eq!(query_node(&mut fixture, node, &mut diagnostics), Ok(error));
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("an invalid type-argument count must report one diagnostic")
+            };
+            assert_eq!(diagnostic.node, Some(node));
+            assert_eq!(diagnostic.diagnostic.code(), 2707);
+            assert_eq!(&diagnostic.diagnostic.arguments[1..], [minimum, maximum]);
+        }
+    }
+
+    #[test]
+    fn source_generic_class_supplied_arguments_leave_compound_defaults_cold() {
+        let mut fixture = fixture("class Box<Value = number[]> {} let value: Box<string>;");
+        let node = variable_type_node(&fixture, "value");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let resolved = query_node(&mut fixture, node, &mut diagnostics).unwrap();
+        let reference = validate_direct_generic_reference(&fixture.store, resolved).unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(reference.type_arguments, [string]);
+        let parameter = validate_direct_generic_reference(&fixture.store, reference.target)
+            .unwrap()
+            .type_arguments[0];
+        let TypeData::TypeParameter(parameter) =
+            fixture.store.type_payload(parameter).unwrap().data()
+        else {
+            panic!("the class must retain its declaration-owned parameter")
+        };
+        assert!(parameter.resolved_default_type.is_none());
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, node, &mut diagnostics),
+            Ok(resolved)
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
