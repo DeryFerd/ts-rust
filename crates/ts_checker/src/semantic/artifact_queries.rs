@@ -709,7 +709,7 @@ impl CanonicalCheckerContext<'_> {
         &self,
         node: NodeRef,
     ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
-        let (declaration, symbol) = {
+        let symbol = {
             let (arena, bound, record) = self.validated_artifact_node(node)?;
             let declaration = if matches!(record.data, NodeData::ClassDeclaration(_)) {
                 node
@@ -733,33 +733,15 @@ impl CanonicalCheckerContext<'_> {
                         node,
                         kind: record.kind,
                     })?;
-            (declaration, self.merged_artifact_symbol(node, symbol)?)
+            self.merged_artifact_symbol(node, symbol)?
         };
-        let name = declaration_name(&self.validated_artifact_node(declaration)?.2.data)
-            .map(|name| NodeRef::new(declaration.arena, declaration.file, name));
-        for location in [declaration].into_iter().chain(name) {
-            if location != declaration
-                && self.validated_artifact_node(location)?.2.parent != Some(declaration.node)
-            {
-                return Err(CanonicalArtifactQueryError::ForeignNode(location));
-            }
-            if let Some(cached) = self.cached_artifact_type(location)? {
-                let declared = self
-                    .store()
-                    .declared_type_links(symbol)
-                    .and_then(|links| links.declared_type);
-                if declared != Some(cached)
-                    || self.store().type_payload(cached).is_none_or(|record| {
-                        record.symbol() != Some(symbol)
-                            || !matches!(record.data(), TypeData::Interface(_))
-                    })
-                {
-                    return Err(CanonicalArtifactQueryError::InvalidType {
-                        node: location,
-                        type_: cached,
-                    });
-                }
-            }
+        if let Some(cached) = self.cached_artifact_type(node)?
+            && super::declared::cached_class_type(self.store(), symbol)? != Some(cached)
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: cached,
+            });
         }
         Ok(Some(symbol))
     }
@@ -2313,7 +2295,7 @@ mod tests {
                     context.diagnostics().len(),
                 );
                 assert_eq!(
-                    context.get_type_at_location(name),
+                    context.get_type_at_location(poisoned),
                     Err(CanonicalArtifactQueryError::InvalidType {
                         node: poisoned,
                         type_: wrong,
