@@ -87,10 +87,10 @@ fn project_report_forces_replay_and_compares_owned_artifacts_and_identities() {
     ));
     let encoded = serde_json::to_value(&report).unwrap();
     assert!(encoded["cold"]["types"]["walkDigest"].is_string());
-    assert_eq!(
-        encoded["cold"]["diagnostics"]["value"]["pinnedErrorBaseline"]["status"],
-        "unavailable"
-    );
+    assert!(matches!(
+        encoded["cold"]["diagnostics"]["value"]["pinnedErrorBaseline"]["status"].as_str(),
+        Some("complete" | "no_content")
+    ));
 }
 
 #[test]

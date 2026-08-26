@@ -2823,8 +2823,95 @@ fn error_baseline_unit_order(case: &Case) -> (Vec<usize>, Vec<String>) {
     (order, Vec::new())
 }
 
+#[derive(Clone, Copy)]
+enum DiagnosticTextContext<'a> {
+    Fixture(&'a Case),
+    Project,
+}
+
+impl DiagnosticTextContext<'_> {
+    fn file_name(self, file_name: &str) -> String {
+        match self {
+            Self::Fixture(case) => baseline_diagnostic_file_name(case, file_name),
+            Self::Project => remove_test_path_prefixes(file_name),
+        }
+    }
+
+    fn location(self, source: &str, position: usize) -> (usize, usize) {
+        match self {
+            Self::Fixture(_) => line_and_utf16_column(source, position),
+            Self::Project => {
+                let starts = self.line_starts(source);
+                let line = starts.partition_point(|start| *start <= position) - 1;
+                let column = source[starts[line]..position].encode_utf16().count();
+                (line + 1, column + 1)
+            }
+        }
+    }
+
+    fn header_library(self, file_name: &str) -> bool {
+        match self {
+            Self::Fixture(_) => is_default_library_file(file_name),
+            Self::Project => {
+                let lower = file_name.to_ascii_lowercase();
+                lower.starts_with("lib") && lower.ends_with(".d.ts")
+            }
+        }
+    }
+
+    fn message(self, message: &str, related: bool) -> String {
+        match self {
+            Self::Fixture(_) => normalize_to_crlf(&remove_test_path_prefixes(message)),
+            Self::Project if related => message.to_owned(),
+            Self::Project => remove_test_path_prefixes(message),
+        }
+    }
+
+    fn line_starts(self, source: &str) -> Vec<usize> {
+        let mut result = vec![0];
+        if matches!(self, Self::Fixture(_)) {
+            result.extend(
+                source
+                    .bytes()
+                    .enumerate()
+                    .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+            );
+            return result;
+        }
+        let mut previous_cr = false;
+        for (index, character) in source.char_indices() {
+            if character == '\n' && previous_cr {
+                *result.last_mut().expect("line starts always contain zero") = index + 1;
+            } else if matches!(character, '\r' | '\n' | '\u{2028}' | '\u{2029}') {
+                result.push(index + character.len_utf8());
+            }
+            previous_cr = character == '\r';
+        }
+        result
+    }
+
+    fn source_whitespace(self, character: char) -> bool {
+        match self {
+            Self::Fixture(_) => matches!(character, ' ' | '\t' | '\u{000b}' | '\u{000c}'),
+            Self::Project => matches!(character, ' ' | '\t' | '\r' | '\n' | '\u{000c}'),
+        }
+    }
+}
+
 fn render_diagnostic_header(
     case: &Case,
+    diagnostics: &[&CompilationDiagnostic],
+    unsupported_details: &mut Vec<String>,
+) -> String {
+    render_diagnostic_header_with_context(
+        DiagnosticTextContext::Fixture(case),
+        diagnostics,
+        unsupported_details,
+    )
+}
+
+fn render_diagnostic_header_with_context(
+    context: DiagnosticTextContext<'_>,
     diagnostics: &[&CompilationDiagnostic],
     unsupported_details: &mut Vec<String>,
 ) -> String {
@@ -2841,11 +2928,11 @@ fn render_diagnostic_header(
                             "diagnostic {index} has an invalid source position {position} for {file_name:?}"
                         ));
                     } else {
-                        let display_name = baseline_diagnostic_file_name(case, file_name);
-                        if is_default_library_file(&display_name) {
+                        let display_name = context.file_name(file_name);
+                        if context.header_library(&display_name) {
                             let _ = write!(output, "{display_name}(--,--): ");
                         } else {
-                            let (line, column) = line_and_utf16_column(
+                            let (line, column) = context.location(
                                 source.as_scannable_str(),
                                 position,
                             );
@@ -2871,15 +2958,12 @@ fn render_diagnostic_header(
                 "diagnostic {index} lacks the code required by an error baseline"
             ));
         }
-        output.push_str(&normalize_to_crlf(&remove_test_path_prefixes(
-            &diagnostic.message,
-        )));
+        output.push_str(&context.message(&diagnostic.message, false));
         output.push_str(HARNESS_NEW_LINE);
     }
     output
 }
 
-#[allow(clippy::too_many_lines)]
 fn annotate_source_unit(
     case: &Case,
     unit: &Unit,
@@ -2889,14 +2973,28 @@ fn annotate_source_unit(
     first_line: &mut bool,
     unsupported_details: &mut Vec<String>,
 ) {
-    let source = unit.source_text.as_scannable_str();
-    let mut line_starts = vec![0];
-    line_starts.extend(
-        source
-            .bytes()
-            .enumerate()
-            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    annotate_diagnostic_source(
+        DiagnosticTextContext::Fixture(case),
+        unit.source_text.as_scannable_str(),
+        &baseline_unit_name(case, unit, unit_index),
+        diagnostics,
+        output,
+        first_line,
+        unsupported_details,
     );
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn annotate_diagnostic_source(
+    context: DiagnosticTextContext<'_>,
+    source: &str,
+    source_name: &str,
+    diagnostics: &[(usize, &&CompilationDiagnostic)],
+    output: &mut String,
+    first_line: &mut bool,
+    unsupported_details: &mut Vec<String>,
+) {
+    let line_starts = context.line_starts(source);
     let lines = source.split('\n').collect::<Vec<_>>();
     let mut marked = vec![false; diagnostics.len()];
 
@@ -2915,8 +3013,7 @@ fn annotate_source_unit(
         {
             let Some(range) = diagnostic.range else {
                 unsupported_details.push(format!(
-                    "diagnostic {diagnostic_index} for {} lacks a source range",
-                    baseline_unit_name(case, unit, unit_index)
+                    "diagnostic {diagnostic_index} for {source_name} lacks a source range"
                 ));
                 continue;
             };
@@ -2925,7 +3022,7 @@ fn annotate_source_unit(
             if start > end || start > source.len() || end > source.len() {
                 unsupported_details.push(format!(
                     "diagnostic {diagnostic_index} has range {start}..{end} outside {} ({} bytes)",
-                    baseline_unit_name(case, unit, unit_index),
+                    source_name,
                     source.len()
                 ));
                 continue;
@@ -2943,7 +3040,7 @@ fn annotate_source_unit(
                     unsupported_details.push(format!(
                         "diagnostic {diagnostic_index} starts at a non-renderable byte offset on line {} of {}",
                         line_index + 1,
-                        baseline_unit_name(case, unit, unit_index)
+                        source_name
                     ));
                     continue;
                 }
@@ -2955,14 +3052,14 @@ fn annotate_source_unit(
                     unsupported_details.push(format!(
                         "diagnostic {diagnostic_index} ends at a non-renderable byte offset on line {} of {}",
                         line_index + 1,
-                        baseline_unit_name(case, unit, unit_index)
+                        source_name
                     ));
                     continue;
                 }
                 let prefix = line[..squiggle_start]
                     .chars()
                     .map(|character| {
-                        if matches!(character, ' ' | '\t' | '\u{000b}' | '\u{000c}') {
+                        if context.source_whitespace(character) {
                             character
                         } else {
                             ' '
@@ -2972,12 +3069,12 @@ fn annotate_source_unit(
                 let squiggles = "~".repeat(line[squiggle_start..squiggle_end].chars().count());
                 append_annotation_line(output, first_line, &format!("    {prefix}{squiggles}"));
                 if line_index + 1 == lines.len() || next_line_start > end {
-                    append_annotated_diagnostic(
+                    append_annotated_diagnostic_with_context(
                         output,
                         first_line,
                         diagnostic,
                         *diagnostic_index,
-                        case,
+                        context,
                         unsupported_details,
                     );
                     marked[file_diagnostic_index] = true;
@@ -2989,8 +3086,7 @@ fn annotate_source_unit(
     for ((diagnostic_index, _), was_marked) in diagnostics.iter().zip(marked) {
         if !was_marked {
             unsupported_details.push(format!(
-                "diagnostic {diagnostic_index} could not be annotated in {}",
-                baseline_unit_name(case, unit, unit_index)
+                "diagnostic {diagnostic_index} could not be annotated in {source_name}"
             ));
         }
     }
@@ -3004,6 +3100,24 @@ fn append_annotated_diagnostic(
     case: &Case,
     unsupported_details: &mut Vec<String>,
 ) {
+    append_annotated_diagnostic_with_context(
+        output,
+        first_line,
+        diagnostic,
+        diagnostic_index,
+        DiagnosticTextContext::Fixture(case),
+        unsupported_details,
+    );
+}
+
+fn append_annotated_diagnostic_with_context(
+    output: &mut String,
+    first_line: &mut bool,
+    diagnostic: &CompilationDiagnostic,
+    diagnostic_index: usize,
+    context: DiagnosticTextContext<'_>,
+    unsupported_details: &mut Vec<String>,
+) {
     let category =
         diagnostic_category_name(diagnostic.category, diagnostic_index, unsupported_details);
     let code = diagnostic.code.map_or_else(
@@ -3015,9 +3129,8 @@ fn append_annotated_diagnostic(
         },
         |code| format!(" TS{code}"),
     );
-    for line in
-        normalize_to_crlf(&remove_test_path_prefixes(&diagnostic.message)).split(HARNESS_NEW_LINE)
-    {
+    for line in context.message(&diagnostic.message, false).split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if !line.is_empty() {
             append_annotation_line(output, first_line, &format!("!!! {category}{code}: {line}"));
         }
@@ -3031,7 +3144,7 @@ fn append_annotated_diagnostic(
                 related.range,
             ) {
                 (Some(file_name), Some(source), Some(range)) => {
-                    let display_name = baseline_diagnostic_file_name(case, file_name);
+                    let display_name = context.file_name(file_name);
                     if is_default_library_file(&display_name) {
                         format!(" {display_name}:--:--")
                     } else {
@@ -3047,7 +3160,7 @@ fn append_annotated_diagnostic(
                             String::new()
                         } else {
                             let (line, column) =
-                                line_and_utf16_column(source.as_scannable_str(), position);
+                                context.location(source.as_scannable_str(), position);
                             format!(" {display_name}:{line}:{column}")
                         }
                     }
@@ -3074,7 +3187,7 @@ fn append_annotated_diagnostic(
                 first_line,
                 &format!(
                     "!!! related{code}{location}: {}",
-                    normalize_to_crlf(&remove_test_path_prefixes(&related.message))
+                    context.message(&related.message, true)
                 ),
             );
         }

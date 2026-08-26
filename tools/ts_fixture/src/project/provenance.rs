@@ -159,6 +159,7 @@ impl ProjectRunProvenance {
 
 fn compiled_helper_digests() -> BTreeMap<String, String> {
     [
+        ("lib.rs", include_bytes!("../lib.rs").as_slice()),
         ("project.rs", include_bytes!("../project.rs").as_slice()),
         (
             "project_main.rs",
@@ -169,6 +170,7 @@ fn compiled_helper_digests() -> BTreeMap<String, String> {
             include_bytes!("options.rs").as_slice(),
         ),
         ("project/graph.rs", include_bytes!("graph.rs").as_slice()),
+        ("project/errors.rs", include_bytes!("errors.rs").as_slice()),
         (
             "project/provenance.rs",
             include_bytes!("provenance.rs").as_slice(),

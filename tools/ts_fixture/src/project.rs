@@ -1,5 +1,6 @@
 //! Owned reports from one on-disk canonical project and forced source replay.
 
+mod errors;
 mod graph;
 mod options;
 mod provenance;
@@ -33,6 +34,7 @@ pub use provenance::{ProjectFileDigest, ProjectRunProvenance};
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ProjectStage<T> {
     Complete { value: T },
+    NoContent { detail: String },
     Unsupported { code: String, detail: String },
     Invariant { code: String, detail: String },
     Unavailable { detail: String },
@@ -193,25 +195,26 @@ pub struct ProjectDiagnosticArtifact {
     pub records: Vec<ProjectDiagnosticRecord>,
     pub json_digest: String,
     pub digest_algorithm: &'static str,
+    pub errors_file_order: Vec<String>,
     pub pinned_error_baseline: ProjectStage<ProjectTextArtifact>,
 }
 
 impl ProjectDiagnosticArtifact {
-    fn new(diagnostics: &[ProgramDiagnostic]) -> Self {
+    fn new(program: &Program, diagnostics: &[ProgramDiagnostic]) -> Self {
         let records = diagnostics
             .iter()
             .map(ProjectDiagnosticRecord::from)
             .collect::<Vec<_>>();
         let bytes =
             serde_json::to_vec(&records).expect("diagnostic records contain only JSON values");
+        let rendered = errors::render(program, diagnostics);
         Self {
             diagnostic_policy: "Complete canonical Program snapshot. The runner does not invoke a separate declaration-diagnostic or emit stage.",
             records,
             json_digest: stable_digest(&bytes),
             digest_algorithm: SCORECARD_DIGEST_ALGORITHM,
-            pinned_error_baseline: ProjectStage::unavailable(
-                "The pinned error-baseline renderer has no real-project input API. Structured records are not an errors.txt artifact.",
-            ),
+            errors_file_order: rendered.file_order,
+            pinned_error_baseline: rendered.output,
         }
     }
 }
@@ -240,7 +243,7 @@ impl ProjectCheckReport {
     ) -> Self {
         let mut report = Self::unavailable("The artifact walk did not complete.");
         report.diagnostics = ProjectStage::Complete {
-            value: ProjectDiagnosticArtifact::new(diagnostics),
+            value: ProjectDiagnosticArtifact::new(program, diagnostics),
         };
         match artifacts {
             Ok(artifacts) => {
@@ -269,6 +272,7 @@ impl ProjectCheckReport {
 
     fn has_invariant(&self) -> bool {
         self.diagnostics.is_invariant()
+            || matches!(&self.diagnostics, ProjectStage::Complete { value } if value.pinned_error_baseline.is_invariant())
             || self.types.output.is_invariant()
             || self.symbols.output.is_invariant()
     }
@@ -278,6 +282,9 @@ impl ProjectCheckReport {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectReplayEquality {
     pub diagnostic_records: bool,
+    pub fresh_diagnostics: ProjectStage<()>,
+    pub error_bytes: Option<bool>,
+    pub errors_file_order: Option<bool>,
     pub type_bytes: Option<bool>,
     pub symbol_bytes: Option<bool>,
     pub type_walk: Option<bool>,
@@ -292,6 +299,8 @@ impl ProjectReplayEquality {
         !self.diagnostic_records
             || !self.checker_store_identity
             || [
+                self.error_bytes,
+                self.errors_file_order,
                 self.type_bytes,
                 self.symbol_bytes,
                 self.type_walk,
@@ -398,7 +407,7 @@ pub fn run_project(
             report.cold = queries.cold;
             report.replay = queries.replay;
             report.replay_equality = queries.equality;
-            let expected = ProjectDiagnosticArtifact::new(program.diagnostics());
+            let expected = ProjectDiagnosticArtifact::new(&program, program.diagnostics());
             if !matches!(&report.cold.diagnostics, ProjectStage::Complete { value } if value == &expected)
             {
                 report.cold.diagnostics = ProjectStage::Invariant {
@@ -420,7 +429,7 @@ pub fn run_project(
                 value: graph::snapshot_report(&program),
             };
             report.cold.diagnostics = ProjectStage::Complete {
-                value: ProjectDiagnosticArtifact::new(program.diagnostics()),
+                value: ProjectDiagnosticArtifact::new(&program, program.diagnostics()),
             };
             report.cold.types = ProjectArtifactReport::unavailable(detail);
             report.cold.symbols = ProjectArtifactReport::unavailable(detail);
@@ -485,6 +494,11 @@ fn capture_queries(
     let warm = ProjectCheckReport::from_artifacts(program, &warm_diagnostics, &warm_artifacts);
     let mut equality = ProjectReplayEquality {
         diagnostic_records: cold_diagnostics == warm_diagnostics,
+        fresh_diagnostics: ProjectStage::unavailable(
+            "Snapshot and error-text equality do not prove that every diagnostic was produced again.",
+        ),
+        error_bytes: None,
+        errors_file_order: None,
         type_bytes: None,
         symbol_bytes: None,
         type_walk: None,
@@ -493,6 +507,22 @@ fn capture_queries(
         symbol_identities: None,
         checker_store_identity: store == queries.semantic_store_id(),
     };
+    if let (ProjectStage::Complete { value: cold }, ProjectStage::Complete { value: warm }) =
+        (&cold.diagnostics, &warm.diagnostics)
+    {
+        equality.error_bytes = match (&cold.pinned_error_baseline, &warm.pinned_error_baseline) {
+            (ProjectStage::Complete { value: cold }, ProjectStage::Complete { value: warm }) => {
+                Some(cold.text.as_bytes() == warm.text.as_bytes())
+            }
+            (ProjectStage::NoContent { .. }, ProjectStage::NoContent { .. }) => Some(true),
+            (ProjectStage::NoContent { .. }, ProjectStage::Complete { .. })
+            | (ProjectStage::Complete { .. }, ProjectStage::NoContent { .. }) => Some(false),
+            _ => None,
+        };
+        if equality.error_bytes.is_some() {
+            equality.errors_file_order = Some(cold.errors_file_order == warm.errors_file_order);
+        }
+    }
     if let (Ok(cold), Ok(warm)) = (&cold_artifacts, &warm_artifacts) {
         equality.type_walk = Some(cold.walk.types == warm.walk.types);
         equality.symbol_walk = Some(cold.walk.symbols == warm.walk.symbols);
