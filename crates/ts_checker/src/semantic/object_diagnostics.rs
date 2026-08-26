@@ -27,6 +27,10 @@ use super::{
         StoredSingleCallableValidation, single_callable_display_projection,
         validate_stored_single_callable,
     },
+    classes::{
+        ClassConstructorVisibility, ClassHeritageMembersValidation, class_member_visibility,
+        validate_class_heritage_members, validated_class_derives_from,
+    },
     formatter::{
         FunctionTypeDisplayUnavailable,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
@@ -1645,6 +1649,152 @@ pub(super) fn declared_property_mismatch_details(
     .map(Option::unwrap_or_default)
 }
 
+fn diagnostic_properties(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+) -> Result<Option<Vec<ResolvedDeclaredProperty>>, SourceCheckError> {
+    match validate_class_heritage_members(store, type_) {
+        ClassHeritageMembersValidation::Malformed => return Err(invalid_structure(type_)),
+        ClassHeritageMembersValidation::Valid => {
+            let properties = store
+                .type_payload(type_)
+                .and_then(|record| record.data().structured())
+                .ok_or_else(|| invalid_structure(type_))?
+                .properties
+                .as_deref()
+                .unwrap_or_default();
+            let mut result = Vec::with_capacity(properties.len());
+            for property in properties {
+                let record = store
+                    .symbol(*property)
+                    .ok_or_else(|| invalid_structure(type_))?;
+                if record.name().is_private_identifier() {
+                    return Ok(None);
+                }
+                result.push(ResolvedDeclaredProperty {
+                    symbol: *property,
+                    name: record.name().to_owned(),
+                    type_: store
+                        .value_symbol_links(*property)
+                        .and_then(|links| links.resolved_type)
+                        .ok_or_else(|| invalid_structure(type_))?,
+                    optional: record.flags().contains(SymbolFlags::OPTIONAL),
+                    declaration: record
+                        .value_declaration()
+                        .ok_or_else(|| invalid_structure(type_))?,
+                });
+            }
+            return Ok(Some(result));
+        }
+        ClassHeritageMembersValidation::NotClass => {}
+    }
+    match validate_resolved_declared_property_type_graph(store, type_) {
+        DeclaredPropertyTypeGraphValidation::Traversable(_) => {}
+        DeclaredPropertyTypeGraphValidation::Opaque => return Ok(None),
+        DeclaredPropertyTypeGraphValidation::Malformed => return Err(invalid_structure(type_)),
+    }
+    store
+        .resolved_declared_property_object(host, type_)?
+        .map(|properties| properties.properties().to_vec())
+        .ok_or_else(|| invalid_structure(type_))
+        .map(Some)
+}
+
+fn diagnostic_property_visibility(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    property: &ResolvedDeclaredProperty,
+) -> Result<(ClassConstructorVisibility, Option<TypeId>), SourceCheckError> {
+    if validate_class_heritage_members(store, type_) != ClassHeritageMembersValidation::Valid {
+        return Ok((ClassConstructorVisibility::Public, None));
+    }
+    let declaring_class = store
+        .symbol(property.symbol)
+        .and_then(ts_binder::semantic::Symbol::parent)
+        .and_then(|owner| store.declared_type_links(owner))
+        .and_then(|links| links.declared_type)
+        .ok_or_else(|| invalid_structure(type_))?;
+    Ok((
+        class_member_visibility(store, property.declaration),
+        Some(declaring_class),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)] // Keeps property and containing-type identities separate.
+fn property_visibility_mismatch_detail(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    source_property: &ResolvedDeclaredProperty,
+    target_property: &ResolvedDeclaredProperty,
+    flags: CanonicalTypeFormatFlags,
+    indentation: usize,
+) -> Result<Option<String>, SourceCheckError> {
+    let (source_visibility, source_class) =
+        diagnostic_property_visibility(store, source_type, source_property)?;
+    let (target_visibility, target_class) =
+        diagnostic_property_visibility(store, target_type, target_property)?;
+    let name = property_name(target_property)?.to_owned();
+    let display = |type_| {
+        type_to_string_with_host_global_types_and_flags(store, host, global_types, type_, flags)
+    };
+    let (code, arguments) = if source_visibility == ClassConstructorVisibility::Private
+        || target_visibility == ClassConstructorVisibility::Private
+    {
+        if source_property.declaration == target_property.declaration {
+            return Ok(None);
+        }
+        if source_visibility == ClassConstructorVisibility::Private
+            && target_visibility == ClassConstructorVisibility::Private
+        {
+            (2442, vec![name])
+        } else {
+            let (private_type, other_type) =
+                if source_visibility == ClassConstructorVisibility::Private {
+                    (source_type, target_type)
+                } else {
+                    (target_type, source_type)
+                };
+            (
+                2325,
+                vec![name, display(private_type)?, display(other_type)?],
+            )
+        }
+    } else if target_visibility == ClassConstructorVisibility::Protected {
+        if let (Some(source_class), Some(target_class)) = (source_class, target_class)
+            && validated_class_derives_from(store, source_class, target_class)
+                .ok_or_else(|| invalid_structure(source_class))?
+        {
+            return Ok(None);
+        }
+        (
+            2443,
+            vec![
+                name,
+                display(source_class.unwrap_or(source_type))?,
+                display(target_class.unwrap_or(target_type))?,
+            ],
+        )
+    } else if source_visibility == ClassConstructorVisibility::Protected {
+        (
+            2444,
+            vec![name, display(source_type)?, display(target_type)?],
+        )
+    } else {
+        return Ok(None);
+    };
+    let detail = Diagnostic::with_arguments(
+        message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
+        arguments,
+    )
+    .render()
+    .expect("visibility diagnostics retain their catalog arguments");
+    Ok(Some(format!("{}{detail}", "  ".repeat(indentation))))
+}
+
 #[allow(clippy::too_many_arguments)] // Keep recursive relation identity and formatting explicit.
 fn recursive_declared_property_mismatch_details(
     store: &mut CanonicalTypeMapperStore,
@@ -1688,26 +1838,39 @@ fn recursive_declared_property_mismatch_details_inner(
     indentation: usize,
     active: &mut HashSet<(TypeId, TypeId)>,
 ) -> Result<Option<Vec<String>>, SourceCheckError> {
-    for type_ in [source_type, target_type] {
-        match validate_resolved_declared_property_type_graph(store, type_) {
-            DeclaredPropertyTypeGraphValidation::Traversable(_) => {}
-            DeclaredPropertyTypeGraphValidation::Opaque => return Ok(None),
-            DeclaredPropertyTypeGraphValidation::Malformed => {
-                return Err(invalid_structure(type_));
-            }
-        }
+    let Some(source) = diagnostic_properties(store, host, source_type)? else {
+        return Ok(None);
+    };
+    let Some(target) = diagnostic_properties(store, host, target_type)? else {
+        return Ok(None);
+    };
+    if target
+        .iter()
+        .any(|target| !target.optional && !source.iter().any(|source| source.name == target.name))
+    {
+        return Ok(None);
     }
-    let source = store
-        .resolved_declared_property_object(host, source_type)?
-        .ok_or_else(|| invalid_structure(source_type))?;
-    let target = store
-        .resolved_declared_property_object(host, target_type)?
-        .ok_or_else(|| invalid_structure(target_type))?;
-    for target_property in target.properties() {
+    for target_property in &target {
         let name = property_name(target_property)?;
-        let Some(source_property) = source.get_source(name) else {
+        let Some(source_property) = source
+            .iter()
+            .find(|source| source.name == target_property.name)
+        else {
             continue;
         };
+        if let Some(detail) = property_visibility_mismatch_detail(
+            store,
+            host,
+            global_types,
+            source_type,
+            target_type,
+            source_property,
+            target_property,
+            flags,
+            indentation,
+        )? {
+            return Ok(Some(vec![detail]));
+        }
         if store.is_type_assignable_to_with_global_types_and_strict_function_types(
             source_property.type_,
             target_property.type_,

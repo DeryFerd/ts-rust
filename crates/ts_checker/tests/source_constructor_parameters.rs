@@ -172,7 +172,7 @@ fn parameter_property_reads_report_visibility_without_losing_type_or_symbol() {
                     context.store().type_len(),
                     context.store().signature_len(),
                     context.store().symbol_len(),
-                    context.store().checker_link_allocated_lengths(),
+                    context.store().mapper_len(),
                 );
                 context.recheck_source_file(file).unwrap();
                 assert_eq!(
@@ -180,7 +180,7 @@ fn parameter_property_reads_report_visibility_without_losing_type_or_symbol() {
                         context.store().type_len(),
                         context.store().signature_len(),
                         context.store().symbol_len(),
-                        context.store().checker_link_allocated_lengths(),
+                        context.store().mapper_len(),
                     ),
                     warm,
                 );
@@ -266,6 +266,130 @@ fn inherited_field_visibility_uses_the_declaring_class_for_instance_and_static_r
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // All visibility branches share the source and replay checks.
+fn class_assignment_visibility_details_match_upstream() {
+    for (target_visibility, source_visibility, detail) in [
+        (
+            "protected",
+            "protected",
+            "Property 'value' is protected but type 'B' is not a class derived from 'A'.",
+        ),
+        (
+            "protected",
+            "public",
+            "Property 'value' is protected but type 'B' is not a class derived from 'A'.",
+        ),
+        (
+            "public",
+            "protected",
+            "Property 'value' is protected in type 'B' but public in type 'A'.",
+        ),
+        (
+            "private",
+            "private",
+            "Types have separate declarations of a private property 'value'.",
+        ),
+        (
+            "private",
+            "public",
+            "Property 'value' is private in type 'A' but not in type 'B'.",
+        ),
+        (
+            "public",
+            "private",
+            "Property 'value' is private in type 'B' but not in type 'A'.",
+        ),
+    ] {
+        for parameter_property in [false, true] {
+            let member = |visibility| {
+                if parameter_property {
+                    format!("constructor({visibility} value: number = 1) {{}}")
+                } else {
+                    format!("{visibility} value: number = 1;")
+                }
+            };
+            let source = format!(
+                "class A {{ {} }} class B {{ {} }} let a = new A(); const b = new B(); a = b;",
+                member(target_visibility),
+                member(source_visibility),
+            );
+            let parsed = parse_source_file(&source);
+            assert!(parsed.diagnostics.is_empty());
+            let file = FileId::new(4_206);
+            let mut context = context(
+                &parsed,
+                file,
+                IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: true,
+                },
+            );
+            context.check_source_file(file).unwrap();
+            let diagnostics = context.diagnostics().as_slice();
+            assert_eq!(diagnostics.len(), 1, "{source}");
+            assert_eq!(diagnostics[0].diagnostic.code(), 2322);
+            assert_eq!(
+                diagnostics[0].diagnostic.render().unwrap(),
+                format!("Type 'B' is not assignable to type 'A'.\n  {detail}"),
+                "{source}",
+            );
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+            );
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(context.diagnostics().len(), 1);
+            assert_eq!(
+                context.diagnostics().as_slice()[0]
+                    .diagnostic
+                    .render()
+                    .unwrap(),
+                format!("Type 'B' is not assignable to type 'A'.\n  {detail}"),
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                ),
+                warm,
+            );
+        }
+    }
+}
+
+#[test]
+fn protected_assignment_details_keep_the_property_declaring_class() {
+    for (declarations, expected) in [
+        (
+            "class A { protected value = 1; } class B extends A {} class C { value = 1; }",
+            "Property 'value' is protected but type 'C' is not a class derived from 'A'.",
+        ),
+        (
+            "class A { protected value = 1; } class B extends A {} class PublicBase { value = 1; } class C extends PublicBase {}",
+            "Property 'value' is protected but type 'PublicBase' is not a class derived from 'A'.",
+        ),
+    ] {
+        let parsed = parse_source_file(&format!(
+            "{declarations} let target = new B(); const source = new C(); target = source;",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(4_207);
+        let mut context = context(&parsed, file, IntrinsicBootstrapOptions::default());
+        context.check_source_file(file).unwrap();
+        assert_eq!(context.diagnostics().len(), 1);
+        assert_eq!(
+            context.diagnostics().as_slice()[0]
+                .diagnostic
+                .render()
+                .unwrap(),
+            format!("Type 'C' is not assignable to type 'B'.\n  {expected}"),
+        );
+    }
+}
+
+#[test]
 fn invalid_visibility_overrides_stay_unsupported_before_class_publication() {
     for static_modifier in ["", "static"] {
         for (base_visibility, derived_visibility) in
@@ -282,7 +406,7 @@ fn invalid_visibility_overrides_stay_unsupported_before_class_publication() {
                 context.store().type_len(),
                 context.store().signature_len(),
                 context.store().symbol_len(),
-                context.store().checker_link_allocated_lengths(),
+                context.store().mapper_len(),
             );
             assert!(matches!(
                 context.check_source_file(file),
@@ -293,7 +417,7 @@ fn invalid_visibility_overrides_stay_unsupported_before_class_publication() {
                     context.store().type_len(),
                     context.store().signature_len(),
                     context.store().symbol_len(),
-                    context.store().checker_link_allocated_lengths(),
+                    context.store().mapper_len(),
                 ),
                 cold,
             );
