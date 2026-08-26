@@ -27,7 +27,10 @@ use super::{
         CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
         validate_stored_single_callable,
     },
-    classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
+    classes::{
+        ClassConstructorVisibility, ClassHeritageMembersValidation,
+        authenticated_class_constructor_value, validate_class_heritage_members,
+    },
     declared::cached_ordinary_type_parameter_owner,
     derived_types::DerivedObjectLiteralValidation,
     enums,
@@ -1632,6 +1635,15 @@ impl<'store> RelaterSession<'store> {
             return Ok(related);
         }
 
+        if self.is_class_constructor_strict_subtype_pair(source, target) {
+            return self.recursive_type_related_to(
+                source,
+                target,
+                intersection_state,
+                recursion_flags,
+            );
+        }
+
         if source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
             && self.cold_global_object_matches_empty_interface(source, target)?
@@ -2380,6 +2392,11 @@ impl<'store> RelaterSession<'store> {
         if canonical_fixed_tuple_pair(self.store, source, target)?.is_some() {
             return self.fixed_tuple_types_related_to(source, target, intersection_state);
         }
+        if let Some(related) =
+            self.class_constructor_strict_subtype(source, target, intersection_state)?
+        {
+            return Ok(related);
+        }
         if let Some((source_signature, target_signature)) =
             self.store.authenticated_declared_construct_pair(
                 source,
@@ -2434,6 +2451,153 @@ impl<'store> RelaterSession<'store> {
             )?;
         }
         Ok(result)
+    }
+
+    /// Compares zero-argument class constructors during array subtype reduction.
+    fn class_constructor_strict_subtype(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+    ) -> Result<Option<Ternary>, RelationUnavailable> {
+        if !self.is_class_constructor_strict_subtype_pair(source, target) {
+            return Ok(None);
+        }
+        let class_owner = |type_| {
+            self.store
+                .type_payload(type_)
+                .filter(|record| matches!(record.data(), TypeData::Object(_)))
+                .and_then(TypeRecord::symbol)
+                .filter(|owner| {
+                    self.store
+                        .symbol(*owner)
+                        .is_some_and(|record| record.flags().contains(SymbolFlags::CLASS))
+                })
+        };
+        let (Some(source_owner), Some(target_owner)) = (class_owner(source), class_owner(target))
+        else {
+            return Ok(None);
+        };
+        let authenticated = |type_, owner| {
+            let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+            let (value, signature) =
+                authenticated_class_constructor_value(self.store, owner).ok_or_else(invalid)?;
+            if value != type_ {
+                return Err(invalid());
+            }
+            let signature = self.store.signature(signature).ok_or_else(invalid)?;
+            if !signature.parameters().is_empty()
+                || !signature.type_parameters().is_empty()
+                || signature.min_argument_count() != 0
+                || signature.this_parameter().is_some()
+            {
+                return Err(RelationUnavailable::StructuredSignatures(type_));
+            }
+            Ok((
+                signature.resolved_return_type().ok_or_else(invalid)?,
+                signature.flags().contains(SignatureFlags::ABSTRACT),
+                signature.declaration(),
+            ))
+        };
+        let (source_instance, source_abstract, source_declaration) =
+            authenticated(source, source_owner)?;
+        let (target_instance, target_abstract, target_declaration) =
+            authenticated(target, target_owner)?;
+        let source_members = self.class_constructor_static_members(source)?;
+        let target_members = self.class_constructor_static_members(target)?;
+        let mut result = self.properties_related_to(source, &source_members, &target_members)?;
+        if result == Ternary::False {
+            return Ok(Some(result));
+        }
+
+        // The authenticated prototype and zero-argument return share the instance type.
+        result &= self.is_related_to_ex(
+            source_instance,
+            target_instance,
+            RecursionFlags::BOTH,
+            intersection_state,
+        )?;
+        if result == Ternary::False || source_abstract && !target_abstract {
+            return Ok(Some(Ternary::False));
+        }
+        if let (Some(source), Some(target)) = (source_declaration, target_declaration) {
+            let source = self.class_constructor_visibility(source);
+            let target = self.class_constructor_visibility(target);
+            if !matches!(
+                (source, target),
+                (_, ClassConstructorVisibility::Private)
+                    | (ClassConstructorVisibility::Public, _)
+                    | (
+                        ClassConstructorVisibility::Protected,
+                        ClassConstructorVisibility::Protected
+                    )
+            ) {
+                return Ok(Some(Ternary::False));
+            }
+        }
+        Ok(Some(result))
+    }
+
+    fn is_class_constructor_strict_subtype_pair(&self, source: TypeId, target: TypeId) -> bool {
+        self.relation == RelationKind::StrictSubtype
+            && [source, target].into_iter().all(|type_| {
+                self.store
+                    .type_payload(type_)
+                    .filter(|record| matches!(record.data(), TypeData::Object(_)))
+                    .and_then(TypeRecord::symbol)
+                    .and_then(|owner| self.store.symbol(owner))
+                    .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+            })
+    }
+
+    fn class_constructor_static_members(
+        &mut self,
+        type_: TypeId,
+    ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
+        let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+        let structured = self
+            .store
+            .type_payload(type_)
+            .and_then(|record| record.data().structured())
+            .ok_or_else(invalid)?;
+        let members = structured.members.ok_or_else(invalid)?;
+        let mut properties = Vec::new();
+        for property in structured.properties.as_deref().unwrap_or_default() {
+            let record = self.store.symbol(*property).ok_or_else(invalid)?;
+            if !record.flags().contains(SymbolFlags::PROTOTYPE) {
+                properties.push(*property);
+            }
+        }
+        self.observe_symbol_table(members);
+        for property in &properties {
+            self.property_symbol(*property, ObjectPropertyOrigin::ValidatedClass)?;
+        }
+        Ok(ResolvedObjectMembers {
+            members: Some(members),
+            properties,
+            index_infos: Vec::new(),
+            property_origin: ObjectPropertyOrigin::ValidatedClass,
+            call_signature: None,
+            exact_callable: false,
+        })
+    }
+
+    fn class_constructor_visibility(&self, declaration: NodeRef) -> ClassConstructorVisibility {
+        for index in 0..declaration.node.index() {
+            let index = u32::try_from(index).expect("source node indices fit in u32");
+            let modifier = NodeRef::new(declaration.arena, declaration.file, NodeId::new(index));
+            if self.store.source_node_parent(modifier)
+                != Some(SourceNodeParent::Parent(declaration))
+            {
+                continue;
+            }
+            match self.store.source_node_kind(modifier) {
+                Some(SyntaxKind::PrivateKeyword) => return ClassConstructorVisibility::Private,
+                Some(SyntaxKind::ProtectedKeyword) => return ClassConstructorVisibility::Protected,
+                _ => {}
+            }
+        }
+        ClassConstructorVisibility::Public
     }
 
     fn fixed_tuple_types_related_to(
@@ -9773,6 +9937,179 @@ mod tests {
             ),
             Err(RelationUnavailable::StructuredSignatures(base_constructor))
         );
+    }
+
+    #[test]
+    fn class_constructor_strict_subtypes_check_abstract_flags_instances_and_statics() {
+        let mut fixture = function_relation_fixture(concat!(
+            "class Empty {} abstract class AbstractEmpty {} ",
+            "class First { value: string; } class Second { value: string; } ",
+            "class Derived extends First { extra: string; } ",
+            "class StaticNumber { static value: number; } ",
+            "class StaticString { static value: string; } ",
+            "class Public { public constructor() {} } ",
+            "class Protected { protected constructor() {} } ",
+            "class Private { private constructor() {} }",
+        ));
+        let mut constructors = HashMap::new();
+        for name in [
+            "Empty",
+            "AbstractEmpty",
+            "First",
+            "Second",
+            "Derived",
+            "StaticNumber",
+            "StaticString",
+            "Public",
+            "Protected",
+            "Private",
+        ] {
+            constructors.insert(
+                name,
+                query_class_members(&mut fixture, name)
+                    .shells()
+                    .value_type(),
+            );
+        }
+        for (source, target, expected) in [
+            ("Empty", "AbstractEmpty", true),
+            ("AbstractEmpty", "Empty", false),
+            ("First", "Second", true),
+            ("Second", "First", true),
+            ("Empty", "First", false),
+            ("First", "Empty", true),
+            ("Derived", "First", true),
+            ("First", "Derived", false),
+            ("StaticNumber", "StaticString", false),
+            ("StaticString", "StaticNumber", false),
+            ("StaticNumber", "Empty", true),
+            ("Empty", "StaticNumber", false),
+            ("Public", "Protected", true),
+            ("Protected", "Public", false),
+            ("Protected", "Private", true),
+            ("Private", "Protected", false),
+            ("Private", "Public", false),
+        ] {
+            let source_type = constructors[source];
+            let target_type = constructors[target];
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_strict_subtype_of(source_type, target_type),
+                Ok(expected),
+                "{source} -> {target}",
+            );
+            let warm = fixture.store.relation_state_snapshot();
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_strict_subtype_of(source_type, target_type),
+                Ok(expected),
+                "{source} -> {target}",
+            );
+            assert_eq!(fixture.store.relation_state_snapshot(), warm);
+        }
+    }
+
+    #[test]
+    fn class_constructor_strict_subtypes_reject_forged_warm_graphs() {
+        for poison in 0..3 {
+            let mut fixture = function_relation_fixture(concat!(
+                "class First { static value: number; } ",
+                "class Second { static value: number; }",
+            ));
+            let source = query_class_members(&mut fixture, "First");
+            let target = query_class_members(&mut fixture, "Second");
+            let source_type = source.shells().value_type();
+            let target_type = target.shells().value_type();
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_strict_subtype_of(source_type, target_type),
+                Ok(true),
+            );
+            match poison {
+                0 => assert!(fixture.store.set_signature_flags(
+                    source.default_construct_signature(),
+                    SignatureFlags::NONE,
+                )),
+                1 | 2 => {
+                    let member = fixture
+                        .store
+                        .type_payload(source_type)
+                        .and_then(|record| record.data().structured())
+                        .and_then(|structured| structured.members)
+                        .and_then(|members| fixture.store.symbol_table(members))
+                        .and_then(|members| {
+                            members.get_source(if poison == 1 { "value" } else { "prototype" })
+                        })
+                        .unwrap();
+                    let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+                    assert!(fixture.store.set_value_symbol_links(
+                        member,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..ValueSymbolLinks::default()
+                        }
+                    ));
+                }
+                _ => unreachable!("only signatures, static fields, and prototypes are changed"),
+            }
+            let state = fixture.store.relation_state_snapshot();
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_strict_subtype_of(source_type, target_type),
+                Err(RelationUnavailable::InvalidStructuredMembers(source_type)),
+                "poison case {poison}",
+            );
+            assert_eq!(fixture.store.relation_state_snapshot(), state);
+        }
+    }
+
+    #[test]
+    fn class_constructor_expression_unions_follow_strict_subtype_reduction() {
+        let mut fixture = function_relation_fixture(concat!(
+            "class First {} class Second {} abstract class Abstract {} ",
+            "class NumberValue { static value: number; } ",
+            "class StringValue { static value: string; }",
+        ));
+        let first = query_class_members(&mut fixture, "First")
+            .shells()
+            .value_type();
+        let second = query_class_members(&mut fixture, "Second")
+            .shells()
+            .value_type();
+        let abstract_ = query_class_members(&mut fixture, "Abstract")
+            .shells()
+            .value_type();
+        let number = query_class_members(&mut fixture, "NumberValue")
+            .shells()
+            .value_type();
+        let string = query_class_members(&mut fixture, "StringValue")
+            .shells()
+            .value_type();
+
+        for (types, expected) in [([first, second], first), ([first, abstract_], abstract_)] {
+            assert_eq!(
+                fixture.store.expression_union_type(
+                    &types,
+                    super::super::bootstrap::UnionReduction::Subtype
+                ),
+                Ok(expected),
+            );
+        }
+        let union = fixture
+            .store
+            .expression_union_type(
+                &[number, string],
+                super::super::bootstrap::UnionReduction::Subtype,
+            )
+            .unwrap();
+        let TypeData::Union(union) = fixture.store.type_payload(union).unwrap().data() else {
+            panic!("incompatible static members must retain both constructors")
+        };
+        assert_eq!(union.union.types.as_slice(), &[number, string]);
     }
 
     #[test]
