@@ -6,17 +6,20 @@
 
 use ts_ast::NodeRef;
 use ts_binder::{EscapedName, EscapedNameRef};
+use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
-    CanonicalCheckerOptions, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
+    CanonicalCheckerDiagnostic, CanonicalCheckerOptions, CanonicalCheckerRelatedInformation,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, MinArgumentCountFlags,
     RelationUnavailable, TypeId,
     bootstrap::UnionReduction,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::ValidatedSingleCallable,
+    calls::{DirectCallError, get_min_argument_count, try_get_type_at_position},
+    formatter::{CanonicalTypeFormatFlags, type_to_string_with_host_global_types_and_flags},
     global_types::{optional_global_type_has_arity, resolve_optional_global_type},
     reference_types::validate_direct_generic_reference,
     relater::ResolvedOwnProperty,
-    signatures::ElementFlags,
     source::{SourceCheckError, UnsupportedSourceSyntax},
     type_records::TypeData,
     types::{ObjectFlags, TypeFlags},
@@ -168,11 +171,8 @@ mod tests {
             receiver: TypeId,
             name: EscapedNameRef<'_>,
         ) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
-            let name = name
-                .as_utf8()
-                .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?;
             store
-                .resolved_own_property(receiver, name)
+                .resolved_own_property_by_key(receiver, name)
                 .map_err(Into::into)
         }
     }
@@ -335,7 +335,63 @@ mod tests {
                     expected
                 }]
             );
+            let diagnostics = prepare_iteration_diagnostics(
+                store,
+                &host,
+                &global_types,
+                options,
+                node,
+                &checked.diagnostics,
+            )
+            .unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("one next-input diagnostic is expected")
+            };
+            assert_eq!(diagnostic.node, Some(node));
+            assert_eq!(diagnostic.diagnostic.code(), use_.next_input_diagnostic());
+            assert_eq!(diagnostic.diagnostic.arguments, ["undefined", "number"]);
+            assert!(diagnostic.related_information.is_empty());
         }
+    }
+
+    #[test]
+    fn iterator_diagnostics_keep_missing_next_as_related_information() {
+        let source = parsed("declare var input: {};");
+        let file = FileId::new(22_299);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&[(file, &source)], 0, options);
+        let node = annotation(&source, file, "input");
+        let input = context.get_type_from_type_node(node).unwrap();
+        let global_types = context.global_types().clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let diagnostic = IterationDiagnostic::NotIterable {
+            input,
+            related: vec![IterationDiagnostic::MissingNext],
+        };
+        let rendered = prepare_iteration_diagnostics(
+            context.store(),
+            &host,
+            &global_types,
+            options,
+            node,
+            &[diagnostic],
+        )
+        .unwrap();
+        let [diagnostic] = rendered.as_slice() else {
+            panic!("one iterable diagnostic is expected")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2488);
+        assert_eq!(diagnostic.diagnostic.arguments, ["{}"]);
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("the missing next method is related information")
+        };
+        assert_eq!(related.node, Some(node));
+        assert_eq!(related.diagnostic.code(), 2489);
     }
 
     #[test]
@@ -536,6 +592,152 @@ mod tests {
         assert_eq!(dynamic.types, IterationTypes::any(any));
         assert!(dynamic.diagnostics.is_empty());
     }
+
+    #[test]
+    fn iterator_method_checks_effective_void_and_tuple_rest_arity() {
+        let library = standard_library();
+        let source = parsed(concat!(
+            "declare var voidInput: (value: void) => Iterator<string, void, undefined>; ",
+            "declare var required: (value: string) => Iterator<string, void, undefined>; ",
+            "declare var voidRest: (...values: [void]) => Iterator<string, void, undefined>; ",
+            "declare var requiredRest: (...values: [string]) => Iterator<string, void, undefined>; ",
+            "declare var optionalRest: (...values: [] | [number]) => Iterator<string, void, undefined>;",
+        ));
+        let source_file = FileId::new(22_399);
+        let mut files = library
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (FileId::new(22_300 + u32::try_from(index).unwrap()), file))
+            .collect::<Vec<_>>();
+        files.push((source_file, &source));
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&files, library.len(), options);
+        let inputs = [
+            ("voidInput", true),
+            ("required", false),
+            ("voidRest", true),
+            ("requiredRest", false),
+            ("optionalRest", true),
+        ]
+        .map(|(name, accepted)| {
+            (
+                context
+                    .get_type_from_type_node(annotation(&source, source_file, name))
+                    .unwrap(),
+                accepted,
+            )
+        });
+        let global_types = context.global_types().clone();
+        let bound = files
+            .iter()
+            .map(|(file, _)| context.file(*file).unwrap().1.clone())
+            .collect::<Vec<_>>();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            files
+                .iter()
+                .zip(&bound)
+                .map(|((_, file), bound)| (&file.arena, bound)),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let node = annotation(&source, source_file, "voidInput");
+        let store = context.store_mut_for_test();
+        let globals = SynchronousIterationGlobals::resolve(store, &host, node).unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let expected = IterationTypes {
+            yield_type: Some(bootstrap.string_type),
+            return_type: Some(bootstrap.void_type),
+            next_type: Some(bootstrap.undefined_type),
+        };
+        let mut query = SynchronousIterationQuery::new(
+            store,
+            &global_types,
+            &globals,
+            options,
+            node,
+            NoProperties,
+        );
+        for (input, accepted) in inputs {
+            match query.iterator_method_result(input).unwrap() {
+                IteratorMethodResult::Returns(iterator) => {
+                    assert!(accepted);
+                    assert_eq!(query.iterator(iterator, true).unwrap().types, expected);
+                }
+                IteratorMethodResult::NeedsArguments => assert!(!accepted),
+                IteratorMethodResult::NotCallable => panic!("the source type is callable"),
+            }
+        }
+    }
+
+    #[test]
+    fn structural_next_reads_tuple_rest_input_positions() {
+        let library = standard_library();
+        let source = parsed(concat!(
+            "interface OptionalInput { next(...values: [] | [number]): { value: string }; } ",
+            "interface EmptyInput { next(...values: []): { value: string }; } ",
+            "interface NoInput { next(): { value: string }; } ",
+            "declare var optional: OptionalInput; ",
+            "declare var empty: EmptyInput; ",
+            "declare var absent: NoInput;",
+        ));
+        let source_file = FileId::new(22_499);
+        let mut files = library
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (FileId::new(22_400 + u32::try_from(index).unwrap()), file))
+            .collect::<Vec<_>>();
+        files.push((source_file, &source));
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&files, library.len(), options);
+        let inputs = ["optional", "empty", "absent"].map(|name| {
+            context
+                .get_type_from_type_node(annotation(&source, source_file, name))
+                .unwrap()
+        });
+        let global_types = context.global_types().clone();
+        let globals = SynchronousIterationGlobals::default();
+        let node = annotation(&source, source_file, "optional");
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (number, undefined, any, unknown) = (
+            bootstrap.number_type,
+            bootstrap.undefined_type,
+            bootstrap.any_type,
+            bootstrap.unknown_type,
+        );
+        let optional = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[number, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let mut query = SynchronousIterationQuery::new(
+            store,
+            &global_types,
+            &globals,
+            options,
+            node,
+            StoredProperties,
+        );
+        for (input, expected) in inputs.into_iter().zip([optional, any, unknown]) {
+            let checked = query.iterator(input, true).unwrap();
+            assert_eq!(checked.types.next_type, Some(expected));
+            assert!(checked.diagnostics.is_empty());
+        }
+    }
 }
 
 impl IterationTypes {
@@ -599,6 +801,91 @@ pub(super) enum IterationDiagnostic {
 pub(super) struct CheckedIterationTypes {
     pub(super) types: IterationTypes,
     pub(super) diagnostics: Vec<IterationDiagnostic>,
+}
+
+enum IteratorMethodResult {
+    NotCallable,
+    NeedsArguments,
+    Returns(TypeId),
+}
+
+/// Formats a complete query before its caller publishes source diagnostics.
+pub(super) fn prepare_iteration_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    node: NodeRef,
+    diagnostics: &[IterationDiagnostic],
+) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| {
+            prepare_iteration_diagnostic(store, host, global_types, options, node, diagnostic)
+        })
+        .collect()
+}
+
+fn prepare_iteration_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    node: NodeRef,
+    diagnostic: &IterationDiagnostic,
+) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
+    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    if options.no_error_truncation {
+        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+    }
+    let display = |type_| {
+        type_to_string_with_host_global_types_and_flags(store, host, global_types, type_, flags)
+            .map_err(SourceCheckError::from)
+    };
+    let mut related_information = Vec::new();
+    let (code, arguments) = match diagnostic {
+        IterationDiagnostic::NotIterable { input, related } => {
+            for reason in related {
+                let reason =
+                    prepare_iteration_diagnostic(store, host, global_types, options, node, reason)?;
+                if !reason.related_information.is_empty() {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Element(node),
+                    ));
+                }
+                related_information.push(CanonicalCheckerRelatedInformation {
+                    node: reason.node,
+                    diagnostic: reason.diagnostic,
+                });
+            }
+            (2488, vec![display(*input)?])
+        }
+        IterationDiagnostic::MissingNext => (2489, vec!["next".to_owned()]),
+        IterationDiagnostic::InvalidMethod(method) => (2767, vec![(*method).to_owned()]),
+        IterationDiagnostic::MissingValue(method) => (2490, vec![(*method).to_owned()]),
+        IterationDiagnostic::IncompatibleNext {
+            use_,
+            sent,
+            expected,
+        } => (
+            use_.next_input_diagnostic(),
+            vec![display(*sent)?, display(*expected)?],
+        ),
+        IterationDiagnostic::IteratorMethodRequiresArguments { .. } => {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Element(node),
+            ));
+        }
+    };
+    Ok(CanonicalCheckerDiagnostic {
+        node: Some(node),
+        range_override: None,
+        diagnostic: Diagnostic::with_arguments(
+            message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
+            arguments,
+        ),
+        related_information,
+    })
 }
 
 /// The global identities used by the pinned synchronous iterator fast paths.
@@ -913,25 +1200,29 @@ impl<'store, 'globals, P: IterationPropertyResolver>
                 diagnostics: Vec::new(),
             });
         }
-        let signatures = self.signatures(property.type_)?;
-        let mut returns = Vec::new();
-        for signature in &signatures {
-            if signature.min_argument_count == 0 {
-                returns.push(self.return_type(signature)?);
+        let iterator = match self.iterator_method_result(property.type_)? {
+            IteratorMethodResult::Returns(iterator) => iterator,
+            IteratorMethodResult::NotCallable => {
+                return Ok(Self::not_iterable(input, report_errors, Vec::new()));
             }
-        }
-        if returns.is_empty() {
-            let mut related = Vec::new();
-            if report_errors
-                && !signatures.is_empty()
-                && let Some(iterable) = self.globals.iterable
-            {
-                related
-                    .push(IterationDiagnostic::IteratorMethodRequiresArguments { input, iterable });
+            IteratorMethodResult::NeedsArguments => {
+                let related = if report_errors {
+                    self.globals
+                        .iterable
+                        .map(
+                            |iterable| IterationDiagnostic::IteratorMethodRequiresArguments {
+                                input,
+                                iterable,
+                            },
+                        )
+                        .into_iter()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                return Ok(Self::not_iterable(input, report_errors, related));
             }
-            return Ok(Self::not_iterable(input, report_errors, related));
-        }
-        let iterator = self.intersection(&returns)?;
+        };
         let checked = self.iterator(iterator, report_errors)?;
         if checked.types.has_types() {
             Ok(checked)
@@ -941,6 +1232,36 @@ impl<'store, 'globals, P: IterationPropertyResolver>
                 report_errors,
                 checked.diagnostics,
             ))
+        }
+    }
+
+    fn iterator_method_result(
+        &mut self,
+        method_type: TypeId,
+    ) -> Result<IteratorMethodResult, SourceCheckError> {
+        let signatures = self.signatures(method_type)?;
+        if signatures.is_empty() {
+            return Ok(IteratorMethodResult::NotCallable);
+        }
+        let mut returns = Vec::new();
+        for signature in &signatures {
+            if get_min_argument_count(
+                self.store,
+                Some(self.global_types),
+                signature,
+                MinArgumentCountFlags::NONE,
+            )
+            .map_err(|error| self.call_error(error))?
+                == 0
+            {
+                returns.push(self.return_type(signature)?);
+            }
+        }
+        if returns.is_empty() {
+            Ok(IteratorMethodResult::NeedsArguments)
+        } else {
+            self.intersection(&returns)
+                .map(IteratorMethodResult::Returns)
         }
     }
 
@@ -1259,63 +1580,22 @@ impl<'store, 'globals, P: IterationPropertyResolver>
         &mut self,
         signature: &ValidatedSingleCallable,
     ) -> Result<Option<TypeId>, SourceCheckError> {
-        if let Some(parameter) = signature.parameters.first() {
-            return Ok(Some(*parameter));
-        }
-        let Some(rest) = signature.rest_parameter else {
+        if signature.parameters.is_empty() && signature.rest_parameter.is_none() {
             return Ok(None);
-        };
-        if self
-            .store
-            .canonical_tuple_shape(rest)
-            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(rest))?
-            .is_some_and(|shape| shape.element_types().is_empty())
-        {
-            return Ok(Some(self.bootstrap()?.any_type));
         }
-        self.rest_parameter_first_type(rest).map(Some)
+        let type_ = try_get_type_at_position(self.store, Some(self.global_types), signature, 0)
+            .map_err(|error| self.call_error(error))?;
+        Ok(Some(type_.unwrap_or(self.bootstrap()?.any_type)))
     }
 
-    fn rest_parameter_first_type(&mut self, type_: TypeId) -> Result<TypeId, SourceCheckError> {
-        let record = self
-            .store
-            .type_payload(type_)
-            .ok_or(RelationUnavailable::Type(type_))?;
-        if let TypeData::Union(union) = record.data() {
-            let constituents = union.union.types.clone();
-            let mut values = Vec::new();
-            for constituent in constituents {
-                values.push(self.rest_parameter_first_type(constituent)?);
+    fn call_error(&self, error: DirectCallError) -> SourceCheckError {
+        match error {
+            DirectCallError::Unsupported(_) => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Element(self.node))
             }
-            return self
-                .union(&values)?
-                .ok_or_else(|| RelationUnavailable::MalformedUnion(type_).into());
+            DirectCallError::Invariant(_) => SourceCheckError::Call(self.node),
+            DirectCallError::Relation(error) => error.into(),
         }
-        if let Some(element) = self
-            .store
-            .canonical_array_element_type(self.global_types, type_)?
-        {
-            return Ok(element);
-        }
-        let shape = self
-            .store
-            .canonical_tuple_shape(type_)
-            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_))?
-            .ok_or(RelationUnavailable::UnsupportedStructuredType(type_))?;
-        let Some(first) = shape.element_types().first().copied() else {
-            return Ok(self.bootstrap()?.undefined_type);
-        };
-        let flags = shape.element_infos()[0].flags();
-        if flags.contains(ElementFlags::VARIADIC) {
-            return self.rest_parameter_first_type(first);
-        }
-        if flags.contains(ElementFlags::OPTIONAL) && self.options.intrinsic.strict_null_checks {
-            let undefined = self.bootstrap()?.undefined_type;
-            return self
-                .union(&[first, undefined])?
-                .ok_or_else(|| RelationUnavailable::InvalidStructuredMembers(type_).into());
-        }
-        Ok(first)
     }
 
     fn iterator_result(&mut self, input: TypeId) -> Result<IterationTypes, SourceCheckError> {
