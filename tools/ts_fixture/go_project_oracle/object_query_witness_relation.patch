@@ -1,9 +1,4 @@
 --- a/internal/checker/relater.go
 +++ b/internal/checker/relater.go
-@@ -399,5 +399,6 @@
- 		c.reportDiagnostic(createDiagnosticChainFromErrorChain(r.errorChain, r.errorNode, r.relatedInfo), diagnosticOutput)
- 	}
+@@ -397,0 +398 @@
 +	c.projectOracleObjectIdentityObserved(source, target, relation, r.overflow)
- 	c.putRelater(r)
- 	return result != TernaryFalse
- }
