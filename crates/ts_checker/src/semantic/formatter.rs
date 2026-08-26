@@ -5150,7 +5150,33 @@ fn display_union_type(
             .type_payload(type_id)
             .ok_or(TypeDisplayUnavailable::Type(type_id))?;
         if let Some(alias) = record.alias() {
-            return display_alias_name(store, host, type_id, alias, state);
+            let arguments = store
+                .type_alias(alias)
+                .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?
+                .type_arguments()
+                .unwrap_or_default();
+            let mut result = display_alias_name(store, host, type_id, alias, state)?;
+            if !arguments.is_empty() {
+                result.push('<');
+                state.add(2);
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index != 0 {
+                        result.push_str(", ");
+                        state.add(2);
+                    }
+                    result.push_str(&display_type_worker(
+                        store,
+                        host,
+                        global_types,
+                        *argument,
+                        flags,
+                        state,
+                        visiting,
+                    )?);
+                }
+                result.push('>');
+            }
+            return Ok(result);
         }
         let TypeData::Union(data) = record.data() else {
             return Err(TypeDisplayUnavailable::InvalidUnion(type_id));

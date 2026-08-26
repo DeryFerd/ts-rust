@@ -6,7 +6,8 @@ use ts_binder::{
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalModuleResolutionEntry,
     CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
-    CanonicalResolvedModuleInput, artifact_queries::CanonicalArtifactQueryError,
+    CanonicalResolvedModuleInput, CanonicalTypeFormatFlags,
+    artifact_queries::CanonicalArtifactQueryError,
 };
 use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 
@@ -290,6 +291,135 @@ fn location_queries_resolve_type_reference_names_without_replacing_alias_symbols
         context.get_symbol_declarations(alias_symbol).unwrap(),
         &[alias]
     );
+}
+
+#[test]
+fn generic_union_alias_locations_preserve_stored_arguments_without_formatting_writes() {
+    let parsed = parse_source_file(concat!(
+        "interface Left<T> {} interface Right<T> {}\n",
+        "type Choice<T> = Left<T> | Right<T>;\n",
+        "declare const text: Choice<string>;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(4_008);
+    let mut context = single_file_context(&parsed, file);
+    let (alias, alias_name) = parsed
+        .arena
+        .iter()
+        .find_map(|(id, record)| {
+            let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                return None;
+            };
+            Some((node(&parsed, file, id), node(&parsed, file, alias.name)))
+        })
+        .unwrap();
+    let text_name = parsed
+        .arena
+        .iter()
+        .find_map(|(_, record)| {
+            let NodeData::VariableDeclaration(variable) = &record.data else {
+                return None;
+            };
+            Some(node(&parsed, file, variable.name))
+        })
+        .unwrap();
+    let alias_symbol = declaration_symbol(&context, alias);
+    assert!(!source_checked(&context, file));
+    let declared = context.get_type_at_location(alias_name).unwrap();
+    assert!(source_checked(&context, file));
+    let concrete = context.get_type_at_location(text_name).unwrap();
+    assert_ne!(declared, concrete);
+    let store = context.store();
+    let parameter_types = store
+        .type_alias_links(alias_symbol)
+        .unwrap()
+        .type_parameters
+        .as_deref()
+        .unwrap();
+    let string_type = store.intrinsic_bootstrap().unwrap().string_type;
+    assert_eq!(parameter_types.len(), 1);
+    for (type_, arguments) in [(declared, parameter_types), (concrete, &[string_type][..])] {
+        let identity = store.type_payload(type_).unwrap().alias().unwrap();
+        let identity = store.type_alias(identity).unwrap();
+        assert_eq!(identity.symbol(), Some(alias_symbol));
+        assert_eq!(identity.type_arguments(), Some(arguments));
+    }
+    let before = (
+        store.type_len(),
+        store.type_alias_len(),
+        store.symbol_len(),
+        store.mapper_len(),
+        store.signature_len(),
+        context.diagnostics().len(),
+    );
+    for _ in 0..2 {
+        assert_eq!(context.type_to_string(declared).unwrap(), "Choice<T>");
+        assert_eq!(context.type_to_string(concrete).unwrap(), "Choice<string>");
+        assert_eq!(context.get_type_at_location(alias_name).unwrap(), declared);
+        assert_eq!(context.get_type_at_location(text_name).unwrap(), concrete);
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().type_alias_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.diagnostics().len(),
+            ),
+            before
+        );
+    }
+    assert!(context.diagnostics().is_empty());
+}
+
+#[test]
+fn generic_union_alias_arguments_recurse_with_the_requested_display_flags() {
+    let parsed = parse_source_file(concat!(
+        "interface Left<T> {} interface Right<T> {}\n",
+        "type Choice<T> = Left<T> | Right<T>;\n",
+        "declare const mixed: Choice<string | number>;\n",
+        "declare const nested: Choice<Choice<'ready'>>;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(4_009);
+    let mut context = single_file_context(&parsed, file);
+    let variables = parsed
+        .arena
+        .iter()
+        .filter_map(|(_, record)| {
+            let NodeData::VariableDeclaration(variable) = &record.data else {
+                return None;
+            };
+            Some(node(&parsed, file, variable.name))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(variables.len(), 2);
+    for (location, expected, single_quoted) in [
+        (
+            variables[0],
+            "Choice<string | number>",
+            "Choice<string | number>",
+        ),
+        (
+            variables[1],
+            "Choice<Choice<\"ready\">>",
+            "Choice<Choice<'ready'>>",
+        ),
+    ] {
+        let type_ = context.get_type_at_location(location).unwrap();
+        assert_eq!(context.type_to_string(type_).unwrap(), expected);
+        assert_eq!(
+            context
+                .type_to_string_with_flags(
+                    type_,
+                    CanonicalTypeFormatFlags::NO_TRUNCATION
+                        | CanonicalTypeFormatFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE,
+                )
+                .unwrap(),
+            single_quoted
+        );
+    }
+    assert!(context.diagnostics().is_empty());
 }
 
 #[test]
