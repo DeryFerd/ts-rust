@@ -10024,21 +10024,38 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             Some(links) => links.resolved_type,
             None => None,
         };
-        let annotation_identity = match annotation_type {
-            Some(type_) => Some(type_),
-            None => self.cached_array_element_identity(annotation)?,
-        };
-        if annotation_type.is_some_and(|type_| self.store.type_payload(type_).is_none())
-            || value_type.is_some_and(|value| annotation_identity != Some(value))
+        self.plan_type_node_in_context(annotation, None, false)?;
+        let annotation_identity = self.cached_array_element_identity(annotation)?;
+        let mut identity_node = annotation;
+        loop {
+            if self
+                .store
+                .type_node_links(identity_node)
+                .is_some_and(|links| {
+                    links.outer_type_parameters.is_some()
+                        || links
+                            .resolved_type
+                            .is_some_and(|cached| Some(cached) != annotation_identity)
+                })
+            {
+                return Err(invalid());
+            }
+            let identity_record = preflight_node(self.store, self.host, identity_node)?;
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &identity_record.data else {
+                break;
+            };
+            identity_node = NodeRef::new(annotation.arena, annotation.file, parenthesized.type_);
+        }
+        if value_type.is_some_and(|value| annotation_identity != Some(value))
             || annotation_identity.is_some_and(|type_| {
-                !self
-                    .store
-                    .source_direct_type_annotation_is_exact(annotation, type_)
+                self.store.type_payload(type_).is_none()
+                    || !self
+                        .store
+                        .source_direct_type_annotation_is_exact(identity_node, type_)
             })
         {
             return Err(invalid());
         }
-        self.plan_type_node_in_context(annotation, None, false)?;
 
         let cached_type = self
             .store

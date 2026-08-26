@@ -19922,8 +19922,97 @@ mod tests {
     }
 
     #[test]
+    fn ambient_imported_variable_queries_preserve_parenthesized_and_array_types() {
+        for type_syntax in ["(string)", "((string))", "string[]", "(string[])"] {
+            let source = format!(
+                "declare module 'models' {{ export const value: {type_syntax}; }} \
+                 declare module 'consumer' {{ \
+                 import * as Models from 'models'; \
+                 interface View {{ value: typeof Models.value; }} \
+                 }}"
+            );
+            let mut fixture = declaration_fixture(
+                Box::leak(source.into_boxed_str()),
+                CanonicalModuleState::Script,
+            );
+            let producer = plan(&fixture, 0);
+            let consumer = plan(&fixture, 1);
+            let [
+                SourceNamespaceMemberPlan::AmbientVariable {
+                    symbol, annotation, ..
+                },
+            ] = producer.members.as_slice()
+            else {
+                panic!("the producer must retain one annotated variable")
+            };
+            assert!(execute(&mut fixture, &producer).unwrap().is_empty());
+            let expected = fixture
+                .context
+                .store()
+                .value_symbol_links(*symbol)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            if fixture.context.store().source_node_kind(*annotation)
+                == Some(SyntaxKind::ParenthesizedType)
+            {
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .type_node_links(*annotation)
+                        .is_none()
+                );
+            }
+            let query = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::TypeQuery).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            assert!(execute(&mut fixture, &consumer).unwrap().is_empty());
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .type_node_links(query)
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+                "{type_syntax}",
+            );
+            let warm = (
+                fixture.context.store().type_len(),
+                fixture.context.store().mapper_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            assert!(execute(&mut fixture, &consumer).unwrap().is_empty());
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().mapper_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{type_syntax}",
+            );
+        }
+    }
+
+    #[test]
     fn ambient_imported_variable_queries_reject_paired_cache_forgery() {
-        for type_syntax in ["string", "Box<string>"] {
+        for type_syntax in [
+            "string",
+            "(string)",
+            "((string))",
+            "Box<string>",
+            "string[]",
+            "(string[])",
+        ] {
             let source = format!(
                 "declare module 'models' {{ \
                  export interface Box<Element> {{ value: Element; }} \
