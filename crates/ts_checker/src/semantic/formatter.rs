@@ -3955,7 +3955,7 @@ fn valid_display_type_alias_owner(
     }
 }
 
-/// Checks every synthetic JSDoc member without using a display output budget.
+/// Checks every synthetic `JSDoc` member without using a display output budget.
 pub(super) fn validate_source_jsdoc_object(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
