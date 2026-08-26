@@ -369,7 +369,7 @@ pub(super) fn check_direct_source_element_write(
 
 /// Reads a non-rest binding from a canonical array or an interface's own numeric index.
 /// The caller must first prove iteration and [`is_array_like_type`]. This query
-/// does not publish binding-node links.
+/// does not publish binding-node links or apply the binding's default value.
 pub(super) fn check_array_binding_element(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -424,7 +424,7 @@ pub(super) fn check_array_binding_element(
     } else {
         global_types.array_type
     };
-    if array_target_has_numeric_index(store, host, target, index)? {
+    if array_target_has_numeric_index(store, host, target, Some(index))? {
         return Ok(CheckedSourceElement {
             type_: unchecked_index_read_type(
                 store,
@@ -450,6 +450,120 @@ pub(super) fn check_array_binding_element(
             related_information: Vec::new(),
         }),
     })
+}
+
+/// Reads the number index signature used by the no-Iterable fallback.
+///
+/// This does not classify the receiver as array-like or select a literal
+/// property. The result has no unchecked-access widening. A missing own
+/// interface index remains unsupported until inherited lookup can prove it.
+#[cfg_attr(not(test), allow(dead_code))] // Source dispatch installs this provider separately.
+#[allow(clippy::too_many_lines)] // Keep numeric index selection separate from indexed properties.
+pub(super) fn numeric_index_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    receiver: TypeId,
+) -> Result<Option<TypeId>, SourceElementError> {
+    if let Some(array) = store.canonical_array_reference(global_types, receiver)? {
+        let target = if array.readonly {
+            global_types.readonly_array_type
+        } else {
+            global_types.array_type
+        };
+        return array_target_has_numeric_index(store, host, target, None)
+            .map(|present| present.then_some(array.element_type));
+    }
+    if let Some(tuple) = store
+        .canonical_tuple_shape(receiver)
+        .map_err(|_| SourceElementError::InvalidType(receiver))?
+    {
+        let flags = tuple.combined_flags();
+        if flags.intersects(super::signatures::ElementFlags::VARIADIC) {
+            return Err(unsupported_numeric_index_type(receiver));
+        }
+        let target = if tuple.is_readonly() {
+            global_types.readonly_array_type
+        } else {
+            global_types.array_type
+        };
+        if target
+            == store
+                .intrinsic_bootstrap()
+                .ok_or(RelationUnavailable::MissingBootstrap)?
+                .empty_generic_type
+            || !array_target_has_numeric_index(store, host, target, None)?
+        {
+            return Ok(None);
+        }
+        let mut types = tuple.element_types().to_vec();
+        if options.intrinsic.strict_null_checks
+            && flags.intersects(super::signatures::ElementFlags::OPTIONAL)
+        {
+            types.push(store.intrinsic_bootstrap().unwrap().undefined_type);
+        }
+        return store
+            .expression_union_type_with_global_types(global_types, &types, UnionReduction::Literal)
+            .map(Some)
+            .map_err(Into::into);
+    }
+    let record = store
+        .type_payload(receiver)
+        .ok_or(SourceElementError::InvalidType(receiver))?;
+    if let TypeData::Union(union) = record.data() {
+        let constituents = union.union.types.clone();
+        store.validate_union_constituent_with_global_types(global_types, receiver)?;
+        let mut types = Vec::with_capacity(constituents.len());
+        for constituent in constituents {
+            let Some(type_) =
+                numeric_index_type(store, host, global_types, options, diagnostics, constituent)?
+            else {
+                return Ok(None);
+            };
+            types.push(type_);
+        }
+        return store
+            .expression_union_type_with_global_types(global_types, &types, UnionReduction::Literal)
+            .map(Some)
+            .map_err(Into::into);
+    }
+    if record.flags().intersects(
+        TypeFlags::ANY
+            | TypeFlags::NEVER
+            | TypeFlags::NULLABLE
+            | TypeFlags::VOID
+            | TypeFlags::UNKNOWN,
+    ) {
+        store.validate_union_constituent(receiver)?;
+        return Ok(None);
+    }
+    if let Some(indexes) = resolved_index_signature_surface(store, receiver)? {
+        validate_computed_binding_index_annotations(
+            store,
+            host,
+            Some(global_types),
+            options,
+            receiver,
+        )?;
+        return Ok(indexes.number);
+    }
+    let index = resolve_own_numeric_interface_index(
+        store,
+        host,
+        Some(global_types),
+        options.into(),
+        diagnostics,
+        receiver,
+    )
+    .map_err(SourceElementError::InterfaceIndex)?
+    .ok_or_else(|| unsupported_numeric_index_type(receiver))?;
+    Ok(Some(index.value_type))
+}
+
+fn unsupported_numeric_index_type(receiver: TypeId) -> SourceElementError {
+    SourceElementError::Unsupported(SourceElementUnsupported::IndexSignatureSurface(receiver))
 }
 
 /// Checks pinned `isArrayLikeType` before selecting a non-rest indexed binding.
@@ -567,7 +681,6 @@ fn array_binding_name_and_index(
         || record.flags.0 != 0
         || element.dot_dot_dot_token.is_some()
         || element.flow_node.is_some()
-        || element.initializer.is_some()
         || element.local_symbol.is_some()
         || element.property_name.is_some()
         || element.symbol.is_some()
@@ -646,6 +759,20 @@ fn array_binding_name_and_index(
     {
         return Err(unsupported_access(binding));
     }
+    if let Some(initializer) = element.initializer {
+        let initializer = NodeRef::new(binding.arena, binding.file, initializer);
+        let initializer_record = host.node(initializer).ok_or_else(invalid)?;
+        if !store.contains_node_ref(initializer)
+            || !bound.contains(initializer)
+            || store.source_node_kind(initializer) != Some(initializer_record.kind)
+            || store.source_node_parent(initializer) != Some(SourceNodeParent::Parent(binding))
+            || initializer_record.parent != Some(binding.node)
+            || name_record.range.end > initializer_record.range.start
+            || initializer_record.range.end != record.range.end
+        {
+            return Err(unsupported_access(binding));
+        }
+    }
     Ok((name, index))
 }
 
@@ -653,7 +780,7 @@ fn array_target_has_numeric_index(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     target: TypeId,
-    position: usize,
+    position: Option<usize>,
 ) -> Result<bool, SourceElementError> {
     let invalid = || SourceElementError::InvalidType(target);
     let unsupported =
@@ -731,7 +858,7 @@ fn array_target_has_numeric_index(
         return Err(invalid());
     }
 
-    if table.get_source(&position.to_string()).is_some() {
+    if position.is_some_and(|position| table.get_source(&position.to_string()).is_some()) {
         return Err(unsupported());
     }
 
@@ -3645,6 +3772,423 @@ mod tests {
     }
 
     #[test]
+    fn array_binding_defaults_leave_numeric_types_and_initializer_links_unchanged() {
+        for source_type in ["number[]", "NumericView"] {
+            let globals = parse_fixture(concat!(
+                "interface Array<T> { [index: number]: T; } ",
+                "interface ReadonlyArray<T> { readonly [index: number]: T; } ",
+                "interface NumericView extends ReadonlyArray<unknown> { ",
+                "readonly [index: number]: number; }",
+            ));
+            let source = parse_fixture(&format!(
+                "declare var input: {source_type}; let [, value = 'fallback', second = value] = input;"
+            ));
+            let globals_file = FileId::new(690);
+            let source_file = FileId::new(691);
+            let options = CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            };
+            let mut context =
+                array_binding_context(&globals, globals_file, &source, source_file, options);
+            let global_types = context.global_types().clone();
+            let globals_bound = context.file(globals_file).unwrap().1.clone();
+            let source_bound = context.file(source_file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&globals.arena, &globals_bound),
+                    (&source.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let receiver = if source_type == "NumericView" {
+                interface_type(&mut context, &host, source_type)
+            } else {
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                context
+                    .store_mut_for_test()
+                    .create_canonical_array_type(&global_types, number, false)
+                    .unwrap()
+            };
+            let bindings = source
+                .arena
+                .iter()
+                .filter_map(|(node, record)| match &record.data {
+                    NodeData::BindingElement(element) => Some((
+                        NodeRef::new(source.arena.id(), source_file, node),
+                        NodeRef::new(source.arena.id(), source_file, element.initializer.unwrap()),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(bindings.len(), 2);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            for no_unchecked_indexed_access in [false, true] {
+                let options = CanonicalCheckerOptions {
+                    no_unchecked_indexed_access,
+                    ..options
+                };
+                for &(binding, initializer) in &bindings {
+                    let checked = check_array_binding_element(
+                        context.store_mut_for_test(),
+                        &host,
+                        &global_types,
+                        options,
+                        &mut diagnostics,
+                        binding,
+                        receiver,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        context.type_to_string(checked.type_).unwrap(),
+                        if no_unchecked_indexed_access {
+                            "number | undefined"
+                        } else {
+                            "number"
+                        },
+                    );
+                    assert!(checked.diagnostic.is_none());
+                    let before = (
+                        context.store().type_len(),
+                        context.store().checker_link_allocated_lengths(),
+                    );
+                    assert_eq!(
+                        check_array_binding_element(
+                            context.store_mut_for_test(),
+                            &host,
+                            &global_types,
+                            options,
+                            &mut diagnostics,
+                            binding,
+                            receiver,
+                        ),
+                        Ok(checked)
+                    );
+                    assert_eq!(
+                        (
+                            context.store().type_len(),
+                            context.store().checker_link_allocated_lengths()
+                        ),
+                        before
+                    );
+                    assert!(context.store().type_node_links(binding).is_none());
+                    assert!(context.store().type_node_links(initializer).is_none());
+                    assert!(
+                        context
+                            .store()
+                            .value_symbol_links(source_bound.symbol(binding).unwrap())
+                            .is_none()
+                    );
+                }
+            }
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn array_binding_default_rejects_initializer_range_overlap_without_writes() {
+        let mut source = parse_fixture("let [value = 1] = input;");
+        let file = FileId::new(692);
+        let (binding, initializer, name_range) = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::BindingElement(element) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(source.arena.id(), file, node),
+                    element.initializer.unwrap(),
+                    source.arena.get(element.name.unwrap()).unwrap().range,
+                ))
+            })
+            .unwrap();
+        source.arena.get_mut(initializer).unwrap().range = name_range;
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/default.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&source.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        store
+            .register_source_file(&source.arena, source.source_file, file)
+            .unwrap();
+        let host = DeclaredTypeHost::new([(&source.arena, &bound)]).unwrap();
+        let before = (store.type_len(), store.checker_link_allocated_lengths());
+        assert_eq!(
+            array_binding_name_and_index(&store, &host, binding),
+            Err(SourceElementError::Unsupported(
+                SourceElementUnsupported::Access(binding)
+            )),
+        );
+        assert_eq!(
+            (store.type_len(), store.checker_link_allocated_lengths()),
+            before
+        );
+    }
+
+    #[test]
+    fn numeric_index_type_does_not_select_zero_or_add_unchecked_undefined() {
+        let globals = parse_fixture(concat!(
+            "interface Array<T> { 0: any; [index: number]: T; } ",
+            "interface ReadonlyArray<T> {}",
+        ));
+        let source = parse_fixture("let [head] = input; let [...tail] = input; let [] = input;");
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            no_unchecked_indexed_access: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let globals_file = FileId::new(693);
+        let source_file = FileId::new(694);
+        let mut context =
+            array_binding_context(&globals, globals_file, &source, source_file, options);
+        let global_types = context.global_types().clone();
+        let globals_bound = context.file(globals_file).unwrap().1.clone();
+        let source_bound = context.file(source_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([
+            (&globals.arena, &globals_bound),
+            (&source.arena, &source_bound),
+        ])
+        .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let store = context.store_mut_for_test();
+        let array = store
+            .create_canonical_array_type(&global_types, number, false)
+            .unwrap();
+        let readonly = store
+            .create_canonical_array_type(&global_types, number, true)
+            .unwrap();
+        let head = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BindingElement).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = (store.type_len(), store.checker_link_allocated_lengths());
+        assert_eq!(
+            check_array_binding_element(
+                store,
+                &host,
+                &global_types,
+                options,
+                &mut diagnostics,
+                head,
+                array
+            ),
+            Err(unsupported_numeric_index_type(global_types.array_type)),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                numeric_index_type(
+                    store,
+                    &host,
+                    &global_types,
+                    options,
+                    &mut diagnostics,
+                    array
+                ),
+                Ok(Some(number))
+            );
+            assert_eq!(
+                numeric_index_type(
+                    store,
+                    &host,
+                    &global_types,
+                    options,
+                    &mut diagnostics,
+                    readonly
+                ),
+                Ok(None)
+            );
+        }
+        assert_eq!(
+            (store.type_len(), store.checker_link_allocated_lengths()),
+            before
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn numeric_index_type_uses_tuple_base_indexes_and_common_union_indexes() {
+        let globals = parse_fixture(concat!(
+            "interface Array<T> { [index: number]: T; } ",
+            "interface ReadonlyArray<T> {}",
+        ));
+        let source = parse_fixture("");
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            no_unchecked_indexed_access: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let globals_file = FileId::new(695);
+        let source_file = FileId::new(696);
+        let mut context =
+            array_binding_context(&globals, globals_file, &source, source_file, options);
+        let global_types = context.global_types().clone();
+        let globals_bound = context.file(globals_file).unwrap().1.clone();
+        let source_bound = context.file(source_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([
+            (&globals.arena, &globals_bound),
+            (&source.arena, &source_bound),
+        ])
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (number, string, never, undefined) = (
+            bootstrap.number_type,
+            bootstrap.string_type,
+            bootstrap.never_type,
+            bootstrap.undefined_type,
+        );
+        let numbers = store
+            .create_canonical_array_type(&global_types, number, false)
+            .unwrap();
+        let strings = store
+            .create_canonical_array_type(&global_types, string, false)
+            .unwrap();
+        let missing = store
+            .create_canonical_array_type(&global_types, number, true)
+            .unwrap();
+        let common = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[numbers, strings],
+                UnionReduction::None,
+            )
+            .unwrap();
+        let absent = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[numbers, missing],
+                UnionReduction::None,
+            )
+            .unwrap();
+        let info = store
+            .create_tuple_element_info(ElementFlags::REQUIRED, None)
+            .unwrap();
+        let tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[number, string],
+                &[info, info],
+                false,
+            ))
+            .unwrap();
+        let readonly_tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[number, string],
+                &[info, info],
+                true,
+            ))
+            .unwrap();
+        let empty = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[], &[], false))
+            .unwrap();
+        let optional_info = store
+            .create_tuple_element_info(ElementFlags::OPTIONAL, None)
+            .unwrap();
+        let optional_string = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[string, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let optional_tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[number, optional_string],
+                &[info, optional_info],
+                false,
+            ))
+            .unwrap();
+        let optional_expected = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[number, string, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let expected = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[number, string],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let numeric = index_object(store, number, string);
+        let string_only = index_object(store, string, number);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = (
+            store.type_len(),
+            store.index_info_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            for (receiver, expected) in [
+                (common, Some(expected)),
+                (absent, None),
+                (tuple, Some(expected)),
+                (readonly_tuple, None),
+                (empty, Some(never)),
+                (optional_tuple, Some(optional_expected)),
+                (numeric, Some(string)),
+                (string_only, None),
+            ] {
+                assert_eq!(
+                    numeric_index_type(
+                        store,
+                        &host,
+                        &global_types,
+                        options,
+                        &mut diagnostics,
+                        receiver
+                    ),
+                    Ok(expected)
+                );
+            }
+        }
+        assert_eq!(
+            (
+                store.type_len(),
+                store.index_info_len(),
+                store.checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn array_binding_reads_own_interface_numeric_index_before_inheritance() {
         for (offset, (name, cursor, value)) in [
             ("Mixed", "ArrayIterator", "number"),
@@ -3786,6 +4330,21 @@ mod tests {
                     warm
                 );
             }
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert_eq!(
+                numeric_index_type(
+                    context.store_mut_for_test(),
+                    &host,
+                    &global_types,
+                    CanonicalCheckerOptions {
+                        no_unchecked_indexed_access: true,
+                        ..options
+                    },
+                    &mut diagnostics,
+                    receiver,
+                ),
+                Ok(Some(number)),
+            );
             assert!(diagnostics.is_empty());
             assert!(context.store().type_node_links(*head).is_none());
             assert!(context.store().symbol_node_links(*head).is_none());
@@ -3842,6 +4401,17 @@ mod tests {
         let before = (
             context.store().type_len(),
             context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            numeric_index_type(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                options,
+                &mut diagnostics,
+                receiver,
+            ),
+            Err(unsupported_numeric_index_type(receiver)),
         );
         assert_eq!(
             check_array_binding_element(
@@ -3970,6 +4540,19 @@ mod tests {
             context.store().type_len(),
             context.store().index_info_len(),
             context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            numeric_index_type(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                options,
+                &mut diagnostics,
+                receiver,
+            ),
+            Err(SourceElementError::InterfaceIndex(
+                InterfaceIndexError::InvalidIndexCache(index_declaration),
+            )),
         );
         assert_eq!(
             check_array_binding_element(
