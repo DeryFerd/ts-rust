@@ -1950,10 +1950,7 @@ impl Program {
                         .map(|node| (node.range, requested_mode.unwrap_or(source_mode)))
                 })
                 .collect::<Vec<_>>();
-            let specifiers = module_specifiers(
-                &self.source_files[file_index].parse,
-                is_javascript_file_name(&containing_file),
-            );
+            let specifiers = module_specifiers(&self.source_files[file_index], &self.options);
             for ModuleSpecifier {
                 text: specifier,
                 range,
@@ -9332,11 +9329,121 @@ fn parsed_module_specifier(
     })
 }
 
-fn module_specifiers(parse: &ParseResult, is_javascript: bool) -> Vec<ModuleSpecifier> {
+fn static_module_dependency_statements(
+    source: &SourceFile,
+    options: &CompilerOptions,
+) -> HashSet<NodeId> {
+    let parse = &source.parse;
+    let mut imports = HashSet::new();
+    let Some(NodeData::SourceFile(file)) =
+        parse.arena.get(parse.source_file).map(|node| &node.data)
+    else {
+        return imports;
+    };
+    let is_declaration_file = ts_path::is_declaration_file(&source.file_name);
+    let language = if is_javascript_file_name(&source.file_name) {
+        CanonicalSourceLanguage::JavaScript
+    } else {
+        CanonicalSourceLanguage::TypeScript
+    };
+    let is_external_module = matches!(
+        source_file_module_state(
+            &source.file_name,
+            parse,
+            language,
+            is_declaration_file,
+            source.implied_node_format,
+            options,
+        ),
+        CanonicalModuleState::External | CanonicalModuleState::ExternalAndCommonJs
+    );
+    let mut pending = file
+        .statements
+        .nodes
+        .iter()
+        .rev()
+        .map(|statement| (*statement, false))
+        .collect::<Vec<_>>();
+    while let Some((statement, in_ambient_module)) = pending.pop() {
+        let Some(node) = parse.arena.get(statement) else {
+            continue;
+        };
+        if matches!(
+            node.data,
+            NodeData::ImportDeclaration(_)
+                | NodeData::ImportEqualsDeclaration(_)
+                | NodeData::ExportDeclaration(_)
+        ) {
+            if let Some(specifier) = parsed_module_specifier(parse, node, false)
+                && !specifier.text.is_empty()
+                && (!in_ambient_module
+                    || !(ts_path::is_relative(&specifier.text)
+                        || ts_path::is_rooted_disk_path(&specifier.text)))
+            {
+                imports.insert(statement);
+            }
+            continue;
+        }
+        // Go traverses only top-level ambient modules in scripts here.
+        if in_ambient_module || is_external_module {
+            continue;
+        }
+        let NodeData::ModuleDeclaration(module) = &node.data else {
+            continue;
+        };
+        let is_ambient_module = module.keyword == SyntaxKind::GlobalKeyword
+            || parse
+                .arena
+                .get(module.name)
+                .is_some_and(|name| name.kind == SyntaxKind::StringLiteral);
+        if !is_ambient_module
+            || !(is_declaration_file
+                || node_has_modifier(
+                    &parse.arena,
+                    module.modifiers.as_ref(),
+                    SyntaxKind::DeclareKeyword,
+                ))
+        {
+            continue;
+        }
+        let Some(NodeData::ModuleBlock(block)) = module
+            .body
+            .and_then(|body| parse.arena.get(body))
+            .map(|node| &node.data)
+        else {
+            continue;
+        };
+        pending.extend(
+            block
+                .statements
+                .nodes
+                .iter()
+                .rev()
+                .map(|node| (*node, true)),
+        );
+    }
+    imports
+}
+
+fn module_specifiers(source: &SourceFile, options: &CompilerOptions) -> Vec<ModuleSpecifier> {
+    let parse = &source.parse;
+    let is_javascript = is_javascript_file_name(&source.file_name);
+    let static_dependencies = static_module_dependency_statements(source, options);
     let mut specifiers = parse
         .arena
         .iter()
-        .filter_map(|(_, node)| parsed_module_specifier(parse, node, is_javascript))
+        .filter_map(|(id, node)| {
+            let mut specifier = parsed_module_specifier(parse, node, is_javascript)?;
+            // Preserve resolution candidates outside dependency-bearing scopes.
+            if matches!(
+                specifier.dependency_order,
+                Some(SourceDependencyOrder::StaticImport(_))
+            ) && !static_dependencies.contains(&id)
+            {
+                specifier.dependency_order = None;
+            }
+            Some(specifier)
+        })
         .collect::<Vec<_>>();
     if let Some(source) = parse.arena.source_text() {
         for (specifier, range, can_resolve_ambient, side_effect_only) in
@@ -13684,6 +13791,198 @@ mod tests {
             module_resolution: ModuleResolutionKind::Bundler,
             ..CompilerOptions::default()
         }
+    }
+
+    fn assert_module_dependency_scope(
+        input_name: &str,
+        input: &str,
+        target_name: &str,
+        specifier: &str,
+        module_detection: ModuleDetectionKind,
+        dependency_first: bool,
+    ) {
+        let fs = MemoryFileSystem::new(true);
+        let input_path = format!("/project/{input_name}");
+        let target_path = format!("/project/{target_name}");
+        fs.write_file(&input_path, input).unwrap();
+        fs.write_file(&target_path, "export interface X {};")
+            .unwrap();
+        let mut program = Program::new_unchecked_with_options_and_checker(
+            &fs,
+            "/project",
+            &[input_name.to_owned(), target_name.to_owned()],
+            CompilerOptions {
+                module_detection,
+                ..canonical_source_order_options()
+            },
+            super::ProgramChecker::Canonical,
+        );
+        program.load_remaining_program_graph(&fs);
+        assert_eq!(
+            program
+                .resolved_modules
+                .get(&(input_path.clone(), specifier.to_owned())),
+            Some(&target_path),
+            "resolution changed for {input}"
+        );
+        assert_eq!(
+            program.source_file_by_id(FileId::new(0)).unwrap().file_name,
+            input_path
+        );
+        assert_eq!(
+            program.source_file_by_id(FileId::new(1)).unwrap().file_name,
+            target_path
+        );
+        let ordinary = program
+            .canonical_semantic_sources()
+            .into_iter()
+            .filter(|source| !source.is_default_library)
+            .map(|source| source.id)
+            .collect::<Vec<_>>();
+        let expected = if dependency_first {
+            [FileId::new(1), FileId::new(0)]
+        } else {
+            [FileId::new(0), FileId::new(1)]
+        };
+        assert_eq!(ordinary, expected, "{input_name}: {input}");
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_excludes_augmentation_body_static_imports() {
+        for input in [
+            "export {}; declare module './dep' { import { X } from './dep'; }",
+            "export {}; declare module './dep' { export { X } from './dep'; }",
+            "export {}; declare global { import { X } from './dep'; }",
+        ] {
+            assert_module_dependency_scope(
+                "input.d.ts",
+                input,
+                "dep.d.ts",
+                "./dep",
+                ModuleDetectionKind::Auto,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_applies_ambient_and_namespace_scope_rules() {
+        for (input, target, specifier, dependency_first) in [
+            (
+                "declare namespace N { import X = require('./dep'); }",
+                "dep.d.ts",
+                "./dep",
+                false,
+            ),
+            (
+                "declare module 'ambient' { import { X } from './dep'; }",
+                "dep.d.ts",
+                "./dep",
+                false,
+            ),
+            (
+                "declare module 'ambient' { export { X } from '/project/dep.d.ts'; }",
+                "dep.d.ts",
+                "/project/dep.d.ts",
+                false,
+            ),
+            (
+                "declare module 'ambient' { import { X } from 'pkg'; export { X } from 'pkg'; }",
+                "node_modules/pkg/index.d.ts",
+                "pkg",
+                true,
+            ),
+            (
+                "module 'ambient' { import X = require('pkg'); }",
+                "node_modules/pkg/index.d.ts",
+                "pkg",
+                true,
+            ),
+            (
+                "declare module 'ambient' { namespace N { import { X } from 'pkg'; } }",
+                "node_modules/pkg/index.d.ts",
+                "pkg",
+                false,
+            ),
+            (
+                "declare module 'ambient' { module 'nested' { import { X } from 'pkg'; } }",
+                "node_modules/pkg/index.d.ts",
+                "pkg",
+                false,
+            ),
+        ] {
+            assert_module_dependency_scope(
+                "input.d.ts",
+                input,
+                target,
+                specifier,
+                ModuleDetectionKind::Auto,
+                dependency_first,
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_uses_module_detection_for_ambient_scopes() {
+        for (file_name, input, detection, dependency_first) in [
+            (
+                "input.ts",
+                "declare module 'ambient' { import { X } from 'pkg'; }",
+                ModuleDetectionKind::Legacy,
+                true,
+            ),
+            (
+                "input.ts",
+                "declare module 'ambient' { import { X } from 'pkg'; }",
+                ModuleDetectionKind::Force,
+                false,
+            ),
+            (
+                "input.ts",
+                "module 'ambient' { import { X } from 'pkg'; }",
+                ModuleDetectionKind::Legacy,
+                false,
+            ),
+            (
+                "input.d.ts",
+                "module 'ambient' { import { X } from 'pkg'; }",
+                ModuleDetectionKind::Force,
+                true,
+            ),
+            (
+                "input.mts",
+                "declare module 'ambient' { import { X } from 'pkg'; }",
+                ModuleDetectionKind::Auto,
+                false,
+            ),
+            (
+                "input.d.mts",
+                "module 'ambient' { import { X } from 'pkg'; }",
+                ModuleDetectionKind::Auto,
+                true,
+            ),
+        ] {
+            assert_module_dependency_scope(
+                file_name,
+                input,
+                "node_modules/pkg/index.d.ts",
+                "pkg",
+                detection,
+                dependency_first,
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_semantic_source_order_keeps_dynamic_imports_in_augmentations() {
+        assert_module_dependency_scope(
+            "input.d.ts",
+            "export {}; declare module './dep' { type Added = import('./dep').X; }",
+            "dep.d.ts",
+            "./dep",
+            ModuleDetectionKind::Auto,
+            true,
+        );
     }
 
     #[test]
