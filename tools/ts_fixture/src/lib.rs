@@ -4719,7 +4719,14 @@ fn compile_case_variant(
                     &roots,
                     compiler_options,
                     project_config_path.as_deref(),
-                    |program, queries| artifacts::render_program(case, program, queries),
+                    |program, queries| {
+                        artifacts::render_program(
+                            case,
+                            program,
+                            queries,
+                            !option_diagnostics.is_empty(),
+                        )
+                    },
                 )
             })?;
             let rendered = rendered
@@ -7021,6 +7028,35 @@ mod tests {
             assert!(!artifacts.walk.types.is_empty(), "{name}");
             assert!(!artifacts.walk.symbols.is_empty(), "{name}");
         }
+    }
+
+    #[test]
+    fn canonical_artifact_intrinsic_names_include_fixture_option_errors() {
+        let case = Case::parse(
+            "options.tsx",
+            concat!(
+                "// @strict: false\n",
+                "// @strictPropertyInitialization: true\n",
+                "// @jsx: preserve\n",
+                "const view = <div />;\n",
+            ),
+        )
+        .unwrap();
+        let mut variant = expand_option_matrix(&case).remove(0);
+        let compilation =
+            super::compile_case_variant(&case, &mut variant, FixtureChecker::Canonical, true)
+                .unwrap();
+        assert!(
+            compilation
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(5052)),
+            "{:?}",
+            compilation.diagnostics,
+        );
+        let types = compilation.semantic_artifacts.unwrap().types.unwrap();
+        assert!(types.contains(">view : any\r\n"), "{types}");
+        assert!(types.contains("><div /> : any\r\n"), "{types}");
     }
 
     #[test]

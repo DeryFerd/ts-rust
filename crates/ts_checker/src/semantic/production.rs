@@ -47,6 +47,7 @@ use super::{
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
     source,
     type_nodes::CanonicalTypeQuery,
+    types::{ObjectFlags, TypeFlags},
 };
 
 /// JSX runtime behavior retained from the compiler's emit setting.
@@ -575,6 +576,61 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             type_id,
             self.type_format_flags(CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT),
         )
+    }
+
+    /// Returns the validated intrinsic name of an `any` type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a foreign type or an invalid intrinsic payload.
+    pub fn intrinsic_any_name(
+        &self,
+        type_id: TypeId,
+    ) -> Result<Option<&str>, TypeDisplayUnavailable> {
+        let record = self
+            .store
+            .type_payload(type_id)
+            .ok_or(TypeDisplayUnavailable::Type(type_id))?;
+        if !record.flags().intersects(TypeFlags::ANY) {
+            return Ok(None);
+        }
+        let bootstrap = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(TypeDisplayUnavailable::MissingBootstrap)?;
+        let expected = [
+            (bootstrap.any_type, "any", ObjectFlags::NONE),
+            (bootstrap.auto_type, "any", ObjectFlags::NON_INFERRABLE_TYPE),
+            (bootstrap.wildcard_type, "any", ObjectFlags::NONE),
+            (bootstrap.blocked_string_type, "any", ObjectFlags::NONE),
+            (bootstrap.error_type, "error", ObjectFlags::NONE),
+            (bootstrap.unresolved_type, "unresolved", ObjectFlags::NONE),
+            (
+                bootstrap.non_inferrable_any_type,
+                "any",
+                ObjectFlags::CONTAINS_WIDENING_TYPE,
+            ),
+            (
+                bootstrap.intrinsic_marker_type,
+                "intrinsic",
+                ObjectFlags::NONE,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(id, name, flags)| (id == type_id).then_some((name, flags)))
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let super::TypeData::Intrinsic(intrinsic) = record.data() else {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        };
+        if record.flags() != TypeFlags::ANY
+            || record.object_flags() != expected.1
+            || intrinsic.intrinsic_name != expected.0
+            || record.symbol().is_some()
+            || record.alias().is_some()
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        Ok(Some(&intrinsic.intrinsic_name))
     }
 
     /// Flag-aware form of [`Self::type_to_string`] for the exact format flags
@@ -2749,6 +2805,72 @@ mod tests {
                 .unwrap();
         }
         binder.finish()
+    }
+
+    #[test]
+    fn intrinsic_any_names_preserve_identity_and_reject_forged_intrinsics() {
+        let parsed = parsed("const value = 1;");
+        let file = FileId::new(8_230);
+        let make_context = || {
+            CanonicalCheckerContext::new(
+                completed_bindings(&[(file, &parsed)]),
+                vec![(file, &parsed.arena)],
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap()
+        };
+        let mut context = make_context();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let intrinsic_names = [
+            (bootstrap.any_type, "any"),
+            (bootstrap.auto_type, "any"),
+            (bootstrap.wildcard_type, "any"),
+            (bootstrap.blocked_string_type, "any"),
+            (bootstrap.error_type, "error"),
+            (bootstrap.unresolved_type, "unresolved"),
+            (bootstrap.non_inferrable_any_type, "any"),
+            (bootstrap.intrinsic_marker_type, "intrinsic"),
+        ];
+        let error = bootstrap.error_type;
+        let number = bootstrap.number_type;
+        let counts = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for (type_id, name) in intrinsic_names {
+            assert_eq!(context.intrinsic_any_name(type_id), Ok(Some(name)));
+        }
+        assert_eq!(context.intrinsic_any_name(number), Ok(None));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            counts,
+        );
+        let foreign = make_context();
+        let foreign_any = foreign.store().intrinsic_bootstrap().unwrap().any_type;
+        assert_eq!(
+            context.intrinsic_any_name(foreign_any),
+            Err(TypeDisplayUnavailable::Type(foreign_any)),
+        );
+        let forged = context
+            .store_mut_for_test()
+            .alloc_intrinsic_type(TypeFlags::ANY, "error")
+            .unwrap();
+        assert_eq!(
+            context.intrinsic_any_name(forged),
+            Err(TypeDisplayUnavailable::MalformedType(forged)),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_object_flags(error, ObjectFlags::NON_INFERRABLE_TYPE)
+        );
+        assert_eq!(
+            context.intrinsic_any_name(error),
+            Err(TypeDisplayUnavailable::MalformedType(error)),
+        );
     }
 
     fn completed_bindings_with_facts(

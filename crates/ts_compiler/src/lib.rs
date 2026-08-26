@@ -1341,9 +1341,16 @@ pub struct Program {
 #[derive(Debug)]
 pub struct CanonicalProgramQueries<'arena> {
     context: CanonicalCheckerContext<'arena>,
+    has_diagnostics: bool,
 }
 
 impl CanonicalProgramQueries<'_> {
+    /// Reports whether program diagnostics remain after comment suppression.
+    #[must_use]
+    pub fn has_diagnostics(&self) -> bool {
+        self.has_diagnostics
+    }
+
     /// Returns the canonical type recorded for an exact Program node.
     ///
     /// # Errors
@@ -1390,6 +1397,18 @@ impl CanonicalProgramQueries<'_> {
         type_id: CanonicalTypeId,
     ) -> Result<String, TypeDisplayUnavailable> {
         self.context.type_to_string(type_id)
+    }
+
+    /// Returns the validated intrinsic name of an `any` type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a foreign type or an invalid intrinsic payload.
+    pub fn intrinsic_any_name(
+        &self,
+        type_id: CanonicalTypeId,
+    ) -> Result<Option<&str>, TypeDisplayUnavailable> {
+        self.context.intrinsic_any_name(type_id)
     }
 
     /// Formats a canonical type with explicit TypeScript display flags.
@@ -4169,7 +4188,10 @@ impl Program {
         );
         self.apply_comment_directives(&mut diagnostics, &checked_sources);
 
-        let mut canonical_queries = CanonicalProgramQueries { context };
+        let mut canonical_queries = CanonicalProgramQueries {
+            context,
+            has_diagnostics: !self.diagnostics.is_empty() || !diagnostics.is_empty(),
+        };
         let result = queries(self, &mut canonical_queries);
         Ok((diagnostics, result))
     }

@@ -3,9 +3,7 @@
 use std::{error::Error, fmt, fmt::Write as _};
 
 use ts_ast::{Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
-use ts_compiler::{
-    CanonicalProgramQueries, CanonicalTypeFormatFlags, CanonicalTypeId, Program, SourceFile,
-};
+use ts_compiler::{CanonicalProgramQueries, CanonicalTypeFormatFlags, Program, SourceFile};
 
 use crate::{
     Case, Unit, baseline_unit_name, is_default_library_file, pinned_project_config,
@@ -180,14 +178,17 @@ pub(crate) fn render_program(
     case: &Case,
     program: &Program,
     queries: &mut CanonicalProgramQueries<'_>,
+    has_fixture_diagnostics: bool,
 ) -> Result<GeneratedSemanticArtifacts, ArtifactWalkError> {
     let walk = walk_program(case, program)?;
+    let has_diagnostics = has_fixture_diagnostics || queries.has_diagnostics();
     let types = render_baseline(
         case,
         program,
         queries,
         SemanticArtifactKind::Types,
         &walk.types,
+        has_diagnostics,
     );
     let symbols = render_baseline(
         case,
@@ -195,6 +196,7 @@ pub(crate) fn render_program(
         queries,
         SemanticArtifactKind::Symbols,
         &walk.symbols,
+        has_diagnostics,
     );
     Ok(GeneratedSemanticArtifacts {
         walk,
@@ -209,6 +211,7 @@ fn render_baseline(
     queries: &mut CanonicalProgramQueries<'_>,
     kind: SemanticArtifactKind,
     nodes: &[NodeRef],
+    has_diagnostics: bool,
 ) -> Result<String, String> {
     let mut sections = String::new();
     for (index, unit, source) in source_files(case, program) {
@@ -216,7 +219,7 @@ fn render_baseline(
             .iter()
             .copied()
             .filter(|node| node.file == source.id)
-            .map(|node| artifact_line(program, queries, source, node, kind))
+            .map(|node| artifact_line(program, queries, source, node, kind, has_diagnostics))
             .filter_map(Result::transpose)
             .collect::<Result<Vec<_>, _>>()?;
         render_source_section(
@@ -244,6 +247,7 @@ fn artifact_line(
     source: &SourceFile,
     reference: NodeRef,
     kind: SemanticArtifactKind,
+    has_diagnostics: bool,
 ) -> Result<Option<ArtifactLine>, String> {
     let node = program
         .node(reference)
@@ -264,20 +268,25 @@ fn artifact_line(
             let type_id = queries
                 .get_type_at_location(reference)
                 .map_err(|error| format!("semantic .types query failed: {error}"))?;
-            let display = queries
-                .type_to_string_with_flags(
-                    type_id,
-                    CanonicalTypeFormatFlags::NO_TRUNCATION
-                        | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE,
-                )
-                .map_err(|error| format!("semantic .types formatting failed: {error}"))?;
-            if !program.options().no_implicit_any
-                && display == "any"
-                && jsx_error_type(program, queries, source, reference, type_id)?
+            let intrinsic_name = if !has_diagnostics
+                && uses_intrinsic_any_name(source, reference.node, node, &source_text)
             {
-                "error".to_owned()
+                queries
+                    .intrinsic_any_name(type_id)
+                    .map_err(|error| format!("semantic intrinsic type query failed: {error}"))?
             } else {
-                display
+                None
+            };
+            if let Some(name) = intrinsic_name {
+                name.to_owned()
+            } else {
+                queries
+                    .type_to_string_with_flags(
+                        type_id,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION
+                            | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE,
+                    )
+                    .map_err(|error| format!("semantic .types formatting failed: {error}"))?
             }
         }
         SemanticArtifactKind::Symbols => {
@@ -298,69 +307,47 @@ fn artifact_line(
     }))
 }
 
-fn jsx_error_type(
-    program: &Program,
-    queries: &mut CanonicalProgramQueries<'_>,
+fn uses_intrinsic_any_name(
     source: &SourceFile,
-    reference: NodeRef,
-    type_id: CanonicalTypeId,
-) -> Result<bool, String> {
-    let Some(record) = program.node(reference) else {
-        return Ok(false);
+    node_id: NodeId,
+    node: &Node,
+    source_text: &str,
+) -> bool {
+    let Some(parent) = node
+        .parent
+        .and_then(|parent| source.parse.arena.get(parent))
+    else {
+        return true;
     };
-    let expression = match &record.data {
-        NodeData::JsxElement(_) | NodeData::JsxSelfClosingElement(_) => reference,
-        NodeData::Identifier(_) => {
-            let Some(parent_id) = record.parent else {
-                return Ok(false);
-            };
-            let Some(NodeData::VariableDeclaration(variable)) =
-                source.parse.arena.get(parent_id).map(|parent| &parent.data)
-            else {
-                return Ok(false);
-            };
-            if variable.name != reference.node {
-                return Ok(false);
-            }
-            let Some(expression) = variable.initializer.and_then(|node| source.node_ref(node))
-            else {
-                return Ok(false);
-            };
-            expression
-        }
-        _ => return Ok(false),
-    };
-    let Some(record) = program.node(expression) else {
-        return Ok(false);
-    };
-    let tag = match &record.data {
-        NodeData::JsxElement(element) => {
-            let Some(NodeData::JsxOpeningElement(opening)) = source
-                .parse
-                .arena
-                .get(element.opening_element)
-                .map(|opening| &opening.data)
-            else {
-                return Ok(false);
-            };
-            opening.tag_name
-        }
-        NodeData::JsxSelfClosingElement(element) => element.tag_name,
-        _ => return Ok(false),
-    };
-    let Some(tag) = source.node_ref(tag) else {
-        return Ok(false);
-    };
-    let expression_type = queries
-        .get_type_at_location(expression)
-        .map_err(|error| format!("semantic JSX expression query failed: {error}"))?;
-    if expression_type != type_id {
-        return Ok(false);
+    if is_jsx_tag(node_id, Some(parent))
+        && (source_text
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_lowercase)
+            || source_text.contains('-'))
+    {
+        return false;
     }
-    let tag_type = queries
-        .get_type_at_location(tag)
-        .map_err(|error| format!("semantic JSX tag query failed: {error}"))?;
-    Ok(tag_type != expression_type)
+    match &parent.data {
+        NodeData::BindingElement(_)
+        | NodeData::PropertyAccessExpression(_)
+        | NodeData::QualifiedName(_)
+        | NodeData::MetaProperty(_) => false,
+        NodeData::ModuleDeclaration(module) if module.keyword == SyntaxKind::GlobalKeyword => false,
+        NodeData::LabeledStatement(statement) => statement.label != node_id,
+        NodeData::BreakStatement(statement) => statement.label != Some(node_id),
+        NodeData::ContinueStatement(statement) => statement.label != Some(node_id),
+        NodeData::ImportSpecifier(specifier) => {
+            specifier.name != node_id && specifier.property_name != Some(node_id)
+        }
+        NodeData::ExportSpecifier(specifier) => {
+            specifier.name != node_id && specifier.property_name != Some(node_id)
+        }
+        NodeData::ImportClause(clause) => clause.name != Some(node_id),
+        NodeData::ImportEqualsDeclaration(declaration) => declaration.name != node_id,
+        NodeData::ExportAssignment(assignment) => assignment.expression != node_id,
+        _ => true,
+    }
 }
 
 fn render_symbol(
@@ -924,7 +911,7 @@ mod tests {
                 ..CompilerOptions::default()
             },
             |program, queries| {
-                render_program(case, program, queries).inspect(|artifacts| {
+                render_program(case, program, queries, false).inspect(|artifacts| {
                     assert_walk_file_order(program, &artifacts.walk, &expected_paths);
                 })
             },
@@ -1260,7 +1247,7 @@ mod tests {
             "/.src",
             &["/.src/view.tsx".to_owned()],
             options,
-            |program, queries| render_program(&case, program, queries),
+            |program, queries| render_program(&case, program, queries, false),
         )
         .unwrap();
         let artifacts = artifacts.unwrap().unwrap();
@@ -1269,6 +1256,103 @@ mod tests {
         assert!(types.contains(">view : error\r\n"), "{types}");
         assert!(types.contains("><div /> : error\r\n"), "{types}");
         assert!(types.contains(">div : any\r\n"), "{types}");
+    }
+
+    #[test]
+    fn intrinsic_error_display_uses_diagnostics_after_comment_suppression() {
+        for (source, no_implicit_any, has_diagnostics, expected) in [
+            ("const view = <div />;\n", false, false, "error"),
+            ("const view = <div />;\n", true, true, "any"),
+            (
+                "// @ts-ignore\nconst view = <div />;\n",
+                true,
+                false,
+                "error",
+            ),
+            (
+                "const invalid: number = 'text';\nconst view = <div />;\n",
+                false,
+                true,
+                "any",
+            ),
+            (
+                "declare namespace JSX { interface IntrinsicElements { div: {} } }\nconst view = <div />;\n",
+                true,
+                false,
+                "error",
+            ),
+        ] {
+            let case = Case::parse("view.tsx", source).unwrap();
+            let filesystem = fixture_filesystem(&case);
+            let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+                &filesystem,
+                "/.src",
+                &["/.src/view.tsx".to_owned()],
+                CompilerOptions {
+                    no_lib: true,
+                    no_implicit_any,
+                    no_implicit_any_specified: true,
+                    jsx: ts_options::JsxEmit::Preserve,
+                    ..CompilerOptions::default()
+                },
+                |program, queries| {
+                    (
+                        queries.has_diagnostics(),
+                        render_program(&case, program, queries, false),
+                    )
+                },
+            )
+            .unwrap();
+            let (snapshot, artifacts) = result.unwrap();
+            assert_eq!(snapshot, has_diagnostics, "{source}");
+            assert_eq!(snapshot, !program.diagnostics().is_empty(), "{source}");
+            let types = artifacts.unwrap().types.unwrap();
+            assert!(
+                types.contains(&format!(">view : {expected}\r\n")),
+                "{types}"
+            );
+            assert!(
+                types.contains(&format!("><div /> : {expected}\r\n")),
+                "{types}"
+            );
+        }
+    }
+
+    #[test]
+    fn evolving_array_targets_keep_their_intrinsic_any_display() {
+        let source = concat!(
+            "interface Object {} interface Function {} interface IArguments {}\n",
+            "interface String {} interface Number {} interface Boolean {}\n",
+            "interface RegExp {} interface Array<T> {}\n",
+            "let values = []; values[0] = { foo: 'hi' }; const observed = values;\n",
+        );
+        let case = Case::parse("array.ts", source).unwrap();
+        let filesystem = fixture_filesystem(&case);
+        let (program, artifacts) = Program::try_new_with_canonical_checker_and_queries(
+            &filesystem,
+            "/.src",
+            &["/.src/array.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                strict_null_checks: true,
+                strict_null_checks_specified: true,
+                no_implicit_any: true,
+                no_implicit_any_specified: true,
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                assert!(!queries.has_diagnostics());
+                render_program(&case, program, queries, false)
+            },
+        )
+        .unwrap();
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        let types = artifacts.unwrap().unwrap().types.unwrap();
+        assert!(types.contains(">values[0] : any\r\n"), "{types}");
     }
 
     #[test]
