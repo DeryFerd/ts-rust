@@ -26575,6 +26575,12 @@ fn check_expression_type(
                 .get_type_from_type_node(*type_node);
                 merge_retry_diagnostics(diagnostics, satisfaction_diagnostics);
                 let target = target?;
+                // A call-only target supplies no object-property context.
+                let recursive_object_operand =
+                    matches!(
+                        operand.unparenthesized().kind,
+                        PlannedExpressionKind::Object { .. }
+                    ) && authenticated_active_recursive_arrow_query(store, host, target);
                 let operand_types = check_expression_type(
                     store,
                     host,
@@ -26586,7 +26592,11 @@ fn check_expression_type(
                     current_flow_types,
                     preflighted_type_import_value_uses,
                     operand,
-                    Some(target),
+                    if recursive_object_operand {
+                        None
+                    } else {
+                        Some(target)
+                    },
                     deferred,
                 )?;
                 if store
@@ -26609,17 +26619,37 @@ fn check_expression_type(
                 )? {
                     let keyword =
                         satisfies_keyword_range(host, expression.node, operand.node, *type_node)?;
-                    let staged = super::object_diagnostics::diagnostics_for_failed_assignment(
-                        store,
-                        host,
-                        global_types,
-                        operand,
-                        &operand_types,
-                        target,
-                        expression.node,
-                        options,
-                        session,
-                    )?;
+                    let staged = if recursive_object_operand {
+                        let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+                        if options.no_error_truncation {
+                            flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+                        }
+                        let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                            store, host, global_types, operand_types.result, target, flags,
+                        )?;
+                        vec![CanonicalCheckerDiagnostic {
+                            node: Some(expression.node),
+                            range_override: None,
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(1360)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(1360))?,
+                                [display.source, display.target],
+                            ),
+                            related_information: Vec::new(),
+                        }]
+                    } else {
+                        super::object_diagnostics::diagnostics_for_failed_assignment(
+                            store,
+                            host,
+                            global_types,
+                            operand,
+                            &operand_types,
+                            target,
+                            expression.node,
+                            options,
+                            session,
+                        )?
+                    };
                     for mut diagnostic in staged {
                         if diagnostic.node == Some(expression.node) {
                             diagnostic.range_override = Some(keyword);
@@ -29589,6 +29619,21 @@ fn non_circular_recursive_arrow_assignment(
     let StoredSingleCallableValidation::Valid { callable, .. } =
         validate_stored_single_callable(store, source)
     else {
+        let resolved_non_callable = store.type_payload(source).is_some_and(|record| {
+            record.flags() == TypeFlags::OBJECT
+                && record
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+                && matches!(record.data(), TypeData::Object(_) | TypeData::Interface(_))
+                && record
+                    .data()
+                    .structured()
+                    .is_some_and(|structured| structured.call_signature_count == 0)
+        });
+        if resolved_non_callable {
+            store.validate_union_constituent_with_global_types(global_types, source)?;
+            return Ok(Some(false));
+        }
         return Ok(None);
     };
     if store
@@ -68345,6 +68390,101 @@ mod tests {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn recursive_arrow_satisfies_reports_noncallable_object_mismatches() {
+        for no_implicit_any in [false, true] {
+            for text in [
+                "const obj = {}; const value = () => obj satisfies typeof value;",
+                "const value = () => ({}) satisfies typeof value;",
+            ] {
+                let source = parsed(text);
+                let file = FileId::new(9_793);
+                let mut context = context(
+                    &[(file, &source)],
+                    CanonicalCheckerOptions {
+                        no_implicit_any,
+                        ..CanonicalCheckerOptions::default()
+                    },
+                );
+                context.check_source_file(file).unwrap();
+                let callable = variable_value_type(&context, &source, file, "value");
+                assert_eq!(context.type_to_string(callable).unwrap(), "() => any");
+                let diagnostics = context.diagnostics().as_slice();
+                let expected_codes: &[u32] = if no_implicit_any {
+                    &[7023, 1360]
+                } else {
+                    &[1360]
+                };
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.diagnostic.code())
+                        .collect::<Vec<_>>(),
+                    expected_codes,
+                    "{text}",
+                );
+                if no_implicit_any {
+                    assert_eq!(
+                        diagnostics[0].node,
+                        Some(variable_name(&source, file, "value"))
+                    );
+                    assert_eq!(diagnostics[0].diagnostic.arguments, ["value"]);
+                }
+                let mismatch = diagnostics.last().unwrap();
+                assert_eq!(mismatch.diagnostic.arguments, ["{}", "() => any"]);
+                let range = mismatch.range_override.unwrap().range();
+                assert_eq!(
+                    source.arena.source_text().unwrap().get(
+                        usize::try_from(range.start.get()).unwrap()
+                            ..usize::try_from(range.end.get()).unwrap()
+                    ),
+                    Some("satisfies"),
+                );
+                let warm = observable_state(&context, file);
+                mark_source_unchecked(&mut context, file);
+                context.check_source_file(file).unwrap();
+                assert_eq!(observable_state(&context, file), warm, "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_arrow_comparison_rejects_forged_noncallable_objects() {
+        let source = parsed("const obj = {}; const callable = () => 1;");
+        let file = FileId::new(9_794);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&[(file, &source)], options);
+        context.check_source_file(file).unwrap();
+        let object = resolved_node_type(&context, variable_initializer(&source, file, "obj"));
+        let callable = variable_value_type(&context, &source, file, "callable");
+        let global_types = context.global_types().clone();
+        assert_eq!(
+            non_circular_recursive_arrow_assignment(
+                context.store_mut_for_test(),
+                &global_types,
+                options,
+                object,
+                callable,
+            )
+            .unwrap(),
+            Some(false),
+        );
+        assert!(context.store_mut_for_test().set_type_object_flags(
+            object,
+            ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED,
+        ));
+        assert!(
+            non_circular_recursive_arrow_assignment(
+                context.store_mut_for_test(),
+                &global_types,
+                options,
+                object,
+                callable,
+            )
+            .is_err()
+        );
     }
 
     #[test]
