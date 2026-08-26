@@ -1,0 +1,8 @@
+--- a/internal/testutil/tsbaseline/type_symbol_baseline.go
++++ b/internal/testutil/tsbaseline/type_symbol_baseline.go
+@@ -307,0 +308 @@
++		projectOracleObserveVisit(n, isSymbolWalk)
+@@ -377,0 +379 @@
++		projectOracleObserveType(node, t)
+@@ -416,0 +419 @@
++	projectOracleObserveSymbol(node, symbol)
