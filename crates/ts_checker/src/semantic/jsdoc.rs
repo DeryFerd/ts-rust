@@ -712,15 +712,14 @@ struct SourceJsDocTypedefObject {
     symbol: Option<SemanticSymbolId>,
     alias: Option<TypeAliasId>,
     object: ObjectTypeData,
+    members: Option<ts_binder::semantic::SymbolTable>,
     properties: Vec<SourceJsDocTypedefProperty>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceJsDocTypedefProperty {
     symbol: SemanticSymbolId,
-    name: EscapedName,
-    flags: SymbolFlags,
-    check_flags: CheckFlags,
+    record: ts_binder::semantic::Symbol,
     links: ValueSymbolLinks,
 }
 
@@ -1862,7 +1861,8 @@ pub(super) fn resolve_source_jsdoc_type(
         return fallback(store);
     };
     if let Some(type_) = store.source_jsdoc_typedef_type(definition_owner, definition.range()) {
-        validate_source_jsdoc_typedef_name(store, host, type_).map_err(|()| invalid())?;
+        validate_source_jsdoc_typedef_name(store, host, Some(global_types), type_)
+            .map_err(|()| invalid())?;
         return Ok(type_);
     }
     let Some(definition_type) = definition.type_() else {
@@ -1887,7 +1887,8 @@ pub(super) fn resolve_source_jsdoc_type(
     let identity = SourceJsDocTypedefIdentity {
         owner: definition_owner,
         definition: definition.clone(),
-        shape: source_jsdoc_typedef_shape(store, type_).ok_or_else(invalid)?,
+        shape: source_jsdoc_typedef_shape(store, host, Some(global_types), type_)
+            .ok_or_else(invalid)?,
     };
     if !store.publish_source_jsdoc_typedef(type_, identity) {
         return Err(invalid());
@@ -1935,6 +1936,7 @@ fn unparenthesized_jsdoc_type(mut type_: &JsDocType) -> &JsDocType {
 pub(super) fn validate_source_jsdoc_typedef_name<'store>(
     store: &'store CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     type_: TypeId,
 ) -> Result<&'store str, ()> {
     let identity = store.source_jsdoc_typedef_identity(type_).ok_or(())?;
@@ -1949,7 +1951,8 @@ pub(super) fn validate_source_jsdoc_typedef_name<'store>(
     let (owner, definition) = source_object_typedef(&plan, identity.definition.name()).ok_or(())?;
     if owner != identity.owner
         || definition != &identity.definition
-        || source_jsdoc_typedef_shape(store, type_).as_ref() != Some(&identity.shape)
+        || source_jsdoc_typedef_shape(store, host, global_types, type_).as_ref()
+            != Some(&identity.shape)
     {
         return Err(());
     }
@@ -1958,6 +1961,8 @@ pub(super) fn validate_source_jsdoc_typedef_name<'store>(
 
 fn source_jsdoc_typedef_shape(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     type_: TypeId,
 ) -> Option<SourceJsDocTypedefShape> {
     let mut shape = SourceJsDocTypedefShape::default();
@@ -1970,6 +1975,8 @@ fn source_jsdoc_typedef_shape(
         let record = store.type_payload(type_)?;
         match record.data() {
             TypeData::Object(object) => {
+                super::formatter::validate_source_jsdoc_object(store, host, global_types, type_)
+                    .ok()?;
                 let mut properties = Vec::new();
                 for property in object.structured.properties.as_deref().unwrap_or_default() {
                     let symbol = store.symbol(*property)?;
@@ -1977,9 +1984,7 @@ fn source_jsdoc_typedef_shape(
                     let property_type = links.resolved_type?;
                     properties.push(SourceJsDocTypedefProperty {
                         symbol: *property,
-                        name: symbol.name().to_owned(),
-                        flags: symbol.flags(),
-                        check_flags: symbol.check_flags(),
+                        record: symbol.clone(),
                         links: links.clone(),
                     });
                     pending.push(property_type);
@@ -1993,32 +1998,56 @@ fn source_jsdoc_typedef_shape(
                     symbol: record.symbol(),
                     alias: record.alias(),
                     object: object.clone(),
+                    members: match object.structured.members {
+                        Some(members) => Some(store.symbol_table(members)?.clone()),
+                        None => None,
+                    },
                     properties,
                 });
             }
             TypeData::Union(union) => {
+                validate_source_jsdoc_leaf(store, global_types, type_)?;
                 shape.unions.push((type_, union.union.types.clone()));
                 pending.extend(union.union.types.iter().copied());
+                pending.extend(union.origin);
             }
             TypeData::TypeReference(reference) => {
+                let array = store
+                    .canonical_array_reference(global_types?, type_)
+                    .ok()??;
                 shape.references.push(SourceJsDocTypedefReference {
                     type_,
                     target: reference.object.target,
                     arguments: reference.resolved_type_arguments.clone(),
                 });
-                pending.extend(
-                    reference
-                        .resolved_type_arguments
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .copied(),
-                );
+                pending.push(array.element_type);
             }
-            _ => {}
+            TypeData::Interface(_) => {
+                validate_source_jsdoc_leaf(store, global_types, type_)?;
+                if let super::object_members::DeclaredPropertyTypeGraphValidation::Traversable(
+                    properties,
+                ) = super::object_members::validate_resolved_declared_property_type_graph(
+                    store, type_,
+                ) {
+                    pending.extend(properties);
+                }
+            }
+            _ => validate_source_jsdoc_leaf(store, global_types, type_)?,
         }
     }
     Some(shape)
+}
+
+fn validate_source_jsdoc_leaf(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_: TypeId,
+) -> Option<()> {
+    match global_types {
+        Some(globals) => store.validate_union_constituent_with_global_types(globals, type_),
+        None => store.validate_union_constituent(type_),
+    }
+    .ok()
 }
 
 /// Validates a nongeneric source-owned `JSDoc` function annotation without publishing a type.

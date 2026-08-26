@@ -76433,6 +76433,234 @@ class Foo2 {
     }
 
     #[test]
+    fn qualified_jsdoc_typedef_warm_reuse_rejects_changed_members_and_owners() {
+        for poison in 0..4 {
+            let source = parse_javascript_source_file(concat!(
+                "/** @typedef {{ tag: number }} Model.Record */\n",
+                "/** @type {Model.Record} */ var value;\n",
+            ));
+            let file = FileId::new(8_420 + poison);
+            let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let type_ = variable_value_type(&context, &source, file, "value");
+            assert_eq!(context.type_to_string(type_).unwrap(), "Model.Record");
+            let property = declared_object_property_symbol(&context, type_, "tag");
+            let members = context
+                .store()
+                .type_payload(type_)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .members
+                .unwrap();
+            let owner = variable_symbol(&context, &source, file, "value");
+            let declaration = variable_declaration(&source, file, "value");
+            match poison {
+                0 => assert_eq!(
+                    context.store_mut_for_test().insert_symbol(
+                        members,
+                        EscapedName::source("extra"),
+                        property,
+                    ),
+                    Some(None),
+                ),
+                1 => assert_eq!(
+                    context.store_mut_for_test().insert_symbol(
+                        members,
+                        EscapedName::source("tag"),
+                        owner,
+                    ),
+                    Some(Some(property)),
+                ),
+                2 => assert!(context.store_mut_for_test().set_symbol_relationships(
+                    property,
+                    None,
+                    None,
+                    Some(owner),
+                    None,
+                )),
+                3 => assert!(context.store_mut_for_test().set_symbol_declarations(
+                    property,
+                    Some(vec![declaration]),
+                    Some(declaration),
+                )),
+                _ => unreachable!(),
+            }
+            let before = observable_state(&context, file);
+            assert!(matches!(
+                context.type_to_string(type_),
+                Err(super::super::formatter::TypeDisplayUnavailable::MalformedType(found))
+                    if found == type_,
+            ));
+            assert_eq!(observable_state(&context, file), before);
+            mark_source_unchecked(&mut context, file);
+            let before = observable_state(&context, file);
+            assert!(
+                context.recheck_source_file(file).is_err(),
+                "poison {poison}"
+            );
+            assert_eq!(observable_state(&context, file), before);
+        }
+    }
+
+    #[test]
+    fn qualified_jsdoc_typedef_validates_descendants_after_the_hard_display_limit() {
+        let source = parse_javascript_source_file(&format!(
+            "/** @typedef {{{{ first: \"{}\", second: {{ tag: number }}, third: number, \
+             fourth: number, fifth: number, sixth: number }}}} Model.Record */\n\
+             /** @type {{Model.Record}} */ var value;\n",
+            "x".repeat(1_000_010),
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_424);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let type_ = variable_value_type(&context, &source, file, "value");
+        let before = observable_state(&context, file);
+        assert_eq!(context.type_to_string(type_).unwrap(), "Model.Record");
+        assert_eq!(observable_state(&context, file), before);
+        let second = declared_object_property_symbol(&context, type_, "second");
+        let nested = context
+            .store()
+            .value_symbol_links(second)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let tag = declared_object_property_symbol(&context, nested, "tag");
+        let members = context
+            .store()
+            .type_payload(nested)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .members
+            .unwrap();
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .insert_symbol(members, EscapedName::source("extra"), tag,),
+            Some(None),
+        );
+        let before = observable_state(&context, file);
+        assert!(matches!(
+            context.type_to_string(type_),
+            Err(super::super::formatter::TypeDisplayUnavailable::MalformedType(found))
+                if found == type_,
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        mark_source_unchecked(&mut context, file);
+        let before = observable_state(&context, file);
+        assert!(context.recheck_source_file(file).is_err());
+        assert_eq!(observable_state(&context, file), before);
+    }
+
+    #[test]
+    fn qualified_jsdoc_typedef_rejects_changed_literal_identity() {
+        let source = parse_javascript_source_file(concat!(
+            "/** @typedef {{ tag: 'ok' }} Model.Record */\n",
+            "/** @type {Model.Record} */ var value;\n",
+        ));
+        let file = FileId::new(8_425);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let type_ = variable_value_type(&context, &source, file, "value");
+        assert_eq!(context.type_to_string(type_).unwrap(), "Model.Record");
+        let property = declared_object_property_symbol(&context, type_, "tag");
+        let literal = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let owner = variable_symbol(&context, &source, file, "value");
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_symbol(literal, Some(owner))
+        );
+        let before = observable_state(&context, file);
+        assert!(matches!(
+            context.type_to_string(type_),
+            Err(super::super::formatter::TypeDisplayUnavailable::MalformedType(found))
+                if found == type_,
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        mark_source_unchecked(&mut context, file);
+        let before = observable_state(&context, file);
+        assert!(context.recheck_source_file(file).is_err());
+        assert_eq!(observable_state(&context, file), before);
+    }
+
+    #[test]
+    fn qualified_jsdoc_typedefs_keep_equal_offset_owners_in_different_files() {
+        let first = parse_javascript_source_file(concat!(
+            "/** @typedef {{ tag: number }} First.Record */\n",
+            "/** @type {First.Record} */ var first;\n",
+        ));
+        let other = parse_javascript_source_file(concat!(
+            "/** @typedef {{ tag: number }} Other.Record */\n",
+            "/** @type {Other.Record} */ var other;\n",
+        ));
+        let first_file = FileId::new(8_426);
+        let other_file = FileId::new(8_427);
+        let files = [(first_file, &first), (other_file, &other)];
+        let mut binder = CanonicalBinder::new();
+        for (file, source) in files {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/{}.js\"", file.index())),
+                        CanonicalSourceLanguage::JavaScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_javascript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, source)| (*file, &source.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(first_file).unwrap();
+        context.check_source_file(other_file).unwrap();
+        let first_type = variable_value_type(&context, &first, first_file, "first");
+        let other_type = variable_value_type(&context, &other, other_file, "other");
+        let first_identity = context
+            .store()
+            .source_jsdoc_typedef_identity(first_type)
+            .unwrap();
+        let other_identity = context
+            .store()
+            .source_jsdoc_typedef_identity(other_type)
+            .unwrap();
+        assert_eq!(
+            first_identity.definition.range(),
+            other_identity.definition.range()
+        );
+        assert_ne!(first_identity.owner, other_identity.owner);
+        assert_ne!(first_type, other_type);
+        assert_eq!(context.type_to_string(first_type).unwrap(), "First.Record");
+        assert_eq!(context.type_to_string(other_type).unwrap(), "Other.Record");
+        let before = observable_state(&context, first_file);
+        context.recheck_source_file(first_file).unwrap();
+        context.recheck_source_file(other_file).unwrap();
+        assert_eq!(observable_state(&context, first_file), before);
+    }
+
+    #[test]
     fn javascript_comment_only_typedef_imports_use_promoted_commonjs_type_exports() {
         for (index, (exported_value, imported_type, variable)) in [
             ("0", "{ a: 1, m: 1 }", "var c;"),

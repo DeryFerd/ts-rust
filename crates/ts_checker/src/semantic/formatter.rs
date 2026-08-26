@@ -631,8 +631,11 @@ fn display_type_worker(
     let type_flags = record.flags();
     if store.source_jsdoc_typedef_identity(type_id).is_some() {
         let host = host.ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-        super::jsdoc::validate_source_jsdoc_typedef_name(store, host, type_id)
-            .map_err(|()| TypeDisplayUnavailable::MalformedType(type_id))?;
+        let name =
+            super::jsdoc::validate_source_jsdoc_typedef_name(store, host, global_types, type_id)
+                .map_err(|()| TypeDisplayUnavailable::MalformedType(type_id))?;
+        state.add(name.len());
+        return Ok(name.to_owned());
     }
 
     if store.canonical_empty_tuple_type_cache() == Some(type_id) {
@@ -1223,13 +1226,9 @@ fn display_object_type(
     }
 
     let proof = validate_structural_object_shell(store, host, global_types, type_id, record)?;
-    let jsdoc_alias = store
-        .source_jsdoc_typedef_identity(type_id)
-        .map(|identity| identity.definition.name());
     if !visiting.insert(type_id) {
         return Err(TypeDisplayUnavailable::CyclicType(type_id));
     }
-    let mut alias_validation = DisplayState::default();
     let result = display_structural_properties(
         store,
         host,
@@ -1237,24 +1236,11 @@ fn display_object_type(
         type_id,
         record,
         proof,
-        if jsdoc_alias.is_some() {
-            flags | CanonicalTypeFormatFlags::NO_TRUNCATION
-        } else {
-            flags
-        },
-        if jsdoc_alias.is_some() {
-            &mut alias_validation
-        } else {
-            &mut *state
-        },
+        flags,
+        state,
         visiting,
     );
     visiting.remove(&type_id);
-    if let Some(name) = jsdoc_alias {
-        result?;
-        state.add(name.len());
-        return Ok(name.to_owned());
-    }
     result
 }
 
@@ -3967,6 +3953,42 @@ fn valid_display_type_alias_owner(
         }),
         _ => false,
     }
+}
+
+/// Checks every synthetic JSDoc member without using a display output budget.
+pub(super) fn validate_source_jsdoc_object(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+) -> Result<(), TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
+    let record = store.type_payload(type_id).ok_or_else(invalid)?;
+    if record.flags() != TypeFlags::OBJECT || record.alias().is_some() {
+        return Err(invalid());
+    }
+    if store
+        .intrinsic_bootstrap()
+        .is_some_and(|bootstrap| type_id == bootstrap.empty_type_literal_type)
+    {
+        return match object_members::validate_resolved_declared_property_object(store, type_id) {
+            object_members::DeclaredPropertyObjectValidation::Valid(
+                object_members::DeclaredPropertyObjectProof::TypeLiteral,
+            ) => Ok(()),
+            _ => Err(invalid()),
+        };
+    }
+    let proof = validate_structural_object_shell(store, Some(host), global_types, type_id, record)?;
+    if !matches!(proof, StructuralObjectProof::Synthetic) {
+        return Err(invalid());
+    }
+    let structured = record.data().structured().ok_or_else(invalid)?;
+    let properties = structured.properties.as_deref().unwrap_or_default();
+    validate_structured_member_table(store, type_id, structured.members, properties)?;
+    for property in properties {
+        validated_property(store, Some(host), type_id, proof, *property)?;
+    }
+    Ok(())
 }
 
 fn validate_structural_object_shell(
