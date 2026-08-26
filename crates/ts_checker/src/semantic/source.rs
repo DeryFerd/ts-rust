@@ -30942,6 +30942,59 @@ fn check_callable_parameter_initializers(
                     parameter.declaration,
                 ));
             }
+            if parameter.has_inferred_initializer_type() {
+                let PlannedExpressionKind::Identifier(read) = &planned.expression.kind else {
+                    return Err(callable_parameter_execution_error(
+                        callable,
+                        parameter.declaration,
+                    ));
+                };
+                let declaration = store
+                    .symbol(read.value_symbol)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    .ok_or_else(|| {
+                        callable_parameter_execution_error(callable, parameter.declaration)
+                    })?;
+                let record = host.node(declaration).ok_or_else(|| {
+                    callable_parameter_execution_error(callable, parameter.declaration)
+                })?;
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return Err(callable_parameter_execution_error(
+                        callable,
+                        parameter.declaration,
+                    ));
+                };
+                if read.kind != PlannedIdentifierReadKind::Variable
+                    || !host.symbol_matches(store, declaration, read.value_symbol)
+                    || variable
+                        .type_
+                        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+                        != Some(parameter.type_node)
+                    || flow_types
+                        .get(&read.value_symbol)
+                        .is_some_and(|existing| *existing != body_type)
+                {
+                    return Err(callable_parameter_execution_error(
+                        callable,
+                        parameter.declaration,
+                    ));
+                }
+                if let Some(cached) = store
+                    .value_symbol_links(read.value_symbol)
+                    .and_then(|links| links.resolved_type)
+                    && cached != body_type
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::CachedValueTypeMismatch {
+                            symbol: read.value_symbol,
+                            cached,
+                            expected: body_type,
+                        },
+                    ));
+                }
+                // Hoisted return inference runs before the initializer source's statement.
+                flow_types.entry(read.value_symbol).or_insert(body_type);
+            }
             let assignment = check_planned_assignment(
                 store,
                 host,
