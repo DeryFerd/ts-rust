@@ -170,6 +170,31 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
             .iter()
             .map(|source| path_identity(&source.file_name))
             .collect::<Vec<_>>();
+    let mut package_display_choices = graph
+        .package_display_specifiers
+        .iter()
+        .map(|((enclosing, target), specifier)| {
+            let source = program
+                .source_file_by_id(*enclosing)
+                .expect("the retained package display location belongs to this Program");
+            (
+                path_identity(&source.file_name),
+                path_identity(target),
+                specifier.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    package_display_choices.sort_unstable();
+    let package_display_specifiers = package_display_choices
+        .iter()
+        .map(|(enclosing, target, specifier)| {
+            json!({
+                "enclosingFile": enclosing,
+                "targetFile": target,
+                "specifier": specifier,
+            })
+        })
+        .collect::<Vec<_>>();
     let evidence = json!({
         "currentDirectory": graph.current_directory,
         "caseSensitive": graph.case_sensitivity == ts_path::CaseSensitivity::Sensitive,
@@ -182,6 +207,7 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
         "resolutions": resolutions,
         "references": references,
         "packageExportSpecifiers": graph.package_export_specifiers,
+        "packageDisplaySpecifiers": package_display_specifiers,
         "artifactFileOrder": ordered_artifact_files,
     });
     let module_resolution_manifest = match &graph.module_resolution_manifest {
@@ -249,5 +275,96 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
         missing_evidence,
         digest: stable_digest(&bytes),
         digest_algorithm: SCORECARD_DIGEST_ALGORITHM,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use ts_compiler::Program;
+    use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind};
+    use ts_vfs::{FileSystem, MemoryFileSystem};
+
+    use super::snapshot_report;
+
+    fn graph_options() -> CompilerOptions {
+        CompilerOptions {
+            no_check: true,
+            no_emit: true,
+            no_lib: true,
+            module: ModuleKind::EsNext,
+            module_resolution: ModuleResolutionKind::Bundler,
+            ..CompilerOptions::default()
+        }
+    }
+
+    #[test]
+    fn graph_report_tracks_alias_choices_without_source_or_import_changes() {
+        let filesystem = MemoryFileSystem::new(true);
+        filesystem
+            .write_file(
+                "/shared/package.json",
+                r#"{"name":"real-package","exports":{".":"./index.js"}}"#,
+            )
+            .unwrap();
+        filesystem
+            .write_file(
+                "/shared/index.d.ts",
+                "export interface Item { value: number; }",
+            )
+            .unwrap();
+        for (directory, alias) in [("/one", "alias-one"), ("/two", "alias-two")] {
+            filesystem.add_directory_link("/shared", &format!("{directory}/node_modules/{alias}"));
+            filesystem
+                .write_file(
+                    &format!("{directory}/bridge.d.ts"),
+                    &format!("export type {{ Item }} from '{alias}';"),
+                )
+                .unwrap();
+            filesystem
+                .write_file(
+                    &format!("{directory}/use.ts"),
+                    "import {} from './bridge'; export {};",
+                )
+                .unwrap();
+        }
+        filesystem
+            .write_file(
+                "/outside/use.ts",
+                "import {} from '../one/bridge'; export {};",
+            )
+            .unwrap();
+        let roots = ["/one/use.ts", "/two/use.ts", "/outside/use.ts"].map(str::to_owned);
+        let build = || Program::new_with_options(&filesystem, "/", &roots, graph_options());
+        let before = snapshot_report(&build());
+        let choice = |enclosing: &str, specifier: &str| {
+            json!({
+                "enclosingFile": enclosing,
+                "targetFile": "/shared/index.d.ts",
+                "specifier": specifier,
+            })
+        };
+        let mut expected = vec![
+            choice("/one/bridge.d.ts", "alias-one"),
+            choice("/one/use.ts", "alias-one"),
+            choice("/two/bridge.d.ts", "alias-two"),
+            choice("/two/use.ts", "alias-two"),
+        ];
+        assert_eq!(before.evidence["packageDisplaySpecifiers"], json!(expected));
+
+        filesystem.add_directory_link("/shared", "/outside/node_modules/alias-one");
+        let after = snapshot_report(&build());
+        expected.insert(2, choice("/outside/use.ts", "alias-one"));
+        assert_eq!(after.evidence["packageDisplaySpecifiers"], json!(expected));
+        let mut previous_evidence = before.evidence.clone();
+        previous_evidence["packageDisplaySpecifiers"] = json!(expected);
+        assert_eq!(previous_evidence, after.evidence);
+        assert_eq!(
+            before.module_resolution_manifest,
+            after.module_resolution_manifest
+        );
+        assert_eq!(before.missing_evidence, after.missing_evidence);
+        assert_ne!(before.digest, after.digest);
+        assert_eq!(after, snapshot_report(&build()));
     }
 }
