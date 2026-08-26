@@ -29593,6 +29593,21 @@ fn source_type_is_assignable_to(
                     RelationUnavailable::UnresolvedFunctionType(type_)
                         if authenticated_pending_recursive_arrow_display(store, host, type_) =>
                     {
+                        // Simple assignments do not read the pending return type.
+                        if type_ == target
+                            && store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                                source == bootstrap.any_type
+                                    || source == bootstrap.error_type
+                                    || source == bootstrap.never_type
+                                    || !options.strict_null_checks
+                                        && (source == bootstrap.null_type
+                                            || source == bootstrap.undefined_type
+                                            || source == bootstrap.null_widening_type
+                                            || source == bootstrap.undefined_widening_type)
+                            })
+                        {
+                            return Ok(true);
+                        }
                         store
                             .source_callable_provenance(type_)
                             .map(|provenance| provenance.signature)
@@ -68294,6 +68309,46 @@ mod tests {
         context.check_source_file(file).unwrap();
         assert_eq!(context.diagnostics().len(), 2);
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn recursive_arrow_satisfies_does_not_force_returns_for_simple_assignments() {
+        for (index, (operand, strict_null_checks, expected_return)) in [
+            ("(42 as any)", true, "any"),
+            ("(42 as never)", true, "never"),
+            ("null", false, "any"),
+            ("undefined", false, "any"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(&format!(
+                "const value = () => {operand} satisfies typeof value;"
+            ));
+            let file = FileId::new(9_781 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    no_implicit_any: true,
+                    strict_null_checks,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let callable = variable_value_type(&context, &source, file, "value");
+            assert_eq!(
+                context.type_to_string(callable).unwrap(),
+                format!("() => {expected_return}"),
+                "operand: {operand}",
+            );
+            assert!(context.diagnostics().is_empty(), "operand: {operand}");
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm, "operand: {operand}");
+        }
     }
 
     #[test]
