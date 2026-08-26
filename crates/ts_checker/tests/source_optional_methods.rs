@@ -184,12 +184,13 @@ fn optional_methods_preserve_callable_values_and_expanded_parameter_unions() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // The three iterator signatures retain separate generic types.
 fn generic_optional_methods_compose_with_rest_binding_signatures() {
     let parsed = parse_source_file(concat!(
-        "interface I<T> { ",
-        "next(...[value]: [] | [T]): { value: T }; ",
-        "return?(value?: T): { value: T }; ",
-        "throw?(reason?: any): { value: T }; }",
+        "interface I<T, TReturn, TNext> { ",
+        "next(...[value]: [] | [TNext]): { value: T }; ",
+        "return?(value?: TReturn): { value: T }; ",
+        "throw?(e?: any): { value: T }; }",
     ));
     assert!(parsed.diagnostics.is_empty());
     let file = FileId::new(4_221);
@@ -203,6 +204,34 @@ fn generic_optional_methods_compose_with_rest_binding_signatures() {
     );
     context.check_source_file(file).unwrap();
     assert!(context.diagnostics().is_empty());
+    let [return_type, next_type] = ["TReturn", "TNext"].map(|name| {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeParameterDeclaration(parameter) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(parameter.name)?.data
+                else {
+                    return None;
+                };
+                let symbol =
+                    context
+                        .file(file)?
+                        .1
+                        .symbol(NodeRef::new(parsed.arena.id(), file, node))?;
+                (identifier.text == name).then(|| {
+                    context
+                        .store()
+                        .declared_type_links(symbol)
+                        .unwrap()
+                        .declared_type
+                        .unwrap()
+                })
+            })
+            .unwrap()
+    });
     for name in ["return", "throw"] {
         let symbol = method(&parsed, file, &context, name);
         let callable = callable(&context, symbol, true, true);
@@ -210,6 +239,33 @@ fn generic_optional_methods_compose_with_rest_binding_signatures() {
         let record = context.store().signature(signature).unwrap();
         assert_eq!(record.min_argument_count(), 0);
         let expected_return = record.resolved_return_type().unwrap();
+        let parameter = context
+            .store()
+            .value_symbol_links(record.parameters()[0])
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        if name == "return" {
+            let TypeData::Union(union) = context.store().type_payload(parameter).unwrap().data()
+            else {
+                panic!("the optional return parameter has a canonical union")
+            };
+            let mut expected = [
+                return_type,
+                context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .undefined_type,
+            ];
+            expected.sort_unstable();
+            assert_eq!(union.union.types, expected);
+        } else {
+            assert_eq!(
+                parameter,
+                context.store().intrinsic_bootstrap().unwrap().any_type
+            );
+        }
         assert_eq!(
             context.get_return_type_of_signature(signature).unwrap(),
             expected_return
@@ -235,6 +291,47 @@ fn generic_optional_methods_compose_with_rest_binding_signatures() {
             .name(),
         EscapedName::source("__0").as_ref()
     );
+    let parameter = context
+        .store()
+        .value_symbol_links(signature.parameters()[0])
+        .unwrap()
+        .resolved_type
+        .unwrap();
+    let TypeData::Union(union) = context.store().type_payload(parameter).unwrap().data() else {
+        panic!("next retains the empty-or-value tuple union")
+    };
+    assert_eq!(union.union.types.len(), 2);
+    let mut tuple_lengths = union
+        .union
+        .types
+        .iter()
+        .map(
+            |type_| match context.store().type_payload(*type_).unwrap().data() {
+                TypeData::Tuple(tuple) => {
+                    assert!(
+                        tuple
+                            .interface
+                            .reference
+                            .resolved_type_arguments
+                            .as_deref()
+                            .unwrap_or_default()
+                            .is_empty()
+                    );
+                    0
+                }
+                TypeData::TypeReference(reference) => {
+                    assert_eq!(
+                        reference.resolved_type_arguments.as_deref(),
+                        Some([next_type].as_slice())
+                    );
+                    1
+                }
+                _ => panic!("each rest alternative is a canonical tuple"),
+            },
+        )
+        .collect::<Vec<_>>();
+    tuple_lengths.sort_unstable();
+    assert_eq!(tuple_lengths, [0, 1]);
     let warm = (
         context.store().type_len(),
         context.store().signature_len(),

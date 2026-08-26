@@ -27,7 +27,7 @@ use super::{
     links::ValueSymbolLinks,
     mapper::TypeMapperApplication,
     object_members::{
-        StoredDeclaredCallSetValidation, declared_method_value_types,
+        StoredDeclaredCallSetValidation, declared_method_value_links, declared_method_value_types,
         validate_stored_declared_call_set,
     },
     reference_types::validate_direct_generic_reference,
@@ -1577,9 +1577,9 @@ pub(super) fn validate_stored_declared_method_callable_set(
         let optional = store.declared_method_optional_flag(method_symbol)?;
         let pending_value = optional
             && store.intrinsic_bootstrap()?.options.strict_null_checks
-            && store
-                .value_symbol_links(method_symbol)
-                .is_none_or(|links| links == &ValueSymbolLinks::default());
+            && store.value_symbol_links(method_symbol).is_none_or(|links| {
+                declared_method_value_links(store, method_symbol, None).as_ref() == Some(links)
+            });
         let declarations = method.declarations()?;
         let owner_declarations = owner.declarations()?;
         let (authenticated_owner, owner_type) = if interface_owner {
@@ -1617,11 +1617,9 @@ pub(super) fn validate_stored_declared_method_callable_set(
             || owner_record.flags() != TypeFlags::OBJECT
             || !valid_owner_type
             || owner_record.symbol() != Some(owner_symbol)
-            || method.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::METHOD
-            || method.check_flags() != CheckFlags::NONE
+            || declared_method_value_links(store, method_symbol, None).is_none()
             || method.name().is_reserved_member_name()
             || method.name().is_private_identifier()
-            || method.name().is_late_bound()
             || method
                 .value_declaration()
                 .is_none_or(|declaration| !declarations.contains(&declaration))
@@ -1629,12 +1627,6 @@ pub(super) fn validate_stored_declared_method_callable_set(
             || method.exports().is_some()
             || method.export_symbol().is_some()
             || store.get_merged_symbol(method_symbol) != Some(method_symbol)
-            || owner
-                .members()
-                .and_then(|members| store.symbol_table(members))
-                .and_then(|members| members.get(method.name()))
-                .and_then(|method| store.get_merged_symbol(method))
-                != Some(method_symbol)
             || !pending_value
                 && declared_method_value_types(store, method_symbol).map(|(callable, _)| callable)
                     != Some(type_)

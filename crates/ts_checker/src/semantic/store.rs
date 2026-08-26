@@ -2926,12 +2926,50 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let owner_declaration = *owner_declaration;
         let links = self.type_node_links(owner_declaration)?;
         let literal_type = links.resolved_type?;
+        let late = method.check_flags().contains(CheckFlags::LATE)
+            || method.flags().contains(SymbolFlags::TRANSIENT)
+            || method.name().is_late_bound();
+        let valid_late = !late
+            || self.late_bound_method_source(symbol).is_some_and(|source| {
+                self.symbol(source).is_some_and(|early| {
+                    early.flags() == method.flags().without(SymbolFlags::TRANSIENT)
+                        && early.check_flags() == CheckFlags::NONE
+                        && early.name() == InternalSymbolName::Computed.as_ref()
+                        && early.declarations() == method.declarations()
+                        && early.value_declaration() == method.value_declaration()
+                        && self.get_parent_of_symbol(source) == Some(owner)
+                        && self.get_merged_symbol(source) == Some(source)
+                        && early.members().is_none()
+                        && early.exports().is_none()
+                        && early.export_symbol().is_none()
+                }) && declarations.iter().all(|declaration| {
+                    self.symbol_node_links(*declaration)
+                        .and_then(|links| links.resolved_symbol)
+                        == Some(symbol)
+                }) && self
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.name_type)
+                    .is_some_and(|type_| self.types.get(type_).is_some())
+            });
+        let members = if late {
+            self.members_and_exports_links(owner).and_then(|links| {
+                links.table(super::links::MembersOrExportsResolutionKind::ResolvedMembers)
+            })
+        } else {
+            literal.members()
+        };
         if declarations.is_empty()
             || self.declared_method_optional_flag(symbol).is_none()
-            || method.check_flags() != CheckFlags::NONE
+            || method.check_flags()
+                != if late {
+                    CheckFlags::LATE
+                } else {
+                    CheckFlags::NONE
+                }
             || method.name().is_reserved_member_name()
             || method.name().is_private_identifier()
-            || method.name().is_late_bound()
+            || late && (!valid_late || !method.name().is_late_bound())
+            || late && !method.flags().contains(SymbolFlags::TRANSIENT)
             || method.value_declaration() != declarations.first().copied()
             || method.members().is_some()
             || method.exports().is_some()
@@ -2952,8 +2990,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     ..TypeNodeLinks::default()
                 })
             || self.types.get(literal_type).is_none()
-            || literal
-                .members()
+            || members
                 .and_then(|members| self.symbol_table(members))
                 .and_then(|members| members.get(method.name()))
                 .and_then(|member| self.get_merged_symbol(member))
