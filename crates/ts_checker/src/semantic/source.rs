@@ -7879,6 +7879,30 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             SourceElementError::Relation(error) => SourceCheckError::RelationUnavailable(error),
             SourceElementError::Array(error) => SourceCheckError::ArrayType(error),
             SourceElementError::Declared(error) => SourceCheckError::DeclaredType(error),
+            SourceElementError::InterfaceIndex(error) => {
+                use super::interface_indexes::InterfaceIndexError;
+                match error {
+                    InterfaceIndexError::DeclaredType(error) => {
+                        SourceCheckError::DeclaredType(error)
+                    }
+                    InterfaceIndexError::IndexSignature(
+                        super::object_members::PropertyObjectError::UnsupportedMember {
+                            node, ..
+                        },
+                    )
+                    | InterfaceIndexError::DuplicateNumericIndex(node) => {
+                        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Element(node))
+                    }
+                    InterfaceIndexError::IndexSignature(error) => {
+                        source_object_execution_error(error)
+                    }
+                    InterfaceIndexError::UnsupportedInterface(_) => {
+                        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Element(access))
+                    }
+                    InterfaceIndexError::InvalidInterface(_) => SourceCheckError::Element(access),
+                    InterfaceIndexError::InvalidIndexCache(node) => SourceCheckError::Element(node),
+                }
+            }
             SourceElementError::Literal(error) => error.into(),
             SourceElementError::Display(error) => SourceCheckError::TypeDisplayUnavailable(error),
             SourceElementError::MissingDiagnostic(code) => {
@@ -31043,6 +31067,7 @@ fn check_callable_parameter_initializers(
                 host,
                 global_types,
                 options,
+                diagnostics,
                 declaration,
                 body_type,
             )
@@ -31669,6 +31694,7 @@ fn check_planned_switch_function_statements(
                     host,
                     global_types,
                     options,
+                    diagnostics,
                     binding.element,
                     initializer.result,
                 )
@@ -32781,6 +32807,7 @@ fn check_planned_lexical_iteration(
                 host,
                 global_types,
                 options,
+                diagnostics,
                 binding.declaration,
                 iteration_type,
             )
@@ -36117,6 +36144,7 @@ fn check_planned_array_binding_element(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     binding: &PlannedArrayBindingElement,
     receiver: TypeId,
 ) -> Result<CheckedSourceElement, SourceCheckError> {
@@ -36304,6 +36332,7 @@ fn check_planned_array_binding_element(
             host,
             global_types,
             options,
+            diagnostics,
             binding.element,
             receiver,
         )
@@ -50114,6 +50143,7 @@ pub(super) fn check_source_file(
                             host,
                             global_types,
                             options,
+                            diagnostics,
                             &element.binding,
                             initializer.result,
                         )?;
@@ -51370,6 +51400,7 @@ pub(super) fn check_source_file(
                             host,
                             global_types,
                             options,
+                            diagnostics,
                             binding,
                             initializer,
                         )?
