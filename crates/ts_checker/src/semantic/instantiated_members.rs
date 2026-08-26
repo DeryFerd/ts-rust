@@ -5310,6 +5310,177 @@ mod tests {
         );
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check source order, union origins, and warm callback identity together.
+    fn array_callback_mapping_preserves_constructor_union_order_and_origin() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> { ",
+            "map<U>(callbackfn: (value: T, index: number, array: T[]) => U, ",
+            "thisArg?: any): U[]; } interface ReadonlyArray<T> {}",
+        ));
+        let source = parse_source_file(concat!(
+            "class Zebra { z: string; } ",
+            "abstract class Alpha { a: string; } ",
+            "abstract class Middle { m: string; } ",
+            "type Pair = typeof Alpha | typeof Middle; ",
+            "declare const grouped: (typeof Zebra | Pair)[]; ",
+            "const first = [Zebra, Alpha, Middle].map; ",
+            "const second = [Middle, Zebra, Alpha].map; ",
+            "const named = grouped.map;",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(6_264);
+        let file = FileId::new(6_265);
+        let files = [(library_file, &library), (file, &source)];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in files {
+            let is_library = file == library_file;
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!(
+                            "\"/project/array-union-{}.ts\"",
+                            file.index()
+                        )),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_library,
+                        is_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, parsed) in files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let globals = context.global_types().clone();
+        let accesses = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::PropertyAccessExpression(access) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(source.arena.id(), file, node),
+                    NodeRef::new(source.arena.id(), file, access.expression),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(accesses.len(), 3);
+        let mut mapped = Vec::new();
+        for (index, (access, receiver)) in accesses.into_iter().enumerate() {
+            let receiver = context.get_type_at_location(receiver).unwrap();
+            let callable = context.get_type_at_location(access).unwrap();
+            let array = context
+                .store()
+                .canonical_array_reference(&globals, receiver)
+                .unwrap()
+                .unwrap();
+            let element = array.element_type;
+            let TypeData::Union(union) = context.store().type_payload(element).unwrap().data()
+            else {
+                panic!("the receiver must retain its constructor union")
+            };
+            assert_eq!(union.origin.is_some(), index == 2);
+            let record = context.store().type_payload(callable).unwrap();
+            let method = record.symbol().unwrap();
+            let [signature] = record
+                .data()
+                .structured()
+                .unwrap()
+                .signatures
+                .as_deref()
+                .unwrap()
+            else {
+                panic!("map must retain one specialized signature")
+            };
+            let callback = context
+                .store()
+                .callable_signature_parameter_types(*signature)
+                .unwrap()[0];
+            let [signature] = context
+                .store()
+                .type_payload(callback)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .signatures
+                .as_deref()
+                .unwrap()
+            else {
+                panic!("the callback must retain one signature")
+            };
+            let parameters = context
+                .store()
+                .callable_signature_parameter_types(*signature)
+                .unwrap();
+            assert_eq!(parameters[0], element);
+            assert_eq!(
+                context
+                    .store()
+                    .canonical_array_element_type(&globals, parameters[2])
+                    .unwrap(),
+                Some(element),
+            );
+            let expected = if index == 2 {
+                "typeof Zebra | Pair"
+            } else {
+                "typeof Zebra | typeof Alpha | typeof Middle"
+            };
+            assert_eq!(context.type_to_string(element).unwrap(), expected);
+            let warm = (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                instantiate_published_generic_interface_method(
+                    context.store_mut_for_test(),
+                    &globals,
+                    receiver,
+                    method,
+                )
+                .unwrap(),
+                callable,
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+            mapped.push(callable);
+        }
+        assert_eq!(mapped[0], mapped[1]);
+    }
+
     struct ArrayMethodPreflightFixture<'arena> {
         context: CanonicalCheckerContext<'arena>,
         method: SemanticSymbolId,
