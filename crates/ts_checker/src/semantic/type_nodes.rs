@@ -1956,6 +1956,7 @@ struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     plan: TypeQueryPlan,
     planning_defaults: HashSet<(SemanticSymbolId, NodeRef)>,
     planning_interfaces: HashSet<SemanticSymbolId>,
+    selected_interface_method_owner: Option<SemanticSymbolId>,
     planning_imported_variables: HashSet<SemanticSymbolId>,
     planning_imported_callables: HashSet<SemanticSymbolId>,
     active_structural_aliases: Vec<(SemanticSymbolId, usize)>,
@@ -1985,6 +1986,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             plan: TypeQueryPlan::default(),
             planning_defaults: HashSet::new(),
             planning_interfaces: HashSet::new(),
+            selected_interface_method_owner: None,
             planning_imported_variables: HashSet::new(),
             planning_imported_callables: HashSet::new(),
             active_structural_aliases: Vec::new(),
@@ -6187,6 +6189,52 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             if method.return_type != root {
                 self.plan_type_node(method.return_type)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_selected_method_type_parameters(
+        &self,
+        methods: &[object_members::PlannedInterfaceMethod],
+    ) -> Result<(), DeclaredTypeError> {
+        for method in methods {
+            for parameter in &method.type_parameters {
+                let Some(type_) = self
+                    .store
+                    .declared_type_links(parameter.symbol)
+                    .and_then(|links| links.declared_type)
+                else {
+                    continue;
+                };
+                let invalid = || {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(
+                        parameter.declaration,
+                    ))
+                };
+                let Some(TypeData::TypeParameter(data)) =
+                    self.store.type_payload(type_).map(TypeRecord::data)
+                else {
+                    return Err(invalid());
+                };
+                if cached_ordinary_type_parameter_owner(self.store, type_) != Some(parameter.symbol)
+                    || data.is_this_type
+                    || data.target.is_some()
+                    || data.mapper.is_some()
+                {
+                    return Err(invalid());
+                }
+                for (annotation, cached) in [
+                    (parameter.constraint, data.constraint),
+                    (parameter.default_type, data.resolved_default_type),
+                ] {
+                    if let Some(cached) = cached {
+                        let annotation = annotation.ok_or_else(invalid)?;
+                        if self.cached_type_node_identity(method.symbol, annotation)? != cached {
+                            return Err(invalid());
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -11063,6 +11111,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     && !flags.contains(SymbolFlags::CLASS)
                     && !self.lazy_interface_values
                     && type_arguments.is_empty()
+                    && self.selected_interface_method_owner != Some(symbol)
                     && !self.is_initialized_global_function(symbol)
                     && !self.is_default_library_template_strings_array(symbol)
                     && !self.is_canonical_global_jsx_element(symbol)
@@ -11132,6 +11181,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     && !flags.contains(SymbolFlags::CLASS)
                     && !self.lazy_interface_values
                     && type_arguments.len() == local_count
+                    && self.selected_interface_method_owner != Some(symbol)
                     && !lazy_react_html_factory
                     && self.has_generic_interface_heritage(symbol)?
                 {
@@ -19694,6 +19744,269 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let result = self.execute_type_node(value.annotation, &plan, &mut prepared);
         let type_ = self.complete_type_query(result, &plan, &mut prepared)?;
         publish_declared_value(self.store, value, type_)
+    }
+
+    fn plan_type_of_interface_method(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<(PropertyObjectPlan, TypeQueryPlan, Option<TypeId>), DeclaredTypeError> {
+        self.reject_type_reference_alias_capabilities()?;
+        if let Some(target) = self.jsdoc_import_type_target {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::JsDocImportTypeCapabilityUnsupported(target.import_type),
+            ));
+        }
+        let symbol = self.canonical_symbol(symbol)?;
+        let mut method =
+            object_members::plan_selected_interface_method(self.store, self.host, symbol)
+                .map_err(property_object_error)?;
+        if !self.pending_function_parameters.is_empty() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(method.node),
+            ));
+        }
+        let mut planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        );
+        match method.kind {
+            object_members::PropertyObjectKind::Interface => {
+                preflight_class_or_interface_reference(
+                    self.store,
+                    self.host,
+                    method.symbol,
+                    self.symbol_flags(method.symbol)?,
+                )?;
+                planner.selected_interface_method_owner = Some(method.symbol);
+            }
+            object_members::PropertyObjectKind::TypeLiteral => {
+                method.alias_symbol = planner.direct_type_alias_owner(method.node)?;
+                self.preflight_selected_type_literal_method_owner(&method)?;
+            }
+            object_members::PropertyObjectKind::ObjectLiteral => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: method.node,
+                        kind: SyntaxKind::ObjectLiteralExpression,
+                    },
+                ));
+            }
+        }
+        let cached = object_members::interface_method_value_state(self.store, &method)
+            .map_err(property_object_error)?;
+        for key in method
+            .methods
+            .iter()
+            .filter_map(|method| method.computed_key)
+        {
+            planner.plan_type_node(key.type_node)?;
+        }
+        planner.plan_interface_method_dependencies(&method.methods, method.node)?;
+        planner.preflight_selected_method_type_parameters(&method.methods)?;
+        Ok((method, planner.finish(), cached))
+    }
+
+    fn preflight_selected_type_literal_method_owner(
+        &self,
+        method: &PropertyObjectPlan,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(method.node));
+        let Some(links) = self.store.type_node_links(method.node) else {
+            return Ok(());
+        };
+        if links.outer_type_parameters.is_some() {
+            return Err(invalid());
+        }
+        let Some(type_) = links.resolved_type else {
+            return Ok(());
+        };
+        let record = self.store.type_payload(type_).ok_or_else(invalid)?;
+        let TypeData::Object(object) = record.data() else {
+            return Err(invalid());
+        };
+        let valid_alias = match (record.alias(), method.alias_symbol) {
+            (None, None) => true,
+            (Some(alias), Some(symbol)) => self.store.type_alias(alias).is_some_and(|alias| {
+                alias.symbol() == Some(symbol) && alias.type_arguments().is_none()
+            }),
+            _ => false,
+        };
+        if record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != ObjectFlags::ANONYMOUS
+                && record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+            || record.symbol() != Some(method.symbol)
+            || !valid_alias
+            || object.target.is_some()
+            || object.mapper.is_some()
+            || object.instantiations != super::type_records::TypeCacheState::Unallocated
+            || !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+                && object.structured != StructuredTypeData::default()
+        {
+            return Err(invalid());
+        }
+        if record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+        {
+            let selected = method.properties[0].symbol;
+            let selected_name = self.store.symbol(selected).ok_or_else(invalid)?.name();
+            if object
+                .structured
+                .members
+                .and_then(|members| self.store.symbol_table(members))
+                .and_then(|members| members.get(selected_name))
+                != Some(selected)
+                || object
+                    .structured
+                    .properties
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|property| **property == selected)
+                    .count()
+                    != 1
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks one interface or type-literal method without changing the store.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn preflight_type_of_interface_method(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        self.plan_type_of_interface_method(symbol).map(|_| ())
+    }
+
+    fn execute_selected_method_owner(
+        &mut self,
+        method: &PropertyObjectPlan,
+    ) -> Result<(), DeclaredTypeError> {
+        match method.kind {
+            object_members::PropertyObjectKind::Interface => {
+                let flags = self.symbol_flags(method.symbol)?;
+                get_declared_class_interface_or_type_parameter(
+                    self.store,
+                    self.host,
+                    method.symbol,
+                    flags,
+                )?
+                .ok_or_else(|| {
+                    property_object_error(PropertyObjectError::InvalidInterfaceSymbol(
+                        method.symbol,
+                    ))
+                })?;
+            }
+            object_members::PropertyObjectKind::TypeLiteral => {
+                if self
+                    .store
+                    .type_node_links(method.node)
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+                {
+                    object_members::ensure_type_literal_shell(self.store, method)
+                        .map_err(property_object_error)?;
+                }
+            }
+            object_members::PropertyObjectKind::ObjectLiteral => {
+                unreachable!("the method query preflight rejects object literals")
+            }
+        }
+        Ok(())
+    }
+
+    /// Publishes one interface or type-literal method without resolving siblings.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn get_type_of_interface_method(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let (mut method, plan, cached) = self.plan_type_of_interface_method(symbol)?;
+        if let Some(value) = cached {
+            return Ok(value);
+        }
+        let optional_unions = if self
+            .store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| bootstrap.options.strict_null_checks)
+        {
+            object_members::optional_method_union_operations(&method)
+                .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?
+        } else {
+            0
+        };
+        let mut prepared = self.prepare_literal_types_with_additional(&plan, optional_unions, 1)?;
+        if let Err(error) = self.seed_pending_function_parameters(&plan, &mut prepared) {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(error);
+        }
+        let result = (|| {
+            self.execute_selected_method_owner(&method)?;
+            for key in method
+                .methods
+                .iter()
+                .filter_map(|method| method.computed_key)
+            {
+                self.execute_type_node(key.type_node, &plan, &mut prepared)?;
+            }
+            object_members::publish_interface_method_names(self.store, &mut method)
+                .map_err(property_object_error)?;
+            self.execute_interface_method_type_parameters(
+                &method.methods,
+                &[],
+                &plan,
+                &mut prepared,
+            )?;
+            let mut resolved = Vec::with_capacity(method.methods.len());
+            for overload in &method.methods {
+                let mut parameter_types = Vec::with_capacity(overload.parameters.len());
+                for parameter in &overload.parameters {
+                    parameter_types.push(self.execute_type_node(
+                        parameter.type_node,
+                        &plan,
+                        &mut prepared,
+                    )?);
+                }
+                let return_type =
+                    self.execute_type_node(overload.return_type, &plan, &mut prepared)?;
+                resolved.push(object_members::ResolvedCallSignatureTypes {
+                    parameter_types,
+                    return_type,
+                });
+            }
+            self.flush_pending_function_parameters(&plan, &mut prepared)?;
+            let values = object_members::publish_interface_method_values_prepared(
+                self.store,
+                &method,
+                &resolved,
+                &mut prepared,
+                self.global_types.as_ref(),
+            )
+            .map_err(property_object_error)?;
+            let value = values.first().copied().ok_or_else(|| {
+                property_object_error(PropertyObjectError::InvalidInterfaceSymbol(method.symbol))
+            })?;
+            if values.iter().any(|candidate| *candidate != value) {
+                return Err(property_object_error(
+                    PropertyObjectError::InvalidInterfaceSymbol(method.symbol),
+                ));
+            }
+            Ok(value)
+        })();
+        self.complete_type_query(result, &plan, &mut prepared)
     }
 
     fn execute_interface_method_type_parameters(
@@ -49669,6 +49982,683 @@ mod tests {
             symbol,
             NodeRef::new(declaration.arena, declaration.file, method.type_.unwrap()),
         )
+    }
+
+    fn query_selected_interface_method(
+        fixture: &mut Fixture,
+        symbol: SemanticSymbolId,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            diagnostics,
+        )?
+        .get_type_of_interface_method(symbol)
+    }
+
+    fn preflight_selected_interface_method(
+        fixture: &mut Fixture,
+        symbol: SemanticSymbolId,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<(), DeclaredTypeError> {
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            diagnostics,
+        )?
+        .preflight_type_of_interface_method(symbol)
+    }
+
+    #[test]
+    fn selected_interface_method_query_keeps_owner_references_lazy() {
+        for source in [
+            "interface Box { select(value: string): Box; ignored(); (): void; }",
+            "interface Box<T> { select(value: T): Box<T>; ignored(); (): void; }",
+        ] {
+            let mut fixture = fixture(source);
+            let owner = canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Box");
+            let (method, _) = selected_interface_method_return(&fixture, "Box", "select");
+            let ignored = fixture
+                .store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| fixture.store.symbol_table(members))
+                .and_then(|members| members.get_source("ignored"))
+                .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let cold = function_store_state(&fixture.store);
+            preflight_selected_interface_method(&mut fixture, method, &mut diagnostics).unwrap();
+            assert_eq!(function_store_state(&fixture.store), cold);
+            let value =
+                query_selected_interface_method(&mut fixture, method, &mut diagnostics).unwrap();
+            let owner_type = fixture
+                .store
+                .declared_type_links(owner)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let TypeData::Interface(owner_record) =
+                fixture.store.type_payload(owner_type).unwrap().data()
+            else {
+                panic!("the method owner retains its interface identity")
+            };
+            assert!(!owner_record.declared_members_resolved);
+            assert!(owner_record.reference.object.structured.members.is_none());
+            assert!(fixture.store.value_symbol_links(ignored).is_none());
+            let signatures = fixture
+                .store
+                .type_payload(value)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .signatures
+                .as_ref()
+                .unwrap();
+            assert_eq!(signatures.len(), 1);
+            let returned = fixture
+                .store
+                .signature(signatures[0])
+                .unwrap()
+                .resolved_return_type()
+                .unwrap();
+            match fixture.store.type_payload(returned).unwrap().data() {
+                TypeData::TypeReference(reference) => {
+                    assert_eq!(reference.object.target, Some(owner_type));
+                }
+                TypeData::Interface(_) => assert_eq!(returned, owner_type),
+                _ => panic!("the method returns its declared owner"),
+            }
+            let warm = function_store_state(&fixture.store);
+            preflight_selected_interface_method(&mut fixture, method, &mut diagnostics).unwrap();
+            assert_eq!(
+                query_selected_interface_method(&mut fixture, method, &mut diagnostics),
+                Ok(value),
+            );
+            assert_eq!(function_store_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn selected_interface_method_query_keeps_merged_overload_parameters() {
+        let mut fixture = fixture(concat!(
+            "interface Box<Outer> { ",
+            "select<First extends Outer = Outer>(value: First): First; ignored(); } ",
+            "interface Box<Outer> { ",
+            "select<Second>(value: Second, other: Second): Outer; }",
+        ));
+        let (method, _) = selected_interface_method_return(&fixture, "Box", "select");
+        let declarations = fixture
+            .store
+            .symbol(method)
+            .unwrap()
+            .declarations()
+            .unwrap()
+            .to_vec();
+        let outer = canonical_fixture_symbol(&fixture, SyntaxKind::TypeParameter, "Outer");
+        let first = canonical_fixture_symbol(&fixture, SyntaxKind::TypeParameter, "First");
+        let second = canonical_fixture_symbol(&fixture, SyntaxKind::TypeParameter, "Second");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let cold = function_store_state(&fixture.store);
+        preflight_selected_interface_method(&mut fixture, method, &mut diagnostics).unwrap();
+        assert_eq!(function_store_state(&fixture.store), cold);
+        let value =
+            query_selected_interface_method(&mut fixture, method, &mut diagnostics).unwrap();
+        let signatures = fixture
+            .store
+            .type_payload(value)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap();
+        assert_eq!(signatures.len(), declarations.len());
+        let types = [outer, first, second].map(|symbol| {
+            fixture
+                .store
+                .declared_type_links(symbol)
+                .unwrap()
+                .declared_type
+                .unwrap()
+        });
+        for (index, signature) in signatures.iter().enumerate() {
+            let signature = fixture.store.signature(*signature).unwrap();
+            assert_eq!(signature.declaration(), Some(declarations[index]));
+            assert_eq!(signature.type_parameters(), &[types[index + 1]]);
+            assert_eq!(signature.parameters().len(), index + 1);
+            assert_eq!(
+                signature.resolved_return_type(),
+                Some(if index == 0 { types[1] } else { types[0] }),
+            );
+        }
+        let TypeData::TypeParameter(first) = fixture.store.type_payload(types[1]).unwrap().data()
+        else {
+            panic!("the first overload keeps its own type parameter")
+        };
+        assert_eq!(first.constraint, Some(types[0]));
+        assert_eq!(first.resolved_default_type, Some(types[0]));
+        let warm = function_store_state(&fixture.store);
+        assert_eq!(
+            query_selected_interface_method(&mut fixture, method, &mut diagnostics),
+            Ok(value),
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn selected_interface_method_query_preserves_optional_values() {
+        for strict_null_checks in [false, true] {
+            let mut fixture = fixture_with_intrinsic(
+                "interface Box<T> { select?(value?: number): string; ignored(); }",
+                IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+            );
+            let (method, _) = selected_interface_method_return(&fixture, "Box", "select");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let cold = function_store_state(&fixture.store);
+            preflight_selected_interface_method(&mut fixture, method, &mut diagnostics).unwrap();
+            assert_eq!(function_store_state(&fixture.store), cold);
+            let value =
+                query_selected_interface_method(&mut fixture, method, &mut diagnostics).unwrap();
+            let (callable, published) =
+                object_members::declared_method_value_types(&fixture.store, method).unwrap();
+            assert_eq!(published, value);
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            if strict_null_checks {
+                let mut expected = [callable, bootstrap.undefined_or_missing_type];
+                expected.sort_unstable();
+                assert_eq!(union_types(&fixture.store, value), &expected);
+            } else {
+                assert_eq!(value, callable);
+            }
+            let signatures = fixture
+                .store
+                .type_payload(callable)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .signatures
+                .as_ref()
+                .unwrap();
+            let signature = fixture.store.signature(signatures[0]).unwrap();
+            let parameter = fixture
+                .store
+                .value_symbol_links(signature.parameters()[0])
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_eq!(signature.min_argument_count(), 0);
+            if strict_null_checks {
+                let mut expected = [bootstrap.number_type, bootstrap.undefined_type];
+                expected.sort_unstable();
+                assert_eq!(union_types(&fixture.store, parameter), &expected);
+            } else {
+                assert_eq!(parameter, bootstrap.number_type);
+            }
+            let warm = function_store_state(&fixture.store);
+            preflight_selected_interface_method(&mut fixture, method, &mut diagnostics).unwrap();
+            assert_eq!(
+                query_selected_interface_method(&mut fixture, method, &mut diagnostics),
+                Ok(value),
+            );
+            assert_eq!(function_store_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn selected_interface_method_query_rejects_partial_or_corrupt_values() {
+        for warm in [false, true] {
+            for corrupt_parameter in [false, true] {
+                let mut fixture =
+                    fixture("interface Box<T> { select(value: string): number; ignored(); }");
+                let (method, _) = selected_interface_method_return(&fixture, "Box", "select");
+                let declaration = fixture
+                    .store
+                    .symbol(method)
+                    .unwrap()
+                    .value_declaration()
+                    .unwrap();
+                let NodeData::MethodSignatureDeclaration(data) =
+                    &fixture.parsed.arena.get(declaration.node).unwrap().data
+                else {
+                    panic!("the selected method retains its source declaration")
+                };
+                let parameter = node_symbol(
+                    &fixture,
+                    NodeRef::new(
+                        declaration.arena,
+                        declaration.file,
+                        data.parameters.nodes[0],
+                    ),
+                );
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                if warm {
+                    query_selected_interface_method(&mut fixture, method, &mut diagnostics)
+                        .unwrap();
+                }
+                let symbol = if corrupt_parameter { parameter } else { method };
+                let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                assert!(fixture.store.set_value_symbol_links(
+                    symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    },
+                ));
+                let before = function_store_state(&fixture.store);
+                assert!(
+                    preflight_selected_interface_method(&mut fixture, method, &mut diagnostics)
+                        .is_err(),
+                    "warm {warm}, parameter {corrupt_parameter}",
+                );
+                assert!(
+                    query_selected_interface_method(&mut fixture, method, &mut diagnostics)
+                        .is_err(),
+                    "warm {warm}, parameter {corrupt_parameter}",
+                );
+                assert_eq!(function_store_state(&fixture.store), before);
+                assert!(diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn selected_interface_method_query_rejects_wrong_unused_parameter_resolution() {
+        let mut fixture = fixture(concat!(
+            "interface Box<T> { ",
+            "select<Unused extends string = string>(): number; ignored(); }",
+        ));
+        let (method, _) = selected_interface_method_return(&fixture, "Box", "select");
+        let parameter = canonical_fixture_symbol(&fixture, SyntaxKind::TypeParameter, "Unused");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let parameter_type = query_declared(
+            &mut fixture,
+            parameter,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_type_parameter_resolution(
+            parameter_type,
+            Some(number),
+            None,
+            None,
+            Some(number),
+        ));
+        let before = function_store_state(&fixture.store);
+        assert!(
+            preflight_selected_interface_method(&mut fixture, method, &mut diagnostics).is_err()
+        );
+        assert!(query_selected_interface_method(&mut fixture, method, &mut diagnostics).is_err());
+        assert_eq!(function_store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn selected_interface_method_query_preflights_every_overload_before_publication() {
+        let mut fixture = fixture(concat!(
+            "interface Box<T> { select(value: string): number; ",
+            "select(value: number): typeof missing; ignored(); }",
+        ));
+        let (method, _) = selected_interface_method_return(&fixture, "Box", "select");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = function_store_state(&fixture.store);
+        assert!(
+            preflight_selected_interface_method(&mut fixture, method, &mut diagnostics).is_err()
+        );
+        assert!(query_selected_interface_method(&mut fixture, method, &mut diagnostics).is_err());
+        assert_eq!(function_store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn selected_interface_method_query_resolves_type_literal_methods_independently() {
+        let mut fixture = fixture(concat!(
+            "type Cursor = { next(): { done: false }; ",
+            "close(value: number): void; ignored(); };",
+        ));
+        let (_, _, literal) = alias_parts(&fixture, "Cursor");
+        let owner = node_symbol(&fixture, literal);
+        let members = fixture.store.symbol(owner).unwrap().members().unwrap();
+        let [next, close, ignored] = ["next", "close", "ignored"].map(|name| {
+            fixture
+                .store
+                .symbol_table(members)
+                .unwrap()
+                .get_source(name)
+                .unwrap()
+        });
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let cold = function_store_state(&fixture.store);
+        preflight_selected_interface_method(&mut fixture, next, &mut diagnostics).unwrap();
+        assert_eq!(function_store_state(&fixture.store), cold);
+        let next_type =
+            query_selected_interface_method(&mut fixture, next, &mut diagnostics).unwrap();
+        let owner_type = fixture
+            .store
+            .type_node_links(literal)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let record = fixture.store.type_payload(owner_type).unwrap();
+        assert_eq!(record.symbol(), Some(owner));
+        assert_eq!(record.object_flags(), ObjectFlags::ANONYMOUS);
+        assert_eq!(
+            fixture
+                .store
+                .type_alias(record.alias().unwrap())
+                .unwrap()
+                .symbol(),
+            Some(named_symbol(
+                &fixture,
+                SyntaxKind::TypeAliasDeclaration,
+                "Cursor"
+            )),
+        );
+        assert!(fixture.store.value_symbol_links(close).is_none());
+        assert!(fixture.store.value_symbol_links(ignored).is_none());
+        let close_type =
+            query_selected_interface_method(&mut fixture, close, &mut diagnostics).unwrap();
+        assert_ne!(next_type, close_type);
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(literal)
+                .unwrap()
+                .resolved_type,
+            Some(owner_type),
+        );
+        assert!(fixture.store.value_symbol_links(ignored).is_none());
+        let warm = function_store_state(&fixture.store);
+        for (method, expected) in [(next, next_type), (close, close_type)] {
+            preflight_selected_interface_method(&mut fixture, method, &mut diagnostics).unwrap();
+            assert_eq!(
+                query_selected_interface_method(&mut fixture, method, &mut diagnostics),
+                Ok(expected),
+            );
+        }
+        assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn selected_interface_method_query_reuses_resolved_type_literal_owner() {
+        let mut fixture = fixture("type Cursor = { next(): number; close(): void; };");
+        let (_, _, literal) = alias_parts(&fixture, "Cursor");
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Cursor");
+        let owner = node_symbol(&fixture, literal);
+        let next = fixture
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("next"))
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let value = fixture
+            .store
+            .value_symbol_links(next)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let before = function_store_state(&fixture.store);
+        preflight_selected_interface_method(&mut fixture, next, &mut diagnostics).unwrap();
+        assert_eq!(
+            query_selected_interface_method(&mut fixture, next, &mut diagnostics),
+            Ok(value),
+        );
+        assert_eq!(function_store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn selected_interface_method_query_allows_later_owner_resolution() {
+        for source in [
+            "interface Cursor { next(): number; close(): void; }",
+            "type Cursor = { next(): number; close(): void; };",
+        ] {
+            let mut fixture = fixture(source);
+            let (owner, method) = if source.starts_with("interface") {
+                (
+                    named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Cursor"),
+                    selected_interface_method_return(&fixture, "Cursor", "next").0,
+                )
+            } else {
+                let (_, _, literal) = alias_parts(&fixture, "Cursor");
+                let symbol = node_symbol(&fixture, literal);
+                (
+                    named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Cursor"),
+                    fixture
+                        .store
+                        .symbol(symbol)
+                        .and_then(ts_binder::semantic::Symbol::members)
+                        .and_then(|members| fixture.store.symbol_table(members))
+                        .and_then(|members| members.get_source("next"))
+                        .unwrap(),
+                )
+            };
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let value =
+                query_selected_interface_method(&mut fixture, method, &mut diagnostics).unwrap();
+            query_declared(
+                &mut fixture,
+                owner,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(method)
+                    .unwrap()
+                    .resolved_type,
+                Some(value),
+            );
+            let warm = function_store_state(&fixture.store);
+            assert_eq!(
+                query_selected_interface_method(&mut fixture, method, &mut diagnostics),
+                Ok(value),
+            );
+            assert_eq!(function_store_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn selected_interface_method_query_rejects_wrong_type_literal_owner_cache() {
+        for warm in [false, true] {
+            for missing_members in [false, true] {
+                let mut fixture = fixture("type Cursor = { next(): number; ignored(); };");
+                let (_, _, literal) = alias_parts(&fixture, "Cursor");
+                let owner = node_symbol(&fixture, literal);
+                let next = fixture
+                    .store
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|members| fixture.store.symbol_table(members))
+                    .and_then(|members| members.get_source("next"))
+                    .unwrap();
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                if warm {
+                    query_selected_interface_method(&mut fixture, next, &mut diagnostics).unwrap();
+                }
+                if missing_members {
+                    let mut plan = {
+                        let host = post_global_host(
+                            &fixture.parsed.arena,
+                            fixture.files.get(&fixture.file).unwrap(),
+                        );
+                        object_members::plan_selected_interface_method(&fixture.store, &host, next)
+                            .unwrap()
+                    };
+                    plan.alias_symbol = Some(named_symbol(
+                        &fixture,
+                        SyntaxKind::TypeAliasDeclaration,
+                        "Cursor",
+                    ));
+                    let type_ =
+                        object_members::ensure_type_literal_shell(&mut fixture.store, &plan)
+                            .unwrap()
+                            .type_id();
+                    assert!(
+                        fixture
+                            .store
+                            .set_structured_type_members(type_, None, None, None, None, None,)
+                    );
+                } else {
+                    let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                    assert!(fixture.store.set_type_node_links(
+                        literal,
+                        TypeNodeLinks {
+                            resolved_type: Some(number),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                let before = function_store_state(&fixture.store);
+                assert!(
+                    preflight_selected_interface_method(&mut fixture, next, &mut diagnostics)
+                        .is_err()
+                );
+                assert!(
+                    query_selected_interface_method(&mut fixture, next, &mut diagnostics).is_err()
+                );
+                assert_eq!(function_store_state(&fixture.store), before);
+                assert!(diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Checks computed names for both owner kinds and both cache states.
+    fn selected_interface_method_query_keeps_computed_optional_names() {
+        for source in [
+            concat!(
+                "declare const key: unique symbol; ",
+                "interface Box<T> { [key]?(value?: number): string; ignored(); }",
+            ),
+            concat!(
+                "declare const key: unique symbol; ",
+                "type Box = { [key]?(value?: number): string; ignored(); };",
+            ),
+        ] {
+            let mut fixture = fixture_with_intrinsic(
+                source,
+                IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: true,
+                },
+            );
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+                        return None;
+                    };
+                    (fixture.parsed.arena.get(method.name)?.kind
+                        == SyntaxKind::ComputedPropertyName)
+                        .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                })
+                .unwrap();
+            let early = node_symbol(&fixture, declaration);
+            let owner = fixture.store.get_parent_of_symbol(early).unwrap();
+            let ignored = fixture
+                .store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| fixture.store.symbol_table(members))
+                .and_then(|members| members.get_source("ignored"))
+                .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let cold = (
+                function_store_state(&fixture.store),
+                fixture.store.symbol_len(),
+            );
+            preflight_selected_interface_method(&mut fixture, early, &mut diagnostics).unwrap();
+            assert_eq!(
+                (
+                    function_store_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                ),
+                cold,
+            );
+            let value =
+                query_selected_interface_method(&mut fixture, early, &mut diagnostics).unwrap();
+            let late = fixture
+                .store
+                .late_bound_links(early)
+                .unwrap()
+                .late_symbol
+                .unwrap();
+            assert_ne!(early, late);
+            let links = fixture.store.value_symbol_links(late).unwrap();
+            assert_eq!(links.resolved_type, Some(value));
+            assert!(links.name_type.is_some());
+            assert_eq!(fixture.store.late_bound_method_source(late), Some(early));
+            assert!(fixture.store.value_symbol_links(ignored).is_none());
+            let (callable, _) =
+                object_members::declared_method_value_types(&fixture.store, late).unwrap();
+            let mut expected = [
+                callable,
+                fixture
+                    .store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .undefined_or_missing_type,
+            ];
+            expected.sort_unstable();
+            assert_eq!(union_types(&fixture.store, value), &expected);
+            let warm = (
+                function_store_state(&fixture.store),
+                fixture.store.symbol_len(),
+            );
+            for method in [early, late] {
+                preflight_selected_interface_method(&mut fixture, method, &mut diagnostics)
+                    .unwrap();
+                assert_eq!(
+                    query_selected_interface_method(&mut fixture, method, &mut diagnostics),
+                    Ok(value),
+                );
+            }
+            assert_eq!(
+                (
+                    function_store_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                ),
+                warm,
+            );
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]
