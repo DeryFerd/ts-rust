@@ -744,13 +744,21 @@ mod tests {
     }
 
     #[test]
-    fn iterator_methods_validate_enum_parameter_dependencies() {
-        for members in ["Stop", "Stop, Cancel"] {
+    fn iterator_throw_ignores_unused_enum_parameter_graphs() {
+        for (members, parameter) in [
+            ("Stop", "Reason"),
+            ("Stop, Cancel", "Reason"),
+            ("Stop", "[Reason]"),
+            ("Stop", "Reason[]"),
+            ("Stop", "Box<Reason>"),
+        ] {
             let source = parsed(&format!(
-                "enum Reason {{ {members} }} \
+                "interface Array<T> {{}} interface ReadonlyArray<T> {{}} \
+                 interface Box<T> {{ value: T }} \
+                 enum Reason {{ {members} }} \
                  interface State {{ \
                  next(): {{ value: string }}; \
-                 throw(reason: Reason): {{ done: true; value: number }}; \
+                 throw(reason: {parameter}): {{ done: true; value: number }}; \
                  }} declare var iterator: State;"
             ));
             let file = FileId::new(22_026);
@@ -782,6 +790,37 @@ mod tests {
                 );
                 assert!(checked.diagnostics.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn iterator_boolean_method_values_keep_invalid_method_diagnostics() {
+        let source = parsed(concat!(
+            "interface State { next(): { value: string }; return: boolean; throw: boolean; } ",
+            "declare var iterator: State;",
+        ));
+        let file = FileId::new(22_027);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&[(file, &source)], 0, options);
+        let node = annotation(&source, file, "iterator");
+        let input = context.get_type_from_type_node(node).unwrap();
+        let global_types = context.global_types().clone();
+        let globals = SynchronousIterationGlobals::default();
+        let mut query = SynchronousIterationQuery::new(
+            context.store_mut_for_test(),
+            &global_types,
+            &globals,
+            options,
+            node,
+            StoredProperties,
+        );
+        for name in ["return", "throw"] {
+            let checked = query.method(input, name, true).unwrap();
+            assert_eq!(checked.types, IterationTypes::default());
+            assert_eq!(
+                checked.diagnostics,
+                [IterationDiagnostic::InvalidMethod(name)]
+            );
         }
     }
 
@@ -1766,14 +1805,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             StoredCallableSetValidation::Malformed { .. } => {
                 Err(RelationUnavailable::MalformedFunctionType(type_).into())
             }
-            StoredCallableSetValidation::Valid {
-                projection, edges, ..
-            } => {
-                for edge in edges {
-                    self.validate_dependency(edge)?;
-                }
-                Ok(projection.call_signatures)
-            }
+            StoredCallableSetValidation::Valid { projection, .. } => Ok(projection.call_signatures),
         }
     }
 
@@ -1783,7 +1815,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             .ok_or_else(|| RelationUnavailable::UnresolvedFunctionType(signature.owner).into())
     }
 
-    fn validate_dependency(&self, input: TypeId) -> Result<(), SourceCheckError> {
+    fn validate_union_metadata(&self, input: TypeId) -> Result<(), SourceCheckError> {
         let record = self
             .store
             .type_payload(input)
@@ -1794,7 +1826,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
                 .ok_or_else(|| RelationUnavailable::MalformedEnumType(input).into());
         }
         self.store
-            .validate_union_constituent_with_global_types(self.global_types, input)
+            .validate_union_query_metadata(input)
             .map_err(Into::into)
     }
 
@@ -1813,7 +1845,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             return Ok(type_);
         };
         let types = union.union.types.clone();
-        self.validate_dependency(type_)?;
+        self.validate_union_metadata(type_)?;
         let original_len = types.len();
         let mut retained = Vec::new();
         for type_ in types {
@@ -2038,7 +2070,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
         }
         let constituents = match record.data() {
             TypeData::Union(union) => {
-                self.validate_dependency(input)?;
+                self.validate_union_metadata(input)?;
                 union.union.types.clone()
             }
             _ => vec![input],

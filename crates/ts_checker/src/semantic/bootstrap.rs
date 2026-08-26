@@ -1225,6 +1225,29 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(())
     }
 
+    /// Checks a cached union without traversing unused member types.
+    /// Query providers validate each member they consume.
+    pub(super) fn validate_union_query_metadata(
+        &self,
+        union: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        if self
+            .intrinsic_bootstrap
+            .as_ref()
+            .is_some_and(|bootstrap| union == bootstrap.boolean_type)
+        {
+            return self.validate_union_constituent(union);
+        }
+        let record = self
+            .type_payload(union)
+            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+        let TypeData::Union(data) = record.data() else {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        };
+        let key = self.validated_union_cache_key(union, record, data)?;
+        self.validate_union_cache_entry_metadata(&key, union)
+    }
+
     fn validate_union_of_union_cache_entry(
         &mut self,
         key: UnionOfUnionCacheKey,
@@ -2107,6 +2130,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         array_validation: UnionArrayValidation<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
+        let key = self.validated_union_cache_key(union, record, data)?;
+        self.validate_union_cache_entry(&key, union, array_validation, allowed_pending)
+    }
+
+    fn validated_union_cache_key(
+        &self,
+        union: TypeId,
+        record: &TypeRecord,
+        data: &super::type_records::UnionTypeData,
+    ) -> Result<UnionTypeCacheKey, LiteralTypeCacheError> {
         let alias = self.checked_union_alias(union, record.alias())?;
         let origin = data.origin.map(|origin| {
             let Some(record) = self.type_payload(origin) else {
@@ -2139,7 +2172,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if cached != Some(union) {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
-        self.validate_union_cache_entry(&key, union, array_validation, allowed_pending)
+        Ok(key)
     }
 
     fn validate_supported_fresh_property_object(

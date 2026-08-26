@@ -2297,7 +2297,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         AliasTargetState, CanonicalCheckerContext, CanonicalCheckerDiagnostics,
-        CanonicalCheckerOptions, SourceCheckError, TypeData,
+        CanonicalCheckerOptions, TypeData,
         bootstrap::{IntrinsicBootstrapOptions, LiteralTypeCacheError},
         production::GlobalMergeCompletion,
         reference_types::{
