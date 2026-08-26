@@ -33,7 +33,8 @@ use super::{
     classes::{
         ClassConstructorVisibility, ClassMemberPlan, ClassMemberQueryPlan,
         authenticated_class_constructor_value, execute_nongeneric_class_member_query,
-        plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
+        optional_constructor_parameter_type, plan_nongeneric_class_member_query,
+        preflight_nongeneric_class_member_query,
     },
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
     functions::plan_function_type,
@@ -3484,9 +3485,18 @@ fn constructor_parameter(
     let symbol_record = store.symbol(symbol).ok_or_else(invalid)?;
     let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
     let type_ = match type_record.kind {
+        SyntaxKind::AnyKeyword => bootstrap.any_type,
+        SyntaxKind::UnknownKeyword => bootstrap.unknown_type,
         SyntaxKind::StringKeyword => bootstrap.string_type,
         SyntaxKind::NumberKeyword => bootstrap.number_type,
-        _ => return Err(invalid()),
+        SyntaxKind::BigIntKeyword => bootstrap.bigint_type,
+        SyntaxKind::BooleanKeyword => bootstrap.boolean_type,
+        SyntaxKind::SymbolKeyword => bootstrap.es_symbol_type,
+        SyntaxKind::VoidKeyword => bootstrap.void_type,
+        SyntaxKind::UndefinedKeyword => bootstrap.undefined_type,
+        SyntaxKind::NeverKeyword => bootstrap.never_type,
+        SyntaxKind::ObjectKeyword => bootstrap.non_primitive_type,
+        _ => return Err(unsupported(SourceNewUnsupported::Constructor(parameter))),
     };
     if constructor.kind != SyntaxKind::Constructor
         || parameter_record.kind != SyntaxKind::Parameter
@@ -6672,16 +6682,32 @@ fn validate_selected_default_signature(
             signature,
         )));
     }
-    if let Some(parameter) = parameter
-        && store.value_symbol_links(parameter.symbol)
+    if let Some(parameter) = parameter {
+        let invalid = || invariant(SourceNewInvariant::InvalidConstructSignature(signature));
+        let declaration = store
+            .symbol(parameter.symbol)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .ok_or_else(invalid)?;
+        let NodeData::ParameterDeclaration(data) =
+            &host.node(declaration).ok_or_else(invalid)?.data
+        else {
+            return Err(invalid());
+        };
+        let value_type = optional_constructor_parameter_type(
+            store,
+            parameter.type_,
+            data.question_token.is_some(),
+            declaration,
+        )?
+        .ok_or_else(invalid)?;
+        if store.value_symbol_links(parameter.symbol)
             != Some(&ValueSymbolLinks {
-                resolved_type: Some(parameter.type_),
+                resolved_type: Some(value_type),
                 ..ValueSymbolLinks::default()
             })
-    {
-        return Err(invariant(SourceNewInvariant::InvalidConstructSignature(
-            signature,
-        )));
+        {
+            return Err(invalid());
+        }
     }
     if instance.reference.object.target != Some(instance_type) {
         return Err(invariant(SourceNewInvariant::InvalidClassValue(
