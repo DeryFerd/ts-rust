@@ -1270,6 +1270,24 @@ fn plan_published_interface_method(
             .to_vec();
         let mut signature_parameters = mapper_sources.clone();
         signature_parameters.extend_from_slice(record.type_parameters());
+        for &parameter in record.type_parameters() {
+            let Some(TypeData::TypeParameter(parameter)) =
+                store.type_payload(parameter).map(super::TypeRecord::data)
+            else {
+                return Err(GenericInterfaceMemberError::InvalidMember(method));
+            };
+            for type_ in [parameter.constraint, parameter.resolved_default_type]
+                .into_iter()
+                .flatten()
+            {
+                member_type_requires_instantiation(
+                    store,
+                    type_,
+                    &signature_parameters,
+                    Some(targets),
+                )?;
+            }
+        }
         for type_ in parameter_types.iter().copied().chain([return_type]) {
             member_type_requires_instantiation(store, type_, &signature_parameters, Some(targets))?;
         }
@@ -5279,6 +5297,268 @@ mod tests {
         assert_eq!(
             instantiate_published_generic_interface_method(store, &global_types, receiver, method),
             Ok(specialized),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    struct ArrayMethodPreflightFixture<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        method: SemanticSymbolId,
+        receiver: TypeId,
+        parameter: TypeId,
+        signature: SignatureId,
+    }
+
+    fn array_method_preflight_fixture(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> ArrayMethodPreflightFixture<'_> {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(parsed, file, CanonicalCheckerOptions::default());
+        let globals = context.global_types().clone();
+        let owner = source_symbol(parsed, file, &context, "Array");
+        let method = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("f"))
+            .unwrap();
+        let declaration = context
+            .store()
+            .symbol(method)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let NodeData::MethodSignatureDeclaration(method_data) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected the generic Array method")
+        };
+        let annotation = NodeRef::new(parsed.arena.id(), file, method_data.type_.unwrap());
+        let parameter = context.get_type_from_type_node(annotation).unwrap();
+        let parameter_declaration =
+            NodeRef::new(parsed.arena.id(), file, method_data.parameters.nodes[0]);
+        let parameter_symbol = context
+            .file(file)
+            .unwrap()
+            .1
+            .symbol(parameter_declaration)
+            .unwrap();
+        let store = context.store_mut_for_test();
+        assert!(store.set_value_symbol_links(
+            parameter_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(parameter),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let source = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+            .unwrap();
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(declaration),
+                vec![parameter],
+                None,
+                vec![parameter_symbol],
+                Some(parameter),
+                None,
+                1,
+            )
+            .unwrap();
+        assert!(store.set_signature_links(
+            declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(source),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_structured_type_members(
+            source,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        assert!(store.set_function_signature_return_annotation(signature, annotation, false));
+        assert!(
+            store.set_callable_signature_parameter_types_batch(vec![(signature, vec![parameter])])
+        );
+        assert_eq!(store.interface_method_linked_type(signature), Some(source));
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let receiver = store
+            .create_canonical_array_type(&globals, number, false)
+            .unwrap();
+        ArrayMethodPreflightFixture {
+            context,
+            method,
+            receiver,
+            parameter,
+            signature,
+        }
+    }
+
+    #[test]
+    fn array_method_preflight_rejects_function_constraints_and_defaults_before_writes() {
+        for (index, method) in [
+            "f<U extends (value: T) => T>(value: U): U;",
+            "f<U extends ((value: T) => T)[]>(value: U): U;",
+            "f<U = (value: T) => T>(value: U): U;",
+            "f<U = ((value: T) => T)[]>(value: U): U;",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(&format!(
+                "interface Array<T> {{ {method} }} interface ReadonlyArray<T> {{}}",
+            ));
+            let file = FileId::new(6_250 + u32::try_from(index).unwrap());
+            let mut fixture = array_method_preflight_fixture(&parsed, file);
+            let globals = fixture.context.global_types().clone();
+            let TypeData::TypeParameter(parameter) = fixture
+                .context
+                .store()
+                .type_payload(fixture.parameter)
+                .unwrap()
+                .data()
+            else {
+                panic!("expected the original generic parameter")
+            };
+            let unsupported = parameter
+                .constraint
+                .or(parameter.resolved_default_type)
+                .unwrap();
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                (
+                    (
+                        store.type_len(),
+                        store.mapper_len(),
+                        store.signature_len(),
+                        store.symbol_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.checker_link_allocated_lengths(),
+                    ),
+                    parsed
+                        .arena
+                        .iter()
+                        .map(|(node, _)| {
+                            let node = NodeRef::new(parsed.arena.id(), file, node);
+                            let symbol = context.file(file).unwrap().1.symbol(node);
+                            (
+                                store.type_node_links(node).cloned(),
+                                store.signature_links(node).cloned(),
+                                symbol
+                                    .and_then(|symbol| store.value_symbol_links(symbol))
+                                    .cloned(),
+                                symbol
+                                    .and_then(|symbol| store.declared_type_links(symbol))
+                                    .cloned(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let before = snapshot(&fixture.context);
+            for _ in 0..2 {
+                assert_eq!(
+                    instantiate_published_generic_interface_method(
+                        fixture.context.store_mut_for_test(),
+                        &globals,
+                        fixture.receiver,
+                        fixture.method,
+                    ),
+                    Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                        unsupported
+                    )),
+                    "{method}",
+                );
+                assert_eq!(snapshot(&fixture.context), before, "{method}");
+            }
+        }
+    }
+
+    #[test]
+    fn array_method_preflight_keeps_supported_constraints_and_defaults() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> { f<U extends T = T>(value: U): U; } ",
+            "interface ReadonlyArray<T> {}",
+        ));
+        let mut fixture = array_method_preflight_fixture(&parsed, FileId::new(6_254));
+        let globals = fixture.context.global_types().clone();
+        let store = fixture.context.store_mut_for_test();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let source_links = store.value_symbol_links(fixture.method).cloned();
+        let callable = instantiate_published_generic_interface_method(
+            store,
+            &globals,
+            fixture.receiver,
+            fixture.method,
+        )
+        .unwrap();
+        let [signature] = store
+            .type_payload(callable)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_deref()
+            .unwrap()
+        else {
+            panic!("expected one mapped method signature")
+        };
+        let signature = store.signature(*signature).unwrap();
+        assert_eq!(signature.target(), Some(fixture.signature));
+        let [fresh] = signature.type_parameters() else {
+            panic!("expected one fresh generic parameter")
+        };
+        assert_ne!(*fresh, fixture.parameter);
+        let TypeData::TypeParameter(parameter) = store.type_payload(*fresh).unwrap().data() else {
+            panic!("expected a mapped generic parameter")
+        };
+        assert_eq!(parameter.constraint, Some(number));
+        assert_eq!(parameter.resolved_default_type, Some(number));
+        assert_eq!(parameter.target, Some(fixture.parameter));
+        assert_eq!(parameter.mapper, signature.mapper());
+        assert_eq!(
+            store.value_symbol_links(fixture.method),
+            source_links.as_ref()
+        );
+        let warm = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            instantiate_published_generic_interface_method(
+                store,
+                &globals,
+                fixture.receiver,
+                fixture.method
+            ),
+            Ok(callable),
         );
         assert_eq!(
             (
