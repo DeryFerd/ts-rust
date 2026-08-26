@@ -4209,6 +4209,23 @@ fn validate_nested_reference_targets(
     if !visited_types.insert(type_) {
         return Ok(());
     }
+    if let Some(tuple) = store
+        .canonical_tuple_shape(type_)
+        .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?
+    {
+        for element in tuple.element_types() {
+            validate_nested_reference_targets(
+                store,
+                *element,
+                array_targets,
+                active_targets,
+                validated_targets,
+                visited_types,
+            )?;
+        }
+        visited_types.remove(&type_);
+        return Ok(());
+    }
     let record = store
         .type_payload(type_)
         .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(type_))?;
@@ -6166,6 +6183,287 @@ mod tests {
             ),
             warm,
         );
+    }
+
+    const NESTED_TUPLE_HOLDER_MEMBERS: [(&str, bool); 3] = [
+        ("item: [Child<T>];", false),
+        ("item: [[Child<T>]];", false),
+        ("item: [T]; [name: string]: [T] | [Child<T>];", true),
+    ];
+
+    struct NestedTupleTargetFixture<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        reference: TypeId,
+        child_reference: TypeId,
+        child_value: SemanticSymbolId,
+        template: TypeId,
+    }
+
+    fn nested_tuple_target_fixture(
+        parsed: &ParseResult,
+        file: FileId,
+        index: bool,
+    ) -> NestedTupleTargetFixture<'_> {
+        assert!(parsed.diagnostics.is_empty());
+        let mut context = checker_context(parsed, file, CanonicalCheckerOptions::default());
+        let child = source_symbol(parsed, file, &context, "Child");
+        let holder = source_symbol(parsed, file, &context, "Holder");
+        let child_target = context.get_declared_type_of_symbol(child).unwrap();
+        let target = context.get_declared_type_of_symbol(holder).unwrap();
+        let TypeData::Interface(child_interface) =
+            context.store().type_payload(child_target).unwrap().data()
+        else {
+            panic!("Child must retain its generic interface target")
+        };
+        let child_parameter = child_interface
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .unwrap()[0];
+        publish_generic_target_for_test(
+            &mut context,
+            child_target,
+            &[("value", child_parameter)],
+            None,
+        );
+        let child_value = context
+            .store()
+            .symbol(child)
+            .unwrap()
+            .members()
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let item = context
+            .store()
+            .symbol(holder)
+            .unwrap()
+            .members()
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("item"))
+            .unwrap();
+        let item_annotation = context
+            .store()
+            .source_direct_type_annotation(
+                context
+                    .store()
+                    .symbol(item)
+                    .unwrap()
+                    .value_declaration()
+                    .unwrap(),
+            )
+            .unwrap();
+        let item_type = context.get_type_from_type_node(item_annotation).unwrap();
+        let index_declaration = index.then(|| {
+            context
+                .store()
+                .symbol(holder)
+                .unwrap()
+                .members()
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get(InternalSymbolName::Index.as_ref()))
+                .and_then(|symbol| context.store().symbol(symbol))
+                .and_then(|symbol| symbol.declarations())
+                .unwrap()[0]
+        });
+        let index_type = index_declaration.map(|declaration| {
+            let annotation = context
+                .store()
+                .source_direct_type_annotation(declaration)
+                .unwrap();
+            context.get_type_from_type_node(annotation).unwrap()
+        });
+        publish_generic_target_for_test(&mut context, target, &[("item", item_type)], None);
+        let store = context.store_mut_for_test();
+        if let Some((declaration, value)) = index_declaration.zip(index_type) {
+            let TypeData::Interface(interface) = store.type_payload(target).unwrap().data() else {
+                panic!("Holder must retain its generic interface target")
+            };
+            let members = interface.declared_members;
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let info = store
+                .alloc_index_info(string, value, false, Some(declaration), Vec::new())
+                .unwrap();
+            assert!(store.set_interface_declared_members(
+                target,
+                true,
+                members,
+                None,
+                None,
+                Some(vec![info])
+            ));
+        }
+        let template = index_type.unwrap_or(item_type);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let reference = store
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let child_reference = store
+            .create_direct_generic_reference_type(child_target, &[string])
+            .unwrap();
+        NestedTupleTargetFixture {
+            context,
+            reference,
+            child_reference,
+            child_value,
+            template,
+        }
+    }
+
+    fn read_nested_tuple_holder_value(
+        store: &mut CanonicalTypeMapperStore,
+        reference: TypeId,
+        index: bool,
+    ) -> Result<TypeId, GenericInterfaceMemberError> {
+        if index {
+            store.resolve_generic_interface_members(reference, None)?;
+            let index = store
+                .type_payload(reference)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .index_infos
+                .as_ref()
+                .unwrap()[0];
+            Ok(store.index_info(index).unwrap().value_type())
+        } else {
+            Ok(store
+                .resolve_generic_interface_property(reference, "item", None)?
+                .unwrap()
+                .type_id())
+        }
+    }
+
+    #[test]
+    fn nested_tuple_targets_keep_cold_and_warm_property_and_index_identity() {
+        for (members, index) in NESTED_TUPLE_HOLDER_MEMBERS {
+            let parsed = parse_source_file(&format!(
+                "interface Child<T> {{ value: T; }} interface Holder<T> {{ {members} }}",
+            ));
+            let mut fixture = nested_tuple_target_fixture(&parsed, FileId::new(6_273), index);
+            let store = fixture.context.store_mut_for_test();
+            assert_eq!(
+                store
+                    .type_payload(fixture.reference)
+                    .unwrap()
+                    .data()
+                    .structured(),
+                Some(&StructuredTypeData::default())
+            );
+            let value = read_nested_tuple_holder_value(store, fixture.reference, index).unwrap();
+            let resolved = store
+                .resolve_generic_interface_members(fixture.reference, None)
+                .unwrap();
+            assert_eq!(
+                instantiated_tuple_member_type_matches(
+                    store,
+                    fixture.template,
+                    value,
+                    resolved.mapper().unwrap(),
+                    None
+                ),
+                Some(true),
+                "{members}",
+            );
+            let before = (
+                store.type_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                read_nested_tuple_holder_value(store, fixture.reference, index),
+                Ok(value)
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+                "{members}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_tuple_targets_reject_poisoned_children_before_cold_or_warm_writes() {
+        for (members, index) in NESTED_TUPLE_HOLDER_MEMBERS {
+            for warm in [false, true] {
+                let parsed = parse_source_file(&format!(
+                    "interface Child<T> {{ value: T; }} interface Holder<T> {{ {members} }}",
+                ));
+                let mut fixture = nested_tuple_target_fixture(&parsed, FileId::new(6_274), index);
+                let store = fixture.context.store_mut_for_test();
+                let cached = warm.then(|| {
+                    read_nested_tuple_holder_value(store, fixture.reference, index).unwrap()
+                });
+                let original = store
+                    .value_symbol_links(fixture.child_value)
+                    .cloned()
+                    .unwrap();
+                assert!(
+                    store.set_value_symbol_links(fixture.child_value, ValueSymbolLinks::default())
+                );
+                let snapshot = |store: &CanonicalTypeMapperStore| {
+                    (
+                        store.type_len(),
+                        store.mapper_len(),
+                        store.index_info_len(),
+                        store.symbol_len(),
+                        store.checker_link_allocated_lengths(),
+                        store
+                            .type_payload(fixture.reference)
+                            .unwrap()
+                            .data()
+                            .structured()
+                            .cloned(),
+                        store
+                            .type_payload(fixture.child_reference)
+                            .unwrap()
+                            .data()
+                            .structured()
+                            .cloned(),
+                    )
+                };
+                let before = snapshot(store);
+                let expected = GenericInterfaceMemberError::InvalidMember(fixture.child_value);
+                assert_eq!(
+                    read_nested_tuple_holder_value(store, fixture.reference, index),
+                    Err(expected.clone()),
+                    "{members}, warm={warm}",
+                );
+                assert_eq!(
+                    store.resolve_generic_interface_property(
+                        fixture.child_reference,
+                        "value",
+                        None
+                    ),
+                    Err(expected),
+                    "{members}, warm={warm}",
+                );
+                assert_eq!(snapshot(store), before, "{members}, warm={warm}");
+                assert_eq!(
+                    store.value_symbol_links(fixture.child_value),
+                    Some(&ValueSymbolLinks::default())
+                );
+                assert!(store.set_value_symbol_links(fixture.child_value, original));
+                let restored =
+                    read_nested_tuple_holder_value(store, fixture.reference, index).unwrap();
+                if let Some(cached) = cached {
+                    assert_eq!(restored, cached, "{members}");
+                }
+                assert_eq!(
+                    read_nested_tuple_holder_value(store, fixture.reference, index),
+                    Ok(restored)
+                );
+            }
+        }
     }
 
     #[test]
