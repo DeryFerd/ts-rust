@@ -6,4 +6,5 @@ mod scanner;
 pub use byte_scanner::{ByteScanner, ByteToken};
 pub use scanner::{
     CommentDirective, LanguageVariant, Scanner, ScannerCheckpoint, Token, TokenFlags,
+    is_identifier_text,
 };

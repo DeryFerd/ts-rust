@@ -16,6 +16,7 @@ use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags, canonical_has_syntactic_modifier,
 };
+use ts_scanner::is_identifier_text;
 
 use super::{
     ArrayTypeError, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
@@ -4588,7 +4589,7 @@ fn structural_property_display_name(
     property: &ts_binder::semantic::Symbol,
     name: &str,
 ) -> Result<String, TypeDisplayUnavailable> {
-    if is_plain_identifier(name) {
+    if is_identifier_text(name) {
         return Ok(name.to_owned());
     }
     if matches!(proof, StructuralObjectProof::Synthetic) {
@@ -4755,7 +4756,7 @@ fn display_symbol_name(
     }
     let name = escaped_name
         .as_utf8()
-        .filter(|name| is_plain_identifier(name))?;
+        .filter(|name| is_identifier_text(name))?;
     state.add(name.len().saturating_add(1).saturating_mul(2));
     Some(name.to_owned())
 }
@@ -4800,22 +4801,12 @@ fn display_unique_symbol_reference(
     let Some(NodeData::Identifier(identifier)) = host.node(name_node).map(|node| &node.data) else {
         return Err(TypeDisplayUnavailable::UniqueSymbolName(type_id));
     };
-    if !is_plain_identifier(&identifier.text)
+    if !is_identifier_text(&identifier.text)
         || owner.name().as_utf8() != Some(identifier.text.as_str())
     {
         return Err(TypeDisplayUnavailable::UniqueSymbolName(type_id));
     }
     Ok(format!("typeof {}", identifier.text))
-}
-
-fn is_plain_identifier(name: &str) -> bool {
-    let mut characters = name.chars();
-    let Some(first) = characters.next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || matches!(first, '_' | '$'))
-        && characters
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '$'))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4965,7 +4956,7 @@ fn namespace_qualified_alias_name(
         let name = record
             .name()
             .as_utf8()
-            .filter(|name| is_plain_identifier(name))
+            .filter(|name| is_identifier_text(name))
             .ok_or(())?;
         names.push(name);
         let Some(parent) = store.get_parent_of_symbol(current) else {
@@ -5006,7 +4997,7 @@ fn namespace_qualified_alias_name(
         let owner_name = owner
             .name()
             .as_utf8()
-            .filter(|name| is_plain_identifier(name))
+            .filter(|name| is_identifier_text(name))
             .ok_or(())?;
         let authenticated = declarations.iter().any(|declaration| {
             let Some(record) = host.node(*declaration) else {
@@ -6372,6 +6363,44 @@ mod tests {
                 .set_type_alias_arguments(identity, Some(arguments))
         );
         assert_eq!(context.type_to_string(mapped).unwrap(), expected);
+    }
+
+    #[test]
+    fn unicode_record_keys_and_property_names_use_scanner_identifier_rules() {
+        let parsed = parse_source_file(concat!(
+            "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+            "const lowerMap: Record<\"i\u{0307}spanyol\" | \"\u{03bf}\u{03c2}\", string> = { ",
+            "[\"i\u{0307}spanyol\"]: \"spanish\", [\"\u{03bf}\u{03c2}\"]: \"greek\" }; ",
+            "const invalid = { [\"\u{0307}name\"]: \"quoted\" };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(225);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let mapped = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "lowerMap"))
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(mapped).unwrap(),
+            "Record<\"i\u{0307}spanyol\" | \"\u{03bf}\u{03c2}\", string>"
+        );
+        for (_, record) in parsed.arena.iter() {
+            let NodeData::VariableDeclaration(variable) = &record.data else {
+                continue;
+            };
+            let NodeData::Identifier(name) = &parsed.arena.get(variable.name).unwrap().data else {
+                panic!("test variables have identifier names")
+            };
+            let expected = match name.text.as_str() {
+                "lowerMap" => "{ i\u{0307}spanyol: string; \u{03bf}\u{03c2}: string; }",
+                "invalid" => "{ \"\u{0307}name\": string; }",
+                _ => unreachable!(),
+            };
+            let initializer = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+            let object = context.get_type_at_location(initializer).unwrap();
+            assert_eq!(context.type_to_string(object).unwrap(), expected);
+        }
     }
 
     #[test]

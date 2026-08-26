@@ -13,6 +13,7 @@ ts_evaluator = { path = "../ts_evaluator" }
 ts_jsnum = { path = "../ts_jsnum" }
 ts_parser = { path = "../ts_parser" }
 ts_path = { path = "../ts_path" }
+ts_scanner = { path = "../ts_scanner" }
 xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 
 [lints]

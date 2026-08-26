@@ -1767,6 +1767,14 @@ const fn diagnostic_category(category: Category) -> DiagnosticCategory {
     }
 }
 
+/// Returns whether text is a complete, unescaped TypeScript identifier name.
+/// Keywords are accepted because property names can use them.
+#[must_use]
+pub fn is_identifier_text(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters.next().is_some_and(is_identifier_start) && characters.all(is_identifier_part)
+}
+
 fn is_identifier_start(ch: char) -> bool {
     matches!(
         ch,
@@ -1932,7 +1940,7 @@ fn keyword(text: &str) -> Option<SyntaxKind> {
 mod tests {
     use ts_core::DiagnosticCategory;
 
-    use super::{LanguageVariant, Scanner, SyntaxKind, TokenFlags};
+    use super::{LanguageVariant, Scanner, SyntaxKind, TokenFlags, is_identifier_text};
 
     fn kinds(source: &str) -> Vec<SyntaxKind> {
         let mut scanner = Scanner::new(source);
@@ -2346,6 +2354,44 @@ mod tests {
         assert_eq!(identifier.text, name);
         assert_eq!(scanner.scan().kind, SyntaxKind::EndOfFile);
         assert!(scanner.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn identifier_text_accepts_unicode_continuations_and_ascii_names() {
+        for name in [
+            "value",
+            "value123",
+            "for",
+            "$",
+            "_",
+            "$value_1",
+            "\u{03bf}\u{03c2}",
+            "i\u{0307}spanyol",
+            "value\u{200c}",
+            "value\u{200d}",
+            "\u{037a}value",
+        ] {
+            assert!(is_identifier_text(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn identifier_text_rejects_invalid_starts_and_extra_tokens() {
+        for name in [
+            "",
+            "1value",
+            "\u{0307}value",
+            "\u{200c}value",
+            "value-name",
+            "value.name",
+            "value name",
+            " value",
+            "value ",
+            "#value",
+            r"\u0061",
+        ] {
+            assert!(!is_identifier_text(name), "{name:?}");
+        }
     }
 
     #[test]
