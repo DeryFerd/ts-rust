@@ -494,11 +494,52 @@ fn constructor_aliases_and_qualified_names_preserve_direct_queries_relations_and
         (
             "declare namespace Namespace { interface Token { value: number; } }",
             "readonly value?: Namespace.Token",
-            "Namespace.Token | undefined",
+            "Token | undefined",
         ),
     ] {
         check_direct_constructor_annotation(prefix, parameter, display);
     }
+}
+
+#[test]
+fn constructor_namespace_annotations_preserve_source_checks_and_display() {
+    let library = parse_source_file(LIBRARY);
+    let source = parse_source_file(concat!(
+        "declare namespace Namespace { interface Token { value: number; } } ",
+        "class Model { constructor(readonly token?: Namespace.Token) {} } ",
+        "new Model();",
+    ));
+    assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+    let mut context = context(&library, &source);
+    check_source(&mut context, &source);
+    let owner = named_symbol(&context, &source, "Model");
+    let members = context.get_nongeneric_class_members(owner).unwrap();
+    let property = members.declared_instance_properties()[0];
+    let type_ = context
+        .store()
+        .value_symbol_links(property)
+        .unwrap()
+        .resolved_type
+        .unwrap();
+    assert_eq!(context.type_to_string(type_).unwrap(), "Token | undefined");
+    let before = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+    );
+
+    context.recheck_source_file(FileId::new(4_301)).unwrap();
+
+    assert_eq!(context.type_to_string(type_).unwrap(), "Token | undefined");
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+        ),
+        before
+    );
+    assert!(context.diagnostics().is_empty());
 }
 
 #[test]
