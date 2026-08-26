@@ -20382,7 +20382,9 @@ mod tests {
 
         assert!(context.store_mut_for_test().set_object_instantiations(
             callable,
-            super::super::type_records::TypeCacheState::Allocated(Default::default()),
+            super::super::type_records::TypeCacheState::Allocated(
+                std::collections::HashMap::default(),
+            ),
         ));
         assert_eq!(
             published_global_array_augmentation_method(
