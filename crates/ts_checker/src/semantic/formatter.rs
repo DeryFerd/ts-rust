@@ -629,6 +629,11 @@ fn display_type_worker(
         .type_payload(type_id)
         .ok_or(TypeDisplayUnavailable::Type(type_id))?;
     let type_flags = record.flags();
+    if store.source_jsdoc_typedef_identity(type_id).is_some() {
+        let host = host.ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        super::jsdoc::validate_source_jsdoc_typedef_name(store, host, type_id)
+            .map_err(|()| TypeDisplayUnavailable::MalformedType(type_id))?;
+    }
 
     if store.canonical_empty_tuple_type_cache() == Some(type_id) {
         store
@@ -1218,9 +1223,13 @@ fn display_object_type(
     }
 
     let proof = validate_structural_object_shell(store, host, global_types, type_id, record)?;
+    let jsdoc_alias = store
+        .source_jsdoc_typedef_identity(type_id)
+        .map(|identity| identity.definition.name());
     if !visiting.insert(type_id) {
         return Err(TypeDisplayUnavailable::CyclicType(type_id));
     }
+    let mut alias_validation = DisplayState::default();
     let result = display_structural_properties(
         store,
         host,
@@ -1228,11 +1237,24 @@ fn display_object_type(
         type_id,
         record,
         proof,
-        flags,
-        state,
+        if jsdoc_alias.is_some() {
+            flags | CanonicalTypeFormatFlags::NO_TRUNCATION
+        } else {
+            flags
+        },
+        if jsdoc_alias.is_some() {
+            &mut alias_validation
+        } else {
+            &mut *state
+        },
         visiting,
     );
     visiting.remove(&type_id);
+    if let Some(name) = jsdoc_alias {
+        result?;
+        state.add(name.len());
+        return Ok(name.to_owned());
+    }
     result
 }
 

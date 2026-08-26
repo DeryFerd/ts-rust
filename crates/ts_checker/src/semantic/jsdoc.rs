@@ -23,13 +23,13 @@ use ts_scanner::Scanner;
 use super::{
     ArrayTypeError, CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange,
     CanonicalCheckerOptions, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
-    IntrinsicBootstrapOptions, ResolvedSignatureState, SignatureLinks, TypeId, TypeNodeLinks,
-    ValueSymbolLinks,
+    IntrinsicBootstrapOptions, ResolvedSignatureState, SignatureLinks, TypeAliasId, TypeId,
+    TypeNodeLinks, ValueSymbolLinks,
     bootstrap::UnionReduction,
     functions::{StoredFunctionTypeValidation, validate_stored_function_type},
     signatures::SignatureFlags,
     store::SourceNodeParent,
-    type_records::{ConstrainedTypeData, TypeCacheState, TypeData},
+    type_records::{ConstrainedTypeData, ObjectTypeData, TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -681,6 +681,47 @@ pub struct PlannedJsDocTypedef {
     properties: Vec<PlannedJsDocProperty>,
     template_parameters: Vec<PlannedJsDocTemplateParameter>,
     source_declaration: Option<NodeRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceJsDocTypedefIdentity {
+    pub(super) owner: NodeRef,
+    pub(super) definition: PlannedJsDocTypedef,
+    shape: SourceJsDocTypedefShape,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SourceJsDocTypedefShape {
+    objects: Vec<SourceJsDocTypedefObject>,
+    unions: Vec<(TypeId, Vec<TypeId>)>,
+    references: Vec<SourceJsDocTypedefReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceJsDocTypedefReference {
+    type_: TypeId,
+    target: Option<TypeId>,
+    arguments: Option<Vec<TypeId>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceJsDocTypedefObject {
+    type_: TypeId,
+    flags: TypeFlags,
+    object_flags: ObjectFlags,
+    symbol: Option<SemanticSymbolId>,
+    alias: Option<TypeAliasId>,
+    object: ObjectTypeData,
+    properties: Vec<SourceJsDocTypedefProperty>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceJsDocTypedefProperty {
+    symbol: SemanticSymbolId,
+    name: EscapedName,
+    flags: SymbolFlags,
+    check_flags: CheckFlags,
+    links: ValueSymbolLinks,
 }
 
 /// One synthetic `JSDoc` callback signature, separate from its host function.
@@ -1781,6 +1822,203 @@ pub fn resolve_planned_jsdoc_type(
         annotation.resolution_type(),
         annotation.range(),
     )
+}
+
+/// Keeps the source identity of an object typedef that has no reparsed alias node.
+pub(super) fn resolve_source_jsdoc_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    owner: NodeRef,
+    annotation: &PlannedJsDocType,
+) -> Result<TypeId, JsDocTypeResolutionError> {
+    let fallback = |store: &mut CanonicalTypeMapperStore| {
+        resolve_planned_jsdoc_type(store, global_types, options, annotation)
+    };
+    let Some(name) = annotation.resolved_alias_name() else {
+        return fallback(store);
+    };
+    if !matches!(annotation.type_(), JsDocType::Named(_)) {
+        return fallback(store);
+    }
+    let invalid = || JsDocTypeResolutionError::ObjectConstruction(annotation.range());
+    let (arena, bound) = host.source(owner).ok_or_else(invalid)?;
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_javascript_file())
+    {
+        return Err(invalid());
+    }
+    let plan = plan_javascript_source_jsdoc(arena, bound.source_file()).map_err(|_| invalid())?;
+    if plan
+        .declaration(owner)
+        .and_then(PlannedJavaScriptDeclaration::type_)
+        != Some(annotation)
+    {
+        return fallback(store);
+    }
+    let Some((definition_owner, definition)) = source_object_typedef(&plan, name) else {
+        return fallback(store);
+    };
+    if let Some(type_) = store.source_jsdoc_typedef_type(definition_owner, definition.range()) {
+        validate_source_jsdoc_typedef_name(store, host, type_).map_err(|()| invalid())?;
+        return Ok(type_);
+    }
+    let Some(definition_type) = definition.type_() else {
+        return Err(invalid());
+    };
+    let JsDocType::ObjectLiteral(properties) =
+        unparenthesized_jsdoc_type(definition_type.resolution_type())
+    else {
+        return Err(invalid());
+    };
+    preflight_planned_jsdoc_type(store, global_types, options, definition_type)?;
+    if !store.try_reserve_source_jsdoc_typedefs(1) {
+        return Err(invalid());
+    }
+    let type_ = resolve_object_type(
+        store,
+        global_types,
+        options,
+        properties,
+        definition_type.range(),
+    )?;
+    let identity = SourceJsDocTypedefIdentity {
+        owner: definition_owner,
+        definition: definition.clone(),
+        shape: source_jsdoc_typedef_shape(store, type_).ok_or_else(invalid)?,
+    };
+    if !store.publish_source_jsdoc_typedef(type_, identity) {
+        return Err(invalid());
+    }
+    Ok(type_)
+}
+
+fn source_object_typedef<'a>(
+    plan: &'a PlannedJavaScriptJsDoc,
+    name: &str,
+) -> Option<(NodeRef, &'a PlannedJsDocTypedef)> {
+    let mut name = name;
+    let mut visited = HashSet::new();
+    while visited.insert(name) {
+        let mut definitions = plan.declarations().iter().flat_map(|declaration| {
+            declaration
+                .typedefs()
+                .iter()
+                .filter(move |definition| definition.name() == name)
+                .map(move |definition| (declaration.node(), definition))
+        });
+        let (owner, definition) = definitions.next()?;
+        if definitions.next().is_some() || !definition.template_parameters().is_empty() {
+            return None;
+        }
+        match unparenthesized_jsdoc_type(definition.type_()?.type_()) {
+            JsDocType::Named(target) => name = target,
+            JsDocType::ObjectLiteral(_) if definition.source_declaration().is_none() => {
+                return Some((owner, definition));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn unparenthesized_jsdoc_type(mut type_: &JsDocType) -> &JsDocType {
+    while let JsDocType::Parenthesized(inner) = type_ {
+        type_ = inner;
+    }
+    type_
+}
+
+/// Rechecks the source definition and stored property identities before displaying its name.
+pub(super) fn validate_source_jsdoc_typedef_name<'store>(
+    store: &'store CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+) -> Result<&'store str, ()> {
+    let identity = store.source_jsdoc_typedef_identity(type_).ok_or(())?;
+    let (arena, bound) = host.source(identity.owner).ok_or(())?;
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_javascript_file())
+    {
+        return Err(());
+    }
+    let plan = plan_javascript_source_jsdoc(arena, bound.source_file()).map_err(|_| ())?;
+    let (owner, definition) = source_object_typedef(&plan, identity.definition.name()).ok_or(())?;
+    if owner != identity.owner
+        || definition != &identity.definition
+        || source_jsdoc_typedef_shape(store, type_).as_ref() != Some(&identity.shape)
+    {
+        return Err(());
+    }
+    Ok(identity.definition.name())
+}
+
+fn source_jsdoc_typedef_shape(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<SourceJsDocTypedefShape> {
+    let mut shape = SourceJsDocTypedefShape::default();
+    let mut pending = vec![type_];
+    let mut visited = HashSet::new();
+    while let Some(type_) = pending.pop() {
+        if !visited.insert(type_) {
+            continue;
+        }
+        let record = store.type_payload(type_)?;
+        match record.data() {
+            TypeData::Object(object) => {
+                let mut properties = Vec::new();
+                for property in object.structured.properties.as_deref().unwrap_or_default() {
+                    let symbol = store.symbol(*property)?;
+                    let links = store.value_symbol_links(*property)?;
+                    let property_type = links.resolved_type?;
+                    properties.push(SourceJsDocTypedefProperty {
+                        symbol: *property,
+                        name: symbol.name().clone(),
+                        flags: symbol.flags(),
+                        check_flags: symbol.check_flags(),
+                        links: links.clone(),
+                    });
+                    pending.push(property_type);
+                }
+                shape.objects.push(SourceJsDocTypedefObject {
+                    type_,
+                    flags: record.flags(),
+                    object_flags: record.object_flags()
+                        & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES),
+                    symbol: record.symbol(),
+                    alias: record.alias(),
+                    object: object.clone(),
+                    properties,
+                });
+            }
+            TypeData::Union(union) => {
+                shape.unions.push((type_, union.union.types.clone()));
+                pending.extend(union.union.types.iter().copied());
+            }
+            TypeData::TypeReference(reference) => {
+                shape.references.push(SourceJsDocTypedefReference {
+                    type_,
+                    target: reference.object.target,
+                    arguments: reference.resolved_type_arguments.clone(),
+                });
+                pending.extend(
+                    reference
+                        .resolved_type_arguments
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .copied(),
+                );
+            }
+            _ => {}
+        }
+    }
+    Some(shape)
 }
 
 /// Validates a nongeneric source-owned `JSDoc` function annotation without publishing a type.

@@ -15,6 +15,7 @@ use ts_binder::{
     SymbolData, SymbolFlags, SymbolStore, SymbolTableId,
     semantic::{PreparedSymbolTable, Symbol, SymbolTable},
 };
+use ts_core::TextRange;
 use ts_parser::{IsolatedEntityName, parse_isolated_entity_name};
 
 use super::{
@@ -29,6 +30,7 @@ use super::{
         TypePredicateId, TypedArena,
     },
     intersection_types::IntersectionTypeCacheKey,
+    jsdoc::SourceJsDocTypedefIdentity,
     links::{
         AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks, AssertionLinks, CheckerLinkStores,
         ContainingSymbolLinks, DeclaredTypeLinks, DecoratorSignatureState, DeferredSymbolLinks,
@@ -499,6 +501,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     direct_interface_heritage_provenance: HashMap<TypeId, DirectInterfaceHeritageProvenance>,
     direct_class_heritage_provenance: HashMap<TypeId, DirectClassHeritageProvenance>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
+    source_jsdoc_typedefs: HashMap<TypeId, SourceJsDocTypedefIdentity>,
     source_callable_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_callable_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
     source_callable_types_by_signature: HashMap<SignatureId, TypeId>,
@@ -602,6 +605,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             direct_interface_heritage_provenance: HashMap::new(),
             direct_class_heritage_provenance: HashMap::new(),
             source_callable_provenance: HashMap::new(),
+            source_jsdoc_typedefs: HashMap::new(),
             source_callable_types_by_declaration: HashMap::new(),
             source_callable_types_by_owner: HashMap::new(),
             source_callable_types_by_signature: HashMap::new(),
@@ -1165,6 +1169,47 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     pub(super) fn try_reserve_types(&mut self, additional: usize) -> bool {
         self.types.try_reserve(additional)
+    }
+
+    pub(super) fn try_reserve_source_jsdoc_typedefs(&mut self, additional: usize) -> bool {
+        self.source_jsdoc_typedefs.try_reserve(additional).is_ok()
+    }
+
+    pub(super) fn source_jsdoc_typedef_type(
+        &self,
+        owner: NodeRef,
+        range: TextRange,
+    ) -> Option<TypeId> {
+        self.source_jsdoc_typedefs
+            .iter()
+            .find_map(|(type_, identity)| {
+                (identity.owner == owner && identity.definition.range() == range).then_some(*type_)
+            })
+    }
+
+    pub(super) fn source_jsdoc_typedef_identity(
+        &self,
+        type_: TypeId,
+    ) -> Option<&SourceJsDocTypedefIdentity> {
+        self.source_jsdoc_typedefs.get(&type_)
+    }
+
+    pub(super) fn publish_source_jsdoc_typedef(
+        &mut self,
+        type_: TypeId,
+        identity: SourceJsDocTypedefIdentity,
+    ) -> bool {
+        if self.types.get(type_).is_none()
+            || self.source_node_kind(identity.owner).is_none()
+            || self.source_jsdoc_typedefs.contains_key(&type_)
+            || self
+                .source_jsdoc_typedef_type(identity.owner, identity.definition.range())
+                .is_some()
+        {
+            return false;
+        }
+        self.source_jsdoc_typedefs.insert(type_, identity);
+        true
     }
 
     pub(super) fn try_reserve_type_aliases(&mut self, additional: usize) -> bool {

@@ -136,7 +136,7 @@ use super::{
         preflight_source_jsdoc_function_type, preflight_source_jsdoc_satisfies_type,
         resolve_planned_jsdoc_callback_signature, resolve_planned_jsdoc_signature,
         resolve_planned_jsdoc_type, resolve_source_jsdoc_function_type,
-        resolve_source_jsdoc_satisfies_signature,
+        resolve_source_jsdoc_satisfies_signature, resolve_source_jsdoc_type,
     },
     logical_operators::{
         LogicalBinaryError, LogicalBinaryInvariant, LogicalBinaryRequest, LogicalBinaryUnsupported,
@@ -49591,10 +49591,12 @@ pub(super) fn check_source_file(
                                 let resolved_annotation = imported_javascript_typedef_annotations
                                     .get(&variable.declaration)
                                     .unwrap_or(annotation);
-                                resolve_planned_jsdoc_type(
+                                resolve_source_jsdoc_type(
                                     store,
+                                    host,
                                     global_types,
                                     options,
+                                    variable.declaration,
                                     resolved_annotation,
                                 )
                                 .map_err(|_| {
@@ -49880,10 +49882,12 @@ pub(super) fn check_source_file(
                                     let annotation = imported_javascript_typedef_annotations
                                         .get(&variable.declaration)
                                         .unwrap_or(annotation);
-                                    resolve_planned_jsdoc_type(
+                                    resolve_source_jsdoc_type(
                                         store,
+                                        host,
                                         global_types,
                                         options,
+                                        variable.declaration,
                                         annotation,
                                     )
                                     .map_err(|_| {
@@ -76320,6 +76324,112 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn qualified_jsdoc_object_typedefs_keep_source_identity_and_alias_names() {
+        let source = parse_javascript_source_file(concat!(
+            "/** @typedef {{ age: number }} People.Model.User */\n",
+            "/** @typedef {People.Model.User} People.User */\n",
+            "/** @typedef {{ age: number }} Other.User */\n",
+            "/** @typedef {number} People.Count */\n",
+            "/** @type {People.Model.User} */ const original = { age: 42 };\n",
+            "/** @type {People.User} */ const same = { age: 7 };\n",
+            "/** @type {Other.User} */ var other;\n",
+            "/** @type {People.Count} */ const count = 1;\n",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_409);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let original = variable_value_type(&context, &source, file, "original");
+        let same = variable_value_type(&context, &source, file, "same");
+        let other = variable_value_type(&context, &source, file, "other");
+        let count = variable_value_type(&context, &source, file, "count");
+        assert_eq!(original, same);
+        assert_ne!(original, other);
+        assert_eq!(
+            context.type_to_string(original).unwrap(),
+            "People.Model.User"
+        );
+        assert_eq!(context.type_to_string(other).unwrap(), "Other.User");
+        assert_eq!(context.type_to_string(count).unwrap(), "number");
+
+        let declaration = variable_declaration(&source, file, "original");
+        let NodeData::VariableDeclaration(variable) =
+            &source.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected the annotated variable")
+        };
+        let initializer = NodeRef::new(source.arena.id(), file, variable.initializer.unwrap());
+        let initializer_type = context.get_type_at_location(initializer).unwrap();
+        assert_eq!(
+            context.type_to_string(initializer_type).unwrap(),
+            "{ age: number; }"
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            variable_value_type(&context, &source, file, "original"),
+            original
+        );
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn qualified_jsdoc_typedef_display_rejects_changed_nested_property_links() {
+        let source = parse_javascript_source_file(concat!(
+            "/** @typedef {{ nested: { label: string } }} Model.Record */\n",
+            "/** @type {Model.Record} */ const value = { nested: { label: 'ok' } };\n",
+        ));
+        let file = FileId::new(8_410);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let type_ = variable_value_type(&context, &source, file, "value");
+        assert_eq!(context.type_to_string(type_).unwrap(), "Model.Record");
+        let nested = context
+            .store()
+            .type_payload(type_)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .properties
+            .as_ref()
+            .unwrap()[0];
+        let nested_type = context
+            .store()
+            .value_symbol_links(nested)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let label = context
+            .store()
+            .type_payload(nested_type)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .properties
+            .as_ref()
+            .unwrap()[0];
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            label,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let before = context.store().type_len();
+        assert!(matches!(
+            context.type_to_string(type_),
+            Err(super::super::formatter::TypeDisplayUnavailable::MalformedType(found)) if found == type_,
+        ));
+        assert_eq!(context.store().type_len(), before);
     }
 
     #[test]
