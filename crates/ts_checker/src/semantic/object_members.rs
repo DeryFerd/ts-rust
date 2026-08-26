@@ -4323,6 +4323,9 @@ fn collect_interface_property_heritage(
             });
         }
         for base in &heritage.bases {
+            if !base.type_arguments.is_empty() {
+                continue;
+            }
             let base_plan = plan_interface(store, host, base.symbol)?;
             if !base_plan.indexes.is_empty() || !base_plan.call_signatures.is_empty() {
                 return Err(PropertyObjectError::UnsupportedMember {
@@ -10045,6 +10048,20 @@ pub(super) fn prepare_direct_interface_declared_properties(
     let TypeData::Interface(interface) = record.data() else {
         return Err(invalid_cache(plan, type_));
     };
+    let reference_identity = validate_nongeneric_interface_argument_origin(store, type_).is_ok();
+    let identity_flags = ObjectFlags::INTERFACE
+        | if reference_identity {
+            ObjectFlags::REFERENCE
+        } else {
+            ObjectFlags::NONE
+        };
+    let object_flags = if reference_identity {
+        record.object_flags()
+            & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
+    } else {
+        record.object_flags()
+    };
     if record.flags() != TypeFlags::OBJECT
         || record.symbol() != Some(plan.symbol)
         || record.alias().is_some()
@@ -10052,14 +10069,26 @@ pub(super) fn prepare_direct_interface_declared_properties(
         || store
             .declared_type_links(plan.symbol)
             .is_none_or(|links| links.declared_type != Some(type_))
-        || !valid_thisless_interface_identity(interface)
+        || !valid_thisless_interface_identity(interface) && !reference_identity
     {
         return Err(invalid_cache(plan, type_));
     }
-    if record.object_flags() == ObjectFlags::INTERFACE
+    let unresolved_members = if reference_identity {
+        interface.reference.object.structured == StructuredTypeData::default()
+            && interface.resolved_base_constructor_type.is_none()
+            && interface.resolved_base_types.is_none()
+            && !interface.declared_members_resolved
+            && interface.declared_members.is_none()
+            && interface.declared_call_signatures.is_none()
+            && interface.declared_construct_signatures.is_none()
+            && interface.declared_index_infos.is_none()
+    } else {
+        valid_unresolved_interface_members(interface)
+    };
+    if object_flags == identity_flags
         && !interface.base_types_resolved
         && store.direct_interface_heritage_provenance(type_).is_none()
-        && valid_unresolved_interface_members(interface)
+        && unresolved_members
         && unresolved_property_links(store, plan)
     {
         return Ok(DirectInterfaceDeclaredState::Unresolved);
@@ -10073,7 +10102,7 @@ pub(super) fn prepare_direct_interface_declared_properties(
                     && expected_declared_property_links(store, plan, property, *type_).as_ref()
                         == store.value_symbol_links(property.symbol)
             });
-    if record.object_flags() == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+    if object_flags == identity_flags | ObjectFlags::MEMBERS_RESOLVED
         && interface.declared_members_resolved
         && interface.declared_members == plan.members
         && interface.declared_call_signatures.is_none()

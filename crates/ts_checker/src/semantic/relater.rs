@@ -42,7 +42,11 @@ use super::{
     },
     ids::{IndexInfoId, SignatureId, TypeId},
     indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
-    instantiated_members::{GenericInterfaceMemberError, validate_generic_interface_members},
+    instantiate::{InstantiationLimits, InstantiationSession},
+    instantiated_members::{
+        GenericInterfaceMemberError, demand_instantiated_property_type,
+        validate_generic_interface_members,
+    },
     intersection_types::IntersectionTypeProjection,
     links::{MembersOrExportsResolutionKind, TypeNodeLinks, ValueSymbolLinks},
     mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
@@ -55,8 +59,8 @@ use super::{
     signatures::{ElementFlags, SignatureFlags, Ternary},
     store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
-        InterfaceHeritageMembersValidation, validate_interface_heritage_members,
-        validate_planned_interface_heritage_members,
+        InterfaceHeritageMembersValidation, inherited_generic_property_reference,
+        validate_interface_heritage_members, validate_planned_interface_heritage_members,
     },
     template_types::StringMappingKind,
     tuple_types::TupleShape,
@@ -520,6 +524,7 @@ pub(super) struct ResolvedOwnProperty {
 #[derive(Clone, Copy)]
 enum ObjectPropertyOrigin {
     Declared,
+    InterfaceHeritage(TypeId),
     ValidatedClass,
     SyntheticStructural(TypeId),
     FiniteMappedRecord(TypeId),
@@ -534,7 +539,10 @@ enum ObjectPropertyOrigin {
 
 impl ObjectPropertyOrigin {
     fn is_declared(self) -> bool {
-        matches!(self, Self::Declared | Self::ValidatedClass)
+        matches!(
+            self,
+            Self::Declared | Self::ValidatedClass | Self::InterfaceHeritage(_)
+        )
     }
 }
 
@@ -609,6 +617,7 @@ struct RelaterSession<'store> {
     global_types: Option<RelationGlobalTypes>,
     strict_function_types: Option<bool>,
     validated_unions: HashMap<TypeId, Vec<TypeId>>,
+    inherited_property_references: HashMap<SemanticSymbolId, TypeId>,
     observation: RelationObservationToken,
     pending: PendingRelationCache,
     maybe_keys: Vec<CacheHashKey>,
@@ -697,6 +706,7 @@ impl<'store> RelaterSession<'store> {
             global_types,
             strict_function_types,
             validated_unions: HashMap::new(),
+            inherited_property_references: HashMap::new(),
             observation,
             pending: PendingRelationCache::default(),
             maybe_keys: Vec::new(),
@@ -3292,9 +3302,8 @@ impl<'store> RelaterSession<'store> {
                         .property_symbol(property, members.property_origin)?
                         .flags()
                         .contains(SymbolFlags::OPTIONAL);
-                    target_types.extend(
-                        self.effective_property_types(self.property_type(property)?, optional)?,
-                    );
+                    let property_type = self.property_type(property)?;
+                    target_types.extend(self.effective_property_types(property_type, optional)?);
                 } else {
                     target_types.push(self.bootstrap.undefined_type);
                 }
@@ -3445,9 +3454,11 @@ impl<'store> RelaterSession<'store> {
             if *source_property == target_property {
                 continue;
             }
+            let source_type = self.property_type(*source_property)?;
+            let target_type = self.property_type(target_property)?;
             let related = self.is_related_to_ex(
-                self.property_type(*source_property)?,
-                self.property_type(target_property)?,
+                source_type,
+                target_type,
                 RecursionFlags::BOTH,
                 IntersectionState::NONE,
             )?;
@@ -3631,8 +3642,9 @@ impl<'store> RelaterSession<'store> {
                 if !self.index_signature_accepts_name(target, &[*target_index], name.as_ref())? {
                     continue;
                 }
+                let property_type = self.property_type(*property)?;
                 let related = self.is_related_to_ex(
-                    self.property_type(*property)?,
+                    property_type,
                     target_value,
                     RecursionFlags::BOTH,
                     intersection_state,
@@ -4191,7 +4203,18 @@ impl<'store> RelaterSession<'store> {
         Ok(result)
     }
 
-    fn property_type(&self, symbol: SemanticSymbolId) -> Result<TypeId, RelationUnavailable> {
+    fn property_type(&mut self, symbol: SemanticSymbolId) -> Result<TypeId, RelationUnavailable> {
+        if let Some(reference) = self.inherited_property_references.get(&symbol).copied() {
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            return demand_instantiated_property_type(
+                self.store,
+                reference,
+                symbol,
+                self.global_types.map(|globals| globals.array_targets),
+                &mut session,
+            )
+            .map_err(|_| RelationUnavailable::UnsupportedProperty(symbol));
+        }
         self.store
             .value_symbol_links(symbol)
             .and_then(|links| links.resolved_type)
@@ -4496,11 +4519,40 @@ impl<'store> RelaterSession<'store> {
             .ok_or(RelationUnavailable::Symbol(global_object))
     }
 
+    fn property_origin_for_symbol(
+        &self,
+        symbol: SemanticSymbolId,
+        origin: ObjectPropertyOrigin,
+    ) -> Result<ObjectPropertyOrigin, RelationUnavailable> {
+        let ObjectPropertyOrigin::InterfaceHeritage(receiver) = origin else {
+            return Ok(origin);
+        };
+        let record = self
+            .store
+            .symbol(symbol)
+            .ok_or(RelationUnavailable::Symbol(symbol))?;
+        if record.flags().contains(SymbolFlags::TRANSIENT)
+            && record.check_flags().contains(CheckFlags::INSTANTIATED)
+        {
+            let reference = inherited_generic_property_reference(
+                self.store,
+                receiver,
+                symbol,
+                self.global_types.map(|globals| globals.array_targets),
+            )
+            .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
+            Ok(ObjectPropertyOrigin::GenericReference(reference))
+        } else {
+            Ok(ObjectPropertyOrigin::Declared)
+        }
+    }
+
     fn property_symbol(
         &mut self,
         symbol: SemanticSymbolId,
         origin: ObjectPropertyOrigin,
     ) -> Result<&ts_binder::semantic::Symbol, RelationUnavailable> {
+        let origin = self.property_origin_for_symbol(symbol, origin)?;
         let record = self
             .store
             .symbol(symbol)
@@ -4704,6 +4756,7 @@ impl<'store> RelaterSession<'store> {
                 };
             }
             ObjectPropertyOrigin::Declared
+            | ObjectPropertyOrigin::InterfaceHeritage(_)
             | ObjectPropertyOrigin::ValidatedClass
             | ObjectPropertyOrigin::GenericReference(_) => {}
         }
@@ -4755,7 +4808,9 @@ impl<'store> RelaterSession<'store> {
                 .ok_or(RelationUnavailable::Symbol(parent))?;
             let allowed_parent_flags = match origin {
                 ObjectPropertyOrigin::ValidatedClass => SymbolFlags::CLASS,
-                ObjectPropertyOrigin::Declared | ObjectPropertyOrigin::GenericReference(_) => {
+                ObjectPropertyOrigin::Declared
+                | ObjectPropertyOrigin::InterfaceHeritage(_)
+                | ObjectPropertyOrigin::GenericReference(_) => {
                     SymbolFlags::INTERFACE | SymbolFlags::TYPE_LITERAL
                 }
                 ObjectPropertyOrigin::FreshObjectLiteral(_)
@@ -5694,6 +5749,14 @@ impl<'store> RelaterSession<'store> {
                 )
             }
             DerivedObjectLiteralValidation::NotDerived
+                if self
+                    .store
+                    .direct_interface_heritage_provenance(type_id)
+                    .is_some() =>
+            {
+                ObjectPropertyOrigin::InterfaceHeritage(type_id)
+            }
+            DerivedObjectLiteralValidation::NotDerived
                 if record_object_flags.intersects(ObjectFlags::REFERENCE)
                     && !record_object_flags.intersects(ObjectFlags::CLASS)
                     && record_symbol
@@ -5775,7 +5838,15 @@ impl<'store> RelaterSession<'store> {
             if !property_set.insert(*property) {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
-            let property_record = self.property_symbol(*property, property_origin)?;
+            let origin = self.property_origin_for_symbol(*property, property_origin)?;
+            if matches!(property_origin, ObjectPropertyOrigin::InterfaceHeritage(_))
+                && let ObjectPropertyOrigin::GenericReference(reference) = origin
+            {
+                self.inherited_property_references
+                    .entry(*property)
+                    .or_insert(reference);
+            }
+            let property_record = self.property_symbol(*property, origin)?;
             if property_origin.is_declared()
                 && property_record.parent() != record_symbol
                 && heritage_members != InterfaceHeritageMembersValidation::Valid

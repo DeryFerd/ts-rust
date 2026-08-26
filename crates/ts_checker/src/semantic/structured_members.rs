@@ -16,6 +16,7 @@ use ts_binder::{
 
 use super::{
     CanonicalTypeMapperStore, IndexInfoId, SignatureId, TypeId,
+    array_types::CanonicalArrayTargets,
     instantiated_members::validate_generic_interface_members,
     links::{
         MembersOrExportsResolutionKind, ResolvedSignatureState, SignatureLinks, ValueSymbolLinks,
@@ -27,7 +28,9 @@ use super::{
         publish_declared_members, publish_prepared_direct_interface_declared_properties,
         resolved_computed_member_key, validate_stored_declared_call_set,
     },
-    reference_types::validate_direct_generic_reference,
+    reference_types::{
+        validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
+    },
     relater::ResolvedOwnProperty,
     signatures::SignatureFlags,
     store::{DirectInterfaceHeritageProvenance, SourceNodeParent},
@@ -68,6 +71,42 @@ fn invalid(plan: &PropertyObjectPlan, type_: TypeId) -> PropertyObjectError {
 
 fn capacity(plan: &PropertyObjectPlan) -> PropertyObjectError {
     PropertyObjectError::Capacity(plan.node)
+}
+
+fn planned_base_matches(
+    store: &CanonicalTypeMapperStore,
+    planned: &super::interface_heritage::DirectInterfaceBasePlan,
+    type_: TypeId,
+) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    if record.symbol() != Some(planned.symbol) {
+        return false;
+    }
+    if planned.type_arguments.is_empty() {
+        return store
+            .declared_type_links(planned.symbol)
+            .and_then(|links| links.declared_type)
+            == Some(type_)
+            && matches!(record.data(), TypeData::Interface(interface)
+                if interface.reference.resolved_type_arguments.as_deref().is_none_or(<[TypeId]>::is_empty));
+    }
+    validate_direct_generic_reference(store, type_).is_ok_and(|reference| {
+        reference.type_arguments.len() == planned.type_arguments.len()
+            && reference
+                .type_arguments
+                .iter()
+                .zip(&planned.type_arguments)
+                .all(|(argument, node)| {
+                    super::object_members::cached_planned_type_identity(store, *node)
+                        == Some(*argument)
+                })
+            && planned.defaults.iter().all(|default| {
+                super::interface_heritage::validate_heritage_default_cache(store, default, true)
+                    .is_ok()
+            })
+    })
 }
 
 fn matching_inherited_property_contract(
@@ -150,7 +189,7 @@ pub(super) fn resolve_direct_interface_members(
         let base_record = store
             .type_payload(base)
             .ok_or_else(|| invalid(plan, type_))?;
-        if base_record.symbol() != Some(planned.symbol) {
+        if !planned_base_matches(store, planned, base) {
             return Err(invalid(plan, type_));
         }
         if base_record.data().structured().is_some_and(|structured| {
@@ -645,31 +684,11 @@ pub(super) fn validate_planned_interface_heritage_members(
     if record.symbol() != Some(plan.symbol)
         || interface.declared_members != plan.members
         || store.direct_interface_heritage_provenance(type_) != Some(expected_provenance)
-        || heritage.bases.iter().zip(base_types).any(|(base, type_)| {
-            store
-                .type_payload(*type_)
-                .and_then(super::type_records::TypeRecord::symbol)
-                != Some(base.symbol)
-                || !base.type_arguments.is_empty()
-                    && !validate_direct_generic_reference(store, *type_).is_ok_and(|reference| {
-                        reference.type_arguments.len() == base.type_arguments.len()
-                            && reference
-                                .type_arguments
-                                .iter()
-                                .zip(&base.type_arguments)
-                                .all(|(argument, node)| {
-                                    super::object_members::cached_planned_type_identity(
-                                        store, *node,
-                                    ) == Some(*argument)
-                                })
-                            && base.defaults.iter().all(|default| {
-                                super::interface_heritage::validate_heritage_default_cache(
-                                    store, default, true,
-                                )
-                                .is_ok()
-                            })
-                    })
-        })
+        || heritage
+            .bases
+            .iter()
+            .zip(base_types)
+            .any(|(base, type_)| !planned_base_matches(store, base, *type_))
     {
         return false;
     }
@@ -772,6 +791,69 @@ fn validate_generic_base_property_interface(
     })
 }
 
+/// Finds the original reference of a proxy borrowed through interface heritage.
+pub(super) fn inherited_generic_property_reference(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+    property: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<TypeId> {
+    if validate_interface_heritage_members(store, receiver)
+        != InterfaceHeritageMembersValidation::Valid
+        || store
+            .type_payload(receiver)?
+            .data()
+            .structured()?
+            .properties
+            .as_deref()
+            .is_none_or(|properties| !properties.contains(&property))
+    {
+        return None;
+    }
+    let property_record = store.symbol(property)?;
+    if !property_record.flags().contains(SymbolFlags::TRANSIENT)
+        || !property_record
+            .check_flags()
+            .contains(CheckFlags::INSTANTIATED)
+    {
+        return None;
+    }
+    let links = store.value_symbol_links(property)?;
+    let target = links.target?;
+    let owner = store.symbol(target)?.parent()?;
+    let owner_type = store.declared_type_links(owner)?.declared_type?;
+    let TypeData::Interface(interface) = store.type_payload(owner_type)?.data() else {
+        return None;
+    };
+    let original = store.map_type(links.mapper?, interface.this_type?)?;
+    let original_members =
+        validate_generic_interface_members(store, original, array_targets).ok()??;
+    if !original_members.properties().contains(&property) {
+        return None;
+    }
+    let mut pending = vec![receiver];
+    let mut seen = HashSet::new();
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        if let Some(heritage) = store.direct_interface_heritage_provenance(current) {
+            if let Some((_, second)) = heritage.second_base {
+                pending.push(second);
+            }
+            pending.push(heritage.base_type);
+        } else if validate_direct_generic_reference(store, current).is_ok()
+            && validate_generic_interface_members(store, current, array_targets)
+                .ok()
+                .flatten()
+                .is_some_and(|members| members.properties().contains(&property))
+        {
+            return Some(original);
+        }
+    }
+    None
+}
+
 fn validate_direct_heritage_property_interface(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -824,7 +906,9 @@ fn validate_property_interface_worker(
         return None;
     }
     let record = store.type_payload(type_)?;
-    if record.object_flags().contains(ObjectFlags::REFERENCE) {
+    let reference_identity =
+        requires_direct_base && validate_nongeneric_interface_argument_origin(store, type_).is_ok();
+    if record.object_flags().contains(ObjectFlags::REFERENCE) && !reference_identity {
         let result = validate_generic_base_property_interface(store, type_);
         assert!(active.remove(&type_));
         return result;
@@ -851,8 +935,21 @@ fn validate_property_interface_worker(
     let owner_declarations = owner_record
         .declarations()
         .filter(|declarations| !declarations.is_empty())?;
+    let identity_flags = ObjectFlags::INTERFACE
+        | if reference_identity {
+            ObjectFlags::REFERENCE
+        } else {
+            ObjectFlags::NONE
+        };
+    let object_flags = if reference_identity {
+        record.object_flags()
+            & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
+    } else {
+        record.object_flags()
+    };
     if record.flags() != TypeFlags::OBJECT
-        || record.object_flags() != ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+        || object_flags != identity_flags | ObjectFlags::MEMBERS_RESOLVED
         || record.alias().is_some()
         || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
         || owner_record.check_flags() != CheckFlags::NONE
@@ -867,7 +964,7 @@ fn validate_property_interface_worker(
         || store
             .declared_type_links(owner)
             .is_none_or(|links| links.declared_type != Some(type_))
-        || !valid_thisless_interface_identity(interface)
+        || !valid_thisless_interface_identity(interface) && !reference_identity
         || !interface.base_types_resolved
         || !interface.declared_members_resolved
         || interface.resolved_base_constructor_type.is_some()
@@ -2313,6 +2410,94 @@ mod tests {
             .symbol(declaration)
             .unwrap();
         fixture.store.get_merged_symbol(raw).unwrap()
+    }
+
+    #[test]
+    fn concrete_base_arguments_are_checked_before_publication() {
+        let mut fixture = fixture_with_source(
+            "interface Base<T> { value: T } interface Derived extends Base<number> {}",
+            861,
+        );
+        let base = interface_symbol(&fixture, "Base");
+        let derived = interface_symbol(&fixture, "Derived");
+        let host = host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let base_type = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            base,
+            SymbolFlags::INTERFACE,
+        )
+        .unwrap()
+        .unwrap();
+        let derived_type = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            derived,
+            SymbolFlags::INTERFACE,
+        )
+        .unwrap()
+        .unwrap();
+        let plan = object_members::plan_interface(&fixture.store, &host, derived).unwrap();
+        let base_plan =
+            object_members::plan_generic_interface(&fixture.store, &host, base).unwrap();
+        let parameter = validate_direct_generic_reference(&fixture.store, base_type)
+            .unwrap()
+            .type_arguments[0];
+        assert!(
+            fixture
+                .store
+                .publish_interface_no_base_resolution(base_type)
+        );
+        object_members::publish_generic_interface_declared_members(
+            &mut fixture.store,
+            &base_plan,
+            base_type,
+            &[parameter],
+        )
+        .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let wrong = fixture
+            .store
+            .create_direct_generic_reference_type(base_type, &[string])
+            .unwrap();
+        fixture
+            .store
+            .resolve_generic_interface_members(wrong, None)
+            .unwrap();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert!(
+            resolve_direct_interface_members(
+                &mut fixture.store,
+                &plan,
+                derived_type,
+                &[],
+                &[wrong]
+            )
+            .is_err()
+        );
+        assert!(
+            fixture
+                .store
+                .direct_interface_heritage_provenance(derived_type)
+                .is_none()
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths()
+            ),
+            before
+        );
     }
 
     fn prepare() -> PreparedFixture {

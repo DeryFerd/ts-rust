@@ -21776,53 +21776,61 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     } else {
                         self.execute_concrete_generic_interface_base(base, plan, prepared)?
                     };
-                    if !base.type_arguments.is_empty() {
-                        let targets = self
-                            .global_types
-                            .as_ref()
-                            .map(CanonicalArrayTargets::from_global_types);
-                        let members =
-                            super::instantiated_members::validate_generic_interface_members(
-                                self.store, type_, targets,
+                    let targets = self
+                        .global_types
+                        .as_ref()
+                        .map(CanonicalArrayTargets::from_global_types);
+                    for property in &interface.properties {
+                        let inherited = self
+                            .store
+                            .type_payload(type_)
+                            .and_then(|record| record.data().structured())
+                            .and_then(|structured| structured.members)
+                            .and_then(|members| self.store.symbol_table(members))
+                            .and_then(|members| members.get_source(&property.name));
+                        if let Some(inherited) = inherited {
+                            let reference = if !base.type_arguments.is_empty() {
+                                Some(type_)
+                            } else if self.store.symbol(inherited).is_some_and(|property| {
+                                property.flags().contains(SymbolFlags::TRANSIENT)
+                                    && property.check_flags().contains(CheckFlags::INSTANTIATED)
+                            }) {
+                                Some(
+                                    structured_members::inherited_generic_property_reference(
+                                        self.store, type_, inherited, targets,
+                                    )
+                                    .ok_or_else(|| {
+                                        property_object_error(
+                                            PropertyObjectError::InvalidCachedInterface {
+                                                symbol: base.symbol,
+                                                type_: type_,
+                                            },
+                                        )
+                                    })?,
+                                )
+                            } else {
+                                None
+                            };
+                            let Some(reference) = reference else {
+                                continue;
+                            };
+                            let mut fallback =
+                                InstantiationSession::new(InstantiationLimits::default());
+                            super::instantiated_members::demand_instantiated_property_type(
+                                self.store,
+                                reference,
+                                inherited,
+                                targets,
+                                self.instantiation_session
+                                    .as_deref_mut()
+                                    .unwrap_or(&mut fallback),
                             )
                             .map_err(|_| {
                                 property_object_error(PropertyObjectError::InvalidCachedInterface {
                                     symbol: base.symbol,
                                     type_: type_,
                                 })
-                            })?
-                            .ok_or_else(|| {
-                                property_object_error(PropertyObjectError::InvalidCachedInterface {
-                                    symbol: base.symbol,
-                                    type_: type_,
-                                })
                             })?;
-                        for property in &interface.properties {
-                            let inherited = members
-                                .members()
-                                .and_then(|members| self.store.symbol_table(members))
-                                .and_then(|members| members.get_source(&property.name));
-                            if let Some(inherited) = inherited {
-                                let mut fallback =
-                                    InstantiationSession::new(InstantiationLimits::default());
-                                super::instantiated_members::demand_instantiated_property_type(
-                                    self.store,
-                                    type_,
-                                    inherited,
-                                    targets,
-                                    self.instantiation_session
-                                        .as_deref_mut()
-                                        .unwrap_or(&mut fallback),
-                                )
-                                .map_err(|_| {
-                                    property_object_error(
-                                        PropertyObjectError::InvalidCachedInterface {
-                                            symbol: base.symbol,
-                                            type_: type_,
-                                        },
-                                    )
-                                })?;
-                            }
                         }
                     }
                     base_types.push(type_);

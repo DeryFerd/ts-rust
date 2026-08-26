@@ -2297,7 +2297,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         AliasTargetState, CanonicalCheckerContext, CanonicalCheckerDiagnostics,
-        CanonicalCheckerOptions, SourceCheckError, TypeData,
+        CanonicalCheckerOptions, TypeData,
         bootstrap::LiteralTypeCacheError,
         production::GlobalMergeCompletion,
         reference_types::{
@@ -4767,28 +4767,79 @@ mod tests {
     }
 
     #[test]
-    fn merged_generic_interface_bases_remain_unsupported_without_publication() {
+    fn merged_generic_interface_bases_preserve_inherited_proxy_identity() {
         let parsed = parse_source_file(concat!(
             "interface Base<T> { first: T }\n",
             "interface Base<T> { second: T }\n",
             "interface Derived extends Base<number> { own: boolean }\n",
+            "interface Leaf extends Derived { first: number; extra: string }\n",
+            "declare const item: Derived;\n",
+            "declare const leaf: Leaf; const leafFirst: number = leaf.first;\n",
+            "const leafSecond: number = leaf.second;\n",
+            "const first: number = item.first; const second: number = item.second;\n",
+            "const own: boolean = item.own;\n",
         ));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(8_402);
         let mut context = checker_context(&parsed, file);
         let base = interface_symbol(&parsed, file, &context, "Base");
         let derived = interface_symbol(&parsed, file, &context, "Derived");
-        let cold = (
+        context.check_source_file(file).unwrap();
+        let base_target = context.get_declared_type_of_symbol(base).unwrap();
+        let target = context.get_declared_type_of_symbol(derived).unwrap();
+        assert!(validate_nongeneric_interface_argument_origin(context.store(), target).is_ok());
+        let TypeData::Interface(interface) = context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("Derived must retain its interface identity")
+        };
+        assert!(interface.this_type.is_some());
+        let [base_reference] = interface.resolved_base_types.as_deref().unwrap() else {
+            panic!("Derived must retain one concrete base")
+        };
+        let base_reference = *base_reference;
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), base_reference)
+                .unwrap()
+                .target,
+            base_target
+        );
+        let properties = interface
+            .reference
+            .object
+            .structured
+            .properties
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            properties
+                .iter()
+                .map(|property| context
+                    .store()
+                    .symbol(*property)
+                    .unwrap()
+                    .name()
+                    .as_utf8()
+                    .unwrap())
+                .collect::<Vec<_>>(),
+            ["own", "first", "second"]
+        );
+        for property in &properties[1..] {
+            let links = context.store().value_symbol_links(*property).unwrap();
+            assert!(links.target.is_some());
+            assert!(links.mapper.is_some());
+            assert_eq!(
+                links.resolved_type,
+                Some(context.store().intrinsic_bootstrap().unwrap().number_type)
+            );
+        }
+        let warm = (
             context.store().type_len(),
             context.store().signature_len(),
             context.store().symbol_store().symbol_table_len(),
             context.store().checker_link_allocated_lengths(),
         );
 
-        assert!(matches!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(_))
-        ));
+        context.recheck_source_file(file).unwrap();
         assert_eq!(
             (
                 context.store().type_len(),
@@ -4796,10 +4847,82 @@ mod tests {
                 context.store().symbol_store().symbol_table_len(),
                 context.store().checker_link_allocated_lengths(),
             ),
-            cold,
+            warm,
         );
-        assert!(context.store().declared_type_links(base).is_none());
-        assert!(context.store().declared_type_links(derived).is_none());
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn inherited_generic_property_reads_reject_proxy_cache_poison() {
+        let parsed = parse_source_file(concat!(
+            "interface Base<T> { value: T; } ",
+            "interface Derived extends Base<number> {} ",
+            "declare const item: Derived; const value: number = item.value;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_553);
+        let mut context = checker_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let owner = interface_symbol(&parsed, file, &context, "Derived");
+        let target = context.get_declared_type_of_symbol(owner).unwrap();
+        let property = context
+            .store_mut_for_test()
+            .resolved_own_property(target, "value")
+            .unwrap()
+            .unwrap()
+            .symbol;
+        let original = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .clone();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for poison_mapper in [false, true] {
+            let mut poisoned = original.clone();
+            if poison_mapper {
+                poisoned.mapper = None;
+            } else {
+                poisoned.resolved_type = Some(string);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, poisoned)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .resolved_own_property(target, "value")
+                    .is_err()
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                warm
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, original.clone())
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolved_own_property(target, "value")
+                    .unwrap()
+                    .unwrap()
+                    .symbol,
+                property
+            );
+        }
         assert!(context.diagnostics().is_empty());
     }
 }
