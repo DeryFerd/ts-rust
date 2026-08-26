@@ -662,12 +662,14 @@ fn validated_conditional_production(
     let TypeData::Conditional(data) = record.data() else {
         return Err(invalid());
     };
+    // Deferred production currently leaves combined_mapper unset.
     if record.flags() != TypeFlags::CONDITIONAL
         || record.symbol().is_some()
         || data.root != proof.definition.root
         || data.check_type != proof.check_type
         || data.extends_type != proof.extends_type
         || data.mapper != proof.mapper
+        || data.combined_mapper.is_some()
         || retain_conditional_alias(store, record.alias())? != proof.alias
     {
         return Err(invalid());
@@ -6348,6 +6350,98 @@ mod tests {
         let before = conditional_allocation_counts(&fixture.store);
         assert!(!fixture.store.publish_conditional_type_production(proof));
         assert_eq!(conditional_allocation_counts(&fixture.store), before);
+    }
+
+    #[test]
+    fn conditional_alias_rejects_unexpected_combined_mapper_without_writes() {
+        let mut fixture = Fixture::new(concat!(
+            "type Select<T> = T extends string ? T : never; ",
+            "type Forward<U> = Select<U>;",
+        ));
+        let forwarded = fixture.declared_alias("Forward");
+        let parameter = fixture.type_parameter("U");
+        let original = conditional_snapshot(&fixture.store, forwarded).unwrap();
+        assert!(original.combined_mapper.is_none());
+        let root = original.root;
+        let checked = fixture.store.conditional_root(root).unwrap().check_type();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (number, never) = (bootstrap.number_type, bootstrap.never_type);
+        let unexpected = fixture
+            .store
+            .new_simple_type_mapper(checked, number)
+            .unwrap();
+        assert!(fixture.store.set_conditional_resolution(
+            forwarded,
+            original.resolved_true_type,
+            original.resolved_false_type,
+            original.resolved_inferred_true_type,
+            original.resolved_default_constraint,
+            original.resolved_constraint_of_distributive,
+            original.mapper,
+            Some(unexpected),
+        ));
+        let forward_symbol = fixture.alias_symbol("Forward");
+        let select_symbol = fixture.alias_symbol("Select");
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            let TypeData::Conditional(data) = store.type_payload(forwarded).unwrap().data() else {
+                panic!("the forwarded type must retain its conditional payload");
+            };
+            (
+                conditional_allocation_counts(store),
+                store.checker_link_allocated_lengths(),
+                store.type_resolution_len(),
+                store.type_resolution_start(),
+                data.clone(),
+                store
+                    .conditional_root(root)
+                    .unwrap()
+                    .instantiations()
+                    .clone(),
+                store.type_alias_links(forward_symbol).cloned(),
+                store.type_alias_links(select_symbol).cloned(),
+            )
+        };
+        let before = snapshot(&fixture.store);
+        assert_eq!(
+            conditional_alias_projection(&fixture.store, forwarded),
+            Err(ConditionalTypeError::InvalidConditional(forwarded))
+        );
+        assert_eq!(snapshot(&fixture.store), before);
+        assert!(fixture.try_declared_alias("Forward").is_err());
+        assert_eq!(snapshot(&fixture.store), before);
+        assert_eq!(
+            get_inferred_true_type_from_conditional_type(
+                &mut fixture.store,
+                forwarded,
+                branches(checked, never),
+                None,
+                None,
+            ),
+            Err(ConditionalTypeError::InvalidConditional(forwarded))
+        );
+        assert_eq!(snapshot(&fixture.store), before);
+
+        assert!(fixture.store.set_conditional_resolution(
+            forwarded,
+            original.resolved_true_type,
+            original.resolved_false_type,
+            original.resolved_inferred_true_type,
+            original.resolved_default_constraint,
+            original.resolved_constraint_of_distributive,
+            original.mapper,
+            original.combined_mapper,
+        ));
+        assert_eq!(fixture.declared_alias("Forward"), forwarded);
+        assert_eq!(
+            get_inferred_true_type_from_conditional_type(
+                &mut fixture.store,
+                forwarded,
+                branches(checked, never),
+                None,
+                None,
+            ),
+            Ok(parameter)
+        );
     }
 
     #[test]
