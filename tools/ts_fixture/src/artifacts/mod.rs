@@ -137,9 +137,7 @@ fn source_files<'a>(
     // The pinned compiler runner writes toBeCompiled, then otherFiles. Both
     // groups retain fixture order, independent of the Program's load order.
     if let Some(config) = pinned_project_config(case) {
-        // Project files are selected before harness option overrides apply.
-        let options = ts_options::parse_project_options(&config).options;
-        let roots = project_root_unit_indices(case, &config, &options);
+        let roots = project_root_unit_indices(case, &config);
         order.sort_by_key(|index| !roots.contains(index));
     } else if config_path.is_none()
         && (case

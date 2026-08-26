@@ -2788,14 +2788,7 @@ fn error_baseline_unit_order(case: &Case) -> (Vec<usize>, Vec<String>) {
     if let Some(&config_index) = config_indices.first() {
         let mut issues = project_configuration_unsupported_details(case);
         let roots = pinned_project_config(case)
-            .map(|config| {
-                let variant = expand_option_matrix(case)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
-                let options = fixture_compiler_options(case, &variant);
-                project_root_unit_indices(case, &config, &options)
-            })
+            .map(|config| project_root_unit_indices(case, &config))
             .unwrap_or_default();
         if config_indices.len() > 1 {
             issues.push(
@@ -4670,7 +4663,7 @@ fn compile_case_variant(
                 )
         });
     if let Some(config) = pinned_project_config(case) {
-        roots = project_root_unit_indices(case, &config, &compiler_options)
+        roots = project_root_unit_indices(case, &config)
             .into_iter()
             .map(|index| virtual_unit_path(case, &case.units[index], index))
             .collect();
@@ -5287,11 +5280,9 @@ fn project_json_value(value: &ts_config::JsonValue) -> Option<serde_json::Value>
     }
 }
 
-fn project_root_unit_indices(
-    case: &Case,
-    config: &ts_config::ProjectConfig,
-    options: &ts_options::CompilerOptions,
-) -> Vec<usize> {
+fn project_root_unit_indices(case: &Case, config: &ts_config::ProjectConfig) -> Vec<usize> {
+    // The pinned runner selects project files before applying harness options.
+    let options = ts_options::parse_project_options(config).options;
     let directory = config
         .path
         .rsplit_once('/')
@@ -7718,6 +7709,58 @@ mod tests {
         let (order, issues) = error_baseline_unit_order(&case);
         assert!(issues.is_empty(), "{issues:?}");
         assert_eq!(order, [0, 2, 1]);
+    }
+
+    #[test]
+    fn project_config_inputs_precede_harness_allow_js_overrides() {
+        let case = Case::parse(
+            "projectOverrides.ts",
+            concat!(
+                "// @allowJs: true\n",
+                "// @checkJs: true\n",
+                "// @noEmit: true\n",
+                "// @filename: unreferenced.js\n",
+                "missingFromUnreferencedFile;\n",
+                "// @filename: tsconfig.json\n",
+                "{}\n",
+                "// @filename: entry.ts\n",
+                "export const entry = 1;\n",
+            ),
+        )
+        .unwrap();
+        let (order, issues) = error_baseline_unit_order(&case);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(order, [1, 2, 0]);
+
+        for checker in [FixtureChecker::Legacy, FixtureChecker::Canonical] {
+            let mut variant = expand_option_matrix(&case).remove(0);
+            assert!(fixture_compiler_options(&case, &variant).allow_js);
+            let compilation = super::compile_case_variant(
+                &case,
+                &mut variant,
+                checker,
+                checker == FixtureChecker::Canonical,
+            )
+            .unwrap();
+            assert!(variant.unsupported_details.is_empty());
+            assert!(
+                compilation.diagnostics.is_empty(),
+                "{checker:?}: {:?}",
+                compilation.diagnostics
+            );
+            if let Some(artifacts) = compilation.semantic_artifacts {
+                for baseline in [artifacts.types, artifacts.symbols] {
+                    let baseline = baseline.unwrap();
+                    assert_eq!(
+                        baseline
+                            .lines()
+                            .filter(|line| line.starts_with("=== "))
+                            .collect::<Vec<_>>(),
+                        ["=== entry.ts ==="],
+                    );
+                }
+            }
+        }
     }
 
     #[test]
