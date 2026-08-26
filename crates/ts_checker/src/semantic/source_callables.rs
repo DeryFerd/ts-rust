@@ -3649,7 +3649,7 @@ fn function_array_parameter_type_node(
         );
         let annotation_record = host.node(annotation)?;
         if function_record.parent != Some(source.node)
-            || function.parameters.nodes.as_slice() != [parameter.node]
+            || !function.parameters.nodes.contains(&parameter.node)
             || initializer_record.kind != SyntaxKind::Identifier
             || initializer_record.flags.0 != 0
             || initializer_record.parent != Some(parameter.node)
@@ -3657,6 +3657,10 @@ fn function_array_parameter_type_node(
             || initializer_name.text.is_empty()
             || bound.container(initializer) != Some(declaration)
             || bound.block_scope_container(initializer) != Some(declaration)
+            || bound
+                .locals(declaration)
+                .and_then(|locals| store.symbol_table(locals))
+                .is_none_or(|locals| locals.get_source(&initializer_name.text).is_some())
             || store.get_merged_symbol(symbol) != Some(symbol)
             || owner.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
             || owner.check_flags() != CheckFlags::NONE
@@ -10105,12 +10109,22 @@ pub(super) fn source_callable_display_projection(
         .signature(signature)
         .ok_or(SourceCallableDisplayError::Malformed)?
         .resolved_return_type();
+    let minimum = usize::try_from(plan.min_argument_count)
+        .map_err(|_| SourceCallableDisplayError::Malformed)?;
     let mut parameters = Vec::with_capacity(plan.parameters.len());
-    for parameter in &plan.parameters {
-        let value_type = store
-            .value_symbol_links(parameter.symbol)
-            .and_then(|links| links.resolved_type)
-            .ok_or(SourceCallableDisplayError::Malformed)?;
+    for (index, parameter) in plan.parameters.iter().enumerate() {
+        let optional = parameter.optional || parameter.initializer.is_some() && index >= minimum;
+        let value_type = if parameter.initializer.is_some() && !optional {
+            store
+                .callable_signature_parameter_types(signature)
+                .and_then(|types| types.get(index))
+                .copied()
+        } else {
+            store
+                .value_symbol_links(parameter.symbol)
+                .and_then(|links| links.resolved_type)
+        }
+        .ok_or(SourceCallableDisplayError::Malformed)?;
         let parameter_node = host
             .node(parameter.declaration)
             .ok_or(SourceCallableDisplayError::Malformed)?;
@@ -10171,7 +10185,7 @@ pub(super) fn source_callable_display_projection(
         parameters.push(ValidatedSingleCallParameterDisplay {
             name,
             value_type,
-            optional: parameter.optional || parameter.initializer.is_some(),
+            optional,
         });
     }
     Ok(ValidatedSingleCallSignatureDisplay {
@@ -15636,6 +15650,8 @@ mod tests {
             "var results: any; function select([, first] = results) {}",
             "var results: string[]; function select([first] = results) {}",
             "function select([, first] = results) {} var results: string[];",
+            "var results: string[]; function select([, results] = results) {}",
+            "var results: string[]; function select([, first] = results, results: number) {}",
         ]
         .into_iter()
         .enumerate()

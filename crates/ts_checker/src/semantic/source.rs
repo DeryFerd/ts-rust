@@ -87308,6 +87308,72 @@ class Foo2 {
     }
 
     #[test]
+    fn defaulted_array_parameters_before_required_parameters_keep_call_site_types() {
+        for (index, (annotation, strict)) in [
+            (": string[]", false),
+            (": string[]", true),
+            ("", false),
+            ("", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let library = parsed("interface Array<T> { [index: number]: T; }");
+            let source = parsed(&format!(
+                "var results: string[]; function select([, second]{annotation} = results, required: number): void {{}}",
+            ));
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(10_064 + offset);
+            let file = FileId::new(10_065 + offset);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions {
+                    no_implicit_any: true,
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: strict,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let owner = function_symbol(&context, &source, file, "select");
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .min_argument_count(),
+                2
+            );
+            assert_eq!(
+                context.type_to_string(callable).unwrap(),
+                if strict {
+                    "([, second]: string[] | undefined, required: number) => void"
+                } else {
+                    "([, second]: string[], required: number) => void"
+                },
+            );
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
     fn initialized_array_parameters_preserve_the_one_lexical_source_diagnostic() {
         let library = parsed("interface Array<T> { [index: number]: T; }");
         let source = parsed(concat!(
