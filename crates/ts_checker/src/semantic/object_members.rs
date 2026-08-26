@@ -8325,7 +8325,7 @@ fn plan_call_signature(
     })
 }
 
-fn plan_index_signature(
+pub(super) fn plan_index_signature(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     owner: NodeRef,
