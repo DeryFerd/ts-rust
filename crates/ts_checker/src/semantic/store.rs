@@ -180,9 +180,10 @@ pub(super) struct SourceCallableInferredReturnCycle {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CircularReturnProvenance {
+enum SignatureReturnProvenance {
     Annotation(TypeId),
-    Inferred(SourceCallableInferredReturnCycle),
+    RecoveredInferred(SourceCallableInferredReturnCycle),
+    InvalidatedRecovery(SourceCallableInferredReturnCycle),
 }
 
 impl SourceCallableFamily {
@@ -509,7 +510,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     properties_types: HashMap<PropertiesTypeCacheKey, TypeId>,
     function_signature_return_annotations: HashMap<SignatureId, (NodeRef, bool)>,
     callable_signature_parameter_types: HashMap<SignatureId, Vec<TypeId>>,
-    circular_return_signatures: HashMap<SignatureId, CircularReturnProvenance>,
+    checked_source_callable_returns: HashMap<SignatureId, TypeId>,
+    signature_return_provenance: HashMap<SignatureId, SignatureReturnProvenance>,
     canonical_tuple_targets: HashMap<CanonicalTupleTargetKey, CanonicalTupleTargetProvenance>,
     canonical_empty_tuple: Option<CanonicalEmptyTupleProvenance>,
     pub(super) intersection_types: HashMap<IntersectionTypeCacheKey, TypeId>,
@@ -601,7 +603,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             properties_types: HashMap::new(),
             function_signature_return_annotations: HashMap::new(),
             callable_signature_parameter_types: HashMap::new(),
-            circular_return_signatures: HashMap::new(),
+            checked_source_callable_returns: HashMap::new(),
+            signature_return_provenance: HashMap::new(),
             canonical_tuple_targets: HashMap::new(),
             canonical_empty_tuple: None,
             intersection_types: HashMap::new(),
@@ -1198,6 +1201,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .is_ok()
             && self
                 .source_callable_type_parameters
+                .try_reserve(additional)
+                .is_ok()
+            && self
+                .checked_source_callable_returns
                 .try_reserve(additional)
                 .is_ok()
     }
@@ -3786,8 +3793,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 (current != &links, current.resolved_symbol.is_some())
             });
         let changes_recovery = changed
-            && (published || self.circular_return_signatures.values().any(|provenance| {
-                matches!(provenance, CircularReturnProvenance::Inferred(cycle)
+            && (published || self.signature_return_provenance.values().any(|provenance| {
+                matches!(provenance,
+                    SignatureReturnProvenance::RecoveredInferred(cycle)
+                        | SignatureReturnProvenance::InvalidatedRecovery(cycle)
                     if [cycle.declaration, cycle.body, cycle.query, cycle.query_name].contains(&node))
             }));
         let relation_dirty = self.relation_observable_nodes.contains(&node) && changed;
@@ -5722,7 +5731,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
         let dirty = self.signature_is_callable(id);
         let relation_observable = self.relation_signature_is_observable(id);
-        let had_circular_provenance = self.circular_return_signatures.contains_key(&id);
+        let had_circular_provenance = self.signature_has_circular_return_type(id);
         let relation_dirty = relation_observable
             && (had_circular_provenance
                 || self
@@ -5731,7 +5740,18 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.signatures.set_resolved_return_type(id, type_id) {
             return false;
         }
-        let cleared_circular_provenance = self.circular_return_signatures.remove(&id).is_some();
+        let cleared_circular_provenance = match self.signature_return_provenance.get(&id).copied() {
+            Some(SignatureReturnProvenance::Annotation(_)) => {
+                self.signature_return_provenance.remove(&id);
+                true
+            }
+            Some(SignatureReturnProvenance::RecoveredInferred(cycle)) => {
+                self.signature_return_provenance
+                    .insert(id, SignatureReturnProvenance::InvalidatedRecovery(cycle));
+                true
+            }
+            _ => false,
+        };
         debug_assert_eq!(cleared_circular_provenance, had_circular_provenance);
         if relation_dirty {
             self.mark_relation_inputs_dirty();
@@ -5743,21 +5763,31 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub(super) fn try_reserve_circular_return_signatures(&mut self, additional: usize) -> bool {
-        self.circular_return_signatures
+        self.signature_return_provenance
             .try_reserve(additional)
             .is_ok()
+            && self
+                .checked_source_callable_returns
+                .try_reserve(additional)
+                .is_ok()
     }
 
     pub(super) fn signature_has_circular_return_type(&self, id: SignatureId) -> bool {
         self.observe_relation_signature_read(id);
-        self.circular_return_signatures.contains_key(&id)
+        matches!(
+            self.signature_return_provenance.get(&id),
+            Some(
+                SignatureReturnProvenance::Annotation(_)
+                    | SignatureReturnProvenance::RecoveredInferred(_)
+            )
+        )
     }
 
     pub(super) fn circular_return_annotation_type(&self, id: SignatureId) -> Option<TypeId> {
         self.observe_relation_signature_read(id);
-        match self.circular_return_signatures.get(&id)? {
-            CircularReturnProvenance::Annotation(type_) => Some(*type_),
-            CircularReturnProvenance::Inferred(_) => None,
+        match self.signature_return_provenance.get(&id)? {
+            SignatureReturnProvenance::Annotation(type_) => Some(*type_),
+            _ => None,
         }
     }
 
@@ -5766,10 +5796,71 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         id: SignatureId,
     ) -> Option<SourceCallableInferredReturnCycle> {
         self.observe_relation_signature_read(id);
-        match self.circular_return_signatures.get(&id)? {
-            CircularReturnProvenance::Inferred(cycle) => Some(*cycle),
-            CircularReturnProvenance::Annotation(_) => None,
+        match self.signature_return_provenance.get(&id)? {
+            SignatureReturnProvenance::RecoveredInferred(cycle) => Some(*cycle),
+            _ => None,
         }
+    }
+
+    /// Returns the checked identity, independently of mutable signature caches.
+    pub(super) fn checked_source_callable_return_type(&self, id: SignatureId) -> Option<TypeId> {
+        self.observe_relation_signature_read(id);
+        self.checked_source_callable_returns.get(&id).copied()
+    }
+
+    pub(super) fn source_callable_return_was_recovered(&self, id: SignatureId) -> bool {
+        self.observe_relation_signature_read(id);
+        matches!(
+            self.signature_return_provenance.get(&id),
+            Some(
+                SignatureReturnProvenance::RecoveredInferred(_)
+                    | SignatureReturnProvenance::InvalidatedRecovery(_)
+            )
+        )
+    }
+
+    /// Publishes the checked return once. Raw cache writes cannot replace this identity.
+    pub(super) fn set_source_callable_inferred_return_type(
+        &mut self,
+        id: SignatureId,
+        type_: TypeId,
+    ) -> bool {
+        let provenance = self
+            .source_callable_types_by_signature
+            .get(&id)
+            .and_then(|callable| self.source_callable_provenance.get(callable));
+        if self.types.get(type_).is_none()
+            || provenance.is_none_or(|provenance| {
+                provenance.return_provenance != SourceCallableReturnProvenance::Inferred
+            })
+            || self.function_signature_return_annotations.contains_key(&id)
+        {
+            return false;
+        }
+        let Some(signature) = self.signatures.get(id) else {
+            return false;
+        };
+        if self.signature_return_provenance.contains_key(&id) {
+            return false;
+        }
+        if let Some(existing) = self.checked_source_callable_returns.get(&id) {
+            return *existing == type_ && signature.resolved_return_type() == Some(type_);
+        }
+        if signature
+            .resolved_return_type()
+            .is_some_and(|existing| existing != type_)
+            || self.checked_source_callable_returns.try_reserve(1).is_err()
+        {
+            return false;
+        }
+        self.checked_source_callable_returns.insert(id, type_);
+        let published = self.signatures.set_resolved_return_type(id, Some(type_));
+        debug_assert!(published, "the inferred return signature was validated");
+        if self.relation_signature_is_observable(id) {
+            self.mark_relation_inputs_dirty();
+        }
+        self.mark_union_cache_validation_dirty();
+        true
     }
 
     fn invalidate_inferred_return_cycles_for_node(
@@ -5778,11 +5869,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         published_type: Option<TypeId>,
     ) {
         let signatures = self
-            .circular_return_signatures
+            .signature_return_provenance
             .iter()
             .filter_map(|(signature, provenance)| {
-                let CircularReturnProvenance::Inferred(cycle) = provenance else {
-                    return None;
+                let cycle = match provenance {
+                    SignatureReturnProvenance::RecoveredInferred(cycle)
+                    | SignatureReturnProvenance::InvalidatedRecovery(cycle) => cycle,
+                    _ => return None,
                 };
                 if node == cycle.declaration && published_type == Some(cycle.callable) {
                     return None;
@@ -5805,7 +5898,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     fn invalidate_inferred_return_cycles(&mut self, signatures: &[SignatureId]) {
         for signature in signatures {
-            self.circular_return_signatures.remove(signature);
+            self.signature_return_provenance.remove(signature);
+            self.checked_source_callable_returns.remove(signature);
             let cleared = self.signatures.set_resolved_return_type(*signature, None);
             debug_assert!(cleared, "a retained cycle owns its signature");
         }
@@ -5821,11 +5915,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         published_type: Option<TypeId>,
     ) {
         let signatures = self
-            .circular_return_signatures
+            .signature_return_provenance
             .iter()
             .filter_map(|(signature, provenance)| {
-                let CircularReturnProvenance::Inferred(cycle) = provenance else {
-                    return None;
+                let cycle = match provenance {
+                    SignatureReturnProvenance::RecoveredInferred(cycle)
+                    | SignatureReturnProvenance::InvalidatedRecovery(cycle) => cycle,
+                    _ => return None,
                 };
                 let owner = self
                     .source_callable_provenance
@@ -5865,12 +5961,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             && self
                 .signature(id)
                 .is_some_and(|signature| signature.resolved_return_type().is_none())
-            && !self.circular_return_signatures.contains_key(&id);
+            && !self.signature_return_provenance.contains_key(&id)
+            && !self.checked_source_callable_returns.contains_key(&id);
         if !valid {
             return false;
         }
-        self.circular_return_signatures
-            .insert(id, CircularReturnProvenance::Inferred(cycle));
+        self.signature_return_provenance
+            .insert(id, SignatureReturnProvenance::RecoveredInferred(cycle));
+        self.checked_source_callable_returns.insert(id, any);
         let published = self.signatures.set_resolved_return_type(id, Some(any));
         debug_assert!(published, "the inferred source signature was validated");
         if self.relation_signature_is_observable(id) {
@@ -5896,13 +5994,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             && self
                 .signature(id)
                 .is_some_and(|signature| signature.resolved_return_type().is_none())
-            && !self.circular_return_signatures.contains_key(&id);
+            && !self.signature_return_provenance.contains_key(&id);
         if !valid {
             return false;
         }
         let previous = self
-            .circular_return_signatures
-            .insert(id, CircularReturnProvenance::Annotation(annotation_type));
+            .signature_return_provenance
+            .insert(id, SignatureReturnProvenance::Annotation(annotation_type));
         assert!(
             previous.is_none(),
             "the circular-return marker was checked absent"

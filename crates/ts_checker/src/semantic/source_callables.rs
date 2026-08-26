@@ -7369,6 +7369,9 @@ pub(super) fn source_callable_state(
     if is_barrier {
         if !allow_active_barrier
             || resolved_return_type.is_some()
+            || store
+                .checked_source_callable_return_type(signature)
+                .is_some()
             || published_parameter_types.is_some()
             || plan
                 .parameters
@@ -7405,6 +7408,9 @@ pub(super) fn source_callable_state(
     {
         if !allow_active_barrier
             || resolved_return_type.is_some()
+            || store
+                .checked_source_callable_return_type(signature)
+                .is_some()
             || published_parameter_types.is_some()
         {
             return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
@@ -8483,6 +8489,7 @@ fn publish_prepared_contextual_source_callable(
             contextual_variable: prepared.variable_symbol,
         },
     ));
+    assert!(store.set_source_callable_inferred_return_type(signature, prepared.return_type));
     assert!(store.set_value_symbol_links(
         prepared.owner_symbol,
         ValueSymbolLinks {
@@ -8979,9 +8986,7 @@ fn publish_ambient_implicit_any_return(
             plan.declaration,
         )));
     }
-    if record.resolved_return_type().is_none()
-        && !store.set_signature_resolved_return_type(signature, Some(any_type))
-    {
+    if !store.set_source_callable_inferred_return_type(signature, any_type) {
         return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
             plan.declaration,
         )));
@@ -9423,6 +9428,32 @@ pub(super) fn validate_inferred_source_callable_return(
         .resolved_return_type())
 }
 
+fn inferred_return_cache_is_exact(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+) -> bool {
+    let resolved = store
+        .signature(signature)
+        .and_then(Signature::resolved_return_type);
+    match (
+        store.checked_source_callable_return_type(signature),
+        resolved,
+    ) {
+        (None, None) => {
+            !store.signature_has_circular_return_type(signature)
+                && !store.source_callable_return_was_recovered(signature)
+        }
+        (Some(expected), Some(actual)) if expected == actual => {
+            if store.source_callable_return_was_recovered(signature) {
+                validate_stored_inferred_return_cycle(store, signature).is_some()
+            } else {
+                !store.signature_has_circular_return_type(signature)
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Proves the untouched interface shell retained for inherited global JSX.Element.
 fn canonical_lazy_global_jsx_element_return(
     store: &CanonicalTypeMapperStore,
@@ -9591,7 +9622,7 @@ pub(super) fn publish_inferred_source_callable_return(
             plan.declaration,
         )));
     }
-    let published = store.set_signature_resolved_return_type(signature, Some(return_type));
+    let published = store.set_source_callable_inferred_return_type(signature, return_type);
     assert!(
         published,
         "inferred source return publication was prevalidated"
@@ -9700,6 +9731,8 @@ pub(super) fn validate_stored_inferred_return_cycle(
             .signature(signature)
             .and_then(Signature::resolved_return_type)
             == Some(bootstrap.any_type)
+            && store.checked_source_callable_return_type(signature) == Some(bootstrap.any_type)
+            && store.source_callable_return_was_recovered(signature)
     }) && inferred_return_cycle_graph_is_exact(store, signature, cycle))
     .then_some(cycle)
 }
@@ -10028,7 +10061,11 @@ pub(super) fn validate_stored_source_callable(
     let return_annotation = store.function_signature_return_annotation(signature);
     let return_provenance_valid = match provenance.return_provenance {
         SourceCallableReturnProvenance::Annotated => {
-            contextual.is_none() && return_annotation.is_some()
+            contextual.is_none()
+                && return_annotation.is_some()
+                && store
+                    .checked_source_callable_return_type(signature)
+                    .is_none()
         }
         SourceCallableReturnProvenance::Inferred => {
             return_annotation.is_none()
@@ -10040,8 +10077,7 @@ pub(super) fn validate_stored_source_callable(
                             &type_parameter_edges,
                         ))
                 && provenance.generic_return_type_parameter.is_none()
-                && (!store.signature_has_circular_return_type(signature)
-                    || validate_stored_inferred_return_cycle(store, signature).is_some())
+                && inferred_return_cache_is_exact(store, signature)
         }
     };
     let mut edges =
@@ -11373,6 +11409,7 @@ fn validate_cached_return_type(
             && plan.type_parameters.is_empty()
             && stored_annotation.is_none()
             && circular_annotation.is_none()
+            && inferred_return_cache_is_exact(store, signature)
             && resolved.is_none_or(|type_| {
                 store
                     .intrinsic_bootstrap()
@@ -11400,8 +11437,7 @@ fn validate_cached_return_type(
         });
         let valid = stored_annotation.is_none()
             && circular_annotation.is_none()
-            && (!store.signature_has_circular_return_type(signature)
-                || validate_stored_inferred_return_cycle(store, signature).is_some())
+            && inferred_return_cache_is_exact(store, signature)
             && (plan.type_parameters.is_empty()
                 || valid_inferred_generic_source_callable(store, plan))
             && resolved_valid;

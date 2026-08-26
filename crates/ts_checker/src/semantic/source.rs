@@ -68701,6 +68701,101 @@ mod tests {
     }
 
     #[test]
+    fn recursive_arrow_checked_returns_cover_all_inferred_publishers() {
+        for text in [
+            "const value = () => 1;",
+            "const value = () => 42 satisfies typeof value;",
+            "const value: () => number = () => 1;",
+            "declare function value();",
+            "function value<T>() {}",
+        ] {
+            let source = parsed(text);
+            let file = FileId::new(9_795);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(
+                        record.kind,
+                        SyntaxKind::ArrowFunction | SyntaxKind::FunctionDeclaration
+                    )
+                    .then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_declaration(declaration)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let expected = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type()
+                .unwrap();
+            let recovered = context
+                .store()
+                .source_callable_return_was_recovered(signature);
+            assert_eq!(
+                context
+                    .store()
+                    .checked_source_callable_return_type(signature),
+                Some(expected),
+                "{text}"
+            );
+            assert!(
+                matches!(
+                    validate_stored_source_callable(context.store(), callable),
+                    StoredSourceCallableValidation::Valid(_)
+                ),
+                "{text}"
+            );
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let wrong = if expected == bootstrap.number_type {
+                bootstrap.string_type
+            } else {
+                bootstrap.number_type
+            };
+            for replacement in [Some(wrong), None, Some(expected)] {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_resolved_return_type(signature, replacement)
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .checked_source_callable_return_type(signature),
+                    Some(expected),
+                    "{text}"
+                );
+                assert!(
+                    context
+                        .store()
+                        .inferred_source_return_cycle(signature)
+                        .is_none(),
+                    "{text}"
+                );
+                let actual = validate_stored_source_callable(context.store(), callable);
+                if replacement == Some(expected) && !recovered {
+                    assert!(
+                        matches!(actual, StoredSourceCallableValidation::Valid(_)),
+                        "{text}: {actual:?}"
+                    );
+                } else {
+                    assert_eq!(actual, StoredSourceCallableValidation::Malformed, "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn recursive_arrow_recovery_is_cleared_when_source_links_change() {
         for poison in [
             "signature",
@@ -68804,6 +68899,13 @@ mod tests {
                     .resolved_return_type(),
                 (poison == "signature").then_some(any),
                 "poison: {poison}",
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .checked_source_callable_return_type(signature),
+                (poison == "signature").then_some(any),
+                "poison: {poison}"
             );
         }
     }
