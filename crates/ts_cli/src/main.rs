@@ -918,7 +918,14 @@ fn check_canonical_project(arguments: &[String]) -> ExitCode {
             return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
         }
     };
-    print_program_diagnostics(&program, &current_directory.to_string_lossy());
+    print!(
+        "{}",
+        format_canonical_diagnostics(
+            &program,
+            program.diagnostics(),
+            &current_directory.to_string_lossy()
+        )
+    );
     if checked.is_none() {
         if program.options().no_check {
             eprintln!("error: canonical checking was skipped because noCheck is enabled.");
@@ -928,6 +935,31 @@ fn check_canonical_project(arguments: &[String]) -> ExitCode {
         return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
     }
     diagnostic_exit(!program.diagnostics().is_empty(), false)
+}
+
+fn format_canonical_diagnostics(
+    program: &Program,
+    diagnostics: &[ProgramDiagnostic],
+    current_directory: &str,
+) -> String {
+    let options = FormattingOptions {
+        current_directory,
+        ..FormattingOptions::default()
+    };
+    let mut output = String::new();
+    // Program has already ordered these diagnostics by path, range, and code.
+    for diagnostic in diagnostics {
+        if let Some(file_name) = diagnostic.file_name.as_deref()
+            && (diagnostic.range.is_none() || program.source_file(file_name).is_none())
+        {
+            let path = Path::new(file_name);
+            let path = path.strip_prefix(current_directory).unwrap_or(path);
+            output.push_str(&path.to_string_lossy().replace('\\', "/"));
+            output.push_str(": ");
+        }
+        output.push_str(&format_program_diagnostic(program, diagnostic, options));
+    }
+    output
 }
 
 fn print_program_diagnostics(program: &Program, current_directory: &str) {
@@ -1147,10 +1179,10 @@ mod tests {
     use ts_cli::BuildOptions;
     use ts_compiler::{Program, ProgramDiagnostic};
     use ts_diagnostic_writer::FormattingOptions;
-    use ts_vfs::OsFileSystem;
+    use ts_vfs::{FileSystem, MemoryFileSystem, OsFileSystem};
     use ts_watch::WatchCompiler;
 
-    use super::{BuildWatchCompiler, format_program_diagnostic};
+    use super::{BuildWatchCompiler, format_canonical_diagnostics, format_program_diagnostic};
 
     struct TestDirectory(PathBuf);
 
@@ -1158,6 +1190,46 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn canonical_diagnostics_keep_range_order_before_code_order() {
+        let file_system = MemoryFileSystem::new(true);
+        file_system
+            .write_file("/project/main.ts", "const value: string = 1;\n")
+            .unwrap();
+        let program = Program::new_with_options(
+            &file_system,
+            "/project",
+            &["main.ts".to_owned()],
+            ts_options::CompilerOptions {
+                no_lib: true,
+                ..ts_options::CompilerOptions::default()
+            },
+        );
+        let short = program
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == Some(2322))
+            .cloned()
+            .unwrap();
+        let source = program.source_file("/project/main.ts").unwrap();
+        let mut long = short.clone();
+        long.range = source.parse.arena.iter().find_map(|(_, node)| {
+            matches!(&node.data, ts_ast::NodeData::VariableDeclaration(_)).then_some(node.range)
+        });
+        long.code = Some(1005);
+        long.message = "Longer range.".to_owned();
+        assert_eq!(short.range.unwrap().start, long.range.unwrap().start);
+        assert!(short.range.unwrap().end < long.range.unwrap().end);
+
+        let output = format_canonical_diagnostics(&program, &[short, long], "/project");
+
+        assert_eq!(
+            output,
+            "main.ts(1,7): error TS2322: Type 'number' is not assignable to type 'string'.\n\
+             main.ts(1,7): error TS1005: Longer range.\n"
+        );
     }
 
     #[test]

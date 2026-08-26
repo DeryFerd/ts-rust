@@ -162,6 +162,22 @@ fn canonical_check_keeps_config_parse_errors() {
     let diagnostics = String::from_utf8(output.stdout).unwrap();
     assert!(diagnostics.contains("tsconfig.json"));
     assert!(diagnostics.contains("error TS1136:"));
+    assert!(diagnostics.starts_with("tsconfig.json: error TS1136:"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn canonical_check_keeps_inherited_config_parse_paths() {
+    let directory = ProjectDirectory::new(&[
+        ("config/base.json", "{"),
+        ("app/tsconfig.json", r#"{"extends":"../config/base.json"}"#),
+    ]);
+
+    let output = directory.run(&["--check-canonical", "app"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let diagnostics = String::from_utf8(output.stdout).unwrap();
+    assert!(diagnostics.starts_with("config/base.json: error TS1136:"));
     assert!(output.stderr.is_empty());
 }
 
