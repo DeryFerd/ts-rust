@@ -1538,6 +1538,7 @@ fn function_member_signature(
     ) {
         return None;
     }
+    function_member_declaring_method(store, source)?;
     let record = store.type_payload(source)?;
     let [signature] = record.data().structured()?.signatures.as_deref()? else {
         return None;
@@ -1559,6 +1560,89 @@ fn function_member_signature(
             return_type: signature_record.resolved_return_type()?,
         },
     ))
+}
+
+/// The installed function-type mapping covers direct global Array method parameters.
+fn function_member_declaring_method(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+) -> Option<SemanticSymbolId> {
+    let callback = store.type_payload(source)?.symbol()?;
+    let [declaration] = store.symbol(callback)?.declarations()? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(parameter) = store.source_node_parent(*declaration)? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(method_declaration) = store.source_node_parent(parameter)? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(interface_declaration) =
+        store.source_node_parent(method_declaration)?
+    else {
+        return None;
+    };
+    if store.source_node_kind(*declaration) != Some(SyntaxKind::FunctionType)
+        || store.source_node_kind(parameter) != Some(SyntaxKind::Parameter)
+        || store.source_node_kind(method_declaration) != Some(SyntaxKind::MethodSignature)
+        || store.source_node_kind(interface_declaration) != Some(SyntaxKind::InterfaceDeclaration)
+        || store.source_direct_type_annotation(parameter) != Some(*declaration)
+    {
+        return None;
+    }
+    let globals = store.symbol_table(store.intrinsic_bootstrap()?.globals)?;
+    ["Array", "ReadonlyArray"].into_iter().find_map(|name| {
+        let owner = store.get_merged_symbol(globals.get_source(name)?)?;
+        let owner_record = store.symbol(owner)?;
+        if !owner_record
+            .declarations()?
+            .contains(&interface_declaration)
+        {
+            return None;
+        }
+        store
+            .symbol_table(owner_record.members()?)?
+            .iter()
+            .find_map(|(_, method)| {
+                let method = store.get_merged_symbol(method)?;
+                let method_record = store.symbol(method)?;
+                if !method_record.declarations()?.contains(&method_declaration)
+                    || store.authenticated_interface_method_owner(method)?.0 != owner
+                {
+                    return None;
+                }
+                let callable = store.value_symbol_links(method)?.resolved_type?;
+                store
+                    .type_payload(callable)?
+                    .data()
+                    .structured()?
+                    .signatures
+                    .as_deref()?
+                    .iter()
+                    .find_map(|&signature| {
+                        let record = store.signature(signature)?;
+                        if record.declaration() != Some(method_declaration)
+                            || store.interface_method_linked_type(signature) != Some(callable)
+                        {
+                            return None;
+                        }
+                        let parameter_types =
+                            store.callable_signature_parameter_types(signature)?;
+                        record
+                            .parameters()
+                            .iter()
+                            .zip(parameter_types)
+                            .any(|(&symbol, &type_)| {
+                                type_ == source
+                                    && store
+                                        .symbol(symbol)
+                                        .and_then(|symbol| symbol.declarations())
+                                        == Some(&[parameter])
+                            })
+                            .then_some(method)
+                    })
+            })
+    })
 }
 
 /// Copies a function-valued member through its enclosing method mapper.

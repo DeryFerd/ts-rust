@@ -9462,6 +9462,72 @@ mod tests {
     }
 
     #[test]
+    fn array_method_queries_reject_unsupported_function_origins_before_instance_writes() {
+        for (index, library, source) in [
+            (
+                "interface Array<T> {} interface ReadonlyArray<T> {}",
+                concat!(
+                    "interface Box<T> { f: (value: T) => T; } ",
+                    "declare const value: Box<number>; ",
+                    "const first = value.f; const second = value.f;",
+                ),
+            ),
+            (
+                concat!(
+                    "interface Array<T> { factory(): (value: T) => T; } ",
+                    "interface ReadonlyArray<T> {}",
+                ),
+                "declare const values: number[]; values.factory();",
+            ),
+            (
+                concat!(
+                    "interface Array<T> { nested(callback: (value: T) => (next: T) => T): T; } ",
+                    "interface ReadonlyArray<T> {}",
+                ),
+                concat!(
+                    "declare const values: number[]; ",
+                    "const first = values.nested; const second = values.nested;",
+                ),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let library = parsed(library);
+            let source = parsed(source);
+            let library_file = FileId::new(49_580 + u32::try_from(index * 2).unwrap());
+            let source_file = FileId::new(49_581 + u32::try_from(index * 2).unwrap());
+            let mut context =
+                context_with_default_library(&library, library_file, &source, source_file);
+            let mappers = context.store().mapper_len();
+
+            assert!(context.check_source_file(source_file).is_err());
+
+            assert_eq!(context.store().mapper_len(), mappers);
+            assert!(!context.store().types().any(|(_, record)| {
+                matches!(record.data(), TypeData::Object(object)
+                    if object.target.is_some_and(|target| context.store().type_has_function_type_provenance(target)))
+            }));
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+            );
+
+            assert!(context.check_source_file(source_file).is_err());
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                ),
+                warm
+            );
+        }
+    }
+
+    #[test]
     fn array_filter_accepts_the_authenticated_generic_boolean_constructor() {
         let library = parsed(concat!(
             "interface Array<T> { ",
