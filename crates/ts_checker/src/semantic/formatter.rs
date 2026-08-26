@@ -6518,9 +6518,10 @@ mod tests {
             assert_eq!(context.type_to_string(type_).unwrap(), "Select<T>");
             let record = context.store().type_payload(type_).unwrap();
             let alias = record.alias().unwrap();
-            let TypeData::Conditional(data) = record.data().clone() else {
+            let TypeData::Conditional(data) = record.data() else {
                 panic!("the generic alias must remain conditional");
             };
+            let data = data.clone();
             let number = context.store().intrinsic_bootstrap().unwrap().number_type;
             let malformed = match corruption {
                 0 => {
