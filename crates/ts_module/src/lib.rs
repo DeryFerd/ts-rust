@@ -93,6 +93,8 @@ pub struct FailedLookup {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedModule {
     pub resolved_file_name: String,
+    /// The exact candidate passed to the file system's `realpath` call.
+    pub original_file_name: String,
     pub extension: Option<FileExtension>,
     pub resolved_using_ts_extension: bool,
     pub is_external_library_import: bool,
@@ -103,6 +105,9 @@ pub struct ResolvedModule {
 pub struct ResolutionResult {
     pub resolved: Option<ResolvedModule>,
     pub failed_lookups: Vec<FailedLookup>,
+    /// The import or require condition selected for this resolution attempt.
+    /// A synthetic default result has no observed mode.
+    pub effective_mode: Option<ModuleFormat>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -278,6 +283,11 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         let result = ResolutionResult {
             resolved,
             failed_lookups: state.failed_lookups,
+            effective_mode: Some(if state.import_condition {
+                ModuleFormat::Esm
+            } else {
+                ModuleFormat::CommonJs
+            }),
         };
         self.cache
             .write()
@@ -307,6 +317,11 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         ResolutionResult {
             resolved,
             failed_lookups: state.failed_lookups,
+            effective_mode: Some(if state.import_condition {
+                ModuleFormat::Esm
+            } else {
+                ModuleFormat::CommonJs
+            }),
         }
     }
 
@@ -985,6 +1000,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 return Some(ResolvedModule {
                     extension: ts_path::extension_from_path(&resolved_file_name),
                     resolved_file_name,
+                    original_file_name: candidate,
                     resolved_using_ts_extension: self.specifier_uses_ts_extension
                         && !self.candidate_ending_is_from_config,
                     is_external_library_import,
