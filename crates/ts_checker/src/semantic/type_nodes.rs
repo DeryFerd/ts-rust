@@ -104,6 +104,211 @@ pub(super) struct CanonicalTypeQueryOptions {
     pub no_implicit_any: bool,
 }
 
+/// Preflights an annotation without claiming options or writing checker state.
+/// Callers without a diagnostic channel must not admit recovery plans.
+pub(super) fn preflight_type_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    options: CanonicalTypeQueryOptions,
+    node: NodeRef,
+    initializer_symbol: Option<SemanticSymbolId>,
+) -> Result<(), DeclaredTypeError> {
+    let aliases = HashMap::new();
+    let mut planner = TypeQueryPlanner::new(
+        store,
+        host,
+        global_types.map(|globals| globals.array_type),
+        global_types.map(CanonicalArrayTargets::from_global_types),
+        options.strict_builtin_iterator_return,
+        &aliases,
+    );
+    let methods = object_members::plan_enclosing_generic_interface_methods(store, host, node)
+        .map_err(property_object_error)?;
+    planner.plan_interface_method_dependencies(&methods, node)?;
+    planner.plan_type_node(node)?;
+    let mut references = Vec::new();
+    let supported = planned_constructor_annotation_shape(
+        store,
+        host,
+        &planner.plan,
+        node,
+        &mut HashSet::new(),
+        &mut references,
+    );
+    if supported {
+        for reference in references {
+            let resolved = planner.resolve_uncached_type_reference_symbol(reference)?;
+            let expected = planner.plan.references[&reference].symbol;
+            if store.get_merged_symbol(resolved) != Some(expected) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedSymbol {
+                        node: reference,
+                        symbol: expected,
+                    },
+                ));
+            }
+        }
+    }
+    let plan = planner.finish();
+    if !supported
+        || !plan.recovered_missing_references.is_empty()
+        || !plan.recovered_missing_reference_diagnostics.is_empty()
+        || plan
+            .references
+            .values()
+            .any(|reference| reference.arity != PlannedTypeReferenceArity::Valid)
+        || plan
+            .unique_symbols
+            .values()
+            .any(|symbol| symbol.diagnostic.is_some())
+        || initializer_symbol.is_some_and(|symbol| {
+            !planned_annotation_accepts_symbol(host, &plan, node, symbol, &mut HashSet::new())
+        })
+    {
+        return Err(type_node_unavailable(
+            TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: preflight_node(store, host, node)?.kind,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn planned_constructor_annotation_shape(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &TypeQueryPlan,
+    node: NodeRef,
+    active: &mut HashSet<NodeRef>,
+    references: &mut Vec<NodeRef>,
+) -> bool {
+    if !active.insert(node) {
+        return false;
+    }
+    let result = if let Some(union) = plan.unions.get(&node) {
+        union.types.iter().all(|node| {
+            planned_constructor_annotation_shape(store, host, plan, *node, active, references)
+        })
+    } else if let Some(reference) = plan.references.get(&node) {
+        references.push(node);
+        reference.type_arguments.is_empty()
+            && store.symbol(reference.symbol).is_some_and(|symbol| {
+                if symbol.flags() == SymbolFlags::TYPE_ALIAS {
+                    plan.aliases.get(&reference.symbol).is_some_and(|alias| {
+                        alias.type_parameters.is_empty()
+                            && planned_constructor_annotation_shape(
+                                store,
+                                host,
+                                plan,
+                                alias.type_node,
+                                active,
+                                references,
+                            )
+                    })
+                } else {
+                    symbol.flags() & SymbolFlags::TYPE == SymbolFlags::INTERFACE
+                        && preflight_class_or_interface_reference(
+                            store,
+                            host,
+                            reference.symbol,
+                            symbol.flags(),
+                        )
+                        .ok()
+                            == Some(0)
+                }
+            })
+    } else {
+        match host.node(node).map(|node| &node.data) {
+            Some(NodeData::KeywordTypeNode(_)) => host.node(node).is_some_and(|node| {
+                matches!(
+                    node.kind,
+                    SyntaxKind::AnyKeyword
+                        | SyntaxKind::UnknownKeyword
+                        | SyntaxKind::StringKeyword
+                        | SyntaxKind::NumberKeyword
+                        | SyntaxKind::BigIntKeyword
+                        | SyntaxKind::BooleanKeyword
+                        | SyntaxKind::SymbolKeyword
+                        | SyntaxKind::VoidKeyword
+                        | SyntaxKind::UndefinedKeyword
+                        | SyntaxKind::NeverKeyword
+                        | SyntaxKind::ObjectKeyword
+                )
+            }),
+            Some(NodeData::LiteralTypeNode(_)) => true,
+            Some(NodeData::ParenthesizedTypeNode(parenthesized)) => {
+                planned_constructor_annotation_shape(
+                    store,
+                    host,
+                    plan,
+                    NodeRef::new(node.arena, node.file, parenthesized.type_),
+                    active,
+                    references,
+                )
+            }
+            _ => false,
+        }
+    };
+    active.remove(&node);
+    result
+}
+
+// Exact declared identities and their union members need no relation writes.
+// Other initializer relations remain unsupported at this preflight boundary.
+fn planned_annotation_accepts_symbol(
+    host: &DeclaredTypeHost<'_>,
+    plan: &TypeQueryPlan,
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+    active: &mut HashSet<NodeRef>,
+) -> bool {
+    if !active.insert(node) {
+        return false;
+    }
+    let result = if let Some(union) = plan.unions.get(&node) {
+        union
+            .types
+            .iter()
+            .any(|node| planned_annotation_accepts_symbol(host, plan, *node, symbol, active))
+    } else if let Some(reference) = plan.references.get(&node) {
+        reference.type_arguments.is_empty()
+            && (reference.symbol == symbol
+                || plan.aliases.get(&reference.symbol).is_some_and(|alias| {
+                    alias.type_parameters.is_empty()
+                        && planned_annotation_accepts_symbol(
+                            host,
+                            plan,
+                            alias.type_node,
+                            symbol,
+                            active,
+                        )
+                }))
+    } else {
+        match host.node(node).map(|node| &node.data) {
+            Some(NodeData::KeywordTypeNode(_)) => host.node(node).is_some_and(|node| {
+                matches!(
+                    node.kind,
+                    SyntaxKind::AnyKeyword | SyntaxKind::UnknownKeyword
+                )
+            }),
+            Some(NodeData::ParenthesizedTypeNode(parenthesized)) => {
+                planned_annotation_accepts_symbol(
+                    host,
+                    plan,
+                    NodeRef::new(node.arena, node.file, parenthesized.type_),
+                    symbol,
+                    active,
+                )
+            }
+            _ => false,
+        }
+    };
+    active.remove(&node);
+    result
+}
+
 /// Immutable proof that one leaf in an exact importer annotation root names
 /// one alias whose immediate and final type-only targets were independently
 /// derived from the program's exact module-resolution manifest.

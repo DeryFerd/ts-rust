@@ -38,8 +38,9 @@ use super::{
         ProductionAliasSourceRegistry, ProductionAliasTargetHost, ProductionAliasTargetHostError,
     },
     classes::{
-        execute_nongeneric_class_member_query, execute_nongeneric_class_shells,
-        plan_nongeneric_class, plan_nongeneric_class_member_query,
+        ClassTypeQueryContext, execute_nongeneric_class_member_query,
+        execute_nongeneric_class_shells, plan_nongeneric_class,
+        plan_nongeneric_class_member_query_with_type_context,
     },
     global_types::initialize_global_library_types,
     instantiate::{InstantiationLimits, InstantiationSession},
@@ -1134,8 +1135,9 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// construct signature for one local nongeneric class declaration.
     ///
     /// The admitted class has either no heritage or one direct local,
-    /// nongeneric, property-only base. It has no executable members,
-    /// initializers, or non-keyword property annotations. The operation
+    /// nongeneric, property-only base. Constructor parameters may use primitive,
+    /// interface-reference, and union annotations with the context's query
+    /// options and global types. The operation
     /// preflights and reserves the entire graph before publishing a cold
     /// dependency or derived shell.
     ///
@@ -1151,6 +1153,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             options,
             files,
             store,
+            global_types,
             ..
         } = self;
         let host = DeclaredTypeHost::from_registry(
@@ -1159,7 +1162,13 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             GlobalMergeCompletion::new(options.name_resolution),
         )
         .map_err(DeclaredTypeError::from)?;
-        let plan = plan_nongeneric_class_member_query(store, &host, symbol)?;
+        let type_context = ClassTypeQueryContext::new(global_types, *options);
+        let plan = plan_nongeneric_class_member_query_with_type_context(
+            store,
+            &host,
+            symbol,
+            Some(&type_context),
+        )?;
         execute_nongeneric_class_member_query(store, &host, &plan)
     }
 

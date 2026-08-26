@@ -104,11 +104,11 @@ use super::{
     classes::{
         ClassConstructorVisibility, ClassGrammarDiagnostic, ClassGrammarDiagnosticPlan,
         ClassHeritageMembersValidation, ClassMemberPlan, ClassMemberQueryPlan,
-        ExportedJsxArrowClassPlan, execute_exported_jsx_arrow_class,
+        ClassTypeQueryContext, ExportedJsxArrowClassPlan, execute_exported_jsx_arrow_class,
         execute_nongeneric_class_member_query, plan_anonymous_abstract_class_expression_grammar,
         plan_class_grammar_diagnostics, plan_exported_jsx_arrow_class,
-        plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
-        validate_class_heritage_members,
+        plan_nongeneric_class_member_query_with_type_context,
+        preflight_nongeneric_class_member_query, validate_class_heritage_members,
     },
     contextual::{
         LiteralTreatment, PreparedExpression,
@@ -1919,6 +1919,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
         &'semantic DeclaredTypeHost<'sources>,
     )>,
     array_targets: Option<CanonicalArrayTargets>,
+    class_type_context: Option<ClassTypeQueryContext>,
     hoisted_functions: HashSet<SemanticSymbolId>,
     prior_variables: HashSet<SemanticSymbolId>,
     readable_variables: HashSet<SemanticSymbolId>,
@@ -1967,6 +1968,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ambient_namespace_reads: Vec::new(),
             semantic: None,
             array_targets: None,
+            class_type_context: None,
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
@@ -2019,6 +2021,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ambient_namespace_reads: Vec::new(),
             semantic: Some((store, host)),
             array_targets: None,
+            class_type_context: None,
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
@@ -2048,6 +2051,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     ) -> Self {
         let mut planner = Self::new_semantic(arena, bound, source, store, host);
         planner.array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
+        planner.class_type_context = Some(ClassTypeQueryContext::new(global_types, options));
         planner.allow_implicit_ambient_any = !options.no_implicit_any;
         planner.no_implicit_any = options.no_implicit_any;
         planner.no_unused_locals = options.no_unused_locals;
@@ -3002,7 +3006,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             statements.push(PlannedStatement::ExportedEmptyClass(empty));
                             continue;
                         }
-                        match plan_nongeneric_class_member_query(store, host, symbol) {
+                        match plan_nongeneric_class_member_query_with_type_context(
+                            store,
+                            host,
+                            symbol,
+                            self.class_type_context.as_ref(),
+                        ) {
                             Ok(class) => {
                                 if class.export_local().is_none()
                                     || class.base_plan().is_some_and(|base| {
@@ -3120,7 +3129,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             .ok_or(SourceCheckError::Provenance(
                                 SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
                             ))?;
-                    let class = match plan_nongeneric_class_member_query(store, host, symbol) {
+                    let class = match plan_nongeneric_class_member_query_with_type_context(
+                        store,
+                        host,
+                        symbol,
+                        self.class_type_context.as_ref(),
+                    ) {
                         Ok(class) => class,
                         Err(error @ super::classes::ClassError::Unsupported(_)) => {
                             if let Some(grammar) =
