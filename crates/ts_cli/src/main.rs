@@ -1207,13 +1207,20 @@ mod tests {
                 ..ts_options::CompilerOptions::default()
             },
         );
-        let short = program
+        let mut short = program
             .diagnostics()
             .iter()
             .find(|diagnostic| diagnostic.code == Some(2322))
             .cloned()
             .unwrap();
         let source = program.source_file("/project/main.ts").unwrap();
+        short.range = source.parse.arena.iter().find_map(|(_, node)| {
+            matches!(
+                &node.data,
+                ts_ast::NodeData::Identifier(identifier) if identifier.text == "value"
+            )
+            .then_some(node.range)
+        });
         let mut long = short.clone();
         long.range = source.parse.arena.iter().find_map(|(_, node)| {
             matches!(&node.data, ts_ast::NodeData::VariableDeclaration(_)).then_some(node.range)
