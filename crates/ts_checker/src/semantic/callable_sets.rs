@@ -1358,6 +1358,15 @@ pub(super) fn instantiated_method_type_matches(
     mapper: super::TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
+    if let Some(matches) = super::instantiated_members::instantiated_tuple_member_type_matches(
+        store,
+        template,
+        actual,
+        mapper,
+        array_targets,
+    ) {
+        return matches;
+    }
     if store.type_has_function_type_provenance(template) {
         return super::instantiated_members::instantiated_function_member_type_matches(
             store,

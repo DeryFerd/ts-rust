@@ -44,11 +44,12 @@ use super::{
         validate_resolved_declared_property_object,
     },
     reference_types::{DirectGenericReferenceError, validate_direct_generic_reference},
-    signatures::{SignatureFlags, SignatureInstantiationError},
+    signatures::{ElementFlags, SignatureFlags, SignatureInstantiationError},
     store::SourceNodeParent,
     structured_members::{
         valid_index_symbol, valid_interface_method_value, valid_late_bound_unique_symbol_member,
     },
+    tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_records::{
         ConstrainedTypeData, LiteralValue, StructuredTypeData, TypeCacheState, TypeData,
     },
@@ -1660,6 +1661,119 @@ fn instantiate_generic_member_type(
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, GenericInterfaceMemberError> {
+    if store.mapper_payload(mapper).is_none() {
+        return Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+            template,
+        ));
+    }
+    instantiate_generic_member_type_worker(
+        store,
+        template,
+        mapper,
+        array_targets,
+        session,
+        &mut HashSet::new(),
+    )
+}
+
+fn instantiate_generic_member_type_worker(
+    store: &mut CanonicalTypeMapperStore,
+    template: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+    active: &mut HashSet<TypeId>,
+) -> Result<TypeId, GenericInterfaceMemberError> {
+    if active.len() >= InstantiationLimits::default().max_depth {
+        return Err(GenericInterfaceMemberError::Capacity(template));
+    }
+    if !active.insert(template) {
+        return Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+            template,
+        ));
+    }
+    let result = instantiate_generic_member_type_inner(
+        store,
+        template,
+        mapper,
+        array_targets,
+        session,
+        active,
+    );
+    active.remove(&template);
+    result
+}
+
+fn instantiate_generic_member_type_inner(
+    store: &mut CanonicalTypeMapperStore,
+    template: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+    active: &mut HashSet<TypeId>,
+) -> Result<TypeId, GenericInterfaceMemberError> {
+    if let Some(tuple) = store
+        .canonical_tuple_shape(template)
+        .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(template))?
+    {
+        if tuple.combined_flags().intersects(ElementFlags::VARIABLE) {
+            return Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                template,
+            ));
+        }
+        let elements = tuple.element_types().to_vec();
+        let infos = tuple.element_infos().to_vec();
+        let readonly = tuple.is_readonly();
+        let mapped = elements
+            .iter()
+            .map(|element| {
+                instantiate_generic_member_type_worker(
+                    store,
+                    *element,
+                    mapper,
+                    array_targets,
+                    session,
+                    active,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if mapped == elements {
+            return Ok(template);
+        }
+        return store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&mapped, &infos, readonly))
+            .map_err(|error| match error {
+                TupleTypeError::Capacity => GenericInterfaceMemberError::Capacity(template),
+                _ => GenericInterfaceMemberError::UnsupportedPropertyType(template),
+            });
+    }
+    if let Some(constituents) = method_tuple_union_members(store, template)? {
+        let constituents = constituents.to_vec();
+        let mapped = constituents
+            .iter()
+            .map(|constituent| {
+                instantiate_generic_member_type_worker(
+                    store,
+                    *constituent,
+                    mapper,
+                    array_targets,
+                    session,
+                    active,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if mapped == constituents {
+            return Ok(template);
+        }
+        return store
+            .literal_union_type_with_alias_and_array_targets(&mapped, None, array_targets)
+            .map_err(|error| match error {
+                super::bootstrap::LiteralTypeCacheError::Capacity => {
+                    GenericInterfaceMemberError::Capacity(template)
+                }
+                _ => GenericInterfaceMemberError::UnsupportedPropertyType(template),
+            });
+    }
     if store.type_has_function_type_provenance(template) {
         return instantiate_function_member_type(store, template, mapper, array_targets, session);
     }
@@ -1721,6 +1835,139 @@ fn instantiate_generic_member_type(
         .value_symbol_links(symbol)
         .and_then(|links| links.resolved_type)
         .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol))
+}
+
+/// Tuple unions retain their canonical arms. Alias and mixed-union mapping stay separate.
+fn method_tuple_union_members(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<&[TypeId]>, GenericInterfaceMemberError> {
+    let invalid = || GenericInterfaceMemberError::UnsupportedPropertyType(type_);
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let TypeData::Union(union) = record.data() else {
+        return Ok(None);
+    };
+    let mut tuple_count = 0;
+    for constituent in &union.union.types {
+        tuple_count += usize::from(
+            store
+                .canonical_tuple_shape(*constituent)
+                .map_err(|_| invalid())?
+                .is_some(),
+        );
+    }
+    if tuple_count == 0 {
+        return Ok(None);
+    }
+    if tuple_count != union.union.types.len() || record.alias().is_some() || union.origin.is_some()
+    {
+        return Err(invalid());
+    }
+    store
+        .validate_canonical_union_metadata(type_, &union.union.types)
+        .map_err(|_| invalid())?;
+    Ok(Some(&union.union.types))
+}
+
+/// Validates fixed tuple templates through the method's original mapper.
+pub(super) fn instantiated_tuple_member_type_matches(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    actual: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<bool> {
+    if store.mapper_payload(mapper).is_none() {
+        return Some(false);
+    }
+    instantiated_tuple_member_type_matches_worker(
+        store,
+        template,
+        actual,
+        mapper,
+        array_targets,
+        &mut HashSet::new(),
+    )
+}
+
+fn instantiated_tuple_member_type_matches_worker(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    actual: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut HashSet<(TypeId, TypeId)>,
+) -> Option<bool> {
+    let tuple = match store.canonical_tuple_shape(template) {
+        Ok(tuple) => tuple,
+        Err(_) => return Some(false),
+    };
+    let union = if tuple.is_none() {
+        match method_tuple_union_members(store, template) {
+            Ok(Some(union)) => Some(union),
+            Ok(None) => return None,
+            Err(_) => return Some(false),
+        }
+    } else {
+        None
+    };
+    if active.len() >= InstantiationLimits::default().max_depth
+        || !active.insert((template, actual))
+    {
+        return Some(false);
+    }
+    let mut child_matches = |template, actual| {
+        instantiated_tuple_member_type_matches_worker(
+            store,
+            template,
+            actual,
+            mapper,
+            array_targets,
+            active,
+        )
+        .unwrap_or_else(|| {
+            instantiated_method_type_matches(store, template, actual, mapper, array_targets)
+        })
+    };
+    let result = if let Some(tuple) = tuple {
+        store
+            .canonical_tuple_shape(actual)
+            .ok()
+            .flatten()
+            .is_some_and(|mapped| {
+                !tuple.combined_flags().intersects(ElementFlags::VARIABLE)
+                    && tuple.target() == mapped.target()
+                    && tuple.element_infos() == mapped.element_infos()
+                    && tuple.is_readonly() == mapped.is_readonly()
+                    && tuple.element_types().len() == mapped.element_types().len()
+                    && tuple
+                        .element_types()
+                        .iter()
+                        .zip(mapped.element_types())
+                        .all(|(template, actual)| child_matches(*template, *actual))
+            })
+    } else {
+        let actual_members = match method_tuple_union_members(store, actual) {
+            Ok(Some(members)) => Some(members),
+            Ok(None) if store.canonical_tuple_shape(actual).ok().flatten().is_some() => {
+                Some(std::slice::from_ref(&actual))
+            }
+            _ => None,
+        };
+        union.zip(actual_members).is_some_and(|(source, mapped)| {
+            source.iter().all(|template| {
+                mapped
+                    .iter()
+                    .any(|actual| child_matches(*template, *actual))
+            }) && mapped.iter().all(|actual| {
+                source
+                    .iter()
+                    .any(|template| child_matches(*template, *actual))
+            })
+        })
+    };
+    active.remove(&(template, actual));
+    Some(result)
 }
 
 fn function_member_signature(
@@ -2973,25 +3220,47 @@ fn member_type_requires_instantiation_inner(
     active: &mut HashSet<TypeId>,
     classify_only: bool,
 ) -> Result<bool, GenericInterfaceMemberError> {
-    // Closed tuple signatures can be reused. Mapping tuples still requires a separate preflight.
-    if classify_only {
-        if let Some(tuple) = store
-            .canonical_tuple_shape(type_)
-            .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?
-        {
-            let mut requires = false;
-            for &element in tuple.element_types() {
-                requires |= member_type_requires_instantiation_worker(
-                    store,
-                    element,
-                    mapper_parameters,
-                    array_targets,
-                    active,
-                    true,
-                )?;
-            }
-            return Ok(requires);
+    if let Some(tuple) = store
+        .canonical_tuple_shape(type_)
+        .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?
+    {
+        if !classify_only && tuple.combined_flags().intersects(ElementFlags::VARIABLE) {
+            return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_));
         }
+        if active.len() >= InstantiationLimits::default().max_depth {
+            return Err(GenericInterfaceMemberError::Capacity(type_));
+        }
+        let mut requires = false;
+        for &element in tuple.element_types() {
+            requires |= member_type_requires_instantiation_worker(
+                store,
+                element,
+                mapper_parameters,
+                array_targets,
+                active,
+                classify_only,
+            )?;
+        }
+        return Ok(requires);
+    }
+    if let Some(constituents) = method_tuple_union_members(store, type_)? {
+        if active.len() >= InstantiationLimits::default().max_depth {
+            return Err(GenericInterfaceMemberError::Capacity(type_));
+        }
+        let mut requires = false;
+        for &constituent in constituents {
+            requires |= member_type_requires_instantiation_worker(
+                store,
+                constituent,
+                mapper_parameters,
+                array_targets,
+                active,
+                classify_only,
+            )?;
+        }
+        return Ok(requires);
+    }
+    if classify_only {
         if let Some(targets) = array_targets
             && let Some(array) = store
                 .canonical_array_reference_with_targets(targets, type_)
@@ -3709,6 +3978,11 @@ fn cached_instantiated_property_type_matches(
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
+    if let Some(matches) =
+        instantiated_tuple_member_type_matches(store, template, cached, mapper, array_targets)
+    {
+        return matches;
+    }
     if store
         .type_payload(template)
         .and_then(super::type_records::TypeRecord::symbol)
@@ -5898,6 +6172,318 @@ mod tests {
                 store.checker_link_allocated_lengths(),
             ),
             warm,
+        );
+    }
+
+    #[test]
+    fn generic_method_tuple_union_keeps_empty_arm_and_inherited_mapper() {
+        let parsed = parse_source_file(concat!(
+            "interface Iterator<T, TReturn, TNext> { next(...args: [] | [TNext]): T; } ",
+            "interface Derived extends Iterator<number, void, string> {}",
+        ));
+        let file = FileId::new(6_270);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let derived = source_symbol(&parsed, file, &context, "Derived");
+        let iterator = source_symbol(&parsed, file, &context, "Iterator");
+        let target = context.get_declared_type_of_symbol(derived).unwrap();
+        let TypeData::Interface(interface) = context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("Derived must retain its interface target")
+        };
+        let base = interface.resolved_base_types.as_ref().unwrap()[0];
+        let store = context.store_mut_for_test();
+        let method = store
+            .symbol(iterator)
+            .unwrap()
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("next"))
+            .unwrap();
+        let source = store
+            .value_symbol_links(method)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let original_signature = store
+            .type_payload(source)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        let original_parameter = store.signature(original_signature).unwrap().parameters()[0];
+        let template = store
+            .value_symbol_links(original_parameter)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let template_arms = method_tuple_union_members(store, template)
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        let original_nonempty = template_arms
+            .iter()
+            .copied()
+            .find(|arm| {
+                !store
+                    .canonical_tuple_shape(*arm)
+                    .unwrap()
+                    .unwrap()
+                    .element_types()
+                    .is_empty()
+            })
+            .unwrap();
+        let next_parameter = store
+            .canonical_tuple_shape(original_nonempty)
+            .unwrap()
+            .unwrap()
+            .element_types()[0];
+        let next = store
+            .resolve_generic_interface_property(base, "next", None)
+            .unwrap()
+            .unwrap();
+        let method_links = store.value_symbol_links(next.symbol()).unwrap();
+        assert_eq!(method_links.target, Some(method));
+        let mapper = method_links.mapper.unwrap();
+        let signature = store
+            .type_payload(next.type_id())
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        let signature = store.signature(signature).unwrap();
+        assert_eq!(signature.target(), Some(original_signature));
+        assert_eq!(signature.mapper(), Some(mapper));
+        assert!(signature.has_rest_parameter());
+        let parameter = store.value_symbol_links(signature.parameters()[0]).unwrap();
+        assert_eq!(parameter.target, Some(original_parameter));
+        assert_eq!(parameter.mapper, Some(mapper));
+        let actual = parameter.resolved_type.unwrap();
+        let arms = method_tuple_union_members(store, actual).unwrap().unwrap();
+        assert_eq!(arms.len(), 2);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(store.map_type(mapper, next_parameter), Some(string));
+        let empty = arms
+            .iter()
+            .copied()
+            .find(|arm| {
+                store
+                    .canonical_tuple_shape(*arm)
+                    .unwrap()
+                    .unwrap()
+                    .element_types()
+                    .is_empty()
+            })
+            .unwrap();
+        assert!(template_arms.contains(&empty));
+        let nonempty = arms.iter().copied().find(|arm| *arm != empty).unwrap();
+        assert_eq!(
+            store
+                .canonical_tuple_shape(nonempty)
+                .unwrap()
+                .unwrap()
+                .element_types(),
+            &[string]
+        );
+        assert_eq!(
+            store
+                .value_symbol_links(original_parameter)
+                .unwrap()
+                .resolved_type,
+            Some(template)
+        );
+        assert_eq!(
+            store
+                .canonical_tuple_shape(original_nonempty)
+                .unwrap()
+                .unwrap()
+                .element_types(),
+            &[next_parameter]
+        );
+        assert!(instantiated_method_type_matches(
+            store, template, actual, mapper, None
+        ));
+        assert!(!instantiated_method_type_matches(
+            store, template, nonempty, mapper, None
+        ));
+        assert!(!instantiated_method_type_matches(
+            store, template, string, mapper, None
+        ));
+        assert!(matches!(
+            super::super::callable_sets::validate_stored_callable_set(store, next.type_id()),
+            StoredCallableSetValidation::Valid { .. }
+        ));
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+        );
+        assert_eq!(
+            store.resolve_generic_interface_property(base, "next", None),
+            Ok(Some(next))
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len()
+            ),
+            before
+        );
+
+        let unregistered = store
+            .alloc_union_type(ObjectFlags::NONE, template_arms)
+            .unwrap();
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+        );
+        assert_eq!(
+            member_type_requires_instantiation(store, unregistered, &[next_parameter], None),
+            Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                unregistered
+            )),
+        );
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        assert_eq!(
+            instantiate_generic_member_type(store, unregistered, mapper, None, &mut session),
+            Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                unregistered
+            )),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn generic_method_tuple_result_keeps_labels_readonly_and_optional_elements() {
+        let parsed =
+            parse_source_file("interface Box<T> { read(): readonly [head: T, tail?: T]; }");
+        let file = FileId::new(6_271);
+        let mut context = checker_context(
+            &parsed,
+            file,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        let owner = source_symbol(&parsed, file, &context, "Box");
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let target = store
+            .declared_type_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let method = store
+            .symbol(owner)
+            .unwrap()
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("read"))
+            .unwrap();
+        let source = store
+            .value_symbol_links(method)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let original_signature = store
+            .type_payload(source)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        let template = store
+            .signature(original_signature)
+            .unwrap()
+            .resolved_return_type()
+            .unwrap();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let receiver = store
+            .create_direct_generic_reference_type(target, &[number])
+            .unwrap();
+        let callable =
+            instantiate_published_generic_interface_method(store, &globals, receiver, method)
+                .unwrap();
+        let signature = store
+            .type_payload(callable)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        let signature = store.signature(signature).unwrap();
+        let actual = signature.resolved_return_type().unwrap();
+        let mapper = signature.mapper().unwrap();
+        assert_eq!(signature.target(), Some(original_signature));
+        let original = store.canonical_tuple_shape(template).unwrap().unwrap();
+        let mapped = store.canonical_tuple_shape(actual).unwrap().unwrap();
+        assert_eq!(mapped.target(), original.target());
+        assert_eq!(mapped.element_infos(), original.element_infos());
+        assert!(mapped.is_readonly());
+        assert_eq!(mapped.element_types()[0], number);
+        let TypeData::Union(optional) = store
+            .type_payload(mapped.element_types()[1])
+            .unwrap()
+            .data()
+        else {
+            panic!("the optional tuple element must retain undefined")
+        };
+        let mut expected = [number, undefined];
+        expected.sort_unstable();
+        assert_eq!(optional.union.types, expected);
+        assert!(instantiated_method_type_matches(
+            store, template, actual, mapper, None
+        ));
+        assert!(matches!(
+            super::super::callable_sets::validate_stored_callable_set(store, callable),
+            StoredCallableSetValidation::Valid { .. }
+        ));
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+        );
+        assert_eq!(
+            instantiate_published_generic_interface_method(store, &globals, receiver, method),
+            Ok(callable)
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len()
+            ),
+            before
         );
     }
 
