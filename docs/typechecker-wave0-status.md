@@ -2,17 +2,21 @@
 
 - Status: active
 - Started: 2026-07-16
-- Updated: 2026-08-22
+- Updated: 2026-08-26
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Latest measured integration checkpoint: `d97e5de` with uncommitted fixes
+- Latest verified code checkpoint: `5e2f9e37`
 
 This file records progress after the initial Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
 map remains authoritative for cluster state.
 
-## Current checkpoint
+Current results and the build-isolation rule are in
+[`typechecker-wave125-status.md`](typechecker-wave125-status.md).
+The figures below retain the earlier execution history.
+
+## August 22 checkpoint
 
 The latest focused package runs pass these unit-test suites:
 

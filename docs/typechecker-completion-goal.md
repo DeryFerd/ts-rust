@@ -132,7 +132,19 @@ inline indexed access, property objects in unions, all eight strict `typeof`
 tags, reversed comparisons, object/function classification, `void` projection,
 and base/local join identity restoration.
 
-### Execution checkpoint: 2026-08-22
+### Execution checkpoint: 2026-08-26
+
+Code checkpoint `5e2f9e37` passes the full repository verification script.
+The semantic smoke report has 32 exact results in 95 executed variants, eight
+more than the previous batch, with no exact losses or fatal invariants. The
+diagnostics-only milestone retains 395 exact results in 511 executed variants.
+Neither result establishes complete upstream semantic parity.
+
+See [`typechecker-wave125-status.md`](typechecker-wave125-status.md) for the
+evidence, prepared branches, and required per-worktree build directories.
+The older figures below remain as execution history.
+
+### Earlier checkpoint: 2026-08-22
 
 The latest focused package runs pass 189 parser unit tests, 174 binder unit
 tests, 1,226 checker unit tests, 159 compiler unit tests, and 564 printer unit

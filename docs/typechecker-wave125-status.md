@@ -1,39 +1,45 @@
 # Typechecker wave 125
 
-- Status: active
+- Status: artifact batch verified; port goal active
 - Date: 2026-08-26
 - Main branch: `july-ultra`
 - Main checkpoint before this batch: `be579e16`
-- Tested candidate: `root/wave125-artifacts` at `98aa6b62`
+- Verified code: `root/wave125-artifacts` at `5e2f9e37`
 - Upstream: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 
-The candidate is not yet merged. Its remaining cold-class display review and
-workspace checks must pass first. The full port goal remains active.
+Full repository verification passed. The fixed reports show eight new semantic
+matches and no exact losses. Full upstream semantic parity remains incomplete.
 
 ## Verified results
 
-The candidate passed these unit suites in its own build directory:
+The verified code passed these unit suites in its own build directory:
 
 | Package | Tests passed |
 |---|---:|
 | `ts_binder` | 214 |
-| `ts_checker` | 3,484 |
+| `ts_checker` | 3,486 |
 | `ts_compiler` | 208 |
 | `ts_fixture` | 130 |
 | `ts_scanner` | 61 |
 
 The fixed semantic smoke run checks diagnostics, `.types`, and `.symbols`.
 It executed 95 variants and retained one upstream skip. Results at the clean
-candidate commit are 32 exact, 56 unsupported, seven artifact mismatches, and
+verified commit are 32 exact, 56 unsupported, seven artifact mismatches, and
 zero fatal invariants. Compared with wave 124, eight variants became exact
 and none lost an exact match.
 
-Evidence: `/tmp/ts-rust-wave125-semantic-smoke.json`.
+Evidence: `/tmp/ts-rust-wave125-final-semantic-smoke.json`.
 Previous evidence: `/tmp/ts-rust-wave124-semantic-smoke.json`.
 
-The previous diagnostics-only milestone has 395 exact results in 511 executed
-variants. It does not establish semantic parity. Its evidence is
-`/tmp/ts-rust-wave124-milestone.json`.
+The final diagnostics-only milestone retained all 395 exact results in 511
+executed variants. The other 116 remain unsupported. There are no supported
+diagnostic mismatches or fatal invariants. Evidence:
+`/tmp/ts-rust-wave125-final-milestone.json`.
+
+`scripts/verify.sh` passed with the pinned upstream checkout enabled. This
+includes formatting, generated AST checks, all workspace tests, strict Clippy,
+and the upstream-case parser test. The parser test does not establish checker
+parity. Full log: `/tmp/ts-rust-wave125-verify.log`.
 
 ## Build isolation
 
@@ -66,24 +72,22 @@ across the named filters, not proof of full fixture coverage.
 |---|---|---|
 | `agent/wave124-arrays` | `041b54b7` | All 25 assigned test executions passed. Iterator protocol cases remain explicitly unsupported. |
 | `agent/wave124-typequery` | `b858b775` | All 22 assigned test executions passed. Full semantic fixture gate remains. |
-| `agent/wave125-react-cache` | `b6610908` | Eight assigned tests passed. Review found a named global-array annotation case still being repaired. |
+| `agent/wave125-react-cache` | `773db606` | Eight assigned tests passed, including named global-array annotations. Integration tests remain. |
 | `agent/wave125-class-parameters` | `6e115f0f` | Optional parameters and visibility checks await final review and tests. |
 | `agent/wave125-construct` | `f008cb9b` | Date and optional-parameter changes await branch tests. The earlier constructor-union result fix is in the candidate. |
-| `agent/wave125-conditional-display` | `751d4fe2` | New alias proofs await review and tests. Depends on the held union changes. |
-| `agent/wave125-union-aliases` | `b3b59580` | Held for alias instantiation, cache, and origin repairs. |
+| `agent/wave125-conditional-display` | `a1e7716a` | All assigned focused filters passed with the repaired union dependency. Final review and artifact checks remain. |
+| `agent/wave125-union-aliases` | `4380a175` | The repaired stack passed 62 focused tests. Final review and artifact checks remain. |
 
 The earlier Boolean-call, generic-index, loop, package, computed-binding,
 object-rest, JSDoc, and recursive-mapped proposals remain unmerged. Reviews
 found semantic errors, weak cache checks, or fixture-specific handling.
 Do not merge them based on old static approvals.
 
-## Next gates
+## Next work
 
-1. Finish the cold-class display review without requiring member algorithms
-   just to print a class name.
-2. Pass the public artifact query tests, workspace formatting, generated AST
-   checks, and strict Clippy on the final candidate.
-3. Rerun the fixed scorecards from a clean commit and retain exact matches.
-4. Merge only verified changes into `july-ultra`.
-5. Test each prepared feature branch before integration. Do not equate a
+1. Test and review each prepared feature branch before integration.
+2. Finish receiver-specific Array method types and location-aware symbol display.
+3. Finish conditional and generic union alias identity after cache review.
+4. Rerun the fixed reports after each coherent change and retain exact matches.
+5. Complete the modern-project and upstream semantic tests. Do not equate a
    diagnostics match with a full semantic match.
