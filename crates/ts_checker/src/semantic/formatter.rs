@@ -7295,9 +7295,9 @@ mod tests {
             .callable_signature_parameter_types(signature)
             .unwrap()
             .to_vec();
-        let mut types = original_types.clone();
+        let mut poisoned_parameters = original_types.clone();
         let number = context.store().intrinsic_bootstrap().unwrap().number_type;
-        types[1] = number;
+        poisoned_parameters[1] = number;
         assert!(context.store_mut_for_test().set_value_symbol_links(
             parameter,
             ValueSymbolLinks {
@@ -7314,7 +7314,10 @@ mod tests {
         assert!(
             !context
                 .store_mut_for_test()
-                .set_callable_signature_parameter_types_batch(vec![(signature, types)])
+                .set_callable_signature_parameter_types_batch(vec![(
+                    signature,
+                    poisoned_parameters
+                )])
         );
         assert_eq!(
             context

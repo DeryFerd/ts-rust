@@ -5075,6 +5075,7 @@ fn pinned_program_diagnostic_message(
     )
 }
 
+#[cfg(test)]
 fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options::CompilerOptions {
     fixture_compiler_options_result(case, variant).options
 }
