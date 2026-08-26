@@ -8762,33 +8762,47 @@ fn valid_prepared_imported_namespace(
                     == Some(property.target_symbol)
                 && store.symbol(property.symbol).is_some_and(|record| {
                     record.flags() == SymbolFlags::PROPERTY
+                        && record.check_flags() == CheckFlags::NONE
                         && record.name() == property.name.as_ref()
                         && record.parent().is_none()
                         && record.declarations().is_none()
+                        && record.value_declaration().is_none()
+                        && record.members().is_none()
+                        && record.exports().is_none()
+                        && record.export_symbol().is_none()
+                        && store.get_merged_symbol(property.symbol) == Some(property.symbol)
                 })
                 && store
                     .value_symbol_links(property.symbol)
                     .is_some_and(|links| {
-                        links.resolved_type == Some(property.type_)
-                            && links.target == owner.map(|_| property.target_symbol)
+                        links
+                            == &ValueSymbolLinks {
+                                resolved_type: Some(property.type_),
+                                target: owner.map(|_| property.target_symbol),
+                                ..ValueSymbolLinks::default()
+                            }
                     })
                 && store.symbol(property.target_symbol).is_some_and(|target| {
-                    if target.flags() == SymbolFlags::ALIAS {
-                        store
-                            .alias_symbol_links(property.target_symbol)
-                            .is_some_and(|links| {
-                                links.alias_target
-                                    == AliasTargetState::Resolved(property.value_symbol)
-                                    && links.type_only_declaration.is_none()
-                            })
+                    if target.flags().intersects(SymbolFlags::ALIAS) {
+                        target.flags() == SymbolFlags::ALIAS
+                            && store
+                                .alias_symbol_links(property.target_symbol)
+                                .is_some_and(|links| {
+                                    links.alias_target
+                                        == AliasTargetState::Resolved(property.value_symbol)
+                                        && links.type_only_declaration.is_none()
+                                })
                     } else {
                         property.target_symbol == property.value_symbol
                     }
                 })
-                && store
-                    .value_symbol_links(property.value_symbol)
-                    .and_then(|links| links.resolved_type)
-                    .is_none_or(|cached| cached == property.type_)
+                && store.symbol(property.value_symbol).is_some_and(|value| {
+                    !value.flags().intersects(SymbolFlags::ALIAS)
+                        && store
+                            .value_symbol_links(property.value_symbol)
+                            .and_then(|links| links.resolved_type)
+                            .is_none_or(|cached| cached == property.type_)
+                })
                 && match &property.namespace {
                     Some(namespace) => {
                         prepare_value_links(store, property.value_symbol, property.type_, false)
@@ -11066,6 +11080,200 @@ mod tests {
             (store_state(context.store()), context.store().symbol_len()),
             warm,
         );
+    }
+
+    #[test]
+    fn package_self_namespace_array_exports_do_not_capture_global_array_identity() {
+        let mut fixture = fixture_with_default_library_files(
+            &[
+                concat!(
+                    "import * as type from 'package'; ",
+                    "export const Array: number = 1; ",
+                    "export const main = type;",
+                ),
+                concat!(
+                    "interface Array<T> { length: number; } ",
+                    "declare var Array: any; ",
+                    "interface ReadonlyArray<T> {}",
+                ),
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(0),
+            }],
+            &[CanonicalModuleState::External, CanonicalModuleState::Script],
+            &[1],
+        );
+        let import = fixture.plan_import(0, 0);
+        let initializer = identifier_initializer(&fixture, 0, "type");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &import.bindings[0],
+            initializer,
+            "type",
+            import.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+        let module = resolved[0].target_symbol;
+        let exported_array = direct_export(&fixture, 0, "Array");
+        let global_array = fixture
+            .store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| fixture.store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Array"))
+            .and_then(|symbol| fixture.store.get_merged_symbol(symbol))
+            .unwrap();
+        assert_ne!(exported_array, global_array);
+
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+
+        let PreparedSourceImportTarget::ModuleNamespace { properties } = &prepared.target else {
+            panic!("the package self import must retain its source namespace")
+        };
+        let [array, main] = properties.as_slice() else {
+            panic!("the package namespace must retain its Array export and main self reference")
+        };
+        assert_eq!(array.name.as_utf8(), Some("Array"));
+        assert_eq!(array.target_symbol, exported_array);
+        assert_eq!(
+            array.type_,
+            fixture.store.intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert_eq!(main.name.as_utf8(), Some("main"));
+        assert_eq!(main.type_, prepared.type_);
+        assert_eq!(
+            fixture.store.type_payload(prepared.type_).unwrap().symbol(),
+            Some(module),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_payload(fixture.global_types.array_type)
+                .and_then(TypeRecord::symbol),
+            Some(global_array),
+        );
+        assert!(fixture.store.value_symbol_links(module).is_none());
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(import.bindings[0].alias_symbol)
+                .is_none()
+        );
+
+        let warm = (store_state(&fixture.store), fixture.store.symbol_len());
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared,
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.symbol_len()),
+            warm,
+        );
+    }
+
+    #[test]
+    fn recursive_package_namespace_publication_rejects_forged_alias_flags_and_properties() {
+        for forgery in 0..4 {
+            let mut fixture = fixture(
+                &[concat!(
+                    "import * as type from 'package'; ",
+                    "export const main = type;",
+                )],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(0),
+                }],
+            );
+            let import = fixture.plan_import(0, 0);
+            let alias = import.bindings[0].alias_symbol;
+            let source = &fixture.files[0];
+            let bound = fixture.bound.get(&source.file).unwrap();
+            let read = plan_source_import_identifier_read(
+                &source.parsed.arena,
+                bound,
+                &fixture.store,
+                &import.bindings[0],
+                identifier_initializer(&fixture, 0, "type"),
+                "type",
+                alias,
+            )
+            .unwrap();
+            let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+            let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+            let PreparedSourceImportTarget::ModuleNamespace { properties } = &prepared.target
+            else {
+                panic!("expected the package self import namespace")
+            };
+            let [property] = properties.as_slice() else {
+                panic!("expected one recursive package export")
+            };
+            let property_symbol = property.symbol;
+            let exported = property.value_symbol;
+
+            match forgery {
+                0 => assert!(fixture.store.set_symbol_flags(
+                    exported,
+                    SymbolFlags::BLOCK_SCOPED_VARIABLE | SymbolFlags::ALIAS,
+                    CheckFlags::NONE,
+                )),
+                1 => {
+                    let mut links = fixture
+                        .store
+                        .value_symbol_links(property_symbol)
+                        .unwrap()
+                        .clone();
+                    links.write_type = Some(property.type_);
+                    assert!(fixture.store.set_value_symbol_links(property_symbol, links));
+                }
+                2 => {
+                    let declaration = fixture
+                        .store
+                        .symbol(exported)
+                        .and_then(ts_binder::semantic::Symbol::value_declaration)
+                        .unwrap();
+                    assert!(fixture.store.set_symbol_declarations(
+                        property_symbol,
+                        None,
+                        Some(declaration),
+                    ));
+                }
+                3 => assert!(fixture.store.set_symbol_flags(
+                    property_symbol,
+                    SymbolFlags::PROPERTY,
+                    CheckFlags::READONLY,
+                )),
+                _ => unreachable!("all recursive namespace property forgeries are covered"),
+            }
+            let before = (store_state(&fixture.store), fixture.store.symbol_len());
+
+            assert_eq!(
+                preflight_prepared_source_import_publications(
+                    &fixture.store,
+                    std::slice::from_ref(&prepared),
+                ),
+                Err(SourceImportError::Invariant(
+                    SourceImportInvariant::PreparedStateChanged(alias),
+                )),
+                "recursive namespace property forgery {forgery} was accepted",
+            );
+            assert_eq!(
+                (store_state(&fixture.store), fixture.store.symbol_len()),
+                before,
+            );
+            assert!(fixture.store.value_symbol_links(alias).is_none());
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(resolved[0].target_symbol)
+                    .is_none()
+            );
+        }
     }
 
     #[test]
