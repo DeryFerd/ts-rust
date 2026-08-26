@@ -1830,6 +1830,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             };
             let function_type = self.function_type_provenance.contains(&contextual_target)
                 && self.source_node_kind(target_declaration) == Some(SyntaxKind::FunctionType)
+                && self
+                    .signature_links(target_declaration)
+                    .and_then(|links| links.resolved_signature.signature())
+                    == Some(target_signature)
                 && self.type_node_links(target_declaration)
                     == Some(&TypeNodeLinks {
                         resolved_type: Some(contextual_target),
