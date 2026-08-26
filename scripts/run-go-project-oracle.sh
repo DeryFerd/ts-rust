@@ -33,10 +33,41 @@ case "$out_real/" in
     ;;
 esac
 project_dir=""
+project_real=""
 if project_dir="$(git -C "$(dirname -- "$config")" rev-parse --show-toplevel 2>/dev/null)"; then
   project_real="$(realpath -- "$project_dir")"
   case "$out_real/" in "$project_real/"*) printf 'Output must be outside the project checkout.\n' >&2; exit 2 ;; esac
 fi
+gomodcache_requested="${GOMODCACHE:-$out/go-mod-cache}"
+out_parent_real="$(dirname -- "$out_real")"
+validate_module_cache() {
+  if [[ "$gomodcache_requested" != /* ]]; then
+    printf 'Module cache must be an absolute path.\n' >&2
+    exit 2
+  fi
+  gomodcache_real="$(realpath -m -- "$gomodcache_requested")"
+  for protected in "$upstream_real" "$config_directory" "${project_real:-}"; do
+    if [[ -z "$protected" ]]; then continue; fi
+    case "$gomodcache_real/" in "$protected/"*)
+      printf 'Module cache must be outside upstream and project sources.\n' >&2
+      exit 2
+      ;;
+    esac
+    case "$protected/" in "$gomodcache_real/"*)
+      printf 'Module cache must not contain upstream or project sources.\n' >&2
+      exit 2
+      ;;
+    esac
+  done
+  if [[ "$gomodcache_real" == "$out_parent_real" || "$gomodcache_real" == "$out_real" ]]; then
+    printf 'Module cache must be a separate directory under the output parent.\n' >&2
+    exit 2
+  fi
+  case "$gomodcache_real/" in "$out_parent_real/"*) ;;
+    *) printf 'Module cache must stay under the output parent.\n' >&2; exit 2 ;;
+  esac
+}
+validate_module_cache
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$script_dir/.." && pwd)"
 sources="$repo/tools/ts_fixture/go_project_oracle"
@@ -72,6 +103,7 @@ if [[ "$mode" != prepare ]]; then
   flock 9
   ulimit -c 0
 fi
+validate_module_cache
 
 hash_file() {
   local hash ignored
@@ -115,7 +147,7 @@ while IFS=$'\t' read -r original replacement; do
 done < <(jq -r '.Replace | to_entries[] | [.key,.value] | @tsv' "$out/overlay.json") | jq -s . >"$out/overlay-sources.json"
 
 build_args=("$go" -C "$upstream" test -mod=readonly -modfile "$out/go.mod" -c -p 1 -overlay "$out/overlay.json" -o "$out/project-oracle.test" ./internal/testutil/tsbaseline)
-build_env=(GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off GOWORK=off GOFLAGS= GOMAXPROCS=1 "GOMEMLIMIT=$((memory_kib * 3 / 4))KiB" "GOCACHE=$out/go-cache" "GOTMPDIR=$out/go-tmp" "TMPDIR=$out/go-tmp" "GOMODCACHE=${GOMODCACHE:-$out/go-mod-cache}")
+build_env=(GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off GOWORK=off GOFLAGS= GOMAXPROCS=1 "GOMEMLIMIT=$((memory_kib * 3 / 4))KiB" "GOCACHE=$out/go-cache" "GOTMPDIR=$out/go-tmp" "TMPDIR=$out/go-tmp" "GOMODCACHE=$gomodcache_real")
 args_json="$(jq -n --args '$ARGS.positional' -- "${build_args[@]}")"
 env_json="$(jq -n --args '$ARGS.positional' -- "${build_env[@]}")"
 rust_sha="$(git -C "$repo" rev-parse HEAD)"
@@ -223,7 +255,7 @@ if [[ "$mode" == build ]]; then
   exit 0
 fi
 if [[ "$mode" == test ]]; then
-  test_args=("$out/project-oracle.test" -test.run '^TestProjectOracle(Metadata|OnDiskReplay|NoCheck)$' -test.count=1 -test.v "-test.timeout=${timeout_seconds}s")
+  test_args=("$out/project-oracle.test" -test.run '^TestProjectOracle.+$' -test.count=1 -test.v "-test.timeout=${timeout_seconds}s")
   test_exit=0
   timeout --signal=TERM --kill-after=10s "${timeout_seconds}s" \
     python3 "$sources/measure.py" "$out/focused-test-resources.json" \
@@ -257,8 +289,11 @@ for run in go-a go-b; do
     '{run_id:$run,exit_code:$code,report_present:$present,resources:$resources,arguments:$arguments,environment:$environment}' >"$out/$run-process.json"
   if ((run_exit != 0)) || [[ "$report_present" != true ]]; then all_ok=0; fi
 done
-equal=false
+equal=null
+comparison_state=unavailable
 if ((all_ok)); then
+  equal=false
+  comparison_state=different
   jq -S 'del(.runtime,.run_id)' "$out/go-a/report.json" >"$out/go-a-stable.json"
   jq -S 'del(.runtime,.run_id)' "$out/go-b/report.json" >"$out/go-b-stable.json"
   if cmp -s "$out/go-a-stable.json" "$out/go-b-stable.json"; then
@@ -267,9 +302,10 @@ if ((all_ok)); then
       if [[ -e "$out/go-a/$artifact" || -e "$out/go-b/$artifact" ]] && ! cmp -s "$out/go-a/$artifact" "$out/go-b/$artifact"; then equal=false; fi
     done
   fi
+  if [[ "$equal" == true ]]; then comparison_state=equal; fi
 fi
-jq -n --argjson equal "$equal" --slurpfile first "$out/go-a-process.json" --slurpfile second "$out/go-b-process.json" \
-  '{schema_version:1,fresh_processes_equal:$equal,processes:[$first[0],$second[0]]}' >"$out/runs.json"
+jq -n --arg state "$comparison_state" --argjson equal "$equal" --slurpfile first "$out/go-a-process.json" --slurpfile second "$out/go-b-process.json" \
+  '{schema_version:2,comparison_state:$state,fresh_processes_equal:$equal,processes:[$first[0],$second[0]]}' >"$out/runs.json"
 if [[ "$equal" != true ]]; then
   printf 'Go oracle did not complete two equal fresh runs. See %s.\n' "$out/runs.json" >&2
   exit 1
