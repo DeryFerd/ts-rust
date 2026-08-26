@@ -445,16 +445,71 @@ fn render_nonempty(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
     use ts_compiler::{Program, ProgramDiagnostic};
+    use ts_config::{ConfigInputKind, ConfigResolutionEvent};
     use ts_core::{TextPos, TextRange};
     use ts_diagnostics::Category;
     use ts_options::CompilerOptions;
-    use ts_vfs::{FileSystem, MemoryFileSystem};
+    use ts_vfs::{DirectoryEntries, FileSystem, MemoryFileSystem};
 
     use super::{
         collect_inputs, go_file_name, mask_library_summary_locations, primary_record, render,
     };
     use crate::{Case, project::ProjectStage, render_error_baseline};
+
+    struct ChangingConfigFileSystem {
+        inner: MemoryFileSystem,
+        config_reads: AtomicUsize,
+        parser_text: &'static str,
+        diagnostic_text: &'static str,
+    }
+
+    impl FileSystem for ChangingConfigFileSystem {
+        fn use_case_sensitive_file_names(&self) -> bool {
+            self.inner.use_case_sensitive_file_names()
+        }
+
+        fn file_exists(&self, path: &str) -> bool {
+            self.inner.file_exists(path)
+        }
+
+        fn directory_exists(&self, path: &str) -> bool {
+            self.inner.directory_exists(path)
+        }
+
+        fn realpath(&self, path: &str) -> String {
+            self.inner.realpath(path)
+        }
+
+        fn modified_time(&self, path: &str) -> Option<u128> {
+            self.inner.modified_time(path)
+        }
+
+        fn read_file(&self, path: &str) -> io::Result<String> {
+            if path == "/case/tsconfig.json" {
+                let read = self.config_reads.fetch_add(1, Ordering::Relaxed);
+                return Ok(if read == 0 {
+                    self.parser_text.to_owned()
+                } else {
+                    self.diagnostic_text.to_owned()
+                });
+            }
+            self.inner.read_file(path)
+        }
+
+        fn write_file(&self, path: &str, contents: &str) -> io::Result<()> {
+            self.inner.write_file(path, contents)
+        }
+
+        fn read_directory(&self, path: &str) -> io::Result<DirectoryEntries> {
+            self.inner.read_directory(path)
+        }
+    }
 
     fn program(files: &[(&str, &str)]) -> Program {
         let fs = MemoryFileSystem::new(true);
@@ -501,6 +556,66 @@ mod tests {
             panic!("missing error text: {output:?}");
         };
         value.text
+    }
+
+    #[test]
+    fn project_errors_keep_diagnostic_read_bytes_when_parser_input_differs() {
+        const PARSER_TEXT: &str = concat!(
+            "// parser read\n",
+            r#"{"compilerOptions":{"noLib":true,"noCheck":true,"noEmit":true,"jsxFactory":"Element.createElement="},"files":["input.ts"]}"#,
+        );
+        const DIAGNOSTIC_TEXT: &str = concat!(
+            "// diagnostic read\n\n",
+            r#"{"compilerOptions":{"noLib":true,"noCheck":true,"noEmit":true,"jsxFactory":"Element.createElement="},"files":["input.ts"]}"#,
+        );
+        let changing = ChangingConfigFileSystem {
+            inner: MemoryFileSystem::new(true),
+            config_reads: AtomicUsize::new(0),
+            parser_text: PARSER_TEXT,
+            diagnostic_text: DIAGNOSTIC_TEXT,
+        };
+        changing
+            .write_file("/case/tsconfig.json", PARSER_TEXT)
+            .unwrap();
+        changing
+            .write_file("/case/input.ts", "const value = 1;\n")
+            .unwrap();
+        let program = Program::from_config(&changing, "/case/tsconfig.json");
+        let graph = program.project_graph_snapshot();
+        let observation = graph.config_resolution_observation.as_ref().unwrap();
+        assert!(observation.is_complete());
+        let parser_input = observation.events.iter().find_map(|event| match event {
+            ConfigResolutionEvent::ReadFile {
+                kind: ConfigInputKind::Config,
+                result: Ok(text),
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(parser_input, Some(PARSER_TEXT));
+        assert_eq!(
+            graph.config.as_ref().unwrap().source_text.as_deref(),
+            Some(DIAGNOSTIC_TEXT)
+        );
+        assert_eq!(changing.config_reads.load(Ordering::Relaxed), 2);
+
+        let stable = MemoryFileSystem::new(true);
+        stable
+            .write_file("/case/tsconfig.json", DIAGNOSTIC_TEXT)
+            .unwrap();
+        stable
+            .write_file("/case/input.ts", "const value = 1;\n")
+            .unwrap();
+        let reference = Program::from_config(&stable, "/case/tsconfig.json");
+        assert_eq!(program.diagnostics(), reference.diagnostics());
+        let actual = render(&program, program.diagnostics());
+        let expected = render(&reference, reference.diagnostics());
+        assert_eq!(actual.file_order, expected.file_order);
+        let actual_text = text(actual.output);
+        assert_eq!(actual_text, text(expected.output));
+        assert!(actual_text.contains("// diagnostic read"));
+        assert!(!actual_text.contains("// parser read"));
+        assert_eq!(changing.config_reads.load(Ordering::Relaxed), 2);
     }
 
     #[test]

@@ -128,9 +128,13 @@ fn project_error_text_appends_the_retained_config_after_source_inputs() {
         panic!("missing graph");
     };
     assert!(
-        graph
+        !graph
             .missing_evidence
             .contains(&"config_parse_inputs".to_owned())
+    );
+    assert_eq!(
+        graph.evidence["configResolutionObservation"]["retentionComplete"],
+        true
     );
     assert!(matches!(
         report.construction,

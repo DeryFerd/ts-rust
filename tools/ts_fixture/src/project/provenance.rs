@@ -209,3 +209,19 @@ fn digest_file(path: &Path) -> io::Result<ProjectFileDigest> {
         digest_algorithm: SCORECARD_DIGEST_ALGORITHM,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn compiled_helper_digests_include_both_error_renderer_sources() {
+        let digests = super::compiled_helper_digests();
+        assert_eq!(
+            digests["lib.rs"],
+            crate::stable_digest(include_bytes!("../lib.rs")),
+        );
+        assert_eq!(
+            digests["project/errors.rs"],
+            crate::stable_digest(include_bytes!("errors.rs")),
+        );
+    }
+}
