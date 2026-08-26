@@ -1987,7 +1987,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 if property_record.value_declaration() != Some(*declaration)
                     || !matches!(
                         self.source_node_kind(*declaration),
-                        Some(SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment)
+                        Some(
+                            SyntaxKind::PropertyAssignment
+                                | SyntaxKind::ShorthandPropertyAssignment
+                        )
                     )
                     || table.get(property_record.name()) != Some(*property)
                     || raw_table.and_then(|raw| raw.get(raw_record.name())) != Some(raw)
