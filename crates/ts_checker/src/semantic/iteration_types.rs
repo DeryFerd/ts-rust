@@ -171,6 +171,44 @@ mod tests {
             receiver: TypeId,
             name: EscapedNameRef<'_>,
         ) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
+            if matches!(
+                store.type_payload(receiver).map(|record| record.data()),
+                Some(TypeData::Union(_))
+            ) {
+                use crate::semantic::member_resolution::UnionPropertyError;
+
+                let name = name
+                    .as_utf8()
+                    .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?;
+                return store
+                    .resolved_union_property(receiver, name)
+                    .map(|property| {
+                        property.map(|property| ResolvedOwnProperty {
+                            symbol: property.symbol(),
+                            type_: property.type_id(),
+                            optional: property.is_optional(),
+                            readonly: property.is_readonly(),
+                        })
+                    })
+                    .map_err(|error| match error {
+                        UnionPropertyError::Relation(error) => error.into(),
+                        UnionPropertyError::TypeCache(error) => error.into(),
+                        UnionPropertyError::UnsupportedUnion(_)
+                        | UnionPropertyError::UnsupportedConstituent(_)
+                        | UnionPropertyError::UnsupportedPropertyType(_)
+                        | UnionPropertyError::UnsupportedExactOptionalProperty(_) => {
+                            RelationUnavailable::UnsupportedStructuredType(receiver).into()
+                        }
+                        UnionPropertyError::Capacity(_) => {
+                            RelationUnavailable::UnionValidationCapacity(receiver).into()
+                        }
+                        UnionPropertyError::InvalidUnion(_)
+                        | UnionPropertyError::InvalidProperty(_)
+                        | UnionPropertyError::InvalidCache(_) => {
+                            RelationUnavailable::InvalidStructuredMembers(receiver).into()
+                        }
+                    });
+            }
             let mut session = crate::semantic::instantiate::InstantiationSession::new(
                 crate::semantic::instantiate::InstantiationLimits::default(),
             );
@@ -645,6 +683,184 @@ mod tests {
     }
 
     #[test]
+    fn iterator_methods_remove_void_from_return_and_throw_unions() {
+        let source = parsed(concat!(
+            "interface State { ",
+            "next(): { value: number }; ",
+            "return: ((value: string) => { done: true; value: string }) | void; ",
+            "throw: (() => { done: true; value: bigint }) | void; ",
+            "} declare var iterator: State;",
+        ));
+        let file = FileId::new(22_023);
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&[(file, &source)], 0, options);
+        let node = annotation(&source, file, "iterator");
+        let input = context.get_type_from_type_node(node).unwrap();
+        let global_types = context.global_types().clone();
+        let globals = SynchronousIterationGlobals::default();
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let expected = [
+            ("return", bootstrap.string_type),
+            ("throw", bootstrap.bigint_type),
+        ];
+        let mut query = SynchronousIterationQuery::new(
+            store,
+            &global_types,
+            &globals,
+            options,
+            node,
+            StoredProperties,
+        );
+        for (name, return_type) in expected {
+            let checked = query.method(input, name, true).unwrap();
+            assert_eq!(
+                checked.types,
+                IterationTypes {
+                    yield_type: None,
+                    return_type: Some(return_type),
+                    next_type: None,
+                }
+            );
+            assert!(checked.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn iterator_result_reads_value_from_the_filtered_union() {
+        let source = parsed(concat!(
+            "declare var result: { done: false; value: number } | ",
+            "{ done: false; value: string };",
+        ));
+        let file = FileId::new(22_024);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&[(file, &source)], 0, options);
+        let node = annotation(&source, file, "result");
+        let input = context.get_type_from_type_node(node).unwrap();
+        let global_types = context.global_types().clone();
+        let globals = SynchronousIterationGlobals::default();
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (number, string, void) = (
+            bootstrap.number_type,
+            bootstrap.string_type,
+            bootstrap.void_type,
+        );
+        let expected = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[number, string],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let mut query = SynchronousIterationQuery::new(
+            store,
+            &global_types,
+            &globals,
+            options,
+            node,
+            StoredProperties,
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                query.iterator_result(input).unwrap(),
+                IterationTypes {
+                    yield_type: Some(expected),
+                    return_type: Some(void),
+                    next_type: None,
+                }
+            );
+        }
+        let TypeData::Union(union) = query.store.type_payload(input).unwrap().data() else {
+            panic!("the iterator result remains a union")
+        };
+        let cache = query
+            .store
+            .symbol_table(union.union.property_cache.unwrap())
+            .unwrap();
+        assert!(cache.get_source("value").is_some());
+    }
+
+    #[test]
+    fn iterator_return_unions_reject_changed_origins_before_use() {
+        let source = parsed(concat!(
+            "interface State { next(): ",
+            "{ done: false; value: string } | { done: true; value: number }; } ",
+            "declare var iterator: State;",
+        ));
+        let file = FileId::new(22_025);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&[(file, &source)], 0, options);
+        let node = annotation(&source, file, "iterator");
+        let input = context.get_type_from_type_node(node).unwrap();
+        let global_types = context.global_types().clone();
+        let globals = SynchronousIterationGlobals::default();
+        let store = context.store_mut_for_test();
+        let method = StoredProperties
+            .property(store, input, EscapedNameRef::source("next"))
+            .unwrap()
+            .unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(store, method.type_)
+        else {
+            panic!("the declared method has a complete callable graph")
+        };
+        let result = projection.call_signatures[0].return_type.unwrap();
+        let mut query = SynchronousIterationQuery::new(
+            store,
+            &global_types,
+            &globals,
+            options,
+            node,
+            StoredProperties,
+        );
+        assert!(query.iterator(input, true).unwrap().diagnostics.is_empty());
+        let TypeData::Union(union) = query.store.type_payload(result).unwrap().data() else {
+            panic!("the next method returns a union")
+        };
+        let union = union.clone();
+        let number = query.bootstrap().unwrap().number_type;
+        assert!(query.store.set_union_caches(
+            result,
+            union.resolved_reduced_type,
+            union.regular_type,
+            Some(number),
+            union.key_property_name,
+            union.constituent_map,
+        ));
+        let before = (
+            query.store.type_len(),
+            query.store.symbol_len(),
+            query.store.signature_len(),
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                query.iterator_result(result),
+                Err(SourceCheckError::LiteralCache(_))
+            ));
+            assert!(matches!(
+                query.without_nullish(result),
+                Err(SourceCheckError::LiteralCache(_))
+            ));
+            assert!(query.iterator(input, true).is_err());
+        }
+        assert_eq!(
+            before,
+            (
+                query.store.type_len(),
+                query.store.symbol_len(),
+                query.store.signature_len(),
+            )
+        );
+    }
+
+    #[test]
     fn invalid_iterator_methods_preserve_pinned_recovery_and_diagnostics() {
         let source = parsed(concat!(
             "declare var missing: {}; ",
@@ -1093,6 +1309,7 @@ fn global_error(
 ///
 /// `None` means a valid missing property. Unsupported or malformed members
 /// must return an error. They must not become a missing-property diagnostic.
+/// Union receivers use the shared union-property query, including its indexes.
 pub(super) trait IterationPropertyResolver {
     /// Resolves the actual global `Symbol.iterator` property-name type before
     /// using the pinned internal known-symbol fallback.
@@ -1496,7 +1713,15 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             StoredCallableSetValidation::Malformed { .. } => {
                 Err(RelationUnavailable::MalformedFunctionType(type_).into())
             }
-            StoredCallableSetValidation::Valid { projection, .. } => Ok(projection.call_signatures),
+            StoredCallableSetValidation::Valid {
+                projection, edges, ..
+            } => {
+                for edge in edges {
+                    self.store
+                        .validate_union_constituent_with_global_types(self.global_types, edge)?;
+                }
+                Ok(projection.call_signatures)
+            }
         }
     }
 
@@ -1513,7 +1738,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             .ok_or(RelationUnavailable::Type(type_))?;
         if record
             .flags()
-            .intersects(TypeFlags::NULL | TypeFlags::UNDEFINED)
+            .intersects(TypeFlags::NULL | TypeFlags::UNDEFINED | TypeFlags::VOID)
         {
             return Ok(self.bootstrap()?.never_type);
         }
@@ -1521,6 +1746,8 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             return Ok(type_);
         };
         let types = union.union.types.clone();
+        self.store
+            .validate_union_constituent_with_global_types(self.global_types, type_)?;
         let mut retained = Vec::new();
         for type_ in types {
             if !self
@@ -1528,7 +1755,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
                 .type_payload(type_)
                 .ok_or(RelationUnavailable::Type(type_))?
                 .flags()
-                .intersects(TypeFlags::NULL | TypeFlags::UNDEFINED)
+                .intersects(TypeFlags::NULL | TypeFlags::UNDEFINED | TypeFlags::VOID)
             {
                 retained.push(type_);
             }
@@ -1740,11 +1967,15 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             }
         }
         let constituents = match record.data() {
-            TypeData::Union(union) => union.union.types.clone(),
+            TypeData::Union(union) => {
+                self.store
+                    .validate_union_constituent_with_global_types(self.global_types, input)?;
+                union.union.types.clone()
+            }
             _ => vec![input],
         };
-        let yield_type = self.result_value(&constituents, false)?;
-        let return_type = self.result_value(&constituents, true)?;
+        let yield_type = self.result_value(input, &constituents, false)?;
+        let return_type = self.result_value(input, &constituents, true)?;
         if yield_type.is_none() && return_type.is_none() {
             return Ok(IterationTypes::default());
         }
@@ -1757,6 +1988,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
 
     fn result_value(
         &mut self,
+        input: TypeId,
         constituents: &[TypeId],
         done: bool,
     ) -> Result<Option<TypeId>, SourceCheckError> {
@@ -1767,7 +1999,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
         };
         let done_key = EscapedName::source("done");
         let value_key = EscapedName::source("value");
-        let mut values = Vec::new();
+        let mut retained = Vec::new();
         for &constituent in constituents {
             if constituent == self.bootstrap()?.never_type {
                 continue;
@@ -1786,15 +2018,20 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             )? {
                 continue;
             }
-            let property = self
-                .properties
-                .property(self.store, constituent, value_key.as_ref())?;
-            let Some(property) = property else {
-                return Ok(None);
-            };
-            values.push(self.read_property_type(property)?);
+            retained.push(constituent);
         }
-        self.union(&values)
+        let filtered = if retained.len() == constituents.len() {
+            Some(input)
+        } else {
+            self.union(&retained)?
+        };
+        let Some(filtered) = filtered else {
+            return Ok(None);
+        };
+        self.properties
+            .property(self.store, filtered, value_key.as_ref())?
+            .map(|property| self.read_property_type(property))
+            .transpose()
     }
 
     fn read_property_type(
