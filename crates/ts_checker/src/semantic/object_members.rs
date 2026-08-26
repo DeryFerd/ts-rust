@@ -1211,6 +1211,14 @@ pub(super) struct LazyMergedGenericInterfacePlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GenericInterfaceIdentityPlan {
+    pub node: NodeRef,
+    pub symbol: SemanticSymbolId,
+    pub parameters: Vec<SemanticSymbolId>,
+    pub heritage: Option<DirectInterfaceHeritagePlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PropertyObjectPlan {
     pub kind: PropertyObjectKind,
     pub node: NodeRef,
@@ -5817,12 +5825,139 @@ pub(super) fn materialize_global_array_concat_method(
     Ok(Some(type_))
 }
 
-/// Plans the declared members of one source-owned generic interface.
-///
-/// The bound member table also contains the interface's type parameters. The
-/// plan accepts merged declarations and canonical exported owners. Publication
-/// creates a separate declared-property table instead of replacing the
-/// binder-owned table.
+/// Validates interface identity and heritage without reading member declarations.
+pub(super) fn plan_generic_interface_identity(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<GenericInterfaceIdentityPlan, PropertyObjectError> {
+    let symbol = store
+        .get_merged_symbol(symbol)
+        .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let owner = store
+        .symbol(symbol)
+        .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let declarations = owner
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+        .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let node = declarations[0];
+    let invalid = || PropertyObjectError::InvalidInterface {
+        declaration: node,
+        symbol,
+    };
+    let members = owner
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(invalid)?;
+    if owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.value_declaration().is_some()
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
+    {
+        return Err(invalid());
+    }
+    let mut seen = HashSet::new();
+    let mut shared_parameters = None;
+    let mut heritage = None;
+    for &declaration in declarations {
+        let record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return Err(invalid());
+        };
+        let parameters = interface.type_parameters.as_ref().ok_or_else(invalid)?;
+        let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
+        let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(invalid());
+        };
+        let parent = declared_type_declaration_parent(
+            store,
+            host,
+            declaration,
+            symbol,
+            name,
+            interface.modifiers.as_ref(),
+        )
+        .map_err(|()| invalid())?;
+        if !seen.insert(declaration)
+            || record.kind != SyntaxKind::InterfaceDeclaration
+            || record.flags.0 != 0
+            || parameters.nodes.is_empty()
+            || parameters.has_trailing_comma
+            || !host.symbol_matches(store, declaration, symbol)
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+            || owner.parent().is_some() != parent.is_some()
+            || store.get_parent_of_symbol(symbol) != parent
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.parent != Some(declaration.node)
+            || interface.flow_node.is_some()
+            || interface.local_symbol.is_some()
+            || interface.symbol.is_some()
+        {
+            return Err(invalid());
+        }
+        let mut current = Vec::with_capacity(parameters.nodes.len());
+        let mut unique = HashSet::new();
+        for parameter in &parameters.nodes {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+            let record = preflight_node(store, host, parameter).map_err(|_| invalid())?;
+            let parameter_symbol = bound_symbol(store, host, parameter).ok_or_else(invalid)?;
+            let parameter_owner = store.symbol(parameter_symbol).ok_or_else(invalid)?;
+            if record.kind != SyntaxKind::TypeParameter
+                || record.parent != Some(declaration.node)
+                || parameter_owner.flags().without(SymbolFlags::TRANSIENT)
+                    != SymbolFlags::TYPE_PARAMETER
+                || parameter_owner.check_flags() != CheckFlags::NONE
+                || store.get_parent_of_symbol(parameter_symbol) != Some(symbol)
+                || members
+                    .get(parameter_owner.name())
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    != Some(parameter_symbol)
+                || !unique.insert(parameter_symbol)
+            {
+                return Err(invalid());
+            }
+            current.push(parameter_symbol);
+        }
+        if shared_parameters
+            .as_ref()
+            .is_some_and(|previous| previous != &current)
+        {
+            return Err(invalid());
+        }
+        shared_parameters.get_or_insert(current);
+        if let Some(clauses) = interface.heritage_clauses.as_ref() {
+            let planned = plan_direct_interface_heritage(store, host, declaration, symbol, clauses)
+                .map_err(|error| match error {
+                    DirectInterfaceHeritageError::Invalid => invalid(),
+                    DirectInterfaceHeritageError::Unsupported { node, kind } => {
+                        PropertyObjectError::UnsupportedMember { node, kind }
+                    }
+                })?;
+            if planned
+                .bases
+                .iter()
+                .any(|base| base.kind != DirectInterfaceBaseKind::Interface)
+            {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: planned.clause,
+                    kind: SyntaxKind::HeritageClause,
+                });
+            }
+            merge_interface_heritage(store, host, &mut heritage, planned, 2)?;
+        }
+    }
+    Ok(GenericInterfaceIdentityPlan {
+        node,
+        symbol,
+        parameters: shared_parameters.ok_or_else(invalid)?,
+        heritage,
+    })
+}
+
+/// Plans declared members while preserving the binder-owned parameter table.
 pub(super) fn plan_generic_interface(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -11892,7 +12027,10 @@ fn valid_declared_index_infos(
     })
 }
 
-fn cached_planned_type_identity(store: &CanonicalTypeMapperStore, node: NodeRef) -> Option<TypeId> {
+pub(super) fn cached_planned_type_identity(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+) -> Option<TypeId> {
     let bootstrap = store.intrinsic_bootstrap()?;
     match store.source_node_kind(node)? {
         SyntaxKind::AnyKeyword => Some(bootstrap.any_type),
@@ -14566,6 +14704,15 @@ fn valid_generic_publication_target(
                 if planned.kind != DirectInterfaceBaseKind::Interface {
                     return false;
                 }
+                if planned.defaults.iter().any(|default| {
+                    planned.type_arguments.get(default.index) != Some(&default.argument)
+                        || super::interface_heritage::validate_heritage_default_cache(
+                            store, default, true,
+                        )
+                        .is_err()
+                }) {
+                    return false;
+                }
                 if planned.type_arguments.is_empty() {
                     if !matches!(
                         validate_resolved_declared_property_object(store, *base),
@@ -14586,37 +14733,27 @@ fn valid_generic_publication_target(
                 let Ok(base_reference) = validate_direct_generic_reference(store, *base) else {
                     return false;
                 };
-                let arguments_match = if base_reference.type_arguments == reference.type_arguments {
-                    true
-                } else {
-                    let mut previous_position = None;
-                    planned.type_arguments.len() == base_reference.type_arguments.len()
-                        && planned
-                            .type_arguments
-                            .iter()
-                            .zip(&base_reference.type_arguments)
-                            .all(|(annotation, argument)| {
-                                if cached_planned_type_identity(store, *annotation)
-                                    != Some(*argument)
-                                {
-                                    return false;
-                                }
-                                let Some(position) = reference
-                                    .type_arguments
-                                    .iter()
-                                    .position(|parameter| parameter == argument)
-                                else {
-                                    return true;
-                                };
-                                if previous_position.is_some_and(|previous| position <= previous) {
-                                    return false;
-                                }
-                                previous_position = Some(position);
-                                cached_ordinary_type_parameter_owner(store, *argument)
-                                    .and_then(|parameter| store.get_parent_of_symbol(parameter))
-                                    == Some(plan.symbol)
-                            })
-                };
+                let arguments_match = planned.type_arguments.len()
+                    == base_reference.type_arguments.len()
+                    && planned
+                        .type_arguments
+                        .iter()
+                        .zip(&base_reference.type_arguments)
+                        .all(|(annotation, argument)| {
+                            if cached_planned_type_identity(store, *annotation) != Some(*argument) {
+                                return false;
+                            }
+                            let Some(_) = reference
+                                .type_arguments
+                                .iter()
+                                .position(|parameter| parameter == argument)
+                            else {
+                                return true;
+                            };
+                            cached_ordinary_type_parameter_owner(store, *argument)
+                                .and_then(|parameter| store.get_parent_of_symbol(parameter))
+                                == Some(plan.symbol)
+                        });
                 if !arguments_match
                     || store
                         .type_payload(base_reference.target)

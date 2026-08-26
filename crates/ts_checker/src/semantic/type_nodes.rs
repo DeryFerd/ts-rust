@@ -62,7 +62,7 @@ use super::{
         InstantiationLimits, InstantiationSession, instantiate_type_with_session,
         instantiate_type_with_vector_and_session,
     },
-    interface_heritage::DirectInterfaceBaseKind,
+    interface_heritage::{DirectInterfaceBaseKind, DirectInterfaceHeritagePlan},
     intersection_types::IntersectionTypeError,
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
@@ -826,6 +826,8 @@ struct TypeQueryPlan {
     type_literals: BTreeMap<NodeRef, PropertyObjectPlan>,
     interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
     generic_interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
+    generic_interface_identities:
+        BTreeMap<SemanticSymbolId, object_members::GenericInterfaceIdentityPlan>,
     functions: BTreeMap<NodeRef, FunctionTypePlan>,
     constructors: BTreeMap<NodeRef, PlannedConstructorType>,
     type_predicates: BTreeMap<NodeRef, CallableTypePredicatePlan>,
@@ -6996,17 +6998,50 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .ok_or(DeclaredTypeError::Unavailable(
                 DeclaredTypeUnavailable::SymbolNotOwned(symbol),
             ))?;
-        if self.plan.generic_interfaces.contains_key(&symbol) {
+        if self.plan.generic_interfaces.contains_key(&symbol)
+            || self.plan.generic_interface_identities.contains_key(&symbol)
+        {
             return Ok(());
         }
-        let planned = object_members::plan_generic_interface(self.store, self.host, symbol)
-            .map_err(property_object_error)?;
-        let Some(heritage) = planned.heritage.as_ref() else {
+        let identity_only = self
+            .store
+            .symbol(symbol)
+            .and_then(|owner| owner.declarations())
+            .is_some_and(|declarations| {
+                declarations.iter().any(|declaration| {
+                    self.host
+                        .bound_file(*declaration)
+                        .and_then(ts_binder::BoundFile::source_facts)
+                        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_default_library)
+                })
+            });
+        let identity = if identity_only {
+            Some(
+                object_members::plan_generic_interface_identity(self.store, self.host, symbol)
+                    .map_err(property_object_error)?,
+            )
+        } else {
+            None
+        };
+        let members = if identity_only {
+            None
+        } else {
+            Some(
+                object_members::plan_generic_interface(self.store, self.host, symbol)
+                    .map_err(property_object_error)?,
+            )
+        };
+        let Some(heritage) = identity
+            .as_ref()
+            .and_then(|plan| plan.heritage.as_ref())
+            .or_else(|| members.as_ref().and_then(|plan| plan.heritage.as_ref()))
+        else {
             return Ok(());
         };
+        let bases = heritage.bases.clone();
         let react_namespace = self.authenticated_react_interface_namespace(symbol)?;
         if react_namespace.is_some()
-            && heritage.bases.iter().any(|base| {
+            && bases.iter().any(|base| {
                 base.type_arguments.is_empty()
                     && self
                         .store
@@ -7016,8 +7051,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         {
             return Ok(());
         }
-        let bases = heritage.bases.clone();
-        self.plan.generic_interfaces.insert(symbol, planned);
+        if let Some(identity) = identity {
+            self.plan
+                .generic_interface_identities
+                .insert(symbol, identity);
+        }
+        if let Some(members) = members {
+            self.plan.generic_interfaces.insert(symbol, members);
+        }
         if !self.planning_interfaces.insert(symbol) {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::GenericReferenceUnsupported {
@@ -7092,8 +7133,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 if self.has_generic_interface_heritage(base.symbol)? {
                     self.plan_generic_interface_heritage(base.symbol)?;
                 }
-                for argument in base.type_arguments {
-                    self.plan_type_node_in_context(argument, None, false)?;
+                for argument in &base.type_arguments {
+                    self.plan_type_node_in_context(*argument, None, false)?;
+                }
+                for default in &base.defaults {
+                    self.plan_type_node_in_context(default.node, None, false)?;
+                    super::interface_heritage::validate_heritage_default_cache(
+                        self.store, default, false,
+                    )
+                    .map_err(|_| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(
+                            default.node,
+                        ))
+                    })?;
                 }
             }
             Ok(())
@@ -21280,11 +21332,41 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             get_declared_class_interface_or_type_parameter(self.store, self.host, symbol, flags)?
         {
             if flags.contains(SymbolFlags::INTERFACE) && !flags.contains(SymbolFlags::CLASS) {
+                if let Some(interface) = plan.generic_interface_identities.get(&symbol) {
+                    let reference = validate_direct_generic_reference(self.store, declared_type)
+                        .map_err(|_| {
+                            type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(
+                                interface.node,
+                            ))
+                        })?;
+                    if reference.target != declared_type
+                        || reference
+                            .type_arguments
+                            .iter()
+                            .map(|parameter| {
+                                cached_ordinary_type_parameter_owner(self.store, *parameter)
+                            })
+                            .collect::<Option<Vec<_>>>()
+                            .as_deref()
+                            != Some(interface.parameters.as_slice())
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidTypeReference(interface.node),
+                        ));
+                    }
+                    return self.execute_generic_interface_heritage(
+                        symbol,
+                        declared_type,
+                        (interface.symbol, interface.heritage.as_ref()),
+                        plan,
+                        prepared,
+                    );
+                }
                 if let Some(interface) = plan.generic_interfaces.get(&symbol).cloned() {
                     return self.execute_generic_interface_heritage(
                         symbol,
                         declared_type,
-                        &interface,
+                        (interface.symbol, interface.heritage.as_ref()),
                         plan,
                         prepared,
                     );
@@ -21317,7 +21399,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         symbol: SemanticSymbolId,
         target: TypeId,
-        interface: &PropertyObjectPlan,
+        (interface_symbol, heritage): (SemanticSymbolId, Option<&DirectInterfaceHeritagePlan>),
         plan: &TypeQueryPlan,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
@@ -21327,8 +21409,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 declared_type: target,
             })
         };
-        let heritage = interface.heritage.as_ref().ok_or_else(invalid)?;
-        if interface.symbol != symbol || heritage.bases.is_empty() {
+        let heritage = heritage.ok_or_else(invalid)?;
+        if interface_symbol != symbol || heritage.bases.is_empty() {
             return Err(invalid());
         }
 
@@ -21341,6 +21423,41 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let mut arguments = Vec::with_capacity(base.type_arguments.len());
             for argument in &base.type_arguments {
                 arguments.push(self.execute_type_node(*argument, plan, prepared)?);
+            }
+            if !base.defaults.is_empty() {
+                let reference = PlannedTypeReference {
+                    symbol: base.symbol,
+                    import_alias: None,
+                    type_arguments: base.type_arguments.clone(),
+                    alias_owner: None,
+                    arity: PlannedTypeReferenceArity::Valid,
+                    global_array_target: None,
+                    direct_generic: true,
+                    direct_generic_constraints: Vec::new(),
+                    direct_generic_defaults: base
+                        .defaults
+                        .iter()
+                        .map(|default| PlannedDirectGenericDefault {
+                            parameter: default.parameter,
+                            node: default.node,
+                            earlier_parameter: default.earlier_parameter,
+                        })
+                        .collect(),
+                };
+                self.resolve_direct_generic_reference_defaults(
+                    base.node,
+                    &reference,
+                    base_target,
+                    &mut arguments,
+                    plan,
+                    prepared,
+                )?;
+                for default in &base.defaults {
+                    super::interface_heritage::validate_heritage_default_cache(
+                        self.store, default, true,
+                    )
+                    .map_err(|_| invalid())?;
+                }
             }
             let reference = if arguments.is_empty() {
                 if !matches!(
