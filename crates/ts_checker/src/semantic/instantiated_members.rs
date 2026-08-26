@@ -1729,13 +1729,13 @@ fn instantiate_function_member_type(
         let index = predicate.parameter_index();
         let name = predicate.parameter_name().to_owned();
         let narrowed = predicate.type_id();
-        let mapped = narrowed
+        let instantiated_type = narrowed
             .map(|type_| {
                 instantiate_generic_member_type(store, type_, mapper, array_targets, session)
             })
             .transpose()?;
         let predicate = store
-            .alloc_type_predicate(kind, index, name, mapped)
+            .alloc_type_predicate(kind, index, name, instantiated_type)
             .ok_or(GenericInterfaceMemberError::Capacity(source))?;
         if !store.set_signature_resolved_type_predicate(signature, Some(predicate)) {
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));

@@ -1390,7 +1390,7 @@ fn instantiated_method_union_expansion_matches(
     if record.alias().is_some() || union.origin.is_some() {
         return false;
     }
-    let mapped = union
+    let constituents = union
         .union
         .types
         .iter()
@@ -1402,10 +1402,10 @@ fn instantiated_method_union_expansion_matches(
             _ => None,
         })
         .collect::<Option<Vec<_>>>();
-    let Some(mut mapped) = mapped else {
+    let Some(mut constituents) = constituents else {
         return false;
     };
-    if !mapped.iter().any(|type_| {
+    if !constituents.iter().any(|type_| {
         matches!(
             store.type_payload(*type_).map(super::TypeRecord::data),
             Some(TypeData::Union(_))
@@ -1419,11 +1419,11 @@ fn instantiated_method_union_expansion_matches(
             .is_ok(),
         None => store.validate_cached_union_result(type_, None).is_ok(),
     };
-    if !valid(template) || !valid(actual) || !mapped.iter().copied().all(valid) {
+    if !valid(template) || !valid(actual) || !constituents.iter().copied().all(valid) {
         return false;
     }
     if let Some(bootstrap) = store.intrinsic_bootstrap()
-        && let [first, second] = mapped.as_slice()
+        && let [first, second] = constituents.as_slice()
     {
         let base = if *first == bootstrap.undefined_type {
             Some(*second)
@@ -1445,19 +1445,28 @@ fn instantiated_method_union_expansion_matches(
             return true;
         }
     }
-    if store.cached_template_result_union(&mapped).ok().flatten() == Some(actual) {
+    if store
+        .cached_template_result_union(&constituents)
+        .ok()
+        .flatten()
+        == Some(actual)
+    {
         return true;
     }
     if store
         .intrinsic_bootstrap()
         .is_some_and(|bootstrap| !bootstrap.options.strict_null_checks)
     {
-        mapped.retain(|type_| {
+        constituents.retain(|type_| {
             store
                 .type_payload(*type_)
                 .is_some_and(|record| !record.flags().intersects(TypeFlags::NULLABLE))
         });
-        return store.cached_template_result_union(&mapped).ok().flatten() == Some(actual);
+        return store
+            .cached_template_result_union(&constituents)
+            .ok()
+            .flatten()
+            == Some(actual);
     }
     false
 }

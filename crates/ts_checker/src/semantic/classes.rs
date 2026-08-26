@@ -1234,13 +1234,13 @@ fn class_property_modifiers(
         {
             (ClassPropertySide::Instance, false)
         }
-        [SyntaxKind::ReadonlyKeyword] => (ClassPropertySide::Instance, true),
-        [
+        [SyntaxKind::ReadonlyKeyword]
+        | [
             SyntaxKind::PublicKeyword | SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword,
             SyntaxKind::ReadonlyKeyword,
         ] => (ClassPropertySide::Instance, true),
-        [SyntaxKind::StaticKeyword] => (ClassPropertySide::Static, false),
-        [
+        [SyntaxKind::StaticKeyword]
+        | [
             SyntaxKind::PublicKeyword | SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword,
             SyntaxKind::StaticKeyword,
         ] => (ClassPropertySide::Static, false),
@@ -1685,17 +1685,18 @@ pub(super) fn optional_constructor_parameter_type(
     optional: bool,
     declaration: NodeRef,
 ) -> Result<Option<TypeId>, ClassError> {
-    let types = constructor_parameter_type_constituents(store, annotation, optional, declaration)?;
-    if let [type_] = types.as_slice() {
+    let constituents =
+        constructor_parameter_type_constituents(store, annotation, optional, declaration)?;
+    if let [type_] = constituents.as_slice() {
         return Ok(Some(*type_));
     }
     let type_ = store
         .intrinsic_bootstrap()
-        .and_then(|bootstrap| bootstrap.cached_union_type(&types));
+        .and_then(|bootstrap| bootstrap.cached_union_type(&constituents));
     if let Some(type_) = type_ {
         if !matches!(
             store.type_payload(type_).map(TypeRecord::data),
-            Some(TypeData::Union(union)) if union.union.types == types
+            Some(TypeData::Union(union)) if union.union.types == constituents
         ) {
             return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
                 declaration,
@@ -15299,10 +15300,11 @@ fn exact_construct_signature(
                 return false;
             }
             0
-        } else if stored_constructor_parameter_is_optional(store, parameter_declaration) {
-            0
         } else {
-            1
+            i32::from(!stored_constructor_parameter_is_optional(
+                store,
+                parameter_declaration,
+            ))
         }
     } else {
         0
