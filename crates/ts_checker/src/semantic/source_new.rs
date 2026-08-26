@@ -1704,15 +1704,18 @@ fn plan_global_date_constructor(
         return Err(reject());
     }
 
-    if let Some(date_type) = store
-        .declared_type_links(symbol)
-        .and_then(|links| links.declared_type)
-    {
-        let record = store.type_payload(date_type).ok_or_else(reject)?;
-        if record.flags() != TypeFlags::OBJECT
-            || !record.object_flags().contains(ObjectFlags::INTERFACE)
-            || record.symbol() != Some(symbol)
-            || record.alias().is_some()
+    for provider in [symbol, owner] {
+        if store
+            .declared_type_links(provider)
+            .and_then(|links| links.declared_type)
+            .is_some()
+            && (store.declared_type_initialization_in_progress(provider)
+                || preflight_class_or_interface_reference(
+                    store,
+                    host,
+                    provider,
+                    store.symbol(provider).ok_or_else(reject)?.flags(),
+                )? != 0)
         {
             return Err(reject());
         }
@@ -5680,6 +5683,20 @@ pub(super) fn authenticated_global_date_constructor_return(
     let owner_record = store.symbol(owner)?;
     let instance = store.declared_type_links(date)?.declared_type?;
     let constructor = store.declared_type_links(owner)?.declared_type?;
+    for provider in [date, owner] {
+        if store.declared_type_initialization_in_progress(provider)
+            || preflight_class_or_interface_reference(
+                store,
+                &DeclaredTypeHost::default(),
+                provider,
+                store.symbol(provider)?.flags(),
+            )
+            .ok()
+                != Some(0)
+        {
+            return None;
+        }
+    }
     let instance_record = store.type_payload(instance)?;
     let constructor_record = store.type_payload(constructor)?;
     let TypeData::Interface(interface) = constructor_record.data() else {
@@ -8831,6 +8848,99 @@ mod tests {
                 validate_class_heritage_members(context.store(), model_type),
                 ClassHeritageMembersValidation::Valid,
                 "case {poison}",
+            );
+        }
+    }
+
+    #[test]
+    fn global_date_defaults_reject_forged_interface_this_type_graphs() {
+        let library = parse_source_file(concat!(
+            "interface Date { self: this; } ",
+            "interface DateConstructor { self: this; new(): Date; readonly prototype: Date; } ",
+            "declare var Date: DateConstructor;",
+        ));
+        let source =
+            parse_source_file("class Model { constructor(readonly timestamp = new Date()) {} }");
+        let library_file = FileId::new(1_899);
+        let source_file = FileId::new(1_900);
+        let mut context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+        let initializer = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        context.check_source_file(source_file).unwrap();
+        let signature = context
+            .store()
+            .signature_links(initializer)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let instance = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .resolved_return_type()
+            .unwrap();
+        for name in ["Date", "DateConstructor"] {
+            let store = context.store();
+            let owner = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .and_then(|globals| globals.get_source(name))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let type_ = store
+                .declared_type_links(owner)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let TypeData::Interface(interface) = store.type_payload(type_).unwrap().data() else {
+                panic!("{name} must retain its declared interface")
+            };
+            let this_type = interface.this_type.unwrap();
+            let alias = context.store_mut_for_test().alloc_type_alias(None).unwrap();
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_alias(this_type, Some(alias))
+            );
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().clone(),
+            );
+
+            assert_eq!(
+                authenticated_global_date_constructor_return(context.store(), signature),
+                None
+            );
+            assert!(!exact_global_date_initializer(
+                context.store(),
+                initializer,
+                instance
+            ));
+            assert!(context.recheck_source_file(source_file).is_err());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().clone(),
+                ),
+                before,
+                "{name}",
+            );
+            assert!(context.store_mut_for_test().set_type_alias(this_type, None));
+            assert_eq!(
+                authenticated_global_date_constructor_return(context.store(), signature),
+                Some(instance)
             );
         }
     }
