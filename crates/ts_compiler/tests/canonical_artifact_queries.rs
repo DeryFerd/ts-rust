@@ -1,4 +1,5 @@
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
+use ts_checker::semantic::{SymbolDisplayError, TypeDisplayUnavailable};
 use ts_compiler::{CanonicalArtifactQueryError, CanonicalTypeFormatFlags, Program};
 use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind};
 use ts_vfs::{FileSystem, MemoryFileSystem};
@@ -181,19 +182,30 @@ fn canonical_queries_display_shared_module_types_through_the_local_alias() {
         &["input.ts".to_owned()],
         options,
         |program, queries| {
-            let location = identifiers(program, "/project/input.ts", "Local")[1];
-            let type_ = queries.get_type_at_location(location).unwrap();
-            for _ in 0..2 {
-                assert_eq!(
-                    queries
-                        .type_to_string_at_location_with_flags(
-                            type_,
-                            location,
-                            CanonicalTypeFormatFlags::NO_TRUNCATION
-                        )
-                        .unwrap(),
-                    "typeof Local"
-                );
+            let local = identifiers(program, "/project/input.ts", "Local");
+            let default = identifiers(program, "/project/input.ts", "default")[0];
+            let type_ = queries.get_type_at_location(default).unwrap();
+            for location in [default, local[0], local[1]] {
+                for _ in 0..2 {
+                    assert_eq!(queries.get_type_at_location(location).unwrap(), type_);
+                    assert_eq!(
+                        queries
+                            .type_to_string_at_location_with_flags(
+                                type_,
+                                location,
+                                CanonicalTypeFormatFlags::NO_TRUNCATION
+                            )
+                            .unwrap(),
+                        "typeof Local"
+                    );
+                    let symbol = queries.get_symbol_at_location(location).unwrap().unwrap();
+                    assert_eq!(
+                        queries
+                            .symbol_to_string_at_location(symbol, location)
+                            .unwrap(),
+                        "Local"
+                    );
+                }
             }
             let bar = identifiers(program, "/project/input.ts", "bar")[0];
             let symbol = queries.get_symbol_at_location(bar).unwrap().unwrap();
@@ -355,6 +367,101 @@ fn package_display_keeps_the_first_matching_export_route() {
             expected
         );
     }
+}
+
+#[test]
+fn package_display_selects_an_alias_that_resolves_from_each_containing_file() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/shared/package.json",
+            r#"{"name":"real-package","exports":{".":"./index.js"}}"#,
+        )
+        .unwrap();
+    filesystem
+        .write_file(
+            "/shared/index.d.ts",
+            "export interface Item { value: number; }",
+        )
+        .unwrap();
+    for (directory, alias) in [("/one", "alias-one"), ("/two", "alias-two")] {
+        filesystem.add_directory_link("/shared", &format!("{directory}/node_modules/{alias}"));
+        filesystem
+            .write_file(
+                &format!("{directory}/bridge.d.ts"),
+                &format!("export type {{ Item }} from '{alias}';"),
+            )
+            .unwrap();
+        filesystem
+            .write_file(
+                &format!("{directory}/use.d.ts"),
+                "import {} from './bridge'; export {};",
+            )
+            .unwrap();
+    }
+    filesystem
+        .write_file(
+            "/outside/use.d.ts",
+            "import {} from '../one/bridge'; export {};",
+        )
+        .unwrap();
+    let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+        &filesystem,
+        "/",
+        &[
+            "/one/use.d.ts".to_owned(),
+            "/two/use.d.ts".to_owned(),
+            "/outside/use.d.ts".to_owned(),
+        ],
+        CompilerOptions {
+            skip_lib_check: true,
+            ..canonical_options()
+        },
+        |program, queries| {
+            let declaration = identifiers(program, "/shared/index.d.ts", "Item")[0];
+            let type_ = queries.get_type_at_location(declaration).unwrap();
+            for (file, expected) in [
+                ("/one/use.d.ts", "import(\"alias-one\").Item"),
+                ("/two/use.d.ts", "import(\"alias-two\").Item"),
+                ("/one/use.d.ts", "import(\"alias-one\").Item"),
+                ("/two/use.d.ts", "import(\"alias-two\").Item"),
+            ] {
+                let source = program.source_file(file).unwrap();
+                let location = source.node_ref(source.parse.source_file).unwrap();
+                assert_eq!(
+                    queries
+                        .type_to_string_at_location_with_flags(
+                            type_,
+                            location,
+                            CanonicalTypeFormatFlags::NO_TRUNCATION
+                        )
+                        .unwrap(),
+                    expected
+                );
+            }
+            let outside = program.source_file("/outside/use.d.ts").unwrap();
+            let outside = outside.node_ref(outside.parse.source_file).unwrap();
+            for _ in 0..2 {
+                assert!(matches!(
+                    queries.type_to_string_at_location_with_flags(
+                        type_,
+                        outside,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION
+                    ),
+                    Err(TypeDisplayUnavailable::SymbolDisplay(
+                        SymbolDisplayError::MissingModuleSpecifier(_)
+                    ))
+                ));
+            }
+        },
+    )
+    .unwrap();
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+    result.expect("canonical checker ran");
 }
 
 #[test]

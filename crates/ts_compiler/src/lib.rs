@@ -1386,7 +1386,8 @@ pub struct Program {
     root_file_names: BTreeSet<String>,
     resolved_modules: BTreeMap<(String, String), String>,
     module_resolution_diagnostics: Vec<ProgramDiagnostic>,
-    package_export_specifiers: BTreeMap<String, String>,
+    package_export_specifiers: BTreeMap<String, Vec<String>>,
+    package_display_specifiers: BTreeMap<(FileId, String), String>,
     diagnostics: Vec<ProgramDiagnostic>,
     current_directory: String,
     config_file_path: Option<String>,
@@ -1706,7 +1707,13 @@ impl Program {
                     .resolved
             {
                 if let Some(package_json) = resolved.package_json.as_deref() {
-                    self.register_package_export_specifiers(file_system, package_json);
+                    self.register_package_export_specifiers(
+                        file_system,
+                        &resolver,
+                        package_json,
+                        &containing_file,
+                        CanonicalModuleResolutionMode::Esm,
+                    );
                 }
                 let containing = canonicalize(
                     &containing_file,
@@ -1730,7 +1737,13 @@ impl Program {
                     .resolved
             {
                 if let Some(package_json) = resolved.package_json.as_deref() {
-                    self.register_package_export_specifiers(file_system, package_json);
+                    self.register_package_export_specifiers(
+                        file_system,
+                        &resolver,
+                        package_json,
+                        &containing_file,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    );
                 }
                 let containing = canonicalize(
                     &containing_file,
@@ -1803,7 +1816,13 @@ impl Program {
                         );
                     }
                     if let Some(package_json) = resolved.package_json.as_deref() {
-                        self.register_package_export_specifiers(file_system, package_json);
+                        self.register_package_export_specifiers(
+                            file_system,
+                            &resolver,
+                            package_json,
+                            &containing_file,
+                            mode,
+                        );
                     }
                     let containing = canonicalize(
                         &containing_file,
@@ -1852,12 +1871,16 @@ impl Program {
             }
             file_index += 1;
         }
+        self.resolve_package_display_specifiers(&resolver);
     }
 
     fn register_package_export_specifiers(
         &mut self,
         file_system: &dyn FileSystem,
+        resolver: &Resolver<'_, dyn FileSystem + '_>,
         package_json_path: &str,
+        containing_file: &str,
+        mode: CanonicalModuleResolutionMode,
     ) {
         let Some(package) = file_system
             .read_file(package_json_path)
@@ -1876,22 +1899,7 @@ impl Program {
         let Some(exports) = exports.as_object() else {
             return;
         };
-        let resolver = Resolver::new(file_system, self.options.module_resolution_options());
-        for (key, value) in exports {
-            let Some(target) = package_export_string_target(value) else {
-                continue;
-            };
-            if !target.starts_with("./") {
-                continue;
-            }
-            let Some(resolved) = resolver.resolve(target, package_json_path).resolved else {
-                continue;
-            };
-            let target = canonicalize(
-                module_file_stem(&resolved.resolved_file_name),
-                &self.current_directory,
-                self.case_sensitivity,
-            );
+        for key in exports.keys() {
             let specifier = if key == "." {
                 name.clone()
             } else if let Some(subpath) = key.strip_prefix("./") {
@@ -1899,9 +1907,72 @@ impl Program {
             } else {
                 continue;
             };
-            self.package_export_specifiers
-                .entry(target)
-                .or_insert(specifier);
+            let resolved = match mode {
+                CanonicalModuleResolutionMode::CommonJs => {
+                    resolver.resolve_with_mode(&specifier, containing_file, ModuleFormat::CommonJs)
+                }
+                CanonicalModuleResolutionMode::Esm => {
+                    resolver.resolve_with_mode(&specifier, containing_file, ModuleFormat::Esm)
+                }
+                CanonicalModuleResolutionMode::None => {
+                    resolver.resolve(&specifier, containing_file)
+                }
+            };
+            let Some(resolved) = resolved.resolved else {
+                continue;
+            };
+            let target = canonicalize(
+                &resolved.resolved_file_name,
+                &self.current_directory,
+                self.case_sensitivity,
+            );
+            let candidates = self.package_export_specifiers.entry(target).or_default();
+            if !candidates.contains(&specifier) {
+                candidates.push(specifier);
+            }
+        }
+    }
+
+    fn resolve_package_display_specifiers(&mut self, resolver: &Resolver<'_, dyn FileSystem + '_>) {
+        self.package_display_specifiers.clear();
+        for source in &self.source_files {
+            if source.is_default_library {
+                continue;
+            }
+            let mode = self.canonical_emit_module_mode(source);
+            for (target, candidates) in &self.package_export_specifiers {
+                if !self.file_index.contains_key(target) {
+                    continue;
+                }
+                for candidate in candidates {
+                    let resolution = match mode {
+                        CanonicalModuleResolutionMode::CommonJs => resolver.resolve_with_mode(
+                            candidate,
+                            &source.file_name,
+                            ModuleFormat::CommonJs,
+                        ),
+                        CanonicalModuleResolutionMode::Esm => resolver.resolve_with_mode(
+                            candidate,
+                            &source.file_name,
+                            ModuleFormat::Esm,
+                        ),
+                        CanonicalModuleResolutionMode::None => {
+                            resolver.resolve(candidate, &source.file_name)
+                        }
+                    };
+                    if resolution.resolved.is_some_and(|resolved| {
+                        canonicalize(
+                            &resolved.resolved_file_name,
+                            &self.current_directory,
+                            self.case_sensitivity,
+                        ) == *target
+                    }) {
+                        self.package_display_specifiers
+                            .insert((source.id, target.clone()), candidate.clone());
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -3736,11 +3807,11 @@ impl Program {
                     return None;
                 }
                 let target = canonicalize(
-                    module_file_stem(&candidate.file_name),
+                    &candidate.file_name,
                     &self.current_directory,
                     self.case_sensitivity,
                 );
-                self.package_export_specifiers.get(&target)
+                self.package_display_specifiers.get(&(source.id, target))
             });
             if let Some(preferred) = preferred {
                 reference.module_specifier.clone_from(preferred);
@@ -4469,17 +4540,19 @@ impl Program {
         );
         self.apply_comment_directives(&mut diagnostics, &checked_sources);
 
-        for source in &self.source_files {
-            let target = canonicalize(
-                module_file_stem(&source.file_name),
-                &self.current_directory,
-                self.case_sensitivity,
-            );
-            if let Some(specifier) = self.package_export_specifiers.get(&target)
-                && source_is_external_module(source)
+        for ((enclosing, target), specifier) in &self.package_display_specifiers {
+            if let Some(source) = self
+                .source_file(target)
+                .filter(|source| source_is_external_module(source))
+                && let Some(enclosing) = self.source_file_by_id(*enclosing)
             {
                 context
                     .set_module_display_specifier(
+                        NodeRef::new(
+                            enclosing.parse.arena.id(),
+                            enclosing.id,
+                            enclosing.parse.source_file,
+                        ),
                         NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file),
                         specifier.clone(),
                     )
@@ -5863,17 +5936,6 @@ fn package_display_name(directory: &str, declared_name: Option<&str>) -> Option<
         ));
     }
     Some(name.to_owned())
-}
-
-fn package_export_string_target(value: &serde_json::Value) -> Option<&str> {
-    if let Some(target) = value.as_str() {
-        return Some(target);
-    }
-    let object = value.as_object()?;
-    ["types", "import", "default", "require"]
-        .into_iter()
-        .find_map(|condition| object.get(condition).and_then(package_export_string_target))
-        .or_else(|| object.values().find_map(package_export_string_target))
 }
 
 fn module_file_stem(path: &str) -> &str {

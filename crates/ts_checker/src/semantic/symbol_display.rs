@@ -707,9 +707,12 @@ impl SymbolDisplayContext {
 
     pub(super) fn add_module_specifiers(
         &mut self,
-        specifiers: &BTreeMap<SemanticSymbolId, String>,
+        specifiers: &BTreeMap<(FileId, SemanticSymbolId), String>,
     ) {
-        for (symbol, specifier) in specifiers {
+        for ((file, symbol), specifier) in specifiers {
+            if *file != self.enclosing.file {
+                continue;
+            }
             self.module_specifiers
                 .entry(*symbol)
                 .or_insert_with(|| specifier.clone());
@@ -1167,10 +1170,18 @@ fn binding_context(
         let record = host
             .node(node)
             .ok_or(SymbolDisplayError::InvalidLocation(node))?;
-        if matches!(
-            record.kind,
-            SyntaxKind::SourceFile | SyntaxKind::ModuleDeclaration
-        ) {
+        let ambient_module = if let NodeData::ModuleDeclaration(module) = &record.data {
+            let name = NodeRef::new(node.arena, node.file, module.name);
+            module.keyword == SyntaxKind::GlobalKeyword
+                || host
+                    .node(name)
+                    .ok_or(SymbolDisplayError::InvalidLocation(name))?
+                    .kind
+                    == SyntaxKind::StringLiteral
+        } else {
+            false
+        };
+        if record.kind == SyntaxKind::SourceFile || ambient_module {
             return Ok(node);
         }
         node.node = record
@@ -1521,22 +1532,22 @@ mod tests {
             ))
         );
         assert_eq!(
-            context.set_module_display_specifier(declaration, "item-api".to_owned()),
+            context.set_module_display_specifier(location, declaration, "item-api".to_owned()),
             Err(SymbolDisplayError::InvalidLocation(declaration))
         );
         assert_eq!(
-            context.set_module_display_specifier(target_source, String::new()),
+            context.set_module_display_specifier(location, target_source, String::new()),
             Err(SymbolDisplayError::InvalidModuleSpecifier(target_source))
         );
         let foreign = parse_source_file("export {};");
         let foreign_source =
             NodeRef::new(foreign.arena.id(), declaration.file, foreign.source_file);
         assert_eq!(
-            context.set_module_display_specifier(foreign_source, "item-api".to_owned()),
+            context.set_module_display_specifier(location, foreign_source, "item-api".to_owned()),
             Err(SymbolDisplayError::InvalidLocation(foreign_source))
         );
         context
-            .set_module_display_specifier(target_source, "item-api".to_owned())
+            .set_module_display_specifier(location, target_source, "item-api".to_owned())
             .unwrap();
         for _ in 0..2 {
             assert_eq!(
@@ -1553,6 +1564,25 @@ mod tests {
         assert_eq!(context.type_to_string_at_location_with_flags(type_, location,
             crate::semantic::CanonicalTypeFormatFlags::NO_TRUNCATION | crate::semantic::CanonicalTypeFormatFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE).unwrap(), "import('item-api').Shape");
         assert_eq!(context.type_to_string(type_).unwrap(), "Shape");
+        let other_location = NodeRef::new(left.arena.id(), FileId::new(41_011), left.source_file);
+        assert_eq!(
+            context.type_to_string_at_location_with_flags(
+                type_,
+                other_location,
+                crate::semantic::CanonicalTypeFormatFlags::NO_TRUNCATION
+            ),
+            Err(TypeDisplayUnavailable::SymbolDisplay(
+                SymbolDisplayError::MissingModuleSpecifier(target_module)
+            ))
+        );
+        assert_eq!(
+            context.set_module_display_specifier(
+                foreign_source,
+                target_source,
+                "item-api".to_owned()
+            ),
+            Err(SymbolDisplayError::InvalidLocation(foreign_source))
+        );
         assert_eq!(
             context.store().type_payload(type_).unwrap().symbol(),
             Some(target_symbol)
@@ -1837,6 +1867,14 @@ mod tests {
                 ))
             );
             assert_eq!(
+                context.symbol_to_string_at_location(shape, location),
+                Err(
+                    crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
+                        SymbolDisplayError::InvalidAliasCache(bad)
+                    )
+                )
+            );
+            assert_eq!(
                 counts(&context),
                 before,
                 "symbols, tables, and every link store must be unchanged"
@@ -1884,6 +1922,47 @@ mod tests {
                 "foo.tag"
             );
             assert_eq!(counts(&context), warm);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_alias_symbol_links(bad, poison.clone())
+        );
+        let exports = context
+            .store()
+            .symbol(synthetic)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let exports_before = context.store().symbol_table(exports).unwrap().clone();
+        let export_links_before = context
+            .store()
+            .export_type_links(synthetic)
+            .unwrap()
+            .clone();
+        let alias_links_before = context
+            .store()
+            .alias_symbol_links(foo_alias)
+            .unwrap()
+            .clone();
+        for _ in 0..2 {
+            assert_eq!(
+                context.type_to_string_at_location(type_, location),
+                Err(TypeDisplayUnavailable::SymbolDisplay(
+                    SymbolDisplayError::InvalidAliasCache(bad)
+                ))
+            );
+            assert_eq!(counts(&context), warm);
+            assert_eq!(context.store().symbol_table(exports), Some(&exports_before));
+            assert_eq!(
+                context.store().export_type_links(synthetic),
+                Some(&export_links_before)
+            );
+            assert_eq!(
+                context.store().alias_symbol_links(foo_alias),
+                Some(&alias_links_before)
+            );
+            assert_eq!(context.store().alias_symbol_links(bad), Some(&poison));
         }
     }
 
@@ -1975,24 +2054,30 @@ mod tests {
 
     #[test]
     fn named_defaults_keep_the_written_name_only_in_the_same_binding_context() {
-        let target = parse_source_file("export default function make(): number;");
+        let target =
+            parse_source_file("export default function make(): number; declare namespace Inner {}");
         let left = parse_source_file("import * as Items from './model';");
         let right = parse_source_file("import chosen from './model';");
         let mut context = import_context(&target, &left, &right);
-        let declaration = declaration(&target, FileId::new(41_010), "make");
-        let make = symbol(&context, declaration);
+        let make_declaration = declaration(&target, FileId::new(41_010), "make");
+        let make = symbol(&context, make_declaration);
+        let inner = declaration(&target, FileId::new(41_010), "Inner");
         let own = NodeRef::new(target.arena.id(), FileId::new(41_010), target.source_file);
         let left_location = NodeRef::new(left.arena.id(), FileId::new(41_011), left.source_file);
         let right_location = NodeRef::new(right.arena.id(), FileId::new(41_012), right.source_file);
         for _ in 0..2 {
             assert_eq!(
                 context
-                    .symbol_to_string_at_location(make, declaration)
+                    .symbol_to_string_at_location(make, make_declaration)
                     .unwrap(),
                 "make"
             );
             assert_eq!(
                 context.symbol_to_string_at_location(make, own).unwrap(),
+                "make"
+            );
+            assert_eq!(
+                context.symbol_to_string_at_location(make, inner).unwrap(),
                 "make"
             );
             assert_eq!(
@@ -2012,5 +2097,51 @@ mod tests {
             context.store().symbol(make).unwrap().name(),
             InternalSymbolName::Default.as_ref()
         );
+    }
+
+    #[test]
+    fn default_binding_context_stops_at_ambient_modules_and_global_augmentations() {
+        let parsed = parse_source_file(concat!(
+            "export {}; ",
+            "declare namespace Outer { namespace Inner { interface Plain {} } } ",
+            "declare module './ambient' { namespace Inner { interface Ambient {} } } ",
+            "declare global { namespace Inner { interface Global {} } }",
+        ));
+        let file = FileId::new(41_030);
+        let mut binder = CanonicalBinder::new();
+        bind(
+            &mut binder,
+            &parsed,
+            file,
+            "/input.d.ts",
+            CanonicalModuleState::External,
+        );
+        let bindings = binder.finish();
+        let host = DeclaredTypeHost::new([(&parsed.arena, bindings.file(file).unwrap())]).unwrap();
+        let source = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let global = declaration(&parsed, file, "global");
+        let ambient = parsed
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return None;
+                };
+                matches!(
+                    parsed.arena.get(module.name)?.data,
+                    NodeData::StringLiteral(_)
+                )
+                .then_some(NodeRef::new(parsed.arena.id(), file, id))
+            })
+            .unwrap();
+        for (name, expected) in [("Plain", source), ("Ambient", ambient), ("Global", global)] {
+            assert_eq!(
+                binding_context(&host, declaration(&parsed, file, name)).unwrap(),
+                expected
+            );
+        }
+        for boundary in [source, ambient, global] {
+            assert_eq!(binding_context(&host, boundary).unwrap(), boundary);
+        }
     }
 }

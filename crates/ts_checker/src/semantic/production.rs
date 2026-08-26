@@ -272,7 +272,7 @@ pub struct CanonicalCheckerContext<'arena> {
     globals: SymbolTableId,
     global_types: CanonicalGlobalTypes,
     module_resolutions: CanonicalModuleResolutionManifest,
-    module_display_specifiers: BTreeMap<SemanticSymbolId, String>,
+    module_display_specifiers: BTreeMap<(FileId, SemanticSymbolId), String>,
     diagnostics: CanonicalCheckerDiagnostics,
     source_diagnostic_staging: BTreeMap<SourceFileRef, CanonicalCheckerDiagnostics>,
     pending_ambient_modules: Vec<SemanticSymbolId>,
@@ -742,7 +742,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         result
     }
 
-    /// Retains a public module specifier supplied by the Program's package resolver.
+    /// Retains a module specifier resolved from one containing file by the Program.
     ///
     /// The checker validates the source module's identity. The Program owns
     /// package resolution and supplies the corresponding package-export name.
@@ -754,9 +754,20 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// module specifier.
     pub fn set_module_display_specifier(
         &mut self,
+        enclosing: NodeRef,
         source: NodeRef,
         specifier: String,
     ) -> Result<(), SymbolDisplayError> {
+        let (arena, bound) = self
+            .file(enclosing.file)
+            .ok_or(SymbolDisplayError::InvalidLocation(enclosing))?;
+        if !enclosing.is_for(arena.id(), bound.file_id())
+            || !bound.contains(enclosing)
+            || arena.revision() != bound.node_arena_revision()
+            || !self.store.contains_node_ref(enclosing)
+        {
+            return Err(SymbolDisplayError::InvalidLocation(enclosing));
+        }
         let (arena, bound) = self
             .file(source.file)
             .ok_or(SymbolDisplayError::InvalidLocation(source))?;
@@ -776,7 +787,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             .symbol(source)
             .and_then(|symbol| self.store.get_merged_symbol(symbol))
             .ok_or(SymbolDisplayError::InvalidLocation(source))?;
-        self.module_display_specifiers.insert(symbol, specifier);
+        self.module_display_specifiers
+            .insert((enclosing.file, symbol), specifier);
         Ok(())
     }
 
