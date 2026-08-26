@@ -1896,7 +1896,35 @@ fn valid_interface_method_signatures(
     let owner = method_record.parent()?;
     let owner_record = store.symbol(owner)?;
     let owner_declarations = owner_record.declarations()?;
-    let record = store.type_payload(type_)?;
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let optional = store.declared_method_optional_flag(method)?;
+    if store.value_symbol_links(method)?.resolved_type != Some(type_) {
+        return None;
+    }
+    let callable_type = if optional && bootstrap.options.strict_null_checks {
+        let TypeData::Union(union) = store.type_payload(type_)?.data() else {
+            return None;
+        };
+        let sentinel = bootstrap.undefined_or_missing_type;
+        let [first, second] = union.union.types.as_slice() else {
+            return None;
+        };
+        let callable = match (*first == sentinel, *second == sentinel) {
+            (true, false) => *second,
+            (false, true) => *first,
+            _ => return None,
+        };
+        let mut expected = [callable, sentinel];
+        expected.sort_unstable();
+        store
+            .validate_canonical_union_metadata(type_, &expected)
+            .ok()?;
+        store.validate_union_constituent(sentinel).ok()?;
+        callable
+    } else {
+        type_
+    };
+    let record = store.type_payload(callable_type)?;
     let TypeData::Object(object) = record.data() else {
         return None;
     };
@@ -1983,17 +2011,17 @@ fn valid_interface_method_signatures(
             let links = store.value_symbol_links(parameter)?;
             let parameter_type = links.resolved_type?;
             let annotation = store.source_direct_type_annotation(*parameter_declaration)?;
-            let optional = annotation
-                .node
-                .index()
-                .checked_sub(1)
-                .and_then(|node| u32::try_from(node).ok())
-                .map(|node| NodeRef::new(annotation.arena, annotation.file, NodeId::new(node)))
-                .is_some_and(|token| {
-                    store.source_node_kind(token) == Some(SyntaxKind::QuestionToken)
-                        && store.source_node_parent(token)
-                            == Some(SourceNodeParent::Parent(*parameter_declaration))
-                });
+            let annotation_type = super::object_members::cached_planned_type_identity(
+                store, annotation,
+            )
+            .or_else(|| {
+                store
+                    .source_direct_type_annotation_is_exact(annotation, bootstrap.null_type)
+                    .then_some(bootstrap.null_type)
+            })?;
+            let optional = store
+                .source_child_with_kind(*parameter_declaration, SyntaxKind::QuestionToken)
+                .is_some();
             let rest = callable.has_rest_parameter() && index + 1 == callable.parameters().len();
             if !seen_parameters.insert(parameter)
                 || record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
@@ -2015,7 +2043,14 @@ fn valid_interface_method_signatures(
                     })
                 || cached_parameter_types
                     .is_some_and(|parameters| parameters[index] != parameter_type)
-                || !store.source_direct_type_annotation_is_exact(annotation, parameter_type)
+                || !store.source_direct_type_annotation_is_exact(annotation, annotation_type)
+                || if optional && bootstrap.options.strict_null_checks {
+                    store
+                        .validate_optional_parameter_type_metadata(annotation_type, parameter_type)
+                        .is_err()
+                } else {
+                    annotation_type != parameter_type
+                }
                 || rest && optional
             {
                 return None;

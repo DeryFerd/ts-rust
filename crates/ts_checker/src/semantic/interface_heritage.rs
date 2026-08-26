@@ -2307,6 +2307,14 @@ mod tests {
     };
 
     fn checker_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        checker_context_with_options(parsed, file, CanonicalCheckerOptions::default())
+    }
+
+    fn checker_context_with_options(
+        parsed: &ParseResult,
+        file: FileId,
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'_> {
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -2324,12 +2332,165 @@ mod tests {
         binder
             .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
-        CanonicalCheckerContext::new(
-            binder.finish(),
-            vec![(file, &parsed.arena)],
-            CanonicalCheckerOptions::default(),
-        )
-        .unwrap()
+        CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
+    }
+
+    #[test]
+    fn inherited_optional_methods_preserve_source_signatures_cold_and_warm() {
+        for exact_optional_property_types in [false, true] {
+            for member in [
+                "read?(): number",
+                "read(value?: number): number",
+                "read(value?: number | string): number",
+                "read(value?: null): number",
+            ] {
+                let parsed = parse_source_file(&format!(
+                    "interface Base {{ {member} }} interface Derived extends Base {{}}"
+                ));
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                let file = FileId::new(8_600);
+                let mut context = checker_context_with_options(
+                    &parsed,
+                    file,
+                    CanonicalCheckerOptions {
+                        strict_null_checks: true,
+                        exact_optional_property_types,
+                        ..CanonicalCheckerOptions::default()
+                    },
+                );
+                let derived = interface_symbol(&parsed, file, &context, "Derived");
+                let target = context.get_declared_type_of_symbol(derived).unwrap();
+                assert_eq!(
+                    crate::semantic::structured_members::validate_interface_heritage_members(
+                        context.store(),
+                        target,
+                    ),
+                    crate::semantic::structured_members::InterfaceHeritageMembersValidation::Valid,
+                    "{member}",
+                );
+                context.check_source_file(file).unwrap();
+                assert!(context.diagnostics().is_empty());
+                let warm = (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                );
+                assert_eq!(context.get_declared_type_of_symbol(derived), Ok(target));
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().signature_len(),
+                        context.store().mapper_len(),
+                        context.store().checker_link_allocated_lengths(),
+                    ),
+                    warm,
+                    "{member}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_optional_methods_reject_missing_and_uncached_wrappers() {
+        for exact_optional_property_types in [false, true] {
+            let parsed = parse_source_file(concat!(
+                "interface Base { read?(): number; parameter(value?: number): number } ",
+                "interface Derived extends Base {}",
+            ));
+            let file = FileId::new(8_601);
+            let mut context = checker_context_with_options(
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let base = interface_symbol(&parsed, file, &context, "Base");
+            let derived = interface_symbol(&parsed, file, &context, "Derived");
+            let target = context.get_declared_type_of_symbol(derived).unwrap();
+            let members = context.store().symbol(base).unwrap().members().unwrap();
+            let table = context.store().symbol_table(members).unwrap();
+            let (method, parameter_method) = (
+                table.get_source("read").unwrap(),
+                table.get_source("parameter").unwrap(),
+            );
+            let original = context.store().value_symbol_links(method).unwrap().clone();
+            let value = original.resolved_type.unwrap();
+            let record = context.store().type_payload(value).unwrap();
+            let TypeData::Union(union) = record.data() else {
+                panic!("an optional method must retain its union wrapper")
+            };
+            let flags = record.object_flags();
+            let types = union.union.types.clone();
+            let sentinel = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .undefined_or_missing_type;
+            let callable = *types.iter().find(|type_| **type_ != sentinel).unwrap();
+            let forged = context
+                .store_mut_for_test()
+                .alloc_union_type(flags, types)
+                .unwrap();
+            let parameter_value = context
+                .store()
+                .value_symbol_links(parameter_method)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let signature = crate::semantic::structured_members::valid_interface_method_value(
+                context.store(),
+                parameter_method,
+                parameter_value,
+            )
+            .unwrap();
+            let parameter = context.store().signature(signature).unwrap().parameters()[0];
+            let original_parameter = context
+                .store()
+                .value_symbol_links(parameter)
+                .unwrap()
+                .clone();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            for (symbol, replacement, restore) in [
+                (method, callable, original.clone()),
+                (method, forged, original.clone()),
+                (parameter, number, original_parameter),
+            ] {
+                let mut changed = restore.clone();
+                changed.resolved_type = Some(replacement);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(symbol, changed)
+                );
+                assert!(context.get_declared_type_of_symbol(derived).is_err());
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().signature_len(),
+                        context.store().mapper_len(),
+                        context.store().checker_link_allocated_lengths(),
+                    ),
+                    warm,
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(symbol, restore)
+                );
+                assert_eq!(context.get_declared_type_of_symbol(derived), Ok(target));
+            }
+        }
     }
 
     fn interface_symbol(
