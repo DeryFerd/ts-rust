@@ -4341,13 +4341,16 @@ impl Program {
             checked_sources.push(file);
         }
 
-        for diagnostic in context.global_types().diagnostics() {
-            diagnostics.push(self.canonical_program_diagnostic(
-                diagnostic.node,
-                None,
-                &diagnostic.diagnostic,
-                std::iter::empty(),
-            )?);
+        // Program.GetGlobalDiagnostics skips checker diagnostics without source files.
+        if !self.source_files.is_empty() {
+            for diagnostic in context.global_types().diagnostics() {
+                diagnostics.push(self.canonical_program_diagnostic(
+                    diagnostic.node,
+                    None,
+                    &diagnostic.diagnostic,
+                    std::iter::empty(),
+                )?);
+            }
         }
         for diagnostic in context.diagnostics().as_slice() {
             diagnostics.push(
