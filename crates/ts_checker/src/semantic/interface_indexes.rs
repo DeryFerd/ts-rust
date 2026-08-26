@@ -622,9 +622,67 @@ mod tests {
     }
 
     #[test]
+    fn own_numeric_index_accepts_empty_and_exact_keyword_caches() {
+        for warm in [false, true] {
+            for cache in 0..3 {
+                let mut fixture = fixture(MIXED);
+                let receiver = interface(&mut fixture, "Mixed");
+                if warm {
+                    query(&mut fixture, receiver).unwrap().unwrap();
+                }
+                let host = host(
+                    &fixture.parsed.arena,
+                    fixture.files.get(&fixture.file).unwrap(),
+                );
+                let plans = plan_own_interface_indexes(&fixture.store, &host, receiver)
+                    .unwrap()
+                    .unwrap();
+                let plan = &plans[0];
+                let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                for annotation in [plan.key_type_node, plan.value_type_node] {
+                    match cache {
+                        0 => assert!(fixture.store.type_node_links(annotation).is_none()),
+                        1 | 2 => assert!(fixture.store.set_type_node_links(
+                            annotation,
+                            TypeNodeLinks {
+                                resolved_type: (cache == 2).then_some(number),
+                                ..TypeNodeLinks::default()
+                            }
+                        )),
+                        _ => unreachable!("keyword caches are absent, default, or exact"),
+                    }
+                }
+                let state = (
+                    fixture.store.type_len(),
+                    fixture.store.index_info_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                );
+                assert_eq!(
+                    query(&mut fixture, receiver),
+                    Ok(Some(InterfaceIndexView {
+                        key_type: number,
+                        value_type: number,
+                        readonly: true,
+                        declaration: plan.declaration,
+                    })),
+                    "cache {cache}, warm {warm}",
+                );
+                assert_eq!(
+                    (
+                        fixture.store.type_len(),
+                        fixture.store.index_info_len(),
+                        fixture.store.checker_link_allocated_lengths(),
+                    ),
+                    state,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn own_numeric_index_rejects_forged_annotation_and_owner_caches() {
         for warm in [false, true] {
-            for poison in 0..3 {
+            for poison in 0..7 {
                 let mut fixture = fixture(MIXED);
                 let receiver = interface(&mut fixture, "Mixed");
                 if warm {
@@ -665,7 +723,22 @@ mod tests {
                         SymbolFlags::INTERFACE | SymbolFlags::CLASS,
                         CheckFlags::NONE
                     )),
-                    _ => unreachable!(),
+                    3..=6 => {
+                        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                        let node = if poison % 2 == 1 {
+                            plan.key_type_node
+                        } else {
+                            plan.value_type_node
+                        };
+                        assert!(fixture.store.set_type_node_links(
+                            node,
+                            TypeNodeLinks {
+                                resolved_type: (poison <= 4).then_some(number),
+                                outer_type_parameters: Some(Vec::new()),
+                            }
+                        ));
+                    }
+                    _ => unreachable!("only annotation caches and interface flags are changed"),
                 }
                 let state = (
                     fixture.store.type_len(),
