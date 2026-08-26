@@ -37,7 +37,7 @@ use super::{
         valid_stored_callable_type_predicate,
     },
     store::SourceNodeParent,
-    tuple_type_nodes::{TupleTypeNodeError, plan_tuple_type_node},
+    tuple_type_nodes::{TupleTypeNodeError, plan_tuple_type_node, validate_warm_tuple_elements},
     type_records::{ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -897,6 +897,17 @@ fn plan_fixed_tuple_rest_annotation(
         }
         _ => return Ok(false),
     };
+    let invalid_cache = || invariant(FunctionTypeInvariant::InvalidParameterCache(parameter));
+    let cached_union = if record.kind == SyntaxKind::UnionType {
+        let links = store.type_node_links(annotation);
+        if links.is_some_and(|links| links.outer_type_parameters.is_some()) {
+            return Err(invalid_cache());
+        }
+        links.and_then(|links| links.resolved_type)
+    } else {
+        None
+    };
+    let mut cached_members = Vec::with_capacity(tuples.len());
     for tuple in tuples {
         let planned =
             plan_tuple_type_node(store, host, tuple, array_targets).map_err(
@@ -929,6 +940,40 @@ fn plan_fixed_tuple_rest_annotation(
             })
         {
             return Ok(false);
+        }
+        if cached_union.is_some() {
+            let cached = planned.cached_type().ok_or_else(invalid_cache)?;
+            let mut base_types = Vec::with_capacity(planned.elements().len());
+            for element in planned.elements() {
+                let identity = peel_parenthesized_type(store, host, element.type_node())?;
+                let null_literal = is_null_literal_type(store, host, identity)?;
+                let base = cached_annotation_identity(store, identity, null_literal)
+                    .ok_or_else(invalid_cache)?;
+                if !store.source_direct_type_annotation_is_exact(identity, base) {
+                    return Err(invalid_cache());
+                }
+                base_types.push(base);
+            }
+            validate_warm_tuple_elements(store, array_targets, &planned, &base_types)
+                .map_err(|_| invalid_cache())?;
+            if !cached_members.contains(&cached) {
+                cached_members.push(cached);
+            }
+        }
+    }
+    // A cached rest union must match its source tuple caches, including union reduction.
+    if let Some(cached) = cached_union {
+        let valid = match cached_members.as_slice() {
+            [only] => cached == *only,
+            _ => store.type_payload(cached).is_some_and(|record| {
+                matches!(record.data(), TypeData::Union(union)
+                    if record.alias().is_none()
+                        && union.union.types.len() == cached_members.len()
+                        && cached_members.iter().all(|member| union.union.types.contains(member)))
+            }),
+        };
+        if !valid {
+            return Err(invalid_cache());
         }
     }
     Ok(true)
@@ -5588,6 +5633,7 @@ mod tests {
             ("(...values: [number]) => number", 1, 1, false),
             ("(...values: [number, string]) => number", 2, 2, false),
             ("(...values: [] | [string]) => number", 0, 1, true),
+            ("(...values: [] | []) => number", 0, 0, false),
             (
                 "(prefix: string, ...values: [number]) => number",
                 2,
