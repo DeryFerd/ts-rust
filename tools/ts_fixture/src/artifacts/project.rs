@@ -6,8 +6,8 @@ use ts_ast::NodeRef;
 use ts_compiler::{CanonicalProgramQueries, Program, SourceFile};
 
 use super::{
-    ArtifactIdentity, ArtifactInputKind, ArtifactRenderError, ArtifactWalkError,
-    SemanticArtifactKind, SemanticArtifactWalk, artifact_line, render_source_section, walk_source,
+    ArtifactIdentity, ArtifactRenderError, ArtifactWalkError, SemanticArtifactKind,
+    SemanticArtifactWalk, artifact_line, render_source_section, walk_source,
 };
 
 /// Completed query identities are retained only for same-Program replay checks.
@@ -198,15 +198,7 @@ fn render_project_baseline(
         let mut lines = Vec::new();
         while remaining.peek().is_some_and(|node| node.file == source.id) {
             let reference = remaining.next().expect("the next node was just checked");
-            match artifact_line(
-                program,
-                queries,
-                source,
-                reference,
-                kind,
-                has_diagnostics,
-                ArtifactInputKind::Project,
-            ) {
+            match artifact_line(program, queries, source, reference, kind, has_diagnostics) {
                 Ok(result) => {
                     identities.push((reference, result.identity));
                     if let Some(line) = result.line {
@@ -234,7 +226,10 @@ fn render_project_baseline(
     let text = if sections.is_empty() {
         "<no content>".to_owned()
     } else {
-        format!("//// [{header}] ////\r\n\r\n{sections}")
+        format!(
+            "//// [{header}] ////\r\n\r\n{}",
+            crate::remove_test_path_prefixes(&sections),
+        )
     };
     ProjectArtifactRun {
         text: Ok(text),
@@ -260,11 +255,14 @@ mod tests {
     };
 
     #[test]
-    fn project_source_sections_keep_original_crlf_line_positions() {
+    fn project_source_sections_keep_pinned_crlf_split() {
         let source = "const first = 1;\r\nconst second = 2;\r\n";
         let mut output = String::new();
         super::super::render_source_section(&mut output, "index.ts", source, &[]);
-        assert_eq!(output, format!("=== index.ts ===\r\n\r\n{source}\r\n"));
+        assert_eq!(
+            output,
+            "=== index.ts ===\r\n\r\nconst first = 1;\r\n\r\nconst second = 2;\r\n\r\n\r\n",
+        );
     }
 
     struct TestProject(PathBuf);
@@ -377,5 +375,53 @@ mod tests {
             validate_sources(&program, &[&other.source_files()[0]]),
             Err(ProjectArtifactInputError::ForeignSource(_))
         ));
+    }
+
+    #[test]
+    fn project_symbols_keep_pinned_library_name_labels_without_omitting_the_source() {
+        let project = TestProject::new();
+        let library = project.write("lib.custom.d.ts", "type LocalLibrary = number;\n");
+        let root = project.write("index.ts", "const value: LocalLibrary = 1;\n");
+        let config = project.write(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true,"skipLibCheck":true,"noEmit":true},"files":["index.ts","lib.custom.d.ts"]}"#,
+        );
+        let (_, artifacts) = Program::try_from_config_with_canonical_checker_and_queries(
+            &OsFileSystem::default(),
+            &config,
+            |program, queries| {
+                assert!(!program.source_file(&library).unwrap().is_default_library);
+                let sources = ordered_project_sources(program, &[root, library.clone()]);
+                render_project(program, queries, &sources, &config, false)
+            },
+        )
+        .unwrap();
+        let text = artifacts.unwrap().unwrap().symbols.text.unwrap();
+        assert!(text.contains(&format!("=== {library} ===")));
+        assert!(text.contains("Decl(lib.custom.d.ts, --, --)"));
+    }
+
+    #[test]
+    fn project_baselines_apply_pinned_path_rewrites_without_changing_program_text() {
+        let project = TestProject::new();
+        let original = "const path = \"/.src/input.ts\";\n";
+        let root = project.write("index.ts", original);
+        let config = project.write(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true,"noEmit":true},"files":["index.ts"]}"#,
+        );
+        let (program, artifacts) = Program::try_from_config_with_canonical_checker_and_queries(
+            &OsFileSystem::default(),
+            &config,
+            |program, queries| {
+                let sources = ordered_project_sources(program, std::slice::from_ref(&root));
+                render_project(program, queries, &sources, &config, false)
+            },
+        )
+        .unwrap();
+        assert_eq!(program.source_file(&root).unwrap().source_text, original);
+        let text = artifacts.unwrap().unwrap().types.text.unwrap();
+        assert!(text.contains("const path = \"input.ts\";"));
+        assert!(!text.contains("/.src/"));
     }
 }

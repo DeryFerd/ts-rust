@@ -93,12 +93,6 @@ pub(crate) enum ArtifactIdentity {
     Symbol(Option<CanonicalSymbolId>),
 }
 
-#[derive(Clone, Copy)]
-enum ArtifactInputKind {
-    Fixture,
-    Project,
-}
-
 struct QueriedArtifactLine {
     line: Option<ArtifactLine>,
     identity: ArtifactIdentity,
@@ -315,17 +309,7 @@ fn render_baseline(
             .iter()
             .copied()
             .filter(|node| node.file == source.id)
-            .map(|node| {
-                artifact_line(
-                    program,
-                    queries,
-                    source,
-                    node,
-                    kind,
-                    has_diagnostics,
-                    ArtifactInputKind::Fixture,
-                )
-            })
+            .map(|node| artifact_line(program, queries, source, node, kind, has_diagnostics))
             .map(|result| result.map(|result| result.line))
             .filter_map(Result::transpose)
             .collect::<Result<Vec<_>, _>>()
@@ -356,7 +340,6 @@ fn artifact_line(
     reference: NodeRef,
     kind: SemanticArtifactKind,
     has_diagnostics: bool,
-    input_kind: ArtifactInputKind,
 ) -> Result<QueriedArtifactLine, ArtifactRenderError> {
     let node = program.node(reference).ok_or_else(|| {
         ArtifactRenderError::invariant(
@@ -455,7 +438,6 @@ fn artifact_line(
                     node.parent.map_or(reference, |parent| {
                         NodeRef::new(reference.arena, reference.file, parent)
                     }),
-                    input_kind,
                 )?,
                 ArtifactIdentity::Symbol(Some(symbol)),
             )
@@ -521,7 +503,6 @@ fn render_symbol(
     file_name: &str,
     symbol: ts_compiler::CanonicalSymbolId,
     enclosing: NodeRef,
-    input_kind: ArtifactInputKind,
 ) -> Result<String, ArtifactRenderError> {
     let name = queries
         .symbol_to_string_at_location(symbol, enclosing)
@@ -555,10 +536,7 @@ fn render_symbol(
             .rsplit(['/', '\\'])
             .next()
             .unwrap_or(&source.file_name);
-        if source.is_default_library
-            || matches!(input_kind, ArtifactInputKind::Fixture)
-                && is_default_library_file(file_name)
-        {
+        if source.is_default_library || is_default_library_file(file_name) {
             write!(result, ", Decl({file_name}, --, --)").expect("writing to a String cannot fail");
             continue;
         }
@@ -672,7 +650,9 @@ fn ecma_line_and_utf16_column(source: &str, position: usize) -> (usize, usize) {
 
 fn render_source_section(output: &mut String, name: &str, source: &str, results: &[ArtifactLine]) {
     write!(output, "=== {name} ===\r\n").expect("writing to a String cannot fail");
-    let code_lines = ecma_source_lines(source);
+    let code_lines = source
+        .split(['\n', '\r', '\u{2028}', '\u{2029}'])
+        .collect::<Vec<_>>();
     let mut last_written = None;
     for result in results {
         let line = result.line.min(code_lines.len().saturating_sub(1));
@@ -699,24 +679,6 @@ fn render_source_section(output: &mut String, name: &str, source: &str, results:
         output.push_str(&code_lines[next..].join("\r\n"));
     }
     output.push_str("\r\n");
-}
-
-fn ecma_source_lines(source: &str) -> Vec<&str> {
-    let mut result = Vec::new();
-    let mut start = 0;
-    let mut characters = source.char_indices().peekable();
-    while let Some((offset, character)) = characters.next() {
-        if matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
-            result.push(&source[start..offset]);
-            start = offset + character.len_utf8();
-            if character == '\r' && characters.peek().is_some_and(|(_, next)| *next == '\n') {
-                characters.next();
-                start += 1;
-            }
-        }
-    }
-    result.push(&source[start..]);
-    result
 }
 
 fn append_code_lines(output: &mut String, lines: &[&str]) {

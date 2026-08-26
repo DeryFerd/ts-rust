@@ -225,7 +225,9 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
         .map(|missing| {
             match missing {
                 ProgramGraphMissingEvidence::ConfigSourceText => "config_source_text",
+                ProgramGraphMissingEvidence::ConfigParseInputs => "config_parse_inputs",
                 ProgramGraphMissingEvidence::ConfigExtendsInputs => "config_extends_inputs",
+                ProgramGraphMissingEvidence::SourceRealPaths => "source_real_paths",
                 ProgramGraphMissingEvidence::ResolutionOriginalPaths => "resolution_original_paths",
                 ProgramGraphMissingEvidence::ResolutionDefaultModes => "resolution_default_modes",
                 ProgramGraphMissingEvidence::PackageIdentities => "package_identities",
