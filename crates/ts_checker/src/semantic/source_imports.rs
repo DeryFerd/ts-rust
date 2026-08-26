@@ -15,10 +15,10 @@
 //! `CommonJS` variables and named assignments, explicit and implicit ambient
 //! `export const` declarations in retained declaration files, annotated
 //! `FunctionDeclaration`s, regular and const enums, already-published inferred
-//! or const-asserted object constants, and narrowly authenticated cold
-//! async-arrow object constants. Declaration-file bodies are never source
-//! checked by this leaf; imported annotations and authenticated ambient class
-//! members are queried lazily.
+//! or const-asserted object constants, recursive package namespaces, and
+//! narrowly authenticated cold async-arrow object constants. Declaration-file
+//! bodies are never source checked by this leaf; imported annotations and
+//! authenticated ambient class members are queried lazily.
 //!
 //! Source integration separates declaration checking from value use. Every
 //! binding is resolved through [`resolve_source_import_binding`], including
@@ -340,6 +340,12 @@ enum PlannedSourceImportValueTarget {
         module: SemanticSymbolId,
         properties: Vec<PreparedSourceImportModuleProperty>,
         type_: TypeId,
+    },
+    RecursiveNamespaceConst {
+        declaration: NodeRef,
+        initializer: NodeRef,
+        namespace_alias: SemanticSymbolId,
+        module: SemanticSymbolId,
     },
     PublishedSpreadObject {
         declaration: NodeRef,
@@ -3058,6 +3064,7 @@ pub(super) fn prepare_source_import_value(
         | PlannedSourceImportValueTarget::ExportedObject { declaration, .. }
         | PlannedSourceImportValueTarget::PublishedObjectConst { declaration, .. }
         | PlannedSourceImportValueTarget::PublishedNamespaceConst { declaration, .. }
+        | PlannedSourceImportValueTarget::RecursiveNamespaceConst { declaration, .. }
         | PlannedSourceImportValueTarget::PublishedSpreadObject { declaration, .. }
         | PlannedSourceImportValueTarget::PublishedConstAssertedObject { declaration, .. }
         | PlannedSourceImportValueTarget::JavaScriptAnnotatedConst { declaration, .. }
@@ -3263,6 +3270,11 @@ pub(super) fn prepare_source_import_value(
                 properties,
             },
         ),
+        PlannedSourceImportValueTarget::RecursiveNamespaceConst { declaration, .. } => {
+            return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+                declaration,
+            )));
+        }
         PlannedSourceImportValueTarget::PublishedSpreadObject { object, type_, .. } => (
             type_,
             PreparedSourceImportTarget::PublishedSpreadObject { object },
@@ -4231,7 +4243,14 @@ fn plan_direct_import_value_target(
                 flags,
             }));
         }
-        return plan_direct_typescript_const_target(store, host, global_types, alias, target);
+        return plan_direct_typescript_const_target(
+            store,
+            host,
+            global_types,
+            alias,
+            target,
+            namespace_module,
+        );
     }
     if flags == SymbolFlags::FUNCTION
         || flags == SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
@@ -5867,6 +5886,28 @@ fn materialize_imported_module_namespace(
 
     let mut resolved_members = Vec::with_capacity(members.len());
     for member in members {
+        if let PlannedSourceImportValueTarget::RecursiveNamespaceConst {
+            declaration,
+            initializer,
+            namespace_alias,
+            module: recursive_module,
+        } = &member.target
+        {
+            if *recursive_module != module
+                || !recursive_namespace_const_is_exact(
+                    store,
+                    member.value_symbol,
+                    *declaration,
+                    *initializer,
+                    *namespace_alias,
+                    module,
+                )
+            {
+                return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
+            }
+            resolved_members.push((member.name, member.symbol, member.value_symbol, None, None));
+            continue;
+        }
         let (type_, namespace) = match member.target {
             PlannedSourceImportValueTarget::AnnotatedConst { type_node, .. } => (
                 CanonicalTypeQuery::new_with_global_types_and_session(
@@ -6006,6 +6047,9 @@ fn materialize_imported_module_namespace(
                     })),
                 )
             }
+            PlannedSourceImportValueTarget::RecursiveNamespaceConst { .. } => {
+                unreachable!("recursive namespace exports are staged before member queries")
+            }
         };
         if let Some(links) = store.value_symbol_links(member.value_symbol)
             && links.resolved_type.is_some_and(|cached| cached != type_)
@@ -6020,18 +6064,33 @@ fn materialize_imported_module_namespace(
             member.name,
             member.symbol,
             member.value_symbol,
-            type_,
+            Some(type_),
             namespace,
         ));
     }
 
     let count = resolved_members.len();
+    let recursive_namespace = resolved_members
+        .iter()
+        .any(|(_, _, _, type_, _)| type_.is_none());
+    if recursive_namespace && owner != Some(module) {
+        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
+    }
     if !store.try_reserve_types(1)
         || !store.try_reserve_checker_symbol_allocations(count, usize::from(count != 0))
         || !store.try_reserve_value_symbol_links(count)
     {
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
     }
+    let recursive_type = if recursive_namespace {
+        Some(
+            store
+                .alloc_plain_object_type(ObjectFlags::ANONYMOUS, owner)
+                .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?,
+        )
+    } else {
+        None
+    };
     let table = if count == 0 {
         None
     } else {
@@ -6039,6 +6098,9 @@ fn materialize_imported_module_namespace(
     };
     let mut properties = Vec::with_capacity(count);
     for (name, target_symbol, value_symbol, type_, namespace) in resolved_members {
+        let type_ = type_
+            .or(recursive_type)
+            .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
         let symbol = store
             .alloc_symbol(SymbolData::new(SymbolFlags::PROPERTY, name.clone()))
             .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
@@ -6063,9 +6125,13 @@ fn materialize_imported_module_namespace(
             namespace,
         });
     }
-    let type_ = store
-        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, owner)
-        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
+    let type_ = if let Some(type_) = recursive_type {
+        type_
+    } else {
+        store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, owner)
+            .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?
+    };
     let property_symbols = (!properties.is_empty())
         .then(|| properties.iter().map(|property| property.symbol).collect());
     if !store.set_structured_type_members(type_, table, property_symbols, None, None, None) {
@@ -6120,6 +6186,7 @@ fn preflight_imported_module_namespace_members(
             | PlannedSourceImportValueTarget::ExportedObject { .. }
             | PlannedSourceImportValueTarget::PublishedObjectConst { .. }
             | PlannedSourceImportValueTarget::PublishedNamespaceConst { .. }
+            | PlannedSourceImportValueTarget::RecursiveNamespaceConst { .. }
             | PlannedSourceImportValueTarget::PublishedSpreadObject { .. }
             | PlannedSourceImportValueTarget::PublishedConstAssertedObject { .. } => {}
             PlannedSourceImportValueTarget::ConstEnum { .. }
@@ -7042,6 +7109,7 @@ fn plan_direct_typescript_const_target(
     global_types: &CanonicalGlobalTypes,
     alias: SemanticSymbolId,
     target: SemanticSymbolId,
+    namespace_module: Option<SemanticSymbolId>,
 ) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
     let target_record = store
         .symbol(target)
@@ -7309,6 +7377,7 @@ fn plan_direct_typescript_const_target(
                 declaration,
                 target,
                 expression,
+                namespace_module,
             );
         }
         if matches!(
@@ -7544,6 +7613,7 @@ fn plan_published_namespace_const_target(
     declaration: NodeRef,
     target: SemanticSymbolId,
     initializer: NodeRef,
+    namespace_module: Option<SemanticSymbolId>,
 ) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
     let unsupported_target = || {
         unsupported(SourceImportUnsupported::MissingTargetAnnotation(
@@ -7555,12 +7625,19 @@ fn plan_published_namespace_const_target(
     let NodeData::Identifier(identifier) = &record.data else {
         return Err(unsupported_target());
     };
-    let Some(namespace_alias) = store
-        .symbol_node_links(initializer)
-        .and_then(|links| links.resolved_symbol)
+    let Some(namespace_alias) = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&identifier.text))
     else {
         return Err(unsupported_target());
     };
+    if store
+        .symbol_node_links(initializer)
+        .is_some_and(|links| links.resolved_symbol != Some(namespace_alias))
+    {
+        return Err(invalid());
+    }
     let Some(alias_record) = store.symbol(namespace_alias) else {
         return Err(invalid());
     };
@@ -7574,14 +7651,44 @@ fn plan_published_namespace_const_target(
     if store.source_node_kind(binding) != Some(SyntaxKind::NamespaceImport) {
         return Err(unsupported_target());
     }
-    let type_ = store
-        .value_symbol_links(target)
-        .and_then(|links| links.resolved_type)
-        .ok_or_else(unsupported_target)?;
+    if record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || alias_record.name().as_utf8() != Some(identifier.text.as_str())
+        || !binding.is_for(arena.id(), bound.file_id())
+        || bound.symbol(binding) != Some(namespace_alias)
+    {
+        return Err(invalid());
+    }
     let module = store
         .alias_symbol_links(namespace_alias)
         .and_then(|links| links.alias_target.symbol())
         .ok_or_else(invalid)?;
+    let Some(type_) = store
+        .value_symbol_links(target)
+        .and_then(|links| links.resolved_type)
+    else {
+        if namespace_module != Some(module) {
+            return Err(unsupported_target());
+        }
+        if !recursive_namespace_const_is_exact(
+            store,
+            target,
+            declaration,
+            initializer,
+            namespace_alias,
+            module,
+        ) {
+            return Err(invalid());
+        }
+        return Ok(PlannedSourceImportValueTarget::RecursiveNamespaceConst {
+            declaration,
+            initializer,
+            namespace_alias,
+            module,
+        });
+    };
     let namespace = store
         .type_payload(type_)
         .and_then(|record| record.data().structured())
@@ -7615,29 +7722,16 @@ fn plan_published_namespace_const_target(
             })
         })
         .collect::<Result<Vec<_>, SourceImportError>>()?;
-    if record.kind != SyntaxKind::Identifier
-        || record.flags.0 != 0
-        || record.parent != Some(declaration.node)
-        || identifier.flow_node.is_some()
-        || alias_record.name().as_utf8() != Some(identifier.text.as_str())
-        || !binding.is_for(arena.id(), bound.file_id())
-        || bound.symbol(binding) != Some(namespace_alias)
-        || bound
-            .locals(bound.source_file())
-            .and_then(|locals| store.symbol_table(locals))
-            .and_then(|locals| locals.get_source(&identifier.text))
-            != Some(namespace_alias)
-        || !published_namespace_const_is_exact(
-            store,
-            target,
-            declaration,
-            initializer,
-            namespace_alias,
-            module,
-            type_,
-            &properties,
-        )
-    {
+    if !published_namespace_const_is_exact(
+        store,
+        target,
+        declaration,
+        initializer,
+        namespace_alias,
+        module,
+        type_,
+        &properties,
+    ) {
         return Err(invalid());
     }
 
@@ -7649,6 +7743,85 @@ fn plan_published_namespace_const_target(
         properties,
         type_,
     })
+}
+
+fn recursive_namespace_const_is_exact(
+    store: &CanonicalTypeMapperStore,
+    target: SemanticSymbolId,
+    declaration: NodeRef,
+    initializer: NodeRef,
+    namespace_alias: SemanticSymbolId,
+    module: SemanticSymbolId,
+) -> bool {
+    let Some(target_record) = store.symbol(target) else {
+        return false;
+    };
+    let Some(alias_record) = store.symbol(namespace_alias) else {
+        return false;
+    };
+    let Some([binding]) = alias_record.declarations() else {
+        return false;
+    };
+    let binding = *binding;
+    let Some(SourceNodeParent::Parent(clause)) = store.source_node_parent(binding) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(import)) = store.source_node_parent(clause) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(import) else {
+        return false;
+    };
+    let Some(module_record) = store.symbol(module) else {
+        return false;
+    };
+
+    target_record.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+        && target_record.check_flags() == CheckFlags::NONE
+        && target_record.declarations() == Some(&[declaration])
+        && target_record.value_declaration() == Some(declaration)
+        && target_record.parent() == Some(module)
+        && store.get_merged_symbol(target) == Some(target)
+        && store.source_node_kind(declaration) == Some(SyntaxKind::VariableDeclaration)
+        && store.source_node_kind(initializer) == Some(SyntaxKind::Identifier)
+        && store.source_node_parent(initializer) == Some(SourceNodeParent::Parent(declaration))
+        && store
+            .symbol_node_links(initializer)
+            .is_none_or(|links| links.resolved_symbol == Some(namespace_alias))
+        && store.type_node_links(initializer).is_none()
+        && store.value_symbol_links(target).is_none()
+        && alias_record.flags() == SymbolFlags::ALIAS
+        && alias_record.check_flags() == CheckFlags::NONE
+        && alias_record.value_declaration().is_none()
+        && alias_record.members().is_none()
+        && alias_record.exports().is_none()
+        && alias_record.parent().is_none()
+        && alias_record.export_symbol().is_none()
+        && store.get_merged_symbol(namespace_alias) == Some(namespace_alias)
+        && store.source_node_kind(binding) == Some(SyntaxKind::NamespaceImport)
+        && store.source_node_kind(clause) == Some(SyntaxKind::ImportClause)
+        && store.source_node_kind(import) == Some(SyntaxKind::ImportDeclaration)
+        && store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
+        && source.file == declaration.file
+        && store
+            .alias_symbol_links(namespace_alias)
+            .is_some_and(|links| {
+                links.immediate_target == Some(module)
+                    && links.alias_target == AliasTargetState::Resolved(module)
+                    && links.type_only_declaration.is_none()
+            })
+        && store.value_symbol_links(namespace_alias).is_none()
+        && module_record.flags() == SymbolFlags::VALUE_MODULE
+        && module_record.check_flags() == CheckFlags::NONE
+        && module_record.declarations() == Some(&[source])
+        && module_record.value_declaration() == Some(source)
+        && module_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(target_record.name()))
+            == Some(target)
+        && store.get_merged_symbol(module) == Some(module)
+        && store.value_symbol_links(module).is_none()
 }
 
 #[allow(clippy::too_many_arguments)] // Each argument proves one retained import or cache edge.
@@ -10783,6 +10956,209 @@ mod tests {
             (store_state(context.store()), context.store().symbol_len()),
             warm
         );
+    }
+
+    #[test]
+    fn package_self_namespace_exports_stage_recursive_shells_without_value_publication() {
+        let text = concat!(
+            "import * as namespace from 'package'; ",
+            "export const value: number = 1; ",
+            "export const forwarded = namespace;",
+        );
+        let mut fixture = fixture(
+            &[text],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(0),
+            }],
+        );
+        let import = fixture.plan_import(0, 0);
+        let initializer = identifier_initializer(&fixture, 0, "namespace");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &import.bindings[0],
+            initializer,
+            "namespace",
+            import.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+        let module = resolved[0].target_symbol;
+        let forwarded = direct_export(&fixture, 0, "forwarded");
+
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+
+        let PreparedSourceImportTarget::ModuleNamespace { properties } = &prepared.target else {
+            panic!("a package self import must retain its staged namespace")
+        };
+        let [value, recursive] = properties.as_slice() else {
+            panic!("the package namespace must expose its value and recursive export")
+        };
+        assert_eq!(value.name.as_utf8(), Some("value"));
+        assert_eq!(
+            value.type_,
+            fixture.store.intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert_eq!(recursive.name.as_utf8(), Some("forwarded"));
+        assert_eq!(recursive.target_symbol, forwarded);
+        assert_eq!(recursive.value_symbol, forwarded);
+        assert_eq!(recursive.type_, prepared.type_);
+        assert_eq!(
+            fixture.store.type_payload(prepared.type_).unwrap().symbol(),
+            Some(module),
+        );
+        for symbol in [module, forwarded, import.bindings[0].alias_symbol] {
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+        }
+
+        let staged = (store_state(&fixture.store), fixture.store.symbol_len());
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared,
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.symbol_len()),
+            staged,
+        );
+        let publications = preflight_prepared_source_import_publications(
+            &fixture.store,
+            std::slice::from_ref(&prepared),
+        )
+        .unwrap();
+        assert_eq!(publications.len(), 2);
+        for symbol in [module, forwarded, import.bindings[0].alias_symbol] {
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+        }
+
+        let source = parsed(text);
+        let file = FileId::new(10_630);
+        let mut context = context_with_routes(
+            &[(file, &source)],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(0),
+            }],
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let (_, bound) = context.file(file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let forwarded = context_exported_type(&context, file, "forwarded");
+        assert_eq!(
+            context.store().type_payload(forwarded).unwrap().symbol(),
+            Some(module),
+        );
+        assert_eq!(
+            context_exported_type(&context, file, "value"),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = (store_state(context.store()), context.store().symbol_len());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (store_state(context.store()), context.store().symbol_len()),
+            warm,
+        );
+    }
+
+    #[test]
+    fn recursive_package_namespace_shells_reject_forged_ownership_and_caches() {
+        for forgery in 0..6 {
+            let mut fixture = fixture(
+                &[
+                    concat!(
+                        "import * as namespace from 'package'; ",
+                        "export const forwarded = namespace;",
+                    ),
+                    "export const foreign: number = 1;",
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(0),
+                }],
+            );
+            let import = fixture.plan_import(0, 0);
+            let alias = import.bindings[0].alias_symbol;
+            let initializer = identifier_initializer(&fixture, 0, "namespace");
+            let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+            let read = plan_source_import_identifier_read(
+                &fixture.files[0].parsed.arena,
+                bound,
+                &fixture.store,
+                &import.bindings[0],
+                initializer,
+                "namespace",
+                alias,
+            )
+            .unwrap();
+            let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+            let module = resolved[0].target_symbol;
+            let forwarded = direct_export(&fixture, 0, "forwarded");
+            let foreign_bound = fixture.bound.get(&fixture.files[1].file).unwrap();
+            let foreign_module = foreign_bound.symbol(foreign_bound.source_file()).unwrap();
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+
+            match forgery {
+                0 => assert!(fixture.store.set_symbol_node_links(
+                    initializer,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(foreign_module),
+                    },
+                )),
+                1 => assert!(fixture.store.set_type_node_links(
+                    initializer,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    },
+                )),
+                2 => {
+                    let mut links = fixture.store.alias_symbol_links(alias).unwrap().clone();
+                    links.immediate_target = Some(foreign_module);
+                    assert!(fixture.store.set_alias_symbol_links(alias, links));
+                }
+                3 => assert!(fixture.store.set_symbol_relationships(
+                    forwarded,
+                    None,
+                    None,
+                    Some(foreign_module),
+                    None,
+                )),
+                4 => assert!(fixture.store.set_value_symbol_links(
+                    alias,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    },
+                )),
+                5 => assert!(fixture.store.set_value_symbol_links(
+                    module,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    },
+                )),
+                _ => unreachable!("all recursive namespace shell forgeries are covered"),
+            }
+            let before = (store_state(&fixture.store), fixture.store.symbol_len());
+
+            assert!(
+                prepare_one(&mut fixture, &resolved[0], &read).is_err(),
+                "recursive namespace shell forgery {forgery} was accepted",
+            );
+            assert_eq!(
+                (store_state(&fixture.store), fixture.store.symbol_len()),
+                before,
+            );
+        }
     }
 
     #[test]
