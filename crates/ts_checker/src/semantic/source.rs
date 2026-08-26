@@ -624,6 +624,7 @@ pub(super) struct PlannedExpression {
     pub(super) kind: PlannedExpressionKind,
     array_spreads: Vec<(usize, NodeRef)>,
     object_spreads: Vec<PlannedExpression>,
+    object_computed_keys: Vec<PlannedExpression>,
     non_null_assertion: bool,
     awaited: bool,
     promise_call: Option<PlannedPromiseCall>,
@@ -638,6 +639,7 @@ impl PlannedExpression {
             kind,
             array_spreads: Vec::new(),
             object_spreads: Vec::new(),
+            object_computed_keys: Vec::new(),
             non_null_assertion: false,
             awaited: false,
             promise_call: None,
@@ -21444,6 +21446,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .map_err(|error| self.object_plan_error(error))?;
         let mut properties = Vec::with_capacity(plan.properties.len());
         let mut spreads = Vec::with_capacity(plan.spread_expression_nodes().len());
+        let mut computed_keys = Vec::new();
         let mut spread_index = 0;
         for (index, initializer) in plan.property_type_nodes().enumerate() {
             while plan
@@ -21454,6 +21457,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let spread = plan.spreads[spread_index];
                 spreads.push(self.plan_object_spread_expression(spread)?);
                 spread_index += 1;
+            }
+            let name = plan.properties[index].name_node;
+            if let NodeData::ComputedPropertyName(computed) = &self.node(name)?.data {
+                let key = self.reference(computed.expression);
+                computed_keys.push(self.plan_expression(key)?);
             }
             properties.push(self.plan_expression(initializer)?);
         }
@@ -21473,6 +21481,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             PlannedExpressionKind::Object { plan, properties },
         );
         expression.object_spreads = spreads;
+        expression.object_computed_keys = computed_keys;
         Ok(expression)
     }
 
@@ -23915,6 +23924,11 @@ where
             debug_assert_eq!(properties.len(), prepared_properties.len());
             super::object_members::object_literal_state(store, plan)
                 .map_err(source_object_execution_error)?;
+            // Check every computed key before values or spreads, without a value context.
+            for key in &expression.object_computed_keys {
+                let checked_key = check_nested_expression(store, key, None)?;
+                preflight_source_expression_cache(store, key.node, checked_key.raw)?;
+            }
             let mut checked_properties = Vec::with_capacity(properties.len());
             let mut property_types = Vec::with_capacity(properties.len());
             let mut spread_types = Vec::with_capacity(plan.spreads.len());
@@ -75086,6 +75100,31 @@ class Foo2 {
             Some(variable)
         );
         assert_eq!(resolved_node_type(&context, *read), bootstrap.string_type);
+
+        let mut keys = source
+            .arena
+            .iter()
+            .filter_map(|(_, record)| {
+                let NodeData::ComputedPropertyName(name) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(source.arena.id(), file, name.expression))
+            })
+            .collect::<Vec<_>>();
+        keys.sort_unstable_by_key(|key| source.arena.get(key.node).unwrap().range.start);
+        let expected_keys = [
+            bootstrap.cached_string_literal_type("literal").unwrap(),
+            bootstrap
+                .cached_number_literal_type(Number::new(2.0))
+                .unwrap(),
+            bootstrap.cached_string_literal_type("template").unwrap(),
+        ];
+        assert_eq!(keys.len(), expected_keys.len());
+        for (key, regular) in keys.into_iter().zip(expected_keys) {
+            let fresh = context.store().fresh_type_of_literal_type(regular).unwrap();
+            assert_eq!(resolved_node_type(&context, key), fresh);
+            assert_eq!(context.get_type_at_location(key).unwrap(), fresh);
+        }
         assert!(context.diagnostics().is_empty());
         assert!(is_type_checked(&context, file));
 
@@ -75093,6 +75132,72 @@ class Foo2 {
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn computed_object_literal_keys_preserve_contextual_errors_and_reject_bad_caches() {
+        for malformed in [false, true] {
+            let source = parsed(concat!(
+                "interface Shape { field: number; } ",
+                "const value: Shape = { ['field']: 'wrong' };",
+            ));
+            let file = FileId::new(9_980);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let key = source
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::ComputedPropertyName(name) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(source.arena.id(), file, name.expression))
+                })
+                .unwrap();
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("the property value must retain its one contextual error")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type 'string' is not assignable to type 'number'.",
+            );
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let string = bootstrap.string_type;
+            let regular = bootstrap.cached_string_literal_type("field").unwrap();
+            let fresh = context.store().fresh_type_of_literal_type(regular).unwrap();
+            assert_eq!(resolved_node_type(&context, key), fresh);
+            assert_eq!(context.get_type_at_location(key).unwrap(), fresh);
+            let object = variable_initializer(&source, file, "value");
+            assert_eq!(object_property_type(&context, object, "field"), string);
+            let warm = observable_state(&context, file);
+
+            context.recheck_source_file(file).unwrap();
+
+            assert_eq!(observable_state(&context, file), warm);
+            let poison = TypeNodeLinks {
+                resolved_type: Some(if malformed { fresh } else { string }),
+                outer_type_parameters: malformed.then(Vec::new),
+            };
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(key, poison.clone())
+            );
+            mark_source_unchecked(&mut context, file);
+            let before = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Assertion(
+                    SourceAssertionError::InvalidExpressionCache { node, cached, expected }
+                )) if node == key && cached == poison.resolved_type && expected == fresh
+            ));
+            assert_eq!(context.store().type_node_links(key), Some(&poison));
+            assert_eq!(observable_state(&context, file), before);
+        }
     }
 
     #[test]
