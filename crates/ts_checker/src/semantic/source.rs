@@ -60932,7 +60932,7 @@ mod tests {
 
         let source = parsed(FORWARD_CLASS_ORDER_SOURCE);
         let file = FileId::new(11_744);
-        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let mut forward_context = context(&[(file, &source)], CanonicalCheckerOptions::default());
         let reference = source
             .arena
             .iter()
@@ -60943,19 +60943,23 @@ mod tests {
                 Some(NodeRef::new(source.arena.id(), file, heritage.expression))
             })
             .unwrap();
-        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
-        assert!(context.store_mut_for_test().set_type_node_links(
+        let wrong = forward_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        assert!(forward_context.store_mut_for_test().set_type_node_links(
             reference,
             TypeNodeLinks {
                 resolved_type: Some(wrong),
                 ..TypeNodeLinks::default()
             },
         ));
-        let poisoned = observable_state(&context, file);
+        let poisoned = observable_state(&forward_context, file);
 
-        assert!(context.check_source_file(file).is_err());
-        assert_eq!(observable_state(&context, file), poisoned);
-        assert!(context.diagnostics().is_empty());
+        assert!(forward_context.check_source_file(file).is_err());
+        assert_eq!(observable_state(&forward_context, file), poisoned);
+        assert!(forward_context.diagnostics().is_empty());
 
         for (index, exports) in [false, true].into_iter().enumerate() {
             let source = parsed(DEFERRED_CLASS_ORDER_SOURCE);
