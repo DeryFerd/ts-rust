@@ -108,8 +108,8 @@ use super::{
     },
     store::{DirectClassHeritageProvenance, SourceNodeParent},
     type_nodes::{
-        CanonicalTypeQuery, CanonicalTypeQueryOptions, TypeNodeUnavailable,
-        preflight_type_annotation,
+        CanonicalTypeQuery, CanonicalTypeQueryOptions, ConstructorAnnotationProof,
+        TypeNodeUnavailable, preflight_type_annotation,
     },
     type_records::{
         ConstrainedTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState, TypeData,
@@ -2103,7 +2103,7 @@ fn preflight_constructor_parameter_annotation(
     context: &ClassTypeQueryContext,
     node: NodeRef,
     initializer_symbol: Option<SemanticSymbolId>,
-) -> Result<(), ClassError> {
+) -> Result<ConstructorAnnotationProof, ClassError> {
     preflight_type_annotation(
         store,
         host,
@@ -2127,7 +2127,7 @@ fn validate_annotated_constructor_parameter_cache(
     context: &ClassTypeQueryContext,
     parameter: &ClassConstructorAnnotatedParameterPlan,
 ) -> Result<Option<TypeId>, ClassError> {
-    preflight_constructor_parameter_annotation(
+    let proof = preflight_constructor_parameter_annotation(
         store,
         host,
         context,
@@ -2136,16 +2136,7 @@ fn validate_annotated_constructor_parameter_cache(
             .initializer
             .map(SourceGlobalDateInitializerPlan::symbol),
     )?;
-    let annotation = match store.type_node_links(parameter.type_node) {
-        None => None,
-        Some(links) if links == &TypeNodeLinks::default() => None,
-        Some(links) if links.outer_type_parameters.is_none() => links.resolved_type,
-        Some(_) => {
-            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
-                parameter.type_node,
-            )));
-        }
-    };
+    let annotation = proof.cached_type(store, host, Some(&context.global_types))?;
     let value_type = annotation
         .map(|annotation| annotated_constructor_value_type(store, context, parameter, annotation))
         .transpose()?
@@ -2187,6 +2178,15 @@ fn materialize_annotated_constructor_parameter(
     parameter: &ClassConstructorAnnotatedParameterPlan,
 ) -> Result<TypeId, ClassError> {
     validate_annotated_constructor_parameter_cache(store, host, context, parameter)?;
+    let proof = preflight_constructor_parameter_annotation(
+        store,
+        host,
+        context,
+        parameter.type_node,
+        parameter
+            .initializer
+            .map(SourceGlobalDateInitializerPlan::symbol),
+    )?;
     let mut diagnostics = CanonicalCheckerDiagnostics::default();
     let annotation = CanonicalTypeQuery::new_with_global_types(
         store,
@@ -2196,7 +2196,9 @@ fn materialize_annotated_constructor_parameter(
         &mut diagnostics,
     )?
     .get_type_from_type_node(parameter.type_node)?;
-    if !diagnostics.is_empty() {
+    if !diagnostics.is_empty()
+        || proof.cached_type(store, host, Some(&context.global_types))? != Some(annotation)
+    {
         return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
             parameter.type_node,
         )));
@@ -15509,13 +15511,12 @@ fn stored_constructor_parameter_annotation(
         let mut annotation = None;
         for child in stored_direct_children(store, declaration)? {
             let kind = store.source_node_kind(child)?;
-            if kind.is_keyword_type()
+            if (kind.is_keyword_type()
                 || (SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
-                    .contains(&(kind as u16))
+                    .contains(&(kind as u16)))
+                && annotation.replace(child).is_some()
             {
-                if annotation.replace(child).is_some() {
-                    return None;
-                }
+                return None;
             }
         }
         return Some((annotation.unwrap_or(initializer), Some(initializer)));
@@ -15564,6 +15565,73 @@ fn stored_constructor_annotation_type(
     annotation: NodeRef,
     active: &mut HashSet<NodeRef>,
 ) -> Option<TypeId> {
+    stored_constructor_annotation_type_with_alias(store, annotation, None, active)
+}
+
+fn stored_constructor_reference_name_matches(
+    store: &CanonicalTypeMapperStore,
+    name: NodeRef,
+    owner: SemanticSymbolId,
+) -> bool {
+    let Some(symbol) = store.symbol(owner) else {
+        return false;
+    };
+    match store.source_node_kind(name) {
+        Some(SyntaxKind::Identifier) => {
+            store.source_identifier_text(name) == symbol.name().as_utf8()
+        }
+        Some(SyntaxKind::QualifiedName) => {
+            let Some(children) = stored_direct_children(store, name) else {
+                return false;
+            };
+            let [left, right] = children.as_slice() else {
+                return false;
+            };
+            let Some(parent) = symbol
+                .parent()
+                .and_then(|parent| store.get_merged_symbol(parent))
+            else {
+                return false;
+            };
+            store.source_identifier_text(*right) == symbol.name().as_utf8()
+                && store
+                    .symbol(parent)
+                    .and_then(Symbol::exports)
+                    .and_then(|table| store.symbol_table(table))
+                    .and_then(|exports| exports.get(symbol.name()))
+                    .and_then(|export| store.get_merged_symbol(export))
+                    == Some(owner)
+                && stored_constructor_reference_name_matches(store, *left, parent)
+        }
+        _ => false,
+    }
+}
+
+fn stored_constructor_annotation_cache_matches(
+    store: &CanonicalTypeMapperStore,
+    annotation: NodeRef,
+    type_: TypeId,
+) -> bool {
+    let expected = TypeNodeLinks {
+        resolved_type: Some(type_),
+        ..TypeNodeLinks::default()
+    };
+    if store.source_node_kind(annotation) == Some(SyntaxKind::ParenthesizedType) {
+        store
+            .type_node_links(annotation)
+            .is_none_or(|links| links == &TypeNodeLinks::default() || links == &expected)
+    } else {
+        store.type_node_links(annotation) == Some(&expected)
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Rebuilds the annotation identity from registered source facts.
+fn stored_constructor_annotation_type_with_alias(
+    store: &CanonicalTypeMapperStore,
+    annotation: NodeRef,
+    alias_owner: Option<SemanticSymbolId>,
+    active: &mut HashSet<NodeRef>,
+) -> Option<TypeId> {
     if !active.insert(annotation) {
         return None;
     }
@@ -15575,80 +15643,102 @@ fn stored_constructor_annotation_type(
                 .source_type_node_result_is_exact(annotation, type_, &[])
                 .then_some(type_);
         }
-        let type_ = store.type_node_links(annotation)?.resolved_type?;
-        if store.type_node_links(annotation)
-            != Some(&TypeNodeLinks {
-                resolved_type: Some(type_),
-                ..TypeNodeLinks::default()
-            })
-        {
-            return None;
-        }
-        match kind {
+        let type_ = match kind {
             SyntaxKind::TypeReference => {
                 let owner = store.symbol_node_links(annotation)?.resolved_symbol?;
                 let symbol = store.symbol(owner)?;
                 let children = stored_direct_children(store, annotation)?;
-                let name = children.iter().find(|child| {
-                    store.source_node_kind(**child) == Some(SyntaxKind::Identifier)
-                })?;
-                if store.source_identifier_text(*name) != symbol.name().as_utf8() {
+                let [name] = children.as_slice() else {
+                    return None;
+                };
+                if store.get_merged_symbol(owner) != Some(owner)
+                    || symbol.check_flags() != CheckFlags::NONE
+                    || !stored_constructor_reference_name_matches(store, *name, owner)
+                {
                     return None;
                 }
-                if store.source_type_node_result_is_exact(annotation, type_, &[]) {
-                    return Some(type_);
-                }
-                (children.as_slice() == [*name]
-                    && symbol.flags() & SymbolFlags::TYPE == SymbolFlags::INTERFACE
-                    && store.get_merged_symbol(owner) == Some(owner)
-                    && store.symbol_node_links(annotation)
-                        == Some(&SymbolNodeLinks {
-                            resolved_symbol: Some(owner),
-                        })
-                    && store.declared_type_links(owner)?.declared_type == Some(type_)
-                    && preflight_class_or_interface_reference(
+                if symbol.flags() == SymbolFlags::TYPE_ALIAS {
+                    let [declaration] = symbol.declarations()? else {
+                        return None;
+                    };
+                    let body = store.source_direct_type_annotation(*declaration)?;
+                    let links = store.type_alias_links(owner)?;
+                    if store.source_node_kind(*declaration)
+                        != Some(SyntaxKind::TypeAliasDeclaration)
+                        || links.type_parameters.is_some()
+                        || links.instantiations.is_some()
+                        || links.is_constructor_declared_property
+                    {
+                        return None;
+                    }
+                    let body_type = stored_constructor_annotation_type_with_alias(
                         store,
-                        &DeclaredTypeHost::default(),
-                        owner,
-                        symbol.flags(),
-                    )
-                    .ok()
-                        == Some(0))
-                .then_some(type_)
+                        body,
+                        Some(owner),
+                        active,
+                    )?;
+                    (links.declared_type == Some(body_type)).then_some(body_type)?
+                } else {
+                    if symbol.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+                        || preflight_class_or_interface_reference(
+                            store,
+                            &DeclaredTypeHost::default(),
+                            owner,
+                            symbol.flags(),
+                        )
+                        .ok()
+                            != Some(0)
+                    {
+                        return None;
+                    }
+                    store.declared_type_links(owner)?.declared_type?
+                }
             }
             SyntaxKind::UnionType => {
                 let children = stored_direct_children(store, annotation)?;
-                let types = children
+                let constituents = children
                     .into_iter()
                     .map(|child| stored_constructor_annotation_type(store, child, active))
                     .collect::<Option<Vec<_>>>()?;
-                (store
-                    .symbol_node_links(annotation)
-                    .is_none_or(|links| links == &SymbolNodeLinks::default())
-                    && store
-                        .cached_literal_union_type_with_alias(&types, None, None)
-                        .ok()?
-                        == Some(type_))
-                .then_some(type_)
+                store
+                    .cached_literal_union_type_with_alias(
+                        &constituents,
+                        alias_owner.map(|owner| (owner, &[][..])),
+                        None,
+                    )
+                    .ok()??
             }
             SyntaxKind::ParenthesizedType => {
                 let children = stored_direct_children(store, annotation)?;
                 let [child] = children.as_slice() else {
                     return None;
                 };
-                (stored_constructor_annotation_type(store, *child, active)? == type_)
-                    .then_some(type_)
+                stored_constructor_annotation_type_with_alias(store, *child, alias_owner, active)?
             }
             SyntaxKind::LiteralType => {
-                (store.source_type_node_result_is_exact(annotation, type_, &[])
-                    || store
-                        .intrinsic_bootstrap()
-                        .is_some_and(|bootstrap| type_ == bootstrap.null_type)
-                        && store.source_direct_type_annotation_is_exact(annotation, type_))
-                .then_some(type_)
+                let null = store.intrinsic_bootstrap()?.null_type;
+                if store.source_direct_type_annotation_is_exact(annotation, null) {
+                    let children = stored_direct_children(store, annotation)?;
+                    let [child] = children.as_slice() else {
+                        return None;
+                    };
+                    return (store.source_node_kind(*child) == Some(SyntaxKind::NullKeyword)
+                        && store.source_type_node_result_is_exact(*child, null, &[]))
+                    .then_some(null);
+                }
+                let type_ = store.type_node_links(annotation)?.resolved_type?;
+                return store
+                    .source_type_node_result_is_exact(annotation, type_, &[])
+                    .then_some(type_);
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+        (stored_constructor_annotation_cache_matches(store, annotation, type_)
+            && (kind == SyntaxKind::TypeReference
+                || store
+                    .symbol_node_links(annotation)
+                    .is_none_or(|links| links == &SymbolNodeLinks::default())))
+        .then_some(type_)
     })();
     active.remove(&annotation);
     result
@@ -19821,11 +19911,7 @@ fn exact_stored_constructor_parameter_property(
             == Some(SourceNodeParent::Parent(owner_declaration))
         && store.source_node_parent(annotation) == Some(SourceNodeParent::Parent(declaration))
         && type_ == value_type
-        && store.type_node_links(annotation)
-            == Some(&TypeNodeLinks {
-                resolved_type: Some(annotation_type),
-                ..TypeNodeLinks::default()
-            })
+        && stored_constructor_annotation_cache_matches(store, annotation, annotation_type)
         && initializer.is_none_or(|initializer| {
             !optional
                 && exact_stored_constructor_parameter_initializer(
@@ -21385,11 +21471,7 @@ fn stored_class_constructor(
                 || store.source_node_kind(parameter_declaration) != Some(SyntaxKind::Parameter)
                 || store.source_node_parent(parameter_declaration)
                     != Some(SourceNodeParent::Parent(declaration))
-                || store.type_node_links(annotation)
-                    != Some(&TypeNodeLinks {
-                        resolved_type: Some(annotation_type),
-                        ..TypeNodeLinks::default()
-                    })
+                || !stored_constructor_annotation_cache_matches(store, annotation, annotation_type)
                 || store.value_symbol_links(*parameter)
                     != Some(&ValueSymbolLinks {
                         resolved_type: Some(type_),
@@ -23484,10 +23566,14 @@ mod tests {
 
     #[test]
     fn constructor_annotation_preflight_and_cache_failures_do_not_write() {
-        for poison in 0..2 {
-            let parsed = parse_source_file(concat!(
-                "interface Token { value: number; } interface Other { other: string; } ",
-                "class Model { constructor(readonly token?: Token) {} }",
+        for poison in 0..4 {
+            let parameter = match poison {
+                2 => "readonly token: Token",
+                3 => "readonly token: (Token)",
+                _ => "readonly token?: Token",
+            };
+            let parsed = parse_source_file(&format!(
+                "interface Token {{ value: number; }} interface Other {{ other: string; }} class Model {{ constructor({parameter}) {{}} }}",
             ));
             let file = FileId::new(8_930);
             let mut binder = CanonicalBinder::new();
@@ -23565,6 +23651,16 @@ mod tests {
 
             context.check_source_file(file).unwrap();
             let members = context.get_nongeneric_class_members(owner).unwrap();
+            let class_type = members.shells().instance_type();
+            let constructor_type = members.shells().value_type();
+            assert_eq!(
+                context.is_type_assignable_to(class_type, class_type),
+                Ok(true)
+            );
+            assert_eq!(
+                context.type_to_string(constructor_type).unwrap(),
+                "typeof Model"
+            );
             let signature = context
                 .store()
                 .signature(members.default_construct_signature())
@@ -23581,12 +23677,21 @@ mod tests {
                 .store()
                 .source_direct_type_annotation(declaration)
                 .unwrap();
-            let annotation_type = context
-                .store()
-                .type_node_links(annotation)
-                .unwrap()
-                .resolved_type
-                .unwrap();
+            let annotation_type = if poison == 3 {
+                context
+                    .store()
+                    .value_symbol_links(local)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap()
+            } else {
+                context
+                    .store()
+                    .type_node_links(annotation)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap()
+            };
             if poison == 0 {
                 let other = context
                     .store()
@@ -23614,11 +23719,24 @@ mod tests {
                     }
                 ));
             } else {
+                let value_type = if poison >= 2 {
+                    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        annotation,
+                        TypeNodeLinks {
+                            resolved_type: Some(number),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    number
+                } else {
+                    annotation_type
+                };
                 for symbol in [local, property] {
                     assert!(context.store_mut_for_test().set_value_symbol_links(
                         symbol,
                         ValueSymbolLinks {
-                            resolved_type: Some(annotation_type),
+                            resolved_type: Some(value_type),
                             ..ValueSymbolLinks::default()
                         }
                     ));
@@ -23629,6 +23747,20 @@ mod tests {
                 context.store().signature_len(),
                 context.store().checker_link_allocated_lengths(),
                 context.diagnostics().clone(),
+            );
+            assert!(
+                context.get_nongeneric_class_members(owner).is_err(),
+                "case {poison}"
+            );
+            assert!(
+                context
+                    .is_type_assignable_to(class_type, class_type)
+                    .is_err(),
+                "case {poison}"
+            );
+            assert!(
+                context.type_to_string(constructor_type).is_err(),
+                "case {poison}"
             );
             assert!(context.recheck_source_file(file).is_err(), "case {poison}");
             assert_eq!(

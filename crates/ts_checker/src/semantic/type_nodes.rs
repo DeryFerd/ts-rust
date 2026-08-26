@@ -113,7 +113,7 @@ pub(super) fn preflight_type_annotation(
     options: CanonicalTypeQueryOptions,
     node: NodeRef,
     initializer_symbol: Option<SemanticSymbolId>,
-) -> Result<(), DeclaredTypeError> {
+) -> Result<ConstructorAnnotationProof, DeclaredTypeError> {
     let aliases = HashMap::new();
     let mut planner = TypeQueryPlanner::new(
         store,
@@ -175,7 +175,178 @@ pub(super) fn preflight_type_annotation(
             },
         ));
     }
-    Ok(())
+    let proof = ConstructorAnnotationProof { node, plan };
+    proof.cached_type(store, host, global_types)?;
+    Ok(proof)
+}
+
+/// Keeps the checked source identities while the ordinary query publishes its types.
+/// Parentheses, keywords, and null do not require their own node cache entries.
+pub(super) struct ConstructorAnnotationProof {
+    node: NodeRef,
+    plan: TypeQueryPlan,
+}
+
+impl ConstructorAnnotationProof {
+    pub(super) fn cached_type(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        global_types: Option<&CanonicalGlobalTypes>,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        self.node_type(store, host, global_types, self.node, &mut HashSet::new())
+    }
+
+    #[allow(clippy::too_many_lines)] // Checks each admitted source shape against its own provider.
+    fn node_type(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        global_types: Option<&CanonicalGlobalTypes>,
+        node: NodeRef,
+        active: &mut HashSet<NodeRef>,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        if !active.insert(node) {
+            return Err(invalid());
+        }
+        let bootstrap = store.intrinsic_bootstrap().ok_or_else(&invalid)?;
+        let expected = if let Some(reference) = self.plan.references.get(&node) {
+            if store.symbol_node_links(node).is_some_and(|links| {
+                links != &SymbolNodeLinks::default()
+                    && links.resolved_symbol != Some(reference.symbol)
+            }) {
+                return Err(invalid());
+            }
+            if let Some(alias) = self.plan.aliases.get(&reference.symbol) {
+                let expected =
+                    self.node_type(store, host, global_types, alias.type_node, active)?;
+                if store
+                    .type_alias_links(reference.symbol)
+                    .is_some_and(|links| {
+                        links.type_parameters.is_some()
+                            || links.instantiations.is_some()
+                            || links.is_constructor_declared_property
+                            || links.declared_type.is_some() && links.declared_type != expected
+                    })
+                {
+                    return Err(invalid());
+                }
+                expected
+            } else {
+                let symbol = store.symbol(reference.symbol).ok_or_else(&invalid)?;
+                if preflight_class_or_interface_reference(
+                    store,
+                    host,
+                    reference.symbol,
+                    symbol.flags(),
+                )? != 0
+                {
+                    return Err(invalid());
+                }
+                store
+                    .declared_type_links(reference.symbol)
+                    .and_then(|links| links.declared_type)
+            }
+        } else if let Some(union) = self.plan.unions.get(&node) {
+            let mut constituents = Vec::with_capacity(union.types.len());
+            let mut complete = true;
+            for child in &union.types {
+                if let Some(type_) = self.node_type(store, host, global_types, *child, active)? {
+                    constituents.push(type_);
+                } else {
+                    complete = false;
+                }
+            }
+            if complete
+                && store
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+            {
+                store
+                    .cached_literal_union_type_with_alias(
+                        &constituents,
+                        union.alias_symbol.map(|symbol| (symbol, &[][..])),
+                        global_types.map(CanonicalArrayTargets::from_global_types),
+                    )
+                    .map_err(type_construction_error)?
+            } else {
+                None
+            }
+        } else if let Some(literal) = self.plan.literals.get(&node) {
+            match literal {
+                PlannedLiteralType::Null => Some(bootstrap.null_type),
+                PlannedLiteralType::String(value) => bootstrap.cached_string_literal_type(value),
+                PlannedLiteralType::Number { value, .. } => {
+                    bootstrap.cached_number_literal_type(*value)
+                }
+                PlannedLiteralType::BigInt { value, .. } => {
+                    bootstrap.cached_bigint_literal_type(value)
+                }
+                PlannedLiteralType::Boolean(value) => Some(if *value {
+                    bootstrap.regular_true_type
+                } else {
+                    bootstrap.regular_false_type
+                }),
+            }
+        } else {
+            let record = preflight_node(store, host, node)?;
+            if let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data {
+                self.node_type(
+                    store,
+                    host,
+                    global_types,
+                    NodeRef::new(node.arena, node.file, parenthesized.type_),
+                    active,
+                )?
+            } else {
+                Some(match record.kind {
+                    SyntaxKind::AnyKeyword => bootstrap.any_type,
+                    SyntaxKind::UnknownKeyword => bootstrap.unknown_type,
+                    SyntaxKind::StringKeyword => bootstrap.string_type,
+                    SyntaxKind::NumberKeyword => bootstrap.number_type,
+                    SyntaxKind::BigIntKeyword => bootstrap.bigint_type,
+                    SyntaxKind::BooleanKeyword => bootstrap.boolean_type,
+                    SyntaxKind::SymbolKeyword => bootstrap.es_symbol_type,
+                    SyntaxKind::VoidKeyword => bootstrap.void_type,
+                    SyntaxKind::UndefinedKeyword => bootstrap.undefined_type,
+                    SyntaxKind::NeverKeyword => bootstrap.never_type,
+                    SyntaxKind::ObjectKeyword => bootstrap.non_primitive_type,
+                    _ => return Err(invalid()),
+                })
+            }
+        };
+        if store.type_node_links(node).is_some_and(|links| {
+            links != &TypeNodeLinks::default()
+                && (links.outer_type_parameters.is_some()
+                    || links.resolved_type.is_none()
+                    || links.resolved_type != expected)
+        }) || !self.plan.references.contains_key(&node)
+            && store
+                .symbol_node_links(node)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return Err(invalid());
+        }
+        active.remove(&node);
+        let needs_node_cache = self.plan.references.contains_key(&node)
+            || self.plan.unions.contains_key(&node)
+            || self
+                .plan
+                .literals
+                .get(&node)
+                .is_some_and(|literal| !matches!(literal, PlannedLiteralType::Null));
+        if needs_node_cache
+            && store
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        {
+            return Ok(None);
+        }
+        Ok(expected)
+    }
 }
 
 fn planned_constructor_annotation_shape(
