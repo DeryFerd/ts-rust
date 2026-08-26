@@ -18,6 +18,7 @@ use ts_core::{Diagnostic, DiagnosticCategory, TextPos, TextRange};
 use ts_diagnostics::{Category, Diagnostic as CheckerDiagnostic, message_by_code};
 use ts_jsnum::{Number, PseudoBigInt};
 use ts_parser::{parse_jsdoc_comment, parse_source_file};
+use ts_scanner::Scanner;
 
 use super::{
     ArrayTypeError, CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange,
@@ -3641,18 +3642,7 @@ fn apply_jsdoc_tag(
             }
         }
         JsDocTagKind::Overload => {
-            let record = arena
-                .get(declaration.node.node)
-                .ok_or(JsDocCommentError::InvalidSourceNode(declaration.node))?;
-            let creates_declaration = matches!(
-                record.kind,
-                SyntaxKind::FunctionDeclaration | SyntaxKind::Constructor
-            ) || record.kind == SyntaxKind::MethodDeclaration
-                && record
-                    .parent
-                    .and_then(|parent| arena.get(parent))
-                    .is_some_and(|parent| parent.kind != SyntaxKind::ObjectLiteralExpression);
-            if creates_declaration {
+            if jsdoc_overload_creates_declaration(arena, declaration.node)? {
                 return Err(JsDocCommentError::UnsupportedOverloadDeclaration(
                     declaration.node,
                 ));
@@ -3683,6 +3673,34 @@ fn apply_jsdoc_tag(
         }
     }
     Ok(())
+}
+
+fn jsdoc_overload_creates_declaration(
+    arena: &NodeArena,
+    declaration: NodeRef,
+) -> Result<bool, JsDocCommentError> {
+    let invalid = || JsDocCommentError::InvalidSourceNode(declaration);
+    let record = arena.get(declaration.node).ok_or_else(invalid)?;
+    if !matches!(
+        record.kind,
+        SyntaxKind::FunctionDeclaration | SyntaxKind::MethodDeclaration | SyntaxKind::Constructor
+    ) {
+        return Ok(false);
+    }
+    // PCObjectLiteralMembers remains set while nested declarations are parsed.
+    let mut parent = record.parent;
+    let mut visited = HashSet::new();
+    while let Some(node) = parent {
+        if !visited.insert(node) {
+            return Err(invalid());
+        }
+        let record = arena.get(node).ok_or_else(invalid)?;
+        if record.kind == SyntaxKind::ObjectLiteralExpression {
+            return Ok(false);
+        }
+        parent = record.parent;
+    }
+    Ok(true)
 }
 
 fn apply_callback_signature_tag(
@@ -4017,28 +4035,19 @@ fn recover_keyword_tags<'source>(comment: &'source str, tags: &mut Vec<ScannedTa
         {
             continue;
         }
-        let rest = &comment[start + 1..];
-        let name_length = rest
-            .char_indices()
-            .find_map(|(index, character)| {
-                (!character.is_alphanumeric() && !matches!(character, '_' | '$' | '-'))
-                    .then_some(index)
-            })
-            .unwrap_or(rest.len());
-        let Some(name) = rest.get(..name_length) else {
+        let mut scanner = Scanner::new(comment);
+        scanner.reset_pos(start + 1);
+        let token = scanner.scan_jsdoc_token();
+        let Ok(body_start) = usize::try_from(token.range.end.get()) else {
             continue;
         };
-        if !matches!(
-            name,
-            "type" | "return" | "extends" | "implements" | "satisfies" | "this"
-        ) || tags.iter().any(|existing| existing.start == start)
-        {
+        if !token.kind.is_keyword() || tags.iter().any(|existing| existing.start == start) {
             continue;
         }
         tags.push(ScannedTag {
-            name,
+            name: token.text,
             start,
-            body_start: start + 1 + name_length,
+            body_start,
         });
     }
 }
@@ -5395,7 +5404,10 @@ mod tests {
     use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
     use super::*;
-    use crate::semantic::{CanonicalCheckerContext, IntrinsicBootstrapOptions, TypeData};
+    use crate::semantic::{
+        CanonicalCheckerContext, IntrinsicBootstrapOptions, SourceCheckError, TypeData,
+        UnsupportedSourceSyntax,
+    };
 
     fn context(
         parsed: &ParseResult,
@@ -5424,6 +5436,32 @@ mod tests {
 
     fn type_tag(source: &str) -> ParsedJsDocComment<'_> {
         parse_jsdoc_comment_at(source, checked_range(0, source.len()).unwrap()).unwrap()
+    }
+
+    fn javascript_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/overloads.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
     }
 
     const GENERIC_OVERLOAD_COMMENT: &str = concat!(
@@ -5539,7 +5577,11 @@ mod tests {
 
     #[test]
     fn jsdoc_overload_blocks_preserve_host_tags_after_the_signature_ends() {
-        for boundary in ["@returns {number}", "@deprecated end of overload"] {
+        for boundary in [
+            "@returns {number}",
+            "@deprecated end of overload",
+            "@private",
+        ] {
             let source = format!(
                 "/**\n * @template T\n * @param {{T}} before\n * @overload\n \
                  * @param {{number}} nested\n * {boundary}\n * @template U\n \
@@ -5661,6 +5703,138 @@ mod tests {
         assert_eq!(declaration.parameters()[0].name(), "value");
         assert!(declaration.this_type().is_none());
         assert!(declaration.return_type().is_none());
+    }
+
+    #[test]
+    fn jsdoc_overload_blocks_are_ignored_in_nested_object_member_declarations() {
+        let comment = "/** @overload @param {number} value @returns {number} */";
+        for (nested, kind) in [
+            (
+                format!("{comment}\nfunction nested(value) {{ return value; }}"),
+                SyntaxKind::FunctionDeclaration,
+            ),
+            (
+                format!("class Nested {{\n{comment}\nconstructor(value) {{}} }}"),
+                SyntaxKind::Constructor,
+            ),
+            (
+                format!("class Nested {{\n{comment}\nread(value) {{ return value; }} }}"),
+                SyntaxKind::MethodDeclaration,
+            ),
+        ] {
+            let source = format!("const object = {{ read() {{ {nested} }} }};");
+            let javascript = parse_javascript_source_file(&source);
+            assert!(
+                javascript.diagnostics.is_empty(),
+                "{:?}",
+                javascript.diagnostics
+            );
+            let root = NodeRef::new(
+                javascript.arena.id(),
+                FileId::new(115),
+                javascript.source_file,
+            );
+            let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+            assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+            let [declaration] = plan.declarations() else {
+                panic!("expected one nested annotation")
+            };
+            assert_eq!(
+                javascript.arena.get(declaration.node().node).unwrap().kind,
+                kind
+            );
+            assert!(declaration.parameters().is_empty());
+            assert!(declaration.return_type().is_none());
+
+            let outside = parse_javascript_source_file(&format!("{source}\n{nested}"));
+            let root = NodeRef::new(outside.arena.id(), FileId::new(116), outside.source_file);
+            assert!(matches!(
+                plan_javascript_source_jsdoc(&outside.arena, root),
+                Err(JsDocCommentError::UnsupportedOverloadDeclaration(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn jsdoc_overload_blocks_single_group_does_not_publish_an_overload_arrow_signature() {
+        let source = concat!(
+            "/** @template T @overload @param {T} value @returns {T} */\n",
+            "const read = value => value;",
+        );
+        let javascript = parse_javascript_source_file(source);
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let file = FileId::new(117);
+        let (arrow, function) = javascript
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::ArrowFunction(function) => {
+                    Some((NodeRef::new(javascript.arena.id(), file, node), function))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(function.type_parameters.is_none());
+        assert!(function.type_.is_none());
+        let mut context = javascript_context(&javascript, file);
+        // Template-only arrows need their own implementation, not an overload's signature.
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::JsDoc(_)
+            ))
+        ));
+        assert!(context.store().signature_links(arrow).is_none());
+    }
+
+    #[test]
+    fn jsdoc_overload_blocks_single_group_keeps_the_primary_checker_signature() {
+        let source = concat!(
+            "/** @template T @param {T} value @returns {T}\n",
+            " * @overload @param {number} value @return {number} */\n",
+            "const read = value => value;",
+        );
+        let javascript = parse_javascript_source_file(source);
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let file = FileId::new(118);
+        let arrow = javascript
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    javascript.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let mut context = javascript_context(&javascript, file);
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let callable = context.get_type_at_location(arrow).unwrap();
+        assert_eq!(
+            context.type_to_string(callable).unwrap(),
+            "<T>(value: T) => T"
+        );
+        let before = (context.store().type_len(), context.store().signature_len());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.get_type_at_location(arrow).unwrap(), callable);
+        assert_eq!(
+            (context.store().type_len(), context.store().signature_len()),
+            before
+        );
     }
 
     #[test]

@@ -499,32 +499,28 @@ fn javascript_jsdoc_callable_signature(
     if comment.find("*/") != Some(comment.len().checked_sub(2)?) {
         return None;
     }
-    let parsed = parse_jsdoc_comment(comment);
-    if !parsed.diagnostics.is_empty() {
-        return None;
-    }
-    let NodeData::JsDoc(jsdoc) = &parsed.arena.get(parsed.jsdoc)?.data else {
-        return None;
-    };
-    let tags = jsdoc.tags.as_ref()?;
+    let tags = javascript_jsdoc_callable_tags(comment)?;
     let mut template = None;
     let mut parameters = Vec::new();
     let mut return_type = None;
-    for tag in &tags.nodes {
-        let node = parsed.arena.get(*tag)?;
-        let NodeData::JsDocUnknownTag(tag) = &node.data else {
-            return None;
-        };
-        let NodeData::Identifier(identifier) = &parsed.arena.get(tag.tag_name)?.data else {
-            return None;
-        };
-        let start = usize::try_from(node.range.start.get()).ok()?;
-        if !javascript_jsdoc_tag_is_top_level(comment, start) {
+    let mut in_overload = false;
+    for tag in tags {
+        if tag.text == "overload" {
+            in_overload = true;
             continue;
         }
-        let body_start = comment_start
-            .checked_add(usize::try_from(parsed.arena.get(tag.tag_name)?.range.end.get()).ok()?)?;
-        match identifier.text.as_str() {
+        if in_overload {
+            match tag.text {
+                "param" | "arg" | "argument" | "this" | "template" => continue,
+                "return" | "returns" => {
+                    in_overload = false;
+                    continue;
+                }
+                _ => in_overload = false,
+            }
+        }
+        let body_start = comment_start.checked_add(usize::try_from(tag.range.end.get()).ok()?)?;
+        match tag.text {
             "typedef" | "callback" => return None,
             "template" => {
                 if template.is_some() {
@@ -564,6 +560,30 @@ fn javascript_jsdoc_callable_signature(
         parameters,
         return_type: return_type?,
     })
+}
+
+// Keyword tags such as @return must also end an overload's child signature.
+fn javascript_jsdoc_callable_tags(comment: &str) -> Option<Vec<Token<'_>>> {
+    let mut scanner = Scanner::new(comment);
+    scanner.reset_pos(3);
+    scanner.set_skip_jsdoc_leading_asterisks(true);
+    let mut tags = Vec::new();
+    loop {
+        let token = scanner.scan_jsdoc_comment_text_token(false);
+        let start = usize::try_from(token.range.start.get()).ok()?;
+        if token.kind == SyntaxKind::EndOfFile || start >= comment.len().checked_sub(2)? {
+            break;
+        }
+        if token.kind == SyntaxKind::AtToken {
+            let tag = scanner.scan_jsdoc_token();
+            if (tag.kind == SyntaxKind::Identifier || tag.kind.is_keyword())
+                && javascript_jsdoc_tag_is_top_level(comment, start)
+            {
+                tags.push(tag);
+            }
+        }
+    }
+    scanner.diagnostics().is_empty().then_some(tags)
 }
 
 fn javascript_jsdoc_identifier(source: &str, start: usize, end: usize) -> Option<Token<'_>> {
@@ -19262,6 +19282,90 @@ export as namespace GlobalName;
                 .for_each_child(|child| pending.push(child));
         }
         assert_eq!(reached.len(), parsed.arena.len());
+    }
+
+    #[test]
+    fn jsdoc_overload_blocks_do_not_attach_nested_arrow_annotations() {
+        for return_tag in ["return", "returns"] {
+            let source = format!(
+                "/** @template T @overload @param {{T}} value @{return_tag} {{T}} */\n\
+                 const read = value => value;"
+            );
+            let parsed = parse_javascript_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let function = parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| match &record.data {
+                    NodeData::ArrowFunction(function) => Some(function),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(function.type_parameters.is_none());
+            assert!(function.type_.is_none());
+            let [parameter] = function.parameters.nodes.as_slice() else {
+                panic!("expected the source parameter")
+            };
+            let NodeData::ParameterDeclaration(parameter) =
+                &parsed.arena.get(*parameter).unwrap().data
+            else {
+                panic!("expected the source parameter declaration")
+            };
+            assert!(parameter.type_.is_none());
+            assert!(
+                parsed
+                    .arena
+                    .iter()
+                    .all(|(_, node)| !node.flags.contains(NodeFlags::REPARSED))
+            );
+        }
+    }
+
+    #[test]
+    fn jsdoc_overload_blocks_preserve_primary_arrow_annotations() {
+        let primary = "@template T @param {T} value @return {T}";
+        for tags in [
+            format!("{primary} @overload @param {{number}} value @returns {{number}}"),
+            format!("@overload @param {{number}} nested @return {{number}} {primary}"),
+            format!("@overload @param {{number}} nested @deprecated {primary}"),
+            format!("@overload @param {{number}} nested @private {primary}"),
+        ] {
+            let source = format!("/** {tags} */\nconst read = value => value;");
+            let parsed = parse_javascript_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let (arrow, function) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| match &record.data {
+                    NodeData::ArrowFunction(function) => Some((node, function)),
+                    _ => None,
+                })
+                .unwrap();
+            let [template] = function.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+                panic!("expected only the primary template")
+            };
+            assert_eq!(parsed.arena.get(*template).unwrap().parent, Some(arrow));
+            let [parameter] = function.parameters.nodes.as_slice() else {
+                panic!("expected only the primary parameter")
+            };
+            let NodeData::ParameterDeclaration(parameter_data) =
+                &parsed.arena.get(*parameter).unwrap().data
+            else {
+                panic!("expected the primary parameter declaration")
+            };
+            for (annotation, parent) in [
+                (parameter_data.type_.unwrap(), *parameter),
+                (function.type_.unwrap(), arrow),
+            ] {
+                let node = parsed.arena.get(annotation).unwrap();
+                assert_eq!(node.parent, Some(parent));
+                assert_eq!(node.flags, NodeFlags::REPARSED);
+                assert_eq!(
+                    &source[node.range.start.get() as usize..node.range.end.get() as usize],
+                    "T"
+                );
+            }
+        }
     }
 
     #[test]
