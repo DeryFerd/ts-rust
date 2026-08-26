@@ -961,6 +961,7 @@ impl CanonicalCheckerContext<'_> {
             {
                 return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
             }
+            self.preflight_enum_type(symbol)?;
             let declared = self
                 .store()
                 .declared_type_links(symbol)
@@ -2635,9 +2636,9 @@ mod tests {
     #[test]
     fn enum_declaration_queries_keep_declared_and_value_types_distinct() {
         for source in [
-            "enum Kind {} const copy = Kind;",
-            "enum Kind { First = 1, Second = 2 } const copy = Kind;",
-            "declare namespace Names { enum Kind {} } const copy = Names.Kind;",
+            "enum Kind {} declare const copy: typeof Kind;",
+            "enum Kind { First = 1, Second = 2 } declare const copy: typeof Kind;",
+            "declare namespace Names { enum Kind {} } declare const copy: typeof Names.Kind;",
         ] {
             let parsed = parse_source_file(source);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -2849,6 +2850,73 @@ mod tests {
                         context.store().checker_link_allocated_lengths(),
                         context.store().source_file_links(source).cloned(),
                         context.store().declared_type_links(second_owner).cloned(),
+                        context.diagnostics().len(),
+                    ),
+                    before,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enum_declaration_queries_reject_changed_dispatch_flags() {
+        let parsed = parse_source_file("declare enum Kind { First = 1 }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_071);
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, enumeration.name),
+                ))
+            })
+            .unwrap();
+        for flags in [
+            SymbolFlags::PROPERTY,
+            SymbolFlags::TYPE_ALIAS,
+            SymbolFlags::REGULAR_ENUM | SymbolFlags::INTERFACE,
+        ] {
+            for warm in [false, true] {
+                let mut context = declaration_context(&parsed, file);
+                let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+                if warm {
+                    context.get_type_at_location(name).unwrap();
+                }
+                assert!(context.store_mut_for_test().set_symbol_flags(
+                    owner,
+                    flags,
+                    CheckFlags::NONE,
+                ));
+                let before = (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                );
+                for location in [declaration, name] {
+                    assert_eq!(
+                        context.get_type_at_location(location),
+                        Err(CanonicalArtifactQueryError::DeclaredType(
+                            crate::semantic::DeclaredTypeError::Enum(
+                                crate::semantic::enums::EnumTypeError::Invariant(
+                                    crate::semantic::enums::EnumTypeInvariant::InvalidOwnerSymbol(
+                                        owner
+                                    ),
+                                ),
+                            ),
+                        )),
+                    );
+                }
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().checker_link_allocated_lengths(),
                         context.diagnostics().len(),
                     ),
                     before,

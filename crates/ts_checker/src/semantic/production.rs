@@ -1099,6 +1099,18 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         .get_declared_type_of_symbol(symbol)
     }
 
+    pub(super) fn preflight_enum_type(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )?;
+        super::enums::preflight_enum(&self.store, &host, symbol).map_err(DeclaredTypeError::from)
+    }
+
     /// Returns a declared module's value type without checking its exports.
     ///
     /// Pure modules retain one anonymous identity. Namespace-only declarations
