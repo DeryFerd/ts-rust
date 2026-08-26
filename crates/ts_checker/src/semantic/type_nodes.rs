@@ -724,6 +724,8 @@ struct TypeQueryPlan {
         BTreeMap<NodeRef, PlannedMissingTypeReferenceDiagnostic>,
     type_queries: BTreeMap<NodeRef, PlannedValueTypeQuery>,
     class_type_queries: BTreeMap<SemanticSymbolId, ClassMemberQueryPlan>,
+    imported_callable_type_queries:
+        BTreeMap<SemanticSymbolId, source_callables::SourceCallablePlan>,
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
     unions: BTreeMap<NodeRef, PlannedUnionType>,
     intersections: BTreeMap<NodeRef, PlannedIntersectionType>,
@@ -1841,6 +1843,7 @@ struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     plan: TypeQueryPlan,
     planning_defaults: HashSet<(SemanticSymbolId, NodeRef)>,
     planning_interfaces: HashSet<SemanticSymbolId>,
+    planning_imported_callables: HashSet<SemanticSymbolId>,
     active_structural_aliases: Vec<(SemanticSymbolId, usize)>,
     active_tuple_aliases: Vec<SemanticSymbolId>,
     function_indirection_depth: usize,
@@ -1867,6 +1870,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             plan: TypeQueryPlan::default(),
             planning_defaults: HashSet::new(),
             planning_interfaces: HashSet::new(),
+            planning_imported_callables: HashSet::new(),
             active_structural_aliases: Vec::new(),
             active_tuple_aliases: Vec::new(),
             function_indirection_depth: 0,
@@ -9850,7 +9854,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
         let alias = self
-            .ambient_module_namespace_import_alias(node, name)
+            .ambient_module_namespace_import_alias(
+                node,
+                name,
+                SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            )
             .ok_or_else(&unsupported)?;
         let symbol = self
             .authenticated_ambient_module_namespace_import_member(
@@ -9883,7 +9891,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .get_parent_of_symbol(symbol)
             .ok_or_else(&invalid)?;
         if !declaration.is_for(node.arena, node.file)
-            || symbol_record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+            || !matches!(
+                symbol_record.flags(),
+                SymbolFlags::BLOCK_SCOPED_VARIABLE | SymbolFlags::FUNCTION
+            )
             || symbol_record.value_declaration() != Some(declaration)
             || symbol_record.name().as_utf8() != Some(member_name.text.as_str())
             || symbol_record.check_flags() != CheckFlags::NONE
@@ -9897,6 +9908,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 != Some(symbol)
         {
             return Err(unsupported());
+        }
+
+        if symbol_record.flags() == SymbolFlags::FUNCTION {
+            return self.plan_imported_callable_type_query(node, name, symbol, declaration, owner);
         }
 
         let declaration_record = preflight_node(self.store, self.host, declaration)?;
@@ -10015,6 +10030,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
         if annotation_type.is_some_and(|type_| self.store.type_payload(type_).is_none())
             || value_type.is_some_and(|value| annotation_identity != Some(value))
+            || annotation_identity.is_some_and(|type_| {
+                !self
+                    .store
+                    .source_direct_type_annotation_is_exact(annotation, type_)
+            })
         {
             return Err(invalid());
         }
@@ -10054,6 +10074,118 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         {
             return Err(invalid());
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // Imported callable dependencies and warm caches share one read-only proof.
+    fn plan_imported_callable_type_query(
+        &mut self,
+        node: NodeRef,
+        name: NodeRef,
+        symbol: SemanticSymbolId,
+        declaration: NodeRef,
+        owner: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let callable = source_callables::plan_source_callable(
+            self.store,
+            self.host,
+            declaration,
+            symbol,
+            self.array_targets,
+        )
+        .map_err(|error| source_callable_error(error, SourceCallableFamily::FunctionDeclaration))?;
+        if callable.family != SourceCallableFamily::FunctionDeclaration
+            || callable.owner_parent != Some(owner)
+            || !callable.body_mode.is_ambient()
+            || !self.type_reference_alias_targets.is_empty()
+        {
+            return Err(invalid());
+        }
+        let type_ = match source_callables::source_callable_state(self.store, &callable, false)
+            .map_err(|error| source_callable_error(error, callable.family))?
+        {
+            source_callables::SourceCallableState::Cold => None,
+            source_callables::SourceCallableState::Resolved { type_, .. }
+                if matches!(
+                    source_callables::validate_stored_source_callable(self.store, type_),
+                    source_callables::StoredSourceCallableValidation::Valid(_)
+                ) =>
+            {
+                Some(type_)
+            }
+            _ => return Err(invalid()),
+        };
+        if !self.planning_imported_callables.insert(symbol) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
+                    kind: SyntaxKind::TypeQuery,
+                },
+            ));
+        }
+        for parameter in &callable.type_parameters {
+            for annotation in [parameter.constraint, parameter.default_type]
+                .into_iter()
+                .flatten()
+            {
+                self.plan_type_node(annotation)?;
+            }
+        }
+        for parameter in &callable.parameters {
+            if let Some(annotation) = parameter.explicit_type_node() {
+                self.plan_type_node(annotation)?;
+            }
+        }
+        if let Some(annotation) = callable.return_type.type_node() {
+            self.plan_type_node(annotation)?;
+        }
+        self.planning_imported_callables.remove(&symbol);
+        let cached_type = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type);
+        let cached_symbol = self
+            .store
+            .symbol_node_links(name)
+            .and_then(|links| links.resolved_symbol);
+        if self
+            .store
+            .type_node_links(node)
+            .is_some_and(|links| links.outer_type_parameters.is_some())
+            || self
+                .store
+                .symbol_node_links(node)
+                .is_some_and(|links| links.resolved_symbol.is_some())
+            || cached_type.is_some_and(|cached| Some(cached) != type_)
+            || cached_symbol.is_some_and(|cached| cached != symbol)
+            || cached_type.is_some() != cached_symbol.is_some()
+        {
+            return Err(invalid());
+        }
+        let query = PlannedValueTypeQuery {
+            name,
+            symbol,
+            source_node: None,
+            type_,
+        };
+        if self
+            .plan
+            .imported_callable_type_queries
+            .get(&symbol)
+            .is_some_and(|previous| previous != &callable)
+            || self
+                .plan
+                .type_queries
+                .get(&node)
+                .is_some_and(|previous| previous != &query)
+        {
+            return Err(invalid());
+        }
+        self.plan
+            .imported_callable_type_queries
+            .insert(symbol, callable);
+        self.plan.type_queries.insert(node, query);
         Ok(())
     }
 
@@ -16963,6 +17095,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         &self,
         reference: NodeRef,
         name: NodeRef,
+        meaning: SymbolFlags,
     ) -> Option<SemanticSymbolId> {
         let (arena, bound) = self.host.source(reference)?;
         let facts = bound.source_facts()?;
@@ -16988,7 +17121,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .resolve(
                     Some(CanonicalResolutionLocation::Bound(root)),
                     &identifier.text,
-                    SymbolFlags::NAMESPACE,
+                    meaning,
                     None,
                     true,
                     false,
@@ -17311,7 +17444,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .intersects(SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE)
                 && target_record.flags().without(allowed) == SymbolFlags::NONE
         } else if meaning == SymbolFlags::VALUE {
-            target_record.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+            matches!(
+                target_record.flags(),
+                SymbolFlags::BLOCK_SCOPED_VARIABLE | SymbolFlags::FUNCTION
+            )
         } else {
             false
         };
@@ -17418,7 +17554,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         reference: NodeRef,
         name: NodeRef,
     ) -> Result<SemanticSymbolId, DeclaredTypeError> {
-        let ambient_alias = self.ambient_module_namespace_import_alias(reference, name);
+        let ambient_alias =
+            self.ambient_module_namespace_import_alias(reference, name, SymbolFlags::NAMESPACE);
         let mut callback_host = self.host.name_resolver_host(self.store)?;
         match callback_host.resolve_entity_name(name, SymbolFlags::TYPE) {
             Ok(Some(symbol)) => {
@@ -23609,6 +23746,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         } else {
             None
         };
+        let callable_value = plan
+            .imported_callable_type_queries
+            .get(&query.symbol)
+            .map(|callable| {
+                self.get_type_of_source_callable(callable.declaration, callable.owner_symbol)
+            })
+            .transpose()?;
         let source_type = match query.source_node {
             Some(source_node) => {
                 match self
@@ -23636,6 +23780,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .type_
             .or(source_type)
             .or(class_value)
+            .or(callable_value)
             .ok_or_else(invalid)?;
         let value_type = self
             .store
@@ -23644,6 +23789,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if value_type.is_some_and(|type_| type_ != expected)
             || source_type.is_some_and(|type_| type_ != expected)
             || class_value.is_some_and(|type_| type_ != expected)
+            || callable_value.is_some_and(|type_| type_ != expected)
             || value_type.is_none() && source_type != Some(expected)
             || self.store.type_payload(expected).is_none()
         {

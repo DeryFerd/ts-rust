@@ -11964,6 +11964,32 @@ pub(super) fn execute_source_namespace(
         &mut declarations,
         &mut planned_diagnostics,
     );
+    for declaration in &declarations {
+        match declaration {
+            SourceNamespaceMemberPlan::TypeAlias {
+                symbol,
+                annotation,
+                deferred: true,
+                ..
+            } if store.type_alias_links(*symbol).is_some()
+                || store.type_node_links(*annotation).is_some() =>
+            {
+                annotations.push(*annotation);
+            }
+            SourceNamespaceMemberPlan::Interface { symbol, .. }
+                if store.declared_type_links(*symbol).is_some() =>
+            {
+                let flags = store
+                    .symbol(*symbol)
+                    .ok_or(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::SymbolNotOwned(*symbol),
+                    ))?
+                    .flags();
+                preflight_class_or_interface_reference(store, host, *symbol, flags)?;
+            }
+            _ => {}
+        }
+    }
     namespace_implicit_variables(plan, &mut implicit_variables);
     namespace_ambient_variables(plan, &mut ambient_variables);
     namespace_object_initializers(plan, &mut object_initializers);
@@ -12298,9 +12324,18 @@ pub(super) fn execute_source_namespace(
         .preflight_type_from_type_node(annotation);
         match result {
             Ok(()) => {}
-            Err(DeclaredTypeError::TypeNodeUnavailable(
-                TypeNodeUnavailable::ImportAliasTypeReference { alias, .. },
-            )) if imports.iter().any(|import| import.import.symbol == alias) => {
+            Err(
+                error @ DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::ImportAliasTypeReference { alias, .. },
+                ),
+            ) if imports.iter().any(|import| import.import.symbol == alias) => {
+                if imports.iter().any(|import| {
+                    import.import.symbol == alias
+                        && store.source_node_kind(import.import.declaration)
+                            == Some(SyntaxKind::NamespaceImport)
+                }) {
+                    return Err(error.into());
+                }
                 alias_dependent_annotations.push(annotation);
             }
             Err(error) => return Err(error.into()),
@@ -12308,7 +12343,12 @@ pub(super) fn execute_source_namespace(
         debug_assert!(staged.is_empty());
     }
 
-    resolve_namespace_imports(store, host, diagnostics, imports)?;
+    let pending_imports = if alias_dependent_annotations.is_empty() {
+        imports
+    } else {
+        resolve_namespace_imports(store, host, diagnostics, imports)?;
+        Vec::new()
+    };
     for annotation in alias_dependent_annotations {
         session.reset_query();
         let mut staged = CanonicalCheckerDiagnostics::default();
@@ -12841,6 +12881,7 @@ pub(super) fn execute_source_namespace(
             );
         }
     }
+    resolve_namespace_imports(store, host, diagnostics, pending_imports)?;
     Ok(())
 }
 
@@ -19656,6 +19697,363 @@ mod tests {
                 fixture.context.store().checker_link_allocated_lengths(),
             ),
             warm,
+        );
+    }
+
+    #[test]
+    fn ambient_imported_generic_aliases_check_forwarded_constraints() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'models' { ",
+                "export interface Box<Value extends string> { value: Value; } ",
+                "} ",
+                "declare module 'consumer' { ",
+                "import * as Models from 'models'; ",
+                "export type Valid<Element extends string> = Models.Box<Element>; ",
+                "export type Invalid<Element> = Models.Box<Element>; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 1);
+        assert!(namespace.members.iter().all(|member| matches!(
+            member,
+            SourceNamespaceMemberPlan::TypeAlias {
+                deferred: false,
+                ..
+            }
+        )));
+        assert!(
+            fixture
+                .context
+                .store()
+                .alias_symbol_links(namespace.imports[0].symbol)
+                .is_none()
+        );
+        let diagnostics = execute(&mut fixture, &namespace).unwrap();
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2_344],
+        );
+        assert!(namespace.members.iter().all(|member| {
+            let SourceNamespaceMemberPlan::TypeAlias { symbol, .. } = member else {
+                return false;
+            };
+            fixture
+                .context
+                .store()
+                .type_alias_links(*symbol)
+                .and_then(|links| links.declared_type)
+                .is_some()
+        }));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check cold generic functions, pending returns, and forged signatures together.
+    fn ambient_imported_function_queries_validate_signatures_before_publication() {
+        for poisoned in [false, true] {
+            let mut fixture = declaration_fixture(
+                concat!(
+                    "declare module 'tools' { ",
+                    "export function text(): string; ",
+                    "export function identity<Item>(value: Item): Item; ",
+                    "} ",
+                    "declare module 'consumer' { ",
+                    "import * as Tools from 'tools'; ",
+                    "interface Calls { ",
+                    "identity: typeof Tools.identity; ",
+                    "text: typeof Tools.text; ",
+                    "} }",
+                ),
+                CanonicalModuleState::Script,
+            );
+            let namespace = plan(&fixture, 1);
+            let imported_module = namespace.imports[0].ambient_target.unwrap();
+            let text = fixture
+                .context
+                .store()
+                .symbol(imported_module)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| fixture.context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source("text"))
+                .unwrap();
+            let declaration = fixture
+                .context
+                .store()
+                .symbol(text)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .unwrap();
+            let bound = fixture.context.file(fixture.file).unwrap().1.clone();
+            let globals = fixture.context.global_types().clone();
+            let options = fixture.context.options();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let type_ = CanonicalTypeQuery::new_with_global_types(
+                fixture.context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_of_source_callable(declaration, text)
+            .unwrap();
+            assert!(diagnostics.is_empty());
+            let signature = fixture
+                .context
+                .store()
+                .source_callable_provenance(type_)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                None,
+            );
+            if poisoned {
+                let store = fixture.context.store_mut_for_test();
+                let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
+                assert!(store.set_signature_resolved_return_type(signature, Some(boolean)));
+            }
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            let result = execute(&mut fixture, &namespace);
+            if poisoned {
+                assert!(result.is_err());
+                assert_eq!(
+                    (
+                        fixture.context.store().type_len(),
+                        fixture.context.store().symbol_len(),
+                        fixture.context.store().checker_link_allocated_lengths(),
+                    ),
+                    before,
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .alias_symbol_links(namespace.imports[0].symbol)
+                        .is_none()
+                );
+            } else {
+                assert!(result.unwrap().is_empty());
+                assert_eq!(
+                    fixture.context.store().source_callable_type_for_owner(text),
+                    Some(type_),
+                );
+                assert_eq!(
+                    fixture
+                        .context
+                        .store()
+                        .signature(signature)
+                        .unwrap()
+                        .resolved_return_type(),
+                    None,
+                );
+                let warm = (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                );
+                assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+                assert_eq!(
+                    (
+                        fixture.context.store().type_len(),
+                        fixture.context.store().symbol_len(),
+                        fixture.context.store().checker_link_allocated_lengths(),
+                    ),
+                    warm,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_imported_value_queries_respect_lexical_shadowing() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'tools' { export const count: number; } ",
+                "declare module 'consumer' { ",
+                "import * as Tools from 'tools'; ",
+                "namespace Local { ",
+                "const Tools: {}; ",
+                "interface View { value: typeof Tools.count; } ",
+                "} }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 1);
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).is_err());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .alias_symbol_links(namespace.imports[0].symbol)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ambient_imported_variable_queries_reject_paired_cache_forgery() {
+        for type_syntax in ["string", "Box<string>"] {
+            let source = format!(
+                "declare module 'models' {{ \
+                 export interface Box<Element> {{ value: Element; }} \
+                 export const value: {type_syntax}; \
+                 }} \
+                 declare module 'consumer' {{ \
+                 import * as Models from 'models'; \
+                 interface View {{ value: typeof Models.value; }} \
+                 }}"
+            );
+            let mut fixture = declaration_fixture(
+                Box::leak(source.into_boxed_str()),
+                CanonicalModuleState::Script,
+            );
+            let namespace = plan(&fixture, 1);
+            let imported_module = namespace.imports[0].ambient_target.unwrap();
+            let imported = fixture
+                .context
+                .store()
+                .symbol(imported_module)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| fixture.context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source("value"))
+                .unwrap();
+            let declaration = fixture
+                .context
+                .store()
+                .symbol(imported)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .unwrap();
+            let NodeData::VariableDeclaration(variable) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("the imported value must retain its variable declaration")
+            };
+            let annotation = child(declaration, variable.type_.unwrap());
+            let store = fixture.context.store_mut_for_test();
+            let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
+            assert!(store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(boolean),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_value_symbol_links(
+                imported,
+                ValueSymbolLinks {
+                    resolved_type: Some(boolean),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let before = (
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            );
+            let annotation_links = store.type_node_links(annotation).cloned();
+            let value_links = store.value_symbol_links(imported).cloned();
+            assert!(execute(&mut fixture, &namespace).is_err(), "{type_syntax}");
+            let store = fixture.context.store();
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+                "{type_syntax}",
+            );
+            assert_eq!(store.type_node_links(annotation), annotation_links.as_ref());
+            assert_eq!(store.value_symbol_links(imported), value_links.as_ref());
+            assert!(
+                store
+                    .alias_symbol_links(namespace.imports[0].symbol)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_imported_interface_queries_reject_class_shaped_cache() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'tools' { export const count: number; } ",
+                "declare module 'consumer' { ",
+                "import * as Tools from 'tools'; ",
+                "interface View { value: typeof Tools.count; } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 1);
+        let [SourceNamespaceMemberPlan::Interface { symbol, .. }] = namespace.members.as_slice()
+        else {
+            panic!("the consumer must retain one interface")
+        };
+        let store = fixture.context.store_mut_for_test();
+        let forged = store
+            .alloc_interface_type(ObjectFlags::CLASS, Some(*symbol))
+            .unwrap();
+        assert!(store.set_declared_type_links(
+            *symbol,
+            super::super::DeclaredTypeLinks {
+                declared_type: Some(forged),
+                ..super::super::DeclaredTypeLinks::default()
+            },
+        ));
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).is_err());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .alias_symbol_links(namespace.imports[0].symbol)
+                .is_none()
         );
     }
 
