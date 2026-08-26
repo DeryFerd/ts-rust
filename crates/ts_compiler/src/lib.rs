@@ -1907,7 +1907,7 @@ impl Program {
             } else {
                 continue;
             };
-            let resolved = match mode {
+            let lookup = match mode {
                 CanonicalModuleResolutionMode::CommonJs => {
                     resolver.resolve_with_mode(&specifier, containing_file, ModuleFormat::CommonJs)
                 }
@@ -1918,11 +1918,11 @@ impl Program {
                     resolver.resolve(&specifier, containing_file)
                 }
             };
-            let Some(resolved) = resolved.resolved else {
+            let Some(module) = lookup.resolved else {
                 continue;
             };
             let target = canonicalize(
-                &resolved.resolved_file_name,
+                &module.resolved_file_name,
                 &self.current_directory,
                 self.case_sensitivity,
             );
@@ -2535,12 +2535,12 @@ impl Program {
             .raw
             .get("files")
             .and_then(ts_config::JsonValue::as_array)
-            .is_some_and(|files| files.is_empty());
+            .is_some_and(<[ts_config::JsonValue]>::is_empty);
         let no_references = config
             .raw
             .get("references")
             .and_then(ts_config::JsonValue::as_array)
-            .is_none_or(|references| references.is_empty());
+            .is_none_or(<[ts_config::JsonValue]>::is_empty);
         if empty_files && no_references {
             // Resolution removes extends, but it suppresses TS18002 on the leaf config.
             let has_extends = config_source
