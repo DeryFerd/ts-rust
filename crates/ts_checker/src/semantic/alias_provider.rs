@@ -90,6 +90,28 @@ pub struct ProductionAliasTargetHost<'source, 'arena, 'manifest> {
     module_resolutions: &'manifest CanonicalModuleResolutionManifest,
 }
 
+/// A namespace view exposes source exports without creating a canonical wrapper.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DisplayAliasTarget {
+    Symbol(SemanticSymbolId),
+    Namespace(SemanticSymbolId),
+}
+
+impl DisplayAliasTarget {
+    pub(super) const fn reference(self) -> Option<SemanticSymbolId> {
+        match self {
+            Self::Symbol(symbol) => Some(symbol),
+            Self::Namespace(_) => None,
+        }
+    }
+
+    pub(super) const fn exports_owner(self) -> SemanticSymbolId {
+        match self {
+            Self::Symbol(symbol) | Self::Namespace(symbol) => symbol,
+        }
+    }
+}
+
 /// Why a source set cannot back production alias-target resolution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProductionAliasTargetHostError {
@@ -1602,6 +1624,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         Ok(true)
     }
 
+    #[allow(clippy::too_many_arguments)] // Keep source proof inputs and publication mode together.
     fn synthetic_namespace_export_equals_target<MapperPayload>(
         &self,
         store: &mut CanonicalSemanticStore<MapperPayload>,
@@ -1610,7 +1633,8 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         resolved: CanonicalResolvedModule,
         module: SemanticSymbolId,
         assignment: SemanticSymbolId,
-    ) -> Result<Option<SemanticSymbolId>, CanonicalAliasTargetUnavailable> {
+        publish: bool,
+    ) -> Result<Option<DisplayAliasTarget>, CanonicalAliasTargetUnavailable> {
         if resolved.is_ambient_module() || resolved.usage_mode() != resolved.target_mode() {
             return Ok(None);
         }
@@ -2180,9 +2204,12 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             {
                 return Err(malformed());
             }
-            return Ok(Some(cached));
+            return Ok(Some(DisplayAliasTarget::Symbol(cached)));
         }
 
+        if !publish {
+            return Ok(Some(DisplayAliasTarget::Namespace(original)));
+        }
         let original_name = original_record
             .name()
             .as_utf8()
@@ -2251,7 +2278,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         if !store.set_alias_symbol_links(alias, alias_links) {
             return Err(malformed());
         }
-        Ok(Some(synthetic))
+        Ok(Some(DisplayAliasTarget::Symbol(synthetic)))
     }
 
     fn can_have_synthetic_default<MapperPayload>(
@@ -2750,6 +2777,31 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         alias: SemanticSymbolId,
     ) -> Result<(CanonicalImmediateAliasTarget, Option<NodeRef>), CanonicalAliasTargetUnavailable>
     {
+        let (target, type_only) = self.alias_declaration_target(store, alias, true)?;
+        match target {
+            DisplayAliasTarget::Symbol(symbol) => {
+                Ok((CanonicalImmediateAliasTarget::Resolved(symbol), type_only))
+            }
+            DisplayAliasTarget::Namespace(_) => {
+                Err(CanonicalAliasTargetUnavailable::TargetProviderUnavailable)
+            }
+        }
+    }
+
+    pub(super) fn get_display_target_and_type_only<MapperPayload>(
+        &mut self,
+        store: &mut CanonicalSemanticStore<MapperPayload>,
+        alias: SemanticSymbolId,
+    ) -> Result<(DisplayAliasTarget, Option<NodeRef>), CanonicalAliasTargetUnavailable> {
+        self.alias_declaration_target(store, alias, false)
+    }
+
+    fn alias_declaration_target<MapperPayload>(
+        &mut self,
+        store: &mut CanonicalSemanticStore<MapperPayload>,
+        alias: SemanticSymbolId,
+        publish_namespaces: bool,
+    ) -> Result<(DisplayAliasTarget, Option<NodeRef>), CanonicalAliasTargetUnavailable> {
         if store.id() != self.store {
             return Err(CanonicalAliasTargetUnavailable::ForeignStore {
                 expected: self.store,
@@ -2771,7 +2823,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         }
         if let SupportedAliasDeclaration::LocalModuleMember { target, .. } = &supported {
             return Ok((
-                CanonicalImmediateAliasTarget::Resolved(*target),
+                DisplayAliasTarget::Symbol(*target),
                 type_only.then_some(declaration),
             ));
         }
@@ -2877,15 +2929,21 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 if *type_only {
                     assignment
                 } else {
-                    self.synthetic_namespace_export_equals_target(
+                    match self.synthetic_namespace_export_equals_target(
                         store,
                         alias,
                         declaration,
                         resolved,
                         module,
                         assignment,
-                    )?
-                    .unwrap_or(assignment)
+                        publish_namespaces,
+                    )? {
+                        Some(DisplayAliasTarget::Symbol(target)) => target,
+                        Some(target @ DisplayAliasTarget::Namespace(_)) => {
+                            return Ok((target, type_only.then_some(declaration)));
+                        }
+                        None => assignment,
+                    }
                 }
             }
             SupportedAliasDeclaration::NamespaceImport { .. }
@@ -2926,7 +2984,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             }
         };
         Ok((
-            CanonicalImmediateAliasTarget::Resolved(target),
+            DisplayAliasTarget::Symbol(target),
             type_only.then_some(declaration),
         ))
     }

@@ -14,7 +14,8 @@ use ts_binder::{InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId
 use super::{
     AliasTargetState, CanonicalTypeMapperStore, DeclaredTypeHost, DeclaredTypeHostError,
     ProductionAliasTargetHost, ProductionAliasTargetHostError,
-    alias::{CanonicalAliasResolutionError, CanonicalAliasResolver, CanonicalImmediateAliasTarget},
+    alias::{CanonicalAliasResolutionError, CanonicalAliasResolver},
+    alias_provider::DisplayAliasTarget,
     module_resolution::{CanonicalModuleResolutionLookup, CanonicalModuleResolutionManifest},
 };
 
@@ -102,7 +103,7 @@ type VisitedTables = HashSet<(SemanticSymbolId, SymbolTableId, bool)>;
 pub(super) struct SymbolDisplayContext {
     enclosing: NodeRef,
     scopes: Vec<ScopeTable>,
-    aliases: HashMap<SemanticSymbolId, Result<SemanticSymbolId, SymbolDisplayError>>,
+    aliases: HashMap<SemanticSymbolId, Result<DisplayAliasTarget, SymbolDisplayError>>,
     module_specifiers: HashMap<SemanticSymbolId, String>,
     file_order: Vec<FileId>,
 }
@@ -171,14 +172,14 @@ impl SymbolDisplayContext {
             for alias in aliases {
                 let checkpoint = store.checkpoint_alias_symbol_links();
                 let result = checked_alias_target(store, alias_host, alias, &mut HashSet::new());
-                if result.is_err() {
+                if result.is_err() || matches!(result, Ok(DisplayAliasTarget::Namespace(_))) {
                     assert!(
                         store.restore_alias_symbol_links(checkpoint),
                         "alias lookup owns its checkpoint"
                     );
                 }
                 if let Ok(target) = result
-                    && let Some(table) = exports(store, target)?
+                    && let Some(table) = display_alias_exports(store, target)?
                 {
                     tables.push(table);
                 }
@@ -349,12 +350,12 @@ impl SymbolDisplayContext {
                 .symbol_table(table)
                 .ok_or(SymbolDisplayError::InvalidTable(table))?;
             if let Some(exported) = table.get(InternalSymbolName::ExportEquals.as_ref())
-                && same_reference(store, self.export_target(store, exported, symbol)?, symbol)?
+                && self.export_matches(store, exported, symbol)?
             {
                 return Ok(Some((module, None)));
             }
             if let Some(exported) = table.get(record.name())
-                && same_reference(store, self.export_target(store, exported, symbol)?, symbol)?
+                && self.export_matches(store, exported, symbol)?
             {
                 return Ok(Some((module, Some(exported))));
             }
@@ -363,8 +364,7 @@ impl SymbolDisplayContext {
                 let export = store
                     .symbol(exported)
                     .ok_or(SymbolDisplayError::InvalidSymbol(exported))?;
-                let target = self.export_target(store, exported, symbol)?;
-                if same_reference(store, target, symbol)? {
+                if self.export_matches(store, exported, symbol)? {
                     if export.name() == InternalSymbolName::ExportEquals.as_ref() {
                         return Ok(Some((module, None)));
                     }
@@ -379,24 +379,30 @@ impl SymbolDisplayContext {
         Ok(None)
     }
 
-    fn export_target(
+    fn export_matches(
         &self,
         store: &CanonicalTypeMapperStore,
         exported: SemanticSymbolId,
         requested: SemanticSymbolId,
-    ) -> Result<SemanticSymbolId, SymbolDisplayError> {
+    ) -> Result<bool, SymbolDisplayError> {
         if store
             .symbol(exported)
             .ok_or(SymbolDisplayError::InvalidSymbol(exported))?
             .flags()
             .intersects(SymbolFlags::ALIAS)
         {
-            self.aliases
+            let target = self
+                .aliases
                 .get(&exported)
                 .copied()
-                .ok_or(SymbolDisplayError::UnnameableSymbol(requested))?
+                .ok_or(SymbolDisplayError::UnnameableSymbol(requested))??;
+            target
+                .reference()
+                .map(|target| same_reference(store, target, requested))
+                .transpose()
+                .map(|matched| matched.unwrap_or(false))
         } else {
-            Ok(exported)
+            same_reference(store, exported, requested)
         }
     }
 
@@ -512,7 +518,12 @@ impl SymbolDisplayContext {
                     continue;
                 }
                 let imported = self.alias_target(alias)?;
-                if same_reference(store, alias, symbol)? || same_reference(store, imported, symbol)?
+                if same_reference(store, alias, symbol)?
+                    || imported
+                        .reference()
+                        .map(|target| same_reference(store, target, symbol))
+                        .transpose()?
+                        .unwrap_or(false)
                 {
                     if ignore_qualification
                         || self.can_qualify(store, host, alias, meaning, visited)?
@@ -521,7 +532,7 @@ impl SymbolDisplayContext {
                     }
                     continue;
                 }
-                if let Some(exports) = exports(store, imported)? {
+                if let Some(exports) = display_alias_exports(store, imported)? {
                     let mut child = self.chain_in_table(
                         store,
                         host,
@@ -582,7 +593,7 @@ impl SymbolDisplayContext {
             let candidate = if candidate_record.flags().intersects(SymbolFlags::ALIAS)
                 && !has_declaration_kind(store, host, candidate, SyntaxKind::ExportSpecifier)?
             {
-                self.alias_target(candidate)?
+                self.alias_target(candidate)?.exports_owner()
             } else {
                 candidate
             };
@@ -619,7 +630,7 @@ impl SymbolDisplayContext {
     fn alias_target(
         &self,
         alias: SemanticSymbolId,
-    ) -> Result<SemanticSymbolId, SymbolDisplayError> {
+    ) -> Result<DisplayAliasTarget, SymbolDisplayError> {
         self.aliases
             .get(&alias)
             .copied()
@@ -803,7 +814,7 @@ fn checked_alias_target(
     host: &mut ProductionAliasTargetHost<'_, '_, '_>,
     alias: SemanticSymbolId,
     visiting: &mut HashSet<SemanticSymbolId>,
-) -> Result<SemanticSymbolId, SymbolDisplayError> {
+) -> Result<DisplayAliasTarget, SymbolDisplayError> {
     if !visiting.insert(alias) {
         return Err(SymbolDisplayError::CyclicAlias(alias));
     }
@@ -813,15 +824,25 @@ fn checked_alias_target(
     }
     let result = (|| {
         let (immediate, type_only) = host
-            .get_target_and_type_only_of_alias_declaration(store, alias)
+            .get_display_target_and_type_only(store, alias)
             .map_err(|reason| {
                 SymbolDisplayError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
                     alias,
                     reason,
                 })
             })?;
-        let CanonicalImmediateAliasTarget::Resolved(immediate) = immediate else {
-            return Err(SymbolDisplayError::InvalidAliasCache(alias));
+        let immediate = match immediate {
+            DisplayAliasTarget::Namespace(namespace) => {
+                if original.as_ref().is_some_and(|links| {
+                    links.immediate_target.is_some()
+                        || links.alias_target != AliasTargetState::Unresolved
+                        || links.type_only_declaration != type_only
+                }) {
+                    return Err(SymbolDisplayError::InvalidAliasCache(alias));
+                }
+                return Ok(DisplayAliasTarget::Namespace(namespace));
+            }
+            DisplayAliasTarget::Symbol(symbol) => symbol,
         };
         let target = store
             .symbol(immediate)
@@ -837,40 +858,80 @@ fn checked_alias_target(
             || target_flags.intersects(SymbolFlags::ALIAS)
                 && target_flags.intersects(SymbolFlags::ASSIGNMENT);
         let target = if non_local_alias {
-            let target = checked_alias_target(store, host, immediate, visiting)?;
-            store
-                .get_merged_symbol(target)
-                .ok_or(SymbolDisplayError::InvalidSymbol(target))?
+            match checked_alias_target(store, host, immediate, visiting)? {
+                DisplayAliasTarget::Symbol(target) => DisplayAliasTarget::Symbol(
+                    store
+                        .get_merged_symbol(target)
+                        .ok_or(SymbolDisplayError::InvalidSymbol(target))?,
+                ),
+                namespace @ DisplayAliasTarget::Namespace(_) => namespace,
+            }
         } else {
-            immediate
+            DisplayAliasTarget::Symbol(immediate)
         };
         let inherited_type_only = store
             .alias_symbol_links(immediate)
             .and_then(|links| links.type_only_declaration);
+        let expected_target = target
+            .reference()
+            .map_or(AliasTargetState::Unresolved, AliasTargetState::Resolved);
+        let expected_type_only = type_only.or(inherited_type_only);
         if let Some(original) = &original
             && (original
                 .immediate_target
                 .is_some_and(|cached| cached != immediate)
                 || original.alias_target != AliasTargetState::Unresolved
-                    && original.alias_target != AliasTargetState::Resolved(target)
+                    && original.alias_target != expected_target
                 || original
                     .type_only_declaration
-                    .is_some_and(|cached| Some(cached) != type_only.or(inherited_type_only))
+                    .is_some_and(|cached| Some(cached) != expected_type_only)
                 || original.alias_target != AliasTargetState::Unresolved
-                    && original.type_only_declaration != type_only.or(inherited_type_only))
+                    && original.type_only_declaration != expected_type_only)
         {
             return Err(SymbolDisplayError::InvalidAliasCache(alias));
+        }
+        if matches!(target, DisplayAliasTarget::Namespace(_)) {
+            let mut links = store
+                .alias_symbol_links(alias)
+                .cloned()
+                .ok_or(SymbolDisplayError::InvalidAliasCache(alias))?;
+            links.type_only_declaration = expected_type_only;
+            if !store.set_alias_symbol_links(alias, links) {
+                return Err(SymbolDisplayError::InvalidAliasCache(alias));
+            }
+            return Ok(target);
         }
         let resolved = CanonicalAliasResolver::new(store, host)
             .resolve_alias(alias)
             .map_err(SymbolDisplayError::Alias)?;
-        if resolved.target != AliasTargetState::Resolved(target) {
+        if resolved.target != expected_target {
             return Err(SymbolDisplayError::InvalidAliasCache(alias));
         }
         Ok(target)
     })();
     visiting.remove(&alias);
     result
+}
+
+fn display_alias_exports(
+    store: &CanonicalTypeMapperStore,
+    target: DisplayAliasTarget,
+) -> Result<Option<SymbolTableId>, SymbolDisplayError> {
+    match target {
+        DisplayAliasTarget::Symbol(symbol) => exports(store, symbol),
+        DisplayAliasTarget::Namespace(symbol) => {
+            let table = store
+                .symbol(symbol)
+                .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?
+                .exports();
+            if let Some(table) = table
+                && store.symbol_table(table).is_none()
+            {
+                return Err(SymbolDisplayError::InvalidTable(table));
+            }
+            Ok(table)
+        }
+    }
 }
 
 fn same_reference(
@@ -1663,6 +1724,167 @@ mod tests {
             "number"
         );
         assert_eq!(context.store().alias_symbol_links(bad), None);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check rejected, display-only, and canonical namespace queries in order.
+    fn display_preflight_does_not_publish_synthetic_namespaces() {
+        let foo = parse_source_file(
+            "declare function foo(): void; declare namespace foo { export const tag: number; } export = foo;",
+        );
+        let shapes = parse_source_file(
+            "export interface Shape { value: number; } export interface Other { text: string; }",
+        );
+        let importer = parse_source_file(
+            "import * as foo from './foo'; import type { Shape as Bad } from './shapes';",
+        );
+        let foo_file = FileId::new(41_020);
+        let shapes_file = FileId::new(41_021);
+        let input_file = FileId::new(41_022);
+        let files = [
+            (foo_file, &foo, "/foo.d.ts"),
+            (shapes_file, &shapes, "/shapes.d.ts"),
+            (input_file, &importer, "/input.d.ts"),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, path) in files {
+            bind(
+                &mut binder,
+                parsed,
+                file,
+                path,
+                CanonicalModuleState::External,
+            );
+        }
+        let entries = importer
+            .arena
+            .iter()
+            .filter_map(|(_, node)| {
+                let NodeData::ImportDeclaration(import) = &node.data else {
+                    return None;
+                };
+                let NodeData::StringLiteral(specifier) =
+                    &importer.arena.get(import.module_specifier)?.data
+                else {
+                    return None;
+                };
+                let target = match specifier.text.as_str() {
+                    "./foo" => foo_file,
+                    "./shapes" => shapes_file,
+                    _ => panic!("unexpected import"),
+                };
+                Some(CanonicalModuleResolutionEntry::resolved(
+                    NodeRef::new(importer.arena.id(), input_file, import.module_specifier),
+                    CanonicalResolvedModuleInput::new(
+                        target,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::Esm,
+                    ),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(file, parsed, _)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new(entries),
+        )
+        .unwrap();
+        let original_foo = symbol(&context, declaration(&foo, foo_file, "foo"));
+        let namespace_import = importer
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                matches!(node.data, NodeData::NamespaceImport(_)).then_some(NodeRef::new(
+                    importer.arena.id(),
+                    input_file,
+                    id,
+                ))
+            })
+            .unwrap();
+        let foo_alias = symbol(&context, namespace_import);
+        let bad = symbol(&context, alias_declaration(&importer, input_file, "Bad"));
+        let shape = symbol(&context, declaration(&shapes, shapes_file, "Shape"));
+        let other = symbol(&context, declaration(&shapes, shapes_file, "Other"));
+        let type_ = context.get_declared_type_of_symbol(shape).unwrap();
+        let location = NodeRef::new(importer.arena.id(), input_file, importer.source_file);
+        let poison = crate::semantic::AliasSymbolLinks {
+            immediate_target: Some(other),
+            alias_target: AliasTargetState::Resolved(other),
+            ..crate::semantic::AliasSymbolLinks::default()
+        };
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_alias_symbol_links(bad, poison.clone())
+        );
+        let counts = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            )
+        };
+        let before = counts(&context);
+        for _ in 0..3 {
+            assert_eq!(
+                context.type_to_string_at_location(type_, location),
+                Err(TypeDisplayUnavailable::SymbolDisplay(
+                    SymbolDisplayError::InvalidAliasCache(bad)
+                ))
+            );
+            assert_eq!(
+                counts(&context),
+                before,
+                "symbols, tables, and every link store must be unchanged"
+            );
+            assert_eq!(context.store().alias_symbol_links(foo_alias), None);
+            assert_eq!(context.store().alias_symbol_links(bad), Some(&poison));
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_alias_symbol_links(bad, crate::semantic::AliasSymbolLinks::default())
+        );
+        context.resolve_alias(bad).unwrap();
+        let tag = foo.arena.iter().find_map(|(id, node)| {
+            let NodeData::VariableDeclaration(variable) = &node.data else { return None };
+            matches!(&foo.arena.get(variable.name)?.data, NodeData::Identifier(name) if name.text == "tag").then_some(NodeRef::new(foo.arena.id(), foo_file, id))
+        }).unwrap();
+        let tag = symbol(&context, tag);
+        assert_eq!(
+            context.symbol_to_string_at_location(tag, location).unwrap(),
+            "foo.tag"
+        );
+        assert_eq!(context.store().symbol_len(), before.0);
+        assert_eq!(context.store().symbol_store().symbol_table_len(), before.1);
+        assert_eq!(context.store().alias_symbol_links(foo_alias), None);
+        let AliasTargetState::Resolved(synthetic) =
+            context.resolve_alias(foo_alias).unwrap().target
+        else {
+            panic!("namespace must resolve")
+        };
+        assert_ne!(synthetic, original_foo);
+        assert_eq!(context.store().symbol_len(), before.0 + 2);
+        assert_eq!(
+            context.store().symbol_store().symbol_table_len(),
+            before.1 + 1
+        );
+        assert_eq!(
+            context.store().export_type_links(synthetic).unwrap().target,
+            Some(original_foo)
+        );
+        let warm = counts(&context);
+        for _ in 0..2 {
+            assert_eq!(
+                context.symbol_to_string_at_location(tag, location).unwrap(),
+                "foo.tag"
+            );
+            assert_eq!(counts(&context), warm);
+        }
     }
 
     #[test]
