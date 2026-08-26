@@ -89328,15 +89328,17 @@ class Foo2 {
                 .set_source_file_links(source_ref, source_links)
         );
 
+        let poisoned = observable_state(&context, file);
         let poisoned_signature_result = context.check_source_file(file);
         assert!(
             matches!(
                 poisoned_signature_result,
-                Err(SourceCheckError::Call(node))
-                    if node == variable_initializer(&source, file, "value")
+                Err(SourceCheckError::Function(SourceFunctionInvariant::Callable(node)))
+                    if node == declaration
             ),
             "poisoned inferred return was not rejected: {poisoned_signature_result:?}"
         );
+        assert_eq!(observable_state(&context, file), poisoned);
         assert_eq!(
             context
                 .store()

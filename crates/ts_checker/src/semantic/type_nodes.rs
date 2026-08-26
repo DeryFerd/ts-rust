@@ -36608,10 +36608,6 @@ mod tests {
     fn named_reference_boundaries_are_typed_and_atomic_without_diagnostics() {
         let cases = [
             ("type Bad = Missing;", 1),
-            (
-                "interface Box<T extends string> {} type Bad = Box<string>;",
-                2,
-            ),
             ("class Box<T = string> {} type Bad = Box<string>;", 3),
         ];
 
@@ -36636,7 +36632,7 @@ mod tests {
                             TypeNodeUnavailable::MissingTypeReference(_)
                         )
                     ) | (
-                        2 | 3,
+                        3,
                         DeclaredTypeError::TypeNodeUnavailable(
                             TypeNodeUnavailable::GenericReferenceUnsupported { .. }
                         )
@@ -36647,6 +36643,45 @@ mod tests {
             assert_eq!(store_state(&fixture.store), before);
             assert!(diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    fn named_constrained_interface_references_preserve_canonical_arguments() {
+        let mut fixture =
+            fixture("interface Box<T extends string> {} type Selected = Box<string>;");
+        let selected = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Selected");
+        let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Box");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let resolved = query_declared(
+            &mut fixture,
+            selected,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let target = fixture
+            .store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let reference = validate_direct_generic_reference(&fixture.store, resolved).unwrap();
+        assert_eq!(reference.target, target);
+        assert_eq!(reference.type_arguments, [string]);
+        assert!(diagnostics.is_empty());
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                selected,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(resolved),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
