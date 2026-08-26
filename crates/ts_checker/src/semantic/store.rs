@@ -24,6 +24,7 @@ use super::{
     conditional_types::{
         ConditionalQueryKey, ConditionalQueryProduction, ConditionalTypeProduction,
     },
+    declared_values::DeclaredValueProvenance,
     derived_types::DerivedTypeCaches,
     ids::{
         ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
@@ -511,6 +512,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     direct_interface_heritage_provenance: HashMap<TypeId, DirectInterfaceHeritageProvenance>,
     direct_class_heritage_provenance: HashMap<TypeId, DirectClassHeritageProvenance>,
     constructor_annotation_bindings: HashMap<NodeRef, SemanticSymbolId>,
+    declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
     source_jsdoc_typedefs: HashMap<TypeId, SourceJsDocTypedefIdentity>,
     source_callable_types_by_declaration: HashMap<NodeRef, TypeId>,
@@ -639,6 +641,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             direct_interface_heritage_provenance: HashMap::new(),
             direct_class_heritage_provenance: HashMap::new(),
             constructor_annotation_bindings: HashMap::new(),
+            declared_value_provenance: HashMap::new(),
             source_callable_provenance: HashMap::new(),
             source_jsdoc_typedefs: HashMap::new(),
             source_callable_types_by_declaration: HashMap::new(),
@@ -2817,7 +2820,83 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         )
     }
 
-    /// Authenticates a binder-owned method against its merged interface owner.
+    /// Returns the binder symbol retained when a computed method was published.
+    pub(super) fn late_bound_method_source(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<SemanticSymbolId> {
+        let source = self.links.late_bound.find_key(|source| {
+            self.links
+                .late_bound
+                .try_get(source)
+                .and_then(|links| links.late_symbol)
+                == Some(symbol)
+        })?;
+        self.links
+            .late_bound
+            .find_key(|candidate| {
+                candidate != source
+                    && self
+                        .links
+                        .late_bound
+                        .try_get(candidate)
+                        .and_then(|links| links.late_symbol)
+                        == Some(symbol)
+            })
+            .is_none()
+            .then_some(*source)
+    }
+
+    /// Checks the method's optional flag against each source declaration.
+    pub(super) fn declared_method_optional_flag(&self, symbol: SemanticSymbolId) -> Option<bool> {
+        let method = self.symbol(symbol)?;
+        let source = if method.flags().contains(SymbolFlags::TRANSIENT)
+            || method.check_flags().contains(CheckFlags::LATE)
+            || method.name().is_late_bound()
+        {
+            self.late_bound_method_source(symbol)?
+        } else {
+            symbol
+        };
+        let source_method = self.symbol(source)?;
+        if source_method.flags() != method.flags().without(SymbolFlags::TRANSIENT)
+            || source_method.declarations() != method.declarations()
+            || source_method.value_declaration() != method.value_declaration()
+            || source_method.check_flags() != CheckFlags::NONE
+        {
+            return None;
+        }
+        let method = source_method;
+        if method.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::METHOD {
+            return None;
+        }
+        let declarations = method.declarations()?;
+        let optional = method.flags().contains(SymbolFlags::OPTIONAL);
+        if declarations.is_empty()
+            || declarations.iter().any(|declaration| {
+                self.source_node_kind(*declaration) != Some(SyntaxKind::MethodSignature)
+                    || self
+                        .source_node_facts
+                        .get(&declaration.arena)
+                        .is_none_or(|facts| {
+                            facts
+                                .iter()
+                                .flatten()
+                                .filter(|facts| {
+                                    facts.parent == Some(declaration.node)
+                                        && facts.kind == SyntaxKind::QuestionToken
+                                })
+                                .count()
+                                != usize::from(optional)
+                        })
+            })
+        {
+            return None;
+        }
+        Some(optional)
+    }
+
+    /// Authenticates a declared or late-bound method against its interface owner.
     pub(super) fn authenticated_interface_method_owner(
         &self,
         symbol: SemanticSymbolId,
@@ -2830,6 +2909,38 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let interface = self.symbol(owner)?;
         let owner_declarations = interface.declarations()?;
         let interface_type = self.declared_type_links(owner)?.declared_type?;
+        let late = method.check_flags().contains(CheckFlags::LATE)
+            || method.flags().contains(SymbolFlags::TRANSIENT)
+            || method.name().is_late_bound();
+        let valid_late = !late
+            || self.late_bound_method_source(symbol).is_some_and(|source| {
+                self.symbol(source).is_some_and(|early| {
+                    early.flags() == method.flags().without(SymbolFlags::TRANSIENT)
+                        && early.check_flags() == CheckFlags::NONE
+                        && early.name() == InternalSymbolName::Computed.as_ref()
+                        && early.declarations() == method.declarations()
+                        && early.value_declaration() == method.value_declaration()
+                        && self.get_parent_of_symbol(source) == Some(owner)
+                        && self.get_merged_symbol(source) == Some(source)
+                        && early.members().is_none()
+                        && early.exports().is_none()
+                        && early.export_symbol().is_none()
+                }) && declarations.iter().all(|declaration| {
+                    self.symbol_node_links(*declaration)
+                        .and_then(|links| links.resolved_symbol)
+                        == Some(symbol)
+                }) && self
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.name_type)
+                    .is_some_and(|type_| self.types.get(type_).is_some())
+            });
+        let members = if late {
+            self.members_and_exports_links(owner).and_then(|links| {
+                links.table(super::links::MembersOrExportsResolutionKind::ResolvedMembers)
+            })
+        } else {
+            interface.members()
+        };
         let merged_namespace = interface.flags().contains(SymbolFlags::NAMESPACE_MODULE);
         let allowed_owner_flags = SymbolFlags::INTERFACE
             | SymbolFlags::FUNCTION_SCOPED_VARIABLE
@@ -2860,11 +2971,27 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     self.source_node_kind(*declaration) == Some(SyntaxKind::ModuleDeclaration)
                 });
         if declarations.is_empty()
-            || method.flags() != SymbolFlags::METHOD
-            || method.check_flags() != CheckFlags::NONE
+            || !method.flags().contains(SymbolFlags::METHOD)
+            || method.flags().without(
+                SymbolFlags::METHOD
+                    | SymbolFlags::OPTIONAL
+                    | if late {
+                        SymbolFlags::TRANSIENT
+                    } else {
+                        SymbolFlags::NONE
+                    },
+            ) != SymbolFlags::NONE
+            || self.declared_method_optional_flag(symbol).is_none()
+            || method.check_flags()
+                != if late {
+                    CheckFlags::LATE
+                } else {
+                    CheckFlags::NONE
+                }
             || method.name().is_reserved_member_name()
             || method.name().is_private_identifier()
-            || method.name().is_late_bound()
+            || late && (!valid_late || !method.name().is_late_bound())
+            || late && !method.flags().contains(SymbolFlags::TRANSIENT)
             || method.value_declaration() != declarations.first().copied()
             || method.members().is_some()
             || method.exports().is_some()
@@ -2876,8 +3003,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || interface.check_flags() != CheckFlags::NONE
             || self.get_merged_symbol(owner) != Some(owner)
             || self.types.get(interface_type).is_none()
-            || interface
-                .members()
+            || members
                 .and_then(|members| self.symbol_table(members))
                 .and_then(|members| members.get(method.name()))
                 .and_then(|member| self.get_merged_symbol(member))
@@ -2885,6 +3011,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || declarations.iter().enumerate().any(|(index, declaration)| {
                 declarations[..index].contains(declaration)
                     || self.source_node_kind(*declaration) != Some(SyntaxKind::MethodSignature)
+                    || self
+                        .source_child_with_kind(*declaration, SyntaxKind::QuestionToken)
+                        .is_some()
+                        != method.flags().contains(SymbolFlags::OPTIONAL)
                     || !matches!(
                         self.source_node_parent(*declaration),
                         Some(SourceNodeParent::Parent(owner_declaration))
@@ -2917,12 +3047,50 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let owner_declaration = *owner_declaration;
         let links = self.type_node_links(owner_declaration)?;
         let literal_type = links.resolved_type?;
+        let late = method.check_flags().contains(CheckFlags::LATE)
+            || method.flags().contains(SymbolFlags::TRANSIENT)
+            || method.name().is_late_bound();
+        let valid_late = !late
+            || self.late_bound_method_source(symbol).is_some_and(|source| {
+                self.symbol(source).is_some_and(|early| {
+                    early.flags() == method.flags().without(SymbolFlags::TRANSIENT)
+                        && early.check_flags() == CheckFlags::NONE
+                        && early.name() == InternalSymbolName::Computed.as_ref()
+                        && early.declarations() == method.declarations()
+                        && early.value_declaration() == method.value_declaration()
+                        && self.get_parent_of_symbol(source) == Some(owner)
+                        && self.get_merged_symbol(source) == Some(source)
+                        && early.members().is_none()
+                        && early.exports().is_none()
+                        && early.export_symbol().is_none()
+                }) && declarations.iter().all(|declaration| {
+                    self.symbol_node_links(*declaration)
+                        .and_then(|links| links.resolved_symbol)
+                        == Some(symbol)
+                }) && self
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.name_type)
+                    .is_some_and(|type_| self.types.get(type_).is_some())
+            });
+        let members = if late {
+            self.members_and_exports_links(owner).and_then(|links| {
+                links.table(super::links::MembersOrExportsResolutionKind::ResolvedMembers)
+            })
+        } else {
+            literal.members()
+        };
         if declarations.is_empty()
-            || method.flags() != SymbolFlags::METHOD
-            || method.check_flags() != CheckFlags::NONE
+            || self.declared_method_optional_flag(symbol).is_none()
+            || method.check_flags()
+                != if late {
+                    CheckFlags::LATE
+                } else {
+                    CheckFlags::NONE
+                }
             || method.name().is_reserved_member_name()
             || method.name().is_private_identifier()
-            || method.name().is_late_bound()
+            || late && (!valid_late || !method.name().is_late_bound())
+            || late && !method.flags().contains(SymbolFlags::TRANSIENT)
             || method.value_declaration() != declarations.first().copied()
             || method.members().is_some()
             || method.exports().is_some()
@@ -2943,8 +3111,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     ..TypeNodeLinks::default()
                 })
             || self.types.get(literal_type).is_none()
-            || literal
-                .members()
+            || members
                 .and_then(|members| self.symbol_table(members))
                 .and_then(|members| members.get(method.name()))
                 .and_then(|member| self.get_merged_symbol(member))
@@ -2965,6 +3132,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     fn interface_method_for_declaration(&self, declaration: NodeRef) -> Option<SemanticSymbolId> {
         if self.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
             return None;
+        }
+        if let Some(method) = self
+            .symbol_node_links(declaration)
+            .and_then(|links| links.resolved_symbol)
+            && self
+                .symbol(method)
+                .is_some_and(|record| record.check_flags().contains(CheckFlags::LATE))
+        {
+            return (self.symbol(method)?.declarations()?.contains(&declaration)
+                && self.authenticated_interface_method_owner(method).is_some())
+            .then_some(method);
         }
         let SourceNodeParent::Parent(owner_declaration) = self.source_node_parent(declaration)?
         else {
@@ -3192,6 +3370,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if value_links
             != &(ValueSymbolLinks {
                 resolved_type: Some(type_),
+                name_type: if method.check_flags().contains(CheckFlags::LATE) {
+                    value_links.name_type
+                } else {
+                    None
+                },
                 ..ValueSymbolLinks::default()
             })
             || self.types.get(type_).is_none()
@@ -3258,6 +3441,49 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 let parameter_type = parameter_links.resolved_type?;
                 let parameter_annotation =
                     self.source_direct_type_annotation(parameter_declaration)?;
+                let optional = facts.iter().flatten().any(|facts| {
+                    facts.kind == SyntaxKind::QuestionToken
+                        && facts.parent == Some(parameter_declaration.node)
+                });
+                let bootstrap = self.intrinsic_bootstrap.as_ref()?;
+                let annotation_matches = if optional && bootstrap.options.strict_null_checks {
+                    let base = self
+                        .type_node_links(parameter_annotation)
+                        .and_then(|links| links.resolved_type)
+                        .or_else(|| {
+                            [
+                                bootstrap.any_type,
+                                bootstrap.unknown_type,
+                                bootstrap.string_type,
+                                bootstrap.number_type,
+                                bootstrap.bigint_type,
+                                bootstrap.boolean_type,
+                                bootstrap.es_symbol_type,
+                                bootstrap.void_type,
+                                bootstrap.undefined_type,
+                                bootstrap.null_type,
+                                bootstrap.never_type,
+                                bootstrap.non_primitive_type,
+                            ]
+                            .into_iter()
+                            .find(|type_| {
+                                self.source_direct_type_annotation_is_exact(
+                                    parameter_annotation,
+                                    *type_,
+                                )
+                            })
+                        });
+                    base.is_some_and(|base| {
+                        self.source_direct_type_annotation_is_exact(parameter_annotation, base)
+                            && bootstrap.cached_optional_parameter_type(base)
+                                == Some(parameter_type)
+                    })
+                } else {
+                    self.source_direct_type_annotation_is_exact(
+                        parameter_annotation,
+                        parameter_type,
+                    )
+                };
                 let expected_parameter = facts
                     .iter()
                     .enumerate()
@@ -3286,20 +3512,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                             ..ValueSymbolLinks::default()
                         })
                     || self.types.get(parameter_type).is_none()
-                    || !self.source_direct_type_annotation_is_exact(
-                        parameter_annotation,
-                        parameter_type,
-                    )
+                    || !annotation_matches
                 {
                     return None;
                 }
 
                 let rest = facts.iter().flatten().any(|facts| {
                     facts.kind == SyntaxKind::DotDotDotToken
-                        && facts.parent == Some(parameter_declaration.node)
-                });
-                let optional = facts.iter().flatten().any(|facts| {
-                    facts.kind == SyntaxKind::QuestionToken
                         && facts.parent == Some(parameter_declaration.node)
                 });
                 if rest && (has_rest || index + 1 != signature.parameters().len()) {
@@ -5824,6 +6043,44 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.links.value_symbol.try_reserve(additional)
     }
 
+    pub(super) fn try_reserve_declared_value_provenance(&mut self, additional: usize) -> bool {
+        self.declared_value_provenance
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    pub(super) fn declared_value_provenance(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<DeclaredValueProvenance> {
+        self.declared_value_provenance.get(&symbol).copied()
+    }
+
+    pub(super) fn publish_declared_value_provenance(
+        &mut self,
+        symbol: SemanticSymbolId,
+        provenance: DeclaredValueProvenance,
+    ) -> bool {
+        if self.symbol(symbol).is_none()
+            || self.type_payload(provenance.type_).is_none()
+            || !self.contains_node_ref(provenance.annotation)
+            || self
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                != Some(provenance.type_)
+            || !self.source_direct_type_annotation_is_exact(provenance.annotation, provenance.type_)
+        {
+            return false;
+        }
+        match self.declared_value_provenance.entry(symbol) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get() == provenance,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(provenance);
+                true
+            }
+        }
+    }
+
     pub(super) fn try_reserve_function_signature_return_annotations(
         &mut self,
         additional: usize,
@@ -6670,6 +6927,30 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         facts.identifier_text.as_deref()
     }
 
+    pub(super) fn source_type_operator(&self, node: NodeRef) -> Option<SyntaxKind> {
+        self.source_node_fact(node)?.type_operator
+    }
+
+    pub(super) fn source_direct_children(&self, parent: NodeRef) -> Option<Vec<NodeRef>> {
+        self.source_node_fact(parent)?;
+        self.source_node_facts
+            .get(&parent.arena)?
+            .iter()
+            .enumerate()
+            .filter_map(|(index, facts)| {
+                let facts = facts.as_ref()?;
+                (facts.parent == Some(parent.node)).then_some(index)
+            })
+            .map(|index| {
+                Some(NodeRef::new(
+                    parent.arena,
+                    parent.file,
+                    NodeId::new(u32::try_from(index).ok()?),
+                ))
+            })
+            .collect()
+    }
+
     /// Returns the registered parent of a source-reachable node. The outer
     /// outer `Option` distinguishes an unknown node from a registered root.
     #[must_use]
@@ -6679,6 +6960,173 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 SourceNodeParent::Parent(NodeRef::new(node.arena, node.file, parent))
             })
         })
+    }
+
+    /// Returns one direct source child of the requested kind, if it is unique.
+    pub(super) fn source_child_with_kind(
+        &self,
+        parent: NodeRef,
+        kind: SyntaxKind,
+    ) -> Option<NodeRef> {
+        self.source_node_fact(parent)?;
+        let mut children = self
+            .source_node_facts
+            .get(&parent.arena)?
+            .iter()
+            .enumerate()
+            .filter_map(|(index, facts)| {
+                let facts = facts.as_ref()?;
+                (facts.parent == Some(parent.node) && facts.kind == kind)
+                    .then(|| {
+                        u32::try_from(index).ok().map(|index| {
+                            NodeRef::new(parent.arena, parent.file, NodeId::new(index))
+                        })
+                    })
+                    .flatten()
+            });
+        let child = children.next()?;
+        children.next().is_none().then_some(child)
+    }
+
+    /// Proves when computed members can leave the binder's member table absent.
+    pub(super) fn source_symbol_has_only_computed_members(&self, owner: SemanticSymbolId) -> bool {
+        let Some(declarations) = self.symbol(owner).and_then(Symbol::declarations) else {
+            return false;
+        };
+        let mut saw_member = false;
+        for declaration in declarations {
+            let Some(facts) = self.source_node_facts.get(&declaration.arena) else {
+                return false;
+            };
+            if !matches!(
+                self.source_node_kind(*declaration),
+                Some(SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral)
+            ) {
+                return false;
+            }
+            for (index, facts) in facts.iter().enumerate() {
+                let Some(facts) = facts
+                    .as_ref()
+                    .filter(|facts| facts.parent == Some(declaration.node))
+                else {
+                    continue;
+                };
+                match facts.kind {
+                    SyntaxKind::MethodSignature
+                    | SyntaxKind::PropertyDeclaration
+                    | SyntaxKind::PropertySignature => {
+                        let Ok(index) = u32::try_from(index) else {
+                            return false;
+                        };
+                        let member =
+                            NodeRef::new(declaration.arena, declaration.file, NodeId::new(index));
+                        if !self.source_member_has_dynamic_name(member) {
+                            return false;
+                        }
+                        saw_member = true;
+                    }
+                    SyntaxKind::TypeParameter
+                    | SyntaxKind::CallSignature
+                    | SyntaxKind::ConstructSignature
+                    | SyntaxKind::IndexSignature => return false,
+                    _ => {}
+                }
+            }
+        }
+        saw_member
+    }
+
+    pub(super) fn source_computed_member_count(&self, owner: SemanticSymbolId) -> Option<usize> {
+        let declarations = self.symbol(owner)?.declarations()?;
+        let mut count = 0usize;
+        for declaration in declarations {
+            if !matches!(
+                self.source_node_kind(*declaration),
+                Some(SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral)
+            ) {
+                continue;
+            }
+            let nodes = self.source_node_facts.get(&declaration.arena)?;
+            let owns_name = |name: NodeId| {
+                nodes
+                    .get(name.index())
+                    .and_then(Option::as_ref)
+                    .filter(|facts| facts.kind == SyntaxKind::ComputedPropertyName)
+                    .and_then(|facts| nodes.get(facts.parent?.index()).and_then(Option::as_ref))
+                    .is_some_and(|member| {
+                        member.parent == Some(declaration.node)
+                            && matches!(
+                                member.kind,
+                                SyntaxKind::MethodSignature
+                                    | SyntaxKind::PropertyDeclaration
+                                    | SyntaxKind::PropertySignature
+                                    | SyntaxKind::GetAccessor
+                                    | SyntaxKind::SetAccessor
+                            )
+                    })
+            };
+            let mut names = 0usize;
+            let mut static_names = HashSet::new();
+            for (index, facts) in nodes.iter().enumerate() {
+                let Some(facts) = facts else {
+                    continue;
+                };
+                let node = NodeId::new(u32::try_from(index).ok()?);
+                if facts.kind == SyntaxKind::ComputedPropertyName && owns_name(node) {
+                    names = names.checked_add(1)?;
+                }
+                if matches!(
+                    facts.kind,
+                    SyntaxKind::StringLiteral
+                        | SyntaxKind::NumericLiteral
+                        | SyntaxKind::NoSubstitutionTemplateLiteral
+                ) && let Some(parent) = facts.parent
+                {
+                    if owns_name(parent) {
+                        static_names.insert(parent);
+                    } else if facts.kind == SyntaxKind::NumericLiteral
+                        && let Some(unary) = nodes.get(parent.index()).and_then(Option::as_ref)
+                        && unary.kind == SyntaxKind::PrefixUnaryExpression
+                        && unary.prefix_unary_operator == Some(SyntaxKind::MinusToken)
+                        && let Some(name) = unary.parent.filter(|name| owns_name(*name))
+                    {
+                        static_names.insert(name);
+                    }
+                }
+            }
+            count = count.checked_add(names.checked_sub(static_names.len())?)?;
+        }
+        Some(count)
+    }
+
+    fn source_member_has_dynamic_name(&self, member: NodeRef) -> bool {
+        let Some(name) = self.source_child_with_kind(member, SyntaxKind::ComputedPropertyName)
+        else {
+            return false;
+        };
+        self.source_computed_name_is_dynamic(name)
+    }
+
+    fn source_computed_name_is_dynamic(&self, name: NodeRef) -> bool {
+        if [
+            SyntaxKind::StringLiteral,
+            SyntaxKind::NumericLiteral,
+            SyntaxKind::NoSubstitutionTemplateLiteral,
+        ]
+        .into_iter()
+        .any(|kind| self.source_child_with_kind(name, kind).is_some())
+        {
+            return false;
+        }
+        !self
+            .source_child_with_kind(name, SyntaxKind::PrefixUnaryExpression)
+            .is_some_and(|unary| {
+                self.source_node_fact(unary).is_some_and(|facts| {
+                    facts.prefix_unary_operator == Some(SyntaxKind::MinusToken)
+                }) && self
+                    .source_child_with_kind(unary, SyntaxKind::NumericLiteral)
+                    .is_some()
+            })
     }
 
     /// Returns the final direct type annotation on a registered declaration.
@@ -6955,13 +7403,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 }
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
-    /// Publishes the canonical late-bound symbol for one computed property.
+    /// Publishes the canonical late-bound symbol for one computed property or method.
     ///
     /// The declaration must retain its binder-owned `__computed` property,
     /// while `key_type` must be the already-created unique-symbol identity.
     /// `members` must be a checker-owned table separate from the binder's
-    /// original member table. Existing complete publication replays without
-    /// allocating another symbol or changing any links.
+    /// original member table. Methods require a resolved key expression from
+    /// the source key plan. Existing publication reuses the same symbol.
     ///
     /// # Panics
     ///
@@ -6975,7 +7423,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         members: SymbolTableId,
     ) -> Option<SemanticSymbolId> {
         let owner_record = self.symbol(owner)?;
-        let binder_members = owner_record.members()?;
+        let binder_members = owner_record.members();
         let early = self.symbol(early_symbol)?;
         let [declaration] = early.declarations()? else {
             return None;
@@ -6991,7 +7439,58 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         };
         let key_symbol = key_record.symbol()?;
         let key = self.symbol(key_symbol)?;
-        let allowed_property_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+        let method = early.flags().contains(SymbolFlags::METHOD);
+        let member_flag = if method {
+            SymbolFlags::METHOD
+        } else {
+            SymbolFlags::PROPERTY
+        };
+        let allowed_property_flags = member_flag | SymbolFlags::OPTIONAL;
+        let key_property = key.flags() == SymbolFlags::PROPERTY;
+        let valid_key = if key_property {
+            let key_declaration = key.value_declaration()?;
+            let key_owner = key.parent()?;
+            let key_owner_record = self.symbol(key_owner)?;
+            let key_annotation = self.source_direct_type_annotation(key_declaration)?;
+            let key_facts = self.source_node_facts.get(&key_declaration.arena)?;
+            let annotation_facts = key_facts.get(key_annotation.node.index())?.as_ref()?;
+            let readonly = key_facts.iter().flatten().any(|facts| {
+                facts.parent == Some(key_declaration.node)
+                    && facts.kind == SyntaxKind::ReadonlyKeyword
+            });
+            let static_ = key_facts.iter().flatten().any(|facts| {
+                facts.parent == Some(key_declaration.node)
+                    && facts.kind == SyntaxKind::StaticKeyword
+            });
+            readonly
+                && annotation_facts.kind == SyntaxKind::TypeOperator
+                && annotation_facts.type_operator == Some(SyntaxKind::UniqueKeyword)
+                && key.declarations() == Some(&[key_declaration][..])
+                && (key_owner_record.flags().contains(SymbolFlags::INTERFACE)
+                    || key_owner_record.flags().contains(SymbolFlags::TYPE_LITERAL)
+                    || key_owner_record.flags().contains(SymbolFlags::CLASS) && static_)
+                && key.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
+                && matches!(
+                    self.source_node_kind(key_declaration),
+                    Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                )
+                && self
+                    .type_node_links(key_annotation)
+                    .and_then(|links| links.resolved_type)
+                    == Some(key_type)
+                && [key_owner_record.members(), key_owner_record.exports()]
+                    .into_iter()
+                    .flatten()
+                    .any(|table| {
+                        self.symbol_table(table)
+                            .and_then(|table| table.get(key.name()))
+                            .and_then(|symbol| self.get_merged_symbol(symbol))
+                            == Some(key_symbol)
+                    })
+        } else {
+            key.flags().contains(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+                && key.check_flags() == CheckFlags::NONE
+        };
         if !owner_record
             .flags()
             .intersects(SymbolFlags::LATE_BINDING_CONTAINER)
@@ -7000,9 +7499,10 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .declarations()
                 .is_none_or(|declarations| !declarations.contains(&owner_declaration))
             || self.get_merged_symbol(owner) != Some(owner)
-            || members == binder_members
+            || Some(members) == binder_members
+            || binder_members.is_none() && !self.source_symbol_has_only_computed_members(owner)
             || self.symbol_table(members).is_none()
-            || !early.flags().contains(SymbolFlags::PROPERTY)
+            || !early.flags().contains(member_flag)
             || early.flags().without(allowed_property_flags) != SymbolFlags::NONE
             || early.check_flags() != CheckFlags::NONE
             || early.name() != InternalSymbolName::Computed.as_ref()
@@ -7015,10 +7515,14 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .and_then(|parent| self.get_merged_symbol(parent))
                 != Some(owner)
             || self.get_merged_symbol(early_symbol) != Some(early_symbol)
-            || !matches!(
-                self.source_node_kind(declaration),
-                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
-            )
+            || if method {
+                self.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature)
+            } else {
+                !matches!(
+                    self.source_node_kind(declaration),
+                    Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                )
+            }
             || !matches!(
                 self.source_node_kind(owner_declaration),
                 Some(SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral)
@@ -7027,8 +7531,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             || key_record.object_flags() != ObjectFlags::NONE
             || key_record.alias().is_some()
             || !unique.name.as_ref().is_late_bound()
-            || !key.flags().contains(SymbolFlags::BLOCK_SCOPED_VARIABLE)
-            || key.check_flags() != CheckFlags::NONE
+            || !valid_key
             || key.value_declaration().is_none()
             || self.get_merged_symbol(key_symbol) != Some(key_symbol)
             || self
@@ -7042,6 +7545,21 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                             resolved_type: Some(key_type),
                             ..ValueSymbolLinks::default()
                         })
+            })
+        {
+            return None;
+        }
+
+        if method
+            && binder_members.is_some_and(|raw| {
+                self.symbol_table(raw).is_none_or(|raw| {
+                    raw.iter().any(|(name, symbol)| {
+                        self.symbol_table(members)
+                            .and_then(|members| members.get(name))
+                            .and_then(|symbol| self.get_merged_symbol(symbol))
+                            != self.get_merged_symbol(symbol)
+                    })
+                })
             })
         {
             return None;
@@ -7082,7 +7600,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             let Some(facts) = facts else {
                 continue;
             };
-            if facts.parent == Some(computed.node) && facts.kind == SyntaxKind::Identifier {
+            if facts.parent == Some(computed.node)
+                && matches!(
+                    facts.kind,
+                    SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
+                )
+            {
                 if key_expression.is_some() {
                     return None;
                 }
@@ -7094,6 +7617,20 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             }
         }
         let key_expression = key_expression?;
+        if (method
+            || key_property
+            || self.source_node_kind(key_expression) == Some(SyntaxKind::PropertyAccessExpression))
+            && (self
+                .symbol_node_links(key_expression)
+                .and_then(|links| links.resolved_symbol)
+                != Some(key_symbol)
+                || self
+                    .type_node_links(key_expression)
+                    .and_then(|links| links.resolved_type)
+                    != Some(key_type))
+        {
+            return None;
+        }
         if self.symbol_node_links(key_expression).is_some_and(|links| {
             links != &SymbolNodeLinks::default()
                 && links
@@ -7585,12 +8122,15 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             .get(&type_)
             .copied()
     }
+}
 
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     /// Publishes one or two source-planned direct-base edges exactly once.
     ///
     /// Callers reserve the map slot before beginning their semantic transaction.
     /// Every declared-type link is authoritative by the time heritage members
-    /// resolve. A second base must be a distinct, resolved, nongeneric
+    /// resolve. The first base may be a canonical reference to its declared
+    /// interface. A second base must be a distinct, resolved, nongeneric
     /// property-only interface.
     pub(super) fn publish_direct_interface_heritage_provenance(
         &mut self,
@@ -7605,16 +8145,22 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             && self
                 .declared_type_links(provenance.owner_symbol)
                 .is_some_and(|links| links.declared_type == Some(type_));
-        let base_is_exact = self
-            .type_payload(provenance.base_type)
-            .is_some_and(|record| {
-                matches!(record.data(), TypeData::Interface(_))
-                    && record.symbol() == Some(provenance.base_symbol)
-            })
-            && self.get_merged_symbol(provenance.base_symbol) == Some(provenance.base_symbol)
+        let base_is_exact = self.get_merged_symbol(provenance.base_symbol)
+            == Some(provenance.base_symbol)
             && self
                 .declared_type_links(provenance.base_symbol)
-                .is_some_and(|links| links.declared_type == Some(provenance.base_type));
+                .and_then(|links| links.declared_type)
+                .is_some_and(|target| {
+                    self.type_payload(target).is_some_and(|record| {
+                        matches!(record.data(), TypeData::Interface(_))
+                            && record.symbol() == Some(provenance.base_symbol)
+                    }) && (target == provenance.base_type
+                        || super::reference_types::validate_direct_generic_reference(
+                            self,
+                            provenance.base_type,
+                        )
+                        .is_ok_and(|reference| reference.target == target))
+                });
         let second_base_is_exact = provenance
             .second_base
             .is_none_or(|(base_symbol, base_type)| {
@@ -7679,7 +8225,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         }
         true
     }
+}
 
+impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     pub(super) fn try_reserve_direct_class_heritage_provenance(
         &mut self,
         additional: usize,

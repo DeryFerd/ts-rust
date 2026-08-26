@@ -3567,6 +3567,9 @@ fn display_single_call_signature(
         if index != 0 {
             result.push_str(", ");
         }
+        if parameter.rest {
+            result.push_str("...");
+        }
         result.push_str(&parameter.name);
         if parameter.optional {
             result.push('?');

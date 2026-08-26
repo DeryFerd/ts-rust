@@ -2,8 +2,8 @@
 //!
 //! This module admits one or two interface bases, including merged
 //! declarations, authenticated namespace exports, forwarded generic type
-//! parameters with bounded trailing primitive arguments, concrete generic
-//! instantiations, bounded base chains, and
+//! parameters, concrete generic arguments, trailing defaults, bounded base
+//! chains, and
 //! merged default-library DOM interface/value identities.
 //! React namespace bases also retain bounded nested forwarded interface
 //! arguments and authenticated deferred generic constraints.
@@ -37,6 +37,16 @@ pub(super) enum DirectInterfaceBaseKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DirectInterfaceDefaultArgument {
+    pub index: usize,
+    pub parameter: SemanticSymbolId,
+    pub declaration: NodeRef,
+    pub node: NodeRef,
+    pub argument: NodeRef,
+    pub earlier_parameter: Option<SemanticSymbolId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DirectInterfaceBasePlan {
     pub node: NodeRef,
     #[allow(dead_code)] // Retained as the instantiation diagnostic anchor.
@@ -44,6 +54,7 @@ pub(super) struct DirectInterfaceBasePlan {
     pub symbol: SemanticSymbolId,
     pub kind: DirectInterfaceBaseKind,
     pub type_arguments: Vec<NodeRef>,
+    pub defaults: Vec<DirectInterfaceDefaultArgument>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,12 +71,11 @@ pub(super) enum DirectInterfaceHeritageError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HeritageTypeParameterAnnotations {
-    Reject,
+    Defaults,
     Defer,
 }
 
 const MAX_INTERFACE_HERITAGE_DEPTH: usize = 16;
-const MAX_TRAILING_PRIMITIVE_HERITAGE_ARGUMENTS: usize = 3;
 const MAX_REACT_FORWARDED_INTERFACE_ARGUMENT_DEPTH: usize = 3;
 
 pub(super) fn plan_direct_interface_heritage(
@@ -246,61 +256,52 @@ fn plan_direct_interface_heritage_inner(
             }
             _ => None,
         };
-        let type_arguments = match (base.type_arguments.as_ref(), react_array_arguments.as_ref()) {
-            (Some(_), Some(arguments)) => arguments.clone(),
-            (None, _) => Vec::new(),
-            (Some(arguments), _) if symbol_record.flags() == SymbolFlags::TYPE_ALIAS => {
-                if identifier.is_none_or(|identifier| identifier.text != "Record")
-                    || clause_data.types.nodes.len() != 1
-                    || !authenticate_record_mapped_alias(store, host, symbol, base_declarations)?
+        let (type_arguments, defaults) =
+            match (base.type_arguments.as_ref(), react_array_arguments.as_ref()) {
+                (Some(_), Some(arguments)) => (arguments.clone(), Vec::new()),
+                (Some(arguments), _) if symbol_record.flags() == SymbolFlags::TYPE_ALIAS => {
+                    if identifier.is_none_or(|identifier| identifier.text != "Record")
+                        || clause_data.types.nodes.len() != 1
+                        || !authenticate_record_mapped_alias(
+                            store,
+                            host,
+                            symbol,
+                            base_declarations,
+                        )?
+                    {
+                        return Err(DirectInterfaceHeritageError::Unsupported {
+                            node: expression,
+                            kind: expression_record.kind,
+                        });
+                    }
+                    (
+                        plan_record_type_arguments(store, host, node, arguments)?,
+                        Vec::new(),
+                    )
+                }
+                (arguments, _)
+                    if symbol_record.flags().without(SymbolFlags::TRANSIENT)
+                        == SymbolFlags::INTERFACE =>
                 {
+                    plan_interface_type_arguments(
+                        store,
+                        host,
+                        declaration,
+                        owner,
+                        node,
+                        symbol,
+                        base_declarations,
+                        arguments,
+                    )?
+                }
+                (None, _) => (Vec::new(), Vec::new()),
+                (Some(_), _) => {
                     return Err(DirectInterfaceHeritageError::Unsupported {
-                        node: expression,
-                        kind: expression_record.kind,
+                        node,
+                        kind: SyntaxKind::ExpressionWithTypeArguments,
                     });
                 }
-                plan_record_type_arguments(store, host, node, arguments)?
-            }
-            (Some(arguments), _)
-                if symbol_record.flags().without(SymbolFlags::TRANSIENT)
-                    == SymbolFlags::INTERFACE =>
-            {
-                let owner_record = preflight_node(store, host, declaration)
-                    .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
-                let NodeData::InterfaceDeclaration(owner_interface) = &owner_record.data else {
-                    return Err(DirectInterfaceHeritageError::Invalid);
-                };
-                if owner_interface.type_parameters.is_some() {
-                    plan_forwarded_interface_type_arguments(
-                        store,
-                        host,
-                        declaration,
-                        owner,
-                        node,
-                        symbol,
-                        base_declarations,
-                        arguments,
-                    )?
-                } else {
-                    plan_concrete_interface_type_arguments(
-                        store,
-                        host,
-                        declaration,
-                        owner,
-                        node,
-                        symbol,
-                        base_declarations,
-                        arguments,
-                    )?
-                }
-            }
-            (Some(_), _) => {
-                return Err(DirectInterfaceHeritageError::Unsupported {
-                    node,
-                    kind: SyntaxKind::ExpressionWithTypeArguments,
-                });
-            }
-        };
+            };
         if symbol_record.flags() == SymbolFlags::TYPE_ALIAS {
             if type_arguments.is_empty() {
                 return Err(DirectInterfaceHeritageError::Unsupported {
@@ -314,6 +315,7 @@ fn plan_direct_interface_heritage_inner(
                 symbol,
                 kind: DirectInterfaceBaseKind::RecordMappedAlias,
                 type_arguments,
+                defaults,
             });
             continue;
         }
@@ -324,6 +326,7 @@ fn plan_direct_interface_heritage_inner(
                 symbol,
                 kind: DirectInterfaceBaseKind::DefaultLibraryArray,
                 type_arguments,
+                defaults,
             });
             continue;
         }
@@ -336,6 +339,7 @@ fn plan_direct_interface_heritage_inner(
                     symbol,
                     kind: DirectInterfaceBaseKind::DefaultLibraryInterface,
                     type_arguments,
+                    defaults,
                 });
                 continue;
             }
@@ -403,6 +407,7 @@ fn plan_direct_interface_heritage_inner(
             symbol,
             kind: DirectInterfaceBaseKind::Interface,
             type_arguments,
+            defaults,
         });
     }
 
@@ -410,7 +415,7 @@ fn plan_direct_interface_heritage_inner(
 }
 
 #[allow(clippy::too_many_arguments)] // Both interface owners and their exact syntax remain explicit.
-fn plan_forwarded_interface_type_arguments(
+fn plan_interface_type_arguments(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
@@ -418,8 +423,8 @@ fn plan_forwarded_interface_type_arguments(
     node: NodeRef,
     base: SemanticSymbolId,
     base_declarations: &[NodeRef],
-    arguments: &NodeList,
-) -> Result<Vec<NodeRef>, DirectInterfaceHeritageError> {
+    arguments: Option<&NodeList>,
+) -> Result<(Vec<NodeRef>, Vec<DirectInterfaceDefaultArgument>), DirectInterfaceHeritageError> {
     let unsupported = || DirectInterfaceHeritageError::Unsupported {
         node,
         kind: SyntaxKind::ExpressionWithTypeArguments,
@@ -429,23 +434,57 @@ fn plan_forwarded_interface_type_arguments(
     let NodeData::InterfaceDeclaration(interface) = &owner_record.data else {
         return Err(DirectInterfaceHeritageError::Invalid);
     };
-    let Some(parameters) = interface.type_parameters.as_ref() else {
-        return Err(unsupported());
-    };
+    let parameters = interface.type_parameters.as_ref();
     let owner_symbol = store
         .symbol(owner)
         .ok_or(DirectInterfaceHeritageError::Invalid)?;
+    let merged_nongeneric_class = owner_symbol.flags()
+        == SymbolFlags::CLASS | SymbolFlags::INTERFACE
+        && parameters.is_none()
+        && arguments.is_none()
+        && owner_symbol
+            .value_declaration()
+            .is_some_and(|class_declaration| {
+                class_declaration.is_for(declaration.arena, declaration.file)
+                    && owner_symbol.declarations().is_some_and(|declarations| {
+                        declarations.len() == 2
+                            && declarations.contains(&class_declaration)
+                            && declarations.contains(&declaration)
+                    })
+                    && host.symbol_matches(store, class_declaration, owner)
+                    && preflight_node(store, host, class_declaration).is_ok_and(|record| {
+                        record.kind == SyntaxKind::ClassDeclaration
+                            && record.parent == owner_record.parent
+                            && matches!(&record.data, NodeData::ClassDeclaration(class)
+                            if class.type_parameters.is_none())
+                    })
+            });
+    let merged_nongeneric_value = parameters.is_none()
+        && arguments.is_none()
+        && owner_symbol.flags().without(SymbolFlags::TRANSIENT)
+            == SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        && owner_symbol
+            .declarations()
+            .is_some_and(|declarations| declarations.contains(&declaration))
+        && authenticate_default_library_interface_base(
+            store,
+            host,
+            owner,
+            owner_symbol
+                .declarations()
+                .ok_or(DirectInterfaceHeritageError::Invalid)?,
+        )?;
     if owner_record.kind != SyntaxKind::InterfaceDeclaration
         || owner_record.flags.0 != 0
         || !host.symbol_matches(store, declaration, owner)
         || owner_symbol.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            && !merged_nongeneric_class
+            && !merged_nongeneric_value
         || owner_symbol.check_flags() != CheckFlags::NONE
-        || parameters.nodes.is_empty()
-        || parameters.has_trailing_comma
-        || arguments.has_trailing_comma
-        || arguments.nodes.is_empty()
-        || arguments.nodes.len()
-            > parameters.nodes.len() + MAX_TRAILING_PRIMITIVE_HERITAGE_ARGUMENTS
+        || parameters
+            .is_some_and(|parameters| parameters.nodes.is_empty() || parameters.has_trailing_comma)
+        || arguments
+            .is_some_and(|arguments| arguments.has_trailing_comma || arguments.nodes.is_empty())
     {
         return Err(unsupported());
     }
@@ -455,67 +494,44 @@ fn plan_forwarded_interface_type_arguments(
         store,
         host,
         declaration,
-        Some(parameters),
+        parameters,
         &mut checked_parameters,
     )
     .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
-    if owner_parameters.len() != parameters.nodes.len() {
+    if owner_parameters.len() != parameters.map_or(0, |parameters| parameters.nodes.len()) {
         return Err(unsupported());
+    }
+    if let Some(parameters) = parameters {
+        for (parameter, symbol) in parameters.nodes.iter().zip(&owner_parameters) {
+            authenticate_heritage_type_parameter(
+                store,
+                host,
+                declaration,
+                owner,
+                NodeRef::new(declaration.arena, declaration.file, *parameter),
+                *symbol,
+                node,
+                HeritageTypeParameterAnnotations::Defer,
+            )?;
+        }
     }
     let react_namespace = authenticated_react_generic_heritage_namespace(store, owner, base);
 
     let mut shared_base_parameters: Option<Vec<SemanticSymbolId>> = None;
-    let mut react_lifecycle_default = None;
+    let mut defaults: Vec<Option<NodeRef>> = Vec::new();
     for &base_declaration in base_declarations {
         let record = preflight_node(store, host, base_declaration)
             .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
         let NodeData::InterfaceDeclaration(interface) = &record.data else {
             return Err(unsupported());
         };
-        let Some(base_parameters) = interface.type_parameters.as_ref() else {
-            return Err(unsupported());
-        };
-        let omitted_react_lifecycle_default = (react_namespace.is_some()
-            && owner_symbol.name().as_utf8() == Some("Mixin")
-            && store.symbol(base).and_then(|base| base.name().as_utf8())
-                == Some("ComponentLifecycle")
-            && parameters.nodes.len() == 2
-            && arguments.nodes.len() == 2
-            && base_parameters.nodes.len() == 3)
-            .then(|| {
-                let parameter = NodeRef::new(
-                    base_declaration.arena,
-                    base_declaration.file,
-                    base_parameters.nodes[2],
-                );
-                let parameter_record = preflight_node(store, host, parameter).ok()?;
-                let NodeData::TypeParameterDeclaration(data) = &parameter_record.data else {
-                    return None;
-                };
-                let name = NodeRef::new(parameter.arena, parameter.file, data.name);
-                let name_record = preflight_node(store, host, name).ok()?;
-                let NodeData::Identifier(identifier) = &name_record.data else {
-                    return None;
-                };
-                let default = NodeRef::new(parameter.arena, parameter.file, data.default_type?);
-                let default_record = preflight_node(store, host, default).ok()?;
-                (parameter_record.kind == SyntaxKind::TypeParameter
-                    && parameter_record.parent == Some(base_declaration.node)
-                    && identifier.text == "SS"
-                    && name_record.kind == SyntaxKind::Identifier
-                    && name_record.parent == Some(parameter.node)
-                    && default_record.kind == SyntaxKind::AnyKeyword
-                    && default_record.flags.0 == 0
-                    && default_record.parent == Some(parameter.node))
-                .then_some(default)
-            })
-            .flatten();
+        let base_parameters = interface.type_parameters.as_ref();
         if record.kind != SyntaxKind::InterfaceDeclaration
             || record.flags.0 != 0
             || !host.symbol_matches(store, base_declaration, base)
-            || base_parameters.has_trailing_comma
-            || base_parameters.nodes.len() != arguments.nodes.len()
-                && omitted_react_lifecycle_default.is_none()
+            || base_parameters.is_some_and(|parameters| {
+                parameters.has_trailing_comma || parameters.nodes.is_empty()
+            })
         {
             return Err(unsupported());
         }
@@ -523,18 +539,23 @@ fn plan_forwarded_interface_type_arguments(
             store,
             host,
             base_declaration,
-            Some(base_parameters),
+            base_parameters,
             &mut checked_parameters,
         )
         .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
-        if symbols.len() != base_parameters.nodes.len()
+        if symbols.len() != base_parameters.map_or(0, |parameters| parameters.nodes.len())
             || shared_base_parameters
                 .as_ref()
                 .is_some_and(|expected| expected != &symbols)
         {
             return Err(unsupported());
         }
-        for (parameter, symbol) in base_parameters.nodes.iter().zip(&symbols) {
+        if shared_base_parameters.is_none() {
+            defaults.resize(symbols.len(), None);
+        }
+        let parameter_nodes =
+            base_parameters.map_or(&[][..], |parameters| parameters.nodes.as_slice());
+        for (index, (parameter, symbol)) in parameter_nodes.iter().zip(&symbols).enumerate() {
             let parameter = NodeRef::new(base_declaration.arena, base_declaration.file, *parameter);
             authenticate_heritage_type_parameter(
                 store,
@@ -544,22 +565,51 @@ fn plan_forwarded_interface_type_arguments(
                 parameter,
                 *symbol,
                 node,
-                if react_namespace.is_some() {
+                if react_namespace.is_some() || owner_parameters.is_empty() {
                     HeritageTypeParameterAnnotations::Defer
                 } else {
-                    HeritageTypeParameterAnnotations::Reject
+                    HeritageTypeParameterAnnotations::Defaults
                 },
             )?;
+            let parameter_record = preflight_node(store, host, parameter)
+                .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+            let NodeData::TypeParameterDeclaration(data) = &parameter_record.data else {
+                return Err(DirectInterfaceHeritageError::Invalid);
+            };
+            if let Some(default) = data.default_type {
+                let default = NodeRef::new(parameter.arena, parameter.file, default);
+                if react_namespace.is_none() && !owner_parameters.is_empty() {
+                    authenticate_concrete_interface_type_argument(store, host, default, 0)?;
+                    if heritage_argument_references_parameters(
+                        store,
+                        host,
+                        default,
+                        &symbols[index..],
+                        0,
+                    )? {
+                        return Err(unsupported());
+                    }
+                }
+                if let Some(previous) = defaults[index]
+                    && !equivalent_heritage_type_argument(store, host, previous, default, 0)?
+                {
+                    return Err(unsupported());
+                }
+                defaults[index].get_or_insert(default);
+            }
         }
         if shared_base_parameters.is_none() {
             shared_base_parameters = Some(symbols);
         }
-        if let Some(default) = omitted_react_lifecycle_default {
-            if react_lifecycle_default.is_some_and(|previous| previous != default) {
-                return Err(unsupported());
-            }
-            react_lifecycle_default = Some(default);
-        }
+    }
+    let base_parameters = shared_base_parameters.ok_or_else(unsupported)?;
+    let supplied = arguments.map_or(&[][..], |arguments| arguments.nodes.as_slice());
+    let minimum = defaults
+        .iter()
+        .rposition(Option::is_none)
+        .map_or(0, |index| index + 1);
+    if supplied.len() < minimum || supplied.len() > base_parameters.len() {
+        return Err(unsupported());
     }
 
     let record =
@@ -570,55 +620,41 @@ fn plan_forwarded_interface_type_arguments(
     let expression_node = NodeRef::new(node.arena, node.file, expression.expression);
     let expression_record = preflight_node(store, host, expression_node)
         .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
-    if arguments.range.start < expression_record.range.end
-        || arguments.range.end != record.range.end
-        || arguments.range.start >= arguments.range.end
-    {
+    if arguments.is_some_and(|arguments| {
+        arguments.range.start < expression_record.range.end
+            || arguments.range.end != record.range.end
+            || arguments.range.start >= arguments.range.end
+    }) {
         return Err(DirectInterfaceHeritageError::Invalid);
     }
 
-    let mut planned =
-        Vec::with_capacity(arguments.nodes.len() + usize::from(react_lifecycle_default.is_some()));
+    let mut planned = Vec::with_capacity(base_parameters.len());
     let mut previous_end = expression_record.range.end;
-    let mut previous_parameter = None;
-    let mut forwarded_parameter_seen = false;
-    let mut trailing_primitive_count = 0;
-    for argument in &arguments.nodes {
+    for argument in supplied {
         let argument = NodeRef::new(node.arena, node.file, *argument);
         let argument_record = preflight_node(store, host, argument)
             .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
         if argument_record.flags.0 != 0
             || argument_record.parent != Some(node.node)
             || argument_record.range.start < previous_end
-            || argument_record.range.start <= arguments.range.start
-            || argument_record.range.end >= arguments.range.end
+            || arguments.is_some_and(|arguments| {
+                argument_record.range.start <= arguments.range.start
+                    || argument_record.range.end >= arguments.range.end
+            })
             || planned.contains(&argument)
         {
             return Err(DirectInterfaceHeritageError::Invalid);
         }
-        if matches!(argument_record.data, NodeData::KeywordTypeNode(_)) {
-            if !forwarded_parameter_seen
-                || trailing_primitive_count >= MAX_TRAILING_PRIMITIVE_HERITAGE_ARGUMENTS
-            {
-                return Err(unsupported());
-            }
-            authenticate_concrete_interface_type_argument(store, host, argument, 0)?;
-            trailing_primitive_count += 1;
-            previous_end = argument_record.range.end;
-            planned.push(argument);
-            continue;
-        }
-        let NodeData::TypeReferenceNode(reference) = &argument_record.data else {
-            return Err(unsupported());
-        };
-        if argument_record.kind != SyntaxKind::TypeReference || trailing_primitive_count != 0 {
-            return Err(unsupported());
-        }
-        if reference.type_arguments.is_some() {
+        authenticate_concrete_interface_type_argument(store, host, argument, 0)?;
+        if !owner_parameters.is_empty()
+            && matches!(
+                &argument_record.data,
+                NodeData::TypeReferenceNode(reference) if reference.type_arguments.is_some()
+            )
+        {
             let Some(namespace) = react_namespace else {
                 return Err(unsupported());
             };
-            authenticate_concrete_interface_type_argument(store, host, argument, 0)?;
             authenticate_react_forwarded_interface_argument(
                 store,
                 host,
@@ -628,73 +664,274 @@ fn plan_forwarded_interface_type_arguments(
                 &owner_parameters,
                 0,
             )?;
-            forwarded_parameter_seen = true;
-            previous_end = argument_record.range.end;
-            planned.push(argument);
-            continue;
-        }
-
-        let name = NodeRef::new(argument.arena, argument.file, reference.type_name);
-        let name_record =
-            preflight_node(store, host, name).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
-        let NodeData::Identifier(identifier) = &name_record.data else {
-            return Err(unsupported());
-        };
-        if name_record.kind != SyntaxKind::Identifier
-            || name_record.flags.0 != 0
-            || name_record.parent != Some(argument.node)
-            || identifier.flow_node.is_some()
-        {
-            return Err(unsupported());
-        }
-
-        let mut callback_host = host
-            .name_resolver_host(store)
-            .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
-        let resolved = callback_host
-            .resolve_entity_name(name, SymbolFlags::TYPE)
-            .map_err(|_| unsupported())?
-            .and_then(|symbol| store.get_merged_symbol(symbol));
-        let Some(position) = owner_parameters
-            .iter()
-            .position(|symbol| Some(*symbol) == resolved)
-        else {
-            return Err(unsupported());
-        };
-        if previous_parameter.is_some_and(|previous| position <= previous) {
-            return Err(unsupported());
-        }
-        previous_parameter = Some(position);
-        forwarded_parameter_seen = true;
-        let expected = owner_parameters[position];
-        let parameter = parameters.nodes[position];
-
-        let parameter = NodeRef::new(declaration.arena, declaration.file, parameter);
-        let parameter_name = authenticate_heritage_type_parameter(
-            store,
-            host,
-            declaration,
-            owner,
-            parameter,
-            expected,
-            node,
-            HeritageTypeParameterAnnotations::Defer,
-        )?;
-        let parameter_name_record = preflight_node(store, host, parameter_name)
-            .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
-        let NodeData::Identifier(parameter_name_data) = &parameter_name_record.data else {
-            return Err(DirectInterfaceHeritageError::Invalid);
-        };
-        if identifier.text != parameter_name_data.text {
-            return Err(unsupported());
         }
         previous_end = argument_record.range.end;
         planned.push(argument);
     }
-    if let Some(default) = react_lifecycle_default {
-        planned.push(default);
+    let mut planned_defaults = Vec::new();
+    for (index, default) in defaults.iter().enumerate().skip(planned.len()) {
+        let default = default.ok_or_else(unsupported)?;
+        let (argument, earlier_parameter) =
+            plan_heritage_default_argument(store, host, default, &base_parameters, &planned)?;
+        let declaration = preflight_node(store, host, default)
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+            .parent
+            .map(|parent| NodeRef::new(default.arena, default.file, parent))
+            .ok_or(DirectInterfaceHeritageError::Invalid)?;
+        let planned_default = DirectInterfaceDefaultArgument {
+            index,
+            parameter: base_parameters[index],
+            declaration,
+            node: default,
+            argument,
+            earlier_parameter,
+        };
+        let resolved = store.declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .and_then(|type_| store.type_payload(type_))
+            .is_some_and(|record| matches!(record.data(), TypeData::Interface(interface) if interface.base_types_resolved));
+        validate_heritage_default_cache(store, &planned_default, resolved)?;
+        planned_defaults.push(planned_default);
+        planned.push(argument);
     }
-    Ok(planned)
+    Ok((planned, planned_defaults))
+}
+
+pub(super) fn validate_heritage_default_cache(
+    store: &CanonicalTypeMapperStore,
+    default: &DirectInterfaceDefaultArgument,
+    require_resolved: bool,
+) -> Result<(), DirectInterfaceHeritageError> {
+    if store.source_node_kind(default.declaration) != Some(SyntaxKind::TypeParameter)
+        || store.source_node_parent(default.node)
+            != Some(super::store::SourceNodeParent::Parent(default.declaration))
+        || store
+            .symbol(default.parameter)
+            .and_then(|owner| owner.declarations())
+            .is_none_or(|declarations| !declarations.contains(&default.declaration))
+    {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    }
+    let expected = if let Some(earlier) = default.earlier_parameter {
+        store
+            .declared_type_links(earlier)
+            .and_then(|links| links.declared_type)
+    } else {
+        super::object_members::cached_planned_type_identity(store, default.node)
+    };
+    if require_resolved
+        && expected.is_none_or(|expected| {
+            !store.source_direct_type_annotation_is_exact(default.node, expected)
+        })
+        || store.type_node_links(default.node).is_some_and(|links| {
+            links
+                != &super::TypeNodeLinks {
+                    resolved_type: links.resolved_type,
+                    ..super::TypeNodeLinks::default()
+                }
+                || links
+                    .resolved_type
+                    .is_some_and(|cached| Some(cached) != expected)
+        })
+    {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    }
+    if default.earlier_parameter.is_some_and(|expected| {
+        store
+            .symbol_node_links(default.node)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|symbol| store.get_merged_symbol(symbol) != Some(expected))
+    }) {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    }
+    if let Some(parameter) = store
+        .declared_type_links(default.parameter)
+        .and_then(|links| links.declared_type)
+    {
+        let Some(TypeData::TypeParameter(data)) = store
+            .type_payload(parameter)
+            .map(super::type_records::TypeRecord::data)
+        else {
+            return Err(DirectInterfaceHeritageError::Invalid);
+        };
+        if super::declared::cached_ordinary_type_parameter_owner(store, parameter)
+            != Some(default.parameter)
+            || data
+                .resolved_default_type
+                .is_some_and(|cached| Some(cached) != expected)
+            || require_resolved && data.resolved_default_type != expected
+        {
+            return Err(DirectInterfaceHeritageError::Invalid);
+        }
+    } else if require_resolved {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    }
+    Ok(())
+}
+
+fn equivalent_heritage_type_argument(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    left: NodeRef,
+    right: NodeRef,
+    depth: usize,
+) -> Result<bool, DirectInterfaceHeritageError> {
+    if depth >= MAX_INTERFACE_HERITAGE_DEPTH {
+        return Ok(false);
+    }
+    let left_record =
+        preflight_node(store, host, left).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let right_record =
+        preflight_node(store, host, right).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    if left_record.flags.0 != 0 || right_record.flags.0 != 0 {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    }
+    if left_record.kind.is_keyword_type() {
+        return Ok(left_record.kind == right_record.kind
+            && matches!(left_record.data, NodeData::KeywordTypeNode(_))
+            && matches!(right_record.data, NodeData::KeywordTypeNode(_)));
+    }
+    let (NodeData::TypeReferenceNode(left_data), NodeData::TypeReferenceNode(right_data)) =
+        (&left_record.data, &right_record.data)
+    else {
+        return Ok(false);
+    };
+    authenticate_concrete_interface_type_argument(store, host, left, depth)?;
+    authenticate_concrete_interface_type_argument(store, host, right, depth)?;
+    let mut resolver = host
+        .name_resolver_host(store)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let left_symbol = resolver
+        .resolve_entity_name(
+            NodeRef::new(left.arena, left.file, left_data.type_name),
+            SymbolFlags::TYPE,
+        )
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    let right_symbol = resolver
+        .resolve_entity_name(
+            NodeRef::new(right.arena, right.file, right_data.type_name),
+            SymbolFlags::TYPE,
+        )
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    if left_symbol.is_none() || left_symbol != right_symbol {
+        return Ok(false);
+    }
+    let left_arguments = left_data
+        .type_arguments
+        .as_ref()
+        .map_or(&[][..], |arguments| arguments.nodes.as_slice());
+    let right_arguments = right_data
+        .type_arguments
+        .as_ref()
+        .map_or(&[][..], |arguments| arguments.nodes.as_slice());
+    if left_arguments.len() != right_arguments.len() {
+        return Ok(false);
+    }
+    for (left_argument, right_argument) in left_arguments.iter().zip(right_arguments) {
+        if !equivalent_heritage_type_argument(
+            store,
+            host,
+            NodeRef::new(left.arena, left.file, *left_argument),
+            NodeRef::new(right.arena, right.file, *right_argument),
+            depth + 1,
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn plan_heritage_default_argument(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    default: NodeRef,
+    parameters: &[SemanticSymbolId],
+    arguments: &[NodeRef],
+) -> Result<(NodeRef, Option<SemanticSymbolId>), DirectInterfaceHeritageError> {
+    authenticate_concrete_interface_type_argument(store, host, default, 0)?;
+    let unsupported = || DirectInterfaceHeritageError::Unsupported {
+        node: default,
+        kind: store
+            .source_node_kind(default)
+            .unwrap_or(SyntaxKind::TypeReference),
+    };
+    let record =
+        preflight_node(store, host, default).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    if let NodeData::TypeReferenceNode(reference) = &record.data {
+        let mut resolver = host
+            .name_resolver_host(store)
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+        let symbol = resolver
+            .resolve_entity_name(
+                NodeRef::new(default.arena, default.file, reference.type_name),
+                SymbolFlags::TYPE,
+            )
+            .map_err(|_| unsupported())?
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(unsupported)?;
+        if let Some(position) = parameters.iter().position(|parameter| *parameter == symbol) {
+            // A direct default reuses the earlier argument. Nested substitutions need a mapper.
+            return arguments
+                .get(position)
+                .copied()
+                .map(|argument| (argument, Some(symbol)))
+                .ok_or_else(unsupported);
+        }
+    }
+    if heritage_argument_references_parameters(store, host, default, parameters, 0)? {
+        return Err(unsupported());
+    }
+    Ok((default, None))
+}
+
+fn heritage_argument_references_parameters(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    argument: NodeRef,
+    parameters: &[SemanticSymbolId],
+    depth: usize,
+) -> Result<bool, DirectInterfaceHeritageError> {
+    if depth >= MAX_INTERFACE_HERITAGE_DEPTH {
+        return Err(DirectInterfaceHeritageError::Unsupported {
+            node: argument,
+            kind: SyntaxKind::TypeReference,
+        });
+    }
+    let record =
+        preflight_node(store, host, argument).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return Ok(false);
+    };
+    let mut resolver = host
+        .name_resolver_host(store)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let symbol = resolver
+        .resolve_entity_name(
+            NodeRef::new(argument.arena, argument.file, reference.type_name),
+            SymbolFlags::TYPE,
+        )
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(DirectInterfaceHeritageError::Invalid)?;
+    if parameters.contains(&symbol) {
+        return Ok(true);
+    }
+    if let Some(arguments) = reference.type_arguments.as_ref() {
+        for nested in &arguments.nodes {
+            if heritage_argument_references_parameters(
+                store,
+                host,
+                NodeRef::new(argument.arena, argument.file, *nested),
+                parameters,
+                depth + 1,
+            )? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn authenticated_react_generic_heritage_namespace(
@@ -1119,8 +1356,7 @@ fn authenticate_heritage_type_parameter(
     if record.kind != SyntaxKind::TypeParameter
         || record.flags.0 != 0
         || record.parent != Some(declaration.node)
-        || annotations == HeritageTypeParameterAnnotations::Reject
-            && (data.constraint.is_some() || data.default_type.is_some())
+        || annotations == HeritageTypeParameterAnnotations::Defaults && data.constraint.is_some()
         || data.expression.is_some()
         || data.modifiers.is_some()
         || data.symbol.is_some()
@@ -2097,13 +2333,24 @@ mod tests {
     use super::*;
     use crate::semantic::{
         AliasTargetState, CanonicalCheckerContext, CanonicalCheckerDiagnostics,
-        CanonicalCheckerOptions, SourceCheckError, TypeData, bootstrap::LiteralTypeCacheError,
+        CanonicalCheckerOptions, TypeData,
+        bootstrap::{IntrinsicBootstrapOptions, LiteralTypeCacheError},
         production::GlobalMergeCompletion,
-        reference_types::validate_nongeneric_interface_argument_origin,
+        reference_types::{
+            validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
+        },
         type_nodes::CanonicalTypeQuery,
     };
 
     fn checker_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        checker_context_with_options(parsed, file, CanonicalCheckerOptions::default())
+    }
+
+    fn checker_context_with_options(
+        parsed: &ParseResult,
+        file: FileId,
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'_> {
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -2121,12 +2368,169 @@ mod tests {
         binder
             .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
-        CanonicalCheckerContext::new(
-            binder.finish(),
-            vec![(file, &parsed.arena)],
-            CanonicalCheckerOptions::default(),
-        )
-        .unwrap()
+        CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
+    }
+
+    #[test]
+    fn inherited_optional_methods_preserve_source_signatures_cold_and_warm() {
+        for exact_optional_property_types in [false, true] {
+            for member in [
+                "read?(): number",
+                "read(value?: number): number",
+                "read(value?: number | string): number",
+                "read(value?: null): number",
+            ] {
+                let parsed = parse_source_file(&format!(
+                    "interface Base {{ {member} }} interface Derived extends Base {{}}"
+                ));
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                let file = FileId::new(8_600);
+                let mut context = checker_context_with_options(
+                    &parsed,
+                    file,
+                    CanonicalCheckerOptions {
+                        intrinsic: IntrinsicBootstrapOptions {
+                            strict_null_checks: true,
+                            exact_optional_property_types,
+                        },
+                        ..CanonicalCheckerOptions::default()
+                    },
+                );
+                let derived = interface_symbol(&parsed, file, &context, "Derived");
+                let target = context.get_declared_type_of_symbol(derived).unwrap();
+                assert_eq!(
+                    crate::semantic::structured_members::validate_interface_heritage_members(
+                        context.store(),
+                        target,
+                    ),
+                    crate::semantic::structured_members::InterfaceHeritageMembersValidation::Valid,
+                    "{member}",
+                );
+                context.check_source_file(file).unwrap();
+                assert!(context.diagnostics().is_empty());
+                let warm = (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                );
+                assert_eq!(context.get_declared_type_of_symbol(derived), Ok(target));
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().signature_len(),
+                        context.store().mapper_len(),
+                        context.store().checker_link_allocated_lengths(),
+                    ),
+                    warm,
+                    "{member}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_optional_methods_reject_missing_and_uncached_wrappers() {
+        for exact_optional_property_types in [false, true] {
+            let parsed = parse_source_file(concat!(
+                "interface Base { read?(): number; parameter(value?: number): number } ",
+                "interface Derived extends Base {}",
+            ));
+            let file = FileId::new(8_601);
+            let mut context = checker_context_with_options(
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        exact_optional_property_types,
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let base = interface_symbol(&parsed, file, &context, "Base");
+            let derived = interface_symbol(&parsed, file, &context, "Derived");
+            let target = context.get_declared_type_of_symbol(derived).unwrap();
+            let members = context.store().symbol(base).unwrap().members().unwrap();
+            let table = context.store().symbol_table(members).unwrap();
+            let (method, parameter_method) = (
+                table.get_source("read").unwrap(),
+                table.get_source("parameter").unwrap(),
+            );
+            let original = context.store().value_symbol_links(method).unwrap().clone();
+            let value = original.resolved_type.unwrap();
+            let record = context.store().type_payload(value).unwrap();
+            let TypeData::Union(union) = record.data() else {
+                panic!("an optional method must retain its union wrapper")
+            };
+            let flags = record.object_flags();
+            let types = union.union.types.clone();
+            let sentinel = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .undefined_or_missing_type;
+            let callable = *types.iter().find(|type_| **type_ != sentinel).unwrap();
+            let forged = context
+                .store_mut_for_test()
+                .alloc_union_type(flags, types)
+                .unwrap();
+            let parameter_value = context
+                .store()
+                .value_symbol_links(parameter_method)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let signature = crate::semantic::structured_members::valid_interface_method_value(
+                context.store(),
+                parameter_method,
+                parameter_value,
+            )
+            .unwrap();
+            let parameter = context.store().signature(signature).unwrap().parameters()[0];
+            let original_parameter = context
+                .store()
+                .value_symbol_links(parameter)
+                .unwrap()
+                .clone();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            for (symbol, replacement, restore) in [
+                (method, callable, original.clone()),
+                (method, forged, original.clone()),
+                (parameter, number, original_parameter),
+            ] {
+                let mut changed = restore.clone();
+                changed.resolved_type = Some(replacement);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(symbol, changed)
+                );
+                assert!(context.get_declared_type_of_symbol(derived).is_err());
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().signature_len(),
+                        context.store().mapper_len(),
+                        context.store().checker_link_allocated_lengths(),
+                    ),
+                    warm,
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(symbol, restore)
+                );
+                assert_eq!(context.get_declared_type_of_symbol(derived), Ok(target));
+            }
+        }
     }
 
     fn interface_symbol(
@@ -3197,6 +3601,697 @@ mod tests {
     }
 
     #[test]
+    fn generic_heritage_accepts_concrete_reordered_and_repeated_arguments() {
+        for (index, source) in [
+            "interface Base<A> {} interface Derived<T> extends Base<string> {}",
+            "interface Base<A, B> {} interface Derived<T, U> extends Base<U, T> {}",
+            "interface Base<A, B> {} interface Derived<T> extends Base<T, T> {}",
+            "interface Base<A, B> {} interface Derived<T> extends Base<string, T> {}",
+            "interface Base<A, B, C> {} interface Derived<T, U> extends Base<T, string, U> {}",
+            concat!(
+                "interface Base<A, B, C, D, E> {} ",
+                "interface Derived<T> extends Base<T, string, number, boolean, never> {}",
+            ),
+            concat!(
+                "type Completion = undefined; ",
+                "interface Base<A, B = any, C = unknown> {} ",
+                "interface Derived<T = string> extends Base<T, Completion, unknown> {}",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(8_520 + u32::try_from(index).unwrap());
+            let context = checker_context(&parsed, file);
+            let before = (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let plan = heritage_plan(&parsed, file, &context, "Derived")
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            let [base] = plan.bases.as_slice() else {
+                panic!("one base was expected")
+            };
+            let NodeData::ExpressionWithTypeArguments(expression) =
+                &parsed.arena.get(base.node.node).unwrap().data
+            else {
+                panic!("the base must retain its source syntax")
+            };
+            assert_eq!(
+                base.type_arguments,
+                expression
+                    .type_arguments
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .map(|argument| NodeRef::new(parsed.arena.id(), file, *argument))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(heritage_plan(&parsed, file, &context, "Derived"), Ok(plan));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn generic_heritage_fills_defaults_in_parameter_order() {
+        for (index, (source, expected)) in [
+            (
+                concat!(
+                    "interface Base<A, B = any, C = unknown> {} ",
+                    "interface Derived<T> extends Base<T> {}",
+                ),
+                vec![
+                    SyntaxKind::TypeReference,
+                    SyntaxKind::AnyKeyword,
+                    SyntaxKind::UnknownKeyword,
+                ],
+            ),
+            (
+                concat!(
+                    "interface Base<A, B = A, C = B> {} ",
+                    "interface Derived<T> extends Base<T> {}",
+                ),
+                vec![SyntaxKind::TypeReference; 3],
+            ),
+            (
+                concat!(
+                    "interface Base<A = number, B = A> {} ",
+                    "interface Derived<T> extends Base {}",
+                ),
+                vec![SyntaxKind::NumberKeyword; 2],
+            ),
+            (
+                concat!(
+                    "interface Base<A = string> {} ",
+                    "interface Derived extends Base {}",
+                ),
+                vec![SyntaxKind::StringKeyword],
+            ),
+            (
+                concat!(
+                    "type Completion = undefined; interface Base<A, B = Completion> {} ",
+                    "interface Derived<T> extends Base<T> {}",
+                ),
+                vec![SyntaxKind::TypeReference; 2],
+            ),
+            (
+                concat!(
+                    "interface Base<A, B = unknown> {} interface Base<A, B> {} ",
+                    "interface Derived<T> extends Base<T> {}",
+                ),
+                vec![SyntaxKind::TypeReference, SyntaxKind::UnknownKeyword],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(8_530 + u32::try_from(index).unwrap());
+            let context = checker_context(&parsed, file);
+            let before = (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let plan = heritage_plan(&parsed, file, &context, "Derived")
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            let arguments = &plan.bases[0].type_arguments;
+            assert_eq!(
+                arguments
+                    .iter()
+                    .map(|argument| parsed.arena.get(argument.node).unwrap().kind)
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+            if index == 1 || index == 2 {
+                assert!(arguments.iter().all(|argument| *argument == arguments[0]));
+            }
+            assert_eq!(heritage_plan(&parsed, file, &context, "Derived"), Ok(plan));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn generic_heritage_rejects_unresolved_defaults_before_publication() {
+        for (index, source) in [
+            "interface Base<A, B> {} interface Derived<T> extends Base<T> {}",
+            "interface Base<A, B = B> {} interface Derived<T> extends Base<T> {}",
+            "interface Base<A, B = B> {} interface Derived<T> extends Base<T, string> {}",
+            "interface Base<A, B = C, C = number> {} interface Derived<T> extends Base<T> {}",
+            "interface Base<A, B = Missing> {} interface Derived<T> extends Base<T> {}",
+            "interface Base<A, B = A[]> {} interface Derived<T> extends Base<T> {}",
+            concat!(
+                "interface Box<A> {} interface Base<A, B = Box<A>> {} ",
+                "interface Derived<T> extends Base<T> {}",
+            ),
+            concat!(
+                "interface Base<A, B = string> {} interface Base<A, B = number> {} ",
+                "interface Derived<T> extends Base<T> {}",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(8_540 + u32::try_from(index).unwrap());
+            let context = checker_context(&parsed, file);
+            let before = (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert!(
+                matches!(
+                    heritage_plan(&parsed, file, &context, "Derived"),
+                    Err(DirectInterfaceHeritageError::Unsupported { .. })
+                ),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn defaulted_iterator_heritage_keeps_default_library_members_lazy() {
+        let library = parse_source_file(include_str!(
+            "../../../ts_bundled/libs/lib.es2015.iterable.d.ts"
+        ));
+        let source = parse_source_file("");
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        let (mut context, library_file, _) =
+            default_library_heritage_context(&library, &source, true);
+        let array = interface_symbol(&library, library_file, &context, "ArrayIterator");
+        let iterator_object = interface_symbol(&library, library_file, &context, "IteratorObject");
+        let iterator = interface_symbol(&library, library_file, &context, "Iterator");
+        let target = context.get_declared_type_of_symbol(array).unwrap();
+        let object_target = context
+            .get_declared_type_of_symbol(iterator_object)
+            .unwrap();
+        let iterator_target = context.get_declared_type_of_symbol(iterator).unwrap();
+        let own_arguments = validate_direct_generic_reference(context.store(), target)
+            .unwrap()
+            .type_arguments;
+        let object_arguments = validate_direct_generic_reference(context.store(), object_target)
+            .unwrap()
+            .type_arguments;
+        let TypeData::Interface(array_data) = context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the array iterator must retain its interface type")
+        };
+        let [base] = array_data.resolved_base_types.as_deref().unwrap() else {
+            panic!("the array iterator must retain one base")
+        };
+        let base = *base;
+        let reference = validate_direct_generic_reference(context.store(), base).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(reference.target, object_target);
+        assert_eq!(
+            reference.type_arguments,
+            [own_arguments[0], bootstrap.any_type, bootstrap.unknown_type],
+        );
+        let TypeData::Interface(object_data) =
+            context.store().type_payload(object_target).unwrap().data()
+        else {
+            panic!("the iterator object must retain its interface type")
+        };
+        let [inherited] = object_data.resolved_base_types.as_deref().unwrap() else {
+            panic!("the iterator object must retain one base")
+        };
+        let inherited = validate_direct_generic_reference(context.store(), *inherited).unwrap();
+        assert_eq!(inherited.target, iterator_target);
+        assert_eq!(inherited.type_arguments, object_arguments);
+        for type_ in [target, object_target, iterator_target] {
+            let TypeData::Interface(data) = context.store().type_payload(type_).unwrap().data()
+            else {
+                panic!("the heritage graph must contain interface types")
+            };
+            assert!(!data.declared_members_resolved);
+            assert!(data.reference.object.structured.properties.is_none());
+            assert!(data.reference.object.structured.signatures.is_none());
+        }
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            )
+        };
+        let warm = snapshot(&context);
+        assert_eq!(context.get_declared_type_of_symbol(array), Ok(target));
+        assert_eq!(snapshot(&context), warm);
+        assert!(context.store_mut_for_test().set_interface_base_resolution(
+            target,
+            true,
+            None,
+            Some(vec![object_target]),
+        ));
+        assert!(context.get_declared_type_of_symbol(array).is_err());
+        assert_eq!(snapshot(&context), warm);
+        assert!(context.store_mut_for_test().set_interface_base_resolution(
+            target,
+            true,
+            None,
+            Some(vec![base]),
+        ));
+        assert_eq!(context.get_declared_type_of_symbol(array), Ok(target));
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn merged_nongeneric_class_heritage_keeps_base_argument_checks() {
+        for (base, extension, expected_arguments) in [
+            ("Base", "Base", Some(0)),
+            ("Base<T>", "Base", None),
+            ("Base<T = number>", "Base", Some(1)),
+            ("Base<T = number>", "Base<number>", None),
+        ] {
+            let parsed = parse_source_file(&format!(
+                "interface {base} {{}} \
+                 class C extends null {{ constructor() {{ super(); }} }} \
+                 interface C extends {extension} {{}}"
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(8_602);
+            let context = checker_context(&parsed, file);
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let result = heritage_plan(&parsed, file, &context, "C");
+            if let Some(expected) = expected_arguments {
+                let plan = result.unwrap();
+                assert_eq!(plan.bases.len(), 1);
+                assert_eq!(plan.bases[0].type_arguments.len(), expected);
+                assert_eq!(plan.bases[0].defaults.len(), expected);
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(DirectInterfaceHeritageError::Unsupported { .. })
+                    ),
+                    "{base} / {extension}: {result:?}",
+                );
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn default_library_interface_value_owners_keep_no_argument_heritage() {
+        let library = parse_source_file(concat!(
+            "interface ElementBase {} ",
+            "interface HTMLAnchorElement extends ElementBase {} ",
+            "declare var HTMLAnchorElement: unknown;",
+        ));
+        let source = parse_source_file("");
+        for default_library in [false, true] {
+            let (context, file, _) =
+                default_library_heritage_context(&library, &source, default_library);
+            let owner = interface_symbol(&library, file, &context, "HTMLAnchorElement");
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let result = heritage_plan(&library, file, &context, "HTMLAnchorElement");
+            if default_library {
+                let plan = result.unwrap();
+                assert_eq!(plan.bases.len(), 1);
+                assert!(plan.bases[0].type_arguments.is_empty());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(DirectInterfaceHeritageError::Unsupported { .. })
+                ));
+            }
+            assert!(context.store().declared_type_links(owner).is_none());
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn heritage_primitive_defaults_validate_uncached_annotations() {
+        for keyword in ["any", "unknown", "string"] {
+            let parsed = parse_source_file(&format!(
+                "interface Base<Value = {keyword}> {{ value: Value }} \
+                 interface Derived extends Base {{}}"
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(8_603);
+            let mut context = checker_context(&parsed, file);
+            let owner = interface_symbol(&parsed, file, &context, "Derived");
+            let target = context.get_declared_type_of_symbol(owner).unwrap();
+            let plan = heritage_plan(&parsed, file, &context, "Derived").unwrap();
+            let default = &plan.bases[0].defaults[0];
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let wrong = bootstrap.number_type;
+            let expected = match keyword {
+                "any" => bootstrap.any_type,
+                "unknown" => bootstrap.unknown_type,
+                "string" => bootstrap.string_type,
+                _ => unreachable!(),
+            };
+            let parameter = context
+                .get_declared_type_of_symbol(default.parameter)
+                .unwrap();
+            let TypeData::TypeParameter(data) =
+                context.store().type_payload(parameter).unwrap().data()
+            else {
+                panic!("the default must retain its declared parameter")
+            };
+            assert_eq!(data.resolved_default_type, Some(expected));
+            assert!(
+                context
+                    .store()
+                    .source_direct_type_annotation_is_exact(default.node, expected)
+            );
+            assert!(context.store().type_node_links(default.node).is_none());
+            let original = context
+                .store()
+                .type_node_links(default.node)
+                .cloned()
+                .unwrap_or_default();
+            assert!(context.store_mut_for_test().set_type_node_links(
+                default.node,
+                super::super::TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..super::super::TypeNodeLinks::default()
+                },
+            ));
+            let before = (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert!(context.get_declared_type_of_symbol(owner).is_err());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(default.node, original)
+            );
+            assert_eq!(context.get_declared_type_of_symbol(owner), Ok(target));
+        }
+    }
+
+    #[test]
+    fn generic_heritage_defaults_retain_original_parameter_and_node_caches() {
+        let parsed = parse_source_file(concat!(
+            "interface Base<A, B = A> { value: B; } ",
+            "interface Derived<T> extends Base<T> {} ",
+            "declare const item: Derived<string>; const value = item.value;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_551);
+        let mut context = checker_context(&parsed, file);
+        let derived = interface_symbol(&parsed, file, &context, "Derived");
+        context.check_source_file(file).unwrap();
+        let target = context.get_declared_type_of_symbol(derived).unwrap();
+        let plan = heritage_plan(&parsed, file, &context, "Derived").unwrap();
+        let default = &plan.bases[0].defaults[0];
+        assert_ne!(default.node, default.argument);
+        assert_eq!(default.index, 1);
+        let parameter = context
+            .get_declared_type_of_symbol(default.parameter)
+            .unwrap();
+        let expected = context
+            .get_declared_type_of_symbol(default.earlier_parameter.unwrap())
+            .unwrap();
+        let TypeData::TypeParameter(data) = context.store().type_payload(parameter).unwrap().data()
+        else {
+            panic!("the default must retain its original parameter")
+        };
+        assert_eq!(data.resolved_default_type, Some(expected));
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(default.node)
+                .and_then(|links| links.resolved_type),
+            Some(expected)
+        );
+        let resolution = (data.constraint, data.target, data.mapper);
+        let original_links = context
+            .store()
+            .type_node_links(default.node)
+            .unwrap()
+            .clone();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for poison_node in [false, true] {
+            if poison_node {
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    default.node,
+                    super::super::TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..super::super::TypeNodeLinks::default()
+                    }
+                ));
+            } else {
+                assert!(context.store_mut_for_test().set_type_parameter_resolution(
+                    parameter,
+                    resolution.0,
+                    resolution.1,
+                    resolution.2,
+                    Some(wrong)
+                ));
+            }
+            assert!(context.get_declared_type_of_symbol(derived).is_err());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                warm
+            );
+            assert!(context.store_mut_for_test().set_type_parameter_resolution(
+                parameter,
+                resolution.0,
+                resolution.1,
+                resolution.2,
+                Some(expected)
+            ));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(default.node, original_links.clone())
+            );
+            assert_eq!(context.get_declared_type_of_symbol(derived), Ok(target));
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn generic_heritage_reordered_arguments_preserve_inherited_member_types() {
+        let parsed = parse_source_file(concat!(
+            "interface Base<A, B> { first: A; second: B; } ",
+            "interface Derived<T, U> extends Base<U, T> {} ",
+            "declare const item: Derived<string, number>; ",
+            "const first: number = item.first; const second: string = item.second;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_552);
+        let mut context = checker_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            warm
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn concrete_iterator_heritage_retains_inherited_next_mapper() {
+        let parsed = parse_source_file(concat!(
+            "interface Iterator<T, TReturn = any, TNext = any> { next(value: TNext): T; } ",
+            "interface Derived extends Iterator<number, void, string> {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_550);
+        let mut context = checker_context(&parsed, file);
+        let iterator = interface_symbol(&parsed, file, &context, "Iterator");
+        let derived = interface_symbol(&parsed, file, &context, "Derived");
+        assert_concrete_iterator_next(&mut context, iterator, derived);
+    }
+
+    #[test]
+    fn bundled_iterator_heritage_retains_inherited_next_mapper() {
+        let library = parse_source_file(include_str!(
+            "../../../ts_bundled/libs/lib.es2015.iterable.d.ts"
+        ));
+        let source =
+            parse_source_file("interface Derived extends Iterator<number, void, string> {}");
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let (mut context, library_file, source_file) =
+            default_library_heritage_context(&library, &source, true);
+        let iterator = interface_symbol(&library, library_file, &context, "Iterator");
+        let derived = interface_symbol(&source, source_file, &context, "Derived");
+        assert_concrete_iterator_next(&mut context, iterator, derived);
+    }
+
+    fn assert_concrete_iterator_next(
+        context: &mut CanonicalCheckerContext<'_>,
+        iterator: SemanticSymbolId,
+        derived: SemanticSymbolId,
+    ) {
+        let original_next = context
+            .store()
+            .symbol(iterator)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("next"))
+            .unwrap();
+        let target = context.get_declared_type_of_symbol(derived).unwrap();
+        let TypeData::Interface(data) = context.store().type_payload(target).unwrap().data() else {
+            panic!("Derived must retain its interface type")
+        };
+        let [base] = data.resolved_base_types.as_deref().unwrap() else {
+            panic!("Derived must retain one iterator base")
+        };
+        let base = *base;
+        let reference = validate_direct_generic_reference(context.store(), base).unwrap();
+        let parameters = validate_direct_generic_reference(context.store(), reference.target)
+            .unwrap()
+            .type_arguments;
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        assert_eq!(
+            reference.type_arguments,
+            [bootstrap.number_type, bootstrap.void_type, string],
+        );
+        let inherited_next = data
+            .reference
+            .object
+            .structured
+            .members
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("next"))
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .value_symbol_links(inherited_next)
+                .unwrap()
+                .resolved_type
+                .is_none()
+        );
+        let next = context
+            .store_mut_for_test()
+            .resolve_generic_interface_property(base, "next", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.symbol(), inherited_next);
+        let links = context.store().value_symbol_links(next.symbol()).unwrap();
+        assert_eq!(links.target, Some(original_next));
+        assert_eq!(
+            context
+                .store()
+                .map_type(links.mapper.unwrap(), parameters[2]),
+            Some(string),
+        );
+        let TypeData::Interface(data) = context.store().type_payload(target).unwrap().data() else {
+            panic!("Derived must retain its interface type")
+        };
+        assert!(
+            data.reference
+                .object
+                .structured
+                .properties
+                .as_ref()
+                .unwrap()
+                .contains(&next.symbol())
+        );
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(context.get_declared_type_of_symbol(derived), Ok(target));
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(base, "next", None),
+            Ok(Some(next)),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
     fn reopened_generic_interface_bases_keep_multiple_heritage_bases_and_recursion_lazy() {
         let parsed = parse_source_file(concat!(
             "interface Array<Value> { length: number }\n",
@@ -3321,7 +4416,7 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_generic_interface_bases_preserve_bounded_trailing_primitive_arguments() {
+    fn generic_interface_bases_preserve_mixed_primitive_arguments() {
         for (index, (source, expected)) in [
             (
                 concat!(
@@ -3396,37 +4491,12 @@ mod tests {
     fn forwarded_generic_interface_bases_reject_unverified_substitutions() {
         for (index, source) in [
             concat!(
-                "interface Derived<Value> extends Base<string> {}\n",
-                "interface Base<Item> { inherited: Item }\n",
-            ),
-            concat!(
                 "interface Derived<Value> extends Base<Value[]> {}\n",
                 "interface Base<Item> { inherited: Item }\n",
             ),
             concat!(
-                "interface Derived<First, Second> extends Base<Second, First> {}\n",
-                "interface Base<Left, Right> { left: Left; right: Right }\n",
-            ),
-            concat!(
                 "interface Derived<Value> extends Base<Value> {}\n",
                 "interface Base<Item extends string> { inherited: Item }\n",
-            ),
-            concat!(
-                "interface Derived<Value> extends Base<Value, Value> {}\n",
-                "interface Base<Left, Right> { left: Left; right: Right }\n",
-            ),
-            concat!(
-                "interface Derived<Value> extends Base<string, Value> {}\n",
-                "interface Base<First, Second> {}\n",
-            ),
-            concat!(
-                "interface Derived<First, Second> extends Base<First, string, Second> {}\n",
-                "interface Base<A, B, C> {}\n",
-            ),
-            concat!(
-                "interface Derived<Value> ",
-                "extends Base<Value, string, number, boolean, never> {}\n",
-                "interface Base<A, B, C, D, E> {}\n",
             ),
         ]
         .into_iter()
@@ -3615,7 +4685,7 @@ mod tests {
     }
 
     #[test]
-    fn react_mixin_heritage_appends_only_its_authenticated_lifecycle_default() {
+    fn react_mixin_heritage_uses_the_declared_lifecycle_default() {
         let parsed = parse_source_file(concat!(
             "declare namespace React { ",
             "interface ComponentLifecycle<P, S, SS = any> {} ",
@@ -4058,28 +5128,79 @@ mod tests {
     }
 
     #[test]
-    fn merged_generic_interface_bases_remain_unsupported_without_publication() {
+    fn merged_generic_interface_bases_preserve_inherited_proxy_identity() {
         let parsed = parse_source_file(concat!(
             "interface Base<T> { first: T }\n",
             "interface Base<T> { second: T }\n",
             "interface Derived extends Base<number> { own: boolean }\n",
+            "interface Leaf extends Derived { first: number; extra: string }\n",
+            "declare const item: Derived;\n",
+            "declare const leaf: Leaf; const leafFirst: number = leaf.first;\n",
+            "const leafSecond: number = leaf.second;\n",
+            "const first: number = item.first; const second: number = item.second;\n",
+            "const own: boolean = item.own;\n",
         ));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(8_402);
         let mut context = checker_context(&parsed, file);
         let base = interface_symbol(&parsed, file, &context, "Base");
         let derived = interface_symbol(&parsed, file, &context, "Derived");
-        let cold = (
+        context.check_source_file(file).unwrap();
+        let base_target = context.get_declared_type_of_symbol(base).unwrap();
+        let target = context.get_declared_type_of_symbol(derived).unwrap();
+        assert!(validate_nongeneric_interface_argument_origin(context.store(), target).is_ok());
+        let TypeData::Interface(interface) = context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("Derived must retain its interface identity")
+        };
+        assert!(interface.this_type.is_some());
+        let [base_reference] = interface.resolved_base_types.as_deref().unwrap() else {
+            panic!("Derived must retain one concrete base")
+        };
+        let base_reference = *base_reference;
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), base_reference)
+                .unwrap()
+                .target,
+            base_target
+        );
+        let properties = interface
+            .reference
+            .object
+            .structured
+            .properties
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            properties
+                .iter()
+                .map(|property| context
+                    .store()
+                    .symbol(*property)
+                    .unwrap()
+                    .name()
+                    .as_utf8()
+                    .unwrap())
+                .collect::<Vec<_>>(),
+            ["own", "first", "second"]
+        );
+        for property in &properties[1..] {
+            let links = context.store().value_symbol_links(*property).unwrap();
+            assert!(links.target.is_some());
+            assert!(links.mapper.is_some());
+            assert_eq!(
+                links.resolved_type,
+                Some(context.store().intrinsic_bootstrap().unwrap().number_type)
+            );
+        }
+        let warm = (
             context.store().type_len(),
             context.store().signature_len(),
             context.store().symbol_store().symbol_table_len(),
             context.store().checker_link_allocated_lengths(),
         );
 
-        assert!(matches!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(_))
-        ));
+        context.recheck_source_file(file).unwrap();
         assert_eq!(
             (
                 context.store().type_len(),
@@ -4087,10 +5208,82 @@ mod tests {
                 context.store().symbol_store().symbol_table_len(),
                 context.store().checker_link_allocated_lengths(),
             ),
-            cold,
+            warm,
         );
-        assert!(context.store().declared_type_links(base).is_none());
-        assert!(context.store().declared_type_links(derived).is_none());
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn inherited_generic_property_reads_reject_proxy_cache_poison() {
+        let parsed = parse_source_file(concat!(
+            "interface Base<T> { value: T; } ",
+            "interface Derived extends Base<number> {} ",
+            "declare const item: Derived; const value: number = item.value;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_553);
+        let mut context = checker_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let owner = interface_symbol(&parsed, file, &context, "Derived");
+        let target = context.get_declared_type_of_symbol(owner).unwrap();
+        let property = context
+            .store_mut_for_test()
+            .resolved_own_property(target, "value")
+            .unwrap()
+            .unwrap()
+            .symbol;
+        let original = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .clone();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for poison_mapper in [false, true] {
+            let mut poisoned = original.clone();
+            if poison_mapper {
+                poisoned.mapper = None;
+            } else {
+                poisoned.resolved_type = Some(string);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, poisoned)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .resolved_own_property(target, "value")
+                    .is_err()
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                warm
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, original.clone())
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolved_own_property(target, "value")
+                    .unwrap()
+                    .unwrap()
+                    .symbol,
+                property
+            );
+        }
         assert!(context.diagnostics().is_empty());
     }
 }

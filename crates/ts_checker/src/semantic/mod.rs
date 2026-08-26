@@ -23,6 +23,7 @@ mod conditional_types;
 mod constraints;
 mod contextual;
 pub mod declared;
+mod declared_values;
 mod derived_types;
 pub mod diagnostics;
 mod enums;
@@ -36,7 +37,10 @@ mod inference;
 mod instantiate;
 mod instantiated_members;
 mod interface_heritage;
+#[allow(dead_code)] // Array binding owns the integration of this index query.
+mod interface_indexes;
 mod intersection_types;
+mod iteration_types;
 pub mod jsdoc;
 mod jsx;
 #[allow(dead_code)] // Root owns the checker-cache and type-node integration adapter.

@@ -14,7 +14,8 @@ use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
-    CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
+    CheckFlags, EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolFlags,
+    SymbolTableId,
 };
 
 use super::{
@@ -22,7 +23,10 @@ use super::{
     ResolvedSignatureState, SignatureLinks,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
-    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+    callable_sets::{
+        StoredCallableSetValidation, validate_stored_callable_set,
+        validate_stored_declared_method_callable_set,
+    },
     callables::{
         CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
         validate_stored_single_callable,
@@ -41,7 +45,11 @@ use super::{
     },
     ids::{IndexInfoId, SignatureId, TypeId},
     indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
-    instantiated_members::{GenericInterfaceMemberError, validate_generic_interface_members},
+    instantiate::{InstantiationLimits, InstantiationSession},
+    instantiated_members::{
+        GenericInterfaceMemberError, demand_instantiated_property_type,
+        validate_generic_interface_members,
+    },
     intersection_types::IntersectionTypeProjection,
     links::{MembersOrExportsResolutionKind, TypeNodeLinks, ValueSymbolLinks},
     mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
@@ -54,8 +62,8 @@ use super::{
     signatures::{ElementFlags, SignatureFlags, Ternary},
     store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
-        InterfaceHeritageMembersValidation, validate_interface_heritage_members,
-        validate_planned_interface_heritage_members,
+        InterfaceHeritageMembersValidation, inherited_generic_property_reference,
+        validate_interface_heritage_members, validate_planned_interface_heritage_members,
     },
     template_types::StringMappingKind,
     tuple_types::TupleShape,
@@ -519,6 +527,7 @@ pub(super) struct ResolvedOwnProperty {
 #[derive(Clone, Copy)]
 enum ObjectPropertyOrigin {
     Declared,
+    InterfaceHeritage(TypeId),
     ValidatedClass,
     SyntheticStructural(TypeId),
     FiniteMappedRecord(TypeId),
@@ -533,7 +542,10 @@ enum ObjectPropertyOrigin {
 
 impl ObjectPropertyOrigin {
     fn is_declared(self) -> bool {
-        matches!(self, Self::Declared | Self::ValidatedClass)
+        matches!(
+            self,
+            Self::Declared | Self::ValidatedClass | Self::InterfaceHeritage(_)
+        )
     }
 }
 
@@ -608,6 +620,7 @@ struct RelaterSession<'store> {
     global_types: Option<RelationGlobalTypes>,
     strict_function_types: Option<bool>,
     validated_unions: HashMap<TypeId, Vec<TypeId>>,
+    inherited_property_references: HashMap<SemanticSymbolId, TypeId>,
     observation: RelationObservationToken,
     pending: PendingRelationCache,
     maybe_keys: Vec<CacheHashKey>,
@@ -696,6 +709,7 @@ impl<'store> RelaterSession<'store> {
             global_types,
             strict_function_types,
             validated_unions: HashMap::new(),
+            inherited_property_references: HashMap::new(),
             observation,
             pending: PendingRelationCache::default(),
             maybe_keys: Vec::new(),
@@ -3291,9 +3305,8 @@ impl<'store> RelaterSession<'store> {
                         .property_symbol(property, members.property_origin)?
                         .flags()
                         .contains(SymbolFlags::OPTIONAL);
-                    target_types.extend(
-                        self.effective_property_types(self.property_type(property)?, optional)?,
-                    );
+                    let property_type = self.property_type(property)?;
+                    target_types.extend(self.effective_property_types(property_type, optional)?);
                 } else {
                     target_types.push(self.bootstrap.undefined_type);
                 }
@@ -3444,9 +3457,11 @@ impl<'store> RelaterSession<'store> {
             if *source_property == target_property {
                 continue;
             }
+            let source_type = self.property_type(*source_property)?;
+            let target_type = self.property_type(target_property)?;
             let related = self.is_related_to_ex(
-                self.property_type(*source_property)?,
-                self.property_type(target_property)?,
+                source_type,
+                target_type,
                 RecursionFlags::BOTH,
                 IntersectionState::NONE,
             )?;
@@ -3630,8 +3645,9 @@ impl<'store> RelaterSession<'store> {
                 if !self.index_signature_accepts_name(target, &[*target_index], name.as_ref())? {
                     continue;
                 }
+                let property_type = self.property_type(*property)?;
                 let related = self.is_related_to_ex(
-                    self.property_type(*property)?,
+                    property_type,
                     target_value,
                     RecursionFlags::BOTH,
                     intersection_state,
@@ -4190,7 +4206,18 @@ impl<'store> RelaterSession<'store> {
         Ok(result)
     }
 
-    fn property_type(&self, symbol: SemanticSymbolId) -> Result<TypeId, RelationUnavailable> {
+    fn property_type(&mut self, symbol: SemanticSymbolId) -> Result<TypeId, RelationUnavailable> {
+        if let Some(reference) = self.inherited_property_references.get(&symbol).copied() {
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            return demand_instantiated_property_type(
+                self.store,
+                reference,
+                symbol,
+                self.global_types.map(|globals| globals.array_targets),
+                &mut session,
+            )
+            .map_err(|_| RelationUnavailable::UnsupportedProperty(symbol));
+        }
         self.store
             .value_symbol_links(symbol)
             .and_then(|links| links.resolved_type)
@@ -4495,11 +4522,40 @@ impl<'store> RelaterSession<'store> {
             .ok_or(RelationUnavailable::Symbol(global_object))
     }
 
+    fn property_origin_for_symbol(
+        &self,
+        symbol: SemanticSymbolId,
+        origin: ObjectPropertyOrigin,
+    ) -> Result<ObjectPropertyOrigin, RelationUnavailable> {
+        let ObjectPropertyOrigin::InterfaceHeritage(receiver) = origin else {
+            return Ok(origin);
+        };
+        let record = self
+            .store
+            .symbol(symbol)
+            .ok_or(RelationUnavailable::Symbol(symbol))?;
+        if record.flags().contains(SymbolFlags::TRANSIENT)
+            && record.check_flags().contains(CheckFlags::INSTANTIATED)
+        {
+            let reference = inherited_generic_property_reference(
+                self.store,
+                receiver,
+                symbol,
+                self.global_types.map(|globals| globals.array_targets),
+            )
+            .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
+            Ok(ObjectPropertyOrigin::GenericReference(reference))
+        } else {
+            Ok(ObjectPropertyOrigin::Declared)
+        }
+    }
+
     fn property_symbol(
         &mut self,
         symbol: SemanticSymbolId,
         origin: ObjectPropertyOrigin,
     ) -> Result<&ts_binder::semantic::Symbol, RelationUnavailable> {
+        let origin = self.property_origin_for_symbol(symbol, origin)?;
         let record = self
             .store
             .symbol(symbol)
@@ -4703,6 +4759,7 @@ impl<'store> RelaterSession<'store> {
                 };
             }
             ObjectPropertyOrigin::Declared
+            | ObjectPropertyOrigin::InterfaceHeritage(_)
             | ObjectPropertyOrigin::ValidatedClass
             | ObjectPropertyOrigin::GenericReference(_) => {}
         }
@@ -4712,25 +4769,16 @@ impl<'store> RelaterSession<'store> {
             self.validated_class_method_callable(symbol)?;
             return Ok(record);
         }
-        if matches!(origin, ObjectPropertyOrigin::Declared) && record.flags() == SymbolFlags::METHOD
+        if matches!(origin, ObjectPropertyOrigin::Declared)
+            && record.flags().contains(SymbolFlags::METHOD)
         {
-            let links = self
-                .store
-                .value_symbol_links(symbol)
-                .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
-            let type_ = links
-                .resolved_type
-                .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
-            return if links
-                == &(ValueSymbolLinks {
-                    resolved_type: Some(type_),
-                    ..ValueSymbolLinks::default()
-                })
-                && super::structured_members::valid_interface_method_value(
-                    self.store, symbol, type_,
-                )
-                .is_some()
-            {
+            let (callable, _) =
+                super::object_members::declared_method_value_types(self.store, symbol)
+                    .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
+            return if matches!(
+                validate_stored_declared_method_callable_set(self.store, callable),
+                Some(StoredCallableSetValidation::Valid { .. })
+            ) {
                 Ok(record)
             } else {
                 Err(RelationUnavailable::UnsupportedProperty(symbol))
@@ -4754,7 +4802,9 @@ impl<'store> RelaterSession<'store> {
                 .ok_or(RelationUnavailable::Symbol(parent))?;
             let allowed_parent_flags = match origin {
                 ObjectPropertyOrigin::ValidatedClass => SymbolFlags::CLASS,
-                ObjectPropertyOrigin::Declared | ObjectPropertyOrigin::GenericReference(_) => {
+                ObjectPropertyOrigin::Declared
+                | ObjectPropertyOrigin::InterfaceHeritage(_)
+                | ObjectPropertyOrigin::GenericReference(_) => {
                     SymbolFlags::INTERFACE | SymbolFlags::TYPE_LITERAL
                 }
                 ObjectPropertyOrigin::FreshObjectLiteral(_)
@@ -5100,6 +5150,14 @@ impl<'store> RelaterSession<'store> {
         }
         if record.flags() != TypeFlags::OBJECT || !self.supports_property_object_alias(type_id) {
             return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
+        }
+        if self
+            .store
+            .direct_interface_heritage_provenance(type_id)
+            .is_some()
+        {
+            validate_direct_interface_heritage_relation_endpoint(self.store, type_id)?;
+            return Ok(());
         }
         if record.object_flags().intersects(ObjectFlags::REFERENCE) {
             let reference_target = match record.data() {
@@ -5693,6 +5751,14 @@ impl<'store> RelaterSession<'store> {
                 )
             }
             DerivedObjectLiteralValidation::NotDerived
+                if self
+                    .store
+                    .direct_interface_heritage_provenance(type_id)
+                    .is_some() =>
+            {
+                ObjectPropertyOrigin::InterfaceHeritage(type_id)
+            }
+            DerivedObjectLiteralValidation::NotDerived
                 if record_object_flags.intersects(ObjectFlags::REFERENCE)
                     && !record_object_flags.intersects(ObjectFlags::CLASS)
                     && record_symbol
@@ -5774,7 +5840,15 @@ impl<'store> RelaterSession<'store> {
             if !property_set.insert(*property) {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
-            let property_record = self.property_symbol(*property, property_origin)?;
+            let origin = self.property_origin_for_symbol(*property, property_origin)?;
+            if matches!(property_origin, ObjectPropertyOrigin::InterfaceHeritage(_))
+                && let ObjectPropertyOrigin::GenericReference(reference) = origin
+            {
+                self.inherited_property_references
+                    .entry(*property)
+                    .or_insert(reference);
+            }
+            let property_record = self.property_symbol(*property, origin)?;
             if property_origin.is_declared()
                 && property_record.parent() != record_symbol
                 && heritage_members != InterfaceHeritageMembersValidation::Valid
@@ -6112,14 +6186,50 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     /// Looks up one required-or-optional own property without synthesizing an
     /// apparent member, a global `Object` augmentation, or an index result.
     ///
-    /// The receiver must already be in the exact declared/fresh/derived
-    /// property-only object domain validated by structural relation. A valid
-    /// receiver with no such own property returns `None`; unsupported receiver
-    /// kinds and malformed warm state retain their typed relation failure.
+    /// Nongeneric receivers use the declared/fresh/derived object validation
+    /// from structural relation. Generic references use their declared member
+    /// table and resolve a selected lazy property type. A valid missing name
+    /// returns `None`. Unsupported receivers and invalid caches remain errors.
     pub(super) fn resolved_own_property(
         &mut self,
         type_id: TypeId,
         name: &str,
+    ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+        if self.direct_interface_heritage_provenance(type_id).is_some() {
+            return self.resolved_own_property_by_key(type_id, EscapedNameRef::source(name));
+        }
+        let mut session = super::instantiate::InstantiationSession::new(
+            super::instantiate::InstantiationLimits::default(),
+        );
+        let property = super::object_members::resolve_object_property_by_key(
+            self,
+            None,
+            type_id,
+            EscapedNameRef::source(name),
+            &mut session,
+        )?;
+        if property.is_none()
+            && self
+                .type_payload(type_id)
+                .and_then(|record| record.data().structured())
+                .is_some_and(|structured| {
+                    structured
+                        .signatures
+                        .as_ref()
+                        .is_some_and(|signatures| !signatures.is_empty())
+                })
+        {
+            return Err(RelationUnavailable::StructuredSignatures(type_id));
+        }
+        Ok(property)
+    }
+
+    /// Uses the validated property view for a byte-exact source or symbol key.
+    /// Inherited properties keep the symbol selected by member resolution.
+    pub(super) fn resolved_own_property_by_key(
+        &mut self,
+        type_id: TypeId,
+        name: EscapedNameRef<'_>,
     ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
         let bootstrap = self.relation_bootstrap_facts()?;
         let mut session = RelaterSession::new(self, RelationKind::Assignable, bootstrap);
@@ -6134,7 +6244,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .store
             .symbol_table(members)
             .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?
-            .get_source(name);
+            .get(name);
         let Some(property) = property else {
             return Ok(None);
         };
@@ -17355,6 +17465,98 @@ mod tests {
             }))
         );
         assert_eq!(store.resolved_own_property(object, "missing"), Ok(None));
+    }
+
+    #[test]
+    fn symbol_key_lookup_does_not_match_displayed_source_names_or_hide_invalid_caches() {
+        let library = parse_source_file("");
+        let source = parse_source_file("const row = { \"__@iterator\": 1 };\n");
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(96_480);
+        let mut context =
+            source_relation_context(&library, &source, file, CanonicalCheckerOptions::default());
+        let object =
+            source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::ObjectLiteralExpression(_))
+                        .then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .unwrap();
+        let receiver = context.get_type_at_location(object).unwrap();
+        let key = ts_binder::semantic::SymbolStore::known_symbol_name("iterator");
+        let store = context.store_mut_for_test();
+        let selected = store
+            .resolved_own_property(receiver, "__@iterator")
+            .unwrap()
+            .unwrap();
+        let warm = (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.symbol_store().symbol_table_len(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            store.resolved_own_property_by_key(receiver, key.as_ref()),
+            Ok(None),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.symbol_store().symbol_table_len(),
+                store.relation_state_snapshot(),
+            ),
+            warm,
+        );
+
+        let links = store.value_symbol_links(selected.symbol).unwrap().clone();
+        assert!(store.set_value_symbol_links(
+            selected.symbol,
+            ValueSymbolLinks {
+                name_type: Some(selected.type_),
+                ..links.clone()
+            },
+        ));
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.symbol_store().symbol_table_len(),
+            store.relation_state_snapshot(),
+        );
+        assert!(
+            store
+                .resolved_own_property_by_key(receiver, key.as_ref())
+                .is_err()
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.symbol_store().symbol_table_len(),
+                store.relation_state_snapshot(),
+            ),
+            before,
+        );
+        assert!(store.set_value_symbol_links(selected.symbol, links));
+        assert_eq!(
+            store.resolved_own_property(receiver, "__@iterator"),
+            Ok(Some(selected))
+        );
+
+        let foreign = initialized(false)
+            .intrinsic_bootstrap()
+            .unwrap()
+            .empty_type_literal_type;
+        assert_eq!(
+            store.resolved_own_property_by_key(foreign, key.as_ref()),
+            Err(RelationUnavailable::Type(foreign)),
+        );
     }
 
     #[test]

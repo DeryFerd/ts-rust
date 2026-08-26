@@ -9,6 +9,8 @@
 //! Unsupported semantic dependencies fail construction instead of silently
 //! changing a type identity.
 
+use std::collections::HashSet;
+
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalNameResolutionError, SemanticSymbolId, SymbolFlags, SymbolTableId, resolve_global_name,
@@ -453,6 +455,164 @@ pub(super) fn initialize_global_library_types(
         this_type,
         diagnostics: resolver.diagnostics,
     })
+}
+
+/// Checks the optional `Iterable` declaration and cache without creating types.
+pub(super) fn global_iterable_type_requires_protocol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+) -> Result<bool, CanonicalGlobalTypeInitializationError> {
+    optional_global_type_has_arity(store, host, "Iterable", 3)
+}
+
+/// Validates an optional global identity without publishing declaration caches.
+pub(super) fn optional_global_type_has_arity(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    name: &str,
+    expected_arity: usize,
+) -> Result<bool, CanonicalGlobalTypeInitializationError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(CanonicalGlobalTypeInitializationError::MissingBootstrap)?;
+    if store.symbol_table(bootstrap.globals).is_none() {
+        return Err(CanonicalGlobalTypeInitializationError::InvalidGlobals(
+            bootstrap.globals,
+        ));
+    }
+    let symbol = {
+        let mut resolver_host = host.name_resolver_host(store)?;
+        resolve_global_name(
+            store.symbol_store(),
+            &mut resolver_host,
+            name,
+            SymbolFlags::TYPE,
+            None,
+            false,
+            false,
+        )?
+    };
+    let Some(symbol) = symbol else {
+        return Ok(false);
+    };
+    let symbol = store.get_merged_symbol(symbol).ok_or(
+        CanonicalGlobalTypeInitializationError::InvalidSymbol(symbol),
+    )?;
+    let record =
+        store
+            .symbol(symbol)
+            .ok_or(CanonicalGlobalTypeInitializationError::InvalidSymbol(
+                symbol,
+            ))?;
+    let flags = record.flags();
+    if !flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
+        return Ok(false);
+    }
+    if super::declared::malformed_alias_merge(flags) {
+        return Err(DeclaredTypeError::Unavailable(
+            super::declared::DeclaredTypeUnavailable::AliasMergedWithDeclaredSymbol(symbol),
+        )
+        .into());
+    }
+    let arity =
+        super::declared::preflight_class_or_interface_reference(store, host, symbol, flags)?;
+    let declarations = record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+        .ok_or(CanonicalGlobalTypeInitializationError::InvalidSymbol(
+            symbol,
+        ))?;
+    let mut checked = HashSet::new();
+    let mut parameters = HashSet::new();
+    let mut has_class = false;
+    let mut has_interface = false;
+    for declaration in declarations {
+        let node = super::declared::preflight_node(store, host, *declaration)?;
+        if !host.symbol_matches(store, *declaration, symbol) {
+            return Err(CanonicalGlobalTypeInitializationError::InvalidSymbol(
+                symbol,
+            ));
+        }
+        let declared_parameters = match &node.data {
+            NodeData::ClassDeclaration(data) if node.kind == SyntaxKind::ClassDeclaration => {
+                has_class = true;
+                data.type_parameters.as_ref()
+            }
+            NodeData::ClassExpression(data) if node.kind == SyntaxKind::ClassExpression => {
+                has_class = true;
+                data.type_parameters.as_ref()
+            }
+            NodeData::InterfaceDeclaration(data)
+                if node.kind == SyntaxKind::InterfaceDeclaration =>
+            {
+                has_interface = true;
+                data.type_parameters.as_ref()
+            }
+            NodeData::TypeAliasDeclaration(_) => {
+                return Err(CanonicalGlobalTypeInitializationError::InvalidSymbol(
+                    symbol,
+                ));
+            }
+            _ if matches!(
+                node.kind,
+                SyntaxKind::ClassDeclaration
+                    | SyntaxKind::ClassExpression
+                    | SyntaxKind::InterfaceDeclaration
+            ) =>
+            {
+                return Err(CanonicalGlobalTypeInitializationError::InvalidSymbol(
+                    symbol,
+                ));
+            }
+            _ => continue,
+        };
+        parameters.extend(super::declared::explicit_type_parameter_symbols(
+            store,
+            host,
+            *declaration,
+            declared_parameters,
+            &mut checked,
+        )?);
+    }
+    let cached_arity = store
+        .declared_type_links(symbol)
+        .and_then(|links| links.declared_type)
+        .map(|type_| interface_arity(store, type_))
+        .transpose()?;
+    if flags.contains(SymbolFlags::CLASS) != has_class
+        || !has_class && !has_interface
+        || arity != parameters.len()
+        || cached_arity.is_some_and(|cached| cached != parameters.len())
+    {
+        return Err(CanonicalGlobalTypeInitializationError::InvalidSymbol(
+            symbol,
+        ));
+    }
+    Ok(arity == expected_arity)
+}
+
+/// Resolves an optional global through the same kind and arity rules as initialization.
+pub(super) fn resolve_optional_global_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    name: &str,
+    arity: usize,
+) -> Result<Option<TypeId>, CanonicalGlobalTypeInitializationError> {
+    if !optional_global_type_has_arity(store, host, name, arity)? {
+        return Ok(None);
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(CanonicalGlobalTypeInitializationError::MissingBootstrap)?;
+    let mut resolver = GlobalTypeResolver {
+        globals: bootstrap.globals,
+        empty_object_type: bootstrap.empty_object_type,
+        empty_generic_type: bootstrap.empty_generic_type,
+        store,
+        host,
+        diagnostics: Vec::new(),
+    };
+    resolver.resolve(name, arity, false).map(Some)
 }
 
 /// Proves the pinned no-heritage `Object` fast path without resolving any

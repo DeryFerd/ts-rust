@@ -26,7 +26,10 @@ use super::{
     instantiate::instantiated_member_type_matches,
     links::ValueSymbolLinks,
     mapper::TypeMapperApplication,
-    object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
+    object_members::{
+        StoredDeclaredCallSetValidation, declared_method_value_links, declared_method_value_types,
+        validate_stored_declared_call_set,
+    },
     reference_types::validate_direct_generic_reference,
     signatures::SignatureFlags,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
@@ -747,14 +750,6 @@ fn validate_stored_instantiated_interface_method_callable_set(
     let family = CallableFamily::DeclaredCallSignatures;
 
     let authenticated = (|| {
-        let source_validation = validate_stored_declared_method_callable_set(store, source)?;
-        let StoredCallableSetValidation::Valid {
-            projection: original,
-            ..
-        } = source_validation
-        else {
-            return None;
-        };
         let method_record = store.symbol(method)?;
         let owner_record = store.symbol(owner)?;
         let declarations = method_record.declarations()?;
@@ -765,22 +760,25 @@ fn validate_stored_instantiated_interface_method_callable_set(
         let this_type = interface.this_type?;
         let receiver = store.map_type(mapper, this_type)?;
         let receiver_reference = validate_direct_generic_reference(store, receiver).ok()?;
-        let array_targets = if matches!(
+        let global_owner = matches!(
             owner_record.name().as_utf8(),
             Some("Array" | "ReadonlyArray")
-        ) {
+        )
+        .then(|| {
             let globals = store.intrinsic_bootstrap()?.globals;
-            let global_owner = store
+            store
                 .symbol_table(globals)?
                 .get(owner_record.name())
-                .and_then(|owner| store.get_merged_symbol(owner));
+                .and_then(|owner| store.get_merged_symbol(owner))
+        })
+        .flatten();
+        let array_targets = if global_owner == Some(owner) {
             let targets = CanonicalArrayTargets::for_single_target_validation(owner_type);
-            if global_owner != Some(owner)
-                || store
-                    .canonical_array_reference_with_targets(targets, receiver)
-                    .ok()
-                    .flatten()
-                    .is_none_or(|reference| reference.base_type != receiver)
+            if store
+                .canonical_array_reference_with_targets(targets, receiver)
+                .ok()
+                .flatten()
+                .is_none_or(|reference| reference.base_type != receiver)
             {
                 return None;
             }
@@ -788,6 +786,24 @@ fn validate_stored_instantiated_interface_method_callable_set(
         } else {
             None
         };
+        if !super::instantiated_members::published_interface_method_source_matches(
+            store,
+            receiver,
+            method,
+            source,
+            array_targets,
+        ) {
+            return None;
+        }
+        let original =
+            validate_stored_callable_set_projection_with(store, source, true, |signature| {
+                store
+                    .callable_signature_parameter_types(signature)
+                    .map(<[TypeId]>::to_vec)
+            })?;
+        if !original.construct_signatures.is_empty() {
+            return None;
+        }
         if parameters.is_empty()
             || receiver_reference.target != owner_type
             || receiver_reference.type_arguments.len() != parameters.len()
@@ -826,11 +842,6 @@ fn validate_stored_instantiated_interface_method_callable_set(
                 .is_some()
             || object.structured.call_signature_count != original.call_signatures.len()
             || declarations.len() != original.call_signatures.len()
-            || store.value_symbol_links(method)
-                != Some(&ValueSymbolLinks {
-                    resolved_type: Some(source),
-                    ..ValueSymbolLinks::default()
-                })
         {
             return None;
         }
@@ -1571,6 +1582,12 @@ pub(super) fn validate_stored_declared_method_callable_set(
 
     let family = CallableFamily::DeclaredCallSignatures;
     let authenticated = (|| {
+        let optional = store.declared_method_optional_flag(method_symbol)?;
+        let pending_value = optional
+            && store.intrinsic_bootstrap()?.options.strict_null_checks
+            && store.value_symbol_links(method_symbol).is_none_or(|links| {
+                declared_method_value_links(store, method_symbol, None).as_ref() == Some(links)
+            });
         let declarations = method.declarations()?;
         let owner_declarations = owner.declarations()?;
         let (authenticated_owner, owner_type) = if interface_owner {
@@ -1584,9 +1601,14 @@ pub(super) fn validate_stored_declared_method_callable_set(
                 && owner_record.object_flags().contains(ObjectFlags::INTERFACE)
                 && owner_record.alias().is_none()
         } else {
-            matches!(owner_record.data(), TypeData::Object(_))
-                && owner_record.object_flags()
+            matches!(owner_record.data(), TypeData::Object(object)
+                if owner_record.object_flags()
                     == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+                    || owner_record.object_flags() == ObjectFlags::ANONYMOUS
+                        && object.structured == StructuredTypeData::default()
+                        && object.target.is_none()
+                        && object.mapper.is_none()
+                        && object.instantiations == TypeCacheState::Unallocated)
         };
         let allowed_owner_flags = SymbolFlags::INTERFACE
             | SymbolFlags::FUNCTION_SCOPED_VARIABLE
@@ -1603,11 +1625,9 @@ pub(super) fn validate_stored_declared_method_callable_set(
             || owner_record.flags() != TypeFlags::OBJECT
             || !valid_owner_type
             || owner_record.symbol() != Some(owner_symbol)
-            || method.flags() != SymbolFlags::METHOD
-            || method.check_flags() != CheckFlags::NONE
+            || declared_method_value_links(store, method_symbol, None).is_none()
             || method.name().is_reserved_member_name()
             || method.name().is_private_identifier()
-            || method.name().is_late_bound()
             || method
                 .value_declaration()
                 .is_none_or(|declaration| !declarations.contains(&declaration))
@@ -1615,17 +1635,9 @@ pub(super) fn validate_stored_declared_method_callable_set(
             || method.exports().is_some()
             || method.export_symbol().is_some()
             || store.get_merged_symbol(method_symbol) != Some(method_symbol)
-            || owner
-                .members()
-                .and_then(|members| store.symbol_table(members))
-                .and_then(|members| members.get(method.name()))
-                .and_then(|method| store.get_merged_symbol(method))
-                != Some(method_symbol)
-            || store.value_symbol_links(method_symbol)
-                != Some(&ValueSymbolLinks {
-                    resolved_type: Some(type_),
-                    ..ValueSymbolLinks::default()
-                })
+            || !pending_value
+                && declared_method_value_types(store, method_symbol).map(|(callable, _)| callable)
+                    != Some(type_)
         {
             return None;
         }
@@ -1720,11 +1732,12 @@ pub(super) fn validate_stored_declared_method_callable_set(
             edges.push(return_type);
         }
 
-        Some((projection, edges))
+        Some((projection, edges, pending_value))
     })();
 
     Some(match authenticated {
-        Some((projection, edges)) => StoredCallableSetValidation::Valid {
+        Some((_, _, true)) => StoredCallableSetValidation::Pending { family },
+        Some((projection, edges, false)) => StoredCallableSetValidation::Valid {
             family,
             projection,
             edges,
@@ -1849,17 +1862,22 @@ fn validated_method_signature_parameter_types(
         }
         let annotation = store.source_direct_type_annotation(*parameter_declaration)?;
         let annotated = validated_method_annotation_type(store, annotation)?;
-        if annotated != type_ {
-            let undefined = store.intrinsic_bootstrap()?.undefined_type;
-            let TypeData::Union(union) = store.type_payload(type_)?.data() else {
-                return None;
-            };
-            if union.union.types.len() != 2
-                || !union.union.types.contains(&annotated)
-                || !union.union.types.contains(&undefined)
-            {
-                return None;
-            }
+        let optional = (0..parameter_declaration.node.index()).any(|index| {
+            let node = ts_ast::NodeRef::new(
+                parameter_declaration.arena,
+                parameter_declaration.file,
+                ts_ast::NodeId::new(u32::try_from(index).expect("source node indices fit in u32")),
+            );
+            store.source_node_kind(node) == Some(SyntaxKind::QuestionToken)
+                && store.source_node_parent(node)
+                    == Some(SourceNodeParent::Parent(*parameter_declaration))
+        });
+        if optional && store.intrinsic_bootstrap()?.options.strict_null_checks {
+            store
+                .validate_optional_parameter_type_metadata(annotated, type_)
+                .ok()?;
+        } else if annotated != type_ {
+            return None;
         }
         parameter_types.push(type_);
     }

@@ -37,6 +37,7 @@ use super::{
         valid_stored_callable_type_predicate,
     },
     store::SourceNodeParent,
+    tuple_type_nodes::{TupleTypeNodeError, plan_tuple_type_node, validate_warm_tuple_elements},
     type_records::{ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -205,9 +206,17 @@ pub(super) struct PendingFunctionType {
 pub(super) struct PendingFunctionTypeProof {
     store: SemanticStoreId,
     type_: TypeId,
-    signature: SignatureId,
     array_targets: Option<CanonicalArrayTargets>,
-    plan: FunctionTypePlan,
+    source: PendingCallableSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingCallableSource {
+    Function {
+        signature: SignatureId,
+        plan: Box<FunctionTypePlan>,
+    },
+    DeclaredMethod(Box<super::object_members::PendingDeclaredMethodTypeProof>),
 }
 
 impl PendingFunctionTypeProof {
@@ -221,6 +230,20 @@ impl PendingFunctionTypeProof {
 
     pub(super) const fn array_targets(&self) -> Option<CanonicalArrayTargets> {
         self.array_targets
+    }
+
+    pub(super) fn declared_method(
+        store: &CanonicalTypeMapperStore,
+        type_: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+        proof: super::object_members::PendingDeclaredMethodTypeProof,
+    ) -> Self {
+        Self {
+            store: store.id(),
+            type_,
+            array_targets,
+            source: PendingCallableSource::DeclaredMethod(Box::new(proof)),
+        }
     }
 }
 
@@ -499,12 +522,16 @@ pub(super) fn plan_function_type(
                 type_node,
                 array_targets,
             )?;
+        let fixed_tuple_rest = data.dot_dot_dot_token.is_some()
+            && !implicit_any_rest
+            && plan_fixed_tuple_rest_annotation(store, host, parameter, type_node, array_targets)?;
         let typed_rest = data.dot_dot_dot_token.is_some()
             && !implicit_any_rest
-            && matches!(
-                preflight_node(store, host, type_node)?.kind,
-                SyntaxKind::ArrayType | SyntaxKind::InferType
-            );
+            && (fixed_tuple_rest
+                || matches!(
+                    preflight_node(store, host, type_node)?.kind,
+                    SyntaxKind::ArrayType | SyntaxKind::InferType
+                ));
         let rest_type_parameter = if data.dot_dot_dot_token.is_some()
             && !implicit_any_rest
             && !explicit_any_rest
@@ -569,6 +596,11 @@ pub(super) fn plan_function_type(
                                     || parameter.flags.0 != 0
                                     || parameter.parent != Some(type_node.node)
                             })
+                        }
+                        NodeData::TupleTypeNode(_) | NodeData::UnionTypeNode(_)
+                            if fixed_tuple_rest =>
+                        {
+                            false
                         }
                         _ => true,
                     }
@@ -819,6 +851,189 @@ pub(super) fn plan_function_type(
     };
     function_type_state(store, &plan, true)?;
     Ok(plan)
+}
+
+fn plan_fixed_tuple_rest_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    parameter: NodeRef,
+    annotation: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, FunctionTypeError> {
+    let record = preflight_node(store, host, annotation)?;
+    let tuples = match (&record.data, record.kind) {
+        (NodeData::TupleTypeNode(_), SyntaxKind::TupleType) => vec![annotation],
+        (NodeData::UnionTypeNode(union), SyntaxKind::UnionType) => {
+            if record.flags.0 != 0
+                || union.types.nodes.len() < 2
+                || union.types.has_trailing_comma
+                || union.types.range != record.range
+            {
+                return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+                    parameter,
+                )));
+            }
+            let mut tuples = Vec::with_capacity(union.types.nodes.len());
+            let mut previous_end = record.range.start;
+            for constituent in &union.types.nodes {
+                let constituent = NodeRef::new(annotation.arena, annotation.file, *constituent);
+                let constituent_record = preflight_node(store, host, constituent)?;
+                if constituent_record.parent != Some(annotation.node)
+                    || constituent_record.range.start < previous_end
+                    || constituent_record.range.end > record.range.end
+                    || constituent_record.flags.0 != 0
+                {
+                    return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+                        parameter,
+                    )));
+                }
+                if constituent_record.kind != SyntaxKind::TupleType {
+                    return Ok(false);
+                }
+                previous_end = constituent_record.range.end;
+                tuples.push(constituent);
+            }
+            tuples
+        }
+        _ => return Ok(false),
+    };
+    let invalid_cache = || invariant(FunctionTypeInvariant::InvalidParameterCache(parameter));
+    let cached_union = if record.kind == SyntaxKind::UnionType {
+        let links = store.type_node_links(annotation);
+        if links.is_some_and(|links| links.outer_type_parameters.is_some()) {
+            return Err(invalid_cache());
+        }
+        links.and_then(|links| links.resolved_type)
+    } else {
+        None
+    };
+    let mut cached_members = Vec::with_capacity(tuples.len());
+    for tuple in tuples {
+        let planned =
+            plan_tuple_type_node(store, host, tuple, array_targets).map_err(
+                |error| match error {
+                    TupleTypeNodeError::DeclaredType(error) => {
+                        FunctionTypeError::DeclaredType(error)
+                    }
+                    TupleTypeNodeError::UnsupportedSyntax { .. }
+                    | TupleTypeNodeError::UnsupportedElementOrder { .. }
+                    | TupleTypeNodeError::AuthoritativeArrayTargetsRequired(_) => {
+                        FunctionTypeError::Unsupported(FunctionTypeUnsupported::RestParameter(
+                            parameter,
+                        ))
+                    }
+                    TupleTypeNodeError::InvalidCachedType { .. } => {
+                        invariant(FunctionTypeInvariant::InvalidParameterCache(parameter))
+                    }
+                    TupleTypeNodeError::Capacity(_) => {
+                        invariant(FunctionTypeInvariant::Capacity(parameter))
+                    }
+                    TupleTypeNodeError::InvalidSyntax(_)
+                    | TupleTypeNodeError::InvalidElementInfo(_) => {
+                        invariant(FunctionTypeInvariant::InvalidParameter(parameter))
+                    }
+                },
+            )?;
+        if planned.readonly()
+            || planned.element_infos().iter().any(|info| {
+                info.flags() != ElementFlags::REQUIRED || info.labeled_declaration().is_some()
+            })
+        {
+            return Ok(false);
+        }
+        if cached_union.is_some() {
+            let cached = planned.cached_type().ok_or_else(invalid_cache)?;
+            let mut base_types = Vec::with_capacity(planned.elements().len());
+            for element in planned.elements() {
+                base_types.push(cached_fixed_tuple_rest_element_type(
+                    store,
+                    host,
+                    parameter,
+                    element.type_node(),
+                )?);
+            }
+            validate_warm_tuple_elements(store, array_targets, &planned, &base_types)
+                .map_err(|_| invalid_cache())?;
+            if !cached_members.contains(&cached) {
+                cached_members.push(cached);
+            }
+        }
+    }
+    // A cached rest union must match its source tuple caches, including union reduction.
+    if let Some(cached) = cached_union {
+        let valid = match cached_members.as_slice() {
+            [only] => cached == *only,
+            _ => store.type_payload(cached).is_some_and(|record| {
+                matches!(record.data(), TypeData::Union(union)
+                    if record.alias().is_none()
+                        && union.union.types.len() == cached_members.len()
+                        && cached_members.iter().all(|member| union.union.types.contains(member)))
+            }),
+        };
+        if !valid {
+            return Err(invalid_cache());
+        }
+    }
+    Ok(true)
+}
+
+fn cached_fixed_tuple_rest_element_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    parameter: NodeRef,
+    annotation: NodeRef,
+) -> Result<TypeId, FunctionTypeError> {
+    let invalid = || invariant(FunctionTypeInvariant::InvalidParameterCache(parameter));
+    let identity = peel_parenthesized_type(store, host, annotation)?;
+    let record = preflight_node(store, host, identity)?;
+    if let NodeData::InferTypeNode(inferred) = &record.data {
+        let declaration = NodeRef::new(identity.arena, identity.file, inferred.type_parameter);
+        let declaration_record = preflight_node(store, host, declaration)?;
+        if record.kind != SyntaxKind::InferType
+            || store.source_node_kind(identity) != Some(SyntaxKind::InferType)
+            || declaration_record.kind != SyntaxKind::TypeParameter
+            || store.source_node_kind(declaration) != Some(SyntaxKind::TypeParameter)
+            || declaration_record.parent != Some(identity.node)
+            || store.source_node_parent(declaration) != Some(SourceNodeParent::Parent(identity))
+            || !matches!(
+                declaration_record.data,
+                NodeData::TypeParameterDeclaration(_)
+            )
+        {
+            return Err(invalid());
+        }
+        let symbol = host
+            .bound_file(declaration)
+            .and_then(|bound| bound.symbol(declaration))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        if !host.symbol_matches(store, declaration, symbol) {
+            return Err(invalid());
+        }
+        preflight_type_parameter_symbol(store, host, symbol, &mut HashSet::new())?;
+        let type_ = store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .filter(|type_| cached_ordinary_type_parameter_owner(store, *type_) == Some(symbol))
+            .ok_or_else(invalid)?;
+        // Nested infer nodes keep their type on the declaration, without an annotation cache.
+        if store.type_node_links(identity).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|cached| cached != type_)
+        }) || store
+            .symbol_node_links(identity)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return Err(invalid());
+        }
+        return Ok(type_);
+    }
+    let null_literal = is_null_literal_type(store, host, identity)?;
+    let base = cached_annotation_identity(store, identity, null_literal).ok_or_else(invalid)?;
+    if !store.source_direct_type_annotation_is_exact(identity, base) {
+        return Err(invalid());
+    }
+    Ok(base)
 }
 
 fn plan_explicit_any_array_rest_parameter(
@@ -1740,10 +1955,38 @@ pub(super) fn function_type_display_projection(
         let NodeData::Identifier(identifier) = &name_node.data else {
             return Err(FunctionTypeDisplayError::Malformed);
         };
+        let rest = signature.has_rest_parameter() && index + 1 == plan.parameters.len();
+        if rest
+            && let Some(tuple) = store
+                .canonical_tuple_shape(value_type)
+                .map_err(|_| FunctionTypeDisplayError::Malformed)?
+        {
+            // Pinned getExpandedParameters expands a tuple, but not a union of tuples.
+            for (element_index, (element, info)) in tuple
+                .element_types()
+                .iter()
+                .zip(tuple.element_infos())
+                .enumerate()
+            {
+                if info.flags() != ElementFlags::REQUIRED || info.labeled_declaration().is_some() {
+                    return Err(FunctionTypeDisplayError::Unsupported(
+                        FunctionTypeUnsupported::RestParameter(parameter.declaration),
+                    ));
+                }
+                parameters.push(ValidatedSingleCallParameterDisplay {
+                    name: format!("{}_{element_index}", identifier.text),
+                    value_type: *element,
+                    optional: false,
+                    rest: false,
+                });
+            }
+            continue;
+        }
         parameters.push(ValidatedSingleCallParameterDisplay {
             name: identifier.text.clone(),
             value_type,
             optional: parameter.optional,
+            rest,
         });
     }
     Ok(ValidatedSingleCallSignatureDisplay {
@@ -1810,6 +2053,7 @@ fn source_jsdoc_function_type_display_projection(
                 name: parameter.name().to_owned(),
                 value_type: *value_type,
                 optional: parameter.is_optional(),
+                rest: parameter.is_rest(),
             },
         )
         .collect();
@@ -2304,9 +2548,11 @@ pub(super) fn pending_function_type_proof(
             Ok(Some(PendingFunctionTypeProof {
                 store: store.id(),
                 type_,
-                signature,
                 array_targets: plan.array_targets,
-                plan: plan.clone(),
+                source: PendingCallableSource::Function {
+                    signature,
+                    plan: Box::new(plan.clone()),
+                },
             }))
         }
         FunctionTypeState::Cold | FunctionTypeState::Resolved { .. } => Ok(None),
@@ -2317,13 +2563,27 @@ pub(super) fn validate_pending_function_type_proof(
     store: &CanonicalTypeMapperStore,
     proof: &PendingFunctionTypeProof,
 ) -> bool {
-    proof.store == store.id()
-        && matches!(
-            function_type_state(store, &proof.plan, true),
+    if proof.store != store.id() {
+        return false;
+    }
+    match &proof.source {
+        PendingCallableSource::Function {
+            signature: expected,
+            plan,
+        } => matches!(
+            function_type_state(store, plan, true),
             Ok(FunctionTypeState::ActiveBarrier { type_, signature }
                 | FunctionTypeState::ActiveParameters { type_, signature })
-                if type_ == proof.type_ && signature == proof.signature
-        )
+                if type_ == proof.type_ && signature == *expected
+        ),
+        PendingCallableSource::DeclaredMethod(method) => {
+            super::object_members::validate_pending_declared_method_type_proof(
+                store,
+                method,
+                proof.type_,
+            )
+        }
+    }
 }
 
 pub(super) fn validate_lazy_return_signature(
@@ -2622,17 +2882,19 @@ pub(super) fn validate_stored_function_type(
                     Some(annotation)
                         if matches!(
                             store.source_node_kind(annotation),
-                            Some(SyntaxKind::ArrayType | SyntaxKind::InferType)
+                            Some(
+                                SyntaxKind::ArrayType
+                                    | SyntaxKind::TupleType
+                                    | SyntaxKind::UnionType
+                                    | SyntaxKind::InferType
+                            )
                         ) =>
                     {
                         super::object_members::declared_signature_parameter_is_rest(
                             store,
                             parameter_declaration,
                         ) == Some(true)
-                            && store
-                                .type_node_links(annotation)
-                                .and_then(|links| links.resolved_type)
-                                == Some(expected)
+                            && store.source_direct_type_annotation_is_exact(annotation, expected)
                             || valid_stored_variadic_type_parameter_rest(
                                 store,
                                 declaration,
@@ -3439,7 +3701,12 @@ fn function_parameter_base_type(
     } else if parameter.typed_rest
         && !matches!(
             store.source_node_kind(parameter.type_node),
-            Some(SyntaxKind::ArrayType | SyntaxKind::InferType)
+            Some(
+                SyntaxKind::ArrayType
+                    | SyntaxKind::TupleType
+                    | SyntaxKind::UnionType
+                    | SyntaxKind::InferType
+            )
         )
     {
         None
@@ -3659,7 +3926,13 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerDiagnostics, IntrinsicBootstrapOptions,
+        CanonicalCheckerDiagnostics, IntrinsicBootstrapOptions, MinArgumentCountFlags,
+        callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+        calls::{
+            DirectCallApplicability, DirectCallForm, DirectCallRequest, get_min_argument_count,
+            get_parameter_count, has_effective_rest_parameter, resolve_direct_call,
+        },
+        formatter::{CanonicalTypeFormatFlags, type_to_string_with_host_global_types_and_flags},
         global_types::initialize_global_library_types,
         production::GlobalMergeCompletion,
         type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions, TypeNodeUnavailable},
@@ -3673,6 +3946,14 @@ mod tests {
     }
 
     fn fixture(source: &str, file: FileId) -> Fixture {
+        fixture_with_intrinsic(source, file, IntrinsicBootstrapOptions::default())
+    }
+
+    fn fixture_with_intrinsic(
+        source: &str,
+        file: FileId,
+        intrinsic: IntrinsicBootstrapOptions,
+    ) -> Fixture {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let mut binder = CanonicalBinder::new();
@@ -3700,15 +3981,48 @@ mod tests {
                 .register_source_file(&parsed.arena, parsed.source_file, file)
                 .is_some()
         );
-        store
-            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
-            .unwrap();
+        store.initialize_intrinsic_bootstrap(intrinsic).unwrap();
         Fixture {
             parsed,
             file,
             bound,
             store,
         }
+    }
+
+    fn fixed_tuple_rest_fixture(signature: &str, file: FileId) -> (Fixture, CanonicalGlobalTypes) {
+        let mut fixture = fixture_with_intrinsic(
+            &format!(
+                "interface Array<T> {{}} interface ReadonlyArray<T> {{}} \
+                 declare let next: {signature};"
+            ),
+            file,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let symbols = fixture
+            .store
+            .symbol_table(locals)
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in symbols {
+            fixture.store.merge_global_symbol(globals, symbol).unwrap();
+        }
+        let global_types = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            initialize_global_library_types(&mut fixture.store, &host, globals, false).unwrap()
+        };
+        (fixture, global_types)
     }
 
     fn generic_function_node(fixture: &Fixture) -> NodeRef {
@@ -5398,6 +5712,682 @@ mod tests {
     }
 
     #[test]
+    fn fixed_tuple_rest_function_signatures_preserve_arity_and_replay_warm() {
+        for (index, (source, minimum, count, effective_rest)) in [
+            ("(value: void) => number", 0, 1, false),
+            ("(...values: []) => number", 0, 0, false),
+            ("(...values: [void]) => number", 0, 1, false),
+            ("(...values: [number]) => number", 1, 1, false),
+            ("(...values: [number, string]) => number", 2, 2, false),
+            ("(...values: [] | [string]) => number", 0, 1, true),
+            ("(...values: [] | []) => number", 0, 0, false),
+            (
+                "(prefix: string, ...values: [number]) => number",
+                2,
+                2,
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut fixture, global_types) = fixed_tuple_rest_fixture(
+                source,
+                FileId::new(95_050 + u32::try_from(index).unwrap()),
+            );
+            let function = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let plan = plan_function_type(
+                &fixture.store,
+                &host,
+                function,
+                None,
+                false,
+                Some(CanonicalArrayTargets::from_global_types(&global_types)),
+            )
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            assert_eq!(
+                function_type_state(&fixture.store, &plan, false),
+                Ok(FunctionTypeState::Cold)
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let function_type = CanonicalTypeQuery::new_with_global_types(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            let FunctionTypeState::Resolved { signature, .. } =
+                function_type_state(&fixture.store, &plan, false).unwrap()
+            else {
+                panic!("{source}: expected a resolved function signature")
+            };
+            assert_eq!(
+                fixture.store.signature(signature).unwrap().parameters(),
+                plan.parameters
+                    .iter()
+                    .map(|parameter| parameter.symbol)
+                    .collect::<Vec<_>>(),
+            );
+            if source.contains("...") {
+                let rest = plan.parameters.last().unwrap();
+                let rest_type = fixture
+                    .store
+                    .value_symbol_links(rest.symbol)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                assert!(rest.typed_rest);
+                assert!(!rest.optional);
+                assert!(rest.rest_tuple_element.is_none());
+                assert_eq!(
+                    fixture
+                        .store
+                        .callable_signature_parameter_types(signature)
+                        .unwrap()
+                        .last(),
+                    Some(&rest_type)
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_direct_type_annotation_is_exact(rest.type_node, rest_type)
+                );
+            }
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(&fixture.store, function_type)
+            else {
+                panic!("{source}: expected a valid callable")
+            };
+            let [callable] = projection.call_signatures.as_ref() else {
+                panic!("{source}: expected one call signature")
+            };
+            assert_eq!(
+                get_min_argument_count(
+                    &fixture.store,
+                    Some(&global_types),
+                    callable,
+                    MinArgumentCountFlags::NONE
+                ),
+                Ok(minimum),
+                "{source}",
+            );
+            assert_eq!(
+                get_parameter_count(&fixture.store, Some(&global_types), callable),
+                Ok(count),
+                "{source}"
+            );
+            assert_eq!(
+                has_effective_rest_parameter(&fixture.store, Some(&global_types), callable),
+                Ok(effective_rest),
+                "{source}"
+            );
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                CanonicalTypeQuery::new_with_global_types(
+                    &mut fixture.store,
+                    &host,
+                    &global_types,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(function),
+                Ok(function_type),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn fixed_tuple_rest_union_calls_keep_complete_argument_tuple_checks() {
+        let (mut fixture, global_types) =
+            fixed_tuple_rest_fixture("(...values: [] | [string]) => number", FileId::new(95_057));
+        let function = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let function_type = CanonicalTypeQuery::new_with_global_types(
+            &mut fixture.store,
+            &host,
+            &global_types,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(function)
+        .unwrap();
+        let signature = fixture
+            .store
+            .signature_links(function)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            CanonicalTypeQuery::new_with_global_types(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature),
+            Ok(number),
+        );
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, function_type)
+        else {
+            panic!("expected the source function to publish a callable")
+        };
+        let [callable] = projection.call_signatures.as_ref() else {
+            panic!("expected one call signature")
+        };
+        assert!(callable.parameters.is_empty());
+        let rest_type = callable.rest_parameter.unwrap();
+        let TypeData::Union(union) = fixture.store.type_payload(rest_type).unwrap().data() else {
+            panic!("the rest parameter must retain the tuple union")
+        };
+        assert_eq!(union.union.types.len(), 2);
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (string, undefined) = (bootstrap.string_type, bootstrap.undefined_type);
+        for (arguments, accepted) in [
+            (&[][..], true),
+            (&[string][..], true),
+            (&[undefined][..], false),
+            (&[string, string][..], false),
+        ] {
+            let mut warm = None;
+            for _ in 0..2 {
+                let result = resolve_direct_call(
+                    &mut fixture.store,
+                    &global_types,
+                    true,
+                    DirectCallRequest {
+                        form: DirectCallForm::Call,
+                        optional_chain: false,
+                        type_argument_count: 0,
+                        has_spread_argument: false,
+                        callee: function_type,
+                        arguments,
+                    },
+                )
+                .unwrap();
+                if accepted {
+                    assert_eq!(result.applicability, DirectCallApplicability::Applicable);
+                } else {
+                    assert!(matches!(
+                        result.applicability,
+                        DirectCallApplicability::RestArgumentsNotAssignable { index: 0, parameter_type, .. }
+                            if parameter_type == rest_type
+                    ));
+                }
+                let state = (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                );
+                if let Some(previous) = warm.replace(state) {
+                    assert_eq!(state, previous);
+                }
+            }
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn fixed_tuple_rest_annotation_cache_poison_fails_before_publication() {
+        let (mut fixture, global_types) =
+            fixed_tuple_rest_fixture("(...values: [] | [number]) => number", FileId::new(95_058));
+        let function = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_function_type(
+            &fixture.store,
+            &host,
+            function,
+            None,
+            false,
+            Some(CanonicalArrayTargets::from_global_types(&global_types)),
+        )
+        .unwrap();
+        let [rest] = plan.parameters.as_slice() else {
+            panic!("expected one rest parameter")
+        };
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_type_node_links(
+            rest.type_node,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for cold in [true, false] {
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert!(
+                CanonicalTypeQuery::new_with_global_types(
+                    &mut fixture.store,
+                    &host,
+                    &global_types,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(function)
+                .is_err()
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            if cold {
+                assert!(
+                    fixture
+                        .store
+                        .set_type_node_links(rest.type_node, TypeNodeLinks::default())
+                );
+                let type_ = CanonicalTypeQuery::new_with_global_types(
+                    &mut fixture.store,
+                    &host,
+                    &global_types,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(function)
+                .unwrap();
+                assert!(matches!(
+                    validate_stored_function_type(&fixture.store, type_),
+                    StoredFunctionTypeValidation::Valid(_)
+                ));
+                assert!(fixture.store.set_type_node_links(
+                    rest.type_node,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+                assert_eq!(
+                    validate_stored_function_type(&fixture.store, type_),
+                    StoredFunctionTypeValidation::Malformed
+                );
+            }
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn fixed_tuple_rest_display_expands_tuples_and_preserves_other_rests() {
+        for (index, (source, expected, has_rest)) in [
+            ("(...values: []) => number", "() => number", false),
+            ("(...values: [] | []) => number", "() => number", false),
+            (
+                "(...values: [number]) => number",
+                "(values_0: number) => number",
+                false,
+            ),
+            (
+                "(...values: [void]) => number",
+                "(values_0: void) => number",
+                false,
+            ),
+            (
+                "(head: string, ...values: [number, string]) => number",
+                "(head: string, values_0: number, values_1: string) => number",
+                false,
+            ),
+            (
+                "(...values: [] | [string]) => number",
+                "(...values: [] | [string]) => number",
+                true,
+            ),
+            (
+                "(...values: number[]) => number",
+                "(...values: number[]) => number",
+                true,
+            ),
+            (
+                "(...values: [item: number]) => number",
+                "(item: number) => number",
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut fixture, global_types) = fixed_tuple_rest_fixture(
+                source,
+                FileId::new(95_070 + u32::try_from(index).unwrap()),
+            );
+            let function = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let type_ = CanonicalTypeQuery::new_with_global_types(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap();
+            let signature = fixture
+                .store
+                .signature_links(function)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            CanonicalTypeQuery::new_with_global_types(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature)
+            .unwrap();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            for _ in 0..2 {
+                let display = function_type_display_projection(
+                    &fixture.store,
+                    &host,
+                    type_,
+                    Some(CanonicalArrayTargets::from_global_types(&global_types)),
+                )
+                .unwrap();
+                assert_eq!(
+                    display.parameters.iter().any(|parameter| parameter.rest),
+                    has_rest,
+                    "{source}"
+                );
+                assert_eq!(
+                    type_to_string_with_host_global_types_and_flags(
+                        &fixture.store,
+                        &host,
+                        &global_types,
+                        type_,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION,
+                    )
+                    .unwrap(),
+                    expected,
+                    "{source}",
+                );
+            }
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths()
+                ),
+                before,
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn fixed_tuple_rest_nested_infer_replays_without_annotation_links() {
+        let mut fixture = fixture(
+            concat!(
+                "type Extract<Input> = Input extends ",
+                "((value: infer Value, ...rest: [] | [infer Rest]) => any) ",
+                "? Value : never;",
+            ),
+            FileId::new(95_078),
+        );
+        let function = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let alias = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .and_then(|node| fixture.bound.symbol(node))
+            .unwrap();
+        let infer = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::InferTypeNode(infer) = &record.data else {
+                    return None;
+                };
+                let declaration = fixture.parsed.arena.get(infer.type_parameter)?;
+                let NodeData::TypeParameterDeclaration(parameter) = &declaration.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.parsed.arena.get(parameter.name)?.data
+                else {
+                    return None;
+                };
+                (name.text == "Rest").then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(alias)
+        .unwrap();
+        let type_ = fixture
+            .store
+            .type_node_links(function)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert!(fixture.store.type_node_links(infer).is_none());
+        let NodeData::InferTypeNode(infer_data) = &host.node(infer).unwrap().data else {
+            unreachable!()
+        };
+        let declaration = NodeRef::new(infer.arena, infer.file, infer_data.type_parameter);
+        let symbol = fixture.bound.symbol(declaration).unwrap();
+        let correct_links = fixture.store.declared_type_links(symbol).unwrap().clone();
+        let inferred = correct_links.declared_type.unwrap();
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&fixture.store, inferred),
+            Some(symbol)
+        );
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function),
+            Ok(type_),
+        );
+        assert!(fixture.store.type_node_links(infer).is_none());
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths()
+            ),
+            before,
+        );
+        let signature = fixture
+            .store
+            .signature_links(function)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let other = fixture
+            .store
+            .callable_signature_parameter_types(signature)
+            .unwrap()[0];
+        assert_ne!(inferred, other);
+        let mut forged = correct_links.clone();
+        forged.declared_type = Some(other);
+        assert!(fixture.store.set_declared_type_links(symbol, forged));
+        let corrupted = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .is_err()
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths()
+            ),
+            corrupted,
+        );
+        assert!(fixture.store.set_declared_type_links(symbol, correct_links));
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function),
+            Ok(type_),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn typed_array_rest_function_signatures_preserve_identity_and_replay_warm() {
         let mut fixture = fixture(
             concat!(
@@ -5999,7 +6989,7 @@ mod tests {
     #[test]
     fn unsupported_tuple_rest_shapes_fail_before_publication() {
         for (index, signature) in [
-            "(...args: [number]) => void",
+            "(...args: [number?]) => void",
             "(...args: [x?: number]) => void",
             "(...args: [x: number, y: string]) => void",
             "(...args: string) => void",
