@@ -4626,6 +4626,84 @@ fn authenticated_react_svg_factory_signature(
         && base_element_data.type_arguments.is_none()
 }
 
+/// Checks the source container as well as a member's module symbol.
+fn ambient_module_owns_member(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    module: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
+    let owned = || -> Option<()> {
+        let record = owned_node(arena, bound, store, declaration).ok()?;
+        let statement = if record.kind == SyntaxKind::VariableDeclaration {
+            let list = child(declaration, record.parent?);
+            let list_record = owned_node(arena, bound, store, list).ok()?;
+            let NodeData::VariableDeclarationList(variables) = &list_record.data else {
+                return None;
+            };
+            let statement = child(list, list_record.parent?);
+            let statement_record = owned_node(arena, bound, store, statement).ok()?;
+            let NodeData::VariableStatement(variable) = &statement_record.data else {
+                return None;
+            };
+            if list_record.kind != SyntaxKind::VariableDeclarationList
+                || !variables.declarations.nodes.contains(&declaration.node)
+                || statement_record.kind != SyntaxKind::VariableStatement
+                || variable.declaration_list != list.node
+            {
+                return None;
+            }
+            statement
+        } else {
+            declaration
+        };
+        let statement_record = owned_node(arena, bound, store, statement).ok()?;
+        let block = child(statement, statement_record.parent?);
+        let block_record = owned_node(arena, bound, store, block).ok()?;
+        let NodeData::ModuleBlock(body) = &block_record.data else {
+            return None;
+        };
+        let module_declaration = child(block, block_record.parent?);
+        let module_record = owned_node(arena, bound, store, module_declaration).ok()?;
+        let NodeData::ModuleDeclaration(module_data) = &module_record.data else {
+            return None;
+        };
+        let name = child(module_declaration, module_data.name);
+        let name_record = owned_node(arena, bound, store, name).ok()?;
+        let NodeData::StringLiteral(identifier) = &name_record.data else {
+            return None;
+        };
+        let owner = store.symbol(module)?;
+        let quoted_name = EscapedName::source(format!("\"{}\"", identifier.text));
+        if block_record.kind != SyntaxKind::ModuleBlock
+            || !body.statements.nodes.contains(&statement.node)
+            || module_record.kind != SyntaxKind::ModuleDeclaration
+            || module_record.parent != Some(bound.source_file().node)
+            || module_data.body != Some(block.node)
+            || name_record.kind != SyntaxKind::StringLiteral
+            || name_record.parent != Some(module_declaration.node)
+            || identifier.token_flags.0 != 0
+            || owner.name() != quoted_name.as_ref()
+            || !owner.declarations()?.contains(&module_declaration)
+            || bound
+                .symbol(module_declaration)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(module)
+            || bound
+                .locals(bound.source_file())
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get(quoted_name.as_ref()))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(module)
+        {
+            return None;
+        }
+        Some(())
+    };
+    owned().is_some()
+}
+
 /// Keeps React's complete imported prop-type value map cold until it is used.
 #[allow(clippy::too_many_lines)] // Namespace, import, exports, members, and caches form one proof.
 fn authenticated_deferred_react_prop_types_interface(
@@ -4781,6 +4859,8 @@ fn authenticated_deferred_react_prop_types_interface(
             || module_name_record.parent != Some(module_declaration.node)
             || module_identifier.token_flags.0 != 0
             || module_identifier.text != "react"
+            || module_owner.name().as_utf8() != Some("\"react\"")
+            || module_owner.check_flags() != CheckFlags::NONE
             || !module_owner.flags().intersects(SymbolFlags::MODULE)
         {
             return None;
@@ -4870,6 +4950,8 @@ fn authenticated_deferred_react_prop_types_interface(
                 .statements
                 .nodes
                 .contains(&import_declaration.node)
+            || imported_owner.name().as_utf8() != Some("\"prop-types\"")
+            || imported_owner.check_flags() != CheckFlags::NONE
             || !imported_owner.flags().intersects(SymbolFlags::MODULE)
             || bound
                 .locals(bound.source_file())
@@ -4999,6 +5081,13 @@ fn authenticated_deferred_react_prop_types_interface(
                     .symbol(imported_declaration)
                     .and_then(|candidate| store.get_merged_symbol(candidate))
                     != Some(imported_symbol)
+                || !ambient_module_owns_member(
+                    arena,
+                    bound,
+                    store,
+                    imported_module,
+                    imported_declaration,
+                )
                 || imported_declaration_record.kind
                     != if index < VALUE_COUNT {
                         SyntaxKind::VariableDeclaration
@@ -5949,6 +6038,7 @@ fn authenticated_deferred_react_prop_types_alias(
                 .symbol(target_declaration)
                 .and_then(|candidate| store.get_merged_symbol(candidate))
                 != Some(target)
+            || !ambient_module_owns_member(arena, bound, store, imported_module, target_declaration)
         {
             return None;
         }
@@ -12769,6 +12859,24 @@ pub(super) fn execute_source_namespace(
         &mut declarations,
         &mut planned_diagnostics,
     );
+    // Cached aliases must pass the normal type proof before imports publish links.
+    annotations.extend(
+        declarations
+            .iter()
+            .filter_map(|declaration| match declaration {
+                SourceNamespaceMemberPlan::TypeAlias {
+                    symbol,
+                    annotation,
+                    deferred: true,
+                    ..
+                } if store.type_alias_links(*symbol).is_some()
+                    || store.type_node_links(*annotation).is_some() =>
+                {
+                    Some(*annotation)
+                }
+                _ => None,
+            }),
+    );
     namespace_implicit_variables(plan, &mut implicit_variables);
     namespace_ambient_variables(plan, &mut ambient_variables);
     namespace_object_initializers(plan, &mut object_initializers);
@@ -17386,6 +17494,197 @@ mod tests {
                 "mutation {mutation}",
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check each forwarded alias before and after a paired cache mutation.
+    fn ambient_react_forwarding_aliases_check_warm_types_before_import_publication() {
+        for name in ["Validator", "Requireable", "ValidationMap"] {
+            for poisoned in [false, true] {
+                let mut fixture = react_prop_types_fixture();
+                let namespace = plan(&fixture, 1);
+                let react = namespace
+                    .members
+                    .iter()
+                    .find_map(|member| match member {
+                        SourceNamespaceMemberPlan::Namespace(namespace) => Some(namespace),
+                        _ => None,
+                    })
+                    .unwrap();
+                let (alias, annotation) = react
+                    .members
+                    .iter()
+                    .find_map(|member| match member {
+                        SourceNamespaceMemberPlan::TypeAlias {
+                            symbol,
+                            annotation,
+                            deferred: true,
+                            ..
+                        } if fixture
+                            .context
+                            .store()
+                            .symbol(*symbol)
+                            .and_then(|owner| owner.name().as_utf8())
+                            == Some(name) =>
+                        {
+                            Some((*symbol, *annotation))
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let bound = fixture.context.file(fixture.file).unwrap().1.clone();
+                let globals = fixture.context.global_types().clone();
+                let options = fixture.context.options();
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&fixture.parsed.arena, &bound)],
+                    GlobalMergeCompletion::for_test(options.name_resolution),
+                )
+                .unwrap();
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                CanonicalTypeQuery::new_with_global_types(
+                    fixture.context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_declared_type_of_symbol(alias)
+                .unwrap();
+                assert!(diagnostics.is_empty());
+                assert!(namespace.imports.iter().all(|import| {
+                    fixture
+                        .context
+                        .store()
+                        .alias_symbol_links(import.symbol)
+                        .is_none()
+                }));
+
+                if poisoned {
+                    let store = fixture.context.store_mut_for_test();
+                    let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
+                    let mut links = store.type_alias_links(alias).unwrap().clone();
+                    links.declared_type = Some(boolean);
+                    for instance in links.instantiations.as_mut().unwrap().values_mut() {
+                        *instance = boolean;
+                    }
+                    assert!(store.set_type_alias_links(alias, links));
+                    assert!(store.set_type_node_links(
+                        annotation,
+                        TypeNodeLinks {
+                            resolved_type: Some(boolean),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+
+                let before = (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                );
+                let result = execute(&mut fixture, &namespace);
+                if poisoned {
+                    assert!(result.is_err(), "{name}");
+                    assert_eq!(
+                        (
+                            fixture.context.store().type_len(),
+                            fixture.context.store().symbol_len(),
+                            fixture.context.store().checker_link_allocated_lengths(),
+                        ),
+                        before,
+                        "{name}",
+                    );
+                    assert!(namespace.imports.iter().all(|import| {
+                        fixture
+                            .context
+                            .store()
+                            .alias_symbol_links(import.symbol)
+                            .is_none()
+                    }));
+                } else {
+                    assert!(result.unwrap().is_empty());
+                    let warm = (
+                        fixture.context.store().type_len(),
+                        fixture.context.store().symbol_len(),
+                        fixture.context.store().checker_link_allocated_lengths(),
+                    );
+                    assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+                    assert_eq!(
+                        (
+                            fixture.context.store().type_len(),
+                            fixture.context.store().symbol_len(),
+                            fixture.context.store().checker_link_allocated_lengths(),
+                        ),
+                        warm,
+                        "{name}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_react_prop_type_imports_reject_a_replaced_module_table_entry() {
+        let original = react_prop_types_fixture();
+        let source = original.parsed.arena.source_text().unwrap().replace(
+            "declare module 'prop-types'",
+            "declare module 'other-types'",
+        );
+        let mut fixture = declaration_fixture(
+            Box::leak(source.into_boxed_str()),
+            CanonicalModuleState::Script,
+        );
+        let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+        let locals = bound.locals(bound.source_file()).unwrap();
+        let source = arena.get(bound.source_file().node).unwrap();
+        let NodeData::SourceFile(source) = &source.data else {
+            panic!("the declaration source must retain its statements")
+        };
+        let imported_declaration = child(bound.source_file(), source.statements.nodes[0]);
+        let module = bound.symbol(imported_declaration).unwrap();
+        assert_eq!(
+            fixture.context.store_mut_for_test().insert_symbol(
+                locals,
+                EscapedName::source("\"prop-types\""),
+                module,
+            ),
+            Some(None),
+        );
+        let namespace = plan(&fixture, 1);
+        let react = namespace
+            .members
+            .iter()
+            .find_map(|member| match member {
+                SourceNamespaceMemberPlan::Namespace(namespace) => Some(namespace),
+                _ => None,
+            })
+            .unwrap();
+        let (declaration, symbol) = react
+            .members
+            .iter()
+            .find_map(|member| match member {
+                SourceNamespaceMemberPlan::Interface {
+                    declaration,
+                    symbol,
+                    ..
+                } => Some((*declaration, *symbol)),
+                _ => None,
+            })
+            .unwrap();
+        let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+        assert!(!authenticated_deferred_react_prop_types_interface(
+            arena,
+            bound,
+            fixture.context.store(),
+            react.symbol,
+            symbol,
+            declaration,
+        ));
+        assert!(react.members.iter().all(|member| !matches!(
+            member,
+            SourceNamespaceMemberPlan::TypeAlias { deferred: true, .. }
+        )));
     }
 
     #[test]
