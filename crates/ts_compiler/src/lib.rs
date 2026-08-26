@@ -1866,20 +1866,29 @@ impl Program {
         else {
             return;
         };
-        let (Some(name), Some(exports)) = (package.name, package.exports) else {
+        let directory = directory_path(package_json_path);
+        let Some(name) = package_display_name(&directory, package.name.as_deref()) else {
+            return;
+        };
+        let Some(exports) = package.exports else {
             return;
         };
         let Some(exports) = exports.as_object() else {
             return;
         };
-        let directory = directory_path(&file_system.realpath(package_json_path));
+        let resolver = Resolver::new(file_system, self.options.module_resolution_options());
         for (key, value) in exports {
             let Some(target) = package_export_string_target(value) else {
                 continue;
             };
-            let target = file_system.realpath(&resolve_path(&directory, &[target]));
+            if !target.starts_with("./") {
+                continue;
+            }
+            let Some(resolved) = resolver.resolve(target, package_json_path).resolved else {
+                continue;
+            };
             let target = canonicalize(
-                ts_path::remove_file_extension(&target),
+                module_file_stem(&resolved.resolved_file_name),
                 &self.current_directory,
                 self.case_sensitivity,
             );
@@ -1890,7 +1899,9 @@ impl Program {
             } else {
                 continue;
             };
-            self.package_export_specifiers.insert(target, specifier);
+            self.package_export_specifiers
+                .entry(target)
+                .or_insert(specifier);
         }
     }
 
@@ -5834,6 +5845,24 @@ fn implied_node_format(file_system: &dyn FileSystem, file_name: &str) -> ModuleK
         directory = parent;
     }
     ModuleKind::CommonJs
+}
+
+fn package_display_name(directory: &str, declared_name: Option<&str>) -> Option<String> {
+    let installed = directory
+        .rsplit_once("/node_modules/")
+        .map(|(_, name)| name)
+        .or_else(|| directory.strip_prefix("node_modules/"));
+    let name = installed.or(declared_name)?;
+    if name.is_empty() {
+        return None;
+    }
+    if let Some(types_package) = name.strip_prefix("@types/") {
+        return Some(types_package.split_once("__").map_or_else(
+            || types_package.to_owned(),
+            |(scope, package)| format!("@{scope}/{package}"),
+        ));
+    }
+    Some(name.to_owned())
 }
 
 fn package_export_string_target(value: &serde_json::Value) -> Option<&str> {

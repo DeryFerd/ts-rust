@@ -28,6 +28,61 @@ fn identifiers(program: &Program, file_name: &str, name: &str) -> Vec<NodeRef> {
     result
 }
 
+fn transitive_package_type(filesystem: &MemoryFileSystem, target: &str, package: &str) -> String {
+    filesystem
+        .write_file(
+            "/project/re-export.d.ts",
+            &format!("export type {{ Item }} from '{package}';"),
+        )
+        .unwrap();
+    filesystem
+        .write_file(
+            "/project/input.d.ts",
+            "import {} from './re-export'; export {};",
+        )
+        .unwrap();
+    let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+        filesystem,
+        "/project",
+        &["input.d.ts".to_owned()],
+        CompilerOptions {
+            skip_lib_check: true,
+            ..canonical_options()
+        },
+        |program, queries| {
+            let declaration = identifiers(program, target, "Item")[0];
+            let source = program.source_file("/project/input.d.ts").unwrap();
+            let location = source.node_ref(source.parse.source_file).unwrap();
+            let type_ = queries.get_type_at_location(declaration).unwrap();
+            let cold = queries
+                .type_to_string_at_location_with_flags(
+                    type_,
+                    location,
+                    CanonicalTypeFormatFlags::NO_TRUNCATION,
+                )
+                .unwrap();
+            assert_eq!(
+                queries
+                    .type_to_string_at_location_with_flags(
+                        type_,
+                        location,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION
+                    )
+                    .unwrap(),
+                cold
+            );
+            cold
+        },
+    )
+    .unwrap();
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+    result.expect("canonical checker ran")
+}
+
 #[test]
 fn canonical_program_exposes_original_type_and_symbol_queries() {
     let filesystem = MemoryFileSystem::new(true);
@@ -205,52 +260,101 @@ fn canonical_queries_use_package_exports_for_types_from_a_transitive_module() {
             "export interface Item { value: number; }",
         ),
         ("/packages/items/index.js", "export {};"),
-        (
-            "/project/re-export.d.ts",
-            "export type { Item } from 'item-api';",
-        ),
-        (
-            "/project/input.d.ts",
-            "import {} from './re-export'; export {};",
-        ),
     ] {
         filesystem.write_file(path, source).unwrap();
     }
     filesystem.add_directory_link("/packages/items", "/project/node_modules/item-api");
-    let (program, result) = Program::try_new_with_canonical_checker_and_queries(
-        &filesystem,
-        "/project",
-        &["input.d.ts".to_owned()],
-        CompilerOptions {
-            skip_lib_check: true,
-            ..canonical_options()
-        },
-        |program, queries| {
-            let declaration = identifiers(program, "/packages/items/index.d.ts", "Item")[0];
-            let source = program.source_file("/project/input.d.ts").unwrap();
-            let location = source.node_ref(source.parse.source_file).unwrap();
-            let type_ = queries.get_type_at_location(declaration).unwrap();
-            for _ in 0..2 {
-                assert_eq!(
-                    queries
-                        .type_to_string_at_location_with_flags(
-                            type_,
-                            location,
-                            CanonicalTypeFormatFlags::NO_TRUNCATION
-                        )
-                        .unwrap(),
-                    "import(\"item-api\").Item"
-                );
-            }
-        },
-    )
-    .unwrap();
-    assert!(
-        program.diagnostics().is_empty(),
-        "{:?}",
-        program.diagnostics()
+    assert_eq!(
+        transitive_package_type(&filesystem, "/packages/items/index.d.ts", "item-api"),
+        "import(\"item-api\").Item"
     );
-    result.expect("canonical checker ran");
+}
+
+#[test]
+fn package_json_file_links_do_not_move_the_export_base() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/metadata/item-api.json",
+            r#"{"name":"item-api","exports":{".":"./index.js"}}"#,
+        )
+        .unwrap();
+    filesystem
+        .write_file(
+            "/types/item-api.d.ts",
+            "export interface Item { value: number; }",
+        )
+        .unwrap();
+    filesystem.add_file_link(
+        "/metadata/item-api.json",
+        "/project/node_modules/item-api/package.json",
+    );
+    filesystem.add_file_link(
+        "/types/item-api.d.ts",
+        "/project/node_modules/item-api/index.d.ts",
+    );
+    assert_eq!(
+        transitive_package_type(&filesystem, "/types/item-api.d.ts", "item-api"),
+        "import(\"item-api\").Item"
+    );
+}
+
+#[test]
+fn package_display_uses_the_installed_alias_instead_of_manifest_name() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/node_modules/alias-package/package.json",
+            r#"{"name":"real-package","exports":{".":"./index.js"}}"#,
+        )
+        .unwrap();
+    filesystem
+        .write_file(
+            "/project/node_modules/alias-package/index.d.ts",
+            "export interface Item { value: number; }",
+        )
+        .unwrap();
+    assert_eq!(
+        transitive_package_type(
+            &filesystem,
+            "/project/node_modules/alias-package/index.d.ts",
+            "alias-package"
+        ),
+        "import(\"alias-package\").Item"
+    );
+}
+
+#[test]
+fn package_display_keeps_the_first_matching_export_route() {
+    for (package_json, expected) in [
+        (
+            r#"{"name":"item-api","exports":{".":"./index.js","./alternate":"./index.js"}}"#,
+            "import(\"item-api\").Item",
+        ),
+        (
+            r#"{"name":"item-api","exports":{"./alternate":"./index.js",".":"./index.js"}}"#,
+            "import(\"item-api/alternate\").Item",
+        ),
+    ] {
+        let filesystem = MemoryFileSystem::new(true);
+        filesystem
+            .write_file("/project/node_modules/item-api/package.json", package_json)
+            .unwrap();
+        filesystem
+            .write_file(
+                "/project/node_modules/item-api/index.d.ts",
+                "export interface Item { value: number; }",
+            )
+            .unwrap();
+        assert_eq!(
+            transitive_package_type(
+                &filesystem,
+                "/project/node_modules/item-api/index.d.ts",
+                "item-api"
+            ),
+            expected
+        );
+    }
 }
 
 #[test]
