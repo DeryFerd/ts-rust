@@ -6957,14 +6957,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             if self.host.source(*declaration).is_none() {
                 return Ok(false);
             }
-            if self
-                .host
-                .bound_file(*declaration)
-                .and_then(ts_binder::BoundFile::source_facts)
-                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_default_library)
-            {
-                return Ok(false);
-            }
             let record = preflight_node(self.store, self.host, *declaration)?;
             let NodeData::InterfaceDeclaration(interface) = &record.data else {
                 return Ok(false);
@@ -6982,12 +6974,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     for base in &heritage.types.nodes {
                         let base = NodeRef::new(clause.arena, clause.file, *base);
                         let record = preflight_node(self.store, self.host, base)?;
-                        let NodeData::ExpressionWithTypeArguments(base) = &record.data else {
+                        let NodeData::ExpressionWithTypeArguments(_) = &record.data else {
                             return Ok(false);
                         };
-                        if base.type_arguments.is_none() && react_namespace.is_none() {
-                            return Ok(false);
-                        }
                     }
                 }
                 return Ok(true);
@@ -7056,9 +7045,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         },
                     ));
                 }
-                if base.kind != DirectInterfaceBaseKind::Interface
-                    || base.type_arguments.is_empty() && react_namespace.is_none()
-                {
+                if base.kind != DirectInterfaceBaseKind::Interface {
                     return Err(type_node_unavailable(
                         TypeNodeUnavailable::GenericReferenceUnsupported {
                             node: base.node,
@@ -7088,7 +7075,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     ));
                 }
                 if base.type_arguments.is_empty() {
-                    if self.authenticated_react_interface_namespace(base.symbol)? != react_namespace
+                    if react_namespace.is_some()
+                        && self.authenticated_react_interface_namespace(base.symbol)?
+                            != react_namespace
                     {
                         return Err(type_node_unavailable(
                             TypeNodeUnavailable::GenericReferenceUnsupported {
