@@ -30,8 +30,11 @@ use super::{
         ValidatedSingleCallSignatureDisplay, single_callable_display_projection,
         single_callable_family, validate_stored_single_callable,
     },
-    classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
-    declared::{cached_class_type, cached_ordinary_type_parameter_owner},
+    classes::{
+        ClassHeritageMembersValidation, validate_class_heritage_members,
+        validate_cold_class_instance_for_display,
+    },
+    declared::cached_ordinary_type_parameter_owner,
     derived_types::DerivedObjectLiteralValidation,
     enums,
     functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
@@ -1789,7 +1792,8 @@ fn display_validated_class_type(
             if interface.outer_type_parameter_count == 0
                 && interface.reference.resolved_type_arguments.as_deref() == Some(&[]));
     let value = if cold_instance {
-        validate_cold_class_instance_display(store, symbol, type_id, record)?;
+        validate_cold_class_instance_for_display(store, host, symbol, type_id)
+            .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
         None
     } else {
         if validate_class_heritage_members(store, instance) != ClassHeritageMembersValidation::Valid
@@ -1852,54 +1856,6 @@ fn display_validated_class_type(
     } else {
         Ok(Some(name))
     }
-}
-
-fn validate_cold_class_instance_display(
-    store: &CanonicalTypeMapperStore,
-    symbol: SemanticSymbolId,
-    type_id: TypeId,
-    record: &TypeRecord,
-) -> Result<(), TypeDisplayUnavailable> {
-    let TypeData::Interface(interface) = record.data() else {
-        return Err(TypeDisplayUnavailable::MalformedType(type_id));
-    };
-    if cached_class_type(store, symbol) != Ok(Some(type_id))
-        || interface.outer_type_parameter_count != 0
-        || interface.reference.resolved_type_arguments.as_deref() != Some(&[])
-        || interface.base_types_resolved
-        || interface.resolved_base_constructor_type.is_some()
-        || interface.resolved_base_types.is_some()
-        || interface.declared_members_resolved
-        || interface.declared_members.is_some()
-        || interface.declared_call_signatures.is_some()
-        || interface.declared_construct_signatures.is_some()
-        || interface.declared_index_infos.is_some()
-        || interface.reference.object.structured
-            != super::type_records::StructuredTypeData::default()
-        || store.direct_class_heritage_provenance(type_id).is_some()
-        || store
-            .value_symbol_links(symbol)
-            .is_some_and(|links| links != &ValueSymbolLinks::default())
-    {
-        return Err(TypeDisplayUnavailable::MalformedType(type_id));
-    }
-    let this = interface
-        .this_type
-        .and_then(|this| store.type_payload(this))
-        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-    let TypeData::TypeParameter(this) = this.data() else {
-        return Err(TypeDisplayUnavailable::MalformedType(type_id));
-    };
-    if this
-        != &(super::type_records::TypeParameterData {
-            constraint: Some(type_id),
-            is_this_type: true,
-            ..super::type_records::TypeParameterData::default()
-        })
-    {
-        return Err(TypeDisplayUnavailable::MalformedType(type_id));
-    }
-    Ok(())
 }
 
 fn display_mapped_type_alias(
@@ -5859,6 +5815,35 @@ mod tests {
         CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
     }
 
+    fn assert_malformed_display_without_writes(
+        context: &CanonicalCheckerContext<'_>,
+        type_: TypeId,
+    ) {
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().len(),
+        );
+        assert_eq!(
+            context.type_to_string(type_),
+            Err(TypeDisplayUnavailable::MalformedType(type_))
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            ),
+            before
+        );
+    }
+
     fn external_parsed_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
         let mut binder = CanonicalBinder::new();
         binder
@@ -6623,10 +6608,7 @@ mod tests {
                 .store_mut_for_test()
                 .set_interface_base_resolution(instance, true, None, None,)
         );
-        assert_eq!(
-            context.type_to_string(instance),
-            Err(TypeDisplayUnavailable::MalformedType(instance))
-        );
+        assert_malformed_display_without_writes(&context, instance);
         assert!(
             context
                 .store_mut_for_test()
@@ -6642,10 +6624,7 @@ mod tests {
                 .store_mut_for_test()
                 .set_type_alias(this, Some(alias))
         );
-        assert_eq!(
-            context.type_to_string(instance),
-            Err(TypeDisplayUnavailable::MalformedType(instance))
-        );
+        assert_malformed_display_without_writes(&context, instance);
         assert!(context.store_mut_for_test().set_type_alias(this, None));
         assert!(context.store_mut_for_test().set_value_symbol_links(
             symbol,
@@ -6654,10 +6633,7 @@ mod tests {
                 ..ValueSymbolLinks::default()
             },
         ));
-        assert_eq!(
-            context.type_to_string(instance),
-            Err(TypeDisplayUnavailable::MalformedType(instance))
-        );
+        assert_malformed_display_without_writes(&context, instance);
         assert!(
             context
                 .store_mut_for_test()
@@ -6686,6 +6662,152 @@ mod tests {
         let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
         let instance = context.get_declared_type_of_symbol(symbol).unwrap();
         assert_eq!(context.type_to_string(instance).unwrap(), "Box<T>");
+    }
+
+    #[test]
+    fn cold_class_display_rejects_extra_nongeneric_instantiation_entries() {
+        let parsed = parse_source_file("declare class Model {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(229);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let instance = context.get_declared_type_of_symbol(symbol).unwrap();
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let reference = context
+            .store_mut_for_test()
+            .alloc_type_reference(ObjectFlags::NONE, Some(symbol))
+            .unwrap();
+        assert!(context.store_mut_for_test().set_object_target_and_mapper(
+            reference,
+            Some(instance),
+            None,
+        ));
+        assert!(context.store_mut_for_test().set_type_reference_resolution(
+            reference,
+            None,
+            Some(vec![number]),
+        ));
+        let key = crate::semantic::type_records::type_list_key(&[number]);
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .insert_object_instantiation(instance, key, reference),
+            Some(reference)
+        );
+        assert_malformed_display_without_writes(&context, instance);
+        let TypeData::Interface(interface) = context.store().type_payload(instance).unwrap().data()
+        else {
+            panic!("the class instance must keep its interface record")
+        };
+        assert!(matches!(
+            &interface.reference.object.instantiations,
+            TypeCacheState::Allocated(cache)
+                if cache.len() == 2 && cache.get(&key) == Some(&reference)
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each table substitution must preserve cold state and be reversible.
+    fn cold_class_display_rejects_foreign_binder_members_and_prototype_flags() {
+        let parsed = parse_source_file(concat!(
+            "declare class Model { value: string; method(): number; static count: number; } ",
+            "declare class Other { value: string; method(): number; static count: number; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(230);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let classes = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                if record.kind != SyntaxKind::ClassDeclaration {
+                    return None;
+                }
+                let declaration = NodeRef::new(parsed.arena.id(), file, node);
+                context.file(file).unwrap().1.symbol(declaration)
+            })
+            .collect::<Vec<_>>();
+        let [model, other] = classes.as_slice() else {
+            panic!("the source must retain both class owners")
+        };
+        let (model, other) = (*model, *other);
+        assert_eq!(
+            context.store().symbol(model).unwrap().name().as_utf8(),
+            Some("Model")
+        );
+        let instance = context.get_declared_type_of_symbol(model).unwrap();
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+        let model_exports = context.store().symbol(model).unwrap().exports().unwrap();
+        let other_exports = context.store().symbol(other).unwrap().exports().unwrap();
+        let model_members = context.store().symbol(model).unwrap().members().unwrap();
+        let other_members = context.store().symbol(other).unwrap().members().unwrap();
+        for (members, donor, name) in [
+            (model_exports, other_exports, "prototype"),
+            (model_exports, other_exports, "count"),
+            (model_members, other_members, "value"),
+            (model_members, other_members, "method"),
+        ] {
+            let original = context
+                .store()
+                .symbol_table(members)
+                .unwrap()
+                .get_source(name)
+                .unwrap();
+            let foreign = context
+                .store()
+                .symbol_table(donor)
+                .unwrap()
+                .get_source(name)
+                .unwrap();
+            assert_eq!(
+                context.store_mut_for_test().insert_symbol(
+                    members,
+                    EscapedName::source(name),
+                    foreign,
+                ),
+                Some(Some(original))
+            );
+            assert_malformed_display_without_writes(&context, instance);
+            assert_eq!(
+                context.store_mut_for_test().insert_symbol(
+                    members,
+                    EscapedName::source(name),
+                    original,
+                ),
+                Some(Some(foreign))
+            );
+            assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+        }
+        let prototype = context
+            .store()
+            .symbol_table(model_exports)
+            .unwrap()
+            .get_source("prototype")
+            .unwrap();
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            prototype,
+            SymbolFlags::PROPERTY,
+            CheckFlags::NONE,
+        ));
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            prototype,
+            SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE,
+            CheckFlags::NONE,
+        ));
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
     }
 
     #[test]

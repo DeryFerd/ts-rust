@@ -16003,6 +16003,27 @@ fn shell_state(
     Ok(ClassShellState { instance, value })
 }
 
+/// Checks a cold class name without publishing member types or constructor state.
+pub(super) fn validate_cold_class_instance_for_display(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    instance_type: TypeId,
+) -> Result<(), ClassError> {
+    let plan = plan_nongeneric_class(store, host, symbol)?;
+    let state = shell_state(store, host, &plan)?;
+    let instance = exact_instance_identity(store, &plan, instance_type)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidInstanceCache(symbol)))?;
+    if state.instance != Some(instance_type)
+        || state.value != StaticShellState::Cold
+        || instance.reference.resolved_type_arguments.as_deref() != Some(&[])
+        || instance.resolved_base_constructor_type.is_some()
+    {
+        return Err(invariant(ClassInvariant::InvalidInstanceCache(symbol)));
+    }
+    Ok(())
+}
+
 /// Installs or validates the two exact class identities from a previously
 /// produced plan.
 ///
