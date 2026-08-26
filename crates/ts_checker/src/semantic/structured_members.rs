@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ts_ast::{NodeId, NodeRef, SyntaxKind};
+use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{
     CheckFlags, EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolFlags,
     SymbolTableId, semantic::PreparedSymbolTable,

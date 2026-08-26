@@ -2297,8 +2297,8 @@ mod tests {
     use super::*;
     use crate::semantic::{
         AliasTargetState, CanonicalCheckerContext, CanonicalCheckerDiagnostics,
-        CanonicalCheckerOptions, TypeData,
-        bootstrap::LiteralTypeCacheError,
+        CanonicalCheckerOptions, SourceCheckError, TypeData,
+        bootstrap::{IntrinsicBootstrapOptions, LiteralTypeCacheError},
         production::GlobalMergeCompletion,
         reference_types::{
             validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
@@ -2353,8 +2353,10 @@ mod tests {
                     &parsed,
                     file,
                     CanonicalCheckerOptions {
-                        strict_null_checks: true,
-                        exact_optional_property_types,
+                        intrinsic: IntrinsicBootstrapOptions {
+                            strict_null_checks: true,
+                            exact_optional_property_types,
+                        },
                         ..CanonicalCheckerOptions::default()
                     },
                 );
@@ -2404,8 +2406,10 @@ mod tests {
                 &parsed,
                 file,
                 CanonicalCheckerOptions {
-                    strict_null_checks: true,
-                    exact_optional_property_types,
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        exact_optional_property_types,
+                    },
                     ..CanonicalCheckerOptions::default()
                 },
             );
