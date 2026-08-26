@@ -23767,7 +23767,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .imported_callable_type_queries
             .get(&query.symbol)
             .map(|callable| {
-                self.get_type_of_source_callable(callable.declaration, callable.owner_symbol)
+                // The outer query can still have pending callback parameters.
+                let mut nested =
+                    CanonicalTypeQuery::new(self.store, self.host, self.options, self.diagnostics)?;
+                nested.array_type = self.array_type;
+                nested.global_types = self.global_types.clone();
+                nested.instantiation_session = self.instantiation_session.as_deref_mut();
+                nested.resolving_property_interfaces = self.resolving_property_interfaces.clone();
+                nested.resolving_instantiated_signatures =
+                    self.resolving_instantiated_signatures.clone();
+                nested.get_type_of_source_callable(callable.declaration, callable.owner_symbol)
             })
             .transpose()?;
         let source_type = match query.source_node {

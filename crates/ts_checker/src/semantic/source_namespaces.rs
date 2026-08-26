@@ -19765,6 +19765,7 @@ mod tests {
                     "declare module 'consumer' { ",
                     "import * as Tools from 'tools'; ",
                     "interface Calls { ",
+                    "callback: (value: string) => void; ",
                     "identity: typeof Tools.identity; ",
                     "text: typeof Tools.text; ",
                     "} }",
@@ -19865,6 +19866,31 @@ mod tests {
                         .resolved_return_type(),
                     None,
                 );
+                let callback = fixture
+                    .parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                            fixture.parsed.arena.id(),
+                            fixture.file,
+                            node,
+                        ))
+                    })
+                    .unwrap();
+                let callback_type = fixture
+                    .context
+                    .store()
+                    .type_node_links(callback)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                assert!(matches!(
+                    super::super::functions::validate_stored_function_type(
+                        fixture.context.store(),
+                        callback_type,
+                    ),
+                    super::super::functions::StoredFunctionTypeValidation::Valid(_)
+                ));
                 let warm = (
                     fixture.context.store().type_len(),
                     fixture.context.store().symbol_len(),
