@@ -6,25 +6,28 @@ Its `missing_evidence` field names inputs the loader does not retain.
 
 ## Mode-specific module targets
 
-The current `Program::resolved_modules` map uses a containing path and module
-specifier as its key. It does not include the request's import or require mode.
-Two requests in one file can therefore resolve to different files and overwrite
-one map entry. For example, an `.mts` source can contain both of these imports:
+`Program::resolved_modules` keys targets by canonical containing path, module
+specifier, and request mode. The canonical manifest uses the exact request mode
+for each specifier node. An `.mts` source can retain different targets for these
+imports:
 
 ```ts
 import { value } from "pkg";
 import other = require("pkg");
 ```
 
-If `pkg` has different `import` and `require` export targets, the raw resolver
-records contain both targets. The canonical module manifest can still use the
-last target for both specifier nodes. This is an existing compiler bug. The
-snapshot does not fix it or approve the resulting manifest.
+`canonical_module_resolution_modes.rs` checks this through public canonical
+queries, value types, declaration owners, and replay in both source orders.
+Declaration-only tests with `skipLibCheck` also check explicit `resolution-mode`
+attributes, an unresolved target in only one mode, and shared ambient targets.
+A JSX test checks that a successful require lookup cannot hide a missing
+import-mode runtime.
 
-`graph_snapshot_keeps_each_mode_and_unresolved_lookup` checks the raw request
-modes and targets. It does not assert that the overwritten manifest target is
-correct. A compiler fix needs mode-aware module-map keys and tests against the
-canonical checker. Keep that fix separate from read-only graph reporting.
+Unresolved source `import = require` checking remains explicitly unsupported.
+The test suite preserves that failure class. The legacy checker still projects
+module targets to a map keyed only by specifier text. These bounded canonical
+checks do not certify mixed-mode legacy checking, emit, or full resolution
+parity. The graph snapshot remains a report of retained inputs and results.
 
 ## Missing input evidence
 

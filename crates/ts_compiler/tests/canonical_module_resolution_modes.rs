@@ -1,6 +1,9 @@
 use ts_ast::{NodeData, NodeRef};
 use ts_checker::semantic::CanonicalModuleResolutionMode;
-use ts_compiler::{CanonicalModuleResolutionLookup, CanonicalProgramQueries, Program};
+use ts_compiler::{
+    CanonicalModuleResolutionLookup, CanonicalProgramCheckError, CanonicalProgramCheckFailureClass,
+    CanonicalProgramQueries, Program,
+};
 use ts_options::{CompilerOptions, JsxEmit, ModuleKind, ModuleResolutionKind};
 use ts_vfs::{FileSystem, MemoryFileSystem};
 
@@ -172,18 +175,18 @@ fn canonical_module_modes_keep_distinct_import_and_require_targets_in_both_order
 }
 
 #[test]
-fn canonical_module_modes_use_each_type_import_attribute() {
+fn canonical_module_modes_use_each_declaration_type_import_attribute() {
     let filesystem = package_filesystem(
         r#"{"name":"pkg","exports":{".":{"import":"./index.d.mts","require":"./index.d.cts"}}}"#,
     );
     filesystem
         .write_file(
-            "/project/main.cts",
+            "/project/main.d.cts",
             concat!(
                 "import type { Value as Imported } from 'pkg' with { 'resolution-mode': 'import' };\n",
                 "import type { Value as Required } from 'pkg' with { 'resolution-mode': 'require' };\n",
-                "const importedValue: Imported = { value: 1 };\n",
-                "const requiredValue: Required = { value: 'ready' };\n",
+                "declare const importedValue: Imported;\n",
+                "declare const requiredValue: Required;\n",
             ),
         )
         .unwrap();
@@ -191,10 +194,10 @@ fn canonical_module_modes_use_each_type_import_attribute() {
     let (program, result) = Program::try_new_with_canonical_checker_and_queries(
         &filesystem,
         "/project",
-        &["main.cts".to_owned()],
+        &["main.d.cts".to_owned()],
         options(),
         |program, queries| {
-            let nodes = specifiers(program, "/project/main.cts");
+            let nodes = specifiers(program, "/project/main.d.cts");
             assert_eq!(nodes.len(), 2);
             assert_target(
                 program,
@@ -233,7 +236,7 @@ fn canonical_module_modes_do_not_reuse_another_modes_success_for_a_missing_targe
         let filesystem = package_filesystem(exports);
         filesystem
             .write_file(
-                "/project/main.mts",
+                "/project/main.d.mts",
                 "import { value } from 'pkg';\nimport required = require('pkg');\n",
             )
             .unwrap();
@@ -241,10 +244,10 @@ fn canonical_module_modes_do_not_reuse_another_modes_success_for_a_missing_targe
         let (program, result) = Program::try_new_with_canonical_checker_and_queries(
             &filesystem,
             "/project",
-            &["main.mts".to_owned()],
+            &["main.d.mts".to_owned()],
             options(),
             |program, queries| {
-                let nodes = specifiers(program, "/project/main.mts");
+                let nodes = specifiers(program, "/project/main.d.mts");
                 assert_eq!(nodes.len(), 2);
                 let missing = nodes[usize::from(!missing_import)];
                 let resolved = nodes[usize::from(missing_import)];
@@ -262,28 +265,56 @@ fn canonical_module_modes_do_not_reuse_another_modes_success_for_a_missing_targe
         )
         .unwrap_or_else(|error| panic!("missing_import={missing_import}: {error:?}"));
         assert_eq!(result, Some(()));
-        assert_eq!(
-            program
-                .diagnostics()
-                .iter()
-                .map(|diagnostic| diagnostic.code)
-                .collect::<Vec<_>>(),
-            [Some(2307)]
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
         );
     }
 }
 
 #[test]
-fn canonical_module_modes_keep_ambient_targets_in_both_modes() {
-    let filesystem = MemoryFileSystem::new(true);
+fn canonical_module_modes_keep_unresolved_source_require_imports_unsupported() {
+    let filesystem = package_filesystem(
+        r#"{"name":"pkg","exports":{".":{"import":"./index.d.mts","require":"./missing.d.cts"}}}"#,
+    );
     filesystem
         .write_file(
             "/project/main.mts",
+            "import { value } from 'pkg';\nimport required = require('pkg');\n",
+        )
+        .unwrap();
+    let error = Program::try_new_with_canonical_checker(
+        &filesystem,
+        "/project",
+        &["main.mts".to_owned()],
+        options(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.failure_class(),
+        CanonicalProgramCheckFailureClass::Unsupported { .. }
+    ));
+    assert!(matches!(
+        error,
+        CanonicalProgramCheckError::SourceCheck {
+            error: ts_checker::semantic::SourceCheckError::Unsupported(
+                ts_checker::semantic::UnsupportedSourceSyntax::Import(_)
+            ),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn canonical_module_modes_keep_ambient_declaration_targets_in_both_modes() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/main.d.mts",
             concat!(
                 "import { value } from 'pkg';\n",
                 "import required = require('pkg');\n",
-                "const importedValue: number = value;\n",
-                "const requiredValue: number = required.value;\n",
             ),
         )
         .unwrap();
@@ -297,10 +328,10 @@ fn canonical_module_modes_keep_ambient_targets_in_both_modes() {
     let (program, result) = Program::try_new_with_canonical_checker_and_queries(
         &filesystem,
         "/project",
-        &["main.mts".to_owned(), "ambient.d.ts".to_owned()],
+        &["main.d.mts".to_owned(), "ambient.d.ts".to_owned()],
         options(),
         |program, queries| {
-            let nodes = specifiers(program, "/project/main.mts");
+            let nodes = specifiers(program, "/project/main.d.mts");
             assert_eq!(nodes.len(), 2);
             let target = program.source_file("/project/ambient.d.ts").unwrap();
             let declaration = target
@@ -346,7 +377,7 @@ fn canonical_module_modes_keep_ambient_targets_in_both_modes() {
 }
 
 #[test]
-fn canonical_module_modes_keep_the_jsx_runtime_separate_from_an_explicit_require() {
+fn canonical_module_modes_do_not_replace_a_missing_jsx_runtime_with_a_require_target() {
     let filesystem = MemoryFileSystem::new(true);
     for (path, text) in [
         (
@@ -359,26 +390,11 @@ fn canonical_module_modes_keep_the_jsx_runtime_separate_from_an_explicit_require
         ),
         (
             "/project/node_modules/pkg/package.json",
-            r#"{"name":"pkg","exports":{"./jsx-runtime":{"import":"./jsx.d.mts","require":"./jsx.d.cts"}}}"#,
-        ),
-        (
-            "/project/node_modules/pkg/jsx.d.mts",
-            concat!(
-                "export namespace JSX {\n",
-                "  interface Element {}\n",
-                "  interface IntrinsicElements { div: { title: string }; }\n",
-                "}\n",
-            ),
+            r#"{"name":"pkg","exports":{"./jsx-runtime":{"import":"./missing.d.mts","require":"./jsx.d.cts"}}}"#,
         ),
         (
             "/project/node_modules/pkg/jsx.d.cts",
-            concat!(
-                "export declare const marker: number;\n",
-                "export namespace JSX {\n",
-                "  interface Element {}\n",
-                "  interface IntrinsicElements { span: {}; }\n",
-                "}\n",
-            ),
+            "export declare const marker: number;\n",
         ),
     ] {
         filesystem.write_file(path, text).unwrap();
@@ -390,6 +406,7 @@ fn canonical_module_modes_keep_the_jsx_runtime_separate_from_an_explicit_require
         CompilerOptions {
             jsx: JsxEmit::ReactJsx,
             jsx_import_source: Some("pkg".to_owned()),
+            no_implicit_any: false,
             ..options()
         },
         |program, queries| {
@@ -412,15 +429,19 @@ fn canonical_module_modes_keep_the_jsx_runtime_separate_from_an_explicit_require
             );
             let view = variable(program, "/project/main.tsx", "view");
             let type_ = queries.get_type_at_location(view).unwrap();
-            assert!(queries.replay_sources().unwrap().is_empty());
+            let cold = queries.cold_diagnostic_snapshot();
+            assert_eq!(queries.replay_sources().unwrap(), cold);
             assert_eq!(queries.get_type_at_location(view).unwrap(), type_);
         },
     )
     .unwrap();
     assert_eq!(result, Some(()));
-    assert!(
-        program.diagnostics().is_empty(),
-        "{:?}",
-        program.diagnostics()
-    );
+    let [diagnostic] = program.diagnostics() else {
+        panic!(
+            "expected one missing runtime diagnostic: {:?}",
+            program.diagnostics()
+        );
+    };
+    assert_eq!(diagnostic.code, Some(2875));
+    assert!(diagnostic.message.contains("pkg/jsx-runtime"));
 }
