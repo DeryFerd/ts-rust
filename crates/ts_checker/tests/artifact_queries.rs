@@ -491,9 +491,13 @@ fn class_names_constructor_reads_and_member_names_preserve_their_distinct_types(
     };
     let access_name = node(&parsed, file, access.name);
 
-    let class_value_type = context.get_type_at_location(class_name).unwrap();
+    let class_instance_type = context.get_type_at_location(class_name).unwrap();
     let members = context.get_nongeneric_class_members(class_symbol).unwrap();
-    assert_eq!(class_value_type, members.shells().value_type());
+    assert_eq!(class_instance_type, members.shells().instance_type());
+    assert_eq!(
+        context.get_type_at_location(class).unwrap(),
+        members.shells().instance_type()
+    );
     assert_eq!(
         context.get_type_at_location(constructor).unwrap(),
         members.shells().value_type()

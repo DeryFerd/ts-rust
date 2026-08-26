@@ -187,6 +187,10 @@ impl CanonicalCheckerContext<'_> {
     ) -> Result<TypeId, CanonicalArtifactQueryError> {
         self.prepare_artifact_location(node)?;
 
+        if let Some(type_) = self.class_declaration_artifact_type(node)? {
+            return Ok(type_);
+        }
+
         if let Some(type_) = self.cached_artifact_type(node)? {
             return Ok(type_);
         }
@@ -653,6 +657,48 @@ impl CanonicalCheckerContext<'_> {
         else {
             return Ok(None);
         };
+        self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    fn class_declaration_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let symbol = {
+            let (arena, bound, record) = self.validated_artifact_node(node)?;
+            let declaration = if matches!(record.data, NodeData::ClassDeclaration(_)) {
+                node
+            } else if let Some(parent) = record.parent {
+                let Some(NodeData::ClassDeclaration(class)) =
+                    arena.get(parent).map(|record| &record.data)
+                else {
+                    return Ok(None);
+                };
+                if class.name != Some(node.node) {
+                    return Ok(None);
+                }
+                NodeRef::new(node.arena, node.file, parent)
+            } else {
+                return Ok(None);
+            };
+            let symbol =
+                bound
+                    .symbol(declaration)
+                    .ok_or(CanonicalArtifactQueryError::MissingType {
+                        node,
+                        kind: record.kind,
+                    })?;
+            self.merged_artifact_symbol(node, symbol)?
+        };
+        let type_ = self.get_declared_type_of_symbol(symbol)?;
+        if let Some(cached) = self.cached_artifact_type(node)?
+            && cached != type_
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: cached,
+            });
+        }
         self.validate_artifact_type(node, type_).map(Some)
     }
 
@@ -1783,6 +1829,68 @@ mod tests {
         let internal = context.file(file).unwrap().1.symbol(object).unwrap();
         assert_eq!(context.get_symbol_at_location(object).unwrap(), None);
         assert_eq!(context.file(file).unwrap().1.symbol(object), Some(internal));
+    }
+
+    #[test]
+    fn class_declaration_queries_preserve_instance_identity_and_reject_forged_caches() {
+        let parsed = parse_source_file("class Model {} const constructor = Model;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_028);
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ClassDeclaration(class) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, class.name.unwrap()),
+                ))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let instance = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(context.get_type_at_location(declaration), Ok(instance));
+        assert_eq!(context.get_type_at_location(name), Ok(instance));
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            name,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert_eq!(
+            context.get_type_at_location(name),
+            Err(CanonicalArtifactQueryError::InvalidType {
+                node: name,
+                type_: wrong,
+            }),
+        );
+        assert_eq!(context.get_type_at_location(declaration), Ok(instance));
     }
 
     #[test]
