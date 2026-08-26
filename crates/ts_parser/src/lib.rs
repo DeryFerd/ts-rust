@@ -505,12 +505,13 @@ fn javascript_jsdoc_callable_signature(
     let mut return_type = None;
     let mut in_overload = false;
     for tag in tags {
-        if tag.text == "overload" {
+        let name = token_value(&tag);
+        if name == "overload" {
             in_overload = true;
             continue;
         }
         if in_overload {
-            match tag.text {
+            match name.as_str() {
                 "param" | "arg" | "argument" | "this" | "template" => continue,
                 "return" | "returns" => {
                     in_overload = false;
@@ -520,7 +521,7 @@ fn javascript_jsdoc_callable_signature(
             }
         }
         let body_start = comment_start.checked_add(usize::try_from(tag.range.end.get()).ok()?)?;
-        match tag.text {
+        match name.as_str() {
             "typedef" | "callback" => return None,
             "template" => {
                 if template.is_some() {
@@ -19359,6 +19360,45 @@ export as namespace GlobalName;
             ] {
                 let node = parsed.arena.get(annotation).unwrap();
                 assert_eq!(node.parent, Some(parent));
+                assert_eq!(node.flags, NodeFlags::REPARSED);
+                assert_eq!(
+                    &source[node.range.start.get() as usize..node.range.end.get() as usize],
+                    "T"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jsdoc_overload_blocks_decode_escaped_primary_tags() {
+        let primary = "@template T @par\\u0061m {T} value @returns {T}";
+        for tags in [
+            primary.to_owned(),
+            format!("@overload @param {{number}} nested @return {{number}} {primary}"),
+            format!("{primary} @overlo\\u0061d @param {{number}} value @return {{number}}"),
+        ] {
+            let source = format!("/** {tags} */\nconst read = value => value;");
+            let parsed = parse_javascript_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let function = parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| match &record.data {
+                    NodeData::ArrowFunction(function) => Some(function),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(function.type_parameters.as_ref().unwrap().nodes.len(), 1);
+            let [parameter] = function.parameters.nodes.as_slice() else {
+                panic!("expected the decoded primary parameter")
+            };
+            let NodeData::ParameterDeclaration(parameter) =
+                &parsed.arena.get(*parameter).unwrap().data
+            else {
+                panic!("expected the source parameter declaration")
+            };
+            for annotation in [parameter.type_.unwrap(), function.type_.unwrap()] {
+                let node = parsed.arena.get(annotation).unwrap();
                 assert_eq!(node.flags, NodeFlags::REPARSED);
                 assert_eq!(
                     &source[node.range.start.get() as usize..node.range.end.get() as usize],
