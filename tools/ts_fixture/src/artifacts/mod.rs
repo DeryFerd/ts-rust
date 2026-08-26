@@ -666,7 +666,10 @@ pub(super) fn is_artifact_candidate(
 ) -> bool {
     node.kind == SyntaxKind::Identifier
         || is_expression_node(arena, node_id, node, parent)
-        || parent.is_some_and(|parent| declaration_name(parent) == Some(node_id))
+        || (!matches!(
+            node.kind,
+            SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern
+        ) && parent.is_some_and(|parent| declaration_name(parent) == Some(node_id)))
 }
 
 fn is_expression_node(
@@ -788,6 +791,7 @@ fn in_expression_context(arena: &NodeArena, node_id: NodeId, parent: &Node) -> b
         NodeData::ReturnStatement(data) => data.expression == Some(node_id),
         NodeData::WithStatement(data) => data.expression == node_id,
         NodeData::SwitchStatement(data) => data.expression == node_id,
+        NodeData::CaseOrDefaultClause(data) => data.expression == node_id,
         NodeData::ThrowStatement(data) => data.expression == node_id,
         NodeData::TypeAssertion(data) => data.expression == node_id,
         NodeData::AsExpression(data) => data.expression == node_id,
@@ -1112,6 +1116,97 @@ mod tests {
                 "/.src/lib.fixture.d.ts".to_owned(),
             ],
         );
+    }
+
+    #[test]
+    fn semantic_artifact_walks_exclude_binding_patterns_but_visit_their_children() {
+        let case = Case::parse(
+            "bindings.ts",
+            concat!(
+                "const { value, nested: { inner } } = { value: 1, nested: { inner: 2 } };\n",
+                "const [first, , ...rest] = [1, 2, 3];\n",
+            ),
+        )
+        .unwrap();
+        let filesystem = fixture_filesystem(&case);
+        let program = Program::new_with_options(
+            &filesystem,
+            "/.src",
+            &["/.src/bindings.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let walk = walk_program(&case, &program).unwrap();
+        for nodes in [&walk.types, &walk.symbols] {
+            assert!(nodes.iter().all(|node| {
+                !matches!(
+                    program.node(*node).unwrap().kind,
+                    SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern
+                )
+            }));
+            for name in ["value", "inner", "first", "rest"] {
+                assert!(nodes.iter().any(|node| {
+                    matches!(
+                        &program.node(*node).unwrap().data,
+                        NodeData::Identifier(identifier) if identifier.text == name
+                    )
+                }));
+            }
+            assert!(nodes.iter().any(|node| {
+                program.node(*node).unwrap().kind == SyntaxKind::ObjectLiteralExpression
+            }));
+            assert!(nodes.iter().any(|node| {
+                program.node(*node).unwrap().kind == SyntaxKind::ArrayLiteralExpression
+            }));
+        }
+    }
+
+    #[test]
+    fn semantic_artifact_walks_include_switch_case_literals() {
+        let source = concat!(
+            "declare const value: 'type';\n",
+            "switch (value) {\n",
+            "  case 'text': break;\n",
+            "  case 1: break;\n",
+            "  case 2n: break;\n",
+            "  case `template`: break;\n",
+            "  default: break;\n",
+            "}\n",
+        );
+        let case = Case::parse("switch.ts", source).unwrap();
+        let filesystem = fixture_filesystem(&case);
+        let program = Program::new_with_options(
+            &filesystem,
+            "/.src",
+            &["/.src/switch.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let walk = walk_program(&case, &program).unwrap();
+        for nodes in [&walk.types, &walk.symbols] {
+            let literals = nodes
+                .iter()
+                .map(|node| program.node(*node).unwrap())
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        SyntaxKind::StringLiteral
+                            | SyntaxKind::NumericLiteral
+                            | SyntaxKind::BigIntLiteral
+                            | SyntaxKind::NoSubstitutionTemplateLiteral
+                    )
+                })
+                .map(|node| {
+                    &source[usize::try_from(node.range.start.get()).unwrap()
+                        ..usize::try_from(node.range.end.get()).unwrap()]
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(literals, ["'text'", "1", "2n", "`template`"]);
+        }
     }
 
     #[test]
