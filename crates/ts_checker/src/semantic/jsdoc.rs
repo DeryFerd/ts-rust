@@ -5805,15 +5805,14 @@ mod tests {
             javascript.diagnostics
         );
         let file = FileId::new(118);
-        let arrow = javascript
+        let name = javascript
             .arena
             .iter()
-            .find_map(|(node, record)| {
-                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
-                    javascript.arena.id(),
-                    file,
-                    node,
-                ))
+            .find_map(|(_, record)| match &record.data {
+                NodeData::VariableDeclaration(variable) => {
+                    Some(NodeRef::new(javascript.arena.id(), file, variable.name))
+                }
+                _ => None,
             })
             .unwrap();
         let mut context = javascript_context(&javascript, file);
@@ -5823,14 +5822,14 @@ mod tests {
             "{:?}",
             context.diagnostics()
         );
-        let callable = context.get_type_at_location(arrow).unwrap();
+        let callable = context.get_type_at_location(name).unwrap();
         assert_eq!(
             context.type_to_string(callable).unwrap(),
             "<T>(value: T) => T"
         );
         let before = (context.store().type_len(), context.store().signature_len());
         context.recheck_source_file(file).unwrap();
-        assert_eq!(context.get_type_at_location(arrow).unwrap(), callable);
+        assert_eq!(context.get_type_at_location(name).unwrap(), callable);
         assert_eq!(
             (context.store().type_len(), context.store().signature_len()),
             before

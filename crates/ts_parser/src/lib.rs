@@ -19316,7 +19316,7 @@ export as namespace GlobalName;
                 parsed
                     .arena
                     .iter()
-                    .all(|(_, node)| !node.flags.contains(NodeFlags::REPARSED))
+                    .all(|(_, node)| node.flags.0 & NodeFlags::REPARSED.0 == 0)
             );
         }
     }
