@@ -42,6 +42,7 @@ pub enum JsDocTagKind {
     Return,
     Typedef,
     Callback,
+    Overload,
     Property,
     Template,
     Satisfies,
@@ -434,6 +435,7 @@ pub struct JsDocTag<'source> {
     name: Option<JsDocTagName<'source>>,
     type_expression: Option<JsDocTypeExpression<'source>>,
     template_parameters: Vec<JsDocTemplateParameter<'source>>,
+    overload_tags: Vec<JsDocTag<'source>>,
     name_first: bool,
     optional: bool,
 }
@@ -467,6 +469,12 @@ impl<'source> JsDocTag<'source> {
     #[must_use]
     pub fn template_parameters(&self) -> &[JsDocTemplateParameter<'source>] {
         &self.template_parameters
+    }
+
+    /// Returns the tags owned by this overload, separate from its host signature.
+    #[must_use]
+    pub fn overload_tags(&self) -> &[JsDocTag<'source>] {
+        &self.overload_tags
     }
 
     #[must_use]
@@ -914,7 +922,7 @@ impl PlannedJavaScriptJsDoc {
     }
 }
 
-/// Invalid source provenance or an inconsistent standalone `JSDoc` parse.
+/// Invalid source provenance, an inconsistent parse, or an unsupported declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JsDocCommentError {
     InvalidCommentRange(TextRange),
@@ -922,6 +930,7 @@ pub enum JsDocCommentError {
     InvalidParserTree(TextRange),
     InvalidSourceNode(NodeRef),
     MissingSourceText(NodeRef),
+    UnsupportedOverloadDeclaration(NodeRef),
     UnsupportedParserDiagnostic { code: Option<u32>, range: TextRange },
     SourcePositionOverflow,
 }
@@ -957,6 +966,12 @@ impl fmt::Display for JsDocCommentError {
                 write!(
                     formatter,
                     "JSDoc comment source text is unavailable for {node:?}"
+                )
+            }
+            Self::UnsupportedOverloadDeclaration(node) => {
+                write!(
+                    formatter,
+                    "JSDoc overload declarations are not supported for {node:?}"
                 )
             }
             Self::UnsupportedParserDiagnostic { code, range } => {
@@ -1154,21 +1169,34 @@ pub fn parse_jsdoc_comment_at(
         .collect::<Result<Vec<_>, _>>()?;
     let mut tags = Vec::new();
     let comment_end = comment.len() - 2;
+    let mut overload_children = 0;
     for (index, tag) in scanned.iter().enumerate() {
+        if overload_children > 0 {
+            overload_children -= 1;
+            continue;
+        }
         let Some(kind) = tag_kind(tag.name) else {
             continue;
         };
         let tag_end = scanned
             .get(index + 1)
             .map_or(comment_end, |next| next.start);
-        tags.push(parse_supported_tag(
-            source,
-            start,
-            *tag,
-            tag_end,
-            kind,
-            &mut diagnostics,
-        )?);
+        let mut parsed_tag =
+            parse_supported_tag(source, start, *tag, tag_end, kind, &mut diagnostics)?;
+        if kind == JsDocTagKind::Overload {
+            parsed_tag.overload_tags = parse_overload_signature_tags(
+                source,
+                start,
+                &scanned[index + 1..],
+                comment_end,
+                &mut diagnostics,
+            )?;
+            overload_children = parsed_tag.overload_tags.len();
+            if let Some(last) = parsed_tag.overload_tags.last() {
+                parsed_tag.range.end = last.range.end;
+            }
+        }
+        tags.push(parsed_tag);
     }
 
     Ok(ParsedJsDocComment {
@@ -1176,6 +1204,49 @@ pub fn parse_jsdoc_comment_at(
         tags,
         diagnostics,
     })
+}
+
+fn parse_overload_signature_tags<'source>(
+    source: &'source str,
+    comment_start: usize,
+    scanned: &[ScannedTag<'source>],
+    comment_end: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<Vec<JsDocTag<'source>>, JsDocCommentError> {
+    let mut tags = Vec::new();
+    for (index, tag) in scanned.iter().copied().enumerate() {
+        let Some(
+            kind @ (JsDocTagKind::Parameter
+            | JsDocTagKind::This
+            | JsDocTagKind::Template
+            | JsDocTagKind::Return),
+        ) = tag_kind(tag.name)
+        else {
+            break;
+        };
+        let end = scanned
+            .get(index + 1)
+            .map_or(comment_end, |next| next.start);
+        let parsed = parse_supported_tag(source, comment_start, tag, end, kind, diagnostics)?;
+        if kind == JsDocTagKind::Template {
+            let range = jsdoc_tag_name_range(&parsed)?;
+            let mut diagnostic = expected_diagnostic(
+                source,
+                range.start.get() as usize,
+                range.end.get() as usize,
+                8039,
+                &[],
+            )?;
+            diagnostic.range = range;
+            diagnostics.push(diagnostic);
+        }
+        tags.push(parsed);
+        // The pinned parseJSDocSignature consumes at most one return tag.
+        if kind == JsDocTagKind::Return {
+            break;
+        }
+    }
+    Ok(tags)
 }
 
 /// Finds and parses the immediately preceding `JSDoc` comment for a source node.
@@ -1263,8 +1334,9 @@ pub fn leading_jsdoc_comments(
 ///
 /// # Errors
 ///
-/// Returns an error for invalid source identity, malformed parser trees, or
-/// parser diagnostics whose catalog arguments cannot be reconstructed.
+/// Returns an error for invalid source identity, malformed parser trees,
+/// unsupported overload declarations, or parser diagnostics whose catalog
+/// arguments cannot be reconstructed.
 pub fn plan_javascript_source_jsdoc(
     arena: &NodeArena,
     source: NodeRef,
@@ -3363,6 +3435,7 @@ fn is_jsdoc_declaration_candidate(kind: SyntaxKind) -> bool {
             | SyntaxKind::ClassDeclaration
             | SyntaxKind::PropertyDeclaration
             | SyntaxKind::MethodDeclaration
+            | SyntaxKind::Constructor
     )
 }
 
@@ -3565,6 +3638,24 @@ fn apply_jsdoc_tag(
                     this_type: None,
                     template_parameters: Vec::new(),
                 });
+            }
+        }
+        JsDocTagKind::Overload => {
+            let record = arena
+                .get(declaration.node.node)
+                .ok_or(JsDocCommentError::InvalidSourceNode(declaration.node))?;
+            let creates_declaration = matches!(
+                record.kind,
+                SyntaxKind::FunctionDeclaration | SyntaxKind::Constructor
+            ) || record.kind == SyntaxKind::MethodDeclaration
+                && record
+                    .parent
+                    .and_then(|parent| arena.get(parent))
+                    .is_some_and(|parent| parent.kind != SyntaxKind::ObjectLiteralExpression);
+            if creates_declaration {
+                return Err(JsDocCommentError::UnsupportedOverloadDeclaration(
+                    declaration.node,
+                ));
             }
         }
         JsDocTagKind::Property | JsDocTagKind::Template => {}
@@ -3904,6 +3995,7 @@ fn tag_kind(name: &str) -> Option<JsDocTagKind> {
         "return" | "returns" => Some(JsDocTagKind::Return),
         "typedef" => Some(JsDocTagKind::Typedef),
         "callback" => Some(JsDocTagKind::Callback),
+        "overload" => Some(JsDocTagKind::Overload),
         "template" => Some(JsDocTagKind::Template),
         "satisfies" => Some(JsDocTagKind::Satisfies),
         "this" => Some(JsDocTagKind::This),
@@ -4000,7 +4092,7 @@ fn parse_supported_tag<'source>(
     let mut name_first = false;
     let mut bracketed = false;
 
-    if source.as_bytes().get(cursor) == Some(&b'{') {
+    if kind != JsDocTagKind::Overload && source.as_bytes().get(cursor) == Some(&b'{') {
         let (parsed, next) = parse_braced_type(source, cursor, absolute_end, diagnostics)?;
         type_expression = parsed;
         cursor = skip_doc_whitespace(source, next, absolute_end);
@@ -4010,6 +4102,7 @@ fn parse_supported_tag<'source>(
             | JsDocTagKind::Property
             | JsDocTagKind::Typedef
             | JsDocTagKind::Callback
+            | JsDocTagKind::Overload
             | JsDocTagKind::Template
     ) {
         name_first = matches!(kind, JsDocTagKind::Parameter | JsDocTagKind::Property);
@@ -4067,6 +4160,7 @@ fn parse_supported_tag<'source>(
         name,
         type_expression,
         template_parameters,
+        overload_tags: Vec::new(),
         name_first,
         optional,
     })
@@ -5330,6 +5424,278 @@ mod tests {
 
     fn type_tag(source: &str) -> ParsedJsDocComment<'_> {
         parse_jsdoc_comment_at(source, checked_range(0, source.len()).unwrap()).unwrap()
+    }
+
+    const GENERIC_OVERLOAD_COMMENT: &str = concat!(
+        "/**\n",
+        " * @template T\n",
+        " * @param {T} value\n",
+        " * @param {number=} count\n",
+        " * @overload one value\n",
+        " * @param {T} value\n",
+        " * @return {T}\n",
+        " * @overload with count\n",
+        " * @param {T} value\n",
+        " * @param {number} count\n",
+        " * @returns {T}\n",
+        " */",
+    );
+
+    #[test]
+    fn jsdoc_overload_blocks_keep_signature_tags_separate() {
+        let comment = type_tag(GENERIC_OVERLOAD_COMMENT);
+        assert!(
+            comment.diagnostics().is_empty(),
+            "{:?}",
+            comment.diagnostics()
+        );
+        assert_eq!(comment.template_tags().count(), 1);
+        assert!(comment.return_tag().is_none());
+        assert!(comment.parameter_tag("count").unwrap().is_optional());
+        let kinds = comment
+            .tags()
+            .iter()
+            .map(JsDocTag::kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                JsDocTagKind::Template,
+                JsDocTagKind::Parameter,
+                JsDocTagKind::Parameter,
+                JsDocTagKind::Overload,
+                JsDocTagKind::Overload,
+            ]
+        );
+        for (overload, parameter_count) in comment.tags()[3..].iter().zip([1, 2]) {
+            assert!(overload.type_expression().is_none());
+            let children = overload.overload_tags();
+            assert_eq!(children.len(), parameter_count + 1);
+            assert!(
+                children[..parameter_count]
+                    .iter()
+                    .all(|tag| tag.kind() == JsDocTagKind::Parameter)
+            );
+            let result = children.last().unwrap();
+            assert_eq!(result.kind(), JsDocTagKind::Return);
+            assert_eq!(
+                result.type_expression().unwrap().type_(),
+                &JsDocType::Named("T".to_owned())
+            );
+            assert_eq!(overload.range().end, result.range().end);
+            assert!(children.iter().all(|tag| {
+                overload.range().start < tag.range().start
+                    && tag.range().end <= overload.range().end
+            }));
+        }
+    }
+
+    #[test]
+    fn jsdoc_overload_blocks_do_not_change_arrow_or_function_expression_signatures() {
+        for initializer in [
+            "(value, count) => value",
+            "function (value, count) { return value; }",
+        ] {
+            for inline in [false, true] {
+                let source = if inline {
+                    format!("const read = {GENERIC_OVERLOAD_COMMENT}{initializer};")
+                } else {
+                    format!("{GENERIC_OVERLOAD_COMMENT}\nconst read = {initializer};")
+                };
+                let javascript = parse_javascript_source_file(&source);
+                assert!(
+                    javascript.diagnostics.is_empty(),
+                    "{:?}",
+                    javascript.diagnostics
+                );
+                let root = NodeRef::new(
+                    javascript.arena.id(),
+                    FileId::new(109),
+                    javascript.source_file,
+                );
+                let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+                assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+                let [declaration] = plan.declarations() else {
+                    panic!("expected one source-owned callable annotation")
+                };
+                let [template] = declaration.template_parameters() else {
+                    panic!("expected only the host template")
+                };
+                assert_eq!(template.name(), "T");
+                let [value, count] = declaration.parameters() else {
+                    panic!("overload parameters must not enter the host signature")
+                };
+                assert_eq!(value.name(), "value");
+                assert_eq!(
+                    value.type_().unwrap().type_(),
+                    &JsDocType::Named("T".to_owned())
+                );
+                assert_eq!(count.name(), "count");
+                assert!(count.is_optional());
+                assert!(declaration.return_type().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn jsdoc_overload_blocks_preserve_host_tags_after_the_signature_ends() {
+        for boundary in ["@returns {number}", "@deprecated end of overload"] {
+            let source = format!(
+                "/**\n * @template T\n * @param {{T}} before\n * @overload\n \
+                 * @param {{number}} nested\n * {boundary}\n * @template U\n \
+                 * @param {{U}} after\n * @return {{U}}\n */\n \
+                 const read = (before, after) => after;"
+            );
+            let javascript = parse_javascript_source_file(&source);
+            let root = NodeRef::new(
+                javascript.arena.id(),
+                FileId::new(110),
+                javascript.source_file,
+            );
+            let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+            assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+            let [declaration] = plan.declarations() else {
+                panic!("expected one arrow annotation")
+            };
+            assert_eq!(
+                declaration
+                    .template_parameters()
+                    .iter()
+                    .map(PlannedJsDocTemplateParameter::name)
+                    .collect::<Vec<_>>(),
+                ["T", "U"]
+            );
+            assert_eq!(
+                declaration
+                    .parameters()
+                    .iter()
+                    .map(PlannedJsDocParameter::name)
+                    .collect::<Vec<_>>(),
+                ["before", "after"]
+            );
+            assert_eq!(
+                declaration.return_type().unwrap().type_(),
+                &JsDocType::Named("U".to_owned())
+            );
+        }
+
+        let source = concat!(
+            "/** @overload @param {number} nested */\n",
+            "/** @param {string} value @returns {string} */\n",
+            "const read = value => value;",
+        );
+        let javascript = parse_javascript_source_file(source);
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(111),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        let [declaration] = plan.declarations() else {
+            panic!("adjacent comments must retain one host")
+        };
+        assert_eq!(declaration.parameters().len(), 1);
+        assert_eq!(declaration.parameters()[0].name(), "value");
+        assert_eq!(
+            declaration.return_type().unwrap().type_(),
+            &JsDocType::Intrinsic(JsDocIntrinsicType::String)
+        );
+    }
+
+    #[test]
+    fn jsdoc_overload_blocks_leave_declaration_overloads_unsupported() {
+        let comment = "/** @overload @param {number} value @returns {number} */";
+        for (source, kind) in [
+            (
+                format!("{comment}\nfunction read(value) {{ return value; }}"),
+                SyntaxKind::FunctionDeclaration,
+            ),
+            (
+                format!("class Box {{\n{comment}\nread(value) {{ return value; }} }}"),
+                SyntaxKind::MethodDeclaration,
+            ),
+            (
+                format!("class Box {{\n{comment}\nconstructor(value) {{}} }}"),
+                SyntaxKind::Constructor,
+            ),
+        ] {
+            let javascript = parse_javascript_source_file(&source);
+            assert!(
+                javascript.diagnostics.is_empty(),
+                "{:?}",
+                javascript.diagnostics
+            );
+            let file = FileId::new(112);
+            let root = NodeRef::new(javascript.arena.id(), file, javascript.source_file);
+            let error = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap_err();
+            let JsDocCommentError::UnsupportedOverloadDeclaration(node) = error else {
+                panic!("expected an explicit unsupported declaration, got {error:?}")
+            };
+            assert_eq!(node.arena, javascript.arena.id());
+            assert_eq!(node.file, file);
+            assert_eq!(javascript.arena.get(node.node).unwrap().kind, kind);
+        }
+    }
+
+    #[test]
+    fn jsdoc_overload_blocks_are_ignored_on_object_methods() {
+        let source = concat!(
+            "const object = {\n",
+            "/**\n * @param {string} value\n * @overload\n",
+            " * @this {number}\n * @param {number} nested\n * @returns {number}\n */\n",
+            "read(value) { return value; }\n};",
+        );
+        let javascript = parse_javascript_source_file(source);
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(113),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        let [declaration] = plan.declarations() else {
+            panic!("expected one object method annotation")
+        };
+        assert_eq!(declaration.parameters().len(), 1);
+        assert_eq!(declaration.parameters()[0].name(), "value");
+        assert!(declaration.this_type().is_none());
+        assert!(declaration.return_type().is_none());
+    }
+
+    #[test]
+    fn jsdoc_overload_blocks_report_nested_templates_without_binding_them_to_the_host() {
+        let source = concat!(
+            "/**\n * @overload\n * @template Bad\n * @param {Bad} nested\n",
+            " * @returns {Bad}\n * @template Good\n * @param {Good} value\n */\n",
+            "const read = value => value;",
+        );
+        let javascript = parse_javascript_source_file(source);
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(114),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        let [diagnostic] = plan.diagnostics() else {
+            panic!("expected one nested-template diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 8039);
+        let start = source.find("@template").unwrap() + 1;
+        assert_eq!(
+            diagnostic.range_override.unwrap().range(),
+            checked_range(start, start + "template".len()).unwrap()
+        );
+        let [declaration] = plan.declarations() else {
+            panic!("expected one arrow annotation")
+        };
+        let [template] = declaration.template_parameters() else {
+            panic!("the nested template must remain inside its overload")
+        };
+        assert_eq!(template.name(), "Good");
+        assert_eq!(declaration.parameters().len(), 1);
+        assert_eq!(declaration.parameters()[0].name(), "value");
+        assert!(declaration.return_type().is_none());
     }
 
     #[test]
