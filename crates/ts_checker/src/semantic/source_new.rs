@@ -1271,6 +1271,7 @@ pub(super) fn exact_global_date_initializer(
     };
     store.source_node_kind(node) == Some(SyntaxKind::NewExpression)
         && store.source_node_kind(constructor) == Some(SyntaxKind::Identifier)
+        && store.source_identifier_text(constructor) == Some("Date")
         && store.source_node_parent(constructor)
             == Some(super::store::SourceNodeParent::Parent(node))
         && store
@@ -5828,6 +5829,11 @@ pub(super) fn authenticated_global_date_constructor_return(
     let date_record = store.symbol(date)?;
     let value_declaration = date_record.value_declaration()?;
     let value_annotation = store.source_direct_type_annotation(value_declaration)?;
+    let value_name = NodeRef::new(
+        value_annotation.arena,
+        value_annotation.file,
+        ts_ast::NodeId::new(u32::try_from(value_annotation.node.index().checked_sub(1)?).ok()?),
+    );
     let owner_record = store.symbol(owner)?;
     let instance = store.declared_type_links(date)?.declared_type?;
     let constructor = store.declared_type_links(owner)?.declared_type?;
@@ -5890,6 +5896,8 @@ pub(super) fn authenticated_global_date_constructor_return(
         || date_record.export_symbol().is_some()
         || store.source_node_kind(value_declaration) != Some(SyntaxKind::VariableDeclaration)
         || store.source_node_kind(value_annotation) != Some(SyntaxKind::TypeReference)
+        || store.source_node_parent(value_name) != Some(SourceNodeParent::Parent(value_annotation))
+        || store.source_identifier_text(value_name) != Some("DateConstructor")
         || store.value_symbol_links(date)
             != Some(&ValueSymbolLinks {
                 resolved_type: Some(constructor),
@@ -5955,6 +5963,7 @@ pub(super) fn authenticated_global_date_constructor_return(
         || record.composite().is_some()
         || store.source_node_kind(return_annotation) != Some(SyntaxKind::TypeReference)
         || store.source_node_kind(return_name) != Some(SyntaxKind::Identifier)
+        || store.source_identifier_text(return_name) != Some("Date")
         || store.source_node_parent(return_name)
             != Some(SourceNodeParent::Parent(return_annotation))
         || before_return_name.is_some_and(|node| {
@@ -9210,11 +9219,11 @@ mod tests {
     }
 
     #[test]
-    fn global_date_signatures_reject_erased_source_parameters() {
+    fn global_date_signatures_reject_erased_parameters_and_wrong_return_names() {
         let library = parse_source_file(concat!(
-            "interface Date {} ",
+            "interface Date {} interface Other {} ",
             "interface DateConstructor { ",
-            "new(): Date; new(value: number): Date; new<Value>(): Date; ",
+            "new(): Date; new(value: number): Date; new<Value>(): Date; new(): Other; ",
             "readonly prototype: Date; ",
             "} declare var Date: DateConstructor;",
         ));
@@ -9246,10 +9255,10 @@ mod tests {
             let NodeData::ConstructSignatureDeclaration(signature) = &record.data else {
                 continue;
             };
-            if signature.parameters.nodes.is_empty() && signature.type_parameters.is_none() {
+            let declaration = NodeRef::new(library.arena.id(), library_file, node);
+            if context.store().signature(original).unwrap().declaration() == Some(declaration) {
                 continue;
             }
-            let declaration = NodeRef::new(library.arena.id(), library_file, node);
             let annotation =
                 NodeRef::new(library.arena.id(), library_file, signature.type_.unwrap());
             let store = context.store_mut_for_test();
@@ -9315,7 +9324,7 @@ mod tests {
             );
             rejected += 1;
         }
-        assert_eq!(rejected, 2);
+        assert_eq!(rejected, 3);
         assert!(context.store_mut_for_test().set_signature_links(
             construction,
             SignatureLinks {

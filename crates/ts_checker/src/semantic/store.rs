@@ -69,10 +69,11 @@ impl PreparedEntityName {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceNodeFacts {
     kind: SyntaxKind,
     parent: Option<NodeId>,
+    identifier_text: Option<Box<str>>,
     prefix_unary_operator: Option<SyntaxKind>,
     type_operator: Option<SyntaxKind>,
     exported: bool,
@@ -1383,7 +1384,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .iter()
                 .enumerate()
             {
-                if facts.is_some_and(|facts| {
+                if facts.as_ref().is_some_and(|facts| {
                     facts.kind == SyntaxKind::PropertyAccessExpression
                         && facts.parent == Some(parent.node)
                 }) {
@@ -3240,8 +3241,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         .source_node_facts
                         .get(&annotation.arena)
                         .and_then(|facts| facts.get(annotation.node.index().checked_sub(1)?))
-                        .copied()
-                        .flatten()
+                        .and_then(Option::as_ref)
                         .is_none_or(|facts| {
                             facts.kind != SyntaxKind::QuestionToken
                                 || facts.parent != Some(parameter_declaration.node)
@@ -6247,6 +6247,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_node_fact(node).map(|facts| facts.kind)
     }
 
+    /// Returns identifier text from the registered source, not checker caches.
+    #[must_use]
+    pub(super) fn source_identifier_text(&self, node: NodeRef) -> Option<&str> {
+        let facts = self.source_node_fact(node)?;
+        if facts.kind != SyntaxKind::Identifier {
+            return None;
+        }
+        facts.identifier_text.as_deref()
+    }
+
     /// Returns the registered parent of a source-reachable node. The outer
     /// outer `Option` distinguishes an unknown node from a registered root.
     #[must_use]
@@ -6269,8 +6279,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .source_node_facts
             .get(&declaration.arena)
             .and_then(|facts| facts.get(annotation))
-            .copied()
-            .flatten()?;
+            .and_then(Option::as_ref)?;
         let is_type = fact.kind.is_keyword_type()
             || (SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
                 .contains(&(fact.kind as u16));
@@ -6357,15 +6366,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_node_fact(node).map(|facts| facts.exported)
     }
 
-    fn source_node_fact(&self, node: NodeRef) -> Option<SourceNodeFacts> {
+    fn source_node_fact(&self, node: NodeRef) -> Option<&SourceNodeFacts> {
         if !self.contains_node_ref(node) {
             return None;
         }
         self.source_node_facts
             .get(&node.arena)
             .and_then(|facts| facts.get(node.node.index()))
-            .copied()
-            .flatten()
+            .and_then(Option::as_ref)
     }
 
     fn validated_source_node_facts(
@@ -6386,6 +6394,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             *slot = Some(SourceNodeFacts {
                 kind: node.kind,
                 parent: node.parent,
+                identifier_text: match &node.data {
+                    NodeData::Identifier(identifier) if node.kind == SyntaxKind::Identifier => {
+                        Some(identifier.text.clone().into_boxed_str())
+                    }
+                    _ => None,
+                },
                 prefix_unary_operator: match &node.data {
                     NodeData::PrefixUnaryExpression(prefix) => Some(prefix.operator),
                     _ => None,
@@ -8475,8 +8489,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .source_node_facts
                 .get(&node.arena)
                 .and_then(|facts| facts.get(literal_index))
-                .copied()
-                .flatten()
+                .and_then(Option::as_ref)
             else {
                 return false;
             };
@@ -8494,8 +8507,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     .source_node_facts
                     .get(&node.arena)
                     .and_then(|facts| facts.get(operand_index))
-                    .copied()
-                    .flatten()
+                    .and_then(Option::as_ref)
                 else {
                     return false;
                 };
@@ -10791,6 +10803,74 @@ mod tests {
             FileId::new(33),
             invalid_root
         )));
+    }
+
+    #[test]
+    fn source_identifier_text_requires_registered_source_ownership() {
+        let mut parsed = parse_source_file("type Value = Date;");
+        let file = FileId::new(41);
+        let identifier = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::Identifier(identifier) if identifier.text == "Date" => Some(node),
+                _ => None,
+            })
+            .unwrap();
+        let name = NodeRef::new(parsed.arena.id(), file, identifier);
+        let mut store = TestStore::new();
+        assert!(store.register_ast_scope(AstScope::new(file, &parsed.arena)));
+        assert_eq!(store.source_identifier_text(name), None);
+        let source = store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        assert_eq!(store.source_identifier_text(name), Some("Date"));
+        assert_eq!(store.source_identifier_text(source.node_ref()), None);
+        assert_eq!(
+            store.source_identifier_text(NodeRef::new(
+                parsed.arena.id(),
+                FileId::new(42),
+                identifier
+            )),
+            None,
+        );
+
+        let other = parse_source_file("type Value = Other;");
+        let mut other_store = TestStore::new();
+        assert!(
+            other_store
+                .register_source_file(&other.arena, other.source_file, file)
+                .is_some()
+        );
+        assert_eq!(other_store.source_identifier_text(name), None);
+        assert_eq!(
+            store.source_identifier_text(NodeRef::new(other.arena.id(), file, identifier)),
+            None
+        );
+
+        let mut discarded = parsed.arena.get(identifier).unwrap().clone();
+        discarded.parent = None;
+        let discarded = parsed.arena.alloc(discarded);
+        assert_eq!(
+            store.register_source_file(&parsed.arena, parsed.source_file, file),
+            Some(source)
+        );
+        assert_eq!(
+            store.source_identifier_text(NodeRef::new(parsed.arena.id(), file, discarded)),
+            None
+        );
+
+        let NodeData::Identifier(changed) = &mut parsed.arena.get_mut(identifier).unwrap().data
+        else {
+            panic!("the selected node must remain an identifier")
+        };
+        changed.text = "Other".to_owned();
+        assert_eq!(
+            store.register_source_file(&parsed.arena, parsed.source_file, file),
+            None
+        );
+        assert_eq!(store.source_identifier_text(name), Some("Date"));
+        assert!(store.contains_source_file(source));
     }
 
     #[test]
