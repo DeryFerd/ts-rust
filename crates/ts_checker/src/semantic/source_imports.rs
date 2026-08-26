@@ -290,6 +290,14 @@ struct PreparedSourceImportModuleProperty {
     value_symbol: SemanticSymbolId,
     type_: TypeId,
     namespace: Option<Box<PreparedSourceImportNestedNamespace>>,
+    recursive_const: Option<PreparedSourceImportRecursiveConst>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedSourceImportRecursiveConst {
+    declaration: NodeRef,
+    initializer: NodeRef,
+    namespace_alias: SemanticSymbolId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2252,7 +2260,7 @@ pub(super) fn resolve_source_import_binding(
     resolve_source_import_binding_phase(store, alias_host, binding, SourceImportPhase::Value)
 }
 
-/// Resolves a used namespace module's re-export aliases without querying values.
+/// Resolves a used namespace module's exports and namespace-valued constants.
 ///
 /// Source execution calls this immediately before preparing a namespace value,
 /// so unused namespace imports retain their existing lazy alias behavior.
@@ -2260,8 +2268,10 @@ pub(super) fn resolve_source_import_binding(
 pub(super) fn resolve_source_import_namespace_exports(
     store: &mut CanonicalTypeMapperStore,
     alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    host: &DeclaredTypeHost<'_>,
     resolved: &ResolvedSourceImportBinding,
 ) -> Result<(), SourceImportError> {
+    resolve_imported_namespace_const_alias(store, alias_host, host, resolved.target_symbol)?;
     if store.export_type_links(resolved.target_symbol).is_some() {
         authenticate_synthetic_import_namespace_identity(
             store,
@@ -2292,17 +2302,16 @@ pub(super) fn resolve_source_import_namespace_exports(
             resolved.target_symbol,
         ))
     })?;
-    let aliases = exports
-        .iter()
-        .filter_map(|(_, symbol)| {
-            store
-                .symbol(symbol)
-                .is_some_and(|record| record.flags() == SymbolFlags::ALIAS)
-                .then_some(symbol)
-        })
-        .collect::<Vec<_>>();
-
-    for alias in aliases {
+    let exports = exports.iter().map(|(_, symbol)| symbol).collect::<Vec<_>>();
+    for symbol in exports {
+        if !store
+            .symbol(symbol)
+            .is_some_and(|record| record.flags() == SymbolFlags::ALIAS)
+        {
+            resolve_imported_namespace_const_alias(store, alias_host, host, symbol)?;
+            continue;
+        }
+        let alias = symbol;
         if store
             .alias_symbol_links(alias)
             .is_some_and(|links| links.type_only_declaration.is_some())
@@ -2322,8 +2331,84 @@ pub(super) fn resolve_source_import_namespace_exports(
                 events: resolution.events,
             });
         }
-        independently_resolve_source_alias_chain(store, alias_host, alias)?;
+        let (_, target) = independently_resolve_source_alias_chain(store, alias_host, alias)?;
+        resolve_imported_namespace_const_alias(store, alias_host, host, target)?;
     }
+    Ok(())
+}
+
+fn resolve_imported_namespace_const_alias(
+    store: &mut CanonicalTypeMapperStore,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    host: &DeclaredTypeHost<'_>,
+    target: SemanticSymbolId,
+) -> Result<(), SourceImportError> {
+    let Some(target_record) = store.symbol(target) else {
+        return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
+            target,
+        )));
+    };
+    if target_record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE {
+        return Ok(());
+    }
+    let Some(declaration) = target_record.value_declaration() else {
+        return Ok(());
+    };
+    let Some((arena, bound)) = host.source(declaration) else {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    };
+    let declaration_record = checked_node(arena, bound, store, declaration)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Ok(());
+    };
+    if variable.type_.is_some() {
+        return Ok(());
+    }
+    let Some(initializer) = variable
+        .initializer
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return Ok(());
+    };
+    let initializer_record = checked_node(arena, bound, store, initializer)?;
+    let NodeData::Identifier(identifier) = &initializer_record.data else {
+        return Ok(());
+    };
+    let Some(alias) = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&identifier.text))
+    else {
+        return Ok(());
+    };
+    let Some(alias_record) = store.symbol(alias) else {
+        return Err(invariant(SourceImportInvariant::InvalidAliasSymbol(alias)));
+    };
+    if alias_record.flags() != SymbolFlags::ALIAS {
+        return Ok(());
+    }
+    let Some([binding]) = alias_record.declarations() else {
+        return Err(invariant(SourceImportInvariant::InvalidAliasSymbol(alias)));
+    };
+    let binding = *binding;
+    if store.source_node_kind(binding) != Some(SyntaxKind::NamespaceImport) {
+        return Ok(());
+    }
+    let Some(SourceNodeParent::Parent(clause)) = store.source_node_parent(binding) else {
+        return Err(invariant(SourceImportInvariant::InvalidAliasSymbol(alias)));
+    };
+    let Some(SourceNodeParent::Parent(import)) = store.source_node_parent(clause) else {
+        return Err(invariant(SourceImportInvariant::InvalidAliasSymbol(alias)));
+    };
+    let import = plan_top_level_named_value_import(arena, bound, store, import)?;
+    let binding = import
+        .bindings
+        .iter()
+        .find(|binding| binding.alias_symbol == alias)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
+    resolve_source_import_binding(store, alias_host, binding)?;
     Ok(())
 }
 
@@ -5834,7 +5919,7 @@ fn materialize_imported_module_namespace(
             .collect::<Result<Vec<_>, SourceImportError>>()?;
         let mut properties = Vec::with_capacity(existing_members.len());
         for (member, symbol, type_) in existing_members {
-            let namespace = match member.target {
+            let (namespace, recursive_const) = match member.target {
                 PlannedSourceImportValueTarget::ModuleNamespace {
                     declaration,
                     members,
@@ -5854,13 +5939,50 @@ fn materialize_imported_module_namespace(
                     if nested_type != type_ {
                         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
                     }
-                    Some(Box::new(PreparedSourceImportNestedNamespace {
-                        declaration,
-                        properties,
-                        links: prepare_value_links(store, member.value_symbol, nested_type, false)?,
-                    }))
+                    (
+                        Some(Box::new(PreparedSourceImportNestedNamespace {
+                            declaration,
+                            properties,
+                            links: prepare_value_links(
+                                store,
+                                member.value_symbol,
+                                nested_type,
+                                false,
+                            )?,
+                        })),
+                        None,
+                    )
                 }
-                _ => None,
+                PlannedSourceImportValueTarget::RecursiveNamespaceConst {
+                    declaration,
+                    initializer,
+                    namespace_alias,
+                    module: recursive_module,
+                } => {
+                    if recursive_module != module
+                        || type_ != existing
+                        || !recursive_namespace_const_is_exact(
+                            store,
+                            member.value_symbol,
+                            declaration,
+                            initializer,
+                            namespace_alias,
+                            module,
+                            Some(existing),
+                        )
+                    {
+                        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
+                    }
+                    (
+                        None,
+                        Some(PreparedSourceImportRecursiveConst {
+                            declaration,
+                            initializer,
+                            namespace_alias,
+                        }),
+                    )
+                }
+                _ => (None, None),
             };
             properties.push(PreparedSourceImportModuleProperty {
                 name: member.name,
@@ -5869,6 +5991,7 @@ fn materialize_imported_module_namespace(
                 value_symbol: member.value_symbol,
                 type_,
                 namespace,
+                recursive_const,
             });
         }
         return Ok((existing, properties));
@@ -5901,11 +6024,23 @@ fn materialize_imported_module_namespace(
                     *initializer,
                     *namespace_alias,
                     module,
+                    None,
                 )
             {
                 return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
             }
-            resolved_members.push((member.name, member.symbol, member.value_symbol, None, None));
+            resolved_members.push((
+                member.name,
+                member.symbol,
+                member.value_symbol,
+                None,
+                None,
+                Some(PreparedSourceImportRecursiveConst {
+                    declaration: *declaration,
+                    initializer: *initializer,
+                    namespace_alias: *namespace_alias,
+                }),
+            ));
             continue;
         }
         let (type_, namespace) = match member.target {
@@ -6066,13 +6201,14 @@ fn materialize_imported_module_namespace(
             member.value_symbol,
             Some(type_),
             namespace,
+            None,
         ));
     }
 
     let count = resolved_members.len();
     let recursive_namespace = resolved_members
         .iter()
-        .any(|(_, _, _, type_, _)| type_.is_none());
+        .any(|(_, _, _, type_, _, _)| type_.is_none());
     if recursive_namespace && owner != Some(module) {
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
     }
@@ -6082,25 +6218,18 @@ fn materialize_imported_module_namespace(
     {
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
     }
-    let recursive_type = if recursive_namespace {
-        Some(
-            store
-                .alloc_plain_object_type(ObjectFlags::ANONYMOUS, owner)
-                .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?,
-        )
-    } else {
-        None
-    };
+    // Allocate the module identity before connecting its recursive properties.
+    let namespace_type = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, owner)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
     let table = if count == 0 {
         None
     } else {
         Some(store.alloc_symbol_table())
     };
     let mut properties = Vec::with_capacity(count);
-    for (name, target_symbol, value_symbol, type_, namespace) in resolved_members {
-        let type_ = type_
-            .or(recursive_type)
-            .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
+    for (name, target_symbol, value_symbol, type_, namespace, recursive_const) in resolved_members {
+        let type_ = type_.unwrap_or(namespace_type);
         let symbol = store
             .alloc_symbol(SymbolData::new(SymbolFlags::PROPERTY, name.clone()))
             .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
@@ -6123,21 +6252,16 @@ fn materialize_imported_module_namespace(
             value_symbol,
             type_,
             namespace,
+            recursive_const,
         });
     }
-    let type_ = if let Some(type_) = recursive_type {
-        type_
-    } else {
-        store
-            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, owner)
-            .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?
-    };
     let property_symbols = (!properties.is_empty())
         .then(|| properties.iter().map(|property| property.symbol).collect());
-    if !store.set_structured_type_members(type_, table, property_symbols, None, None, None) {
+    if !store.set_structured_type_members(namespace_type, table, property_symbols, None, None, None)
+    {
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
     }
-    Ok((type_, properties))
+    Ok((namespace_type, properties))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7661,10 +7785,10 @@ fn plan_published_namespace_const_target(
     {
         return Err(invalid());
     }
-    let module = store
+    let namespace_links = store
         .alias_symbol_links(namespace_alias)
-        .and_then(|links| links.alias_target.symbol())
-        .ok_or_else(invalid)?;
+        .ok_or_else(unsupported_target)?;
+    let module = namespace_links.alias_target.symbol().ok_or_else(invalid)?;
     let Some(type_) = store
         .value_symbol_links(target)
         .and_then(|links| links.resolved_type)
@@ -7679,6 +7803,7 @@ fn plan_published_namespace_const_target(
             initializer,
             namespace_alias,
             module,
+            None,
         ) {
             return Err(invalid());
         }
@@ -7719,6 +7844,7 @@ fn plan_published_namespace_const_target(
                 value_symbol,
                 type_: links.resolved_type.ok_or_else(invalid)?,
                 namespace: None,
+                recursive_const: None,
             })
         })
         .collect::<Result<Vec<_>, SourceImportError>>()?;
@@ -7752,6 +7878,7 @@ fn recursive_namespace_const_is_exact(
     initializer: NodeRef,
     namespace_alias: SemanticSymbolId,
     module: SemanticSymbolId,
+    expected_type: Option<TypeId>,
 ) -> bool {
     let Some(target_record) = store.symbol(target) else {
         return false;
@@ -7775,6 +7902,27 @@ fn recursive_namespace_const_is_exact(
     let Some(module_record) = store.symbol(module) else {
         return false;
     };
+    let module_type = store
+        .value_symbol_links(module)
+        .and_then(|links| links.resolved_type);
+    let namespace_type = expected_type.or(module_type);
+    if namespace_type.is_some_and(|type_| {
+        store.type_payload(type_).is_none_or(|record| {
+            record.symbol() != Some(module)
+                || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+                || record.data().structured().is_none()
+        })
+    }) || store.value_symbol_links(module).is_some_and(|links| {
+        namespace_type.is_none_or(|type_| {
+            links
+                != &ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                }
+        })
+    }) {
+        return false;
+    }
 
     target_record.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
         && target_record.check_flags() == CheckFlags::NONE
@@ -7821,7 +7969,6 @@ fn recursive_namespace_const_is_exact(
             .and_then(|exports| exports.get(target_record.name()))
             == Some(target)
         && store.get_merged_symbol(module) == Some(module)
-        && store.value_symbol_links(module).is_none()
 }
 
 #[allow(clippy::too_many_arguments)] // Each argument proves one retained import or cache edge.
@@ -8803,6 +8950,20 @@ fn valid_prepared_imported_namespace(
                             .and_then(|links| links.resolved_type)
                             .is_none_or(|cached| cached == property.type_)
                 })
+                && property.recursive_const.is_none_or(|recursive| {
+                    owner == Some(module)
+                        && property.type_ == type_
+                        && property.namespace.is_none()
+                        && recursive_namespace_const_is_exact(
+                            store,
+                            property.value_symbol,
+                            recursive.declaration,
+                            recursive.initializer,
+                            recursive.namespace_alias,
+                            module,
+                            Some(type_),
+                        )
+                })
                 && match &property.namespace {
                     Some(namespace) => {
                         prepare_value_links(store, property.value_symbol, property.type_, false)
@@ -9701,8 +9862,13 @@ mod tests {
                 )
             })
         };
+        let declared_host = DeclaredTypeHost::new_after_global_merge(
+            sources(),
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
         let mut alias_host = ProductionAliasTargetHost::new(store, sources(), manifest).unwrap();
-        resolve_source_import_namespace_exports(store, &mut alias_host, resolved)
+        resolve_source_import_namespace_exports(store, &mut alias_host, &declared_host, resolved)
     }
 
     fn resolve_all_types(
@@ -11174,6 +11340,285 @@ mod tests {
             (store_state(&fixture.store), fixture.store.symbol_len()),
             warm,
         );
+    }
+
+    #[test]
+    fn recursive_namespace_imports_check_consumers_before_providers() {
+        let consumer = parsed(concat!(
+            "import * as provider from './provider'; ",
+            "export const copied = provider;",
+        ));
+        let provider = parsed(concat!(
+            "import * as namespace from './provider'; ",
+            "export const forwarded = namespace;",
+        ));
+        let consumer_file = FileId::new(10_710);
+        let provider_file = FileId::new(10_711);
+        let mut context = context_with_routes(
+            &[(consumer_file, &consumer), (provider_file, &provider)],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(1),
+                },
+            ],
+        );
+
+        context.check_source_file(consumer_file).unwrap();
+
+        let copied = context_exported_type(&context, consumer_file, "copied");
+        let (_, bound) = context.file(provider_file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let forwarded = context.store().symbol(module).unwrap().exports().unwrap();
+        let forwarded = context
+            .store()
+            .symbol_table(forwarded)
+            .unwrap()
+            .get_source("forwarded")
+            .unwrap();
+        assert_eq!(
+            context.store().type_payload(copied).unwrap().symbol(),
+            Some(module)
+        );
+        assert!(context.store().value_symbol_links(forwarded).is_none());
+
+        context.check_source_file(provider_file).unwrap();
+
+        assert_eq!(
+            context_exported_type(&context, provider_file, "forwarded"),
+            copied
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = (store_state(context.store()), context.store().symbol_len());
+        context.recheck_source_file(consumer_file).unwrap();
+        context.recheck_source_file(provider_file).unwrap();
+        assert_eq!(
+            (store_state(context.store()), context.store().symbol_len()),
+            warm
+        );
+    }
+
+    #[test]
+    fn namespace_const_imports_keep_cold_cross_file_values_unsupported() {
+        for consumer in [
+            "import * as provider from './provider'; export const copied = provider;",
+            "import { forwarded } from './provider'; export const copied = forwarded;",
+        ] {
+            let consumer = parsed(consumer);
+            let provider = parsed(concat!(
+                "import * as namespace from './dependency'; ",
+                "export const forwarded = namespace;",
+            ));
+            let dependency = parsed("export const value: number = 1;");
+            let consumer_file = FileId::new(10_712);
+            let provider_file = FileId::new(10_713);
+            let dependency_file = FileId::new(10_714);
+            let mut context = context_with_routes(
+                &[
+                    (consumer_file, &consumer),
+                    (provider_file, &provider),
+                    (dependency_file, &dependency),
+                ],
+                &[
+                    Route {
+                        source: 0,
+                        specifier: 0,
+                        target: Some(1),
+                    },
+                    Route {
+                        source: 1,
+                        specifier: 0,
+                        target: Some(2),
+                    },
+                ],
+            );
+
+            assert!(matches!(
+                context.check_source_file(consumer_file),
+                Err(crate::semantic::SourceCheckError::Unsupported(_)),
+            ));
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn recursive_namespace_imports_reject_provider_aliases_with_false_self_targets() {
+        let mut fixture = fixture(
+            &[
+                "import * as provider from './provider'; const copied = provider;",
+                "import * as namespace from './dependency'; export const forwarded = namespace;",
+                "export const value: number = 1;",
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(2),
+                },
+            ],
+        );
+        let import = fixture.plan_import(0, 0);
+        let provider_import = fixture.plan_import(1, 0);
+        let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+        resolve_all(&mut fixture, &provider_import.bindings).unwrap();
+        let alias = provider_import.bindings[0].alias_symbol;
+        let module = resolved[0].target_symbol;
+        let mut links = fixture.store.alias_symbol_links(alias).unwrap().clone();
+        links.immediate_target = Some(module);
+        links.alias_target = AliasTargetState::Resolved(module);
+        assert!(fixture.store.set_alias_symbol_links(alias, links));
+        let before = (store_state(&fixture.store), fixture.store.symbol_len());
+
+        assert_eq!(
+            resolve_namespace_exports(&mut fixture, &resolved[0]),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::InvalidAliasLinks(alias)
+            )),
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.symbol_len()),
+            before
+        );
+        assert!(fixture.store.value_symbol_links(module).is_none());
+        assert!(fixture.store.value_symbol_links(alias).is_none());
+    }
+
+    #[test]
+    fn recursive_namespace_preparation_rejects_changed_staged_property_types() {
+        let mut fixture = fixture(
+            &["import * as namespace from './self'; export const forwarded = namespace;"],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(0),
+            }],
+        );
+        let import = fixture.plan_import(0, 0);
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &import.bindings[0],
+            identifier_initializer(&fixture, 0, "namespace"),
+            "namespace",
+            import.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+        let PreparedSourceImportTarget::ModuleNamespace { properties } = &prepared.target else {
+            panic!("expected a recursive namespace")
+        };
+        let property = &properties[0];
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let mut links = fixture
+            .store
+            .value_symbol_links(property.symbol)
+            .unwrap()
+            .clone();
+        links.resolved_type = Some(number);
+        assert!(fixture.store.set_value_symbol_links(property.symbol, links));
+        let before = (store_state(&fixture.store), fixture.store.symbol_len());
+
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::InvalidTargetLinks(resolved[0].target_symbol,)
+            )),
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.symbol_len()),
+            before
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(resolved[0].target_symbol)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(import.bindings[0].alias_symbol)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recursive_namespace_publication_rechecks_provider_alias_targets() {
+        let mut fixture = fixture(
+            &[
+                "import * as provider from './provider'; const copied = provider;",
+                "import * as namespace from './provider'; export const forwarded = namespace;",
+                "export const value: number = 1;",
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(1),
+                },
+            ],
+        );
+        let import = fixture.plan_import(0, 0);
+        let provider_import = fixture.plan_import(1, 0);
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &import.bindings[0],
+            identifier_initializer(&fixture, 0, "provider"),
+            "provider",
+            import.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+        resolve_namespace_exports(&mut fixture, &resolved[0]).unwrap();
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+        let foreign_bound = fixture.bound.get(&fixture.files[2].file).unwrap();
+        let foreign = foreign_bound.symbol(foreign_bound.source_file()).unwrap();
+        let alias = provider_import.bindings[0].alias_symbol;
+        let mut links = fixture.store.alias_symbol_links(alias).unwrap().clone();
+        links.immediate_target = Some(foreign);
+        links.alias_target = AliasTargetState::Resolved(foreign);
+        assert!(fixture.store.set_alias_symbol_links(alias, links));
+        let before = (store_state(&fixture.store), fixture.store.symbol_len());
+
+        assert_eq!(
+            preflight_prepared_source_import_publications(&fixture.store, &[prepared]),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::PreparedStateChanged(import.bindings[0].alias_symbol,)
+            )),
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.symbol_len()),
+            before
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(resolved[0].target_symbol)
+                .is_none()
+        );
+        assert!(fixture.store.value_symbol_links(alias).is_none());
     }
 
     #[test]
