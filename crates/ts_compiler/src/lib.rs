@@ -860,12 +860,45 @@ fn display_error_is_unsupported(error: &TypeDisplayUnavailable) -> bool {
         | TypeDisplayUnavailable::EmptyTupleType(_)
         | TypeDisplayUnavailable::SourceHost(_) => false,
         TypeDisplayUnavailable::ArrayType(error) => array_type_error_is_unsupported(error),
-        TypeDisplayUnavailable::SymbolDisplay(error) => matches!(
-            error,
-            ts_checker::semantic::SymbolDisplayError::MissingModuleSpecifier(_)
-                | ts_checker::semantic::SymbolDisplayError::CyclicAlias(_)
-                | ts_checker::semantic::SymbolDisplayError::Alias(_)
+        TypeDisplayUnavailable::SymbolDisplay(error) => symbol_display_error_is_unsupported(*error),
+    }
+}
+
+fn symbol_display_error_is_unsupported(error: ts_checker::semantic::SymbolDisplayError) -> bool {
+    use ts_checker::semantic::{
+        SymbolDisplayError,
+        alias::{CanonicalAliasResolutionError, CanonicalAliasTargetUnavailable},
+    };
+    match error {
+        SymbolDisplayError::MissingModuleSpecifier(_) | SymbolDisplayError::CyclicAlias(_) => true,
+        SymbolDisplayError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
+            reason,
+            ..
+        }) => matches!(
+            reason,
+            CanonicalAliasTargetUnavailable::UnsupportedDeclarationFamily
+                | CanonicalAliasTargetUnavailable::TargetProviderUnavailable
+                | CanonicalAliasTargetUnavailable::ModuleResolutionCapabilityUnavailable(_)
+                | CanonicalAliasTargetUnavailable::ModuleResolutionEntryAbsent(_)
+                | CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(_)
+                | CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(_)
+                | CanonicalAliasTargetUnavailable::UnsupportedDefaultAlias(_)
+                | CanonicalAliasTargetUnavailable::UnsupportedLocalExport(_)
+                | CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported { .. }
+                | CanonicalAliasTargetUnavailable::ExportEqualsResolutionUnsupported { .. }
+                | CanonicalAliasTargetUnavailable::CommonJsModuleUnsupported { .. }
+                | CanonicalAliasTargetUnavailable::JavaScriptModuleUnsupported { .. }
+                | CanonicalAliasTargetUnavailable::SyntheticModuleResolutionUnsupported { .. }
         ),
+        SymbolDisplayError::SourceHost(_)
+        | SymbolDisplayError::AliasHost(_)
+        | SymbolDisplayError::InvalidLocation(_)
+        | SymbolDisplayError::InvalidModuleSpecifier(_)
+        | SymbolDisplayError::InvalidSymbol(_)
+        | SymbolDisplayError::InvalidTable(_)
+        | SymbolDisplayError::InvalidAliasCache(_)
+        | SymbolDisplayError::Alias(_)
+        | SymbolDisplayError::CyclicContainer(_) => false,
     }
 }
 

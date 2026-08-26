@@ -660,7 +660,8 @@ impl CanonicalCheckerContext<'_> {
             .unwrap_or_default();
         let mut result = String::new();
         for symbol in chain {
-            let (name, indexed) = self.artifact_symbol_name_as_written(symbol)?;
+            let (name, indexed) =
+                self.artifact_symbol_name_as_written(symbol, !result.is_empty())?;
             if !result.is_empty() && !indexed {
                 result.push('.');
             }
@@ -675,6 +676,7 @@ impl CanonicalCheckerContext<'_> {
     fn artifact_symbol_name_as_written(
         &self,
         symbol: SemanticSymbolId,
+        qualified: bool,
     ) -> Result<(String, bool), CanonicalArtifactQueryError> {
         let record = self
             .store()
@@ -683,8 +685,12 @@ impl CanonicalCheckerContext<'_> {
         if record.name() == InternalSymbolName::Global.as_ref() {
             return Ok(("global".to_owned(), false));
         }
-        if let Some(name) = self.literal_artifact_symbol_name(symbol)? {
-            return Ok(name);
+        if let Some((name, indexed)) = self.literal_artifact_symbol_name(symbol)? {
+            return Ok(if qualified && !indexed {
+                (format!("[{name}]"), true)
+            } else {
+                (name, indexed)
+            });
         }
         if let Some(name) = self.escaped_identifier_artifact_name(symbol)? {
             let indexed = record.flags().intersects(

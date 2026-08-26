@@ -90,6 +90,8 @@ struct ScopeTable {
     local: bool,
 }
 
+type VisitedTables = HashSet<(SemanticSymbolId, SymbolTableId, bool)>;
+
 /// One query's scope and independently checked alias targets.
 #[derive(Debug)]
 pub(super) struct SymbolDisplayContext {
@@ -276,7 +278,7 @@ impl SymbolDisplayContext {
         host: &DeclaredTypeHost<'_>,
         symbol: SemanticSymbolId,
         meaning: SymbolFlags,
-        visited: &mut HashSet<(SemanticSymbolId, SymbolTableId)>,
+        visited: &mut VisitedTables,
     ) -> Result<Vec<SemanticSymbolId>, SymbolDisplayError> {
         if is_property_or_method_declaration(store, host, symbol)? {
             return Ok(Vec::new());
@@ -285,6 +287,28 @@ impl SymbolDisplayContext {
             let chain =
                 self.chain_in_table(store, host, symbol, meaning, *scope, false, visited)?;
             if !chain.is_empty() {
+                return Ok(chain);
+            }
+        }
+        let globals = *self.scopes.last().expect("scope lookup includes globals");
+        let global_this = store
+            .intrinsic_bootstrap()
+            .ok_or(SymbolDisplayError::InvalidTable(globals.id))?
+            .global_this_symbol;
+        if store.symbol(global_this).is_none_or(|record| {
+            record.name().as_utf8() != Some("globalThis") || record.exports() != Some(globals.id)
+        }) {
+            return Err(SymbolDisplayError::InvalidSymbol(global_this));
+        }
+        if symbol != global_this {
+            // globalThis exports the global table. A qualified visit must not
+            // collide with the same table's lexical visit when a name is hidden.
+            let mut chain =
+                self.chain_in_table(store, host, symbol, meaning, globals, true, visited)?;
+            if !chain.is_empty()
+                && self.can_qualify(store, host, global_this, left_meaning(meaning), visited)?
+            {
+                chain.insert(0, global_this);
                 return Ok(chain);
             }
         }
@@ -300,9 +324,9 @@ impl SymbolDisplayContext {
         meaning: SymbolFlags,
         scope: ScopeTable,
         ignore_qualification: bool,
-        visited: &mut HashSet<(SemanticSymbolId, SymbolTableId)>,
+        visited: &mut VisitedTables,
     ) -> Result<Vec<SemanticSymbolId>, SymbolDisplayError> {
-        if !visited.insert((symbol, scope.id)) {
+        if !visited.insert((symbol, scope.id, ignore_qualification)) {
             return Ok(Vec::new());
         }
         let result = (|| {
@@ -390,7 +414,7 @@ impl SymbolDisplayContext {
             candidates.sort_by(|left, right| self.compare_chains(store, host, left, right));
             Ok(candidates.into_iter().next().unwrap_or_default())
         })();
-        visited.remove(&(symbol, scope.id));
+        visited.remove(&(symbol, scope.id, ignore_qualification));
         result
     }
 
@@ -448,7 +472,7 @@ impl SymbolDisplayContext {
         host: &DeclaredTypeHost<'_>,
         symbol: SemanticSymbolId,
         meaning: SymbolFlags,
-        visited: &mut HashSet<(SemanticSymbolId, SymbolTableId)>,
+        visited: &mut VisitedTables,
     ) -> Result<bool, SymbolDisplayError> {
         if !self.needs_qualification(store, host, symbol, meaning)? {
             return Ok(true);
@@ -691,7 +715,7 @@ fn checked_alias_target(
         let inherited_type_only = store
             .alias_symbol_links(immediate)
             .and_then(|links| links.type_only_declaration);
-        if let Some(original) = original
+        if let Some(original) = &original
             && (original
                 .immediate_target
                 .is_some_and(|cached| cached != immediate)
@@ -714,6 +738,12 @@ fn checked_alias_target(
         Ok(target)
     })();
     visiting.remove(&alias);
+    if result.is_err()
+        && let Some(original) = original
+        && !store.set_alias_symbol_links(alias, original)
+    {
+        return Err(SymbolDisplayError::InvalidAliasCache(alias));
+    }
     result
 }
 
@@ -1050,6 +1080,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn location_display_uses_global_this_when_a_type_name_is_hidden() {
+        let parsed = parse_source_file(
+            "interface Shape { global: number; } declare namespace Local { interface Shape { local: string; } }",
+        );
+        let file = FileId::new(41_003);
+        let mut binder = CanonicalBinder::new();
+        bind(
+            &mut binder,
+            &parsed,
+            file,
+            "/input.d.ts",
+            CanonicalModuleState::Script,
+        );
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let target = symbol(&context, declaration(&parsed, file, "Shape"));
+        let type_ = context.get_declared_type_of_symbol(target).unwrap();
+        let inside = declaration(&parsed, file, "Local");
+        let outside = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        for _ in 0..2 {
+            assert_eq!(
+                context.type_to_string_at_location(type_, inside).unwrap(),
+                "globalThis.Shape"
+            );
+            assert_eq!(
+                context.type_to_string_at_location(type_, outside).unwrap(),
+                "Shape"
+            );
+        }
+    }
+
     fn import_context<'a>(
         target: &'a ParseResult,
         left: &'a ParseResult,
@@ -1205,6 +1271,8 @@ mod tests {
                 "import(\"item-api\").Shape"
             );
         }
+        assert_eq!(context.type_to_string_at_location_with_flags(type_, location,
+            crate::semantic::CanonicalTypeFormatFlags::NO_TRUNCATION | crate::semantic::CanonicalTypeFormatFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE).unwrap(), "import('item-api').Shape");
         assert_eq!(context.type_to_string(type_).unwrap(), "Shape");
         assert_eq!(
             context.store().type_payload(type_).unwrap().symbol(),
@@ -1253,21 +1321,28 @@ mod tests {
             })
             .unwrap();
         let alias = symbol(&context, alias);
-        let mut links = context.store().alias_symbol_links(alias).unwrap().clone();
-        links.alias_target = AliasTargetState::Resolved(other);
-        links.immediate_target = Some(other);
-        assert!(
-            context
-                .store_mut_for_test()
-                .set_alias_symbol_links(alias, links.clone())
-        );
-        assert_eq!(
-            context.type_to_string_at_location(type_, left_location),
-            Err(TypeDisplayUnavailable::SymbolDisplay(
-                SymbolDisplayError::InvalidAliasCache(alias)
-            ))
-        );
-        assert_eq!(context.store().alias_symbol_links(alias), Some(&links));
+        let mut wrong_target = context.store().alias_symbol_links(alias).unwrap().clone();
+        let mut wrong_marker = wrong_target.clone();
+        wrong_target.alias_target = AliasTargetState::Resolved(other);
+        wrong_target.immediate_target = Some(other);
+        wrong_marker.type_only_declaration =
+            Some(declaration(&target, FileId::new(41_010), "Other"));
+        for links in [wrong_target, wrong_marker] {
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_alias_symbol_links(alias, links.clone())
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    context.type_to_string_at_location(type_, left_location),
+                    Err(TypeDisplayUnavailable::SymbolDisplay(
+                        SymbolDisplayError::InvalidAliasCache(alias)
+                    ))
+                );
+                assert_eq!(context.store().alias_symbol_links(alias), Some(&links));
+            }
+        }
         assert_eq!(
             context
                 .type_to_string_at_location(type_, right_location)
@@ -1282,6 +1357,23 @@ mod tests {
             Err(TypeDisplayUnavailable::SymbolDisplay(
                 SymbolDisplayError::InvalidLocation(foreign_location)
             ))
+        );
+    }
+
+    #[test]
+    fn location_display_brackets_a_string_named_namespace_export() {
+        let target =
+            parse_source_file("declare function read(): number; export { read as 'read-name' };");
+        let left = parse_source_file("export {};");
+        let right = parse_source_file("import * as Items from './model';");
+        let mut context = import_context(&target, &left, &right);
+        let target = symbol(&context, declaration(&target, FileId::new(41_010), "read"));
+        let location = NodeRef::new(right.arena.id(), FileId::new(41_012), right.source_file);
+        assert_eq!(
+            context
+                .symbol_to_string_at_location(target, location)
+                .unwrap(),
+            "Items['read-name']"
         );
     }
 }

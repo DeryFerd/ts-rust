@@ -400,8 +400,7 @@ pub(super) fn type_to_string_at_location_with_flags(
 ) -> Result<String, TypeDisplayUnavailable> {
     let mut state = DisplayState {
         location: Some(location),
-        include_module_chain: !flags
-            .contains(CanonicalTypeFormatFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE),
+        format_flags: flags,
         ..DisplayState::default()
     };
     let displayed = display_type_worker(
@@ -953,7 +952,7 @@ struct DisplayState {
     // Fresh method parameters are named only while their validated signature is in scope.
     method_type_parameters: Vec<(TypeId, SemanticSymbolId)>,
     location: Option<SymbolDisplayContext>,
-    include_module_chain: bool,
+    format_flags: CanonicalTypeFormatFlags,
 }
 
 impl DisplayState {
@@ -4929,7 +4928,15 @@ fn display_location_symbol_name(
         .as_ref()
         .expect("location-aware display has an enclosing node");
     let chain = location
-        .symbol_chain(store, host, symbol, meaning, state.include_module_chain)
+        .symbol_chain(
+            store,
+            host,
+            symbol,
+            meaning,
+            !state
+                .format_flags
+                .contains(CanonicalTypeFormatFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE),
+        )
         .map_err(TypeDisplayUnavailable::SymbolDisplay)?;
     let mut result = String::new();
     for (index, symbol) in chain.into_iter().enumerate() {
@@ -4940,7 +4947,15 @@ fn display_location_symbol_name(
             let specifier = location
                 .module_specifier(symbol)
                 .map_err(TypeDisplayUnavailable::SymbolDisplay)?;
-            write!(result, "import({})", quote_string_literal(specifier, '"'))
+            let quote = if state
+                .format_flags
+                .contains(CanonicalTypeFormatFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE)
+            {
+                '\''
+            } else {
+                '"'
+            };
+            write!(result, "import({})", quote_string_literal(specifier, quote))
                 .expect("writing a String cannot fail");
             continue;
         }
