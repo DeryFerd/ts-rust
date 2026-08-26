@@ -134,6 +134,24 @@ and base/local join identity restoration.
 
 ### Execution checkpoint: 2026-08-26
 
+Wave 127 passes all 6,105 workspace tests and strict workspace Clippy. The fixed
+semantic report has 40 exact results in 95 executed variants, three more than
+wave 126. The diagnostics-only milestone retains 397 exact results in 511
+executed variants. Neither report lost an exact result or produced a fatal
+invariant. The remaining semantic outcomes are 50 unsupported variants and five
+artifact mismatches.
+
+The opt-in canonical project CLI and the reviewed modern-project input
+inventory are integrated. The inventory contains five core repositories with
+224,500 non-generated TypeScript code lines. Dependency graphs, exact Go
+artifacts, forced replay, and performance evidence remain incomplete.
+
+See [`typechecker-wave127-status.md`](typechecker-wave127-status.md) for the
+runtime checkpoint `ed33229a`, lint-only follow-up `4a6f52fe`, evidence, and held
+iterator and project-runner work. The full port goal remains active.
+
+### Earlier wave 126 checkpoint: 2026-08-26
+
 Code checkpoint `c440602d` passes all 6,001 workspace tests and strict Clippy
 for all targets. The semantic smoke report has 37 exact results in 95 executed
 variants, five more than wave 125. The diagnostics-only milestone has 397
