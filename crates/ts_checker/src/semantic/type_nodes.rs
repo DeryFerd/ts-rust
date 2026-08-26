@@ -30844,7 +30844,7 @@ mod tests {
             Ok(()),
         );
         let mut session = InstantiationSession::new(InstantiationLimits::default());
-        let mapped = crate::semantic::instantiate::instantiate_type_with_session(
+        let member_result = crate::semantic::instantiate::instantiate_type_with_session(
             &mut fixture.store,
             declared,
             mapper,
@@ -30854,7 +30854,7 @@ mod tests {
         .unwrap();
         let instantiated = query_global_node(&mut fixture, &globals, node, &mut diagnostics)
             .expect("Many<string> substitutes both union constituents");
-        assert_eq!(mapped, instantiated);
+        assert_eq!(member_result, instantiated);
         assert_eq!(
             fixture
                 .store
