@@ -824,6 +824,39 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         location.symbol_chain(&self.store, &host, symbol, SymbolFlags::NONE, false)
     }
 
+    pub(super) fn written_default_symbol_name(
+        &self,
+        symbol: SemanticSymbolId,
+        enclosing: NodeRef,
+        initial: bool,
+    ) -> Result<Option<String>, SymbolDisplayError> {
+        let record = self
+            .store
+            .symbol(symbol)
+            .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
+        if record.name() != InternalSymbolName::Default.as_ref()
+            || !record
+                .flags()
+                .intersects(SymbolFlags::FUNCTION | SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+        {
+            return Ok(None);
+        }
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )
+        .map_err(SymbolDisplayError::SourceHost)?;
+        super::symbol_display::written_default_name(
+            &self.store,
+            &host,
+            symbol,
+            enclosing,
+            initial,
+            false,
+        )
+    }
+
     /// Computes exact TS2322 source and target display arguments without
     /// mutating checker state. The retained `no_error_truncation` compiler
     /// option is applied to both display arguments.

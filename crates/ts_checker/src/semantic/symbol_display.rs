@@ -32,6 +32,7 @@ pub enum SymbolDisplayError {
     CyclicAlias(SemanticSymbolId),
     CyclicContainer(SemanticSymbolId),
     MissingModuleSpecifier(SemanticSymbolId),
+    UnnameableSymbol(SemanticSymbolId),
 }
 
 impl std::fmt::Display for SymbolDisplayError {
@@ -67,6 +68,10 @@ impl std::fmt::Display for SymbolDisplayError {
             Self::MissingModuleSpecifier(symbol) => write!(
                 formatter,
                 "symbol display has no module specifier for {symbol:?}"
+            ),
+            Self::UnnameableSymbol(symbol) => write!(
+                formatter,
+                "symbol display cannot prove an accessible export name for {symbol:?}"
             ),
         }
     }
@@ -240,7 +245,12 @@ impl SymbolDisplayContext {
                 )?
             {
                 let root = *chain.first().unwrap_or(&symbol);
-                if let Some(parent) = validated_parent(store, host, root)? {
+                let container = if let Some(parent) = validated_parent(store, host, root)? {
+                    Some((parent, Some(root)))
+                } else {
+                    self.declaration_export_container(store, host, root)?
+                };
+                if let Some((parent, exported)) = container {
                     let mut parent_chain = self.symbol_chain_worker(
                         store,
                         host,
@@ -252,7 +262,11 @@ impl SymbolDisplayContext {
                     )?;
                     if !parent_chain.is_empty() {
                         if chain.is_empty() {
-                            chain.push(symbol);
+                            chain.extend(exported);
+                        } else if let Some(exported) = exported {
+                            chain[0] = exported;
+                        } else {
+                            chain.remove(0);
                         }
                         parent_chain.extend(chain);
                         chain = parent_chain;
@@ -265,6 +279,16 @@ impl SymbolDisplayContext {
             let record = store
                 .symbol(symbol)
                 .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
+            if record.parent().is_none()
+                && !record.name().is_internal()
+                && record.flags().intersects(SymbolFlags::TYPE)
+                && record
+                    .declarations()
+                    .is_some_and(|declarations| !declarations.is_empty())
+                && !is_external_module(store, host, symbol)?
+            {
+                return Err(SymbolDisplayError::UnnameableSymbol(symbol));
+            }
             if !end_of_chain
                 && (record
                     .flags()
@@ -277,6 +301,107 @@ impl SymbolDisplayContext {
         })();
         parents.remove(&symbol);
         result
+    }
+
+    fn declaration_export_container(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        symbol: SemanticSymbolId,
+    ) -> Result<Option<(SemanticSymbolId, Option<SemanticSymbolId>)>, SymbolDisplayError> {
+        let record = store
+            .symbol(symbol)
+            .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
+        for declaration in record.declarations().unwrap_or_default() {
+            let node = host
+                .node(*declaration)
+                .ok_or(SymbolDisplayError::InvalidLocation(*declaration))?;
+            let Some(parent) = node.parent else { continue };
+            let mut container = NodeRef::new(declaration.arena, declaration.file, parent);
+            let parent_node = host
+                .node(container)
+                .ok_or(SymbolDisplayError::InvalidLocation(container))?;
+            if parent_node.kind == SyntaxKind::ModuleBlock {
+                let Some(parent) = parent_node.parent else {
+                    continue;
+                };
+                container.node = parent;
+            }
+            let kind = host
+                .node(container)
+                .ok_or(SymbolDisplayError::InvalidLocation(container))?
+                .kind;
+            if !matches!(kind, SyntaxKind::SourceFile | SyntaxKind::ModuleDeclaration) {
+                continue;
+            }
+            let Some(module) = host
+                .bound_file(container)
+                .and_then(|bound| bound.symbol(container))
+                .and_then(|module| store.get_merged_symbol(module))
+            else {
+                continue;
+            };
+            validate_symbol(store, host, module)?;
+            let Some(table) = exports(store, module)? else {
+                continue;
+            };
+            let table = store
+                .symbol_table(table)
+                .ok_or(SymbolDisplayError::InvalidTable(table))?;
+            if let Some(exported) = table.get(InternalSymbolName::ExportEquals.as_ref())
+                && same_reference(store, self.export_target(store, exported, symbol)?, symbol)?
+            {
+                return Ok(Some((module, None)));
+            }
+            if let Some(exported) = table.get(record.name())
+                && same_reference(store, self.export_target(store, exported, symbol)?, symbol)?
+            {
+                return Ok(Some((module, Some(exported))));
+            }
+            let mut candidates = Vec::new();
+            for (_, exported) in table.iter() {
+                let export = store
+                    .symbol(exported)
+                    .ok_or(SymbolDisplayError::InvalidSymbol(exported))?;
+                let target = self.export_target(store, exported, symbol)?;
+                if same_reference(store, target, symbol)? {
+                    if export.name() == InternalSymbolName::ExportEquals.as_ref() {
+                        return Ok(Some((module, None)));
+                    }
+                    candidates.push(exported);
+                }
+            }
+            candidates.sort_by(|left, right| self.compare_symbols(store, host, *left, *right));
+            if let Some(exported) = candidates.first() {
+                return Ok(Some((module, Some(*exported))));
+            }
+        }
+        Ok(None)
+    }
+
+    fn export_target(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        exported: SemanticSymbolId,
+        requested: SemanticSymbolId,
+    ) -> Result<SemanticSymbolId, SymbolDisplayError> {
+        if store
+            .symbol(exported)
+            .ok_or(SymbolDisplayError::InvalidSymbol(exported))?
+            .flags()
+            .intersects(SymbolFlags::ALIAS)
+        {
+            self.aliases
+                .get(&exported)
+                .copied()
+                .ok_or(SymbolDisplayError::UnnameableSymbol(requested))?
+        } else {
+            Ok(exported)
+        }
+    }
+
+    pub(super) fn enclosing(&self) -> NodeRef {
+        self.enclosing
     }
 
     fn accessible_chain(
@@ -913,6 +1038,86 @@ const fn left_meaning(meaning: SymbolFlags) -> SymbolFlags {
     }
 }
 
+pub(super) fn written_default_name(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    enclosing: NodeRef,
+    initial: bool,
+    use_alias_outside_scope: bool,
+) -> Result<Option<String>, SymbolDisplayError> {
+    let record = store
+        .symbol(symbol)
+        .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
+    if record.name() != InternalSymbolName::Default.as_ref()
+        || !record
+            .flags()
+            .intersects(SymbolFlags::FUNCTION | SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+    {
+        return Ok(None);
+    }
+    let declarations = record.declarations().unwrap_or_default();
+    if !use_alias_outside_scope
+        && (!initial
+            || declarations.is_empty()
+            || binding_context(host, declarations[0])? != binding_context(host, enclosing)?)
+    {
+        return Ok(Some("default".to_owned()));
+    }
+    for declaration in declarations {
+        let node = host
+            .node(*declaration)
+            .ok_or(SymbolDisplayError::InvalidLocation(*declaration))?;
+        let name = match &node.data {
+            NodeData::FunctionDeclaration(function) => function.name,
+            NodeData::ClassDeclaration(class) => class.name,
+            NodeData::InterfaceDeclaration(interface) => Some(interface.name),
+            _ => None,
+        };
+        let Some(name) = name else { continue };
+        let name = NodeRef::new(declaration.arena, declaration.file, name);
+        let name_node = host
+            .node(name)
+            .ok_or(SymbolDisplayError::InvalidLocation(name))?;
+        let NodeData::Identifier(identifier) = &name_node.data else {
+            continue;
+        };
+        let written = host
+            .source(name)
+            .and_then(|(arena, _)| arena.source_text())
+            .and_then(|text| {
+                text.get(name_node.range.start.get() as usize..name_node.range.end.get() as usize)
+            })
+            .unwrap_or(&identifier.text);
+        return Ok(Some(written.to_owned()));
+    }
+    Ok(None)
+}
+
+fn binding_context(
+    host: &DeclaredTypeHost<'_>,
+    mut node: NodeRef,
+) -> Result<NodeRef, SymbolDisplayError> {
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(node) {
+            return Err(SymbolDisplayError::InvalidLocation(node));
+        }
+        let record = host
+            .node(node)
+            .ok_or(SymbolDisplayError::InvalidLocation(node))?;
+        if matches!(
+            record.kind,
+            SyntaxKind::SourceFile | SyntaxKind::ModuleDeclaration
+        ) {
+            return Ok(node);
+        }
+        node.node = record
+            .parent
+            .ok_or(SymbolDisplayError::InvalidLocation(node))?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1474,6 +1679,116 @@ mod tests {
                 .symbol_to_string_at_location(target, location)
                 .unwrap(),
             "Items['read-name']"
+        );
+    }
+
+    #[test]
+    fn location_display_finds_the_public_export_of_a_local_type() {
+        let target =
+            parse_source_file("interface Item { value: number; } export { Item as PublicItem };");
+        let left = parse_source_file("import {} from './model';");
+        let right = parse_source_file("import * as Items from './model';");
+        let mut context = import_context(&target, &left, &right);
+        let item = symbol(&context, declaration(&target, FileId::new(41_010), "Item"));
+        assert_eq!(context.store().symbol(item).unwrap().parent(), None);
+        let type_ = context.get_declared_type_of_symbol(item).unwrap();
+        let own = NodeRef::new(target.arena.id(), FileId::new(41_010), target.source_file);
+        let left_location = NodeRef::new(left.arena.id(), FileId::new(41_011), left.source_file);
+        let right_location = NodeRef::new(right.arena.id(), FileId::new(41_012), right.source_file);
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(
+                        type_,
+                        left_location,
+                        crate::semantic::CanonicalTypeFormatFlags::NO_TRUNCATION
+                    )
+                    .unwrap(),
+                "import(\"./model\").PublicItem"
+            );
+            assert_eq!(
+                context
+                    .symbol_to_string_at_location(item, right_location)
+                    .unwrap(),
+                "Items.PublicItem"
+            );
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(
+                        type_,
+                        own,
+                        crate::semantic::CanonicalTypeFormatFlags::NO_TRUNCATION
+                    )
+                    .unwrap(),
+                "Item"
+            );
+        }
+        assert_eq!(
+            context.store().symbol(item).unwrap().name().as_utf8(),
+            Some("Item")
+        );
+    }
+
+    #[test]
+    fn location_display_does_not_substitute_an_inaccessible_private_name() {
+        let target =
+            parse_source_file("interface Item { value: number; } export { Item as PublicItem };");
+        let left = parse_source_file("export {};");
+        let right = parse_source_file("export {};");
+        let mut context = import_context(&target, &left, &right);
+        let item = symbol(&context, declaration(&target, FileId::new(41_010), "Item"));
+        let type_ = context.get_declared_type_of_symbol(item).unwrap();
+        let location = NodeRef::new(left.arena.id(), FileId::new(41_011), left.source_file);
+        assert_eq!(
+            context.type_to_string_at_location_with_flags(
+                type_,
+                location,
+                crate::semantic::CanonicalTypeFormatFlags::NO_TRUNCATION
+            ),
+            Err(TypeDisplayUnavailable::SymbolDisplay(
+                SymbolDisplayError::UnnameableSymbol(item)
+            ))
+        );
+    }
+
+    #[test]
+    fn named_defaults_keep_the_written_name_only_in_the_same_binding_context() {
+        let target = parse_source_file("export default function make(): number;");
+        let left = parse_source_file("import * as Items from './model';");
+        let right = parse_source_file("import chosen from './model';");
+        let mut context = import_context(&target, &left, &right);
+        let declaration = declaration(&target, FileId::new(41_010), "make");
+        let make = symbol(&context, declaration);
+        let own = NodeRef::new(target.arena.id(), FileId::new(41_010), target.source_file);
+        let left_location = NodeRef::new(left.arena.id(), FileId::new(41_011), left.source_file);
+        let right_location = NodeRef::new(right.arena.id(), FileId::new(41_012), right.source_file);
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .symbol_to_string_at_location(make, declaration)
+                    .unwrap(),
+                "make"
+            );
+            assert_eq!(
+                context.symbol_to_string_at_location(make, own).unwrap(),
+                "make"
+            );
+            assert_eq!(
+                context
+                    .symbol_to_string_at_location(make, left_location)
+                    .unwrap(),
+                "Items.default"
+            );
+            assert_eq!(
+                context
+                    .symbol_to_string_at_location(make, right_location)
+                    .unwrap(),
+                "chosen"
+            );
+        }
+        assert_eq!(
+            context.store().symbol(make).unwrap().name(),
+            InternalSymbolName::Default.as_ref()
         );
     }
 }

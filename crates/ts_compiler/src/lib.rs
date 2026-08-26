@@ -870,7 +870,9 @@ fn symbol_display_error_is_unsupported(error: ts_checker::semantic::SymbolDispla
         alias::{CanonicalAliasResolutionError, CanonicalAliasTargetUnavailable},
     };
     match error {
-        SymbolDisplayError::MissingModuleSpecifier(_) | SymbolDisplayError::CyclicAlias(_) => true,
+        SymbolDisplayError::MissingModuleSpecifier(_)
+        | SymbolDisplayError::CyclicAlias(_)
+        | SymbolDisplayError::UnnameableSymbol(_) => true,
         SymbolDisplayError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
             reason,
             ..

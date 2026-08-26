@@ -4964,17 +4964,31 @@ fn display_location_symbol_name(
             .ok_or(TypeDisplayUnavailable::SymbolDisplay(
                 SymbolDisplayError::InvalidSymbol(symbol),
             ))?;
-        let name = record
-            .name()
-            .as_utf8()
-            .filter(|name| is_identifier_text(name))
-            .ok_or(TypeDisplayUnavailable::SymbolDisplay(
-                SymbolDisplayError::InvalidSymbol(symbol),
-            ))?;
+        let name = symbol_display::written_default_name(
+            store,
+            host,
+            symbol,
+            location.enclosing(),
+            index == 0,
+            state
+                .format_flags
+                .contains(CanonicalTypeFormatFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE),
+        )
+        .map_err(TypeDisplayUnavailable::SymbolDisplay)?
+        .or_else(|| {
+            record
+                .name()
+                .as_utf8()
+                .filter(|name| is_identifier_text(name))
+                .map(str::to_owned)
+        })
+        .ok_or(TypeDisplayUnavailable::SymbolDisplay(
+            SymbolDisplayError::InvalidSymbol(symbol),
+        ))?;
         if !result.is_empty() {
             result.push('.');
         }
-        result.push_str(name);
+        result.push_str(&name);
     }
     state.add(result.len().saturating_add(1).saturating_mul(2));
     Ok(result)
