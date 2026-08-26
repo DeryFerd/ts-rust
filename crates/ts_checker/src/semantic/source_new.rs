@@ -5692,13 +5692,39 @@ pub(super) fn authenticated_global_date_constructor_return(
         .and_then(|symbol| store.get_merged_symbol(symbol))?;
     let symbol_record = store.symbol(constructor_symbol)?;
     let return_annotation = store.source_direct_type_annotation(declaration)?;
+    let return_name = NodeRef::new(
+        return_annotation.arena,
+        return_annotation.file,
+        ts_ast::NodeId::new(u32::try_from(return_annotation.node.index().checked_sub(1)?).ok()?),
+    );
+    // Parameter nodes precede the return reference in parser order.
+    let before_return_name = return_name
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+        .map(|index| {
+            NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                ts_ast::NodeId::new(index),
+            )
+        });
+    let allowed_date_flags =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
 
     if date_record.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
         || !date_record
             .flags()
             .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        || date_record.flags().without(allowed_date_flags) != SymbolFlags::NONE
         || date_record.check_flags() != CheckFlags::NONE
         || date_record.name().as_utf8() != Some("Date")
+        || date_record.parent().is_some()
+        || date_record.exports().is_some()
+        || date_record.export_symbol().is_some()
+        || store.source_node_kind(value_declaration) != Some(SyntaxKind::VariableDeclaration)
+        || store.source_node_kind(value_annotation) != Some(SyntaxKind::TypeReference)
         || store.value_symbol_links(date)
             != Some(&ValueSymbolLinks {
                 resolved_type: Some(constructor),
@@ -5716,6 +5742,9 @@ pub(super) fn authenticated_global_date_constructor_return(
         || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
         || owner_record.check_flags() != CheckFlags::NONE
         || owner_record.name().as_utf8() != Some("DateConstructor")
+        || owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
         || owner_record
             .declarations()
             .is_none_or(|declarations| !declarations.contains(&owner_declaration))
@@ -5760,6 +5789,12 @@ pub(super) fn authenticated_global_date_constructor_return(
         || record.isolated_signature_type().is_some()
         || record.composite().is_some()
         || store.source_node_kind(return_annotation) != Some(SyntaxKind::TypeReference)
+        || store.source_node_kind(return_name) != Some(SyntaxKind::Identifier)
+        || store.source_node_parent(return_name)
+            != Some(SourceNodeParent::Parent(return_annotation))
+        || before_return_name.is_some_and(|node| {
+            store.source_node_parent(node) == Some(SourceNodeParent::Parent(declaration))
+        })
         || store.type_node_links(return_annotation)
             != Some(&TypeNodeLinks {
                 resolved_type: Some(instance),
@@ -5773,6 +5808,8 @@ pub(super) fn authenticated_global_date_constructor_return(
         || store
             .callable_signature_parameter_types(signature)
             .is_some_and(|parameters| !parameters.is_empty())
+        || interface.reference.object.structured.signatures.is_none()
+            && interface.reference.object.structured.call_signature_count != 0
         || interface
             .reference
             .object
@@ -6491,8 +6528,8 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks, SourceCheckError,
-        UnsupportedSourceSyntax,
+        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks,
+        IntrinsicBootstrapOptions, SourceCheckError, UnsupportedSourceSyntax,
         classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
         production::GlobalMergeCompletion,
     };
@@ -8084,10 +8121,33 @@ mod tests {
 
     #[test]
     fn reopened_global_date_constructors_preserve_merged_signature_ownership() {
-        let library = global_date_constructor_library();
-        let extension = parse_source_file(concat!(
-            "interface Date { toISOString(): string; } ",
-            "interface DateConstructor { new(value: Date): Date; now(): number; }",
+        let library = parse_source_file(concat!(
+            "interface Date { toISOString(): string; toJSON(key?: any): string; } ",
+            "interface DateConstructor { ",
+            "new(): Date; ",
+            "new(value: number | string): Date; ",
+            "new(year: number, monthIndex: number, date?: number, hours?: number, ",
+            "minutes?: number, seconds?: number, ms?: number): Date; ",
+            "(): string; readonly prototype: Date; parse(s: string): number; now(): number; ",
+            "} declare var Date: DateConstructor;",
+        ));
+        let extension = parse_source_file(
+            "interface DateConstructor { new(value: number | string | Date): Date; }",
+        );
+        let script_host = parse_source_file(concat!(
+            "declare class VarDate { private constructor(); private VarDate_typekey: VarDate; } ",
+            "interface DateConstructor { new(vd: VarDate): Date; } ",
+            "interface Date { getVarDate: () => VarDate; }",
+        ));
+        let well_known = parse_source_file(concat!(
+            "interface SymbolConstructor { readonly toPrimitive: unique symbol; } ",
+            "declare var Symbol: SymbolConstructor; ",
+            "interface Date { ",
+            "[Symbol.toPrimitive](hint: 'default'): string; ",
+            "[Symbol.toPrimitive](hint: 'string'): string; ",
+            "[Symbol.toPrimitive](hint: 'number'): number; ",
+            "[Symbol.toPrimitive](hint: string): string | number; ",
+            "}",
         ));
         let source = parse_source_file(concat!(
             "export class SomeClass { ",
@@ -8101,9 +8161,21 @@ mod tests {
             extension.diagnostics
         );
         assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        assert!(
+            script_host.diagnostics.is_empty(),
+            "{:?}",
+            script_host.diagnostics
+        );
+        assert!(
+            well_known.diagnostics.is_empty(),
+            "{:?}",
+            well_known.diagnostics
+        );
         let library_file = FileId::new(1_870);
         let extension_file = FileId::new(1_871);
         let source_file = FileId::new(1_872);
+        let script_host_file = FileId::new(1_881);
+        let well_known_file = FileId::new(1_882);
         let mut binder = CanonicalBinder::new();
         for (parsed, file, path, default_library, module_state) in [
             (
@@ -8117,6 +8189,20 @@ mod tests {
                 &extension,
                 extension_file,
                 "\"/lib/es2015.core.d.ts\"",
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                &script_host,
+                script_host_file,
+                "\"/lib/scripthost.d.ts\"",
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                &well_known,
+                well_known_file,
+                "\"/lib/es2015.symbol.wellknown.d.ts\"",
                 true,
                 CanonicalModuleState::Script,
             ),
@@ -8151,9 +8237,22 @@ mod tests {
             vec![
                 (library_file, &library.arena),
                 (extension_file, &extension.arena),
+                (script_host_file, &script_host.arena),
+                (well_known_file, &well_known.arena),
                 (source_file, &source.arena),
             ],
-            CanonicalCheckerOptions::default(),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: true,
+                },
+                strict_bind_call_apply: true,
+                strict_builtin_iterator_return: true,
+                strict_function_types: true,
+                strict_property_initialization: true,
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
         )
         .unwrap();
         let (date, owner, constructor_symbol) = {
@@ -8223,7 +8322,7 @@ mod tests {
                 .symbol(constructor_symbol)
                 .and_then(ts_binder::semantic::Symbol::declarations)
                 .map(<[NodeRef]>::len),
-            Some(3),
+            Some(5),
         );
         assert!(store.declared_type_links(owner).is_some());
         let warm = (
@@ -8568,7 +8667,7 @@ mod tests {
 
         context.check_source_file(source_file).unwrap();
 
-        let (owner, annotation, signature, instance, constructor, model_type) = {
+        let (date, owner, annotation, signature, instance, constructor, model_type) = {
             let store = context.store();
             let globals = store
                 .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
@@ -8603,6 +8702,7 @@ mod tests {
                 .and_then(|links| links.declared_type)
                 .unwrap();
             (
+                date,
                 owner,
                 annotation,
                 signature,
@@ -8612,10 +8712,12 @@ mod tests {
             )
         };
         let alias = context.store_mut_for_test().alloc_type_alias(None).unwrap();
+        let date_flags = context.store().symbol(date).unwrap().flags();
         let owner_flags = context.store().symbol(owner).unwrap().flags();
+        let owner_members = context.store().symbol(owner).unwrap().members();
         assert_ne!(instance, constructor);
 
-        for poison in 0..4 {
+        for poison in 0..6 {
             match poison {
                 0 => assert!(context.store_mut_for_test().set_type_node_links(
                     annotation,
@@ -8638,6 +8740,18 @@ mod tests {
                     owner,
                     owner_flags | SymbolFlags::CLASS,
                     CheckFlags::NONE,
+                )),
+                4 => assert!(context.store_mut_for_test().set_symbol_flags(
+                    date,
+                    date_flags | SymbolFlags::VALUE_MODULE,
+                    CheckFlags::NONE,
+                )),
+                5 => assert!(context.store_mut_for_test().set_symbol_relationships(
+                    owner,
+                    owner_members,
+                    None,
+                    Some(date),
+                    None,
                 )),
                 _ => unreachable!("Date provider poison cases are bounded"),
             }
@@ -8694,6 +8808,18 @@ mod tests {
                     owner_flags,
                     CheckFlags::NONE,
                 )),
+                4 => assert!(context.store_mut_for_test().set_symbol_flags(
+                    date,
+                    date_flags,
+                    CheckFlags::NONE,
+                )),
+                5 => assert!(context.store_mut_for_test().set_symbol_relationships(
+                    owner,
+                    owner_members,
+                    None,
+                    None,
+                    None,
+                )),
                 _ => unreachable!("Date provider poison cases are bounded"),
             }
             assert_eq!(
@@ -8707,6 +8833,127 @@ mod tests {
                 "case {poison}",
             );
         }
+    }
+
+    #[test]
+    fn global_date_signatures_reject_erased_source_parameters() {
+        let library = parse_source_file(concat!(
+            "interface Date {} ",
+            "interface DateConstructor { ",
+            "new(): Date; new(value: number): Date; new<Value>(): Date; ",
+            "readonly prototype: Date; ",
+            "} declare var Date: DateConstructor;",
+        ));
+        let source = parse_source_file("const value = new Date();");
+        let library_file = FileId::new(1_883);
+        let source_file = FileId::new(1_884);
+        let mut context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+        let (construction, constructor) = variable_new(&source, source_file, "value");
+        context.check_source_file(source_file).unwrap();
+
+        let date = context
+            .store()
+            .symbol_node_links(constructor)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        let instance = context
+            .store()
+            .type_node_links(construction)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let original = context
+            .store()
+            .signature_links(construction)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let mut rejected = 0;
+        for (node, record) in library.arena.iter() {
+            let NodeData::ConstructSignatureDeclaration(signature) = &record.data else {
+                continue;
+            };
+            if signature.parameters.nodes.is_empty() && signature.type_parameters.is_none() {
+                continue;
+            }
+            let declaration = NodeRef::new(library.arena.id(), library_file, node);
+            let annotation =
+                NodeRef::new(library.arena.id(), library_file, signature.type_.unwrap());
+            let store = context.store_mut_for_test();
+            let forged = store
+                .alloc_signature(
+                    SignatureFlags::CONSTRUCT,
+                    Some(declaration),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    Some(instance),
+                    None,
+                    0,
+                )
+                .unwrap();
+            assert!(store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(instance),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_symbol_node_links(
+                annotation,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(date),
+                },
+            ));
+            for node in [declaration, construction] {
+                assert!(store.set_signature_links(
+                    node,
+                    SignatureLinks {
+                        resolved_signature: ResolvedSignatureState::Resolved(forged),
+                        ..SignatureLinks::default()
+                    },
+                ));
+            }
+            assert!(store.set_function_signature_return_annotation(forged, annotation, false));
+            let before = (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                authenticated_global_date_constructor_return(store, forged),
+                None
+            );
+            assert!(!exact_global_date_initializer(
+                store,
+                construction,
+                instance
+            ));
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            rejected += 1;
+        }
+        assert_eq!(rejected, 2);
+        assert!(context.store_mut_for_test().set_signature_links(
+            construction,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(original),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(exact_global_date_initializer(
+            context.store(),
+            construction,
+            instance
+        ));
     }
 
     #[test]
