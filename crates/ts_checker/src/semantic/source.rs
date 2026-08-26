@@ -107,7 +107,7 @@ use super::{
         ClassTypeQueryContext, ExportedJsxArrowClassPlan, execute_exported_jsx_arrow_class,
         execute_nongeneric_class_member_query, plan_anonymous_abstract_class_expression_grammar,
         plan_class_grammar_diagnostics, plan_exported_jsx_arrow_class,
-        plan_nongeneric_class_member_query_with_type_context,
+        plan_nongeneric_class_member_query, plan_nongeneric_class_member_query_with_type_context,
         preflight_nongeneric_class_member_query, validate_class_heritage_members,
     },
     contextual::{

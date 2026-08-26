@@ -19106,13 +19106,11 @@ pub(super) fn execute_nongeneric_class_member_query(
     host: &DeclaredTypeHost<'_>,
     plan: &ClassMemberQueryPlan,
 ) -> Result<ClassMembers, ClassError> {
-    let current = plan_nongeneric_class_member_query(
+    let current = plan_nongeneric_class_member_query_with_type_context(
         store,
         host,
-        match plan {
-            ClassMemberQueryPlan::Direct(plan)
-            | ClassMemberQueryPlan::Derived { class: plan, .. } => plan.class.symbol,
-        },
+        plan.symbol(),
+        plan.type_query_context(),
     )?;
     if current != *plan {
         return Err(invariant(ClassInvariant::InvalidPlan(match plan {
@@ -23540,7 +23538,7 @@ mod tests {
                 let (_, bound) = context.file(file).unwrap();
                 let host = DeclaredTypeHost::new_after_global_merge(
                     [(&parsed.arena, bound)],
-                    GlobalMergeCompletion::new(options.name_resolution),
+                    GlobalMergeCompletion::for_test(options.name_resolution),
                 )
                 .unwrap();
                 assert!(matches!(

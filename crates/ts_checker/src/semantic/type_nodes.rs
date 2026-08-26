@@ -123,6 +123,8 @@ pub(super) fn preflight_type_annotation(
         options.strict_builtin_iterator_return,
         &aliases,
     );
+    // Class validation needs complete reference and union plans on warm queries.
+    planner.replay_cached_annotations = true;
     let methods = object_members::plan_enclosing_generic_interface_methods(store, host, node)
         .map_err(property_object_error)?;
     planner.plan_interface_method_dependencies(&methods, node)?;
@@ -2150,6 +2152,7 @@ struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     array_type: Option<TypeId>,
     array_targets: Option<CanonicalArrayTargets>,
     strict_builtin_iterator_return: bool,
+    replay_cached_annotations: bool,
     type_reference_alias_targets: &'aliases HashMap<NodeRef, CanonicalTypeReferenceAliasTarget>,
     jsdoc_import_type_target: Option<CanonicalJsDocImportTypeTarget>,
     plan: TypeQueryPlan,
@@ -2178,6 +2181,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             array_type,
             array_targets,
             strict_builtin_iterator_return,
+            replay_cached_annotations: false,
             type_reference_alias_targets,
             jsdoc_import_type_target: None,
             plan: TypeQueryPlan::default(),
@@ -2300,7 +2304,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     .unwrap_or(false);
                 match self.validate_cached_union_result(cached, alias_owner.or(derived_alias)) {
                     Ok(())
-                        if !replay_generic_union
+                        if !self.replay_cached_annotations
+                            && !replay_generic_union
                             && self.type_reference_alias_targets.is_empty()
                             && !alias_owner.is_some_and(|owner| {
                                 self.plan
@@ -10839,7 +10844,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.reject_cached_import_alias_without_capability(node, name, name_text)?;
         }
 
-        if !union_constituent
+        if !self.replay_cached_annotations
+            && !union_constituent
             && self.intersection_planning_depth == 0
             && exact_import.is_none()
             && cached_type.is_some()
@@ -18706,7 +18712,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if cached.is_some() {
             self.validate_cached_generic_alias_constraints(symbol, &planned_parameters)?;
         }
-        if self.intersection_planning_depth != 0
+        if self.replay_cached_annotations
+            || self.intersection_planning_depth != 0
             || cached.is_none()
             || cached_array_capability_missing
             || cached_pending_function

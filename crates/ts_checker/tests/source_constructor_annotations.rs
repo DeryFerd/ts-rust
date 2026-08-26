@@ -5,7 +5,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
-    TypeData, TypeId,
+    TypeData, TypeId, UnsupportedSourceSyntax,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -54,7 +54,7 @@ fn context<'a>(library: &'a ParseResult, source: &'a ParseResult) -> CanonicalCh
     }
     CanonicalCheckerContext::new(
         binder.finish(),
-        [
+        vec![
             (FileId::new(4_300), &library.arena),
             (FileId::new(4_301), &source.arena),
         ],
@@ -115,6 +115,23 @@ fn contains_type(context: &CanonicalCheckerContext<'_>, type_: TypeId, expected:
         || matches!(context.store().type_payload(type_).unwrap().data(), TypeData::Union(union) if union.union.types.contains(&expected))
 }
 
+fn check_source(context: &mut CanonicalCheckerContext<'_>, source: &ParseResult) {
+    context
+        .check_source_file(FileId::new(4_301))
+        .unwrap_or_else(|error| {
+            if let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(node)) = error
+                && node.is_for(source.arena.id(), FileId::new(4_301))
+            {
+                let record = source.arena.get(node.node).unwrap();
+                let text = source.arena.source_text().unwrap();
+                let text = &text[usize::try_from(record.range.start.get()).unwrap()
+                    ..usize::try_from(record.range.end.get()).unwrap()];
+                panic!("{error:?} at {:?}: {text}", record.kind);
+            }
+            panic!("{error:?}");
+        });
+}
+
 #[test]
 #[allow(clippy::too_many_lines)] // The upstream cases share one declared Date identity.
 fn constructor_reference_annotations_keep_default_and_optional_types_distinct() {
@@ -128,7 +145,7 @@ fn constructor_reference_annotations_keep_default_and_optional_types_distinct() 
     ));
     assert!(source.diagnostics.is_empty());
     let mut context = context(&library, &source);
-    context.check_source_file(FileId::new(4_301)).unwrap();
+    check_source(&mut context, &source);
     let date = {
         let store = context.store();
         let owner = store
@@ -243,7 +260,7 @@ fn local_constructor_references_and_unions_use_canonical_names_and_order() {
     ));
     assert!(source.diagnostics.is_empty());
     let mut context = context(&library, &source);
-    context.check_source_file(FileId::new(4_301)).unwrap();
+    check_source(&mut context, &source);
     let local = named_symbol(&context, &source, "LocalStamp");
     let local_type = context
         .store()
