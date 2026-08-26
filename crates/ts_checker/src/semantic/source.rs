@@ -39556,6 +39556,7 @@ fn recovered_static_class_alias(
 fn recovered_static_class_reset(
     arena: &NodeArena,
     bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
     class: &RecoveredProtectedClass,
     statement: NodeId,
 ) -> Option<()> {
@@ -39591,6 +39592,9 @@ fn recovered_static_class_reset(
         && binary.type_.is_none()
         && binary.facts == 0
         && binary.modifiers.is_none()
+        && store
+            .assertion_links(assertion)
+            .is_none_or(|links| links == &AssertionLinks::default())
         && reference == class.name)
         .then_some(())
 }
@@ -40313,6 +40317,8 @@ fn recover_deferred_constructor_class_order(
         && constructor_owner.name() == ts_binder::InternalSymbolName::Constructor.as_ref()
         && constructor_owner.declarations() == Some(&[constructor])
         && constructor_owner.value_declaration().is_none()
+        && constructor_owner.members().is_none()
+        && constructor_owner.exports().is_none()
         && constructor_owner.parent() == Some(first.symbol)
         && constructor_owner.export_symbol().is_none()
         && store.get_merged_symbol(constructor_symbol) == Some(constructor_symbol)
@@ -41880,7 +41886,7 @@ fn recover_static_class_self_references(
         && recovered_static_console_body(arena, bound, private_body, &class, None).is_some()
         && recovered_static_private_call(arena, bound, public_body, public_method, &private_name)
             .is_some()
-        && recovered_static_class_reset(arena, bound, &class, *reset).is_some()
+        && recovered_static_class_reset(arena, bound, store, &class, *reset).is_some()
         && recovered_static_alias_call(arena, bound, *first_call, &alias_name, &arrow_name, false)
             .is_some()
         && recovered_static_alias_call(
@@ -60335,7 +60341,7 @@ mod tests {
 
     #[test]
     fn static_class_recovery_rejects_forged_member_owners_and_capture_caches() {
-        for poison in 0..3 {
+        for poison in 0..4 {
             let source = parsed(STATIC_CLASS_SELF_REFERENCE_SOURCE);
             let file = FileId::new(11_707 + poison);
             let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
@@ -60382,7 +60388,26 @@ mod tests {
                         ..ValueSymbolLinks::default()
                     },
                 )),
-                _ => unreachable!("only static member and capture poison cases are visited"),
+                3 => {
+                    let assertion = source
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            (record.kind == SyntaxKind::AsExpression).then_some(NodeRef::new(
+                                source.arena.id(),
+                                file,
+                                node,
+                            ))
+                        })
+                        .unwrap();
+                    assert!(context.store_mut_for_test().set_assertion_links(
+                        assertion,
+                        AssertionLinks {
+                            expr_type: Some(wrong),
+                        },
+                    ));
+                }
+                _ => unreachable!("only static member, capture, and assertion poison is visited"),
             }
             let poisoned = observable_state(&context, file);
 
@@ -60931,6 +60956,40 @@ mod tests {
         assert!(context.check_source_file(file).is_err());
         assert_eq!(observable_state(&context, file), poisoned);
         assert!(context.diagnostics().is_empty());
+
+        for (index, exports) in [false, true].into_iter().enumerate() {
+            let source = parsed(DEFERRED_CLASS_ORDER_SOURCE);
+            let file = FileId::new(11_745 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let owner = global_symbol(&context, "bar");
+            let members = context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .unwrap();
+            let constructor = context
+                .store()
+                .symbol_table(members)
+                .and_then(|members| {
+                    members.get(ts_binder::InternalSymbolName::Constructor.as_ref())
+                })
+                .unwrap();
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                constructor,
+                (!exports).then_some(members),
+                exports.then_some(members),
+                Some(owner),
+                None,
+            ));
+            let poisoned = observable_state(&context, file);
+
+            assert!(
+                context.check_source_file(file).is_err(),
+                "constructor exports={exports}"
+            );
+            assert_eq!(observable_state(&context, file), poisoned);
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
