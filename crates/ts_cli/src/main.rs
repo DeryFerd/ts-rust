@@ -40,6 +40,12 @@ fn main() -> ExitCode {
     {
         return compile_development(&args[1..]);
     }
+    if args
+        .first()
+        .is_some_and(|argument| argument == "--check-canonical")
+    {
+        return check_canonical_project(&args[1..]);
+    }
     let expanded = expand_command_line(&args, read_response_file);
     let quiet = expanded
         .as_ref()
@@ -888,6 +894,42 @@ fn compile_development(files: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn check_canonical_project(arguments: &[String]) -> ExitCode {
+    let [project] = arguments else {
+        eprintln!("error: --check-canonical requires exactly one project path");
+        return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+    };
+    let Ok(current_directory) = env::current_dir() else {
+        eprintln!("error: could not determine the current directory");
+        return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+    };
+    let config_path = match resolve_project_path(&current_directory, project, false, false) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let (program, checked) = match Program::try_from_config_with_canonical_checker_and_queries(
+        &OsFileSystem::default(),
+        &config_path.to_string_lossy(),
+        |_, _| (),
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("error {}: {error}", error.failure_class().code());
+            return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+        }
+    };
+    print_program_diagnostics(&program, &current_directory.to_string_lossy());
+    if checked.is_none() {
+        if program.options().no_check {
+            eprintln!("error: canonical checking was skipped because noCheck is enabled.");
+        } else if program.diagnostics().is_empty() {
+            eprintln!("error: canonical checking did not run.");
+        }
+        return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+    }
+    diagnostic_exit(!program.diagnostics().is_empty(), false)
+}
+
 fn print_program_diagnostics(program: &Program, current_directory: &str) {
     print_diagnostics(
         program,
@@ -1092,6 +1134,9 @@ fn print_help() {
     println!("      --lsp          Run the language server over stdin/stdout");
     println!("      --parse        Parse one source file (development)");
     println!("      --compile-dev  Run the development compiler pipeline");
+    println!(
+        "      --check-canonical PROJECT Check a project with the canonical checker (development)"
+    );
     println!("      --tokenize     Print the token stream for one source file");
 }
 
