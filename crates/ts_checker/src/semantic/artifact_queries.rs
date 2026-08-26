@@ -339,6 +339,17 @@ impl CanonicalCheckerContext<'_> {
             )
         };
 
+        if matches!(parent, Some(LocationParent::TypeReference(_)))
+            && let Some(symbol) =
+                self.lexical_artifact_symbol(node, SymbolFlags::TYPE | SymbolFlags::ALIAS)?
+            && self
+                .store()
+                .symbol(symbol)
+                .is_some_and(|record| record.flags().contains(SymbolFlags::ALIAS))
+        {
+            return Ok(Some(symbol));
+        }
+
         if bound_symbol.is_none()
             && !matches!(
                 parent,
@@ -1172,9 +1183,12 @@ impl CanonicalCheckerContext<'_> {
         if record.name() != InternalSymbolName::Global.as_ref() {
             return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
         }
+        if record.flags().intersects(SymbolFlags::VALUE_MODULE) {
+            return Ok(None);
+        }
         self.store()
             .intrinsic_bootstrap()
-            .map(|bootstrap| self.validate_artifact_type(node, bootstrap.any_type))
+            .map(|bootstrap| self.validate_artifact_type(node, bootstrap.error_type))
             .transpose()
     }
 
@@ -3694,7 +3708,7 @@ mod tests {
     }
 
     #[test]
-    fn global_augmentation_names_use_their_public_spelling_and_canonical_any_type() {
+    fn namespace_only_global_augmentation_names_use_the_canonical_error_type() {
         let parsed = parse_source_file(concat!(
             "export {};\n",
             "declare global { interface Marker { value: string; } }\n",
@@ -3743,8 +3757,76 @@ mod tests {
         assert_eq!(context.symbol_to_string(symbol).unwrap(), "global");
         assert_eq!(
             context.get_type_at_location(name).unwrap(),
-            context.store().intrinsic_bootstrap().unwrap().any_type
+            context.store().intrinsic_bootstrap().unwrap().error_type
         );
+    }
+
+    #[test]
+    fn global_augmentation_value_names_do_not_fabricate_any_types() {
+        let parsed = parse_source_file(concat!(
+            "export {};\n",
+            "declare global { var marker: 'ready'; }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_062);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/global.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return None;
+                };
+                (module.keyword == SyntaxKind::GlobalKeyword).then_some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, module.name),
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        assert!(
+            context
+                .store()
+                .symbol(symbol)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::VALUE_MODULE)
+        );
+
+        for _ in 0..2 {
+            assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(symbol));
+            assert_eq!(
+                context.get_type_at_location(name),
+                Err(CanonicalArtifactQueryError::MissingType {
+                    node: name,
+                    kind: SyntaxKind::Identifier,
+                })
+            );
+            assert!(context.store().type_node_links(name).is_none());
+            assert!(context.store().value_symbol_links(symbol).is_none());
+        }
     }
 
     #[test]
@@ -4075,6 +4157,176 @@ mod tests {
             assert_eq!(context.get_symbol_at_location(root).unwrap(), Some(alias));
             assert_eq!(context.get_symbol_at_location(name).unwrap(), expected);
             assert_eq!(context.get_symbol_at_location(member).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn imported_type_reference_names_preserve_alias_identity_cold_and_warm() {
+        for (import, local_name, declaration_file) in [
+            ("Item", "Item", false),
+            ("Item as Local", "Local", false),
+            ("Item", "Item", true),
+            ("Item as Local", "Local", true),
+        ] {
+            let declaration = if declaration_file {
+                format!("declare const result: {local_name};")
+            } else {
+                format!("const result: {local_name} = {{ value: 'ready' }};")
+            };
+            let importer = parse_source_file(&format!(
+                "import type {{ {import} }} from './target';\n{declaration}\n"
+            ));
+            let target = parse_source_file("export interface Item { value: string; }\n");
+            assert!(
+                importer.diagnostics.is_empty(),
+                "{:?}",
+                importer.diagnostics
+            );
+            assert!(target.diagnostics.is_empty(), "{:?}", target.diagnostics);
+            let importer_file = FileId::new(6_060);
+            let target_file = FileId::new(6_061);
+            let mut binder = CanonicalBinder::new();
+            let importer_path = if declaration_file {
+                "\"/project/importer.d.ts\""
+            } else {
+                "\"/project/importer.ts\""
+            };
+            for (file, parsed, path, declaration_file) in [
+                (importer_file, &importer, importer_path, declaration_file),
+                (target_file, &target, "\"/project/target.d.ts\"", true),
+            ] {
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(path),
+                            CanonicalSourceLanguage::TypeScript,
+                            declaration_file,
+                            CanonicalModuleState::External,
+                        ),
+                    )
+                    .unwrap();
+            }
+            for (file, parsed) in [(importer_file, &importer), (target_file, &target)] {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let specifier = importer
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::ImportDeclaration(import) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(
+                        importer.arena.id(),
+                        importer_file,
+                        import.module_specifier,
+                    ))
+                })
+                .unwrap();
+            let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+                binder.finish(),
+                vec![
+                    (importer_file, &importer.arena),
+                    (target_file, &target.arena),
+                ],
+                CanonicalCheckerOptions::default(),
+                CanonicalModuleResolutionManifestInput::new([
+                    CanonicalModuleResolutionEntry::resolved(
+                        specifier,
+                        CanonicalResolvedModuleInput::new(
+                            target_file,
+                            CanonicalModuleResolutionMode::Esm,
+                            CanonicalModuleResolutionMode::Esm,
+                        ),
+                    ),
+                ]),
+            )
+            .unwrap();
+            let import_declaration = importer
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::ImportSpecifier(_)).then_some(NodeRef::new(
+                        importer.arena.id(),
+                        importer_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let target_declaration = target
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::InterfaceDeclaration(_))
+                        .then_some(NodeRef::new(target.arena.id(), target_file, node))
+                })
+                .unwrap();
+            let alias = context
+                .file(importer_file)
+                .unwrap()
+                .1
+                .symbol(import_declaration)
+                .unwrap();
+            let target_symbol = context
+                .file(target_file)
+                .unwrap()
+                .1
+                .symbol(target_declaration)
+                .unwrap();
+            let (reference, name) = importer
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeReferenceNode(reference) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(importer.arena.id(), importer_file, node),
+                        NodeRef::new(importer.arena.id(), importer_file, reference.type_name),
+                    ))
+                })
+                .unwrap();
+
+            assert_ne!(alias, target_symbol);
+            assert!(context.store().type_node_links(reference).is_none());
+            assert!(context.store().symbol_node_links(reference).is_none());
+            assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(alias));
+            if declaration_file {
+                assert!(context.store().type_node_links(reference).is_none());
+                assert!(context.store().symbol_node_links(reference).is_none());
+                assert!(context.store().symbol_node_links(name).is_none());
+                continue;
+            }
+            let expected = context.get_declared_type_of_symbol(target_symbol).unwrap();
+            assert_eq!(context.get_type_at_location(reference).unwrap(), expected);
+            assert_eq!(context.get_type_at_location(name).unwrap(), expected);
+            let type_links = context.store().type_node_links(reference).cloned();
+            let symbol_links = context.store().symbol_node_links(reference).cloned();
+            assert_eq!(
+                symbol_links
+                    .as_ref()
+                    .and_then(|links| links.resolved_symbol),
+                Some(target_symbol)
+            );
+            assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(alias));
+            assert_eq!(
+                context.get_symbol_declarations(alias).unwrap(),
+                &[import_declaration]
+            );
+            assert_eq!(
+                context.store().type_node_links(reference),
+                type_links.as_ref()
+            );
+            assert_eq!(
+                context.store().symbol_node_links(reference),
+                symbol_links.as_ref()
+            );
+            assert!(context.store().symbol_node_links(name).is_none());
         }
     }
 
