@@ -5,7 +5,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
 };
 
 use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
@@ -24,6 +24,7 @@ pub enum SymbolDisplayError {
     SourceHost(DeclaredTypeHostError),
     AliasHost(ProductionAliasTargetHostError),
     InvalidLocation(NodeRef),
+    InvalidModuleSpecifier(NodeRef),
     InvalidSymbol(SemanticSymbolId),
     InvalidTable(SymbolTableId),
     InvalidAliasCache(SemanticSymbolId),
@@ -41,6 +42,10 @@ impl std::fmt::Display for SymbolDisplayError {
             Self::InvalidLocation(node) => {
                 write!(formatter, "symbol display has an invalid location {node:?}")
             }
+            Self::InvalidModuleSpecifier(node) => write!(
+                formatter,
+                "symbol display has an invalid module specifier for {node:?}"
+            ),
             Self::InvalidSymbol(symbol) => {
                 write!(formatter, "symbol display has an invalid symbol {symbol:?}")
             }
@@ -531,6 +536,17 @@ impl SymbolDisplayContext {
             .get(&symbol)
             .map(String::as_str)
             .ok_or(SymbolDisplayError::MissingModuleSpecifier(symbol))
+    }
+
+    pub(super) fn add_module_specifiers(
+        &mut self,
+        specifiers: &BTreeMap<SemanticSymbolId, String>,
+    ) {
+        for (symbol, specifier) in specifiers {
+            self.module_specifiers
+                .entry(*symbol)
+                .or_insert_with(|| specifier.clone());
+        }
     }
 }
 
@@ -1134,6 +1150,65 @@ mod tests {
                 .name()
                 .as_utf8(),
             Some("Shape")
+        );
+    }
+
+    #[test]
+    fn module_display_specifiers_require_the_exact_source_module() {
+        let target = parse_source_file("export interface Shape { value: number; }");
+        let left = parse_source_file("export {};");
+        let right = parse_source_file("export {};");
+        let mut context = import_context(&target, &left, &right);
+        let declaration = declaration(&target, FileId::new(41_010), "Shape");
+        let target_symbol = symbol(&context, declaration);
+        let type_ = context.get_declared_type_of_symbol(target_symbol).unwrap();
+        let target_source = NodeRef::new(target.arena.id(), declaration.file, target.source_file);
+        let location = NodeRef::new(right.arena.id(), FileId::new(41_012), right.source_file);
+        let target_module = symbol(&context, target_source);
+        assert_eq!(
+            context.type_to_string_at_location_with_flags(
+                type_,
+                location,
+                crate::semantic::CanonicalTypeFormatFlags::NO_TRUNCATION
+            ),
+            Err(TypeDisplayUnavailable::SymbolDisplay(
+                SymbolDisplayError::MissingModuleSpecifier(target_module)
+            ))
+        );
+        assert_eq!(
+            context.set_module_display_specifier(declaration, "item-api".to_owned()),
+            Err(SymbolDisplayError::InvalidLocation(declaration))
+        );
+        assert_eq!(
+            context.set_module_display_specifier(target_source, String::new()),
+            Err(SymbolDisplayError::InvalidModuleSpecifier(target_source))
+        );
+        let foreign = parse_source_file("export {};");
+        let foreign_source =
+            NodeRef::new(foreign.arena.id(), declaration.file, foreign.source_file);
+        assert_eq!(
+            context.set_module_display_specifier(foreign_source, "item-api".to_owned()),
+            Err(SymbolDisplayError::InvalidLocation(foreign_source))
+        );
+        context
+            .set_module_display_specifier(target_source, "item-api".to_owned())
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(
+                        type_,
+                        location,
+                        crate::semantic::CanonicalTypeFormatFlags::NO_TRUNCATION
+                    )
+                    .unwrap(),
+                "import(\"item-api\").Shape"
+            );
+        }
+        assert_eq!(context.type_to_string(type_).unwrap(), "Shape");
+        assert_eq!(
+            context.store().type_payload(type_).unwrap().symbol(),
+            Some(target_symbol)
         );
     }
 

@@ -193,6 +193,66 @@ fn canonical_queries_name_an_anonymous_expando_owner_from_its_variable() {
 }
 
 #[test]
+fn canonical_queries_use_package_exports_for_types_from_a_transitive_module() {
+    let filesystem = MemoryFileSystem::new(true);
+    for (path, source) in [
+        (
+            "/project/node_modules/item-api/package.json",
+            r#"{"name":"item-api","exports":{".":"./index.d.ts"}}"#,
+        ),
+        (
+            "/project/node_modules/item-api/index.d.ts",
+            "export interface Item { value: number; }",
+        ),
+        (
+            "/project/re-export.d.ts",
+            "export type { Item } from 'item-api';",
+        ),
+        (
+            "/project/input.d.ts",
+            "import {} from './re-export'; export {};",
+        ),
+    ] {
+        filesystem.write_file(path, source).unwrap();
+    }
+    let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+        &filesystem,
+        "/project",
+        &["input.d.ts".to_owned()],
+        CompilerOptions {
+            skip_lib_check: true,
+            ..canonical_options()
+        },
+        |program, queries| {
+            let declaration =
+                identifiers(program, "/project/node_modules/item-api/index.d.ts", "Item")[0];
+            let source = program.source_file("/project/input.d.ts").unwrap();
+            let location = source.node_ref(source.parse.source_file).unwrap();
+            let type_ = queries.get_type_at_location(declaration).unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    queries
+                        .type_to_string_at_location_with_flags(
+                            type_,
+                            location,
+                            CanonicalTypeFormatFlags::NO_TRUNCATION
+                        )
+                        .unwrap(),
+                    "import(\"item-api\").Item"
+                );
+            }
+        },
+    )
+    .unwrap();
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+    result.expect("canonical checker ran");
+}
+
+#[test]
 fn canonical_queries_preserve_cross_file_identity_and_reject_foreign_nodes() {
     let filesystem = MemoryFileSystem::new(true);
     filesystem

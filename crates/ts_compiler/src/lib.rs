@@ -4423,6 +4423,29 @@ impl Program {
         );
         self.apply_comment_directives(&mut diagnostics, &checked_sources);
 
+        for source in &self.source_files {
+            let target = canonicalize(
+                module_file_stem(&source.file_name),
+                &self.current_directory,
+                self.case_sensitivity,
+            );
+            if let Some(specifier) = self.package_export_specifiers.get(&target)
+                && source_is_external_module(source)
+            {
+                context
+                    .set_module_display_specifier(
+                        NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file),
+                        specifier.clone(),
+                    )
+                    .map_err(|error| CanonicalProgramCheckError::SourceCheck {
+                        file_name: source.file_name.clone(),
+                        error: SourceCheckError::TypeDisplayUnavailable(
+                            TypeDisplayUnavailable::SymbolDisplay(error),
+                        ),
+                    })?;
+            }
+        }
+
         let mut canonical_queries = CanonicalProgramQueries {
             context,
             has_diagnostics: !self.diagnostics.is_empty() || !diagnostics.is_empty(),

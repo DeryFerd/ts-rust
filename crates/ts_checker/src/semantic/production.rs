@@ -272,6 +272,7 @@ pub struct CanonicalCheckerContext<'arena> {
     globals: SymbolTableId,
     global_types: CanonicalGlobalTypes,
     module_resolutions: CanonicalModuleResolutionManifest,
+    module_display_specifiers: BTreeMap<SemanticSymbolId, String>,
     diagnostics: CanonicalCheckerDiagnostics,
     source_diagnostic_staging: BTreeMap<SourceFileRef, CanonicalCheckerDiagnostics>,
     pending_ambient_modules: Vec<SemanticSymbolId>,
@@ -490,6 +491,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             globals: initialized.globals,
             global_types: initialized.global_types,
             module_resolutions,
+            module_display_specifiers: BTreeMap::new(),
             diagnostics: CanonicalCheckerDiagnostics::default(),
             source_diagnostic_staging: BTreeMap::new(),
             pending_ambient_modules: initialized.pending_ambient_modules,
@@ -714,6 +716,44 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         )
     }
 
+    /// Retains a public module specifier supplied by the Program's package resolver.
+    ///
+    /// The checker validates the source module's identity. The Program owns
+    /// package resolution and supplies the corresponding package-export name.
+    /// This display fact does not change the module symbol or its exports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a foreign node, a non-module source, or an empty
+    /// module specifier.
+    pub fn set_module_display_specifier(
+        &mut self,
+        source: NodeRef,
+        specifier: String,
+    ) -> Result<(), SymbolDisplayError> {
+        let (arena, bound) = self
+            .file(source.file)
+            .ok_or(SymbolDisplayError::InvalidLocation(source))?;
+        if source != bound.source_file()
+            || arena.revision() != bound.node_arena_revision()
+            || !self.store.contains_node_ref(source)
+            || !bound
+                .source_facts()
+                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_external_or_common_js_module)
+        {
+            return Err(SymbolDisplayError::InvalidLocation(source));
+        }
+        if specifier.is_empty() || specifier.chars().any(char::is_control) {
+            return Err(SymbolDisplayError::InvalidModuleSpecifier(source));
+        }
+        let symbol = bound
+            .symbol(source)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+            .ok_or(SymbolDisplayError::InvalidLocation(source))?;
+        self.module_display_specifiers.insert(symbol, specifier);
+        Ok(())
+    }
+
     fn symbol_display_context(
         &mut self,
         enclosing: NodeRef,
@@ -730,7 +770,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             &self.module_resolutions,
         )
         .map_err(SymbolDisplayError::AliasHost)?;
-        SymbolDisplayContext::new(
+        let mut context = SymbolDisplayContext::new(
             &mut self.store,
             &host,
             &mut alias_host,
@@ -738,7 +778,9 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             self.globals,
             &self.file_order,
             enclosing,
-        )
+        )?;
+        context.add_module_specifiers(&self.module_display_specifiers);
+        Ok(context)
     }
 
     pub(super) fn artifact_symbol_chain(
