@@ -949,6 +949,9 @@ impl CanonicalCheckerContext<'_> {
         };
         let cached = self.cached_artifact_type(node)?;
         if is_enum {
+            if self.store().get_merged_symbol(symbol) != Some(symbol) {
+                return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+            }
             let owner = self
                 .store()
                 .symbol(symbol)
@@ -2922,6 +2925,81 @@ mod tests {
                     before,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn enum_declaration_queries_reject_chained_owner_redirects() {
+        let parsed = parse_source_file(concat!(
+            "declare enum First {} declare enum Bridge {} ",
+            "declare enum Last { Value = 1 }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_072);
+        for warm in [false, true] {
+            let mut context = declaration_context(&parsed, file);
+            let owners = parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                        return None;
+                    };
+                    let declaration = NodeRef::new(parsed.arena.id(), file, node);
+                    Some((
+                        declaration,
+                        NodeRef::new(parsed.arena.id(), file, enumeration.name),
+                        context.file(file).unwrap().1.symbol(declaration).unwrap(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let [first, bridge, last] = owners.as_slice() else {
+                panic!("expected three enum declarations");
+            };
+            if warm {
+                for (_, name, _) in &owners {
+                    context.get_type_at_location(*name).unwrap();
+                }
+            }
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                bridge.2,
+                Some(vec![first.0]),
+                Some(first.0),
+            ));
+            context
+                .store_mut_for_test()
+                .record_merged_symbol(bridge.2, first.2)
+                .unwrap();
+            context
+                .store_mut_for_test()
+                .record_merged_symbol(last.2, bridge.2)
+                .unwrap();
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().declared_type_links(last.2).cloned(),
+                context.diagnostics().len(),
+            );
+            for node in [first.0, first.1] {
+                assert_eq!(
+                    context.get_type_at_location(node),
+                    Err(CanonicalArtifactQueryError::InvalidSymbol {
+                        node,
+                        symbol: bridge.2,
+                    }),
+                );
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().declared_type_links(last.2).cloned(),
+                    context.diagnostics().len(),
+                ),
+                before,
+            );
         }
     }
 
