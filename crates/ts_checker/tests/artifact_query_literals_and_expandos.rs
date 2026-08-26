@@ -165,3 +165,58 @@ fn expando_assignment_accesses_reuse_properties_without_exposing_expression_symb
         );
     }
 }
+
+#[test]
+fn annotated_expando_accesses_keep_declared_property_symbols() {
+    let parsed = parse_source_file(concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {} ",
+        "const callback: { (): void; items?: string[] } = () => undefined; ",
+        "callback.items = [];",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(4_102);
+    let mut context = context(&parsed, file, false, CanonicalModuleState::Script);
+    let declaration = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            matches!(record.data, NodeData::PropertyDeclaration(_)).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    let (expression, access, name) = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::BinaryExpression(binary) = &record.data else {
+                return None;
+            };
+            let NodeData::PropertyAccessExpression(access) = &parsed.arena.get(binary.left)?.data
+            else {
+                return None;
+            };
+            Some((
+                NodeRef::new(parsed.arena.id(), file, node),
+                NodeRef::new(parsed.arena.id(), file, binary.left),
+                NodeRef::new(parsed.arena.id(), file, access.name),
+            ))
+        })
+        .unwrap();
+    let declared = context.file(file).unwrap().1.symbol(declaration).unwrap();
+    let assigned = context.file(file).unwrap().1.symbol(expression).unwrap();
+    assert_ne!(declared, assigned);
+    assert_eq!(context.get_symbol_at_location(access), Ok(Some(declared)));
+    assert_eq!(context.get_symbol_at_location(name), Ok(Some(declared)));
+    assert_eq!(context.get_symbol_at_location(expression), Ok(None));
+    assert_eq!(
+        context.get_symbol_declarations(declared),
+        Ok(&[declaration][..]),
+    );
+    assert_eq!(
+        context.get_symbol_declarations(assigned),
+        Ok(&[expression][..]),
+    );
+}

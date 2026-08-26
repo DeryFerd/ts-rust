@@ -1002,13 +1002,21 @@ impl CanonicalCheckerContext<'_> {
         )
         .map_err(|_| invalid())?
         {
-            Some((plan.left, plan.property_symbol))
+            Some((plan.left, plan.property_symbol, plan.property_symbol))
         } else {
             super::assignment::plan_arrow_expando_assignment(arena, bound, self.store(), statement)
                 .map_err(|_| invalid())?
-                .map(|plan| (plan.left, plan.property_symbol))
+                .map(|plan| {
+                    self.annotated_expando_artifact_symbol(
+                        node,
+                        plan.variable_symbol,
+                        plan.property_symbol,
+                    )
+                    .map(|target| (plan.left, plan.property_symbol, target))
+                })
+                .transpose()?
         };
-        let Some((left, property_symbol)) = proven else {
+        let Some((left, property_symbol, target)) = proven else {
             return Ok(None);
         };
         if left != access || property_symbol != symbol {
@@ -1020,7 +1028,7 @@ impl CanonicalCheckerContext<'_> {
                 .store()
                 .symbol_node_links(location)
                 .and_then(|links| links.resolved_symbol)
-                && self.merged_artifact_symbol(location, cached)? != symbol
+                && self.merged_artifact_symbol(location, cached)? != target
             {
                 return Err(CanonicalArtifactQueryError::InvalidSymbol {
                     node: location,
@@ -1028,7 +1036,40 @@ impl CanonicalCheckerContext<'_> {
                 });
             }
         }
-        self.merged_artifact_symbol(node, symbol).map(Some)
+        self.merged_artifact_symbol(node, target).map(Some)
+    }
+
+    fn annotated_expando_artifact_symbol(
+        &self,
+        node: NodeRef,
+        variable: SemanticSymbolId,
+        property: SemanticSymbolId,
+    ) -> Result<SemanticSymbolId, CanonicalArtifactQueryError> {
+        let invalid = || CanonicalArtifactQueryError::InvalidSymbol {
+            node,
+            symbol: variable,
+        };
+        let declaration = self
+            .store()
+            .symbol(variable)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .ok_or_else(invalid)?;
+        let (_, bound, record) = self.validated_artifact_node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &record.data else {
+            return Err(invalid());
+        };
+        let Some(annotation) = variable.type_ else {
+            return Ok(property);
+        };
+        let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+        let name = self.store().symbol(property).ok_or_else(invalid)?.name();
+        bound
+            .symbol(annotation)
+            .and_then(|symbol| self.store().symbol(symbol))
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| self.store().symbol_table(members))
+            .and_then(|members| members.get(name))
+            .ok_or_else(invalid)
     }
 
     fn literal_artifact_symbol_name(
