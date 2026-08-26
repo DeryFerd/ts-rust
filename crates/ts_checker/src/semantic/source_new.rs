@@ -198,6 +198,12 @@ struct SourceClassUnionConstructorPlan {
     classes: Vec<ClassMemberQueryPlan>,
 }
 
+struct SourceClassUnionConstructorCandidates {
+    value_type: TypeId,
+    signatures: Vec<SignatureId>,
+    instance_types: Vec<TypeId>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceClassUnionConstructorProvider {
     Ambient(NodeRef),
@@ -4816,11 +4822,7 @@ pub(super) fn check_direct_default_new(
             })?
         }
         SourceNewTarget::ClassUnion(union) => {
-            resolved_declared_class_union_constructor(store, plan, union)?.ok_or_else(|| {
-                invariant(SourceNewInvariant::InvalidConstructorCache(
-                    plan.constructor,
-                ))
-            })?
+            materialize_class_union_constructor(store, plan, union)?
         }
         SourceNewTarget::GlobalObject(global) => {
             resolved_global_object_constructor(store, plan, global)?.ok_or_else(|| {
@@ -5066,6 +5068,127 @@ fn resolved_declared_class_union_constructor(
     plan: &SourceDefaultNewPlan,
     union: &SourceClassUnionConstructorPlan,
 ) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
+    let Some(candidates) = class_union_constructor_candidates(store, plan, union)? else {
+        return Ok(None);
+    };
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    let value_type = candidates.value_type;
+    if union.classes.iter().any(ClassMemberQueryPlan::is_abstract) {
+        let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+        let signature = bootstrap.unknown_signature;
+        let record = store.signature(signature).ok_or_else(invalid)?;
+        if record.flags() != SignatureFlags::NONE
+            || record.declaration().is_some()
+            || !record.parameters().is_empty()
+            || !record.type_parameters().is_empty()
+            || record.min_argument_count() != 0
+            || record.resolved_min_argument_count() != -1
+            || record.this_parameter().is_some()
+            || record.resolved_return_type() != Some(bootstrap.error_type)
+            || record.resolved_type_predicate().is_some()
+            || record.target().is_some()
+            || record.mapper().is_some()
+            || record.composite().is_some()
+            || record.isolated_signature_type().is_some()
+        {
+            return Err(invalid());
+        }
+        return Ok(Some(CheckedSourceDefaultNew {
+            value_type,
+            instance_type: bootstrap.error_type,
+            signature,
+        }));
+    }
+    if let [signature] = candidates.signatures.as_slice() {
+        return Ok(Some(CheckedSourceDefaultNew {
+            value_type,
+            instance_type: candidates.instance_types[0],
+            signature: *signature,
+        }));
+    }
+    let structured = store
+        .type_payload(value_type)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(invalid)?;
+    if structured == &StructuredTypeData::default() {
+        return Ok(None);
+    }
+    let StoredCallableSetValidation::Valid {
+        family: CallableFamily::DeclaredCallSignatures,
+        projection,
+        ..
+    } = validate_stored_callable_set(store, value_type)
+    else {
+        return Err(invalid());
+    };
+    let [signature] = projection.construct_signatures.as_ref() else {
+        return Err(invalid());
+    };
+    let instance_type = store
+        .signature(*signature)
+        .and_then(Signature::resolved_return_type)
+        .ok_or_else(invalid)?;
+    Ok(Some(CheckedSourceDefaultNew {
+        value_type,
+        instance_type,
+        signature: *signature,
+    }))
+}
+
+fn materialize_class_union_constructor(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &SourceDefaultNewPlan,
+    union: &SourceClassUnionConstructorPlan,
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    if let Some(resolved) = resolved_declared_class_union_constructor(store, plan, union)? {
+        return Ok(resolved);
+    }
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    let candidates = class_union_constructor_candidates(store, plan, union)?.ok_or_else(invalid)?;
+    let Some(first) = candidates.signatures.first().copied() else {
+        return Err(invalid());
+    };
+    if !store.try_reserve_signatures(1) {
+        return Err(invariant(SourceNewInvariant::Capacity(plan.node)));
+    }
+    // Upstream removeSubtypes keeps unrelated class instances. These direct
+    // class plans have no object base, so their return union needs no reduction.
+    let mut prepared = store
+        .prepare_type_query_types(&[], &[], &[], 1, 0)
+        .map_err(|error| literal_cache_error(plan.node, error))?;
+    let instance_type = store
+        .literal_union_type_prepared(&candidates.instance_types, None, &mut prepared)
+        .map_err(|error| literal_cache_error(plan.node, error))?;
+    let composite = store
+        .create_composite_signature(true, candidates.signatures)
+        .ok_or_else(invalid)?;
+    let signature = store.clone_signature(first).map_err(|_| invalid())?;
+    assert!(store.set_signature_composite(signature, Some(composite)));
+    assert!(store.set_signature_resolved_return_type(signature, Some(instance_type)));
+    assert!(store.set_structured_type_members(
+        candidates.value_type,
+        None,
+        None,
+        None,
+        Some(vec![signature]),
+        None,
+    ));
+    resolved_declared_class_union_constructor(store, plan, union)?.ok_or_else(invalid)
+}
+
+fn class_union_constructor_candidates(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceDefaultNewPlan,
+    union: &SourceClassUnionConstructorPlan,
+) -> Result<Option<SourceClassUnionConstructorCandidates>, SourceNewError> {
     let invalid = || {
         invariant(SourceNewInvariant::InvalidConstructorCache(
             plan.constructor,
@@ -5148,7 +5271,8 @@ fn resolved_declared_class_union_constructor(
         return Err(invalid());
     }
 
-    let mut selected = None;
+    let mut signatures = Vec::with_capacity(candidates.len());
+    let mut instance_types = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let owner = store
             .type_payload(*candidate)
@@ -5172,6 +5296,7 @@ fn resolved_declared_class_union_constructor(
         if value != *candidate
             || record.flags() != expected_flags
             || !record.parameters().is_empty()
+            || !record.type_parameters().is_empty()
             || record.min_argument_count() != 0
             || record.resolved_min_argument_count() != -1
             || record.this_parameter().is_some()
@@ -5185,15 +5310,17 @@ fn resolved_declared_class_union_constructor(
         {
             return Err(invalid());
         }
-        if selected.is_none() {
-            selected = Some(CheckedSourceDefaultNew {
-                value_type,
-                instance_type,
-                signature,
-            });
-        }
+        signatures.push(signature);
+        instance_types.push(instance_type);
     }
-    selected.map(Some).ok_or_else(invalid)
+    if signatures.is_empty() {
+        return Err(invalid());
+    }
+    Ok(Some(SourceClassUnionConstructorCandidates {
+        value_type,
+        signatures,
+        instance_types,
+    }))
 }
 
 fn resolved_global_object_constructor(
@@ -5961,9 +6088,12 @@ fn preflight_default_new_cache(
             }
         }
         SourceNewTarget::ClassUnion(union) => {
+            let candidates = class_union_constructor_candidates(store, plan, union)?;
             let resolved = resolved_declared_class_union_constructor(store, plan, union)?;
             if constructor_type.is_some_and(|constructor| {
-                resolved.is_none_or(|resolved| constructor != resolved.value_type)
+                candidates
+                    .as_ref()
+                    .is_none_or(|candidates| constructor != candidates.value_type)
             }) || result_type.is_some_and(|result| {
                 resolved.is_none_or(|resolved| result != resolved.instance_type)
             }) || signature.is_some_and(|signature| {
@@ -8917,14 +9047,10 @@ mod tests {
                 Some(result),
                 "{source}",
             );
-            assert!(candidates.union.types.iter().any(|candidate| {
-                store
-                    .type_payload(*candidate)
-                    .and_then(TypeRecord::symbol)
-                    .and_then(|symbol| authenticated_class_constructor_value(store, symbol))
-                    .is_some_and(|(_, actual)| actual == signature)
-            }));
             if abstract_union {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                assert_eq!(signature, bootstrap.unknown_signature, "{source}");
+                assert_eq!(result, bootstrap.error_type, "{source}");
                 let [diagnostic] = context.diagnostics().as_slice() else {
                     panic!("{source} must reject an abstract constructor constituent")
                 };
@@ -8933,6 +9059,35 @@ mod tests {
                 assert_eq!(diagnostic.node, Some(construction), "{source}");
             } else {
                 assert!(context.diagnostics().is_empty(), "{source}");
+                let composite = store.signature(signature).unwrap().composite().unwrap();
+                let constructors = candidates
+                    .union
+                    .types
+                    .iter()
+                    .map(|candidate| {
+                        let symbol = store.type_payload(*candidate).unwrap().symbol().unwrap();
+                        authenticated_class_constructor_value(store, symbol)
+                            .unwrap()
+                            .1
+                    })
+                    .collect::<Vec<_>>();
+                assert!(composite.is_union(), "{source}");
+                assert_eq!(composite.signatures(), constructors, "{source}");
+                let TypeData::Union(instances) = store.type_payload(result).unwrap().data() else {
+                    panic!("{source} must keep every concrete instance type")
+                };
+                assert_eq!(instances.union.types.len(), constructors.len(), "{source}");
+                for constructor in constructors {
+                    assert!(
+                        instances.union.types.contains(
+                            &store
+                                .signature(constructor)
+                                .unwrap()
+                                .resolved_return_type()
+                                .unwrap()
+                        )
+                    );
+                }
             }
             let warm = (
                 store.type_len(),
@@ -9345,6 +9500,92 @@ mod tests {
             assert!(context.store().signature_links(construction).is_none());
             assert!(context.store().symbol_node_links(constructor).is_none());
             assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn constructor_union_results_reject_forged_returns_and_composite_members() {
+        for poison in 0..3 {
+            let parsed = parse_source_file(concat!(
+                "class First {} class Second {} ",
+                "type Factory = typeof First | typeof Second; ",
+                "declare const factory: Factory; const result = new factory();",
+            ));
+            let file = FileId::new(1_895 + poison);
+            let mut context = context(&parsed, file);
+            let (construction, _) = variable_new(&parsed, file, "result");
+            context.check_source_file(file).unwrap();
+            let signature = context
+                .store()
+                .signature_links(construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let members = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .composite()
+                .unwrap()
+                .signatures()
+                .to_vec();
+            match poison {
+                0 => {
+                    let first_instance = context
+                        .store()
+                        .signature(members[0])
+                        .unwrap()
+                        .resolved_return_type()
+                        .unwrap();
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_resolved_return_type(signature, Some(first_instance),)
+                    );
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        construction,
+                        TypeNodeLinks {
+                            resolved_type: Some(first_instance),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                1 | 2 => {
+                    let replacement = if poison == 1 {
+                        vec![members[0], members[0]]
+                    } else {
+                        vec![members[1], members[0]]
+                    };
+                    let composite = context
+                        .store()
+                        .create_composite_signature(true, replacement)
+                        .unwrap();
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_composite(signature, Some(composite))
+                    );
+                }
+                _ => unreachable!("only constructor returns and composite members are forged"),
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().clone(),
+            );
+
+            assert!(context.recheck_source_file(file).is_err(), "case {poison}");
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().clone(),
+                ),
+                before,
+                "case {poison}",
+            );
         }
     }
 

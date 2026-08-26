@@ -31,7 +31,7 @@ use super::{
     signatures::SignatureFlags,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     store::{SourceCallableReturnProvenance, SourceNodeParent},
-    type_records::{ConstrainedTypeData, TypeCacheState, TypeData},
+    type_records::{ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -178,6 +178,10 @@ pub(super) fn validate_stored_callable_set(
         return validation;
     }
 
+    if let Some(validation) = validate_stored_class_constructor_union_callable_set(store, type_) {
+        return validation;
+    }
+
     if let Some(validation) = validate_stored_default_library_method_callable_set(store, type_) {
         return validation;
     }
@@ -258,6 +262,129 @@ fn validate_stored_class_constructor_callable_set(
         edges.push(signature.resolved_return_type()?);
         Some((projection, edges))
     })();
+
+    Some(match authenticated {
+        Some((projection, edges)) => StoredCallableSetValidation::Valid {
+            family,
+            projection,
+            edges,
+        },
+        None => StoredCallableSetValidation::Malformed { family },
+    })
+}
+
+fn validate_stored_class_constructor_union_callable_set(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<StoredCallableSetValidation> {
+    let record = store.type_payload(type_)?;
+    let TypeData::Union(union) = record.data() else {
+        return None;
+    };
+    let structured = &union.union.structured;
+    structured.signatures.as_ref()?;
+    if !union.union.types.iter().all(|candidate| {
+        store.type_payload(*candidate).is_some_and(|record| {
+            matches!(record.data(), TypeData::Object(_))
+                && record
+                    .symbol()
+                    .and_then(|symbol| store.symbol(symbol))
+                    .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::CLASS))
+        })
+    }) {
+        return None;
+    }
+
+    let family = CallableFamily::DeclaredCallSignatures;
+    let authenticated =
+        (|| {
+            store.validate_union_constituent(type_).ok()?;
+            let [signature] = structured.signatures.as_deref()? else {
+                return None;
+            };
+            if !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+                || structured
+                    != &(StructuredTypeData {
+                        signatures: Some(vec![*signature]),
+                        ..StructuredTypeData::default()
+                    })
+            {
+                return None;
+            }
+            let mut signatures = Vec::with_capacity(union.union.types.len());
+            let mut instances = Vec::with_capacity(union.union.types.len());
+            for candidate in &union.union.types {
+                let symbol = store.type_payload(*candidate)?.symbol()?;
+                let (value, signature) = authenticated_class_constructor_value(store, symbol)?;
+                let record = store.signature(signature)?;
+                let instance = record.resolved_return_type()?;
+                let TypeData::Interface(instance_record) = store.type_payload(instance)?.data()
+                else {
+                    return None;
+                };
+                if value != *candidate
+                    || record.flags() != SignatureFlags::CONSTRUCT
+                    || !record.parameters().is_empty()
+                    || !record.type_parameters().is_empty()
+                    || record.min_argument_count() != 0
+                    || record.resolved_min_argument_count() != -1
+                    || record.this_parameter().is_some()
+                    || record.resolved_type_predicate().is_some()
+                    || record.target().is_some()
+                    || record.mapper().is_some()
+                    || record.composite().is_some()
+                    || record.isolated_signature_type().is_some()
+                    || !instance_record.base_types_resolved
+                    || instance_record.resolved_base_types.is_some()
+                {
+                    return None;
+                }
+                signatures.push(signature);
+                instances.push(instance);
+            }
+            let first = store.signature(*signatures.first()?)?;
+            let record = store.signature(*signature)?;
+            let composite = record.composite()?;
+            let return_type = record.resolved_return_type()?;
+            let return_record = store.type_payload(return_type)?;
+            let TypeData::Union(result) = return_record.data() else {
+                return None;
+            };
+            if record.flags() != SignatureFlags::CONSTRUCT
+                || record.declaration() != first.declaration()
+                || !record.parameters().is_empty()
+                || !record.type_parameters().is_empty()
+                || record.min_argument_count() != 0
+                || record.resolved_min_argument_count() != -1
+                || record.this_parameter().is_some()
+                || record.resolved_type_predicate().is_some()
+                || record.target().is_some()
+                || record.mapper().is_some()
+                || record.isolated_signature_type().is_some()
+                || !composite.is_union()
+                || composite.signatures() != signatures
+                || return_record.alias().is_some()
+                || result.origin.is_some()
+                || result.union.types.len() != instances.len()
+                || !instances
+                    .iter()
+                    .all(|instance| result.union.types.contains(instance))
+                || store
+                    .validate_cached_union_result(return_type, None)
+                    .is_err()
+            {
+                return None;
+            }
+            let projection =
+                validate_stored_callable_set_projection_with(store, type_, false, |_| {
+                    Some(Vec::new())
+                })?;
+            let mut edges = union.union.types.clone();
+            edges.push(return_type);
+            Some((projection, edges))
+        })();
 
     Some(match authenticated {
         Some((projection, edges)) => StoredCallableSetValidation::Valid {
