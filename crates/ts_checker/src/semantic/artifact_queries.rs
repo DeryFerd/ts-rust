@@ -285,6 +285,7 @@ impl CanonicalCheckerContext<'_> {
         if matches!(
             &self.validated_artifact_node(node)?.2.data,
             NodeData::ArrowFunction(_)
+                | NodeData::BinaryExpression(_)
                 | NodeData::ObjectLiteralExpression(_)
                 | NodeData::JsxElement(_)
                 | NodeData::JsxOpeningElement(_)
@@ -303,6 +304,10 @@ impl CanonicalCheckerContext<'_> {
         }
 
         if let Some(symbol) = self.literal_computed_artifact_symbol(node)? {
+            return Ok(Some(symbol));
+        }
+
+        if let Some(symbol) = self.expando_artifact_symbol(node)? {
             return Ok(Some(symbol));
         }
 
@@ -943,6 +948,86 @@ impl CanonicalCheckerContext<'_> {
         let Some(symbol) = bound.symbol(declaration) else {
             return Ok(None);
         };
+        self.merged_artifact_symbol(node, symbol).map(Some)
+    }
+
+    fn expando_artifact_symbol(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
+        let (_, _, record) = self.validated_artifact_node(node)?;
+        let access = match record.data {
+            NodeData::PropertyAccessExpression(_) => node,
+            NodeData::Identifier(_) => {
+                let Some(parent) = record.parent else {
+                    return Ok(None);
+                };
+                NodeRef::new(node.arena, node.file, parent)
+            }
+            _ => return Ok(None),
+        };
+        let (arena, bound, access_record) = self.validated_artifact_node(access)?;
+        let NodeData::PropertyAccessExpression(property) = &access_record.data else {
+            return Ok(None);
+        };
+        if node != access && property.name != node.node {
+            return Ok(None);
+        }
+        let Some(parent) = access_record.parent else {
+            return Ok(None);
+        };
+        let expression = NodeRef::new(node.arena, node.file, parent);
+        let (_, _, expression_record) = self.validated_artifact_node(expression)?;
+        let NodeData::BinaryExpression(binary) = &expression_record.data else {
+            return Ok(None);
+        };
+        if binary.left != access.node {
+            return Ok(None);
+        }
+        let Some(symbol) = bound.symbol(expression) else {
+            return Ok(None);
+        };
+        let Some(parent) = expression_record.parent else {
+            return Ok(None);
+        };
+        let statement = NodeRef::new(node.arena, node.file, parent);
+        self.validated_artifact_node(statement)?;
+        let invalid = || CanonicalArtifactQueryError::InvalidSymbol { node, symbol };
+
+        let proven = if let Some(plan) = super::assignment::plan_function_expando_assignment(
+            arena,
+            bound,
+            self.store(),
+            statement,
+        )
+        .map_err(|_| invalid())?
+        {
+            Some((plan.left, plan.property_symbol))
+        } else {
+            super::assignment::plan_arrow_expando_assignment(arena, bound, self.store(), statement)
+                .map_err(|_| invalid())?
+                .map(|plan| (plan.left, plan.property_symbol))
+        };
+        let Some((left, property_symbol)) = proven else {
+            return Ok(None);
+        };
+        if left != access || property_symbol != symbol {
+            return Err(invalid());
+        }
+
+        for location in [access, node] {
+            if let Some(cached) = self
+                .store()
+                .symbol_node_links(location)
+                .and_then(|links| links.resolved_symbol)
+                && self.merged_artifact_symbol(location, cached)? != symbol
+            {
+                return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                    node: location,
+                    symbol: cached,
+                });
+            }
+        }
         self.merged_artifact_symbol(node, symbol).map(Some)
     }
 
@@ -2071,6 +2156,87 @@ mod tests {
                 assert_ne!(resolved, wrong);
                 assert_eq!(context.get_type_from_type_node(annotation), Ok(resolved));
             }
+        }
+    }
+
+    #[test]
+    fn expando_symbol_queries_reject_conflicting_reference_caches_without_writes() {
+        let parsed = parse_source_file("function foo() {} foo.bar = 42;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_030);
+        let (expression, access, name, receiver) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::BinaryExpression(binary) = &record.data else {
+                    return None;
+                };
+                let NodeData::PropertyAccessExpression(access) =
+                    &parsed.arena.get(binary.left)?.data
+                else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, binary.left),
+                    NodeRef::new(parsed.arena.id(), file, access.name),
+                    NodeRef::new(parsed.arena.id(), file, access.expression),
+                ))
+            })
+            .unwrap();
+
+        for poisoned in [access, name, receiver] {
+            let mut context = context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let property = context.file(file).unwrap().1.symbol(expression).unwrap();
+            let saved = context
+                .store()
+                .symbol_node_links(poisoned)
+                .cloned()
+                .unwrap_or_default();
+            let wrong = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .unknown_symbol;
+            assert!(context.store_mut_for_test().set_symbol_node_links(
+                poisoned,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(wrong),
+                },
+            ));
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            );
+            let query = if poisoned == name { name } else { access };
+            assert!(context.get_symbol_at_location(query).is_err());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                ),
+                before,
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(poisoned)
+                    .and_then(|links| links.resolved_symbol),
+                Some(wrong),
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(poisoned, saved),
+            );
+            assert_eq!(context.get_symbol_at_location(query), Ok(Some(property)));
         }
     }
 

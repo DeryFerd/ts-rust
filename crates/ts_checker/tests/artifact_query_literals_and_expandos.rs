@@ -10,6 +10,7 @@ fn context(
     parsed: &ParseResult,
     file: FileId,
     declaration_file: bool,
+    module_state: CanonicalModuleState,
 ) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
@@ -21,7 +22,7 @@ fn context(
                 EscapedName::source("\"/project/locations.ts\""),
                 CanonicalSourceLanguage::TypeScript,
                 declaration_file,
-                CanonicalModuleState::Script,
+                module_state,
             ),
         )
         .unwrap();
@@ -45,7 +46,7 @@ fn literal_annotation_tokens_use_their_production_type_without_checking_declarat
     ));
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(4_100);
-    let mut context = context(&parsed, file, true);
+    let mut context = context(&parsed, file, true, CanonicalModuleState::Script);
     let literals = parsed
         .arena
         .iter()
@@ -97,4 +98,70 @@ fn literal_annotation_tokens_use_their_production_type_without_checking_declarat
             .source_file_links(context.source_file(file).unwrap())
             .is_none_or(|links| !links.type_checked),
     );
+}
+
+#[test]
+fn expando_assignment_accesses_reuse_properties_without_exposing_expression_symbols() {
+    for source in [
+        "const foo = () => {}; foo.bar = 42; export {};",
+        "const foo = function() {}; foo.bar = 42; export {};",
+        "function foo() {} foo.bar = 42; const copy = foo.bar; export {};",
+    ] {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4_101);
+        let mut context = context(&parsed, file, false, CanonicalModuleState::External);
+        let (expression, access, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                let NodeData::BinaryExpression(binary) = &record.data else {
+                    return None;
+                };
+                let NodeData::PropertyAccessExpression(access) =
+                    &parsed.arena.get(binary.left)?.data
+                else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, id),
+                    NodeRef::new(parsed.arena.id(), file, binary.left),
+                    NodeRef::new(parsed.arena.id(), file, access.name),
+                ))
+            })
+            .unwrap();
+        let property = context.file(file).unwrap().1.symbol(expression).unwrap();
+
+        assert_eq!(context.get_symbol_at_location(expression).unwrap(), None);
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.diagnostics().len(),
+        );
+        for _ in 0..2 {
+            assert_eq!(context.get_symbol_at_location(access), Ok(Some(property)));
+            assert_eq!(context.get_symbol_at_location(name), Ok(Some(property)));
+            assert_eq!(context.get_symbol_at_location(expression), Ok(None));
+            assert_eq!(
+                context.get_symbol_declarations(property),
+                Ok(&[expression][..])
+            );
+        }
+        assert_eq!(
+            context.file(file).unwrap().1.symbol(expression),
+            Some(property)
+        );
+        assert!(context.store().symbol_node_links(access).is_none());
+        assert!(context.store().symbol_node_links(name).is_none());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.diagnostics().len(),
+            ),
+            warm,
+        );
+    }
 }
