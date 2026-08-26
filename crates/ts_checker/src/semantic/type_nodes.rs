@@ -11205,6 +11205,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         }
 
+        if arity == PlannedTypeReferenceArity::Valid && flags.contains(SymbolFlags::TYPE_ALIAS) {
+            self.preflight_cached_union_alias_instantiation(
+                symbol,
+                effective_alias_owner,
+                &type_arguments,
+            )?;
+        }
         let planned = PlannedTypeReference {
             symbol,
             import_alias: exact_import.map(|capability| capability.alias),
@@ -11222,6 +11229,90 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if cached_pending_function && let Some(cached) = cached_type {
             self.validate_cached_array_capability(cached)
                 .map_err(type_construction_error)?;
+        }
+        Ok(())
+    }
+
+    fn preflight_cached_union_alias_instantiation(
+        &self,
+        symbol: SemanticSymbolId,
+        owner: Option<SemanticSymbolId>,
+        argument_nodes: &[NodeRef],
+    ) -> Result<(), DeclaredTypeError> {
+        let Some(links) = self.store.type_alias_links(symbol) else {
+            return Ok(());
+        };
+        let (Some(declared), Some(parameters), Some(instantiations)) = (
+            links.declared_type,
+            links.type_parameters.as_deref(),
+            links.instantiations.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        let Some(TypeData::Union(union)) = self.store.type_payload(declared).map(TypeRecord::data)
+        else {
+            return Ok(());
+        };
+        if parameters.len() != argument_nodes.len()
+            || union.union.types.iter().any(|type_| {
+                self.store
+                    .type_payload(*type_)
+                    .and_then(TypeRecord::symbol)
+                    .is_some_and(|symbol| {
+                        self.store
+                            .authenticated_type_literal_method_owner(symbol)
+                            .is_some()
+                    })
+            })
+        {
+            return Ok(());
+        }
+        let Ok(arguments) = argument_nodes
+            .iter()
+            .map(|node| self.cached_type_node_identity(symbol, *node))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return Ok(());
+        };
+        let identity = if let Some(owner) = owner {
+            let Some(global) = self.store.symbol_store().assigned_global_symbol_id(owner) else {
+                return Ok(());
+            };
+            let Some(owner_links) = self.store.type_alias_links(owner) else {
+                return Ok(());
+            };
+            Some((
+                owner,
+                global,
+                owner_links.type_parameters.as_deref().unwrap_or_default(),
+            ))
+        } else {
+            None
+        };
+        let key = type_alias_instantiation_cache_key(
+            &arguments,
+            identity.map(|(_, global, arguments)| (global, arguments)),
+        );
+        let Some(cached) = instantiations.get(&key).copied() else {
+            return Ok(());
+        };
+        let expected = super::instantiate::cached_instantiation_with_vector(
+            self.store,
+            declared,
+            parameters,
+            &arguments,
+            self.array_targets,
+            identity.map(|(owner, _, arguments)| (owner, arguments)),
+        )
+        .map_err(|_| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                symbol,
+            ))
+        })?;
+        if expected != Some(cached) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+            ));
         }
         Ok(())
     }
@@ -25427,6 +25518,40 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         if matches!(
             self.store.type_payload(declared_type).map(TypeRecord::data),
+            Some(TypeData::Union(_))
+        ) && let Some(cached) = links
+            .instantiations
+            .as_ref()
+            .and_then(|instantiations| instantiations.get(&key))
+            .copied()
+        {
+            let expected = super::instantiate::cached_instantiation_with_vector(
+                self.store,
+                declared_type,
+                &type_parameters,
+                &type_arguments,
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+                alias_identity
+                    .as_ref()
+                    .map(|(owner, arguments)| (*owner, arguments.as_slice())),
+            )
+            .map_err(|_| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                    symbol,
+                ))
+            })?;
+            return if expected == Some(cached) {
+                Ok(cached)
+            } else {
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+                ))
+            };
+        }
+        if matches!(
+            self.store.type_payload(declared_type).map(TypeRecord::data),
             Some(TypeData::Mapped(_))
         ) {
             let utility = plan
@@ -26853,7 +26978,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(alias),
             ));
         };
-        let TypeData::Union(union) = record.data() else {
+        let TypeData::Union(_) = record.data() else {
             return Ok(false);
         };
         if record
@@ -26878,17 +27003,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.store
             .validate_union_alias_identity(type_, alias, parameters)
             .map_err(Self::literal_cache_error)?;
-        Ok(union.union.types.iter().any(|constituent| {
-            parameters.contains(constituent)
-                || validate_direct_generic_reference(self.store, *constituent).is_ok_and(
-                    |reference| {
-                        reference
-                            .type_arguments
-                            .iter()
-                            .any(|argument| parameters.contains(argument))
-                    },
-                )
-        }))
+        Ok(!parameters.is_empty())
     }
 
     fn instantiate_dependent_alias_union(
@@ -29835,6 +29950,335 @@ mod tests {
             Ok(declared)
         );
         assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn union_alias_arguments_are_mapped_when_members_are_concrete() {
+        let mut fixture = fixture(concat!(
+            "type Choice<Left, Right> = Left | Right; ",
+            "type Fixed<Value> = Choice<string, number>; ",
+            "let text: Fixed<string>; let numeric: Fixed<number>;",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Fixed");
+        let text = variable_type_node(&fixture, "text");
+        let numeric = variable_type_node(&fixture, "numeric");
+        let (string, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let declared = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let text_type = query_node(&mut fixture, text, &mut diagnostics).unwrap();
+        let numeric_type = query_node(&mut fixture, numeric, &mut diagnostics).unwrap();
+        assert_ne!(declared, text_type);
+        assert_ne!(text_type, numeric_type);
+        assert_eq!(
+            union_types(&fixture.store, text_type),
+            union_types(&fixture.store, numeric_type)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_alias_identity(text_type, alias, &[string]),
+            Ok(())
+        );
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_alias_identity(numeric_type, alias, &[number]),
+            Ok(())
+        );
+        let before = union_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, text, &mut diagnostics),
+            Ok(text_type)
+        );
+        assert_eq!(
+            query_node(&mut fixture, numeric, &mut diagnostics),
+            Ok(numeric_type)
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn union_member_replay_normalizes_boolean_arguments_and_checks_origins() {
+        let mut fixture = fixture_with_intrinsic(
+            concat!(
+                "type Named = string | number; ",
+                "type Maybe<Value> = Value | null; ",
+                "type Outer<Value> = Value | Named; ",
+                "let maybe: Maybe<boolean>; let outer: Outer<boolean>;",
+            ),
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+        let boolean = fixture.store.intrinsic_bootstrap().unwrap().boolean_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for (name, variable) in [("Maybe", "maybe"), ("Outer", "outer")] {
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+            let node = variable_type_node(&fixture, variable);
+            let declared = query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let parameter = fixture
+                .store
+                .type_alias_links(alias)
+                .unwrap()
+                .type_parameters
+                .as_ref()
+                .unwrap()[0];
+            let concrete = query_node(&mut fixture, node, &mut diagnostics).unwrap();
+            let mapper = fixture
+                .store
+                .new_simple_type_mapper(parameter, boolean)
+                .unwrap();
+            let before = union_state(&fixture.store);
+            assert_eq!(
+                crate::semantic::instantiate::instantiated_member_type_matches(
+                    &fixture.store,
+                    declared,
+                    concrete,
+                    mapper,
+                    None
+                ),
+                Ok(true)
+            );
+            assert_eq!(
+                query_node(&mut fixture, node, &mut diagnostics),
+                Ok(concrete)
+            );
+            assert_eq!(union_state(&fixture.store), before);
+            if name == "Outer" {
+                assert!(union_origin(&fixture.store, concrete).is_some());
+                let flattened = union_types(&fixture.store, concrete).to_vec();
+                let without_origin = fixture
+                    .store
+                    .literal_union_type_with_alias_and_array_targets(
+                        &flattened,
+                        Some((alias, &[boolean])),
+                        None,
+                    )
+                    .unwrap();
+                assert!(union_origin(&fixture.store, without_origin).is_none());
+                assert_ne!(without_origin, concrete);
+                let before = union_state(&fixture.store);
+                assert_eq!(
+                    crate::semantic::instantiate::instantiated_member_type_matches(
+                        &fixture.store,
+                        declared,
+                        without_origin,
+                        mapper,
+                        None
+                    ),
+                    Ok(false)
+                );
+                assert_eq!(union_state(&fixture.store), before);
+            }
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn nested_union_aliases_replay_inside_generic_reference_arguments() {
+        let mut fixture = fixture_with_intrinsic(
+            concat!(
+                "interface Box<Item> { value: Item } ",
+                "type Inner<Value> = Value | null; ",
+                "type Outer<Value> = Box<Inner<Value>> | null; ",
+                "let value: Outer<string>;",
+            ),
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Outer");
+        let node = variable_type_node(&fixture, "value");
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let declared = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let parameter = fixture
+            .store
+            .type_alias_links(alias)
+            .unwrap()
+            .type_parameters
+            .as_ref()
+            .unwrap()[0];
+        let concrete = query_node(&mut fixture, node, &mut diagnostics).unwrap();
+        let mapper = fixture
+            .store
+            .new_simple_type_mapper(parameter, string)
+            .unwrap();
+        let before = union_state(&fixture.store);
+        assert_eq!(
+            crate::semantic::instantiate::instantiated_member_type_matches(
+                &fixture.store,
+                declared,
+                concrete,
+                mapper,
+                None
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            query_node(&mut fixture, node, &mut diagnostics),
+            Ok(concrete)
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn wrong_union_alias_instantiation_keys_fail_before_allocating_expected_results() {
+        let mut fixture = fixture(concat!(
+            "type Choice<Left, Right> = Left | Right; ",
+            "let first: Choice<string, number>; let later: Choice<boolean, number>;",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Choice");
+        let first = variable_type_node(&fixture, "first");
+        let later = variable_type_node(&fixture, "later");
+        let (boolean, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.boolean_type, bootstrap.number_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let first_type = query_node(&mut fixture, first, &mut diagnostics).unwrap();
+        let original = fixture.store.type_alias_links(alias).unwrap().clone();
+        let mut forged = original.clone();
+        forged
+            .instantiations
+            .as_mut()
+            .unwrap()
+            .insert(type_list_key(&[boolean, number]), first_type);
+        assert!(fixture.store.set_type_alias_links(alias, forged.clone()));
+        let before = union_state(&fixture.store);
+        assert!(query_node(&mut fixture, later, &mut diagnostics).is_err());
+        assert_eq!(union_state(&fixture.store), before);
+        assert_eq!(fixture.store.type_alias_links(alias), Some(&forged));
+        assert!(fixture.store.set_type_alias_links(alias, original));
+        let later_type = query_node(&mut fixture, later, &mut diagnostics).unwrap();
+        assert_ne!(first_type, later_type);
+        let before = union_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, later, &mut diagnostics),
+            Ok(later_type)
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn concrete_union_alias_fast_paths_reject_changed_arguments_without_writes() {
+        let mut fixture = fixture_with_intrinsic(
+            "type Maybe<Value> = Value | null; let value: Maybe<number>;",
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Maybe");
+        let node = variable_type_node(&fixture, "value");
+        let (string, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let concrete = query_node(&mut fixture, node, &mut diagnostics).unwrap();
+        let parameter = fixture
+            .store
+            .type_alias_links(alias)
+            .unwrap()
+            .type_parameters
+            .as_ref()
+            .unwrap()[0];
+        let mapper = fixture
+            .store
+            .new_simple_type_mapper(parameter, number)
+            .unwrap();
+        let identity = fixture
+            .store
+            .type_payload(concrete)
+            .unwrap()
+            .alias()
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_type_alias_arguments(identity, Some(vec![string]))
+        );
+        let before = union_state(&fixture.store);
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 0,
+            max_count: 0,
+        });
+        assert!(
+            crate::semantic::instantiate::instantiate_type_with_session(
+                &mut fixture.store,
+                concrete,
+                mapper,
+                None,
+                &mut session
+            )
+            .is_err()
+        );
+        assert!(
+            crate::semantic::instantiate::validate_instantiable_member_type(
+                &fixture.store,
+                concrete,
+                &[parameter],
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            crate::semantic::instantiate::instantiated_member_type_matches(
+                &fixture.store,
+                concrete,
+                concrete,
+                mapper,
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 0);
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(
+            fixture
+                .store
+                .set_type_alias_arguments(identity, Some(vec![number]))
+        );
+        assert_eq!(
+            crate::semantic::instantiate::instantiate_type_with_session(
+                &mut fixture.store,
+                concrete,
+                mapper,
+                None,
+                &mut session
+            ),
+            Ok(concrete)
+        );
+        assert_eq!(session.query_count(), 0);
         assert!(diagnostics.is_empty());
     }
 

@@ -494,6 +494,12 @@ fn instantiate_type_with_alias(
     alias: Option<TypeAliasId>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
+    if matches!(
+        store.type_payload(type_).map(TypeRecord::data),
+        Some(TypeData::Union(_))
+    ) {
+        instantiable_union_source_types(store, type_, array_targets)?;
+    }
     if !could_contain_installed_type_variables(store, type_, array_targets)? {
         return Ok(type_);
     }
@@ -993,25 +999,12 @@ fn validate_instantiable_member_type_worker(
             )
         }
         TypeData::Union(data) => {
+            instantiable_union_source_types(store, type_, array_targets)?;
             let contains_variables =
                 could_contain_installed_type_variables(store, type_, array_targets)?;
             if (record.alias().is_some() || data.origin.is_some()) && !contains_variables {
                 Ok(())
             } else {
-                if record.alias().is_some() || data.origin.is_some() {
-                    let validation = match array_targets {
-                        Some(targets) => store
-                            .validate_cached_union_result_with_array_targets(targets, type_, None),
-                        None => store.validate_cached_union_result(type_, None),
-                    };
-                    validation.map_err(|_| {
-                        if record.alias().is_some() {
-                            InstantiationError::UnsupportedAliasedUnion(type_)
-                        } else {
-                            InstantiationError::UnsupportedUnionOrigin(type_)
-                        }
-                    })?;
-                }
                 if data.union.types.len() < 2
                     || data
                         .union
@@ -1145,14 +1138,9 @@ fn instantiated_member_type_matches_worker(
             cached_instantiated_member_type(store, template, mapper, &mut HashSet::new())
                 .map(|expected| expected == Some(actual))
         }
-        TypeData::Union(union) => instantiated_member_union_matches(
-            store,
-            template,
-            &union.union.types,
-            actual,
-            mapper,
-            array_targets,
-        ),
+        TypeData::Union(_) => {
+            instantiated_member_union_matches(store, template, actual, mapper, array_targets)
+        }
         TypeData::TypeReference(_) | TypeData::Interface(_) => {
             if let Some(targets) = array_targets
                 && let Some(source) =
@@ -1216,33 +1204,109 @@ fn cached_instantiated_member_type(
     mapper: TypeMapperId,
     active: &mut HashSet<TypeId>,
 ) -> Result<Option<TypeId>, InstantiationError> {
+    cached_instantiated_type_worker(
+        store,
+        template,
+        InstantiationMapping::Stored(mapper),
+        None,
+        None,
+        active,
+    )
+}
+
+/// Checks an alias instantiation cache before the mutable path can publish a result.
+pub(super) fn cached_instantiation_with_vector(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    if sources.len() != targets.len() {
+        return Err(InstantiationError::InvalidType(template));
+    }
+    for type_ in sources.iter().chain(targets) {
+        if store.type_payload(*type_).is_none() {
+            return Err(InstantiationError::InvalidType(*type_));
+        }
+    }
+    cached_instantiated_type_worker(
+        store,
+        template,
+        InstantiationMapping::Vector { sources, targets },
+        array_targets,
+        alias_override,
+        &mut HashSet::new(),
+    )
+}
+
+fn cached_instantiated_type_worker(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+    active: &mut HashSet<TypeId>,
+) -> Result<Option<TypeId>, InstantiationError> {
     if !active.insert(template) {
         return Err(InstantiationError::UnsupportedType(template));
     }
     let record = store
         .type_payload(template)
         .ok_or(InstantiationError::InvalidType(template))?;
-    let result = match record.data() {
+    let result = (|| match record.data() {
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
             Ok(Some(template))
         }
-        TypeData::TypeParameter(_) => store
-            .map_type(mapper, template)
-            .map(Some)
-            .ok_or(InstantiationError::InvalidMapper(mapper)),
-        TypeData::TemplateLiteral(data) => cached_instantiated_template_member_type(
-            store,
-            template,
-            &data.texts,
-            &data.types,
-            mapper,
-            active,
-        ),
+        TypeData::TypeParameter(_) => match mapping {
+            InstantiationMapping::Stored(mapper) => store
+                .map_type(mapper, template)
+                .map(Some)
+                .ok_or(InstantiationError::InvalidMapper(mapper)),
+            InstantiationMapping::Vector { sources, targets } => Ok(Some(
+                sources
+                    .iter()
+                    .position(|source| *source == template)
+                    .map_or(template, |index| targets[index]),
+            )),
+        },
+        TypeData::TemplateLiteral(data) => {
+            let mut types = Vec::with_capacity(data.types.len());
+            for type_ in &data.types {
+                let Some(mapped) = cached_instantiated_type_worker(
+                    store,
+                    *type_,
+                    mapping,
+                    array_targets,
+                    None,
+                    active,
+                )?
+                else {
+                    return Ok(None);
+                };
+                types.push(mapped);
+            }
+            if types == data.types {
+                Ok(Some(template))
+            } else {
+                store
+                    .cached_resolved_template_literal_type(&data.texts, &types)
+                    .map_err(Into::into)
+            }
+        }
         TypeData::StringMapping(data) => {
             let symbol = record
                 .symbol()
                 .ok_or(InstantiationError::UnsupportedType(template))?;
-            let target = cached_instantiated_member_type(store, data.target, mapper, active)?;
+            let target = cached_instantiated_type_worker(
+                store,
+                data.target,
+                mapping,
+                array_targets,
+                None,
+                active,
+            )?;
             match target {
                 Some(target) if target == data.target => Ok(Some(template)),
                 Some(target) => store
@@ -1251,289 +1315,166 @@ fn cached_instantiated_member_type(
                 None => Ok(None),
             }
         }
-        TypeData::Union(union) => {
-            let mut types = Vec::with_capacity(union.union.types.len());
-            let mut changed = false;
-            for constituent in &union.union.types {
-                let Some(instantiated) =
-                    cached_instantiated_member_type(store, *constituent, mapper, active)?
+        TypeData::Union(_) => {
+            let constituents = instantiable_union_source_types(store, template, array_targets)?;
+            if !could_contain_installed_type_variables(store, template, array_targets)? {
+                return Ok(Some(template));
+            }
+            let mut types = Vec::with_capacity(constituents.len());
+            for constituent in constituents {
+                let Some(instantiated) = cached_instantiated_type_worker(
+                    store,
+                    *constituent,
+                    mapping,
+                    array_targets,
+                    None,
+                    active,
+                )?
                 else {
-                    active.remove(&template);
                     return Ok(None);
                 };
-                changed |= instantiated != *constituent;
                 types.push(instantiated);
             }
-            if changed {
+            let source_alias = record
+                .alias()
+                .and_then(|identity| store.type_alias(identity));
+            let mut arguments = Vec::new();
+            let alias = if let Some(alias) = alias_override {
+                Some(alias)
+            } else if let Some(alias) = source_alias {
+                for argument in alias.type_arguments().unwrap_or_default() {
+                    let Some(mapped) = cached_instantiated_type_worker(
+                        store,
+                        *argument,
+                        mapping,
+                        array_targets,
+                        None,
+                        active,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    arguments.push(mapped);
+                }
+                Some((
+                    alias
+                        .symbol()
+                        .ok_or(InstantiationError::UnsupportedAliasedUnion(template))?,
+                    arguments.as_slice(),
+                ))
+            } else {
+                None
+            };
+            let original_alias = source_alias.and_then(|alias| {
+                alias
+                    .symbol()
+                    .map(|symbol| (symbol, alias.type_arguments().unwrap_or_default()))
+            });
+            if types == constituents && alias == original_alias {
+                return Ok(Some(template));
+            }
+            if alias.is_none()
+                && types.iter().any(|type_| {
+                    matches!(
+                        store.type_payload(*type_).map(TypeRecord::data),
+                        Some(TypeData::TemplateLiteral(_) | TypeData::StringMapping(_))
+                    )
+                })
+            {
                 store
                     .cached_template_result_union(&types)
                     .map_err(Into::into)
             } else {
-                Ok(Some(template))
+                store
+                    .cached_literal_union_type_with_alias(&types, alias, array_targets)
+                    .map_err(Into::into)
             }
         }
+        TypeData::Interface(data)
+            if data
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .is_none_or(Vec::is_empty) =>
+        {
+            Ok(Some(template))
+        }
+        TypeData::Object(_)
+            if store
+                .intrinsic_bootstrap()
+                .is_some_and(|bootstrap| bootstrap.empty_type_literal_type == template) =>
+        {
+            if matches!(
+                validate_resolved_declared_property_object(store, template),
+                DeclaredPropertyObjectValidation::Valid(_)
+            ) {
+                Ok(Some(template))
+            } else {
+                Err(InstantiationError::UnsupportedType(template))
+            }
+        }
+        TypeData::TypeReference(_) | TypeData::Interface(_) => {
+            if let Some(targets) = array_targets {
+                store.canonical_array_reference_with_targets(targets, template)?;
+            }
+            let reference = validate_direct_generic_reference(store, template)?;
+            let mut arguments = Vec::with_capacity(reference.type_arguments.len());
+            for argument in &reference.type_arguments {
+                let Some(mapped) = cached_instantiated_type_worker(
+                    store,
+                    *argument,
+                    mapping,
+                    array_targets,
+                    None,
+                    active,
+                )?
+                else {
+                    return Ok(None);
+                };
+                arguments.push(mapped);
+            }
+            if arguments == reference.type_arguments {
+                return Ok(Some(template));
+            }
+            let Some(cached) =
+                store.relation_object_instantiation(reference.target, type_list_key(&arguments))
+            else {
+                return Ok(None);
+            };
+            let actual = validate_direct_generic_reference(store, cached)?;
+            if actual.target != reference.target || actual.type_arguments != arguments {
+                return Err(InstantiationError::InvalidType(cached));
+            }
+            Ok(Some(cached))
+        }
         _ => Err(InstantiationError::UnsupportedType(template)),
-    };
+    })();
     active.remove(&template);
     result
-}
-
-fn cached_instantiated_template_member_type(
-    store: &CanonicalTypeMapperStore,
-    template: TypeId,
-    texts: &[String],
-    types: &[TypeId],
-    mapper: TypeMapperId,
-    active: &mut HashSet<TypeId>,
-) -> Result<Option<TypeId>, InstantiationError> {
-    let mut placeholders = Vec::with_capacity(types.len());
-    let mut changed = false;
-    for placeholder in types {
-        let Some(instantiated) =
-            cached_instantiated_member_type(store, *placeholder, mapper, active)?
-        else {
-            return Ok(None);
-        };
-        changed |= instantiated != *placeholder;
-        placeholders.push(instantiated);
-    }
-    if changed {
-        store
-            .cached_resolved_template_literal_type(texts, &placeholders)
-            .map_err(Into::into)
-    } else {
-        Ok(Some(template))
-    }
 }
 
 fn instantiated_member_union_matches(
     store: &CanonicalTypeMapperStore,
     template: TypeId,
-    constituents: &[TypeId],
     actual: TypeId,
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<bool, InstantiationError> {
-    let source_alias = store
-        .type_payload(template)
-        .and_then(TypeRecord::alias)
-        .and_then(|identity| store.type_alias(identity));
-    if source_alias.is_some()
-        && could_contain_installed_type_variables(store, template, array_targets)?
-    {
-        instantiable_union_source_types(store, template, array_targets)?;
+    if matches!(
+        store.type_payload(actual).map(TypeRecord::data),
+        Some(TypeData::Union(_))
+    ) {
+        instantiable_union_source_types(store, actual, array_targets)?;
     }
-    let mut substituted_types = Vec::with_capacity(constituents.len());
-    let mut includes_template = false;
-    for constituent in constituents {
-        let record = store
-            .type_payload(*constituent)
-            .ok_or(InstantiationError::InvalidType(*constituent))?;
-        let substituted = match record.data() {
-            TypeData::TypeParameter(_) => store
-                .map_type(mapper, *constituent)
-                .ok_or(InstantiationError::InvalidMapper(mapper))?,
-            TypeData::TemplateLiteral(_) | TypeData::StringMapping(_) => {
-                includes_template = true;
-                let Some(substituted) = cached_instantiated_member_type(
-                    store,
-                    *constituent,
-                    mapper,
-                    &mut HashSet::new(),
-                )?
-                else {
-                    return Ok(false);
-                };
-                substituted
-            }
-            TypeData::TypeReference(_) => {
-                let Some(reference) = authenticated_instantiable_interface_reference(
-                    store,
-                    *constituent,
-                    array_targets,
-                ) else {
-                    return Err(InstantiationError::UnsupportedUnionConstituent(
-                        *constituent,
-                    ));
-                };
-                let mut arguments = Vec::with_capacity(reference.type_arguments.len());
-                for argument in &reference.type_arguments {
-                    let Some(instantiated) = cached_instantiated_member_type(
-                        store,
-                        *argument,
-                        mapper,
-                        &mut HashSet::new(),
-                    )?
-                    else {
-                        return Ok(false);
-                    };
-                    arguments.push(instantiated);
-                }
-                if arguments == reference.type_arguments {
-                    *constituent
-                } else {
-                    let Some(cached) = store
-                        .relation_object_instantiation(reference.target, type_list_key(&arguments))
-                    else {
-                        return Ok(false);
-                    };
-                    let Ok(actual) = validate_direct_generic_reference(store, cached) else {
-                        return Ok(false);
-                    };
-                    if actual.target != reference.target || actual.type_arguments != arguments {
-                        return Ok(false);
-                    }
-                    cached
-                }
-            }
-            _ => *constituent,
-        };
-        substituted_types.push(substituted);
-    }
-    if substituted_types.as_slice() == constituents && source_alias.is_none() {
-        return Ok(actual == template);
-    }
-
-    if includes_template && source_alias.is_none() {
-        return store
-            .cached_template_result_union(&substituted_types)
-            .map(|expected| expected == Some(actual))
-            .map_err(Into::into);
-    }
-
-    let actual_record = store
-        .type_payload(actual)
-        .ok_or(InstantiationError::InvalidType(actual))?;
-    let actual_types = match actual_record.data() {
-        TypeData::Union(union) => {
-            let actual_alias = actual_record
-                .alias()
-                .and_then(|identity| store.type_alias(identity));
-            match (source_alias, actual_alias) {
-                (None, None) => {}
-                (Some(source), Some(actual_identity))
-                    if source.symbol() == actual_identity.symbol() =>
-                {
-                    let source_arguments = source.type_arguments().unwrap_or_default();
-                    let actual_arguments = actual_identity.type_arguments().unwrap_or_default();
-                    if source_arguments.len() != actual_arguments.len() {
-                        return Ok(false);
-                    }
-                    for (source, actual) in source_arguments.iter().zip(actual_arguments) {
-                        if !instantiated_member_type_matches_worker(
-                            store,
-                            *source,
-                            *actual,
-                            mapper,
-                            array_targets,
-                            &mut HashSet::new(),
-                        )? {
-                            return Ok(false);
-                        }
-                    }
-                    if substituted_types.as_slice() == constituents
-                        && source_arguments == actual_arguments
-                    {
-                        return Ok(actual == template);
-                    }
-                }
-                _ => return Ok(false),
-            }
-            let validation = match array_targets {
-                Some(targets) => {
-                    store.validate_cached_union_result_with_array_targets(targets, actual, None)
-                }
-                None => store.validate_cached_union_result(actual, None),
-            };
-            if validation.is_err()
-                && !union
-                    .union
-                    .types
-                    .iter()
-                    .copied()
-                    .any(|type_| is_exact_optional_missing_type(store, type_))
-            {
-                return Ok(false);
-            }
-            if source_alias.is_none()
-                && (union.origin.is_some()
-                    || store
-                        .intrinsic_bootstrap()
-                        .and_then(|bootstrap| bootstrap.cached_union_type(&union.union.types))
-                        != Some(actual))
-            {
-                return Ok(false);
-            }
-            union.union.types.as_slice()
-        }
-        _ => std::slice::from_ref(&actual),
-    };
-
-    if actual_record.flags().intersects(TypeFlags::ANY_OR_UNKNOWN) {
-        let Some(bootstrap) = store.intrinsic_bootstrap() else {
-            return Ok(false);
-        };
-        let has_any = substituted_types.iter().any(|type_| {
-            store
-                .type_payload(*type_)
-                .is_some_and(|record| record.flags().intersects(TypeFlags::ANY))
-        });
-        let expected = if has_any {
-            if substituted_types.contains(&bootstrap.wildcard_type) {
-                bootstrap.wildcard_type
-            } else if substituted_types.contains(&bootstrap.error_type) {
-                bootstrap.error_type
-            } else {
-                bootstrap.any_type
-            }
-        } else {
-            bootstrap.unknown_type
-        };
-        return Ok(substituted_types.contains(&actual) && actual == expected);
-    }
-
-    if actual_types
-        .iter()
-        .any(|candidate| !substituted_types.contains(candidate))
-    {
-        return Ok(false);
-    }
-    Ok(substituted_types.iter().all(|type_| {
-        actual_types.contains(type_)
-            || mapped_member_union_type_is_redundant(store, *type_, actual_types)
-    }))
-}
-
-fn mapped_member_union_type_is_redundant(
-    store: &CanonicalTypeMapperStore,
-    mapped: TypeId,
-    actual_types: &[TypeId],
-) -> bool {
-    let Some(record) = store.type_payload(mapped) else {
-        return false;
-    };
-    if record.flags().intersects(TypeFlags::NEVER) {
-        return true;
-    }
-    if store.intrinsic_bootstrap().is_some_and(|bootstrap| {
-        !bootstrap.options.strict_null_checks && record.flags().intersects(TypeFlags::NULLABLE)
-    }) {
-        return !actual_types.is_empty();
-    }
-    let TypeData::Literal(literal) = record.data() else {
-        return false;
-    };
-    actual_types.iter().any(|actual| {
-        *actual == literal.regular_type
-            || store.type_payload(*actual).is_some_and(|actual| {
-                record.flags().intersects(TypeFlags::STRING_LITERAL)
-                    && actual.flags().intersects(TypeFlags::STRING)
-                    || record.flags().intersects(TypeFlags::NUMBER_LITERAL)
-                        && actual.flags().intersects(TypeFlags::NUMBER)
-                    || record.flags().intersects(TypeFlags::BIG_INT_LITERAL)
-                        && actual.flags().intersects(TypeFlags::BIG_INT)
-            })
-    })
+    cached_instantiated_type_worker(
+        store,
+        template,
+        InstantiationMapping::Stored(mapper),
+        array_targets,
+        None,
+        &mut HashSet::new(),
+    )
+    .map(|expected| expected == Some(actual))
 }
 
 enum InstantiationWork {
@@ -2070,7 +2011,10 @@ fn instantiable_union_source_types(
     let TypeData::Union(union) = record.data() else {
         return Err(InstantiationError::UnsupportedType(source));
     };
-    if record.alias().is_some() || union.origin.is_some() {
+    if record.alias().is_some()
+        || union.origin.is_some()
+        || store.canonical_union_alias_creation(source).is_some()
+    {
         let validation = match array_targets {
             Some(targets) => {
                 store.validate_cached_union_result_with_array_targets(targets, source, None)
@@ -2178,7 +2122,9 @@ fn instantiate_union(
             .template_result_union(&mapped_types)
             .map_err(Into::into)
     } else {
-        canonical_anonymous_union(store, &mapped_types).map_err(Into::into)
+        store
+            .literal_union_type_with_alias_and_array_targets(&mapped_types, None, array_targets)
+            .map_err(Into::into)
     }
 }
 
@@ -2888,11 +2834,13 @@ mod tests {
                 EscapedName::source("Named"),
             ))
             .unwrap();
-        let alias = store.alloc_type_alias(Some(symbol)).unwrap();
         let union = store
-            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, vec![string, number])
+            .literal_union_type_with_alias_and_array_targets(
+                &[string, number],
+                Some((symbol, &[])),
+                None,
+            )
             .unwrap();
-        assert!(store.set_type_alias(union, Some(alias)));
         let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
         let mut session = InstantiationSession::new(InstantiationLimits {
             max_depth: 0,
