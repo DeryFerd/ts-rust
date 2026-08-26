@@ -5236,11 +5236,14 @@ fn missing_argument_related_information(
     call: NodeRef,
     signature: SignatureId,
     actual: usize,
-) -> Result<CanonicalCheckerRelatedInformation, SourceCheckError> {
-    let parameter = *store
+) -> Result<Option<CanonicalCheckerRelatedInformation>, SourceCheckError> {
+    let Some(parameter) = store
         .signature(signature)
         .and_then(|signature| signature.parameters().get(actual))
-        .ok_or(SourceCheckError::Call(call))?;
+        .copied()
+    else {
+        return Ok(None);
+    };
     let symbol = store
         .symbol(parameter)
         .ok_or(SourceCheckError::Call(call))?;
@@ -5248,21 +5251,45 @@ fn missing_argument_related_information(
         .declarations()
         .and_then(|declarations| declarations.first())
         .ok_or(SourceCheckError::Call(call))?;
-    if host.node(declaration).is_none() {
+    let Some(NodeData::ParameterDeclaration(parameter)) =
+        host.node(declaration).map(|node| &node.data)
+    else {
         return Err(SourceCheckError::Call(call));
-    }
+    };
     let name = symbol
         .name()
         .as_utf8()
         .ok_or(SourceCheckError::Call(call))?
         .to_owned();
-    Ok(CanonicalCheckerRelatedInformation {
-        node: Some(declaration),
-        diagnostic: Diagnostic::with_arguments(
-            message_by_code(6210).ok_or(SourceCheckError::MissingDiagnostic(6210))?,
+    let binding = host
+        .node(NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            parameter.name,
+        ))
+        .is_some_and(|name| {
+            matches!(
+                name.kind,
+                SyntaxKind::ArrayBindingPattern | SyntaxKind::ObjectBindingPattern
+            )
+        });
+    let diagnostic = if binding {
+        Diagnostic::new(message_by_code(6211).ok_or(SourceCheckError::MissingDiagnostic(6211))?)
+    } else {
+        let code = if parameter.dot_dot_dot_token.is_some() {
+            6236
+        } else {
+            6210
+        };
+        Diagnostic::with_arguments(
+            message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
             [name],
-        ),
-    })
+        )
+    };
+    Ok(Some(CanonicalCheckerRelatedInformation {
+        node: Some(declaration),
+        diagnostic,
+    }))
 }
 
 fn source_call_display_flags(options: CanonicalCheckerOptions) -> CanonicalTypeFormatFlags {
@@ -5684,13 +5711,15 @@ fn prepare_legacy_source_call_diagnostic(
                 node: Some(plan.callee_diagnostic_node),
                 range_override: None,
                 diagnostic: Diagnostic::with_arguments(message, [expected, actual.to_string()]),
-                related_information: vec![missing_argument_related_information(
+                related_information: missing_argument_related_information(
                     store,
                     host,
                     plan.node,
                     resolution.signature,
                     actual,
-                )?],
+                )?
+                .into_iter()
+                .collect(),
             }
         }
         DirectCallApplicability::TooManyArguments {
@@ -5753,6 +5782,76 @@ fn prepare_legacy_source_call_diagnostic(
                 argument_type,
                 parameter_type,
             );
+        }
+        DirectCallApplicability::RestArgumentsNotAssignable {
+            index,
+            argument_type,
+            parameter_type,
+        } => {
+            let source_index = index
+                .checked_sub(implicit_arguments)
+                .ok_or(SourceCheckError::Call(plan.node))?;
+            let arguments = argument_types
+                .get(index..)
+                .ok_or(SourceCheckError::Call(plan.node))?;
+            let tuple = store
+                .canonical_tuple_shape(argument_type)
+                .map_err(|_| SourceCheckError::Call(plan.node))?
+                .ok_or(SourceCheckError::Call(plan.node))?;
+            if tuple.is_readonly()
+                || tuple.element_types().len() != arguments.len()
+                || tuple
+                    .element_infos()
+                    .iter()
+                    .any(|info| info.flags() != ElementFlags::REQUIRED)
+                || tuple
+                    .element_types()
+                    .iter()
+                    .zip(arguments)
+                    .any(|(element, argument)| {
+                        let expected = match store.type_payload(*argument).map(TypeRecord::data) {
+                            Some(TypeData::Literal(literal)) => literal.regular_type,
+                            _ => *argument,
+                        };
+                        *element != expected
+                    })
+            {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            let node = if arguments.len() == 1 {
+                plan.arguments
+                    .get(source_index)
+                    .ok_or(SourceCheckError::Call(plan.node))?
+                    .unparenthesized()
+                    .node
+            } else {
+                plan.node
+            };
+            let range_override = (arguments.len() > 1)
+                .then(|| extra_argument_diagnostic_range(host, plan, source_index))
+                .transpose()?;
+            let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                store,
+                host,
+                global_types,
+                argument_type,
+                parameter_type,
+                source_call_display_flags(options),
+            )?;
+            let details =
+                short_rest_tuple_argument_detail(store, node, argument_type, parameter_type)?
+                    .into_iter()
+                    .collect::<Vec<_>>();
+            CanonicalCheckerDiagnostic {
+                node: Some(node),
+                range_override,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2345).ok_or(SourceCheckError::MissingDiagnostic(2345))?,
+                    [display.source, display.target],
+                )
+                .with_details(details),
+                related_information: Vec::new(),
+            }
         }
     };
     Ok(vec![diagnostic])
@@ -5873,13 +5972,15 @@ fn prepare_vector_source_call_diagnostic(
                 node: Some(plan.callee_diagnostic_node),
                 range_override: None,
                 diagnostic: Diagnostic::with_arguments(message, [expected, actual.to_string()]),
-                related_information: vec![missing_argument_related_information(
+                related_information: missing_argument_related_information(
                     store,
                     host,
                     plan.node,
                     projection.generic_signature,
                     actual,
-                )?],
+                )?
+                .into_iter()
+                .collect(),
             }
         }
         GenericCallVectorApplicability::TooManyArguments { expected, actual } => {

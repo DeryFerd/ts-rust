@@ -9,13 +9,19 @@
 //! projects its resolved return type. It never substitutes `any` for an
 //! unsupported or malformed call.
 
+use std::collections::HashSet;
+
 use ts_binder::SymbolFlags;
 
 use super::{
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, RelationUnavailable, SignatureId, TypeId,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, MinArgumentCountFlags, RelationUnavailable,
+    SignatureId, TypeId,
+    array_types::CanonicalArrayTargets,
+    bootstrap::{LiteralTypeCacheError, UnionReduction},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::ValidatedSingleCallable,
-    signatures::{Signature, SignatureFlags},
+    signatures::{ElementFlags, Signature, SignatureFlags, TupleElementInfo},
+    tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
 };
@@ -87,6 +93,11 @@ pub(super) enum DirectCallInvariant {
         minimum: usize,
         maximum: usize,
     },
+    InvalidResolvedMinimumArgumentCount {
+        signature: SignatureId,
+        cached: i32,
+        expected: usize,
+    },
     InvalidParameterType {
         signature: SignatureId,
         index: usize,
@@ -106,6 +117,8 @@ pub(super) enum DirectCallInvariant {
         signature: SignatureId,
         type_: TypeId,
     },
+    ParameterProjectionCapacity(SignatureId),
+    InvalidParameterProjection(SignatureId),
 }
 
 /// A capability, provenance, or relation failure. Ordinary call diagnostics
@@ -163,6 +176,7 @@ pub(super) struct DirectCallProjection {
     pub(super) maximum_argument_count: usize,
     pub(super) has_effective_rest: bool,
     pub(super) argument_targets: Vec<DirectCallArgumentTarget>,
+    pub(super) rest_argument_target: Option<DirectCallArgumentTarget>,
     pub(super) return_type: TypeId,
     pub(super) return_kind: DirectCallReturnKind,
 }
@@ -184,6 +198,58 @@ pub(super) enum DirectCallApplicability {
         argument_type: TypeId,
         parameter_type: TypeId,
     },
+    RestArgumentsNotAssignable {
+        index: usize,
+        argument_type: TypeId,
+        parameter_type: TypeId,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum RestParameterShape {
+    Array {
+        type_: TypeId,
+        element: TypeId,
+    },
+    Tuple {
+        type_: TypeId,
+        elements: Vec<TypeId>,
+        infos: Vec<TupleElementInfo>,
+        fixed_length: usize,
+        combined_flags: ElementFlags,
+    },
+    Union {
+        type_: TypeId,
+        members: Vec<Self>,
+    },
+    Intrinsic(TypeId),
+}
+
+impl RestParameterShape {
+    fn type_id(&self) -> TypeId {
+        match self {
+            Self::Array { type_, .. }
+            | Self::Tuple { type_, .. }
+            | Self::Union { type_, .. }
+            | Self::Intrinsic(type_) => *type_,
+        }
+    }
+
+    fn has_effective_rest(&self) -> bool {
+        match self {
+            Self::Tuple { combined_flags, .. } => combined_flags.intersects(ElementFlags::VARIABLE),
+            _ => true,
+        }
+    }
+
+    fn parameter_count(&self) -> usize {
+        match self {
+            Self::Tuple { fixed_length, .. } => {
+                *fixed_length + usize::from(self.has_effective_rest())
+            }
+            _ => 1,
+        }
+    }
 }
 
 /// Complete result of the first direct-call semantic cut.
@@ -195,9 +261,8 @@ pub(super) struct DirectCallResolution {
 
 /// Resolves the dependency-closed non-generic direct-call branch.
 ///
-/// The source caller must pass the context's immutable `strictFunctionTypes`
-/// option and authoritative global identities. Relation caches may be written;
-/// callable validation and projection themselves are read-only.
+/// The source caller supplies immutable options and authoritative globals.
+/// Projection can create canonical position unions and rest-argument tuples.
 pub(super) fn resolve_direct_call(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -460,6 +525,7 @@ fn recover_single_overload_argument_error(
     if !matches!(
         applicability,
         DirectCallApplicability::ArgumentNotAssignable { .. }
+            | DirectCallApplicability::RestArgumentsNotAssignable { .. }
     ) {
         return Ok(None);
     }
@@ -538,46 +604,22 @@ fn validate_argument_types(
     Ok(())
 }
 
-fn project_validated_direct_call(
-    store: &CanonicalTypeMapperStore,
-    global_types: Option<&CanonicalGlobalTypes>,
-    request: DirectCallRequest<'_>,
+fn validate_signature_parameters<'store>(
+    store: &'store CanonicalTypeMapperStore,
     callable: &ValidatedSingleCallable,
-) -> Result<DirectCallResolution, DirectCallError> {
-    if callable.owner != request.callee {
-        return Err(DirectCallInvariant::CallableOwnerMismatch {
-            callee: request.callee,
-            owner: callable.owner,
-        }
-        .into());
-    }
+) -> Result<&'store Signature, DirectCallError> {
     let signature = store
         .signature(callable.signature)
         .ok_or(DirectCallInvariant::InvalidSignature(callable.signature))?;
-    if !signature.type_parameters().is_empty() {
-        return Err(DirectCallUnsupported::GenericSignature(callable.signature).into());
-    }
-    if signature.this_parameter().is_some() {
-        return Err(DirectCallUnsupported::ExplicitThisParameter(callable.signature).into());
-    }
-    let has_rest_parameter = signature
-        .flags()
-        .contains(SignatureFlags::HAS_REST_PARAMETER);
-    if has_rest_parameter != callable.rest_parameter.is_some() {
-        return Err(DirectCallInvariant::SignatureParameterCountMismatch {
-            signature: callable.signature,
-            stored: signature.parameters().len(),
-            projected: callable.parameters.len() + usize::from(callable.rest_parameter.is_some()),
-        }
-        .into());
-    }
-    let projected_parameter_count =
+    let parameter_count =
         callable.parameters.len() + usize::from(callable.rest_parameter.is_some());
-    if signature.parameters().len() != projected_parameter_count {
+    if signature.has_rest_parameter() != callable.rest_parameter.is_some()
+        || signature.parameters().len() != parameter_count
+    {
         return Err(DirectCallInvariant::SignatureParameterCountMismatch {
             signature: callable.signature,
             stored: signature.parameters().len(),
-            projected: projected_parameter_count,
+            projected: parameter_count,
         }
         .into());
     }
@@ -589,48 +631,402 @@ fn project_validated_direct_call(
         }
         .into());
     }
-    let maximum_argument_count = callable.parameters.len();
-    if callable.min_argument_count > maximum_argument_count {
+    if callable.min_argument_count > callable.parameters.len() {
         return Err(DirectCallInvariant::InvalidMinimumArgumentCount {
             signature: callable.signature,
             minimum: callable.min_argument_count,
-            maximum: maximum_argument_count,
+            maximum: callable.parameters.len(),
         }
         .into());
     }
-    for (index, parameter) in callable.parameters.iter().copied().enumerate() {
-        if store.type_payload(parameter).is_none() {
+    for (index, &type_) in callable.parameters.iter().enumerate() {
+        if store.type_payload(type_).is_none() {
             return Err(DirectCallInvariant::InvalidParameterType {
                 signature: callable.signature,
                 index,
-                type_: parameter,
+                type_,
             }
             .into());
         }
     }
-    let rest_element_type = match callable.rest_parameter {
-        None => None,
-        Some(rest) if store.validate_canonical_empty_tuple_type(rest).is_ok() => None,
-        Some(rest) => {
-            let Some(global_types) = global_types else {
-                return Err(DirectCallUnsupported::RestSignature(callable.signature).into());
+    Ok(signature)
+}
+
+fn rest_parameter_shape(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    signature: SignatureId,
+    type_: TypeId,
+    active: &mut HashSet<TypeId>,
+) -> Result<RestParameterShape, DirectCallError> {
+    let invalid = || {
+        DirectCallError::Invariant(DirectCallInvariant::InvalidRestParameterType {
+            signature,
+            type_,
+        })
+    };
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    if !active.insert(type_) {
+        return Err(invalid());
+    }
+    let result = (|| {
+        if let TypeData::Union(union) = record.data() {
+            let valid = match global_types {
+                Some(globals) => store.validate_cached_union_result_with_array_targets(
+                    CanonicalArrayTargets::from_global_types(globals),
+                    type_,
+                    None,
+                ),
+                None => store.validate_cached_union_result(type_, None),
             };
-            match store.canonical_array_element_type(global_types, rest) {
-                Ok(Some(element)) => Some(element),
-                Ok(None) => {
-                    return Err(DirectCallUnsupported::RestSignature(callable.signature).into());
-                }
-                Err(_) => {
-                    return Err(DirectCallInvariant::InvalidRestParameterType {
-                        signature: callable.signature,
-                        type_: rest,
+            if !record.flags().intersects(TypeFlags::UNION) {
+                return Err(invalid());
+            }
+            if let Err(error) = valid {
+                return Err(match error {
+                    LiteralTypeCacheError::UnsupportedUnionConstituent(_) => {
+                        DirectCallUnsupported::RestSignature(signature).into()
                     }
-                    .into());
+                    LiteralTypeCacheError::ArrayType { .. } if global_types.is_none() => {
+                        DirectCallUnsupported::RestSignature(signature).into()
+                    }
+                    LiteralTypeCacheError::Capacity => {
+                        DirectCallInvariant::ParameterProjectionCapacity(signature).into()
+                    }
+                    _ => invalid(),
+                });
+            }
+            let members = union
+                .union
+                .types
+                .iter()
+                .map(|&member| rest_parameter_shape(store, global_types, signature, member, active))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(RestParameterShape::Union { type_, members });
+        }
+        if record.flags().intersects(TypeFlags::UNION) {
+            return Err(invalid());
+        }
+        if let Some(tuple) = store.canonical_tuple_shape(type_).map_err(|_| invalid())? {
+            return Ok(RestParameterShape::Tuple {
+                type_,
+                elements: tuple.element_types().to_vec(),
+                infos: tuple.element_infos().to_vec(),
+                fixed_length: tuple.fixed_length(),
+                combined_flags: tuple.combined_flags(),
+            });
+        }
+        if let Some(globals) = global_types
+            && let Some(array) = store
+                .canonical_array_reference(globals, type_)
+                .map_err(|_| invalid())?
+        {
+            return Ok(RestParameterShape::Array {
+                type_,
+                element: array.element_type,
+            });
+        }
+        if record.flags().intersects(TypeFlags::ANY | TypeFlags::NEVER) {
+            store
+                .validate_union_constituent(type_)
+                .map_err(|_| invalid())?;
+            return Ok(RestParameterShape::Intrinsic(type_));
+        }
+        Err(DirectCallUnsupported::RestSignature(signature).into())
+    })();
+    active.remove(&type_);
+    result
+}
+
+fn callable_rest_shape(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    callable: &ValidatedSingleCallable,
+) -> Result<Option<RestParameterShape>, DirectCallError> {
+    callable
+        .rest_parameter
+        .map(|rest| {
+            rest_parameter_shape(
+                store,
+                global_types,
+                callable.signature,
+                rest,
+                &mut HashSet::new(),
+            )
+        })
+        .transpose()
+}
+
+/// Counts fixed tuple positions and one effective rest position, as in pinned `getParameterCount`.
+pub(super) fn get_parameter_count(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    callable: &ValidatedSingleCallable,
+) -> Result<usize, DirectCallError> {
+    validate_signature_parameters(store, callable)?;
+    Ok(callable.parameters.len()
+        + callable_rest_shape(store, global_types, callable)?
+            .as_ref()
+            .map_or(0, RestParameterShape::parameter_count))
+}
+
+/// Fixed rest tuples have no effective rest. Tuple unions retain their rest semantics.
+pub(super) fn has_effective_rest_parameter(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    callable: &ValidatedSingleCallable,
+) -> Result<bool, DirectCallError> {
+    validate_signature_parameters(store, callable)?;
+    Ok(callable_rest_shape(store, global_types, callable)?
+        .as_ref()
+        .is_some_and(RestParameterShape::has_effective_rest))
+}
+
+fn collect_rest_position_types(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    signature: SignatureId,
+    rest: &RestParameterShape,
+    position: Option<usize>,
+    result: &mut Vec<TypeId>,
+    active: &mut HashSet<TypeId>,
+) -> Result<(), DirectCallError> {
+    let bootstrap =
+        store
+            .intrinsic_bootstrap()
+            .ok_or(DirectCallInvariant::InvalidRestParameterType {
+                signature,
+                type_: rest.type_id(),
+            })?;
+    if !active.insert(rest.type_id()) {
+        return Err(DirectCallInvariant::InvalidRestParameterType {
+            signature,
+            type_: rest.type_id(),
+        }
+        .into());
+    }
+    match rest {
+        RestParameterShape::Array { element, .. } => result.push(*element),
+        RestParameterShape::Intrinsic(type_) => result.push(*type_),
+        RestParameterShape::Union { members, .. } => {
+            for member in members {
+                let before = result.len();
+                collect_rest_position_types(
+                    store,
+                    global_types,
+                    signature,
+                    member,
+                    position,
+                    result,
+                    active,
+                )?;
+                if before == result.len() && position.is_some() {
+                    result.push(bootstrap.undefined_type);
                 }
             }
         }
+        RestParameterShape::Tuple {
+            elements,
+            infos,
+            fixed_length,
+            combined_flags,
+            ..
+        } => {
+            let range = match position {
+                Some(position) if position < *fixed_length => position..position + 1,
+                Some(_) if !combined_flags.intersects(ElementFlags::VARIABLE) => 0..0,
+                Some(_) => *fixed_length..elements.len(),
+                None => 0..elements.len(),
+            };
+            for index in range {
+                let element = elements[index];
+                let flags = infos[index].flags();
+                if flags.contains(ElementFlags::VARIADIC) {
+                    let nested = rest_parameter_shape(
+                        store,
+                        global_types,
+                        signature,
+                        element,
+                        &mut HashSet::new(),
+                    )?;
+                    collect_rest_position_types(
+                        store,
+                        global_types,
+                        signature,
+                        &nested,
+                        None,
+                        result,
+                        active,
+                    )?;
+                } else {
+                    result.push(element);
+                }
+                if flags.contains(ElementFlags::OPTIONAL) && bootstrap.options.strict_null_checks {
+                    result.push(bootstrap.undefined_type);
+                }
+            }
+        }
+    }
+    active.remove(&rest.type_id());
+    Ok(())
+}
+
+fn position_types(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    callable: &ValidatedSingleCallable,
+    rest: Option<&RestParameterShape>,
+    position: usize,
+) -> Result<Vec<TypeId>, DirectCallError> {
+    if let Some(&type_) = callable.parameters.get(position) {
+        return Ok(vec![type_]);
+    }
+    let mut result = Vec::new();
+    if let Some(rest) = rest {
+        collect_rest_position_types(
+            store,
+            global_types,
+            callable.signature,
+            rest,
+            Some(position - callable.parameters.len()),
+            &mut result,
+            &mut HashSet::new(),
+        )?;
+    }
+    Ok(result)
+}
+
+/// Reads a provider-validated signature without publishing a resolved-minimum cache.
+/// Arity alone does not establish compatibility with a rest tuple union.
+pub(super) fn get_min_argument_count(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    callable: &ValidatedSingleCallable,
+    flags: MinArgumentCountFlags,
+) -> Result<usize, DirectCallError> {
+    let signature = validate_signature_parameters(store, callable)?;
+    let rest = callable_rest_shape(store, global_types, callable)?;
+    let required_rest = match rest.as_ref() {
+        Some(RestParameterShape::Tuple {
+            infos,
+            fixed_length,
+            ..
+        }) => {
+            let required = infos
+                .iter()
+                .position(|info| !info.flags().contains(ElementFlags::REQUIRED))
+                .unwrap_or(*fixed_length);
+            (required > 0).then_some(callable.parameters.len() + required)
+        }
+        _ => None,
     };
-    let has_effective_rest = rest_element_type.is_some();
+    let mut minimum = if let Some(minimum) = required_rest {
+        minimum
+    } else if !flags.intersects(MinArgumentCountFlags::STRONG_ARITY_FOR_UNTYPED_JS)
+        && signature
+            .flags()
+            .contains(SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE)
+    {
+        0
+    } else {
+        callable.min_argument_count
+    };
+    if flags.intersects(MinArgumentCountFlags::VOID_IS_NON_OPTIONAL) {
+        return Ok(minimum);
+    }
+    while minimum > 0 {
+        let types = position_types(store, global_types, callable, rest.as_ref(), minimum - 1)?;
+        let mut accepts_void = false;
+        for type_ in types {
+            accepts_void |= type_contains_void(store, callable.signature, minimum - 1, type_)?;
+        }
+        if !accepts_void {
+            break;
+        }
+        minimum -= 1;
+    }
+    let cached = signature.resolved_min_argument_count();
+    if cached != -1 && usize::try_from(cached).ok() != Some(minimum) {
+        return Err(DirectCallInvariant::InvalidResolvedMinimumArgumentCount {
+            signature: callable.signature,
+            cached,
+            expected: minimum,
+        }
+        .into());
+    }
+    Ok(minimum)
+}
+
+/// Reads one parameter position. Union and optional positions use canonical unions.
+/// This indexed type does not replace a complete rest-argument compatibility check.
+#[allow(dead_code)] // Shared with the iterator protocol adapter.
+pub(super) fn try_get_type_at_position(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    callable: &ValidatedSingleCallable,
+    position: usize,
+) -> Result<Option<TypeId>, DirectCallError> {
+    validate_signature_parameters(store, callable)?;
+    let rest = callable_rest_shape(store, global_types, callable)?;
+    let types = position_types(store, global_types, callable, rest.as_ref(), position)?;
+    parameter_position_union(store, global_types, callable.signature, &types)
+}
+
+fn parameter_position_union(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    signature: SignatureId,
+    types: &[TypeId],
+) -> Result<Option<TypeId>, DirectCallError> {
+    match types {
+        [] => Ok(None),
+        [type_] => Ok(Some(*type_)),
+        _ => {
+            let result = match global_types {
+                Some(globals) => store.expression_union_type_with_global_types(
+                    globals,
+                    types,
+                    UnionReduction::Literal,
+                ),
+                None => store.expression_union_type(types, UnionReduction::Literal),
+            };
+            result.map(Some).map_err(|error| match error {
+                LiteralTypeCacheError::Capacity => {
+                    DirectCallInvariant::ParameterProjectionCapacity(signature).into()
+                }
+                LiteralTypeCacheError::UnsupportedUnionConstituent(_) => {
+                    DirectCallUnsupported::RestSignature(signature).into()
+                }
+                _ => DirectCallInvariant::InvalidParameterProjection(signature).into(),
+            })
+        }
+    }
+}
+
+fn project_validated_direct_call(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    request: DirectCallRequest<'_>,
+    callable: &ValidatedSingleCallable,
+) -> Result<DirectCallResolution, DirectCallError> {
+    if callable.owner != request.callee {
+        return Err(DirectCallInvariant::CallableOwnerMismatch {
+            callee: request.callee,
+            owner: callable.owner,
+        }
+        .into());
+    }
+    let signature = validate_signature_parameters(store, callable)?;
+    if !signature.type_parameters().is_empty() {
+        return Err(DirectCallUnsupported::GenericSignature(callable.signature).into());
+    }
+    if signature.this_parameter().is_some() {
+        return Err(DirectCallUnsupported::ExplicitThisParameter(callable.signature).into());
+    }
+    let rest = callable_rest_shape(store, global_types, callable)?;
+    let has_effective_rest = has_effective_rest_parameter(store, global_types, callable)?;
+    let parameter_count = get_parameter_count(store, global_types, callable)?;
+    let maximum_argument_count = parameter_count - usize::from(has_effective_rest);
     if request.form == DirectCallForm::TaggedTemplate {
         let first_parameter = callable.parameters.first().copied();
         let has_required_template_parameter = callable.min_argument_count != 0
@@ -644,7 +1040,7 @@ fn project_validated_direct_call(
                 callable.rest_parameter == Some(global_types.any_array_type)
                     && store
                         .intrinsic_bootstrap()
-                        .is_some_and(|bootstrap| rest_element_type == Some(bootstrap.any_type))
+                        .is_some_and(|bootstrap| matches!(rest.as_ref(), Some(RestParameterShape::Array { element, .. }) if *element == bootstrap.any_type))
             });
         if !has_required_template_parameter && !has_canonical_any_rest {
             return Err(DirectCallUnsupported::Form(DirectCallForm::TaggedTemplate).into());
@@ -670,25 +1066,44 @@ fn project_validated_direct_call(
         DirectCallReturnKind::Value
     };
 
-    let minimum_argument_count = effective_minimum_argument_count(store, callable)?;
-    let argument_targets = request
-        .arguments
-        .iter()
-        .copied()
-        .enumerate()
-        .filter_map(|(index, argument_type)| {
-            callable
-                .parameters
-                .get(index)
-                .copied()
-                .or(rest_element_type)
-                .map(|parameter_type| DirectCallArgumentTarget {
-                    index,
-                    argument_type,
-                    parameter_type,
-                })
+    let minimum_argument_count =
+        get_min_argument_count(store, global_types, callable, MinArgumentCountFlags::NONE)?;
+    let non_array_rest = non_array_rest_target(store, global_types, callable, rest.as_ref())?;
+    let fixed_arguments = non_array_rest
+        .as_ref()
+        .map_or(request.arguments.len(), |(index, _)| {
+            (*index).min(request.arguments.len())
+        });
+    let positions = (0..fixed_arguments)
+        .map(|index| position_types(store, global_types, callable, rest.as_ref(), index))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut argument_targets = Vec::with_capacity(positions.len());
+    for (index, types) in positions.into_iter().enumerate() {
+        if let Some(parameter_type) =
+            parameter_position_union(store, global_types, callable.signature, &types)?
+        {
+            argument_targets.push(DirectCallArgumentTarget {
+                index,
+                argument_type: request.arguments[index],
+                parameter_type,
+            });
+        }
+    }
+    let rest_argument_target = non_array_rest
+        .map(|(_, parameter_type)| {
+            let argument_type = argument_tuple_type(
+                store,
+                global_types,
+                callable.signature,
+                &request.arguments[fixed_arguments..],
+            )?;
+            Ok::<_, DirectCallError>(DirectCallArgumentTarget {
+                index: fixed_arguments,
+                argument_type,
+                parameter_type,
+            })
         })
-        .collect();
+        .transpose()?;
     let applicability = match request.arguments.len() {
         actual if actual < minimum_argument_count => DirectCallApplicability::TooFewArguments {
             expected_at_least: minimum_argument_count,
@@ -710,6 +1125,7 @@ fn project_validated_direct_call(
             maximum_argument_count,
             has_effective_rest,
             argument_targets,
+            rest_argument_target,
             return_type,
             return_kind,
         },
@@ -717,31 +1133,106 @@ fn project_validated_direct_call(
     })
 }
 
-fn effective_minimum_argument_count(
-    store: &CanonicalTypeMapperStore,
+fn non_array_rest_target(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     callable: &ValidatedSingleCallable,
-) -> Result<usize, DirectCallError> {
-    if store
-        .signature(callable.signature)
-        .ok_or(DirectCallInvariant::InvalidSignature(callable.signature))?
-        .flags()
-        .contains(SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE)
-    {
-        return Ok(0);
+    rest: Option<&RestParameterShape>,
+) -> Result<Option<(usize, TypeId)>, DirectCallError> {
+    let Some(rest) = rest else {
+        return Ok(None);
+    };
+    let prefix = callable.parameters.len();
+    match rest {
+        RestParameterShape::Array { .. } => Ok(None),
+        RestParameterShape::Intrinsic(type_)
+            if store
+                .type_payload(*type_)
+                .is_some_and(|record| record.flags().intersects(TypeFlags::ANY)) =>
+        {
+            Ok(None)
+        }
+        RestParameterShape::Intrinsic(type_) | RestParameterShape::Union { type_, .. } => {
+            Ok(Some((prefix, *type_)))
+        }
+        RestParameterShape::Tuple {
+            elements,
+            infos,
+            fixed_length,
+            combined_flags,
+            ..
+        } => {
+            if !combined_flags.intersects(ElementFlags::VARIABLE) {
+                return Ok(None);
+            }
+            if infos[*fixed_length..]
+                .iter()
+                .any(|info| info.flags().contains(ElementFlags::VARIADIC))
+            {
+                return Err(DirectCallUnsupported::RestSignature(callable.signature).into());
+            }
+            if infos[*fixed_length..].len() == 1
+                && infos[*fixed_length].flags() == ElementFlags::REST
+            {
+                return Ok(None);
+            }
+            let request = CanonicalTupleTypeRequest::new(
+                &elements[*fixed_length..],
+                &infos[*fixed_length..],
+                false,
+            );
+            let request = global_types.map_or(request, |globals| {
+                request.with_array_targets(CanonicalArrayTargets::from_global_types(globals))
+            });
+            let tail = store
+                .create_canonical_tuple_type(request)
+                .map_err(|error| tuple_projection_error(callable.signature, error))?;
+            Ok(Some((prefix + *fixed_length, tail)))
+        }
     }
+}
 
-    let mut minimum = callable.min_argument_count;
-    while minimum != 0
-        && type_contains_void(
-            store,
-            callable.signature,
-            minimum - 1,
-            callable.parameters[minimum - 1],
-        )?
-    {
-        minimum -= 1;
+fn argument_tuple_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    signature: SignatureId,
+    arguments: &[TypeId],
+) -> Result<TypeId, DirectCallError> {
+    let required = store
+        .create_tuple_element_info(ElementFlags::REQUIRED, None)
+        .ok_or(DirectCallInvariant::ParameterProjectionCapacity(signature))?;
+    let types = arguments
+        .iter()
+        .map(
+            |&type_| match store.type_payload(type_).map(TypeRecord::data) {
+                Some(TypeData::Literal(literal)) => literal.regular_type,
+                _ => type_,
+            },
+        )
+        .collect::<Vec<_>>();
+    let infos = vec![required; types.len()];
+    let request = CanonicalTupleTypeRequest::new(&types, &infos, false);
+    let request = global_types.map_or(request, |globals| {
+        request.with_array_targets(CanonicalArrayTargets::from_global_types(globals))
+    });
+    store
+        .create_canonical_tuple_type(request)
+        .map_err(|error| tuple_projection_error(signature, error))
+}
+
+fn tuple_projection_error(signature: SignatureId, error: TupleTypeError) -> DirectCallError {
+    match error {
+        TupleTypeError::Capacity => {
+            DirectCallInvariant::ParameterProjectionCapacity(signature).into()
+        }
+        TupleTypeError::UnsupportedElementFlags { .. }
+        | TupleTypeError::UnsupportedElementOrder { .. }
+        | TupleTypeError::UnsupportedCreationFlags(_)
+        | TupleTypeError::ArrayRestCollapseUnavailable => {
+            DirectCallUnsupported::RestSignature(signature).into()
+        }
+        _ => DirectCallInvariant::InvalidParameterProjection(signature).into(),
     }
-    Ok(minimum)
 }
 
 fn type_contains_void(
@@ -818,6 +1309,15 @@ fn check_argument_applicability(
             });
         }
     }
+    if let Some(target) = projection.rest_argument_target
+        && !is_assignable(target.argument_type, target.parameter_type)?
+    {
+        return Ok(DirectCallApplicability::RestArgumentsNotAssignable {
+            index: target.index,
+            argument_type: target.argument_type,
+            parameter_type: target.parameter_type,
+        });
+    }
     Ok(DirectCallApplicability::Applicable)
 }
 
@@ -846,6 +1346,13 @@ mod tests {
     }
 
     fn array_context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
+        array_context_with_options(parsed, CanonicalCheckerOptions::default())
+    }
+
+    fn array_context_with_options(
+        parsed: &ParseResult,
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'_> {
         let file = FileId::new(9_411);
         let mut binder = CanonicalBinder::new();
         binder
@@ -864,12 +1371,7 @@ mod tests {
         binder
             .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
-        CanonicalCheckerContext::new(
-            binder.finish(),
-            vec![(file, &parsed.arena)],
-            CanonicalCheckerOptions::default(),
-        )
-        .unwrap()
+        CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
     }
 
     fn context_template_strings_array(context: &mut CanonicalCheckerContext<'_>) -> TypeId {
@@ -966,6 +1468,493 @@ mod tests {
             callee,
             arguments,
         }
+    }
+
+    fn tuple(store: &mut CanonicalTypeMapperStore, elements: &[(TypeId, ElementFlags)]) -> TypeId {
+        let types = elements.iter().map(|(type_, _)| *type_).collect::<Vec<_>>();
+        let infos = elements
+            .iter()
+            .map(|(_, flags)| store.create_tuple_element_info(*flags, None).unwrap())
+            .collect::<Vec<_>>();
+        store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&types, &infos, false))
+            .unwrap()
+    }
+
+    #[test]
+    fn signature_positions_preserve_void_and_untyped_minimum_rules() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (void, number, undefined) = (
+            bootstrap.void_type,
+            bootstrap.number_type,
+            bootstrap.undefined_type,
+        );
+        let required_void = callable(&mut store, SignatureFlags::NONE, &[void], 1, Some(number));
+        let undefined_parameter = callable(
+            &mut store,
+            SignatureFlags::NONE,
+            &[undefined],
+            1,
+            Some(number),
+        );
+        let leading_void = callable(
+            &mut store,
+            SignatureFlags::NONE,
+            &[void, number],
+            2,
+            Some(number),
+        );
+        let untyped = callable(
+            &mut store,
+            SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE,
+            &[number],
+            1,
+            Some(number),
+        );
+        let before = (store.type_len(), store.signature_len(), store.mapper_len());
+
+        for _ in 0..2 {
+            assert_eq!(
+                get_min_argument_count(&store, None, &required_void, MinArgumentCountFlags::NONE),
+                Ok(0)
+            );
+            assert_eq!(
+                get_min_argument_count(
+                    &store,
+                    None,
+                    &required_void,
+                    MinArgumentCountFlags::VOID_IS_NON_OPTIONAL
+                ),
+                Ok(1)
+            );
+            assert_eq!(
+                get_min_argument_count(
+                    &store,
+                    None,
+                    &undefined_parameter,
+                    MinArgumentCountFlags::NONE
+                ),
+                Ok(1)
+            );
+            assert_eq!(
+                get_min_argument_count(&store, None, &leading_void, MinArgumentCountFlags::NONE),
+                Ok(2)
+            );
+            assert_eq!(
+                get_min_argument_count(&store, None, &untyped, MinArgumentCountFlags::NONE),
+                Ok(0)
+            );
+            assert_eq!(
+                get_min_argument_count(
+                    &store,
+                    None,
+                    &untyped,
+                    MinArgumentCountFlags::STRONG_ARITY_FOR_UNTYPED_JS
+                ),
+                Ok(1)
+            );
+        }
+        assert_eq!(
+            (store.type_len(), store.signature_len(), store.mapper_len()),
+            before
+        );
+        assert_eq!(
+            store
+                .signature(required_void.signature)
+                .unwrap()
+                .resolved_min_argument_count(),
+            -1
+        );
+
+        assert!(store.set_signature_resolved_min_argument_count(required_void.signature, 1));
+        assert_eq!(
+            get_min_argument_count(&store, None, &required_void, MinArgumentCountFlags::NONE),
+            Err(DirectCallError::Invariant(
+                DirectCallInvariant::InvalidResolvedMinimumArgumentCount {
+                    signature: required_void.signature,
+                    cached: 1,
+                    expected: 0
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn signature_positions_expand_fixed_rest_tuples_without_losing_required_elements() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (number, string, void) = (
+            bootstrap.number_type,
+            bootstrap.string_type,
+            bootstrap.void_type,
+        );
+        let empty = tuple(&mut store, &[]);
+        let required = tuple(&mut store, &[(number, ElementFlags::REQUIRED)]);
+        let trailing_void = tuple(
+            &mut store,
+            &[
+                (number, ElementFlags::REQUIRED),
+                (void, ElementFlags::REQUIRED),
+            ],
+        );
+        let optional = tuple(
+            &mut store,
+            &[
+                (number, ElementFlags::REQUIRED),
+                (string, ElementFlags::OPTIONAL),
+            ],
+        );
+        for (rest, expected_minimum, expected_count) in [
+            (empty, 0, 0),
+            (required, 1, 1),
+            (trailing_void, 1, 2),
+            (optional, 1, 2),
+        ] {
+            let callable = callable(
+                &mut store,
+                SignatureFlags::HAS_REST_PARAMETER,
+                &[rest],
+                0,
+                Some(void),
+            );
+            assert_eq!(
+                get_parameter_count(&store, None, &callable),
+                Ok(expected_count)
+            );
+            assert_eq!(
+                get_min_argument_count(&store, None, &callable, MinArgumentCountFlags::NONE),
+                Ok(expected_minimum)
+            );
+            assert_eq!(
+                has_effective_rest_parameter(&store, None, &callable),
+                Ok(false)
+            );
+            assert_eq!(
+                try_get_type_at_position(&mut store, None, &callable, expected_count),
+                Ok(None)
+            );
+            let result = project_validated_direct_call(
+                &mut store,
+                None,
+                request(callable.owner, &[]),
+                &callable,
+            )
+            .unwrap();
+            assert_eq!(result.projection.minimum_argument_count, expected_minimum);
+            assert_eq!(result.projection.maximum_argument_count, expected_count);
+            assert_eq!(
+                result.applicability,
+                if expected_minimum == 0 {
+                    DirectCallApplicability::Applicable
+                } else {
+                    DirectCallApplicability::TooFewArguments {
+                        expected_at_least: expected_minimum,
+                        actual: 0,
+                    }
+                }
+            );
+        }
+        let required_rest = callable(
+            &mut store,
+            SignatureFlags::HAS_REST_PARAMETER | SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE,
+            &[required],
+            0,
+            Some(void),
+        );
+        assert_eq!(
+            get_min_argument_count(&store, None, &required_rest, MinArgumentCountFlags::NONE),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn signature_positions_preserve_optional_and_variable_tuple_positions() {
+        let parsed = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let mut context = array_context_with_options(
+            &parsed,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let globals = context.global_types().clone();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (number, string, boolean, undefined) = (
+            bootstrap.number_type,
+            bootstrap.string_type,
+            bootstrap.boolean_type,
+            bootstrap.undefined_type,
+        );
+        let store = context.store_mut_for_test();
+        let optional = tuple(store, &[(number, ElementFlags::OPTIONAL)]);
+        let variable = tuple(
+            store,
+            &[
+                (number, ElementFlags::REQUIRED),
+                (string, ElementFlags::REST),
+                (boolean, ElementFlags::REQUIRED),
+            ],
+        );
+        let optional_callable = callable(
+            store,
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[optional],
+            0,
+            Some(number),
+        );
+        let variable_callable = callable(
+            store,
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[variable],
+            0,
+            Some(number),
+        );
+        let expected_optional = store
+            .expression_union_type(&[number, undefined], UnionReduction::Literal)
+            .unwrap();
+        let expected_tail = store
+            .expression_union_type(&[string, boolean], UnionReduction::Literal)
+            .unwrap();
+        assert_eq!(
+            try_get_type_at_position(store, Some(&globals), &optional_callable, 0),
+            Ok(Some(expected_optional))
+        );
+        assert_eq!(
+            get_parameter_count(store, Some(&globals), &variable_callable),
+            Ok(2)
+        );
+        assert_eq!(
+            get_min_argument_count(
+                store,
+                Some(&globals),
+                &variable_callable,
+                MinArgumentCountFlags::NONE
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            has_effective_rest_parameter(store, Some(&globals), &variable_callable),
+            Ok(true)
+        );
+        assert_eq!(
+            try_get_type_at_position(store, Some(&globals), &variable_callable, 0),
+            Ok(Some(number))
+        );
+        assert_eq!(
+            try_get_type_at_position(store, Some(&globals), &variable_callable, 1),
+            Ok(Some(expected_tail))
+        );
+        assert_eq!(
+            try_get_type_at_position(store, Some(&globals), &variable_callable, 100),
+            Ok(Some(expected_tail))
+        );
+        let before = (store.type_len(), store.signature_len(), store.mapper_len());
+        assert_eq!(
+            try_get_type_at_position(store, Some(&globals), &optional_callable, 0),
+            Ok(Some(expected_optional))
+        );
+        assert_eq!(
+            try_get_type_at_position(store, Some(&globals), &variable_callable, 100),
+            Ok(Some(expected_tail))
+        );
+        assert_eq!(
+            (store.type_len(), store.signature_len(), store.mapper_len()),
+            before
+        );
+    }
+
+    #[test]
+    fn signature_positions_tuple_union_calls_check_the_whole_argument_tuple() {
+        let parsed = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let mut context = array_context_with_options(
+            &parsed,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let globals = context.global_types().clone();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, undefined, number) = (
+            bootstrap.string_type,
+            bootstrap.undefined_type,
+            bootstrap.number_type,
+        );
+        let store = context.store_mut_for_test();
+        let empty = tuple(store, &[]);
+        let one = tuple(store, &[(string, ElementFlags::REQUIRED)]);
+        let rest = store
+            .expression_union_type_with_global_types(
+                &globals,
+                &[empty, one],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let signature = callable(
+            store,
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[rest],
+            0,
+            Some(number),
+        );
+        let optional_string = store
+            .expression_union_type(&[string, undefined], UnionReduction::Literal)
+            .unwrap();
+        assert_eq!(
+            get_min_argument_count(
+                store,
+                Some(&globals),
+                &signature,
+                MinArgumentCountFlags::NONE
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            get_parameter_count(store, Some(&globals), &signature),
+            Ok(1)
+        );
+        assert_eq!(
+            has_effective_rest_parameter(store, Some(&globals), &signature),
+            Ok(true)
+        );
+        assert_eq!(
+            try_get_type_at_position(store, Some(&globals), &signature, 0),
+            Ok(Some(optional_string))
+        );
+        assert_eq!(
+            try_get_type_at_position(store, Some(&globals), &signature, 1),
+            Ok(Some(undefined))
+        );
+        for (arguments, applicable) in [
+            (&[][..], true),
+            (&[string][..], true),
+            (&[undefined][..], false),
+            (&[string, string][..], false),
+        ] {
+            let mut warm = None;
+            for _ in 0..2 {
+                let result = project_validated_direct_call(
+                    store,
+                    Some(&globals),
+                    request(signature.owner, arguments),
+                    &signature,
+                )
+                .unwrap();
+                assert_eq!(result.applicability, DirectCallApplicability::Applicable);
+                let checked = check_argument_applicability(&result.projection, |source, target| {
+                    store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                        source, target, &globals, false,
+                    )
+                })
+                .unwrap();
+                if applicable {
+                    assert_eq!(checked, DirectCallApplicability::Applicable);
+                } else {
+                    assert!(
+                        matches!(checked, DirectCallApplicability::RestArgumentsNotAssignable { index: 0, parameter_type, .. } if parameter_type == rest)
+                    );
+                }
+                let state = (store.type_len(), store.signature_len(), store.mapper_len());
+                if let Some(previous) = warm.replace(state) {
+                    assert_eq!(state, previous);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn signature_positions_reject_foreign_and_poisoned_rest_types_without_writes() {
+        let mut store = initialized_store();
+        let mut other = initialized_store();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let foreign = tuple(&mut other, &[]);
+        let foreign_signature = callable(
+            &mut store,
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[foreign],
+            0,
+            Some(number),
+        );
+        let before = (store.type_len(), store.signature_len(), store.mapper_len());
+        assert_eq!(
+            get_min_argument_count(
+                &store,
+                None,
+                &foreign_signature,
+                MinArgumentCountFlags::NONE
+            ),
+            Err(DirectCallError::Invariant(
+                DirectCallInvariant::InvalidRestParameterType {
+                    signature: foreign_signature.signature,
+                    type_: foreign
+                }
+            ))
+        );
+        assert_eq!(
+            (store.type_len(), store.signature_len(), store.mapper_len()),
+            before
+        );
+
+        let rest = tuple(&mut store, &[(number, ElementFlags::REQUIRED)]);
+        let empty = tuple(&mut store, &[]);
+        let forged_union = store
+            .alloc_union_type(ObjectFlags::NONE, vec![empty, rest])
+            .unwrap();
+        let forged_signature = callable(
+            &mut store,
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[forged_union],
+            0,
+            Some(number),
+        );
+        let before = (store.type_len(), store.signature_len(), store.mapper_len());
+        assert!(matches!(
+            get_min_argument_count(&store, None, &forged_signature, MinArgumentCountFlags::NONE),
+            Err(DirectCallError::Invariant(
+                DirectCallInvariant::InvalidRestParameterType { .. }
+            ))
+        ));
+        assert_eq!(
+            (store.type_len(), store.signature_len(), store.mapper_len()),
+            before
+        );
+        let signature = callable(
+            &mut store,
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[rest],
+            0,
+            Some(number),
+        );
+        let target = store.canonical_tuple_shape(rest).unwrap().unwrap().target();
+        let Some(TypeData::Tuple(tuple)) = store.type_payload(target).map(TypeRecord::data) else {
+            panic!("expected a canonical tuple target")
+        };
+        let this_type = tuple.interface.this_type.unwrap();
+        assert!(store.set_resolved_base_constraint(this_type, Some(number)));
+        let before = (store.type_len(), store.signature_len(), store.mapper_len());
+        assert!(matches!(
+            get_min_argument_count(&store, None, &signature, MinArgumentCountFlags::NONE),
+            Err(DirectCallError::Invariant(
+                DirectCallInvariant::InvalidRestParameterType { .. }
+            ))
+        ));
+        assert!(matches!(
+            try_get_type_at_position(&mut store, None, &signature, 0),
+            Err(DirectCallError::Invariant(
+                DirectCallInvariant::InvalidRestParameterType { .. }
+            ))
+        ));
+        assert_eq!(
+            (store.type_len(), store.signature_len(), store.mapper_len()),
+            before
+        );
     }
 
     #[test]
@@ -1274,7 +2263,8 @@ mod tests {
         assert_eq!(validate_direct_call_form(tagged), Ok(()));
         assert_eq!(validate_tagged_template_argument(&store, tagged), Ok(()));
 
-        let resolution = project_validated_direct_call(&store, None, tagged, &callable).unwrap();
+        let resolution =
+            project_validated_direct_call(&mut store, None, tagged, &callable).unwrap();
         assert_eq!(
             resolution.applicability,
             DirectCallApplicability::Applicable
@@ -1340,7 +2330,7 @@ mod tests {
         };
         assert_eq!(validate_tagged_template_argument(&store, tagged), Ok(()));
         assert_eq!(
-            project_validated_direct_call(&store, None, tagged, &wrong_signature),
+            project_validated_direct_call(&mut store, None, tagged, &wrong_signature),
             Err(unsupported)
         );
 
@@ -1352,13 +2342,13 @@ mod tests {
             Some(number),
         );
         assert_eq!(
-            project_validated_direct_call(&store, None, tagged, &optional_template),
+            project_validated_direct_call(&mut store, None, tagged, &optional_template),
             Err(unsupported)
         );
 
         let optional_any = callable(&mut store, SignatureFlags::NONE, &[any], 0, Some(number));
         assert_eq!(
-            project_validated_direct_call(&store, None, tagged, &optional_any),
+            project_validated_direct_call(&mut store, None, tagged, &optional_any),
             Err(unsupported)
         );
 
@@ -1370,7 +2360,7 @@ mod tests {
             Some(number),
         );
         assert_eq!(
-            project_validated_direct_call(&store, None, tagged, &unknown_signature),
+            project_validated_direct_call(&mut store, None, tagged, &unknown_signature),
             Err(unsupported)
         );
     }
@@ -1408,7 +2398,8 @@ mod tests {
             Ok(())
         );
         let fixed_resolution =
-            project_validated_direct_call(context.store(), None, fixed_tag, &fixed).unwrap();
+            project_validated_direct_call(context.store_mut_for_test(), None, fixed_tag, &fixed)
+                .unwrap();
         assert_eq!(
             fixed_resolution.projection.argument_targets,
             vec![DirectCallArgumentTarget {
@@ -1437,9 +2428,13 @@ mod tests {
             validate_tagged_template_argument(context.store(), tagged),
             Ok(())
         );
-        let resolution =
-            project_validated_direct_call(context.store(), Some(&global_types), tagged, &with_rest)
-                .unwrap();
+        let resolution = project_validated_direct_call(
+            context.store_mut_for_test(),
+            Some(&global_types),
+            tagged,
+            &with_rest,
+        )
+        .unwrap();
         assert_eq!(
             resolution.applicability,
             DirectCallApplicability::Applicable
@@ -1484,7 +2479,8 @@ mod tests {
             form: DirectCallForm::TaggedTemplate,
             ..request(callable.owner, &arguments)
         };
-        let resolution = project_validated_direct_call(&store, None, tagged, &callable).unwrap();
+        let resolution =
+            project_validated_direct_call(&mut store, None, tagged, &callable).unwrap();
         let applicability =
             check_argument_applicability(&resolution.projection, |source, target| {
                 Ok(source == target)
@@ -1540,7 +2536,7 @@ mod tests {
                 context.store().checker_link_allocated_lengths(),
             );
             let resolution = project_validated_direct_call(
-                context.store(),
+                context.store_mut_for_test(),
                 Some(&global_types),
                 tagged,
                 &callable,
@@ -1625,7 +2621,7 @@ mod tests {
 
             assert_eq!(
                 project_validated_direct_call(
-                    context.store(),
+                    context.store_mut_for_test(),
                     Some(&global_types),
                     tagged,
                     &callable,
@@ -1665,7 +2661,7 @@ mod tests {
             ..request(callable.owner, &arguments)
         };
         assert_eq!(
-            project_validated_direct_call(context.store(), None, tagged, &callable),
+            project_validated_direct_call(context.store_mut_for_test(), None, tagged, &callable),
             Err(DirectCallError::Unsupported(
                 DirectCallUnsupported::RestSignature(callable.signature),
             )),
@@ -1687,7 +2683,7 @@ mod tests {
         );
         let arguments = [number];
         let resolution = project_validated_direct_call(
-            &store,
+            &mut store,
             None,
             request(callable.owner, &arguments),
             &callable,
@@ -1731,7 +2727,7 @@ mod tests {
         );
 
         let too_few = project_validated_direct_call(
-            &store,
+            &mut store,
             None,
             request(callable.owner, &[number]),
             &callable,
@@ -1746,7 +2742,7 @@ mod tests {
         );
 
         let too_many = project_validated_direct_call(
-            &store,
+            &mut store,
             None,
             request(callable.owner, &[number, string, number]),
             &callable,
@@ -1776,7 +2772,7 @@ mod tests {
             Some(void),
         );
         let resolution = project_validated_direct_call(
-            &store,
+            &mut store,
             None,
             request(callable.owner, &[number]),
             &callable,
@@ -1810,7 +2806,7 @@ mod tests {
         );
 
         let missing = project_validated_direct_call(
-            &store,
+            &mut store,
             None,
             request(javascript.owner, &[]),
             &javascript,
@@ -1821,7 +2817,7 @@ mod tests {
         assert_eq!(missing.applicability, DirectCallApplicability::Applicable);
 
         let extra = project_validated_direct_call(
-            &store,
+            &mut store,
             None,
             request(javascript.owner, &[number, number, number]),
             &javascript,
@@ -1843,7 +2839,7 @@ mod tests {
 
         let typescript = callable(&mut store, SignatureFlags::NONE, &[any], 1, Some(void));
         let missing = project_validated_direct_call(
-            &store,
+            &mut store,
             None,
             request(typescript.owner, &[]),
             &typescript,
@@ -1874,7 +2870,7 @@ mod tests {
             Some(string),
         );
         let resolution = project_validated_direct_call(
-            &store,
+            &mut store,
             None,
             request(callable.owner, &[number, string]),
             &callable,
@@ -1905,7 +2901,7 @@ mod tests {
         let unresolved = callable(&mut store, SignatureFlags::NONE, &[number], 1, None);
         assert_eq!(
             project_validated_direct_call(
-                &store,
+                &mut store,
                 None,
                 request(unresolved.owner, &[number]),
                 &unresolved,
@@ -1923,7 +2919,7 @@ mod tests {
             Some(number),
         );
         assert_eq!(
-            project_validated_direct_call(&store, None, request(rest.owner, &[number]), &rest,),
+            project_validated_direct_call(&mut store, None, request(rest.owner, &[number]), &rest,),
             Err(DirectCallError::Unsupported(
                 DirectCallUnsupported::RestSignature(rest.signature)
             ))
