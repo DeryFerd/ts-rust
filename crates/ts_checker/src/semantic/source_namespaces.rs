@@ -19930,6 +19930,147 @@ mod tests {
     }
 
     #[test]
+    fn ambient_imported_variable_queries_reject_cycles_before_publication() {
+        for source in [
+            concat!(
+                "declare module 'models' { ",
+                "import * as Self from 'models'; ",
+                "export const value: typeof Self.value; ",
+                "}",
+            ),
+            concat!(
+                "declare module 'first' { ",
+                "import * as Second from 'second'; ",
+                "export const value: typeof Second.value; ",
+                "} ",
+                "declare module 'second' { ",
+                "import * as First from 'first'; ",
+                "export const value: typeof First.value; ",
+                "}",
+            ),
+        ] {
+            let mut fixture = declaration_fixture(source, CanonicalModuleState::Script);
+            let namespace = plan(&fixture, 0);
+            let (_, bound) = fixture.context.file(fixture.file).unwrap();
+            let aliases = fixture
+                .parsed
+                .arena
+                .iter()
+                .filter(|(_, record)| record.kind == SyntaxKind::NamespaceImport)
+                .map(|(node, _)| {
+                    bound
+                        .symbol(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().mapper_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+                fixture.context.store().type_resolution_internal_state(),
+            );
+            assert!(
+                matches!(
+                    execute(&mut fixture, &namespace),
+                    Err(SourceCheckError::DeclaredType(
+                        DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::UnsupportedSyntax {
+                                kind: SyntaxKind::TypeQuery,
+                                ..
+                            }
+                        )
+                    ))
+                ),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().mapper_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                    fixture.context.store().type_resolution_internal_state(),
+                ),
+                before,
+                "{source}",
+            );
+            assert!(
+                aliases
+                    .iter()
+                    .all(|alias| { fixture.context.store().alias_symbol_links(*alias).is_none() })
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_imported_variable_queries_reuse_shared_acyclic_values() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'consumer' { ",
+                "import * as Models from 'models'; ",
+                "interface View { ",
+                "left: typeof Models.left; right: typeof Models.right; ",
+                "} } ",
+                "declare module 'models' { ",
+                "import * as Base from 'base'; ",
+                "export const left: typeof Base.value; ",
+                "export const right: typeof Base.value; ",
+                "} ",
+                "declare module 'base' { export const value: string; }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let queries = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeQuery).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let string = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .string_type;
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(queries.len(), 4);
+        for query in queries {
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .type_node_links(query)
+                    .and_then(|links| links.resolved_type),
+                Some(string),
+            );
+        }
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().mapper_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().mapper_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
     fn ambient_imported_value_queries_respect_lexical_shadowing() {
         let mut fixture = declaration_fixture(
             concat!(

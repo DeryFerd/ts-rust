@@ -1843,6 +1843,7 @@ struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     plan: TypeQueryPlan,
     planning_defaults: HashSet<(SemanticSymbolId, NodeRef)>,
     planning_interfaces: HashSet<SemanticSymbolId>,
+    planning_imported_variables: HashSet<SemanticSymbolId>,
     planning_imported_callables: HashSet<SemanticSymbolId>,
     active_structural_aliases: Vec<(SemanticSymbolId, usize)>,
     active_tuple_aliases: Vec<SemanticSymbolId>,
@@ -1870,6 +1871,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             plan: TypeQueryPlan::default(),
             planning_defaults: HashSet::new(),
             planning_interfaces: HashSet::new(),
+            planning_imported_variables: HashSet::new(),
             planning_imported_callables: HashSet::new(),
             active_structural_aliases: Vec::new(),
             active_tuple_aliases: Vec::new(),
@@ -10023,7 +10025,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             Some(links) => links.resolved_type,
             None => None,
         };
-        self.plan_type_node_in_context(annotation, None, false)?;
+        if !self.planning_imported_variables.insert(symbol) {
+            return Err(unsupported());
+        }
+        let annotation_plan = self.plan_type_node_in_context(annotation, None, false);
+        self.planning_imported_variables.remove(&symbol);
+        annotation_plan?;
         let annotation_identity = self.cached_array_element_identity(annotation)?;
         let mut identity_node = annotation;
         loop {
