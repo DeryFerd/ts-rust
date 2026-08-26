@@ -3776,12 +3776,20 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.contains_node_ref(node) || !self.valid_optional_symbol(links.resolved_symbol) {
             return false;
         }
-        let changed = self
+        let (changed, published) = self
             .symbol_node_links(node)
-            .is_none_or(|current| current != &links);
+            .map_or((true, false), |current| {
+                (current != &links, current.resolved_symbol.is_some())
+            });
+        let changes_recovery = changed
+            && (published || self.circular_return_signatures.values().any(|provenance| {
+                matches!(provenance, CircularReturnProvenance::Inferred(cycle)
+                    if [cycle.declaration, cycle.body, cycle.query, cycle.query_name].contains(&node))
+            }));
         let relation_dirty = self.relation_observable_nodes.contains(&node) && changed;
         self.links.symbol_node.replace_key(node, links);
-        if changed {
+        // A first capture-cache write records the binding that was already checked.
+        if changes_recovery {
             self.invalidate_inferred_return_cycles_for_node(node, None);
         }
         if relation_dirty {

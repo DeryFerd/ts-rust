@@ -29606,6 +29606,35 @@ fn non_circular_recursive_arrow_assignment(
         .type_payload(source)
         .map(TypeRecord::flags)
         .ok_or(RelationUnavailable::Type(source))?;
+    if flags == TypeFlags::NEVER {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?;
+        let object_flags = if source == bootstrap.silent_never_type {
+            Some(ObjectFlags::NON_INFERRABLE_TYPE)
+        } else if [
+            bootstrap.never_type,
+            bootstrap.implicit_never_type,
+            bootstrap.unreachable_never_type,
+        ]
+        .contains(&source)
+        {
+            Some(ObjectFlags::NONE)
+        } else {
+            None
+        };
+        let valid = store.type_payload(source).is_some_and(|record| {
+            object_flags == Some(record.object_flags())
+                && record.symbol().is_none()
+                && record.alias().is_none()
+                && matches!(record.data(), TypeData::Intrinsic(intrinsic) if intrinsic.intrinsic_name == "never")
+        });
+        return if valid {
+            Ok(Some(true))
+        } else {
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(source).into())
+        };
+    }
     if flags
         .intersects(TypeFlags::ANY | TypeFlags::NEVER | TypeFlags::PRIMITIVE | TypeFlags::UNKNOWN)
     {
@@ -68677,6 +68706,7 @@ mod tests {
             "signature",
             "query",
             "query-name",
+            "query-symbol",
             "body",
             "arrow",
             "value",
@@ -68739,6 +68769,12 @@ mod tests {
                         .store_mut_for_test()
                         .set_symbol_node_links(cycle.query_name, SymbolNodeLinks::default())
                 ),
+                "query-symbol" => assert!(context.store_mut_for_test().set_symbol_node_links(
+                    cycle.query,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(cycle.variable)
+                    },
+                )),
                 "value" => assert!(context.store_mut_for_test().set_value_symbol_links(
                     cycle.variable,
                     ValueSymbolLinks {
@@ -68748,8 +68784,8 @@ mod tests {
                 )),
                 "owner" => assert!(context.store_mut_for_test().set_symbol_flags(
                     cycle.variable,
-                    SymbolFlags::BLOCK_SCOPED_VARIABLE,
-                    CheckFlags::READONLY
+                    SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                    CheckFlags::NONE
                 )),
                 _ => unreachable!(),
             }
