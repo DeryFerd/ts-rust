@@ -16,7 +16,7 @@ use super::{
     DeclaredTypeHost, DeclaredTypeUnavailable, SignatureId, TypeId, TypeResolutionTarget,
     TypeSystemPropertyName, UnsupportedDeclaredTypeKind,
     array_types::CanonicalArrayTargets,
-    bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes, UnionReduction},
+    bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     classes::{
         ClassMemberQueryPlan, authenticated_class_constructor_value,
@@ -5378,10 +5378,22 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
     fn generic_union_constituent_references_owned_parameter(
         &self,
-        mut node: NodeRef,
+        node: NodeRef,
         parameters: &HashSet<SemanticSymbolId>,
     ) -> Result<bool, DeclaredTypeError> {
-        let mut visited = HashSet::new();
+        self.generic_union_constituent_references_owned_parameter_worker(
+            node,
+            parameters,
+            &mut HashSet::new(),
+        )
+    }
+
+    fn generic_union_constituent_references_owned_parameter_worker(
+        &self,
+        mut node: NodeRef,
+        parameters: &HashSet<SemanticSymbolId>,
+        visited: &mut HashSet<NodeRef>,
+    ) -> Result<bool, DeclaredTypeError> {
         loop {
             if !visited.insert(node) {
                 return Ok(false);
@@ -5414,7 +5426,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let Some(owner) = self.store.symbol(symbol) else {
             return Ok(false);
         };
-        if !owner.flags().contains(SymbolFlags::INTERFACE)
+        if !owner
+            .flags()
+            .intersects(SymbolFlags::INTERFACE | SymbolFlags::TYPE_ALIAS)
             || owner.flags().contains(SymbolFlags::CLASS)
         {
             return Ok(false);
@@ -5422,14 +5436,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
         for argument in &arguments.nodes {
             let argument = NodeRef::new(node.arena, node.file, *argument);
-            let record = preflight_node(self.store, self.host, argument)?;
-            let NodeData::TypeReferenceNode(reference) = &record.data else {
-                continue;
-            };
-            if record.kind == SyntaxKind::TypeReference
-                && record.parent == Some(node.node)
-                && reference.type_arguments.is_none()
-                && parameters.contains(&self.resolve_uncached_type_reference_symbol(argument)?)
+            if preflight_node(self.store, self.host, argument)?.parent == Some(node.node)
+                && self.generic_union_constituent_references_owned_parameter_worker(
+                    argument, parameters, visited,
+                )?
             {
                 return Ok(true);
             }
@@ -10600,6 +10610,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !cached_syntax_contains_builtin_array
             && !self.cached_class_or_interface_reference(node)
             && !cached_type.is_some_and(|cached| is_instantiated_mapped_type(self.store, cached))
+            && !cached_symbol
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                .and_then(|symbol| self.store.type_alias_links(symbol))
+                .is_some_and(|links| {
+                    links.type_parameters.is_some()
+                        && links
+                            .declared_type
+                            .and_then(|type_| self.store.type_payload(type_))
+                            .is_some_and(|record| matches!(record.data(), TypeData::Union(_)))
+                })
             && !qualified
             && !source_parameter_constraint
             && !self.is_recovered_source_variable_reference(node, cached_type)?
@@ -16836,6 +16856,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 Ok(())
             }
             NodeData::UnionTypeNode(_) => {
+                if !self.plan.unions.contains_key(&node)
+                    && let Some(owner) = self.direct_union_alias(node)?
+                    && let Some(cached) = self
+                        .store
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type)
+                    && self.store.type_alias_links(owner).is_some_and(|links| {
+                        links.type_parameters.is_none() && links.declared_type == Some(cached)
+                    })
+                {
+                    return self
+                        .validate_cached_union_result(cached, Some(owner))
+                        .map_err(type_construction_error);
+                }
                 let union = self.plan.unions.get(&node).ok_or_else(|| {
                     type_node_unavailable(TypeNodeUnavailable::MissingPlannedUnionType(node))
                 })?;
@@ -30165,11 +30199,10 @@ mod tests {
         let first_type = query_node(&mut fixture, first, &mut diagnostics).unwrap();
         let original = fixture.store.type_alias_links(alias).unwrap().clone();
         let mut forged = original.clone();
-        forged
-            .instantiations
-            .as_mut()
-            .unwrap()
-            .insert(type_list_key(&[boolean, number]), first_type);
+        forged.instantiations.as_mut().unwrap().insert(
+            type_alias_instantiation_cache_key(&[boolean, number], None),
+            first_type,
+        );
         assert!(fixture.store.set_type_alias_links(alias, forged.clone()));
         let before = union_state(&fixture.store);
         assert!(query_node(&mut fixture, later, &mut diagnostics).is_err());
@@ -30330,7 +30363,10 @@ mod tests {
                     _ => unreachable!(),
                 }
                 let before = union_state(&fixture.store);
-                assert!(query_node(&mut fixture, node, &mut diagnostics).is_err());
+                assert!(
+                    query_node(&mut fixture, node, &mut diagnostics).is_err(),
+                    "declared={declared_result}, corruption={corruption}"
+                );
                 assert_eq!(union_state(&fixture.store), before);
                 assert!(
                     fixture
