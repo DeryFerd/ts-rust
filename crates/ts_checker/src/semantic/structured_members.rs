@@ -10,19 +10,23 @@ use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
-    CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
-    semantic::PreparedSymbolTable,
+    CheckFlags, EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolFlags,
+    SymbolTableId, semantic::PreparedSymbolTable,
 };
 
 use super::{
     CanonicalTypeMapperStore, IndexInfoId, SignatureId, TypeId,
-    links::{ResolvedSignatureState, SignatureLinks, ValueSymbolLinks},
-    object_members::{
-        DirectInterfaceDeclaredState, PropertyObjectError, PropertyObjectKind, PropertyObjectPlan,
-        PropertyObjectState, ResolvedCallSignatureTypes, StoredDeclaredCallSetValidation,
-        prepare_direct_interface_declared_properties, publish_declared_members,
-        publish_prepared_direct_interface_declared_properties, validate_stored_declared_call_set,
+    links::{
+        MembersOrExportsResolutionKind, ResolvedSignatureState, SignatureLinks, ValueSymbolLinks,
     },
+    object_members::{
+        DirectInterfaceDeclaredState, PlannedComputedMemberKey, PropertyObjectError,
+        PropertyObjectKind, PropertyObjectPlan, PropertyObjectState, ResolvedCallSignatureTypes,
+        StoredDeclaredCallSetValidation, prepare_direct_interface_declared_properties,
+        publish_declared_members, publish_prepared_direct_interface_declared_properties,
+        resolved_computed_member_key, validate_stored_declared_call_set,
+    },
+    relater::ResolvedOwnProperty,
     signatures::SignatureFlags,
     store::{DirectInterfaceHeritageProvenance, SourceNodeParent},
     type_records::{ConstrainedTypeData, InterfaceTypeData, TypeCacheState, TypeData},
@@ -734,6 +738,33 @@ fn validate_property_interface(
     validate_property_interface_worker(store, type_, requires_direct_base, &mut HashSet::new())
 }
 
+/// Reads a key only after the complete nongeneric interface has been validated.
+pub(super) fn validated_interface_property_by_key(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    name: EscapedNameRef<'_>,
+) -> Option<Option<ResolvedOwnProperty>> {
+    let inherited = store.direct_interface_heritage_provenance(type_).is_some();
+    let view = validate_property_interface(store, type_, inherited)?;
+    let members = store.type_payload(type_)?.data().structured()?.members;
+    let Some(members) = members else {
+        return Some(None);
+    };
+    let Some(symbol) = store.symbol_table(members)?.get(name) else {
+        return Some(None);
+    };
+    if !view.properties.contains(&symbol) {
+        return None;
+    }
+    let record = store.symbol(symbol)?;
+    Some(Some(ResolvedOwnProperty {
+        symbol,
+        type_: store.value_symbol_links(symbol)?.resolved_type?,
+        optional: record.flags().contains(SymbolFlags::OPTIONAL),
+        readonly: record.check_flags().contains(CheckFlags::READONLY),
+    }))
+}
+
 fn validate_property_interface_worker(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -772,7 +803,7 @@ fn validate_property_interface_worker(
         || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
         || owner_record.check_flags() != CheckFlags::NONE
         || owner_record.value_declaration().is_some()
-        || owner_record.members() != interface.declared_members
+        || !valid_declared_member_table(store, owner, interface.declared_members)
         || owner_record.exports().is_some()
         || owner_record.export_symbol().is_some()
         || store.get_merged_symbol(owner) != Some(owner)
@@ -958,6 +989,88 @@ fn validate_property_interface_worker(
     };
     assert!(active.remove(&type_));
     Some(result)
+}
+
+/// Accepts the raw table or its exact late-bound member expansion.
+pub(super) fn valid_declared_member_table(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declared: Option<SymbolTableId>,
+) -> bool {
+    let Some(owner_record) = store.symbol(owner) else {
+        return false;
+    };
+    let Some(computed_count) = store.source_computed_member_count(owner) else {
+        return false;
+    };
+    if owner_record.members() == declared {
+        return computed_count == 0;
+    }
+    let raw = match owner_record.members() {
+        Some(table) => {
+            let Some(raw) = store.symbol_table(table) else {
+                return false;
+            };
+            Some(raw)
+        }
+        None if store.source_symbol_has_only_computed_members(owner) => None,
+        None => return false,
+    };
+    let Some(declared) = declared.and_then(|table| store.symbol_table(table)) else {
+        return false;
+    };
+    let Some(resolved) = store
+        .members_and_exports_links(owner)
+        .and_then(|links| links.table(MembersOrExportsResolutionKind::ResolvedMembers))
+        .and_then(|table| store.symbol_table(table))
+    else {
+        return false;
+    };
+    if declared.len() != resolved.len()
+        || raw.map_or(0, ts_binder::semantic::SymbolTable::len) >= resolved.len()
+        || raw
+            .into_iter()
+            .flat_map(ts_binder::semantic::SymbolTable::iter)
+            .any(|(name, symbol)| {
+                resolved
+                    .get(name)
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    != store.get_merged_symbol(symbol)
+            })
+    {
+        return false;
+    }
+    let mut actual_computed = 0usize;
+    let valid = declared.iter().all(|(name, symbol)| {
+        if resolved.get(name) != Some(symbol) {
+            return false;
+        }
+        if let Some(raw) = raw.and_then(|raw| raw.get(name)) {
+            return store.get_merged_symbol(raw) == Some(symbol);
+        }
+        let Some(member) = store.symbol(symbol) else {
+            return false;
+        };
+        let Some(declarations) = member.declarations() else {
+            return false;
+        };
+        let Some(links) = store.value_symbol_links(symbol) else {
+            return false;
+        };
+        let Some(count) = actual_computed.checked_add(declarations.len()) else {
+            return false;
+        };
+        actual_computed = count;
+        valid_late_bound_unique_symbol_member(
+            store,
+            owner,
+            symbol,
+            declarations,
+            links,
+            Some(resolved),
+        )
+    });
+    valid && actual_computed == computed_count
 }
 
 fn declared_members(
@@ -1310,6 +1423,195 @@ fn valid_accessor_declarations(
         && flags.contains(SymbolFlags::PROPERTY) == (property_count != 0)
 }
 
+/// Checks the source and key identities of a published computed member.
+pub(super) fn valid_late_bound_unique_symbol_member(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    declarations: &[NodeRef],
+    links: &ValueSymbolLinks,
+    resolved_table: Option<&ts_binder::semantic::SymbolTable>,
+) -> bool {
+    let Some(member) = store.symbol(symbol) else {
+        return false;
+    };
+    let method = member.flags().contains(SymbolFlags::METHOD);
+    let member_flag = if method {
+        SymbolFlags::METHOD
+    } else {
+        SymbolFlags::PROPERTY
+    };
+    let allowed_flags = member_flag | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT;
+    let allowed_checks = CheckFlags::LATE
+        | if method {
+            CheckFlags::NONE
+        } else {
+            CheckFlags::READONLY
+        };
+    let Some(name_type) = links.name_type else {
+        return false;
+    };
+    let Some(record) = store.type_payload(name_type) else {
+        return false;
+    };
+    let TypeData::UniqueEsSymbol(unique) = record.data() else {
+        return false;
+    };
+    let Some(key) = record.symbol() else {
+        return false;
+    };
+    let Some(key_record) = store.symbol(key) else {
+        return false;
+    };
+    let Some(key_declaration) = key_record.value_declaration() else {
+        return false;
+    };
+    let Some(annotation) = store.source_direct_type_annotation(key_declaration) else {
+        return false;
+    };
+    let key_property = key_record.flags() == SymbolFlags::PROPERTY;
+    if !member
+        .flags()
+        .contains(member_flag | SymbolFlags::TRANSIENT)
+        || member.flags().without(allowed_flags) != SymbolFlags::NONE
+        || !member.check_flags().contains(CheckFlags::LATE)
+        || member.check_flags().bits() & !allowed_checks.bits() != 0
+        || !member.name().is_late_bound()
+        || member.name() != unique.name.as_ref()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store.get_parent_of_symbol(symbol) != Some(owner)
+        || declarations.is_empty()
+        || member.declarations() != Some(declarations)
+        || member
+            .value_declaration()
+            .is_none_or(|declaration| !declarations.contains(&declaration))
+        || member.members().is_some()
+        || member.exports().is_some()
+        || member.export_symbol().is_some()
+        || store
+            .value_symbol_links(key)
+            .and_then(|links| links.resolved_type)
+            != Some(name_type)
+        || resolved_table.and_then(|table| table.get(member.name())) != Some(symbol)
+        || links
+            != &(ValueSymbolLinks {
+                resolved_type: links.resolved_type,
+                name_type: Some(name_type),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return false;
+    }
+    if key_property {
+        let Some(key_owner) = store.get_parent_of_symbol(key) else {
+            return false;
+        };
+        let Some(key_owner_record) = store.symbol(key_owner) else {
+            return false;
+        };
+        if !key_owner_record
+            .flags()
+            .intersects(SymbolFlags::INTERFACE | SymbolFlags::TYPE_LITERAL | SymbolFlags::CLASS)
+            || !matches!(store.source_node_parent(key_declaration), Some(SourceNodeParent::Parent(parent)) if key_owner_record.declarations().is_some_and(|declarations| declarations.contains(&parent)))
+            || store
+                .source_child_with_kind(key_declaration, SyntaxKind::ReadonlyKeyword)
+                .is_none()
+            || key_owner_record.flags().contains(SymbolFlags::CLASS)
+                && store
+                    .source_child_with_kind(key_declaration, SyntaxKind::StaticKeyword)
+                    .is_none()
+            || key_record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
+            || ![key_owner_record.members(), key_owner_record.exports()]
+                .into_iter()
+                .flatten()
+                .any(|table| {
+                    store
+                        .symbol_table(table)
+                        .and_then(|table| table.get(key_record.name()))
+                        .and_then(|symbol| store.get_merged_symbol(symbol))
+                        == Some(key)
+                })
+        {
+            return false;
+        }
+    } else if !key_record
+        .flags()
+        .contains(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+        || key_record.check_flags() != CheckFlags::NONE
+        || store.get_parent_of_symbol(key) != store.get_parent_of_symbol(owner)
+        || store.source_node_kind(key_declaration) != Some(SyntaxKind::VariableDeclaration)
+    {
+        return false;
+    }
+    if method {
+        let Some(source) = store.late_bound_method_source(symbol) else {
+            return false;
+        };
+        let Some(early) = store.symbol(source) else {
+            return false;
+        };
+        if early.flags() != member.flags().without(SymbolFlags::TRANSIENT)
+            || early.check_flags() != CheckFlags::NONE
+            || early.name() != InternalSymbolName::Computed.as_ref()
+            || early.declarations() != Some(declarations)
+            || early.value_declaration() != member.value_declaration()
+            || store.get_parent_of_symbol(source) != Some(owner)
+            || early.members().is_some()
+            || early.exports().is_some()
+            || early.export_symbol().is_some()
+            || store.get_merged_symbol(source) != Some(source)
+            || store
+                .late_bound_links(source)
+                .and_then(|links| links.late_symbol)
+                != Some(symbol)
+        {
+            return false;
+        }
+    }
+    declarations.iter().all(|declaration| {
+        if store
+            .symbol_node_links(*declaration)
+            .and_then(|links| links.resolved_symbol)
+            != Some(symbol)
+        {
+            return false;
+        }
+        let Some(name) =
+            store.source_child_with_kind(*declaration, SyntaxKind::ComputedPropertyName)
+        else {
+            return false;
+        };
+        let expression = match (
+            store.source_child_with_kind(name, SyntaxKind::Identifier),
+            store.source_child_with_kind(name, SyntaxKind::PropertyAccessExpression),
+        ) {
+            (Some(expression), None) | (None, Some(expression)) => expression,
+            _ => return false,
+        };
+        if (method || key_property)
+            && (store
+                .symbol_node_links(expression)
+                .and_then(|links| links.resolved_symbol)
+                != Some(key)
+                || store
+                    .type_node_links(expression)
+                    .and_then(|links| links.resolved_type)
+                    != Some(name_type))
+        {
+            return false;
+        }
+        resolved_computed_member_key(
+            store,
+            &PlannedComputedMemberKey {
+                expression,
+                key_symbol: key,
+                type_node: annotation,
+            },
+        )
+        .is_ok_and(|resolved| resolved == Some((name_type, unique.name.clone())))
+    })
+}
+
 fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSymbolId) -> bool {
     let Some(record) = store.symbol(property) else {
         return false;
@@ -1322,6 +1624,9 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
     };
     let method = record.flags().contains(SymbolFlags::METHOD);
     let accessor = record.flags().intersects(SymbolFlags::ACCESSOR);
+    let late = record.name().is_late_bound()
+        || record.check_flags().contains(CheckFlags::LATE)
+        || record.flags().contains(SymbolFlags::TRANSIENT);
     let expected_flags = if method {
         SymbolFlags::METHOD
     } else if accessor {
@@ -1337,13 +1642,35 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
         SymbolFlags::OPTIONAL
     } else {
         SymbolFlags::NONE
+    } | if late {
+        SymbolFlags::TRANSIENT
+    } else {
+        SymbolFlags::NONE
     };
     if record.flags() != expected_flags
         || method && accessor
         || accessor
             && record.flags().contains(SymbolFlags::OPTIONAL)
             && !record.flags().contains(SymbolFlags::PROPERTY)
-        || if method || accessor {
+        || if late {
+            let owner = store.get_parent_of_symbol(property);
+            let links = store.value_symbol_links(property);
+            let table = owner
+                .and_then(|owner| store.members_and_exports_links(owner))
+                .and_then(|links| links.table(MembersOrExportsResolutionKind::ResolvedMembers))
+                .and_then(|table| store.symbol_table(table));
+            accessor
+                || !owner.zip(links).is_some_and(|(owner, links)| {
+                    valid_late_bound_unique_symbol_member(
+                        store,
+                        owner,
+                        property,
+                        declarations,
+                        links,
+                        table,
+                    )
+                })
+        } else if method || accessor {
             record.check_flags() != CheckFlags::NONE
         } else {
             record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
@@ -1386,6 +1713,7 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
             == &ValueSymbolLinks {
                 resolved_type: Some(read_type),
                 write_type,
+                name_type: if late { links.name_type } else { None },
                 ..ValueSymbolLinks::default()
             }
             && store.type_payload(read_type).is_some()

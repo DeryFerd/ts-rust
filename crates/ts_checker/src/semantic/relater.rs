@@ -6125,13 +6125,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let mut session = super::instantiate::InstantiationSession::new(
             super::instantiate::InstantiationLimits::default(),
         );
-        super::object_members::resolve_object_property_by_key(
+        let property = super::object_members::resolve_object_property_by_key(
             self,
             None,
             type_id,
             EscapedNameRef::source(name),
             &mut session,
-        )
+        )?;
+        if property.is_none()
+            && self
+                .type_payload(type_id)
+                .and_then(|record| record.data().structured())
+                .is_some_and(|structured| {
+                    structured
+                        .signatures
+                        .as_ref()
+                        .is_some_and(|signatures| !signatures.is_empty())
+                })
+        {
+            return Err(RelationUnavailable::StructuredSignatures(type_id));
+        }
+        Ok(property)
     }
 
     /// Uses the validated property view for a byte-exact source or symbol key.

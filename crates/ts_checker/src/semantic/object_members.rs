@@ -84,6 +84,20 @@ pub(super) fn resolve_object_property_by_key(
     let record = store
         .type_payload(receiver)
         .ok_or(RelationUnavailable::Type(receiver))?;
+    if matches!(record.data(), TypeData::Object(_))
+        && let Some(owner) = record.symbol().filter(|owner| {
+            store
+                .symbol(*owner)
+                .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+        })
+    {
+        if super::classes::authenticated_class_constructor_value(store, owner)
+            .is_none_or(|(value, _)| value != receiver)
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(receiver));
+        }
+        return property_from_validated_members(store, receiver, name);
+    }
     let target = match record.data() {
         TypeData::TypeReference(reference) => reference.object.target,
         TypeData::Interface(interface)
@@ -134,7 +148,354 @@ pub(super) fn resolve_object_property_by_key(
             }
         });
     }
-    store.resolved_own_property_by_key(receiver, name)
+    match validate_stored_declared_call_set(store, receiver) {
+        StoredDeclaredCallSetValidation::Valid(_) => {
+            property_from_validated_members(store, receiver, name)
+        }
+        StoredDeclaredCallSetValidation::Malformed => {
+            Err(RelationUnavailable::InvalidStructuredMembers(receiver))
+        }
+        StoredDeclaredCallSetValidation::NotDeclaredCallSet => {
+            if let Some(property) = super::structured_members::validated_interface_property_by_key(
+                store, receiver, name,
+            ) {
+                return Ok(property);
+            }
+            if store.type_payload(receiver).is_some_and(|record| {
+                matches!(record.data(), TypeData::Interface(_))
+                    && record
+                        .symbol()
+                        .and_then(|owner| store.source_computed_member_count(owner))
+                        .is_some_and(|count| count != 0)
+            }) {
+                return Err(RelationUnavailable::InvalidStructuredMembers(receiver));
+            }
+            store.resolved_own_property_by_key(receiver, name)
+        }
+    }
+}
+
+fn property_from_validated_members(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+    let structured = store
+        .type_payload(receiver)
+        .and_then(|record| record.data().structured())
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+    let Some(members) = structured.members else {
+        return Ok(None);
+    };
+    let Some(symbol) = store
+        .symbol_table(members)
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?
+        .get(name)
+    else {
+        return Ok(None);
+    };
+    if !structured
+        .properties
+        .as_deref()
+        .unwrap_or_default()
+        .contains(&symbol)
+    {
+        return Err(RelationUnavailable::InvalidStructuredMembers(receiver));
+    }
+    let property = store
+        .symbol(symbol)
+        .ok_or(RelationUnavailable::Symbol(symbol))?;
+    let type_ = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+        .ok_or(RelationUnavailable::UnresolvedPropertyType(symbol))?;
+    Ok(Some(ResolvedOwnProperty {
+        symbol,
+        type_,
+        optional: property.flags().contains(SymbolFlags::OPTIONAL),
+        readonly: property.check_flags().contains(CheckFlags::READONLY),
+    }))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum KnownSymbolKeyError {
+    MissingBootstrap,
+    MissingGlobalTypes,
+    InvalidSymbol(SemanticSymbolId),
+    InvalidType(TypeId),
+    NeedsValueType {
+        symbol: SemanticSymbolId,
+        annotation: Option<NodeRef>,
+    },
+    Relation(RelationUnavailable),
+}
+
+/// Gets the actual global `Symbol.iterator` key before the pinned fallback.
+/// An unresolved value is a query dependency, not a missing global symbol.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn iterator_key(
+    store: &mut CanonicalTypeMapperStore,
+) -> Result<EscapedName, KnownSymbolKeyError> {
+    known_symbol_key(store, None, "iterator")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn iterator_key_with_global_types(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+) -> Result<EscapedName, KnownSymbolKeyError> {
+    known_symbol_key(store, Some(globals), "iterator")
+}
+
+fn known_symbol_key(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    name: &str,
+) -> Result<EscapedName, KnownSymbolKeyError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(KnownSymbolKeyError::MissingBootstrap)?;
+    let globals = store
+        .symbol_table(bootstrap.globals)
+        .ok_or(KnownSymbolKeyError::MissingBootstrap)?;
+    let fallback = || ts_binder::semantic::SymbolStore::known_symbol_name(name);
+    let Some(raw) = globals.get_source("Symbol") else {
+        return Ok(fallback());
+    };
+    let symbol = store
+        .get_merged_symbol(raw)
+        .ok_or(KnownSymbolKeyError::InvalidSymbol(raw))?;
+    let record = store
+        .symbol(symbol)
+        .ok_or(KnownSymbolKeyError::InvalidSymbol(symbol))?;
+    if record.name().as_utf8() != Some("Symbol") || record.check_flags() != CheckFlags::NONE {
+        return Err(KnownSymbolKeyError::InvalidSymbol(symbol));
+    }
+    if !record.flags().intersects(SymbolFlags::VALUE) {
+        if record.flags().contains(SymbolFlags::ALIAS) {
+            return Err(KnownSymbolKeyError::NeedsValueType {
+                symbol,
+                annotation: None,
+            });
+        }
+        return Ok(fallback());
+    }
+    let declaration = record
+        .value_declaration()
+        .ok_or(KnownSymbolKeyError::InvalidSymbol(symbol))?;
+    let symbol_flags = record.flags();
+    if record
+        .declarations()
+        .is_none_or(|declarations| !declarations.contains(&declaration))
+        || store.source_node_kind(declaration).is_none()
+    {
+        return Err(KnownSymbolKeyError::InvalidSymbol(symbol));
+    }
+    let annotation = store.source_direct_type_annotation(declaration);
+    let annotation_type =
+        annotation.and_then(|annotation| cached_planned_type_identity(store, annotation));
+    if annotation
+        .and_then(|annotation| store.type_node_links(annotation))
+        .and_then(|links| links.resolved_type)
+        .zip(annotation_type)
+        .is_some_and(|(cached, expected)| cached != expected)
+    {
+        return Err(KnownSymbolKeyError::InvalidSymbol(symbol));
+    }
+    let links = store
+        .value_symbol_links(symbol)
+        .cloned()
+        .unwrap_or_default();
+    if links
+        != (ValueSymbolLinks {
+            resolved_type: links.resolved_type,
+            ..ValueSymbolLinks::default()
+        })
+        || links
+            .resolved_type
+            .zip(annotation_type)
+            .is_some_and(|(value, annotation)| value != annotation)
+    {
+        return Err(KnownSymbolKeyError::InvalidSymbol(symbol));
+    }
+    let value_type = links
+        .resolved_type
+        .or(annotation_type)
+        .ok_or(KnownSymbolKeyError::NeedsValueType { symbol, annotation })?;
+    let value = store
+        .type_payload(value_type)
+        .ok_or(KnownSymbolKeyError::InvalidType(value_type))?;
+    if symbol_flags.contains(SymbolFlags::CLASS)
+        && super::classes::authenticated_class_constructor_value(store, symbol)
+            .is_none_or(|(type_, _)| type_ != value_type)
+        || symbol_flags.intersects(SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE)
+            && value.symbol() != Some(symbol)
+    {
+        return Err(KnownSymbolKeyError::InvalidSymbol(symbol));
+    }
+    if value.flags().intersects(TypeFlags::ANY) {
+        return Ok(fallback());
+    }
+    if let Some(annotation) = annotation
+        .filter(|annotation| store.source_node_kind(*annotation) == Some(SyntaxKind::TypeReference))
+    {
+        let mut target = store
+            .symbol_node_links(annotation)
+            .and_then(|links| links.resolved_symbol)
+            .and_then(|target| store.get_merged_symbol(target))
+            .ok_or(KnownSymbolKeyError::InvalidSymbol(symbol))?;
+        let mut aliases = HashSet::new();
+        while store
+            .symbol(target)
+            .is_some_and(|record| record.flags().contains(SymbolFlags::ALIAS))
+        {
+            if !aliases.insert(target) {
+                return Err(KnownSymbolKeyError::InvalidSymbol(target));
+            }
+            target = store
+                .alias_symbol_links(target)
+                .and_then(|links| links.alias_target.symbol())
+                .and_then(|target| store.get_merged_symbol(target))
+                .ok_or(KnownSymbolKeyError::InvalidSymbol(target))?;
+        }
+        let target_record = store
+            .symbol(target)
+            .ok_or(KnownSymbolKeyError::InvalidSymbol(target))?;
+        let identity_matches = if target_record.flags().contains(SymbolFlags::TYPE_ALIAS) {
+            store
+                .type_alias_links(target)
+                .is_some_and(|links| links.declared_type == Some(value_type))
+                || value
+                    .alias()
+                    .and_then(|alias| store.type_alias(alias))
+                    .is_some_and(|alias| alias.symbol() == Some(target))
+        } else {
+            value.symbol() == Some(target)
+        };
+        if !identity_matches {
+            return Err(KnownSymbolKeyError::InvalidSymbol(symbol));
+        }
+    }
+    let signatures = value
+        .data()
+        .structured()
+        .map(|structured| {
+            (
+                structured.call_signature_count,
+                structured.signatures.as_deref().map_or(0, <[_]>::len),
+            )
+        })
+        .unwrap_or_default();
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    let mut property = resolve_object_property_by_key(
+        store,
+        global_types,
+        value_type,
+        EscapedNameRef::source(name),
+        &mut session,
+    )
+    .map_err(KnownSymbolKeyError::Relation)?;
+    if property.is_none() {
+        if let Some(global_types) = global_types {
+            let function = if signatures.0 != 0 {
+                Some(global_types.callable_function_type)
+            } else if signatures.1 != 0 {
+                Some(global_types.newable_function_type)
+            } else {
+                None
+            };
+            for augment in function
+                .into_iter()
+                .chain(std::iter::once(global_types.object_type))
+            {
+                property = resolve_object_property_by_key(
+                    store,
+                    Some(global_types),
+                    augment,
+                    EscapedNameRef::source(name),
+                    &mut session,
+                )
+                .map_err(KnownSymbolKeyError::Relation)?;
+                if property.is_some() {
+                    break;
+                }
+            }
+        } else {
+            let globals = store
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                .ok_or(KnownSymbolKeyError::MissingBootstrap)?;
+            if globals.get_source("Object").is_some()
+                || signatures.1 != 0
+                    && ["Function", "CallableFunction", "NewableFunction"]
+                        .into_iter()
+                        .any(|name| globals.get_source(name).is_some())
+            {
+                return Err(KnownSymbolKeyError::MissingGlobalTypes);
+            }
+        }
+    }
+    let Some(property) = property else {
+        return Ok(fallback());
+    };
+    let record = store
+        .type_payload(property.type_)
+        .ok_or(KnownSymbolKeyError::InvalidType(property.type_))?;
+    match record.data() {
+        TypeData::Literal(literal) => match &literal.value {
+            super::type_records::LiteralValue::String(name)
+                if record.flags().intersects(TypeFlags::STRING_LITERAL) =>
+            {
+                Ok(EscapedName::source(ts_ast::normalize_js_string(name)))
+            }
+            super::type_records::LiteralValue::Number(number)
+                if record.flags().intersects(TypeFlags::NUMBER_LITERAL) =>
+            {
+                Ok(EscapedName::source(number.to_string()))
+            }
+            _ if record
+                .flags()
+                .intersects(TypeFlags::STRING_LITERAL | TypeFlags::NUMBER_LITERAL) =>
+            {
+                Err(KnownSymbolKeyError::InvalidType(property.type_))
+            }
+            _ => Ok(fallback()),
+        },
+        TypeData::UniqueEsSymbol(unique) => {
+            let key = record
+                .symbol()
+                .ok_or(KnownSymbolKeyError::InvalidType(property.type_))?;
+            let key_record = store
+                .symbol(key)
+                .ok_or(KnownSymbolKeyError::InvalidSymbol(key))?;
+            let global_id = store
+                .symbol_store()
+                .assigned_global_symbol_id(key)
+                .ok_or(KnownSymbolKeyError::InvalidSymbol(key))?;
+            let suffix = unique
+                .name
+                .as_bytes()
+                .strip_prefix(b"\xFE@")
+                .and_then(|name| name.strip_prefix(key_record.name().as_bytes()))
+                .and_then(|name| name.strip_prefix(b"@"));
+            if record.flags() != TypeFlags::UNIQUE_ES_SYMBOL
+                || record.object_flags() != ObjectFlags::NONE
+                || record.alias().is_some()
+                || store.get_merged_symbol(key) != Some(key)
+                || suffix != Some(global_id.to_string().as_bytes())
+            {
+                return Err(KnownSymbolKeyError::InvalidType(property.type_));
+            }
+            Ok(unique.name.clone())
+        }
+        _ if record.flags().intersects(
+            TypeFlags::STRING_LITERAL | TypeFlags::NUMBER_LITERAL | TypeFlags::UNIQUE_ES_SYMBOL,
+        ) =>
+        {
+            Err(KnownSymbolKeyError::InvalidType(property.type_))
+        }
+        _ => Ok(fallback()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -46,7 +46,9 @@ use super::{
     reference_types::{DirectGenericReferenceError, validate_direct_generic_reference},
     signatures::{SignatureFlags, SignatureInstantiationError},
     store::SourceNodeParent,
-    structured_members::{valid_index_symbol, valid_interface_method_value},
+    structured_members::{
+        valid_index_symbol, valid_interface_method_value, valid_late_bound_unique_symbol_member,
+    },
     type_records::{
         ConstrainedTypeData, LiteralValue, StructuredTypeData, TypeCacheState, TypeData,
     },
@@ -3157,6 +3159,7 @@ fn declared_target_header(
     let mut seen = HashSet::with_capacity(declared_count);
     let mut seen_declarations = HashSet::with_capacity(declared_count);
     let mut late_count = 0usize;
+    let mut late_declaration_count = 0usize;
     for (name, symbol) in declared_table
         .into_iter()
         .flat_map(ts_binder::semantic::SymbolTable::iter)
@@ -3220,9 +3223,21 @@ fn declared_target_header(
             || property.flags().contains(SymbolFlags::TRANSIENT)
             || property.name().is_late_bound()
             || links.name_type.is_some();
-        let valid_identity = if method {
-            !late
-                && property.flags() == SymbolFlags::METHOD
+        let valid_identity = if late {
+            valid_late_bound_unique_symbol_member(
+                store,
+                owner,
+                symbol,
+                declarations,
+                links,
+                resolved_table,
+            ) && (!method || valid_interface_method_value(store, symbol, type_).is_some())
+        } else if method {
+            property.flags().contains(SymbolFlags::METHOD)
+                && property
+                    .flags()
+                    .without(SymbolFlags::METHOD | SymbolFlags::OPTIONAL)
+                    == SymbolFlags::NONE
                 && property.check_flags() == CheckFlags::NONE
                 && raw_table
                     .get(property.name())
@@ -3234,15 +3249,6 @@ fn declared_target_header(
                         ..ValueSymbolLinks::default()
                     })
                 && valid_interface_method_value(store, symbol, type_).is_some()
-        } else if late {
-            valid_late_bound_unique_symbol_member(
-                store,
-                owner,
-                symbol,
-                declarations,
-                links,
-                resolved_table,
-            )
         } else {
             let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
             property.flags().contains(SymbolFlags::PROPERTY)
@@ -3280,6 +3286,9 @@ fn declared_target_header(
             late_count = late_count
                 .checked_add(1)
                 .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+            late_declaration_count = late_declaration_count
+                .checked_add(declarations.len())
+                .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
         }
         properties.push((
             owner_index,
@@ -3296,6 +3305,9 @@ fn declared_target_header(
     let early_count = declared_count
         .checked_sub(late_count)
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+    if store.source_computed_member_count(owner) != Some(late_declaration_count) {
+        return Err(GenericInterfaceMemberError::InvalidTarget(target));
+    }
     if raw_table.len()
         != early_count
             .checked_add(parameter_symbols.len())
@@ -3445,86 +3457,6 @@ fn cold_generic_interface_has_authenticated_non_property_members(
         }
     }
     unsupported_member
-}
-
-fn valid_late_bound_unique_symbol_member(
-    store: &CanonicalTypeMapperStore,
-    owner: SemanticSymbolId,
-    symbol: SemanticSymbolId,
-    declarations: &[ts_ast::NodeRef],
-    links: &ValueSymbolLinks,
-    resolved_table: Option<&ts_binder::semantic::SymbolTable>,
-) -> bool {
-    let Some(property) = store.symbol(symbol) else {
-        return false;
-    };
-    let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT;
-    let allowed_checks = CheckFlags::LATE | CheckFlags::READONLY;
-    let Some(name_type) = links.name_type else {
-        return false;
-    };
-    let Some(type_record) = store.type_payload(name_type) else {
-        return false;
-    };
-    let TypeData::UniqueEsSymbol(unique) = type_record.data() else {
-        return false;
-    };
-    let Some(key) = type_record.symbol() else {
-        return false;
-    };
-    let Some(key_record) = store.symbol(key) else {
-        return false;
-    };
-    let Some(global_id) = store.symbol_store().assigned_global_symbol_id(key) else {
-        return false;
-    };
-    let Some(suffix) = unique
-        .name
-        .as_bytes()
-        .strip_prefix(b"\xFE@")
-        .and_then(|name| name.strip_prefix(key_record.name().as_bytes()))
-        .and_then(|name| name.strip_prefix(b"@"))
-    else {
-        return false;
-    };
-
-    property
-        .flags()
-        .contains(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
-        && property.flags().without(allowed_flags) == SymbolFlags::NONE
-        && property.check_flags().contains(CheckFlags::LATE)
-        && property.check_flags().bits() & !allowed_checks.bits() == 0
-        && property.name().is_late_bound()
-        && property.name() == unique.name.as_ref()
-        && suffix == global_id.to_string().as_bytes()
-        && type_record.flags() == TypeFlags::UNIQUE_ES_SYMBOL
-        && type_record.object_flags() == ObjectFlags::NONE
-        && type_record.alias().is_none()
-        && key_record
-            .flags()
-            .contains(SymbolFlags::BLOCK_SCOPED_VARIABLE)
-        && store.get_merged_symbol(key) == Some(key)
-        && store.get_parent_of_symbol(key) == store.get_parent_of_symbol(owner)
-        && key_record.value_declaration().is_some_and(|declaration| {
-            store.source_node_kind(declaration) == Some(SyntaxKind::VariableDeclaration)
-        })
-        && store
-            .value_symbol_links(key)
-            .and_then(|links| links.resolved_type)
-            == Some(name_type)
-        && resolved_table.and_then(|table| table.get(property.name())) == Some(symbol)
-        && declarations.iter().all(|declaration| {
-            store
-                .symbol_node_links(*declaration)
-                .and_then(|links| links.resolved_symbol)
-                == Some(symbol)
-        })
-        && links
-            == &(ValueSymbolLinks {
-                resolved_type: links.resolved_type,
-                name_type: Some(name_type),
-                ..ValueSymbolLinks::default()
-            })
 }
 
 fn valid_generic_interface_declaration_owner(
@@ -6009,6 +5941,657 @@ mod tests {
             ),
             before
         );
+    }
+
+    #[test]
+    fn iterator_symbol_key_uses_the_global_value_annotation_before_fallback() {
+        use crate::semantic::object_members::{
+            KnownSymbolKeyError, iterator_key, iterator_key_with_global_types,
+        };
+        for (index, (body, expected)) in [
+            ("readonly iterator: unique symbol", None),
+            ("(): symbol; readonly iterator: unique symbol", None),
+            ("iterator: \"custom\"", Some("custom")),
+            ("iterator: 7", Some("7")),
+            ("iterator: number", Some("__@iterator")),
+            ("other: string", Some("__@iterator")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(&format!(
+                "interface Factory {{ {body} }} interface OtherFactory {{ iterator: \"wrong\" }} declare const Symbol: Factory;"
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(6_240 + u32::try_from(index).unwrap());
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            let symbol = source_symbol(&parsed, file, &context, "Symbol");
+            let declaration = context
+                .store()
+                .symbol(symbol)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let annotation = context
+                .store()
+                .source_direct_type_annotation(declaration)
+                .unwrap();
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                iterator_key(context.store_mut_for_test()),
+                Err(KnownSymbolKeyError::NeedsValueType {
+                    symbol,
+                    annotation: Some(annotation)
+                })
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+            let value_type = context.get_type_from_type_node(annotation).unwrap();
+            let actual = iterator_key(context.store_mut_for_test()).unwrap();
+            let globals = context.global_types().clone();
+            assert_eq!(
+                iterator_key_with_global_types(context.store_mut_for_test(), &globals),
+                Ok(actual.clone())
+            );
+            if let Some(expected) = expected {
+                assert_eq!(actual.escaped_display().to_string(), expected);
+                assert_eq!(actual.as_ref().is_late_bound(), expected == "__@iterator");
+            } else {
+                let value = context
+                    .store()
+                    .type_payload(value_type)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap();
+                let property = context
+                    .store()
+                    .symbol_table(value.members.unwrap())
+                    .unwrap()
+                    .get_source("iterator")
+                    .unwrap();
+                let property_type = context
+                    .store()
+                    .value_symbol_links(property)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                let TypeData::UniqueEsSymbol(unique) =
+                    context.store().type_payload(property_type).unwrap().data()
+                else {
+                    panic!("iterator must retain its unique key type");
+                };
+                assert_eq!(actual, unique.name);
+                assert_ne!(
+                    actual,
+                    ts_binder::semantic::SymbolStore::known_symbol_name("iterator")
+                );
+            }
+            let warm = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(iterator_key(context.store_mut_for_test()), Ok(actual));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                warm
+            );
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                iterator_key(context.store_mut_for_test()),
+                Err(KnownSymbolKeyError::InvalidSymbol(symbol))
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+            let other = source_symbol(&parsed, file, &context, "OtherFactory");
+            let other_type = context.get_declared_type_of_symbol(other).unwrap();
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(other_type),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            assert!(context.store_mut_for_test().set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(other_type),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                iterator_key(context.store_mut_for_test()),
+                Err(KnownSymbolKeyError::InvalidSymbol(symbol))
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn iterator_symbol_key_preserves_class_value_and_prototype_validation() {
+        use crate::semantic::object_members::{KnownSymbolKeyError, iterator_key};
+        let parsed = parse_source_file("declare class Symbol { static iterator: number; }");
+        let file = FileId::new(6_250);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let symbol = context
+            .store()
+            .symbol_table(context.globals())
+            .unwrap()
+            .get_source("Symbol")
+            .unwrap();
+        let members = context.get_nongeneric_class_members(symbol).unwrap();
+        let store = context.store_mut_for_test();
+        assert_eq!(
+            iterator_key(store),
+            Ok(ts_binder::semantic::SymbolStore::known_symbol_name(
+                "iterator"
+            ))
+        );
+        let original = store.value_symbol_links(symbol).unwrap().clone();
+        let any = store.intrinsic_bootstrap().unwrap().any_type;
+        assert!(store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(any),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            iterator_key(store),
+            Err(KnownSymbolKeyError::InvalidSymbol(symbol))
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert!(store.set_value_symbol_links(symbol, original));
+        let prototype = members.prototype();
+        let links = store
+            .value_symbol_links(prototype)
+            .cloned()
+            .unwrap_or_default();
+        assert!(store.set_value_symbol_links(
+            prototype,
+            ValueSymbolLinks {
+                resolved_type: Some(any),
+                ..links
+            }
+        ));
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            iterator_key(store),
+            Err(KnownSymbolKeyError::InvalidSymbol(symbol))
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn iterator_symbol_key_falls_back_only_for_absent_or_unusable_globals() {
+        use crate::semantic::object_members::iterator_key;
+        for source in [
+            "interface Other {}",
+            "interface Symbol {}",
+            "declare const Symbol: any;",
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(6_246);
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                iterator_key(context.store_mut_for_test()),
+                Ok(ts_binder::semantic::SymbolStore::known_symbol_name(
+                    "iterator"
+                ))
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn iterator_symbol_key_uses_callable_function_augmentation() {
+        use crate::semantic::object_members::{
+            KnownSymbolKeyError, iterator_key, iterator_key_with_global_types,
+        };
+        let parsed = parse_source_file(concat!(
+            "interface Function { iterator: \"inherited\" } ",
+            "interface Factory { (): symbol; } declare const Symbol: Factory;",
+        ));
+        let file = FileId::new(6_247);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let symbol = source_symbol(&parsed, file, &context, "Symbol");
+        let function = source_symbol(&parsed, file, &context, "Function");
+        let annotation = context
+            .store()
+            .source_direct_type_annotation(
+                context
+                    .store()
+                    .symbol(symbol)
+                    .unwrap()
+                    .value_declaration()
+                    .unwrap(),
+            )
+            .unwrap();
+        context.get_type_from_type_node(annotation).unwrap();
+        context.get_declared_type_of_symbol(function).unwrap();
+        let globals = context.global_types().clone();
+        assert_eq!(
+            iterator_key(context.store_mut_for_test()),
+            Err(KnownSymbolKeyError::MissingGlobalTypes)
+        );
+        assert_eq!(
+            iterator_key_with_global_types(context.store_mut_for_test(), &globals),
+            Ok(EscapedName::source("inherited"))
+        );
+    }
+
+    #[test]
+    fn late_bound_unique_symbol_method_members_keep_callable_identity_and_source_links() {
+        use crate::semantic::{
+            DeclaredTypeHost, LateBoundLinks,
+            object_members::{
+                plan_computed_member_key, publish_computed_member_key_links,
+                resolve_object_property_by_key,
+            },
+            production::GlobalMergeCompletion,
+        };
+        for (index, parameters) in ["", "<T>"].into_iter().enumerate() {
+            let return_text = if parameters.is_empty() { "number" } else { "T" };
+            let derived_text = if parameters.is_empty() {
+                ""
+            } else {
+                "interface Derived<T> extends Box<T> {}"
+            };
+            let parsed = parse_source_file(&format!(
+                "declare const key: unique symbol; interface Box{parameters} {{ [key](): {return_text}; }} {derived_text}"
+            ));
+            let file = FileId::new(6_248 + u32::try_from(index).unwrap());
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(ts_binder::CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let owner = source_symbol(&parsed, file, &context, "Box");
+            let target = context
+                .store_mut_for_test()
+                .get_declared_type_of_symbol(&host, owner)
+                .unwrap();
+            let (declaration, name) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, method.name),
+                    ))
+                })
+                .unwrap();
+            let key_plan = plan_computed_member_key(context.store(), &host, name).unwrap();
+            context.get_type_from_type_node(key_plan.type_node).unwrap();
+            let (key_type, key_name) =
+                publish_computed_member_key_links(context.store_mut_for_test(), &key_plan).unwrap();
+            let early = bound.symbol(declaration).unwrap();
+            let derived =
+                (!parameters.is_empty()).then(|| source_symbol(&parsed, file, &context, "Derived"));
+            let store = context.store_mut_for_test();
+            let raw = store.symbol(owner).unwrap().members();
+            let resolved = match raw {
+                Some(raw) => store.clone_symbol_table(raw).unwrap(),
+                None => store.alloc_symbol_table(),
+            };
+            let late = store
+                .create_late_bound_property_symbol(owner, early, key_type, resolved)
+                .unwrap();
+            let mut links = crate::semantic::MembersAndExportsLinks::default();
+            links.tables[MembersOrExportsResolutionKind::ResolvedMembers as usize] = Some(resolved);
+            assert!(store.set_members_and_exports_links(owner, links));
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let annotation = store.source_direct_type_annotation(declaration).unwrap();
+            let return_type = if parameters.is_empty() {
+                number
+            } else {
+                let NodeData::TypeReferenceNode(reference) =
+                    &parsed.arena.get(annotation.node).unwrap().data
+                else {
+                    panic!("the generic method must return its parameter");
+                };
+                let type_name =
+                    NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+                let parameter = host
+                    .name_resolver_host(store)
+                    .unwrap()
+                    .resolve_entity_name(type_name, SymbolFlags::TYPE)
+                    .unwrap()
+                    .unwrap();
+                let type_ = store.get_declared_type_of_symbol(&host, parameter).unwrap();
+                assert!(store.set_symbol_node_links(
+                    annotation,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(parameter)
+                    }
+                ));
+                assert!(store.set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+                type_
+            };
+            let callable = store
+                .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(late))
+                .unwrap();
+            let signature = store
+                .alloc_signature(
+                    SignatureFlags::NONE,
+                    Some(declaration),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    Some(return_type),
+                    None,
+                    0,
+                )
+                .unwrap();
+            assert!(store.set_signature_links(
+                declaration,
+                SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                }
+            ));
+            assert!(store.set_structured_type_members(
+                callable,
+                None,
+                None,
+                Some(vec![signature]),
+                None,
+                None
+            ));
+            assert!(store.set_value_symbol_links(
+                late,
+                ValueSymbolLinks {
+                    resolved_type: Some(callable),
+                    name_type: Some(key_type),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            assert!(
+                store.set_callable_signature_parameter_types_batch(vec![(signature, Vec::new())])
+            );
+            let members = store.alloc_symbol_table();
+            assert_eq!(
+                store.insert_symbol(members, key_name.clone(), late),
+                Some(None)
+            );
+            assert!(store.publish_interface_no_base_resolution(target));
+            assert!(store.set_interface_declared_members(
+                target,
+                true,
+                Some(members),
+                None,
+                None,
+                None
+            ));
+            let receiver = if parameters.is_empty() {
+                assert!(store.set_structured_type_members(
+                    target,
+                    Some(members),
+                    Some(vec![late]),
+                    None,
+                    None,
+                    None
+                ));
+                target
+            } else {
+                store
+                    .create_direct_generic_reference_type(target, &[number])
+                    .unwrap()
+            };
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            assert!(valid_late_bound_unique_symbol_member(
+                store,
+                owner,
+                late,
+                &[declaration],
+                store.value_symbol_links(late).unwrap(),
+                store.symbol_table(resolved),
+            ));
+            assert!(
+                valid_interface_method_value(store, late, callable).is_some(),
+                "method callable: {:?}, signature: {:?}",
+                store.type_payload(callable),
+                store.signature(signature)
+            );
+            if parameters.is_empty() {
+                assert!(
+                    crate::semantic::structured_members::valid_declared_member_table(
+                        store,
+                        owner,
+                        Some(members)
+                    )
+                );
+            }
+            let property = resolve_object_property_by_key(
+                store,
+                None,
+                receiver,
+                key_name.as_ref(),
+                &mut session,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "method {parameters:?}: {error:?}, receiver: {:?}",
+                    store.type_payload(receiver)
+                )
+            })
+            .unwrap();
+            if parameters.is_empty() {
+                assert_eq!(property.symbol, late);
+                assert_eq!(property.type_, callable);
+            } else {
+                assert_ne!(property.symbol, late);
+                assert_ne!(property.type_, callable);
+                let links = store.value_symbol_links(property.symbol).unwrap();
+                assert_eq!(links.target, Some(late));
+                assert_eq!(links.name_type, Some(key_type));
+                let instantiated = store
+                    .type_payload(property.type_)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .signatures
+                    .as_ref()
+                    .unwrap()[0];
+                assert_eq!(
+                    store
+                        .signature(instantiated)
+                        .unwrap()
+                        .resolved_return_type(),
+                    Some(number)
+                );
+                assert_eq!(
+                    store.signature(signature).unwrap().resolved_return_type(),
+                    Some(return_type)
+                );
+                assert_eq!(
+                    store.type_node_links(annotation).unwrap().resolved_type,
+                    Some(return_type)
+                );
+            }
+            let warm = (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                resolve_object_property_by_key(
+                    store,
+                    None,
+                    receiver,
+                    key_name.as_ref(),
+                    &mut session
+                ),
+                Ok(Some(property))
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths()
+                ),
+                warm
+            );
+            if let Some(derived) = derived {
+                let derived = store.get_declared_type_of_symbol(&host, derived).unwrap();
+                let TypeData::Interface(data) = store.type_payload(derived).unwrap().data() else {
+                    panic!("Derived must keep its interface target");
+                };
+                let parameter = data.reference.resolved_type_arguments.as_ref().unwrap()[0];
+                let base = store
+                    .create_direct_generic_reference_type(target, &[parameter])
+                    .unwrap();
+                assert!(store.set_interface_base_resolution(derived, true, None, Some(vec![base])));
+                assert!(
+                    store.set_interface_declared_members(derived, true, None, None, None, None)
+                );
+                let inherited = store
+                    .create_direct_generic_reference_type(derived, &[number])
+                    .unwrap();
+                assert_eq!(
+                    resolve_object_property_by_key(
+                        store,
+                        None,
+                        inherited,
+                        key_name.as_ref(),
+                        &mut session
+                    ),
+                    Ok(Some(property))
+                );
+            }
+            assert!(store.set_late_bound_links(early, LateBoundLinks::default()));
+            let before = (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            );
+            assert!(
+                resolve_object_property_by_key(
+                    store,
+                    None,
+                    receiver,
+                    key_name.as_ref(),
+                    &mut session
+                )
+                .is_err()
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths()
+                ),
+                before
+            );
+            assert!(store.set_late_bound_links(
+                early,
+                LateBoundLinks {
+                    late_symbol: Some(late)
+                }
+            ));
+            assert_eq!(
+                resolve_object_property_by_key(
+                    store,
+                    None,
+                    receiver,
+                    key_name.as_ref(),
+                    &mut session
+                ),
+                Ok(Some(property))
+            );
+        }
     }
 
     #[test]
