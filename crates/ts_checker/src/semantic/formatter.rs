@@ -3726,6 +3726,9 @@ fn display_interface_name(
         validate_merged_interface_display_owner(store, host, type_id, symbol_id)?;
     }
     if resolved {
+        if !interface_display_property_annotations_match(store, symbol_id) {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
         if validate_resolved_named_interface(store, host, type_id, symbol_id, interface).is_err()
             && !keyof_types::plan_nongeneric_keyof_type(store, type_id).is_ok_and(|plan| {
                 plan.proof() == object_members::DeclaredPropertyObjectProof::Interface
@@ -3768,6 +3771,9 @@ fn interface_display_declarations_match(
     else {
         return false;
     };
+    if host.is_none() && !store.source_symbol_declarations_match(owner) {
+        return false;
+    }
     !declarations.is_empty()
         && declarations.iter().all(|&declaration| {
             if let Some(host) = host {
@@ -4103,7 +4109,6 @@ fn validate_resolved_named_interface(
                     .is_some_and(|property_type| {
                         interface_property_annotation_matches(
                             store,
-                            host,
                             property.type_node,
                             property_type,
                         )
@@ -4191,22 +4196,68 @@ fn validate_resolved_named_interface(
     Ok(())
 }
 
+fn interface_display_property_annotations_match(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+) -> bool {
+    let Some(owner) = store.symbol(owner) else {
+        return false;
+    };
+    let Some(members) = owner.members() else {
+        return true;
+    };
+    let Some(members) = store.symbol_table(members) else {
+        return false;
+    };
+    members.iter().all(|(_, property)| {
+        let Some(property) = store.get_merged_symbol(property) else {
+            return false;
+        };
+        let Some(record) = store.symbol(property) else {
+            return false;
+        };
+        if !record.flags().contains(SymbolFlags::PROPERTY) {
+            return true;
+        }
+        let Some(declaration) = record.value_declaration() else {
+            return false;
+        };
+        match store.source_node_kind(declaration) {
+            Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature) => {}
+            Some(SyntaxKind::GetAccessor | SyntaxKind::SetAccessor)
+                if record.flags().intersects(SymbolFlags::ACCESSOR) =>
+            {
+                return true;
+            }
+            _ => return false,
+        }
+        let Some(type_) = store
+            .value_symbol_links(property)
+            .and_then(|links| links.resolved_type)
+        else {
+            return false;
+        };
+        store
+            .source_direct_type_annotation(declaration)
+            .is_some_and(|annotation| {
+                interface_property_annotation_matches(store, annotation, type_)
+            })
+    })
+}
+
 fn interface_property_annotation_matches(
     store: &CanonicalTypeMapperStore,
-    host: &DeclaredTypeHost<'_>,
     mut annotation: NodeRef,
     type_: TypeId,
 ) -> bool {
     loop {
-        let Some(record) = host.node(annotation) else {
+        if store.source_node_kind(annotation) != Some(SyntaxKind::ParenthesizedType) {
+            return store.source_direct_type_annotation_is_exact(annotation, type_);
+        }
+        let Some(inner) = store.source_direct_type_annotation(annotation) else {
             return false;
         };
-        let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
-            return store.source_direct_type_annotation_is_exact(annotation, type_);
-        };
-        let inner = NodeRef::new(annotation.arena, annotation.file, parenthesized.type_);
-        if record.kind != SyntaxKind::ParenthesizedType
-            || inner.node.index() >= annotation.node.index()
+        if inner.node.index() >= annotation.node.index()
             || store.source_node_parent(inner) != Some(SourceNodeParent::Parent(annotation))
             || store.type_node_links(annotation).is_some_and(|links| {
                 links.outer_type_parameters.is_some()
@@ -6376,15 +6427,27 @@ mod tests {
         object
     }
 
-    fn alloc_named_interface(store: &mut CanonicalTypeMapperStore, name: &str) -> TypeId {
+    fn named_interface_store(name: &str) -> (CanonicalTypeMapperStore, TypeId) {
         let parsed = parse_source_file(&format!("interface {name} {{}}"));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(191);
-        assert!(
-            store
-                .register_source_file(&parsed.arena, parsed.source_file, file)
-                .is_some()
-        );
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/formatter-interface.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
         let declaration = parsed
             .arena
             .iter()
@@ -6393,9 +6456,17 @@ mod tests {
                     .then(|| NodeRef::new(parsed.arena.id(), file, node))
             })
             .unwrap();
-        let mut symbol_data = SymbolData::new(SymbolFlags::INTERFACE, EscapedName::source(name));
-        symbol_data.declarations = Some(vec![declaration]);
-        let symbol = store.alloc_symbol(symbol_data).unwrap();
+        let symbol = binder.file(file).unwrap().symbol(declaration).unwrap();
+        let (symbols, _) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
         let interface = store
             .alloc_interface_type(ObjectFlags::INTERFACE, Some(symbol))
             .unwrap();
@@ -6406,7 +6477,7 @@ mod tests {
                 ..crate::semantic::DeclaredTypeLinks::default()
             },
         ));
-        interface
+        (store, interface)
     }
 
     fn alloc_named_object_alias(
@@ -6799,12 +6870,11 @@ mod tests {
 
     #[test]
     fn formats_named_interfaces_object_aliases_and_property_only_structures() {
-        let mut store = bootstrapped_store();
+        let (mut store, interface) = named_interface_store("Shape");
         let (string, number) = store
             .intrinsic_bootstrap()
             .map(|bootstrap| (bootstrap.string_type, bootstrap.number_type))
             .unwrap();
-        let interface = alloc_named_interface(&mut store, "Shape");
         let (alias, _) = alloc_named_object_alias(&mut store, "AliasShape");
         let nested_value = alloc_typed_property(&mut store, "value", string, false, false);
         let nested = alloc_structural_object(&mut store, vec![nested_value]);
@@ -7111,6 +7181,43 @@ mod tests {
     }
 
     #[test]
+    fn merged_interface_display_keeps_duplicate_alias_annotations_cold() {
+        let parsed = parse_source_file(concat!(
+            "type Item = string; ",
+            "interface Catalog { value: Item; } interface Catalog { value: Item; }",
+        ));
+        let file = FileId::new(1_925);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let owner = merged_interface_display_global(&context, "Catalog");
+        let interface = context.get_declared_type_of_symbol(owner).unwrap();
+        let store = context.store();
+        let property = store
+            .symbol(owner)
+            .and_then(|symbol| symbol.members())
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source("value"))
+            .unwrap();
+        let [first, second] = store.symbol(property).unwrap().declarations().unwrap() else {
+            panic!("the property must keep both source declarations")
+        };
+        let first_annotation = store.source_direct_type_annotation(*first).unwrap();
+        let second_annotation = store.source_direct_type_annotation(*second).unwrap();
+        assert!(store.type_node_links(first_annotation).is_some());
+        assert!(store.type_node_links(second_annotation).is_none());
+        let before = (store.type_len(), store.checker_link_allocated_lengths());
+
+        assert_eq!(context.type_to_string(interface).unwrap(), "Catalog");
+        assert!(context.store().type_node_links(second_annotation).is_none());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+    }
+
+    #[test]
     fn merged_interface_display_rejects_paired_parenthesized_property_cache_changes() {
         for (index, annotation) in ["(string)", "((string))"].into_iter().enumerate() {
             let parsed = parse_source_file(&format!(
@@ -7196,6 +7303,248 @@ mod tests {
             );
             assert_eq!(context.type_to_string(interface).unwrap(), "Clock");
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check both single and merged property caches and their restoration.
+    fn interface_only_display_rejects_paired_parenthesized_property_cache_changes() {
+        for (index, source) in [
+            "interface Catalog { value: (string); count: number; }",
+            "interface Catalog { value: (string); } interface Catalog { count: number; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(1_920 + u32::try_from(index).unwrap());
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            let owner = merged_interface_display_global(&context, "Catalog");
+            let interface = context.get_declared_type_of_symbol(owner).unwrap();
+            assert_eq!(
+                context.store().symbol(owner).unwrap().flags(),
+                SymbolFlags::INTERFACE
+            );
+            assert_eq!(context.type_to_string(interface).unwrap(), "Catalog");
+            if index == 0 {
+                assert_eq!(
+                    type_to_string(context.store(), interface).unwrap(),
+                    "Catalog"
+                );
+            }
+            let store = context.store();
+            let property = store
+                .symbol(owner)
+                .and_then(|symbol| symbol.members())
+                .and_then(|table| store.symbol_table(table))
+                .and_then(|table| table.get_source("value"))
+                .unwrap();
+            let declaration = store.symbol(property).unwrap().value_declaration().unwrap();
+            let annotation = store.source_direct_type_annotation(declaration).unwrap();
+            let inner = store.source_direct_type_annotation(annotation).unwrap();
+            assert_eq!(
+                store.source_node_kind(inner),
+                Some(SyntaxKind::StringKeyword)
+            );
+            let inner_links = store.type_node_links(inner).cloned();
+            let property_links = store.value_symbol_links(property).unwrap().clone();
+            let annotation_links = store
+                .type_node_links(annotation)
+                .cloned()
+                .unwrap_or_default();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let mut changed_property = property_links.clone();
+            changed_property.resolved_type = Some(number);
+            let mut changed_annotation = annotation_links.clone();
+            changed_annotation.resolved_type = Some(number);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, changed_property.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(annotation, changed_annotation.clone())
+            );
+
+            assert_malformed_display_without_writes(&context, interface);
+            assert_hostless_malformed_display_without_writes(&context, interface);
+            assert_eq!(context.store().type_node_links(inner), inner_links.as_ref());
+            assert_eq!(
+                context.store().value_symbol_links(property),
+                Some(&changed_property)
+            );
+            assert_eq!(
+                context.store().type_node_links(annotation),
+                Some(&changed_annotation)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .declared_type_links(owner)
+                    .unwrap()
+                    .declared_type,
+                Some(interface)
+            );
+
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, property_links)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(annotation, annotation_links)
+            );
+            assert_eq!(context.type_to_string(interface).unwrap(), "Catalog");
+            if index == 0 {
+                assert_eq!(
+                    type_to_string(context.store(), interface).unwrap(),
+                    "Catalog"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Bind both files and check the complete owner replacement.
+    fn hostless_interface_display_rejects_private_external_module_declarations() {
+        let global = parse_source_file("interface Clock { value: string; extra: boolean; }");
+        let external =
+            parse_source_file("export {}; interface Clock { value: string; extra: boolean; }");
+        let files = [
+            (FileId::new(1_922), &global, false),
+            (FileId::new(1_923), &external, false),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for (index, (file, parsed, _)) in files.iter().copied().enumerate() {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/formatter/{index}.ts\"")),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        if index == 0 {
+                            CanonicalModuleState::Script
+                        } else {
+                            CanonicalModuleState::External
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, parsed, _) in files.iter().copied() {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, parsed, _)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let owner = merged_interface_display_global(&context, "Clock");
+        let interface = merged_interface_display_identity(&mut context, &files, owner);
+        assert_eq!(context.type_to_string(interface).unwrap(), "Clock");
+        assert_eq!(type_to_string(context.store(), interface).unwrap(), "Clock");
+        let declarations = context
+            .store()
+            .symbol(owner)
+            .unwrap()
+            .declarations()
+            .unwrap()
+            .to_vec();
+        let declared_links = context.store().declared_type_links(owner).unwrap().clone();
+        let borrowed = external
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                    external.arena.id(),
+                    files[1].0,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_ne!(
+            context.file(files[1].0).unwrap().1.symbol(borrowed),
+            Some(owner)
+        );
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            owner,
+            Some(vec![borrowed]),
+            None
+        ));
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            owner,
+            SymbolFlags::INTERFACE,
+            CheckFlags::NONE
+        ));
+
+        assert_malformed_display_without_writes(&context, interface);
+        assert_hostless_malformed_display_without_writes(&context, interface);
+        assert_eq!(
+            context.store().symbol(owner).unwrap().declarations(),
+            Some([borrowed].as_slice())
+        );
+        assert_eq!(
+            context.store().symbol(owner).unwrap().value_declaration(),
+            None
+        );
+        assert_eq!(
+            context.store().declared_type_links(owner),
+            Some(&declared_links)
+        );
+        assert_eq!(merged_interface_display_global(&context, "Clock"), owner);
+
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            owner,
+            Some(declarations),
+            None
+        ));
+        assert_eq!(context.type_to_string(interface).unwrap(), "Clock");
+        assert_eq!(type_to_string(context.store(), interface).unwrap(), "Clock");
+    }
+
+    #[test]
+    fn hostless_interface_display_rejects_symbols_without_binder_ownership() {
+        let parsed = parse_source_file("interface Clock {}");
+        let file = FileId::new(1_924);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let owner = merged_interface_display_global(&context, "Clock");
+        let declaration = context
+            .store()
+            .symbol(owner)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let mut symbol = SymbolData::new(SymbolFlags::INTERFACE, EscapedName::source("Clock"));
+        symbol.declarations = Some(vec![declaration]);
+        let store = context.store_mut_for_test();
+        let unbound = store.alloc_symbol(symbol).unwrap();
+        let interface = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(unbound))
+            .unwrap();
+        assert!(store.set_declared_type_links(
+            unbound,
+            crate::semantic::DeclaredTypeLinks {
+                declared_type: Some(interface),
+                ..crate::semantic::DeclaredTypeLinks::default()
+            }
+        ));
+
+        assert_malformed_display_without_writes(&context, interface);
+        assert_hostless_malformed_display_without_writes(&context, interface);
     }
 
     #[test]
@@ -9250,13 +9599,16 @@ mod tests {
 
     #[test]
     fn global_aware_array_display_uses_suffix_syntax_and_literal_clone_shape() {
-        let parsed = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let parsed =
+            parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {} interface T {}");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let mut context = parsed_context(
             &parsed,
             FileId::new(195),
             CanonicalCheckerOptions::default(),
         );
+        let named_t_symbol = merged_interface_display_global(&context, "T");
+        let named_t = context.get_declared_type_of_symbol(named_t_symbol).unwrap();
         let global_types = context.global_types().clone();
         let bootstrap = context.store().intrinsic_bootstrap().unwrap();
         let (number, string) = (bootstrap.number_type, bootstrap.string_type);
@@ -9280,7 +9632,6 @@ mod tests {
         let union_array = store
             .create_canonical_array_type(&global_types, primitive_union, false)
             .unwrap();
-        let named_t = alloc_named_interface(store, "T");
         let readonly_array = store
             .create_canonical_array_type(&global_types, named_t, true)
             .unwrap();
@@ -9911,8 +10262,7 @@ mod tests {
 
     #[test]
     fn unqualified_named_display_rejects_parent_and_flag_poisons() {
-        let mut interface_store = bootstrapped_store();
-        let interface = alloc_named_interface(&mut interface_store, "Good");
+        let (mut interface_store, interface) = named_interface_store("Good");
         let interface_symbol = interface_store
             .type_payload(interface)
             .unwrap()
