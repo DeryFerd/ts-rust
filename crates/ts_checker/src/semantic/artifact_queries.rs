@@ -2638,10 +2638,13 @@ mod tests {
 
     #[test]
     fn enum_declaration_queries_keep_declared_and_value_types_distinct() {
-        for source in [
-            "enum Kind {} declare const copy: typeof Kind;",
-            "enum Kind { First = 1, Second = 2 } declare const copy: typeof Kind;",
-            "declare namespace Names { enum Kind {} } declare const copy: typeof Names.Kind;",
+        for (source, has_reference) in [
+            ("enum Kind {}", false),
+            (
+                "enum Kind { First = 1, Second = 2, Third = Kind.First }",
+                true,
+            ),
+            ("declare namespace Names { enum Kind {} }", false),
         ] {
             let parsed = parse_source_file(source);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -2684,8 +2687,8 @@ mod tests {
                     (node != name.node
                         && matches!(&record.data, NodeData::Identifier(identifier) if identifier.text == "Kind"))
                     .then_some(NodeRef::new(parsed.arena.id(), file, node))
-                })
-                .unwrap();
+                });
+            assert_eq!(reference.is_some(), has_reference);
             let before = (
                 context.store().type_len(),
                 context.store().symbol_len(),
@@ -2694,7 +2697,13 @@ mod tests {
             for _ in 0..2 {
                 assert_eq!(context.get_type_at_location(declaration), Ok(declared));
                 assert_eq!(context.get_type_at_location(name), Ok(declared));
-                assert_eq!(context.get_type_at_location(reference), Ok(value));
+                assert_eq!(
+                    context.type_of_artifact_symbol(name, owner),
+                    Ok(Some(value))
+                );
+                if let Some(reference) = reference {
+                    assert_eq!(context.get_type_at_location(reference), Ok(value));
+                }
                 assert_eq!(context.get_symbol_at_location(name), Ok(Some(owner)));
             }
             assert_eq!(
