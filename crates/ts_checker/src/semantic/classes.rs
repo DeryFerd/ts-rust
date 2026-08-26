@@ -2137,6 +2137,16 @@ fn validate_annotated_constructor_parameter_cache(
             .map(SourceGlobalDateInitializerPlan::symbol),
     )?;
     let annotation = proof.cached_type(store, host, Some(&context.global_types))?;
+    if store
+        .value_symbol_links(parameter.symbol)
+        .and_then(|links| links.resolved_type)
+        .is_some()
+        && !proof.bindings_are_published(store)
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+            parameter.type_node,
+        )));
+    }
     let value_type = annotation
         .map(|annotation| annotated_constructor_value_type(store, context, parameter, annotation))
         .transpose()?
@@ -2176,7 +2186,7 @@ fn materialize_annotated_constructor_parameter(
     host: &DeclaredTypeHost<'_>,
     context: &ClassTypeQueryContext,
     parameter: &ClassConstructorAnnotatedParameterPlan,
-) -> Result<TypeId, ClassError> {
+) -> Result<(TypeId, ConstructorAnnotationProof), ClassError> {
     validate_annotated_constructor_parameter_cache(store, host, context, parameter)?;
     let proof = preflight_constructor_parameter_annotation(
         store,
@@ -2187,6 +2197,9 @@ fn materialize_annotated_constructor_parameter(
             .initializer
             .map(SourceGlobalDateInitializerPlan::symbol),
     )?;
+    if !store.try_reserve_constructor_annotation_bindings(&proof) {
+        return Err(invariant(ClassInvariant::Capacity(parameter.declaration)));
+    }
     let mut diagnostics = CanonicalCheckerDiagnostics::default();
     let annotation = CanonicalTypeQuery::new_with_global_types(
         store,
@@ -2209,7 +2222,7 @@ fn materialize_annotated_constructor_parameter(
         })?;
     }
     if let Some(type_) = annotated_constructor_value_type(store, context, parameter, annotation)? {
-        return Ok(type_);
+        return Ok((type_, proof));
     }
     let types = constructor_parameter_type_constituents(
         store,
@@ -2217,7 +2230,7 @@ fn materialize_annotated_constructor_parameter(
         parameter.optional,
         parameter.declaration,
     )?;
-    store
+    let type_ = store
         .literal_union_type_with_alias_and_array_targets(
             &types,
             None,
@@ -2229,7 +2242,8 @@ fn materialize_annotated_constructor_parameter(
             invariant(ClassInvariant::InvalidPropertyTypeCache(
                 parameter.declaration,
             ))
-        })
+        })?;
+    Ok((type_, proof))
 }
 
 fn constructor_date_initializer_error(
@@ -15645,7 +15659,14 @@ fn stored_constructor_annotation_type_with_alias(
         }
         let type_ = match kind {
             SyntaxKind::TypeReference => {
-                let owner = store.symbol_node_links(annotation)?.resolved_symbol?;
+                let owner = store.constructor_annotation_binding(annotation)?;
+                if store.symbol_node_links(annotation)
+                    != Some(&SymbolNodeLinks {
+                        resolved_symbol: Some(owner),
+                    })
+                {
+                    return None;
+                }
                 let symbol = store.symbol(owner)?;
                 let children = stored_direct_children(store, annotation)?;
                 let [name] = children.as_slice() else {
@@ -17931,7 +17952,7 @@ pub(super) fn execute_nongeneric_class_members(
         .class
         .constructor
         .and_then(|constructor| constructor.annotated_parameter);
-    let annotated_parameter_type = annotated_parameter
+    let annotated_parameter_state = annotated_parameter
         .map(|parameter| {
             let context =
                 plan.class.type_query_context.as_ref().ok_or_else(|| {
@@ -17940,6 +17961,7 @@ pub(super) fn execute_nongeneric_class_members(
             materialize_annotated_constructor_parameter(store, host, context, &parameter)
         })
         .transpose()?;
+    let annotated_parameter_type = annotated_parameter_state.as_ref().map(|(type_, _)| *type_);
     let inferred_date_parameter = plan
         .class
         .constructor
@@ -18402,6 +18424,10 @@ pub(super) fn execute_nongeneric_class_members(
             );
         }
         if let Some(parameter) = constructor.annotated_parameter {
+            let (_, proof) = annotated_parameter_state
+                .as_ref()
+                .expect("the constructor annotation retains its checked bindings");
+            assert!(store.publish_constructor_annotation_bindings(proof));
             let value_type = annotated_parameter_type
                 .expect("the constructor annotation was prepared before its class");
             for symbol in std::iter::once(parameter.symbol)
@@ -18599,6 +18625,24 @@ fn execute_direct_derived_class_members(
         .class
         .constructor
         .and_then(|constructor| constructor.parameter_property);
+    let parameter_binding_proof = parameter_property
+        .map(|parameter| {
+            preflight_type_annotation(
+                store,
+                host,
+                None,
+                CanonicalTypeQueryOptions::default(),
+                parameter.type_node,
+                None,
+            )
+        })
+        .transpose()?;
+    if parameter_binding_proof
+        .as_ref()
+        .is_some_and(|proof| !store.try_reserve_constructor_annotation_bindings(proof))
+    {
+        return Err(invariant(ClassInvariant::Capacity(plan.class.declaration)));
+    }
     let super_call = plan
         .class
         .constructor
@@ -19100,6 +19144,13 @@ fn execute_direct_derived_class_members(
                     },
                 ));
             }
+            assert!(
+                store.publish_constructor_annotation_bindings(
+                    parameter_binding_proof
+                        .as_ref()
+                        .expect("the constructor parameter retains its source binding")
+                )
+            );
             for symbol in [parameter.property_symbol, parameter.local_symbol] {
                 assert!(store.set_value_symbol_links(
                     symbol,
@@ -23566,9 +23617,9 @@ mod tests {
 
     #[test]
     fn constructor_annotation_preflight_and_cache_failures_do_not_write() {
-        for poison in 0..4 {
+        for poison in 0..5 {
             let parameter = match poison {
-                2 => "readonly token: Token",
+                2 | 4 => "readonly token: Token",
                 3 => "readonly token: (Token)",
                 _ => "readonly token?: Token",
             };
@@ -23619,6 +23670,7 @@ mod tests {
                 context.store().signature_len(),
                 context.store().checker_link_allocated_lengths(),
                 context.store().claimed_strict_builtin_iterator_return(),
+                context.store().constructor_annotation_binding_count(),
             );
             {
                 let (_, bound) = context.file(file).unwrap();
@@ -23644,7 +23696,8 @@ mod tests {
                     context.store().type_len(),
                     context.store().signature_len(),
                     context.store().checker_link_allocated_lengths(),
-                    context.store().claimed_strict_builtin_iterator_return()
+                    context.store().claimed_strict_builtin_iterator_return(),
+                    context.store().constructor_annotation_binding_count(),
                 ),
                 before
             );
@@ -23718,6 +23771,12 @@ mod tests {
                         resolved_symbol: Some(other)
                     }
                 ));
+            } else if poison == 4 {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(annotation, SymbolNodeLinks::default(),)
+                );
             } else {
                 let value_type = if poison >= 2 {
                     let number = context.store().intrinsic_bootstrap().unwrap().number_type;
@@ -23746,6 +23805,7 @@ mod tests {
                 context.store().type_len(),
                 context.store().signature_len(),
                 context.store().checker_link_allocated_lengths(),
+                context.store().constructor_annotation_binding_count(),
                 context.diagnostics().clone(),
             );
             assert!(
@@ -23768,10 +23828,235 @@ mod tests {
                     context.store().type_len(),
                     context.store().signature_len(),
                     context.store().checker_link_allocated_lengths(),
+                    context.store().constructor_annotation_binding_count(),
                     context.diagnostics().clone()
                 ),
                 before,
                 "case {poison}"
+            );
+        }
+    }
+
+    #[test]
+    fn constructor_annotation_bindings_reject_same_name_scope_retargets() {
+        for (prefix, annotation_name) in [("", "Token"), ("type Chosen = Token;", "Chosen")] {
+            let globals = parse_source_file("interface Token { global: number; }");
+            let module = parse_source_file(&format!(
+                "export const marker = 0; interface Token {{ local: number; }} {prefix} class C {{ constructor(readonly token: {annotation_name}) {{}} }}",
+            ));
+            let global_file = FileId::new(8_931);
+            let module_file = FileId::new(8_932);
+            let mut binder = CanonicalBinder::new();
+            for (parsed, file, path, declaration, module_state) in [
+                (
+                    &globals,
+                    global_file,
+                    "\"/global-token.d.ts\"",
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+                (
+                    &module,
+                    module_file,
+                    "\"/module-token.ts\"",
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            ] {
+                assert!(parsed.diagnostics.is_empty());
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(path),
+                            CanonicalSourceLanguage::TypeScript,
+                            declaration,
+                            module_state,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let declarations = module
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    let name = match &record.data {
+                        NodeData::ClassDeclaration(class) => class.name?,
+                        NodeData::InterfaceDeclaration(interface) => interface.name,
+                        NodeData::TypeAliasDeclaration(alias) => alias.name,
+                        _ => return None,
+                    };
+                    let NodeData::Identifier(identifier) = &module.arena.get(name)?.data else {
+                        return None;
+                    };
+                    Some((
+                        identifier.text.as_str(),
+                        NodeRef::new(module.arena.id(), module_file, node),
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let options = CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: true,
+                },
+                strict_builtin_iterator_return: true,
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            };
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(global_file, &globals.arena), (module_file, &module.arena)],
+                options,
+            )
+            .unwrap();
+            let global_token = context
+                .store()
+                .symbol_table(context.store().intrinsic_bootstrap().unwrap().globals)
+                .and_then(|table| table.get_source("Token"))
+                .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                .unwrap();
+            let local_token = context
+                .file(module_file)
+                .unwrap()
+                .1
+                .symbol(declarations["Token"])
+                .unwrap();
+            let local_token = context.store().get_merged_symbol(local_token).unwrap();
+            let owner = context
+                .file(module_file)
+                .unwrap()
+                .1
+                .symbol(declarations["C"])
+                .unwrap();
+            let owner = context.store().get_merged_symbol(owner).unwrap();
+            assert_ne!(global_token, local_token);
+            let global_type = context.get_declared_type_of_symbol(global_token).unwrap();
+            let local_type = context.get_declared_type_of_symbol(local_token).unwrap();
+            assert_ne!(global_type, local_type);
+            let annotation = module
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::ParameterDeclaration(parameter) = &record.data else {
+                        return None;
+                    };
+                    parameter
+                        .type_
+                        .map(|node| NodeRef::new(module.arena.id(), module_file, node))
+                })
+                .unwrap();
+            assert_eq!(
+                context.get_type_from_type_node(annotation).unwrap(),
+                local_type
+            );
+            assert_eq!(context.store().constructor_annotation_binding_count(), 0);
+            let members = context.get_nongeneric_class_members(owner).unwrap();
+            context.check_source_file(module_file).unwrap();
+            let signature = context
+                .store()
+                .signature(members.default_construct_signature())
+                .unwrap();
+            let local = signature.parameters()[0];
+            let property = members.declared_instance_properties()[0];
+            let alias = declarations.get("Chosen").map(|declaration| {
+                let symbol = context
+                    .file(module_file)
+                    .unwrap()
+                    .1
+                    .symbol(*declaration)
+                    .unwrap();
+                (
+                    context.store().get_merged_symbol(symbol).unwrap(),
+                    context
+                        .store()
+                        .source_direct_type_annotation(*declaration)
+                        .unwrap(),
+                )
+            });
+            let reference = alias.map_or(annotation, |(_, body)| body);
+            assert_eq!(
+                context.store().constructor_annotation_binding(reference),
+                Some(local_token)
+            );
+            let instance = members.shells().instance_type();
+            let constructor = members.shells().value_type();
+            assert_eq!(context.is_type_assignable_to(instance, instance), Ok(true));
+            assert_eq!(context.type_to_string(constructor).unwrap(), "typeof C");
+
+            assert!(context.store_mut_for_test().set_symbol_node_links(
+                reference,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(global_token),
+                }
+            ));
+            assert!(context.store_mut_for_test().set_type_node_links(
+                reference,
+                TypeNodeLinks {
+                    resolved_type: Some(global_type),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            if let Some((alias, _)) = alias {
+                let mut links = context.store().type_alias_links(alias).unwrap().clone();
+                links.declared_type = Some(global_type);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_alias_links(alias, links)
+                );
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(global_type),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+            }
+            for symbol in [local, property] {
+                assert!(context.store_mut_for_test().set_value_symbol_links(
+                    symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(global_type),
+                        ..ValueSymbolLinks::default()
+                    }
+                ));
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().constructor_annotation_binding_count(),
+                context.diagnostics().clone(),
+            );
+            assert_eq!(
+                context.store().constructor_annotation_binding(reference),
+                Some(local_token)
+            );
+            assert_eq!(
+                validate_class_heritage_members(context.store(), instance),
+                ClassHeritageMembersValidation::Malformed
+            );
+            assert!(context.get_nongeneric_class_members(owner).is_err());
+            assert!(context.is_type_assignable_to(instance, instance).is_err());
+            assert!(context.type_to_string(constructor).is_err());
+            assert!(context.recheck_source_file(module_file).is_err());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().constructor_annotation_binding_count(),
+                    context.diagnostics().clone(),
+                ),
+                before
             );
         }
     }

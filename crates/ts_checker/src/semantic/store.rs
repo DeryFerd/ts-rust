@@ -52,7 +52,7 @@ use super::{
     source_callables::{
         SourceCallableTypeParameterSyntaxProof, source_type_parameter_default_is_assignable,
     },
-    type_nodes::UnionAliasInstantiationProof,
+    type_nodes::{ConstructorAnnotationProof, UnionAliasInstantiationProof},
     type_records::{
         CacheHashKey, ConditionalRoot, ConstrainedTypeData, LiteralValue, TypeAlias,
         TypeCacheState, TypeData, TypeRecord, type_list_key,
@@ -510,6 +510,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     declared_call_set_types_by_signature: HashMap<SignatureId, TypeId>,
     direct_interface_heritage_provenance: HashMap<TypeId, DirectInterfaceHeritageProvenance>,
     direct_class_heritage_provenance: HashMap<TypeId, DirectClassHeritageProvenance>,
+    constructor_annotation_bindings: HashMap<NodeRef, SemanticSymbolId>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
     source_jsdoc_typedefs: HashMap<TypeId, SourceJsDocTypedefIdentity>,
     source_callable_types_by_declaration: HashMap<NodeRef, TypeId>,
@@ -637,6 +638,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             declared_call_set_types_by_signature: HashMap::new(),
             direct_interface_heritage_provenance: HashMap::new(),
             direct_class_heritage_provenance: HashMap::new(),
+            constructor_annotation_bindings: HashMap::new(),
             source_callable_provenance: HashMap::new(),
             source_jsdoc_typedefs: HashMap::new(),
             source_callable_types_by_declaration: HashMap::new(),
@@ -7685,6 +7687,95 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         self.direct_class_heritage_provenance
             .try_reserve(additional)
             .is_ok()
+    }
+
+    pub(super) fn constructor_annotation_binding(
+        &self,
+        reference: NodeRef,
+    ) -> Option<SemanticSymbolId> {
+        self.observe_relation_node_read(reference);
+        self.constructor_annotation_bindings
+            .get(&reference)
+            .copied()
+    }
+
+    #[cfg(test)]
+    pub(super) fn constructor_annotation_binding_count(&self) -> usize {
+        self.constructor_annotation_bindings.len()
+    }
+
+    pub(super) fn try_reserve_constructor_annotation_bindings(
+        &mut self,
+        proof: &ConstructorAnnotationProof,
+    ) -> bool {
+        if !proof.bindings().all(|(reference, symbol)| {
+            self.source_node_kind(reference) == Some(SyntaxKind::TypeReference)
+                && self.get_merged_symbol(symbol) == Some(symbol)
+                && self
+                    .constructor_annotation_bindings
+                    .get(&reference)
+                    .is_none_or(|&existing| existing == symbol)
+        }) {
+            return false;
+        }
+        let missing = proof
+            .bindings()
+            .filter(|(reference, _)| !self.constructor_annotation_bindings.contains_key(reference))
+            .count();
+        self.constructor_annotation_bindings
+            .try_reserve(missing)
+            .is_ok()
+    }
+
+    /// Records source bindings from a checked plan. Existing bindings cannot change.
+    pub(super) fn publish_constructor_annotation_bindings(
+        &mut self,
+        proof: &ConstructorAnnotationProof,
+    ) -> bool {
+        if !proof.bindings().all(|(reference, symbol)| {
+            self.source_node_kind(reference) == Some(SyntaxKind::TypeReference)
+                && self.get_merged_symbol(symbol) == Some(symbol)
+                && self.symbol_node_links(reference)
+                    == Some(&SymbolNodeLinks {
+                        resolved_symbol: Some(symbol),
+                    })
+                && self.type_node_links(reference).is_some_and(|links| {
+                    links.resolved_type.is_some() && links.outer_type_parameters.is_none()
+                })
+                && self
+                    .constructor_annotation_bindings
+                    .get(&reference)
+                    .is_none_or(|&existing| existing == symbol)
+        }) {
+            return false;
+        }
+        let missing = proof
+            .bindings()
+            .filter(|(reference, _)| !self.constructor_annotation_bindings.contains_key(reference))
+            .count();
+        if missing
+            > self.constructor_annotation_bindings.capacity()
+                - self.constructor_annotation_bindings.len()
+        {
+            return false;
+        }
+        let mut observable = false;
+        for (reference, symbol) in proof.bindings() {
+            if self
+                .constructor_annotation_bindings
+                .insert(reference, symbol)
+                .is_none()
+            {
+                observable |= self.relation_observable_nodes.contains(&reference);
+            }
+        }
+        if missing != 0 {
+            self.mark_union_cache_validation_dirty();
+        }
+        if observable {
+            self.mark_relation_inputs_dirty();
+        }
+        true
     }
 
     pub(super) fn direct_class_heritage_provenance(

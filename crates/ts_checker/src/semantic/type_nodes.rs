@@ -139,7 +139,7 @@ pub(super) fn preflight_type_annotation(
         &mut references,
     );
     if supported {
-        for reference in references {
+        for &reference in &references {
             let resolved = planner.resolve_uncached_type_reference_symbol(reference)?;
             let expected = planner.plan.references[&reference].symbol;
             if store.get_merged_symbol(resolved) != Some(expected) {
@@ -175,7 +175,15 @@ pub(super) fn preflight_type_annotation(
             },
         ));
     }
-    let proof = ConstructorAnnotationProof { node, plan };
+    let bindings = references
+        .into_iter()
+        .map(|node| (node, plan.references[&node].symbol))
+        .collect();
+    let proof = ConstructorAnnotationProof {
+        node,
+        plan,
+        bindings,
+    };
     proof.cached_type(store, host, global_types)?;
     Ok(proof)
 }
@@ -185,9 +193,21 @@ pub(super) fn preflight_type_annotation(
 pub(super) struct ConstructorAnnotationProof {
     node: NodeRef,
     plan: TypeQueryPlan,
+    bindings: BTreeMap<NodeRef, SemanticSymbolId>,
 }
 
 impl ConstructorAnnotationProof {
+    pub(super) fn bindings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (NodeRef, SemanticSymbolId)> + '_ {
+        self.bindings.iter().map(|(&node, &symbol)| (node, symbol))
+    }
+
+    pub(super) fn bindings_are_published(&self, store: &CanonicalTypeMapperStore) -> bool {
+        self.bindings()
+            .all(|(node, symbol)| store.constructor_annotation_binding(node) == Some(symbol))
+    }
+
     pub(super) fn cached_type(
         &self,
         store: &CanonicalTypeMapperStore,
@@ -212,10 +232,19 @@ impl ConstructorAnnotationProof {
         }
         let bootstrap = store.intrinsic_bootstrap().ok_or_else(&invalid)?;
         let expected = if let Some(reference) = self.plan.references.get(&node) {
-            if store.symbol_node_links(node).is_some_and(|links| {
-                links != &SymbolNodeLinks::default()
-                    && links.resolved_symbol != Some(reference.symbol)
-            }) {
+            let cached_symbol = store
+                .symbol_node_links(node)
+                .and_then(|links| links.resolved_symbol);
+            let published_type = store
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+                .is_some();
+            if (published_type || cached_symbol.is_some())
+                && cached_symbol != Some(reference.symbol)
+                || store
+                    .constructor_annotation_binding(node)
+                    .is_some_and(|binding| binding != reference.symbol)
+            {
                 return Err(invalid());
             }
             if let Some(alias) = self.plan.aliases.get(&reference.symbol) {
