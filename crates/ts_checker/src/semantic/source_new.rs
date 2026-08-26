@@ -9089,7 +9089,24 @@ mod tests {
             );
             let instance =
                 authenticated_global_date_constructor_return(context.store(), signature).unwrap();
-            assert_eq!(context.type_to_string(instance).unwrap(), "Date");
+            let store = context.store();
+            let date = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .and_then(|globals| globals.get_source("Date"))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            assert_eq!(
+                store
+                    .declared_type_links(date)
+                    .and_then(|links| links.declared_type),
+                Some(instance),
+            );
+            assert_eq!(
+                store
+                    .type_node_links(expression)
+                    .and_then(|links| links.resolved_type),
+                Some(instance),
+            );
             let warm = (context.store().type_len(), context.store().signature_len());
             context.recheck_source_file(source_file).unwrap();
             assert_eq!(
