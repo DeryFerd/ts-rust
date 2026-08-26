@@ -3544,17 +3544,16 @@ mod tests {
             .unwrap()
             .declarations()
             .unwrap()[0];
-        let value = globals
+        let (index_declaration, value) = globals
             .arena
             .iter()
-            .find_map(|(_, record)| {
+            .find_map(|(node, record)| {
                 let NodeData::IndexSignatureDeclaration(index) = &record.data else {
                     return None;
                 };
-                (record.parent == Some(declaration.node)).then_some(NodeRef::new(
-                    globals.arena.id(),
-                    globals_file,
-                    index.type_,
+                (record.parent == Some(declaration.node)).then_some((
+                    NodeRef::new(globals.arena.id(), globals_file, node),
+                    NodeRef::new(globals.arena.id(), globals_file, index.type_),
                 ))
             })
             .unwrap();
@@ -3571,7 +3570,7 @@ mod tests {
             context.store().index_info_len(),
             context.store().checker_link_allocated_lengths(),
         );
-        assert!(matches!(
+        assert_eq!(
             check_array_binding_element(
                 context.store_mut_for_test(),
                 &host,
@@ -3582,9 +3581,9 @@ mod tests {
                 receiver
             ),
             Err(SourceElementError::InterfaceIndex(
-                InterfaceIndexError::DeclaredType(_)
+                InterfaceIndexError::InvalidIndexCache(index_declaration)
             )),
-        ));
+        );
         assert_eq!(
             (
                 context.store().type_len(),
