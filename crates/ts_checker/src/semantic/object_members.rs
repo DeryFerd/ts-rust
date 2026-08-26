@@ -3761,6 +3761,7 @@ fn authenticated_global_builtin_interface(
     };
     let (annotation_name, marker, parameter_count) = match owner_name {
         "Boolean" => ("BooleanConstructor", "valueOf", 0),
+        "Date" => ("DateConstructor", "toISOString", 0),
         "Number" => ("NumberConstructor", "toFixed", 1),
         "String" => ("StringConstructor", "toLowerCase", 0),
         "Object" => ("ObjectConstructor", "toString", 0),
@@ -24011,6 +24012,10 @@ mod generic_publication_tests {
             "interface Shared { max(...values: number[]): number } declare var Shared: Shared;",
             "interface Math { random(): number } declare var Math: Math;",
             "interface Math { random(value: number): number } declare var Math: Math;",
+            concat!(
+                "interface Date { toISOString(): string } ",
+                "interface DateConstructor {} declare var Date: DateConstructor;",
+            ),
             concat!(
                 "interface Number { toFixed(fractionDigits?: number): string } ",
                 "interface NumberConstructor {} declare var Number: NumberConstructor;",
