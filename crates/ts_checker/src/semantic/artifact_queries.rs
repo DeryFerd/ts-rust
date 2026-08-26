@@ -15,7 +15,8 @@ use ts_jsnum::PseudoBigInt;
 
 use super::{
     AliasTargetState, CanonicalAliasQueryError, CanonicalCheckerContext, DeclaredTypeError,
-    SourceCheckError, TypeData, TypeId,
+    SourceCheckError, TypeData, TypeId, TypeNodeLinks,
+    source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     type_nodes::{normalize_bigint_literal, normalize_numeric_separators},
     type_records::TypeRecord,
 };
@@ -204,6 +205,10 @@ impl CanonicalCheckerContext<'_> {
         }
 
         if let Some(type_) = self.literal_annotation_artifact_type(node)? {
+            return Ok(type_);
+        }
+
+        if let Some(type_) = self.arrow_artifact_type(node)? {
             return Ok(type_);
         }
 
@@ -703,6 +708,65 @@ impl CanonicalCheckerContext<'_> {
             return Ok(None);
         };
         self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    fn arrow_artifact_type(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (_, bound, record) = self.validated_artifact_node(node)?;
+        if !matches!(record.data, NodeData::ArrowFunction(_)) {
+            return Ok(None);
+        }
+        let cached = self
+            .store()
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type);
+        let owner = bound.symbol(node);
+        let source_callable = self
+            .store()
+            .source_callable_type_for_declaration(node)
+            .or_else(|| owner.and_then(|owner| self.store().source_callable_type_for_owner(owner)))
+            .or_else(|| {
+                owner
+                    .and_then(|owner| self.store().value_symbol_links(owner))
+                    .and_then(|links| links.resolved_type)
+                    .filter(|type_| self.store().source_callable_provenance(*type_).is_some())
+            })
+            .or_else(|| {
+                cached.filter(|type_| self.store().source_callable_provenance(*type_).is_some())
+            });
+        let Some(type_) = source_callable else {
+            return Ok(None);
+        };
+        let valid_owner =
+            self.store()
+                .source_callable_provenance(type_)
+                .is_some_and(|provenance| {
+                    provenance.declaration == node && owner == Some(provenance.owner_symbol)
+                });
+        if !valid_owner
+            || !matches!(
+                validate_stored_source_callable(self.store(), type_),
+                StoredSourceCallableValidation::Valid(_)
+            )
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType { node, type_ });
+        }
+        if self.store().type_node_links(node).is_some_and(|links| {
+            links != &TypeNodeLinks::default()
+                && links
+                    != &(TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    })
+        }) {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: cached.unwrap_or(type_),
+            });
+        }
+        Ok(Some(type_))
     }
 
     fn class_declaration_artifact_symbol(
@@ -2185,6 +2249,190 @@ mod tests {
         let internal = context.file(file).unwrap().1.symbol(object).unwrap();
         assert_eq!(context.get_symbol_at_location(object).unwrap(), None);
         assert_eq!(context.file(file).unwrap().1.symbol(object), Some(internal));
+    }
+
+    #[test]
+    fn arrow_location_queries_preserve_checked_callable_identity() {
+        for (text, display) in [
+            ("const value = () => 42;", "() => number"),
+            (
+                "const value = (input: number): number => input;",
+                "(input: number) => number",
+            ),
+            (
+                "const value = () => 42 satisfies typeof value;",
+                "() => any",
+            ),
+        ] {
+            let parsed = parse_source_file(text);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(6_040);
+            let mut context = context_with_options(
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    no_implicit_any: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let arrow = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::ArrowFunction(_)).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let type_ = context.get_type_at_location(arrow).unwrap();
+            assert_eq!(
+                context.store().source_callable_type_for_declaration(arrow),
+                Some(type_),
+            );
+            assert_eq!(context.type_to_string(type_).unwrap(), display);
+            assert_eq!(context.get_symbol_at_location(arrow).unwrap(), None);
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            );
+            assert_eq!(context.get_type_at_location(arrow), Ok(type_));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn arrow_location_queries_reject_changed_callable_caches_without_writes() {
+        for poison in [
+            "node",
+            "node_metadata",
+            "owner",
+            "declaration",
+            "missing_declaration",
+            "return",
+        ] {
+            let parsed = parse_source_file(if poison == "node_metadata" {
+                concat!(
+                    "const value = () => 42;\n",
+                    "const other = (): string => 'value';\n",
+                )
+            } else {
+                concat!(
+                    "const value = () => 42 satisfies typeof value;\n",
+                    "const other = (): string => 'value';\n",
+                )
+            });
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(6_041);
+            let mut context = context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let arrows = parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    matches!(record.data, NodeData::ArrowFunction(_)).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let arrow = arrows[0];
+            let type_ = context.get_type_at_location(arrow).unwrap();
+            let provenance = context.store().source_callable_provenance(type_).unwrap();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            match poison {
+                "node" => assert!(context.store_mut_for_test().set_type_node_links(
+                    arrow,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    },
+                )),
+                "node_metadata" => assert!(context.store_mut_for_test().set_type_node_links(
+                    arrow,
+                    TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        outer_type_parameters: Some(vec![number]),
+                    },
+                )),
+                "owner" => assert!(context.store_mut_for_test().set_value_symbol_links(
+                    provenance.owner_symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    },
+                )),
+                "declaration" => {
+                    let other = context.get_type_at_location(arrows[1]).unwrap();
+                    assert_eq!(
+                        context
+                            .store_mut_for_test()
+                            .replace_source_callable_type_for_declaration_for_test(
+                                arrow,
+                                Some(other),
+                            ),
+                        Some(type_),
+                    );
+                }
+                "missing_declaration" => {
+                    let other = context.get_type_at_location(arrows[1]).unwrap();
+                    assert_eq!(
+                        context
+                            .store_mut_for_test()
+                            .replace_source_callable_type_for_declaration_for_test(arrow, None),
+                        Some(type_),
+                    );
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        arrow,
+                        TypeNodeLinks {
+                            resolved_type: Some(other),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                "return" => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_resolved_return_type(provenance.signature, Some(number))
+                ),
+                _ => unreachable!(),
+            }
+            let poisoned = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            );
+            assert!(
+                matches!(
+                    context.get_type_at_location(arrow),
+                    Err(CanonicalArtifactQueryError::InvalidType { node, .. }) if node == arrow
+                ),
+                "{poison}",
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                ),
+                poisoned,
+                "{poison}",
+            );
+        }
     }
 
     #[test]
