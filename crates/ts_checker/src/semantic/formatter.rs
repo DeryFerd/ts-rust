@@ -34,6 +34,7 @@ use super::{
         ClassHeritageMembersValidation, validate_class_heritage_members,
         validate_cold_class_instance_for_display,
     },
+    conditional_types::conditional_alias_projection,
     declared::cached_ordinary_type_parameter_owner,
     derived_types::DerivedObjectLiteralValidation,
     enums,
@@ -767,6 +768,17 @@ fn display_type_worker(
         return display_symbol_name(store, type_id, symbol, state)
             .ok_or(TypeDisplayUnavailable::MalformedType(type_id));
     }
+    if type_flags.intersects(TypeFlags::CONDITIONAL) {
+        return display_conditional_type_alias(
+            store,
+            host,
+            global_types,
+            type_id,
+            flags,
+            state,
+            visiting,
+        );
+    }
     if type_flags.intersects(TypeFlags::INDEX) {
         return display_index_type(store, host, global_types, type_id, flags, state, visiting);
     }
@@ -803,6 +815,57 @@ fn display_type_worker(
         type_id,
         kind: record.data().kind(),
     })
+}
+
+#[allow(clippy::too_many_arguments)] // Keep recursive formatter state explicit.
+fn display_conditional_type_alias(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    let projection = conditional_alias_projection(store, type_id)
+        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+        .ok_or(TypeDisplayUnavailable::UnsupportedType {
+            type_id,
+            kind: TypeDataKind::Conditional,
+        })?;
+    let alias = store
+        .type_payload(type_id)
+        .and_then(TypeRecord::alias)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    let result = (|| {
+        let mut result = display_alias_name(store, host, type_id, alias, state)?;
+        if !projection.type_arguments.is_empty() {
+            result.push('<');
+            state.add(2);
+            for (index, argument) in projection.type_arguments.iter().enumerate() {
+                if index != 0 {
+                    result.push_str(", ");
+                    state.add(2);
+                }
+                result.push_str(&display_type_worker(
+                    store,
+                    host,
+                    global_types,
+                    *argument,
+                    flags,
+                    state,
+                    visiting,
+                )?);
+            }
+            result.push('>');
+        }
+        Ok(result)
+    })();
+    visiting.remove(&type_id);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6335,6 +6398,227 @@ mod tests {
             let type_ = context.get_type_from_type_node(node).unwrap();
             assert_eq!(context.type_to_string(type_).unwrap(), name);
         }
+    }
+
+    #[test]
+    fn conditional_alias_display_preserves_inferred_tuples_and_constructor_returns() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Tail<T> = T extends [...(infer Rest)[], ...infer Last extends [any, any]] ",
+            "? Last : never; ",
+            "type Head<T> = T extends [...infer First extends [any, any], ...(infer Rest)[]] ",
+            "? First : never; ",
+            "type Middle<T> = T extends [unknown, ...infer Part, unknown] ? Part : never; ",
+            "type ExtractReturn<T> = T extends { new(): infer Result } ? Result : never; ",
+            "type TailPair = Tail<[1, 2]>; type HeadPair = Head<[1, 2]>; ",
+            "type TailLong = Tail<[1, 2, 3, 4]>; type HeadLong = Head<[1, 2, 3, 4]>; ",
+            "type TooShort = Middle<[1]>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(207);
+        let mut context = parsed_context(
+            &parsed,
+            file,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        for (name, expected) in [
+            ("Tail", "Tail<T>"),
+            ("Head", "Head<T>"),
+            ("Middle", "Middle<T>"),
+            ("ExtractReturn", "ExtractReturn<T>"),
+            ("TailPair", "[1, 2]"),
+            ("HeadPair", "[1, 2]"),
+            ("TailLong", "[3, 4]"),
+            ("HeadLong", "[1, 2]"),
+            ("TooShort", "never"),
+        ] {
+            let body = type_alias_body(&parsed, file, name);
+            let declaration = parsed.arena.get(body.node).unwrap().parent.unwrap();
+            let NodeData::TypeAliasDeclaration(alias) =
+                &parsed.arena.get(declaration).unwrap().data
+            else {
+                panic!("the alias body must retain its declaration");
+            };
+            let location = NodeRef::new(body.arena, body.file, alias.name);
+            let type_ = context.get_type_at_location(location).unwrap();
+            assert_eq!(context.type_to_string(type_).unwrap(), expected, "{name}");
+            assert_eq!(context.get_type_from_type_node(body).unwrap(), type_);
+            assert_eq!(context.type_to_string(type_).unwrap(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn conditional_alias_display_preserves_overrides_and_reduced_identities() {
+        let parsed = parse_source_file(concat!(
+            "type Select<Left, Right> = ((Left extends string ? Right : boolean)); ",
+            "type Forward<Value, Unused> = Select<Value, never>; ",
+            "type Inner<T> = T extends string ? number : boolean; ",
+            "type Outer<U> = string extends string ? Inner<U> : never; ",
+            "type Resolved = Outer<string>; ",
+            "type Distributed = Inner<string | number>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(208);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        for (name, expected) in [
+            ("Select", "Select<Left, Right>"),
+            ("Forward", "Forward<Value, Unused>"),
+            ("Inner", "Inner<T>"),
+            ("Outer", "Inner<U>"),
+            ("Resolved", "number"),
+            ("Distributed", "Distributed"),
+        ] {
+            let node = type_alias_body(&parsed, file, name);
+            let type_ = context.get_type_from_type_node(node).unwrap();
+            let before = (
+                context.store().type_len(),
+                context.store().type_alias_len(),
+                context.store().mapper_len(),
+                context.store().conditional_production_lengths(),
+            );
+            assert_eq!(context.type_to_string(type_).unwrap(), expected, "{name}");
+            assert_eq!(
+                type_to_string(context.store(), type_).unwrap(),
+                expected,
+                "{name}"
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().type_alias_len(),
+                    context.store().mapper_len(),
+                    context.store().conditional_production_lengths(),
+                ),
+                before,
+                "{name}",
+            );
+            assert_eq!(context.get_type_from_type_node(node).unwrap(), type_);
+        }
+    }
+
+    #[test]
+    fn conditional_alias_display_rejects_forged_records_without_writes() {
+        for corruption in 0..3 {
+            let parsed = parse_source_file("type Select<T> = T extends string ? number : boolean;");
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(209);
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            let type_ = context
+                .get_type_from_type_node(type_alias_body(&parsed, file, "Select"))
+                .unwrap();
+            assert_eq!(context.type_to_string(type_).unwrap(), "Select<T>");
+            let record = context.store().type_payload(type_).unwrap();
+            let alias = record.alias().unwrap();
+            let TypeData::Conditional(data) = record.data().clone() else {
+                panic!("the generic alias must remain conditional");
+            };
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let malformed = match corruption {
+                0 => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_type_alias_arguments(alias, Some(vec![number]))
+                    );
+                    type_
+                }
+                1 => {
+                    let clone = context
+                        .store_mut_for_test()
+                        .alloc_conditional_type(data.root, number, data.extends_type, None, None)
+                        .unwrap();
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_type_alias(clone, Some(alias))
+                    );
+                    clone
+                }
+                2 => {
+                    let mapper = context
+                        .store_mut_for_test()
+                        .new_simple_type_mapper(data.check_type, number)
+                        .unwrap();
+                    assert!(context.store_mut_for_test().set_conditional_resolution(
+                        type_,
+                        data.resolved_true_type,
+                        data.resolved_false_type,
+                        data.resolved_inferred_true_type,
+                        data.resolved_default_constraint,
+                        data.resolved_constraint_of_distributive,
+                        data.mapper,
+                        Some(mapper),
+                    ));
+                    type_
+                }
+                _ => unreachable!(),
+            };
+            let before = (
+                context.store().type_len(),
+                context.store().type_alias_len(),
+                context.store().mapper_len(),
+                context.store().conditional_production_lengths(),
+            );
+            assert_eq!(
+                context.type_to_string(malformed),
+                Err(TypeDisplayUnavailable::MalformedType(malformed)),
+                "corruption {corruption}",
+            );
+            assert_eq!(
+                type_to_string(context.store(), malformed),
+                Err(TypeDisplayUnavailable::MalformedType(malformed)),
+                "corruption {corruption}",
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().type_alias_len(),
+                    context.store().mapper_len(),
+                    context.store().conditional_production_lengths(),
+                ),
+                before,
+                "corruption {corruption}",
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_alias_display_leaves_unaliased_types_unsupported() {
+        let parsed = parse_source_file(concat!(
+            "type Wrapped<T> = (value: T) => ",
+            "T extends string ? number : boolean;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(210);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ConditionalType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let type_ = context.get_type_from_type_node(node).unwrap();
+        assert_eq!(
+            context.type_to_string(type_),
+            Err(TypeDisplayUnavailable::UnsupportedType {
+                type_id: type_,
+                kind: TypeDataKind::Conditional,
+            }),
+        );
     }
 
     #[test]
