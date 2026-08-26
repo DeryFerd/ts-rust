@@ -134,6 +134,24 @@ and base/local join identity restoration.
 
 ### Execution checkpoint: 2026-08-26
 
+Wave 128 passes all 6,173 workspace tests. Strict workspace Clippy passes after
+the lint-only follow-up. The fixed semantic report has 47 exact results in 95
+executed variants, seven more than wave 127. The diagnostic-only milestone
+retains all 397 exact results in 511 executed variants. Neither report lost an
+exact result or produced a fatal invariant.
+
+Canonical library ordering, lazy module values, enum declaration queries,
+owned project graph observations, and source replay are integrated. The
+remaining semantic outcomes are 46 unsupported variants and two artifact
+mismatches. Prepared project inputs and Go probes remain separate evidence,
+not a passing project ring.
+
+See [`typechecker-wave128-status.md`](typechecker-wave128-status.md) for runtime
+checkpoint `df2ba7bc`, lint follow-up `f07dc2f1`, and the verification details.
+The full port goal remains active.
+
+### Earlier wave 127 checkpoint: 2026-08-26
+
 Wave 127 passes all 6,105 workspace tests and strict workspace Clippy. The fixed
 semantic report has 40 exact results in 95 executed variants, three more than
 wave 126. The diagnostics-only milestone retains 397 exact results in 511
