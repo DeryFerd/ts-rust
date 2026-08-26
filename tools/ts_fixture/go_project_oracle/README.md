@@ -11,7 +11,7 @@ a config. Go module downloads require an explicit opt-in.
 `scripts/run-go-project-oracle.sh GO UPSTREAM CONFIG OUT [prepare|build|test|run]`
 requires absolute paths. `OUT` must not exist. The default mode is `run`.
 `prepare` writes overlays and provenance without invoking Go. `build` also
-builds the test executable. `test` also runs the three focused instrumentation
+builds the test executable. `test` also runs the focused instrumentation
 tests without checking the supplied project. `run` instead starts two fresh
 project oracle processes.
 Builds use `GOTOOLCHAIN=local`, `GOPROXY=off`, and an output-local Go cache.
@@ -23,9 +23,12 @@ Linux. It uses the standard library and requires no package install.
 build. It selects only versions in the pinned `go.mod` and requires a content
 checksum for each in the pinned `go.sum`. The helper copies both files into
 the output directory, uses `-modfile`, and rejects any change to the copies.
-The build itself still uses `GOPROXY=off`. `GOMODCACHE` can name a cache under
-the caller's exclusive output directory. Otherwise the helper uses a cache
-inside `OUT`. No dependency download runs in `prepare` mode.
+The build itself still uses `GOPROXY=off`. An inherited `GOMODCACHE` must be
+absolute. Its canonical path must be under the output parent and separate
+from `OUT` and both source checkouts. Symlinks into source directories are
+rejected before Go can run. The check repeats after the build lock is acquired.
+Without an override, the helper uses a cache inside `OUT`. No dependency
+download runs in `prepare` mode.
 
 The test executable reads these environment variables:
 
@@ -37,11 +40,13 @@ The test executable reads these environment variables:
 
 ## Report contract
 
-Each process writes `report.json` with `schema_version: 1` and
-`implementation: "typescript-go"`. `outcome` is one of `complete`,
-`config_error`, `no_check`, `no_sources`, `invariant_error`, or `oracle_error`.
-`complete` means that the oracle ran. It does not mean that the project has
-no diagnostics or that Rust matches Go.
+Each process writes `report.json` with `schema_version: 2` and
+`implementation: "typescript-go"`. Outcomes include `config_error`,
+`no_check`, `no_sources`, `missing_replay_evidence`, `incomplete_evidence`,
+`invariant_error`, and `oracle_error`. This version cannot produce complete
+replay evidence. A source replay with stable retained outputs returns
+`incomplete_evidence` because freshly produced diagnostics are not isolated
+from cached results. No run is counted as semantic success on that basis.
 
 Top-level fields are `schema_version`, `implementation`, `upstream_sha`,
 `run_id`, `header`, `outcome`, `failure`, `graph`, `graph_sha256`, `cold`,
@@ -67,8 +72,10 @@ content digests at the time the normal host reads each file. Config inputs
 name the selected config and the loader's transitive extends inputs.
 Missing evidence is explicit. A missing fact is not an empty fact.
 
-`cold` and `warm` each have `diagnostics`, `errors_file_order`, `errors`,
-`types`, `symbols`, and `walk`. Error input order uses the artifact order,
+`cold` and `warm` each have `diagnostics`, `diagnostic_evidence`,
+`errors_file_order`, `errors`, `types`, `symbols`, and `walk`.
+Warm diagnostics use `retained_program_snapshot`. This includes cached
+checker and declaration diagnostics. Error input order uses the artifact order,
 then diagnostic-bearing config inputs in path order. With no diagnostics,
 the error input order is empty. Artifact records have `state`, `path`,
 `sha256`, `bytes`, and `reason`.
@@ -77,12 +84,32 @@ null paths and hashes. A present artifact uses the exact pinned renderer
 bytes, including its line endings. Errors with no diagnostics use
 `no_content`, not the digest of an empty file.
 
-`walk` counts AST visits, type queries, and symbol queries from the actual
-baseline walker. `replay` records the Program-eligible source order, reset
-completion flags, exact artifact and diagnostic equality, walk equality,
-and retained type and symbol identity equality. Identities are compared
-inside one Program. Pointer values are not published or compared across
-processes. The helper runs the process twice and retains both results.
+`walk.type_queries` counts each direct `GetTypeAtLocation` call in the pinned
+baseline walker, with its actual argument node. A class-base expression can
+query its parent, then query itself as an `any` fallback. `rendered_types`
+counts the final types selected for rendering. These counts are separate.
+AST visits and direct symbol queries are also counted.
+
+`replay` records actual source resets, eligible project and default-library
+source counts, exact artifact bytes, retained diagnostic equality, walk
+equality, and retained identities. Query type identities and final rendered
+type identities have separate equality fields. Pointer values are compared
+only inside one Program and are not published.
+
+`replay.fresh_diagnostics` has `state: "unavailable"`, `equal: null`, and a
+reason. `retained_diagnostics_equal` is not proof that each cold diagnostic
+was produced again. The driver keeps checker collections, lazy/global
+diagnostics, and declaration caches intact. It does not clear them to obtain
+an apparently fresh result. A completed source re-entry has replay state
+`partial`, not `complete`.
+
+If no non-default-library source is eligible, replay state is
+`no_eligible_project_sources` and the outcome is `missing_replay_evidence`.
+Default-library checks alone do not count as project replay. Cold artifacts
+still include declaration inputs. Warm artifacts are unavailable in this case.
+The helper retains both fresh-process reports, including non-success reports.
+`runs.json` also uses schema version 2. If either process does not complete,
+`comparison_state` is `unavailable` and `fresh_processes_equal` is null.
 
 ## Upstream calls
 
@@ -103,6 +130,12 @@ it clears those flags, releases the checker, then repeats the same Program
 diagnostic collection. Eligibility uses `Program.SkipTypeChecking(file, false)`.
 An overlay of the pinned walker adds observation hooks only. It does not
 replace its renderer, query selection, or formatting rules.
+
+Module-cache path checks can run without Go:
+
+```sh
+python3 tools/ts_fixture/go_project_oracle/test_cache_paths.py UPSTREAM CONFIG OUTPUT_PARENT
+```
 
 The build manifest records every overlay mapping, source hash, tool version,
 build arguments, explicit environment overrides, upstream dirty state, and

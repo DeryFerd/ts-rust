@@ -9,9 +9,10 @@ import (
 var projectOracleActiveObserver *projectOracleObserver
 
 type projectOracleObserver struct {
-	visit  func(*ast.Node, bool)
-	typ    func(*ast.Node, *checker.Type)
-	symbol func(*ast.Node, *ast.Symbol)
+	visit        func(*ast.Node, bool)
+	typeQuery    func(*ast.Node, *ast.Node, *checker.Type)
+	renderedType func(*ast.Node, *checker.Type)
+	symbol       func(*ast.Node, *ast.Symbol)
 }
 
 func projectOracleObserveVisit(node *ast.Node, symbolWalk bool) {
@@ -20,9 +21,15 @@ func projectOracleObserveVisit(node *ast.Node, symbolWalk bool) {
 	}
 }
 
-func projectOracleObserveType(node *ast.Node, typ *checker.Type) {
+func projectOracleObserveTypeQuery(renderedNode, queriedNode *ast.Node, typ *checker.Type) {
 	if observer := projectOracleActiveObserver; observer != nil {
-		observer.typ(node, typ)
+		observer.typeQuery(renderedNode, queriedNode, typ)
+	}
+}
+
+func projectOracleObserveRenderedType(node *ast.Node, typ *checker.Type) {
+	if observer := projectOracleActiveObserver; observer != nil {
+		observer.renderedType(node, typ)
 	}
 }
 

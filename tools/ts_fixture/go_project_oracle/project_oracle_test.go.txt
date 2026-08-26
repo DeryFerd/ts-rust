@@ -55,17 +55,19 @@ type projectOracleWalk struct {
 	TypeASTVisits   int `json:"type_ast_visits"`
 	SymbolASTVisits int `json:"symbol_ast_visits"`
 	TypeQueries     int `json:"type_queries"`
+	RenderedTypes   int `json:"rendered_types"`
 	SymbolQueries   int `json:"symbol_queries"`
 	SymbolsReturned int `json:"symbols_returned"`
 }
 
 type projectOraclePass struct {
-	Diagnostics     []projectOracleDiagnostic `json:"diagnostics"`
-	ErrorsFileOrder []string                  `json:"errors_file_order"`
-	Errors          projectOracleArtifact     `json:"errors"`
-	Types           projectOracleArtifact     `json:"types"`
-	Symbols         projectOracleArtifact     `json:"symbols"`
-	Walk            projectOracleWalk         `json:"walk"`
+	Diagnostics        []projectOracleDiagnostic `json:"diagnostics"`
+	DiagnosticEvidence string                    `json:"diagnostic_evidence"`
+	ErrorsFileOrder    []string                  `json:"errors_file_order"`
+	Errors             projectOracleArtifact     `json:"errors"`
+	Types              projectOracleArtifact     `json:"types"`
+	Symbols            projectOracleArtifact     `json:"symbols"`
+	Walk               projectOracleWalk         `json:"walk"`
 }
 
 type projectOracleReset struct {
@@ -75,13 +77,23 @@ type projectOracleReset struct {
 }
 
 type projectOracleReplay struct {
-	State            string               `json:"state"`
-	Sources          []projectOracleReset `json:"sources"`
-	DiagnosticsEqual bool                 `json:"diagnostics_equal"`
-	ArtifactsEqual   bool                 `json:"artifacts_equal"`
-	WalkEqual        bool                 `json:"walk_equal"`
-	TypeIDsEqual     bool                 `json:"type_identities_equal"`
-	SymbolIDsEqual   bool                 `json:"symbol_identities_equal"`
+	State                    string                                `json:"state"`
+	Sources                  []projectOracleReset                  `json:"sources"`
+	EligibleProjectSources   int                                   `json:"eligible_project_sources"`
+	EligibleLibrarySources   int                                   `json:"eligible_default_library_sources"`
+	RetainedDiagnosticsEqual bool                                  `json:"retained_diagnostics_equal"`
+	FreshDiagnostics         projectOracleDiagnosticReplayEvidence `json:"fresh_diagnostics"`
+	ArtifactsEqual           bool                                  `json:"artifacts_equal"`
+	WalkEqual                bool                                  `json:"walk_equal"`
+	TypeQueryIDsEqual        bool                                  `json:"type_query_identities_equal"`
+	RenderedTypeIDsEqual     bool                                  `json:"rendered_type_identities_equal"`
+	SymbolIDsEqual           bool                                  `json:"symbol_identities_equal"`
+}
+
+type projectOracleDiagnosticReplayEvidence struct {
+	State  string `json:"state"`
+	Equal  *bool  `json:"equal"`
+	Reason string `json:"reason"`
 }
 
 type projectOracleRuntime struct {
@@ -122,18 +134,25 @@ type projectOracleTypeIdentity struct {
 	typ  *checker.Type
 }
 
+type projectOracleTypeQueryIdentity struct {
+	renderedNode *ast.Node
+	queriedNode  *ast.Node
+	typ          *checker.Type
+}
+
 type projectOracleSymbolIdentity struct {
 	node   *ast.Node
 	symbol *ast.Symbol
 }
 
 type projectOracleObservation struct {
-	walk         projectOracleWalk
-	typeVisits   []*ast.Node
-	symbolVisits []*ast.Node
-	types        []projectOracleTypeIdentity
-	symbols      []projectOracleSymbolIdentity
-	texts        [3]string
+	walk          projectOracleWalk
+	typeVisits    []*ast.Node
+	symbolVisits  []*ast.Node
+	typeQueries   []projectOracleTypeQueryIdentity
+	renderedTypes []projectOracleTypeIdentity
+	symbols       []projectOracleSymbolIdentity
+	texts         [3]string
 }
 
 func (observation *projectOracleObservation) observer() *projectOracleObserver {
@@ -147,9 +166,13 @@ func (observation *projectOracleObservation) observer() *projectOracleObserver {
 				observation.typeVisits = append(observation.typeVisits, node)
 			}
 		},
-		typ: func(node *ast.Node, typ *checker.Type) {
+		typeQuery: func(renderedNode, queriedNode *ast.Node, typ *checker.Type) {
 			observation.walk.TypeQueries++
-			observation.types = append(observation.types, projectOracleTypeIdentity{node, typ})
+			observation.typeQueries = append(observation.typeQueries, projectOracleTypeQueryIdentity{renderedNode, queriedNode, typ})
+		},
+		renderedType: func(node *ast.Node, typ *checker.Type) {
+			observation.walk.RenderedTypes++
+			observation.renderedTypes = append(observation.renderedTypes, projectOracleTypeIdentity{node, typ})
 		},
 		symbol: func(node *ast.Node, symbol *ast.Symbol) {
 			observation.walk.SymbolQueries++
@@ -187,7 +210,7 @@ func TestProjectOracle(t *testing.T) {
 		}
 		projectOracleActiveObserver = nil
 		report.Runtime = projectOracleRuntimeSnapshot(started)
-		if t.Failed() && report.Outcome == "complete" {
+		if t.Failed() && report.Outcome != "oracle_error" {
 			report.Outcome = "invariant_error"
 			report.Failure = projectOracleString("the pinned baseline renderer rejected an invariant")
 		}
@@ -245,11 +268,17 @@ func projectOracleValidateProvenance(data []byte) error {
 
 func projectOracleNewReport(header string) *projectOracleReport {
 	return &projectOracleReport{
-		SchemaVersion: 1, Implementation: "typescript-go", UpstreamSHA: projectOracleUpstreamSHA,
+		SchemaVersion: 2, Implementation: "typescript-go", UpstreamSHA: projectOracleUpstreamSHA,
 		Header: header, Outcome: "oracle_error", Provenance: json.RawMessage("null"),
-		Cold:   projectOracleUnavailablePass("cold run did not complete"),
-		Warm:   projectOracleUnavailablePass("forced replay did not complete"),
-		Replay: projectOracleReplay{State: "unavailable", Sources: []projectOracleReset{}},
+		Cold: projectOracleUnavailablePass("cold run did not complete"),
+		Warm: projectOracleUnavailablePass("forced replay did not complete"),
+		Replay: projectOracleReplay{
+			State: "unavailable", Sources: []projectOracleReset{},
+			FreshDiagnostics: projectOracleDiagnosticReplayEvidence{
+				State:  "unavailable",
+				Reason: "checker diagnostics and declaration diagnostics retain cold results; source replay does not prove that each diagnostic was produced again",
+			},
+		},
 	}
 }
 
@@ -265,6 +294,7 @@ func projectOracleRun(t *testing.T, configPath, output string, report *projectOr
 		report.Outcome = "config_error"
 		report.Failure = projectOracleString("the normal compiler host could not load the config")
 		report.Cold.Diagnostics = projectOracleDiagnostics(loadDiagnostics)
+		report.Cold.DiagnosticEvidence = "config_loader_snapshot"
 		report.Cold.Errors = projectOracleWriteArtifact(output, "cold.errors.txt", projectOracleErrorBaseline(t, nil, loadDiagnostics, &report.Cold))
 		report.Graph = projectOracleUnloadedGraph(configPath, fs)
 		projectOracleHashGraph(report)
@@ -280,6 +310,7 @@ func projectOracleRun(t *testing.T, configPath, output string, report *projectOr
 	diagnostics := projectOracleCollectDiagnostics(program, loadDiagnostics)
 	if config.CompilerOptions().NoCheck.IsTrue() || len(files) == 0 {
 		report.Cold.Diagnostics = projectOracleDiagnostics(diagnostics)
+		report.Cold.DiagnosticEvidence = "cold_program_snapshot"
 		report.Cold.Errors = projectOracleWriteArtifact(output, "cold.errors.txt", projectOracleErrorBaseline(t, files, diagnostics, &report.Cold))
 		if config.CompilerOptions().NoCheck.IsTrue() {
 			report.Outcome = "no_check"
@@ -292,11 +323,26 @@ func projectOracleRun(t *testing.T, configPath, output string, report *projectOr
 	}
 	fs.setPhase("cold_artifacts")
 	cold := projectOracleCapture(t, program, files, diagnostics, output, "cold", report.Header, &report.Cold)
-	fs.setPhase("replay")
+	eligible := []*ast.SourceFile{}
 	for _, file := range program.SourceFiles() {
 		if program.SkipTypeChecking(file, false) {
 			continue
 		}
+		eligible = append(eligible, file)
+		if program.IsSourceFileDefaultLibrary(file.Path()) {
+			report.Replay.EligibleLibrarySources++
+		} else {
+			report.Replay.EligibleProjectSources++
+		}
+	}
+	if report.Replay.EligibleProjectSources == 0 {
+		report.Replay.State = "no_eligible_project_sources"
+		report.Outcome = "missing_replay_evidence"
+		report.Failure = projectOracleString("no non-default-library source is eligible for semantic replay")
+		return
+	}
+	fs.setPhase("replay")
+	for _, file := range eligible {
 		fileChecker, done := program.GetTypeCheckerForFileExclusive(context.Background(), file)
 		typeChecked, unusedChecked := fileChecker.ProjectOracleResetSource(file)
 		done()
@@ -310,15 +356,16 @@ func projectOracleRun(t *testing.T, configPath, output string, report *projectOr
 	warmDiagnostics := projectOracleCollectDiagnostics(program, loadDiagnostics)
 	fs.setPhase("warm_artifacts")
 	warm := projectOracleCapture(t, program, files, warmDiagnostics, output, "warm", report.Header, &report.Warm)
-	report.Replay.State = "complete"
-	report.Replay.DiagnosticsEqual = reflect.DeepEqual(report.Cold.Diagnostics, report.Warm.Diagnostics)
+	report.Replay.State = "partial"
+	report.Replay.RetainedDiagnosticsEqual = reflect.DeepEqual(report.Cold.Diagnostics, report.Warm.Diagnostics)
 	report.Replay.ArtifactsEqual = cold.texts == warm.texts
 	report.Replay.WalkEqual = cold.walk == warm.walk && slices.Equal(cold.typeVisits, warm.typeVisits) && slices.Equal(cold.symbolVisits, warm.symbolVisits)
-	report.Replay.TypeIDsEqual = slices.Equal(cold.types, warm.types)
+	report.Replay.TypeQueryIDsEqual = slices.Equal(cold.typeQueries, warm.typeQueries)
+	report.Replay.RenderedTypeIDsEqual = slices.Equal(cold.renderedTypes, warm.renderedTypes)
 	report.Replay.SymbolIDsEqual = slices.Equal(cold.symbols, warm.symbols)
-	if !report.Replay.DiagnosticsEqual || !report.Replay.ArtifactsEqual || !report.Replay.WalkEqual || !report.Replay.TypeIDsEqual || !report.Replay.SymbolIDsEqual {
+	if !report.Replay.RetainedDiagnosticsEqual || !report.Replay.ArtifactsEqual || !report.Replay.WalkEqual || !report.Replay.TypeQueryIDsEqual || !report.Replay.RenderedTypeIDsEqual || !report.Replay.SymbolIDsEqual {
 		report.Outcome = "invariant_error"
-		report.Failure = projectOracleString("forced source replay changed diagnostics, artifacts, visits, or retained identities")
+		report.Failure = projectOracleString("forced source replay changed retained diagnostics, artifacts, visits, or retained identities")
 		return
 	}
 	if len(program.GetConfigFileParsingDiagnostics()) != 0 {
@@ -326,7 +373,8 @@ func projectOracleRun(t *testing.T, configPath, output string, report *projectOr
 		report.Failure = projectOracleString("the normal config loader reported diagnostics")
 		return
 	}
-	report.Outcome = "complete"
+	report.Outcome = "incomplete_evidence"
+	report.Failure = projectOracleString("fresh diagnostic replay evidence is unavailable")
 }
 
 // Use Program diagnostics so comment directives and no-emit filtering stay active.
@@ -348,6 +396,10 @@ func projectOracleCapture(t *testing.T, program *compiler.Program, files []*harn
 	observation := &projectOracleObservation{}
 	defer func() { pass.Walk = observation.walk }()
 	pass.Diagnostics = projectOracleDiagnostics(diagnostics)
+	pass.DiagnosticEvidence = "cold_program_snapshot"
+	if prefix == "warm" {
+		pass.DiagnosticEvidence = "retained_program_snapshot"
+	}
 	observation.texts[0] = projectOracleErrorBaseline(t, files, diagnostics, pass)
 	pass.Errors = projectOracleWriteArtifact(output, prefix+".errors.txt", observation.texts[0])
 	projectOracleActiveObserver = observation.observer()
@@ -431,7 +483,7 @@ func projectOracleWriteArtifact(output, name, content string) projectOracleArtif
 
 func projectOracleUnavailablePass(reason string) projectOraclePass {
 	absent := projectOracleArtifact{State: "unavailable", Reason: &reason}
-	return projectOraclePass{Diagnostics: []projectOracleDiagnostic{}, ErrorsFileOrder: []string{}, Errors: absent, Types: absent, Symbols: absent}
+	return projectOraclePass{Diagnostics: []projectOracleDiagnostic{}, DiagnosticEvidence: "unavailable", ErrorsFileOrder: []string{}, Errors: absent, Types: absent, Symbols: absent}
 }
 
 func projectOracleHash(data []byte) string {
@@ -557,7 +609,7 @@ func TestProjectOracleOnDiskReplay(t *testing.T) {
 	}
 	report := projectOracleNewReport("project")
 	projectOracleRun(t, filepath.Join(project, "tsconfig.json"), t.TempDir(), report)
-	if report.Outcome != "complete" {
+	if report.Outcome != "incomplete_evidence" {
 		t.Fatalf("unexpected outcome %s: %v", report.Outcome, report.Failure)
 	}
 	want := []string{filepath.Join(project, "second.ts"), filepath.Join(project, "first.ts"), filepath.Join(project, "ambient.d.ts")}
@@ -567,13 +619,139 @@ func TestProjectOracleOnDiskReplay(t *testing.T) {
 	if len(report.Cold.Diagnostics) != 0 || report.Cold.Errors.State != "no_content" {
 		t.Fatal("Program comment suppression was not retained")
 	}
-	if len(report.Replay.Sources) != 2 || report.Cold.Walk.TypeQueries == 0 || !report.Replay.TypeIDsEqual || !report.Replay.SymbolIDsEqual {
+	if len(report.Replay.Sources) != 2 || report.Cold.Walk.TypeQueries == 0 || !report.Replay.TypeQueryIDsEqual || !report.Replay.RenderedTypeIDsEqual || !report.Replay.SymbolIDsEqual {
 		t.Fatalf("invalid replay evidence: %+v", report.Replay)
+	}
+	if report.Replay.State != "partial" || report.Replay.FreshDiagnostics.State != "unavailable" || report.Replay.FreshDiagnostics.Equal != nil {
+		t.Fatalf("fresh diagnostic evidence was invented: %+v", report.Replay)
 	}
 	if len(report.Graph.Sources) <= len(want) {
 		t.Fatal("the graph omitted embedded default libraries")
 	}
 	if !strings.Contains(report.Graph.ArtifactOrder[2], "ambient.d.ts") {
 		t.Fatal("the artifact list omitted a declaration input")
+	}
+}
+
+func projectOracleTestConfig(t *testing.T, config string, inputs map[string]string) string {
+	t.Helper()
+	project := t.TempDir()
+	for name, content := range inputs {
+		if err := os.WriteFile(filepath.Join(project, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(project, "tsconfig.json")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestProjectOracleDiagnosticReplayEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		config string
+		source string
+		code   int32
+	}{
+		{"checker_collection", `{"compilerOptions":{"strict":true,"skipLibCheck":true,"declaration":true},"files":["input.ts"]}`, `export const value: number = "bad";`, 2322},
+		{"declaration_cache", `{"compilerOptions":{"strict":true,"skipLibCheck":true,"declaration":true,"isolatedDeclarations":true},"files":["input.ts"]}`, `export function value() {}`, 9007},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := projectOracleTestConfig(t, test.config, map[string]string{"input.ts": test.source})
+			report := projectOracleNewReport("project")
+			projectOracleRun(t, config, t.TempDir(), report)
+			if report.Outcome != "incomplete_evidence" || report.Replay.State != "partial" {
+				t.Fatalf("cached diagnostics were counted as full replay proof: %+v", report)
+			}
+			if !slices.ContainsFunc(report.Cold.Diagnostics, func(diagnostic projectOracleDiagnostic) bool { return diagnostic.Code == test.code }) {
+				t.Fatalf("missing cold TS%d diagnostic: %+v", test.code, report.Cold.Diagnostics)
+			}
+			if !report.Replay.RetainedDiagnosticsEqual || report.Warm.DiagnosticEvidence != "retained_program_snapshot" {
+				t.Fatalf("retained Program diagnostics were lost: %+v", report.Replay)
+			}
+			if report.Replay.FreshDiagnostics.State != "unavailable" || report.Replay.FreshDiagnostics.Equal != nil || report.Replay.FreshDiagnostics.Reason == "" {
+				t.Fatalf("fresh diagnostic equality is not available: %+v", report.Replay.FreshDiagnostics)
+			}
+		})
+	}
+}
+
+func TestProjectOracleNoEligibleSources(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		config      string
+		file        string
+		source      string
+		libraryWork bool
+	}{
+		{"declarations_skipped", `{"compilerOptions":{"skipLibCheck":true},"files":["input.d.ts"]}`, "input.d.ts", "declare const value: number;\n", false},
+		{"nocheck_sources", `{"compilerOptions":{"skipLibCheck":true},"files":["input.ts"]}`, "input.ts", "// @ts-nocheck\nexport const value = 1;\n", false},
+		{"libraries_do_not_count_as_project_replay", `{"compilerOptions":{"skipLibCheck":false},"files":["input.ts"]}`, "input.ts", "// @ts-nocheck\nexport const value = 1;\n", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := projectOracleTestConfig(t, test.config, map[string]string{test.file: test.source})
+			report := projectOracleNewReport("project")
+			projectOracleRun(t, config, t.TempDir(), report)
+			if report.Outcome != "missing_replay_evidence" || report.Replay.State != "no_eligible_project_sources" || report.Replay.EligibleProjectSources != 0 || len(report.Replay.Sources) != 0 {
+				t.Fatalf("empty project replay was accepted: %+v", report.Replay)
+			}
+			if (report.Replay.EligibleLibrarySources != 0) != test.libraryWork {
+				t.Fatalf("unexpected default-library eligibility: %d", report.Replay.EligibleLibrarySources)
+			}
+			if report.Cold.Types.State != "present" || report.Cold.Symbols.State != "present" || len(report.Graph.ArtifactOrder) != 1 {
+				t.Fatal("cold declaration or source artifacts were omitted")
+			}
+			if report.Warm.Types.State != "unavailable" || report.Warm.Types.SHA256 != nil || report.Warm.DiagnosticEvidence != "unavailable" {
+				t.Fatal("warm evidence was produced without an eligible project source")
+			}
+		})
+	}
+}
+
+func TestProjectOracleTypeQueryCalls(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		source        string
+		expectedCalls int
+	}{
+		{"class_base", "class Base {}\nclass Derived extends Base {}\n", 1},
+		{"any_base_fallback", "declare const Base: any;\nclass Derived extends Base {}\n", 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			configPath := projectOracleTestConfig(t, `{"compilerOptions":{"strict":true,"skipLibCheck":true,"noEmit":true},"files":["input.ts"]}`, map[string]string{"input.ts": test.source})
+			fs := newProjectOracleFS(bundled.WrapFS(osvfs.FS()))
+			host := compiler.NewCompilerHost(filepath.Dir(configPath), fs, bundled.LibPath(), nil, nil)
+			config, errors := tsoptions.GetParsedCommandLineOfConfigFile(configPath, nil, nil, host, nil)
+			if config == nil || len(errors) != 0 {
+				t.Fatalf("cannot load query-count project: %v", errors)
+			}
+			program := compiler.NewProgram(compiler.ProgramOptions{Host: host, Config: config, SingleThreaded: core.TSTrue})
+			diagnostics := projectOracleCollectDiagnostics(program, nil)
+			pass := projectOracleUnavailablePass("not captured")
+			observed := projectOracleCapture(t, program, projectOracleArtifactFiles(program), diagnostics, t.TempDir(), "cold", "project", &pass)
+			var base *ast.Node
+			for _, result := range observed.renderedTypes {
+				if ast.IsIdentifier(result.node) && result.node.Text() == "Base" && ast.IsExpressionWithTypeArgumentsInClassExtendsClause(result.node.Parent) {
+					base = result.node
+				}
+			}
+			if base == nil {
+				t.Fatal("the renderer did not visit the class-base expression")
+			}
+			calls := []*ast.Node{}
+			for _, query := range observed.typeQueries {
+				if query.renderedNode == base {
+					calls = append(calls, query.queriedNode)
+				}
+			}
+			if len(calls) != test.expectedCalls || calls[0] != base.Parent || len(calls) == 2 && calls[1] != base {
+				t.Fatalf("class-base queries did not retain actual call nodes: %v", calls)
+			}
+			if pass.Walk.TypeQueries != len(observed.typeQueries) || pass.Walk.RenderedTypes != len(observed.renderedTypes) || pass.Walk.TypeQueries-pass.Walk.RenderedTypes != test.expectedCalls-1 {
+				t.Fatalf("query counts were confused with rendered types: %+v", pass.Walk)
+			}
+		})
 	}
 }
