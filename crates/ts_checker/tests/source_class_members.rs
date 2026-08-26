@@ -1191,13 +1191,69 @@ fn unannotated_non_private_and_non_ambient_fields_remain_unsupported() {
 }
 
 #[test]
+fn ambient_keyword_visibility_fields_keep_their_declared_type() {
+    for (visibility, code) in [("private", 2341), ("protected", 2445)] {
+        let parsed = parse_source_file(&format!(
+            "declare class Model {{ {visibility} value: number; }} \
+             declare const instance: Model; const result = instance.value;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(85);
+        let mut context = checker_context(&parsed, file);
+        let owner = class_symbol(&parsed, file, &context, "Model");
+
+        context.check_source_file(file).unwrap();
+
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        let [field] = members.instance_properties() else {
+            panic!("the class must retain its one declared field")
+        };
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context.store().symbol(*field).unwrap().parent(),
+            Some(owner)
+        );
+        assert_eq!(
+            context.store().value_symbol_links(*field),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the field read must report its visibility error")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), code);
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.diagnostics().clone(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            context.get_nongeneric_class_members(owner).unwrap(),
+            members
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.diagnostics().clone(),
+            ),
+            warm,
+        );
+    }
+}
+
+#[test]
 fn unsupported_ambient_class_shapes_leave_class_publication_cold() {
     let cases = [
         ("declare class Generic<T extends string> {}", "Generic"),
-        (
-            "declare class Private { private value: number; }",
-            "Private",
-        ),
         (
             concat!(
                 "declare class Overloaded { ",
