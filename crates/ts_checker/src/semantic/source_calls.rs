@@ -1647,11 +1647,23 @@ pub(super) fn array_callback_contextual_parameter_type(
         .and_then(|links| links.resolved_symbol)
         .ok_or(SourceCheckError::Call(call))?;
     let callee_type = store
-        .type_node_links(property)
+        .value_symbol_links(method)
         .and_then(|links| links.resolved_type)
         .ok_or(SourceCheckError::Call(call))?;
     let StoredCallableSetValidation::Valid { projection, .. } =
         validate_stored_callable_set(store, callee_type)
+    else {
+        return Err(SourceCheckError::Call(call));
+    };
+    let [source_parameter] = store
+        .type_payload(target)
+        .and_then(|record| match record.data() {
+            TypeData::Interface(interface) => {
+                interface.reference.resolved_type_arguments.as_deref()
+            }
+            _ => None,
+        })
+        .ok_or(SourceCheckError::Call(call))?
     else {
         return Err(SourceCheckError::Call(call));
     };
@@ -1663,7 +1675,7 @@ pub(super) fn array_callback_contextual_parameter_type(
             .call_signatures
             .iter()
             .all(|signature| signature.parameters.first().copied() != Some(contextual_type))
-        || parameter_type != array.element_type
+        || parameter_type != *source_parameter
     {
         return Err(SourceCheckError::Call(call));
     }
@@ -1868,10 +1880,19 @@ fn check_authenticated_array_callback_call(
         .source_callable_provenance(callback)
         .and_then(|provenance| provenance.contextual_target);
     if callback_context.is_some_and(|context| {
-        projection
-            .call_signatures
-            .iter()
-            .all(|signature| signature.parameters.first().copied() != Some(context))
+        projection.call_signatures.iter().all(|signature| {
+            signature
+                .parameters
+                .first()
+                .copied()
+                .is_none_or(|parameter| {
+                    parameter != context
+                        && !matches!(
+                            store.type_payload(parameter).map(TypeRecord::data),
+                            Some(TypeData::Object(object)) if object.target == Some(context)
+                        )
+                })
+        })
     }) {
         return Err(SourceCheckError::Call(plan.node));
     }
@@ -1975,14 +1996,15 @@ fn check_authenticated_array_callback_call(
                 .map_err(|_| SourceCheckError::Call(plan.node))?
         }
         "find" => {
-            let valid_return = template_return == expected_element
-                || matches!(
-                    store.type_payload(template_return).map(TypeRecord::data),
-                    Some(TypeData::Union(union))
-                        if union.union.types.len() == 2
-                            && union.union.types.contains(&expected_element)
-                            && union.union.types.contains(&undefined)
-                );
+            let expected_return = store
+                .expression_union_type_with_global_types(
+                    global_types,
+                    &[expected_element, undefined],
+                    UnionReduction::Literal,
+                )
+                .map_err(|_| SourceCheckError::Call(plan.node))?;
+            let valid_return =
+                template_return == expected_element || template_return == expected_return;
             if !valid_return {
                 return Err(SourceCheckError::Call(plan.node));
             }
@@ -2453,6 +2475,23 @@ pub(super) fn source_call_argument_contextual_type(
     if !projection.construct_signatures.is_empty() || projection.call_signatures.is_empty() {
         return Ok(None);
     }
+    let projection = if array_callback {
+        let source = store
+            .type_payload(callee_type)
+            .and_then(|record| match record.data() {
+                TypeData::Object(object) => object.target,
+                _ => None,
+            })
+            .unwrap_or(callee_type);
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(store, source)
+        else {
+            return Err(SourceCheckError::Call(plan.node));
+        };
+        projection
+    } else {
+        projection
+    };
 
     if matches!(argument.kind, PlannedExpressionKind::Array(_))
         && let [callable] = projection.call_signatures.as_ref()
@@ -6793,6 +6832,22 @@ mod tests {
         source: &'arena ParseResult,
         source_file: FileId,
     ) -> CanonicalCheckerContext<'arena> {
+        context_with_default_library_and_options(
+            library,
+            library_file,
+            source,
+            source_file,
+            CanonicalCheckerOptions::default(),
+        )
+    }
+
+    fn context_with_default_library_and_options<'arena>(
+        library: &'arena ParseResult,
+        library_file: FileId,
+        source: &'arena ParseResult,
+        source_file: FileId,
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'arena> {
         let files = [(library_file, library), (source_file, source)];
         let mut binder = CanonicalBinder::new();
         for (file, parsed) in files {
@@ -6823,7 +6878,7 @@ mod tests {
                 .into_iter()
                 .map(|(file, parsed)| (file, &parsed.arena))
                 .collect(),
-            CanonicalCheckerOptions::default(),
+            options,
         )
         .unwrap()
     }
@@ -9324,6 +9379,86 @@ mod tests {
             StoredCallableSetValidation::Malformed { .. }
         ));
         assert!(context.recheck_source_file(source_file).is_err());
+    }
+
+    #[test]
+    fn array_method_queries_find_preserves_union_elements_with_strict_null_checks() {
+        let library = array_callback_default_library();
+        for (index, receiver) in ["(string | number)[]", "ReadonlyArray<string | number>"]
+            .into_iter()
+            .enumerate()
+        {
+            let source = parsed(&format!(
+                "declare const values: {receiver}; const found = values.find(value => true);",
+            ));
+            let library_file = FileId::new(49_572 + u32::try_from(index * 2).unwrap());
+            let source_file = FileId::new(49_573 + u32::try_from(index * 2).unwrap());
+            let mut context = context_with_default_library_and_options(
+                &library,
+                library_file,
+                &source,
+                source_file,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(source_file).unwrap();
+
+            assert!(
+                context.diagnostics().is_empty(),
+                "{:?}",
+                context.diagnostics()
+            );
+            let call_nodes = calls(&source, source_file);
+            let [call] = call_nodes.as_slice() else {
+                panic!("the source must contain one find call")
+            };
+            let return_type = context
+                .store()
+                .type_node_links(*call)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let Some(TypeData::Union(union)) = context
+                .store()
+                .type_payload(return_type)
+                .map(TypeRecord::data)
+            else {
+                panic!("find must preserve both receiver members and undefined")
+            };
+            assert_eq!(union.union.types.len(), 3);
+            for expected in [
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.undefined_type,
+            ] {
+                assert!(union.union.types.contains(&expected));
+            }
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                call_publication_state(&context, *call),
+            );
+
+            context.recheck_source_file(source_file).unwrap();
+
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    call_publication_state(&context, *call),
+                ),
+                warm
+            );
+        }
     }
 
     #[test]
