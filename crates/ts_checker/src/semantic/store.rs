@@ -6763,7 +6763,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 return false;
             }
             for (index, facts) in facts.iter().enumerate() {
-                let Some(facts) = facts.filter(|facts| facts.parent == Some(declaration.node))
+                let Some(facts) = facts
+                    .as_ref()
+                    .filter(|facts| facts.parent == Some(declaration.node))
                 else {
                     continue;
                 };
@@ -6806,10 +6808,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             let owns_name = |name: NodeId| {
                 nodes
                     .get(name.index())
-                    .copied()
-                    .flatten()
+                    .and_then(Option::as_ref)
                     .filter(|facts| facts.kind == SyntaxKind::ComputedPropertyName)
-                    .and_then(|facts| nodes.get(facts.parent?.index()).copied().flatten())
+                    .and_then(|facts| nodes.get(facts.parent?.index()).and_then(Option::as_ref))
                     .is_some_and(|member| {
                         member.parent == Some(declaration.node)
                             && matches!(
@@ -6842,7 +6843,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     if owns_name(parent) {
                         static_names.insert(parent);
                     } else if facts.kind == SyntaxKind::NumericLiteral
-                        && let Some(unary) = nodes.get(parent.index()).copied().flatten()
+                        && let Some(unary) = nodes.get(parent.index()).and_then(Option::as_ref)
                         && unary.kind == SyntaxKind::PrefixUnaryExpression
                         && unary.prefix_unary_operator == Some(SyntaxKind::MinusToken)
                         && let Some(name) = unary.parent.filter(|name| owns_name(*name))

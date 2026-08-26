@@ -16,7 +16,7 @@ use super::{
     DeclaredTypeHost, DeclaredTypeUnavailable, SignatureId, TypeId, TypeResolutionTarget,
     TypeSystemPropertyName, UnsupportedDeclaredTypeKind,
     array_types::CanonicalArrayTargets,
-    bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
+    bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes, UnionReduction},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     classes::{
         ClassMemberQueryPlan, authenticated_class_constructor_value,
