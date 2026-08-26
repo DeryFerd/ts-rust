@@ -702,6 +702,17 @@ mod tests {
         let mut context = context(&[(file, &source)], 0, options);
         let node = annotation(&source, file, "iterator");
         let input = context.get_type_from_type_node(node).unwrap();
+        for (node, record) in source.arena.iter() {
+            if record.kind == ts_ast::SyntaxKind::FunctionType {
+                let node = NodeRef::new(source.arena.id(), file, node);
+                let signature = context
+                    .store()
+                    .signature_links(node)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .unwrap();
+                context.get_return_type_of_signature(signature).unwrap();
+            }
+        }
         let global_types = context.global_types().clone();
         let globals = SynchronousIterationGlobals::default();
         let store = context.store_mut_for_test();
@@ -729,6 +740,48 @@ mod tests {
                 }
             );
             assert!(checked.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn iterator_methods_validate_enum_parameter_dependencies() {
+        for members in ["Stop", "Stop, Cancel"] {
+            let source = parsed(&format!(
+                "enum Reason {{ {members} }} \
+                 interface State {{ \
+                 next(): {{ value: string }}; \
+                 throw(reason: Reason): {{ done: true; value: number }}; \
+                 }} declare var iterator: State;"
+            ));
+            let file = FileId::new(22_026);
+            let options = CanonicalCheckerOptions::default();
+            let mut context = context(&[(file, &source)], 0, options);
+            let node = annotation(&source, file, "iterator");
+            let input = context.get_type_from_type_node(node).unwrap();
+            let global_types = context.global_types().clone();
+            let globals = SynchronousIterationGlobals::default();
+            let store = context.store_mut_for_test();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let mut query = SynchronousIterationQuery::new(
+                store,
+                &global_types,
+                &globals,
+                options,
+                node,
+                StoredProperties,
+            );
+            for _ in 0..2 {
+                let checked = query.method(input, "throw", true).unwrap();
+                assert_eq!(
+                    checked.types,
+                    IterationTypes {
+                        yield_type: None,
+                        return_type: Some(number),
+                        next_type: None,
+                    }
+                );
+                assert!(checked.diagnostics.is_empty());
+            }
         }
     }
 
@@ -1717,8 +1770,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
                 projection, edges, ..
             } => {
                 for edge in edges {
-                    self.store
-                        .validate_union_constituent_with_global_types(self.global_types, edge)?;
+                    self.validate_dependency(edge)?;
                 }
                 Ok(projection.call_signatures)
             }
@@ -1729,6 +1781,21 @@ impl<'store, 'globals, P: IterationPropertyResolver>
         signature
             .return_type
             .ok_or_else(|| RelationUnavailable::UnresolvedFunctionType(signature.owner).into())
+    }
+
+    fn validate_dependency(&self, input: TypeId) -> Result<(), SourceCheckError> {
+        let record = self
+            .store
+            .type_payload(input)
+            .ok_or(RelationUnavailable::Type(input))?;
+        if record.flags().intersects(TypeFlags::ENUM_LIKE) {
+            return super::enums::canonical_enum_type_owner(self.store, input)
+                .map(|_| ())
+                .ok_or_else(|| RelationUnavailable::MalformedEnumType(input).into());
+        }
+        self.store
+            .validate_union_constituent_with_global_types(self.global_types, input)
+            .map_err(Into::into)
     }
 
     fn without_nullish(&mut self, type_: TypeId) -> Result<TypeId, SourceCheckError> {
@@ -1746,8 +1813,8 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             return Ok(type_);
         };
         let types = union.union.types.clone();
-        self.store
-            .validate_union_constituent_with_global_types(self.global_types, type_)?;
+        self.validate_dependency(type_)?;
+        let original_len = types.len();
         let mut retained = Vec::new();
         for type_ in types {
             if !self
@@ -1759,6 +1826,9 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             {
                 retained.push(type_);
             }
+        }
+        if retained.len() == original_len {
+            return Ok(type_);
         }
         Ok(self
             .union(&retained)?
@@ -1968,8 +2038,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
         }
         let constituents = match record.data() {
             TypeData::Union(union) => {
-                self.store
-                    .validate_union_constituent_with_global_types(self.global_types, input)?;
+                self.validate_dependency(input)?;
                 union.union.types.clone()
             }
             _ => vec![input],
