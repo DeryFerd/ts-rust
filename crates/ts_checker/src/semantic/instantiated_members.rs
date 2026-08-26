@@ -687,6 +687,24 @@ pub(super) fn instantiate_published_generic_interface_method(
     receiver: TypeId,
     method: SemanticSymbolId,
 ) -> Result<TypeId, GenericInterfaceMemberError> {
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    instantiate_published_generic_interface_method_with_session(
+        store,
+        global_types,
+        receiver,
+        method,
+        &mut session,
+    )
+}
+
+/// Keeps selected method instantiation inside the caller's source query limits.
+pub(super) fn instantiate_published_generic_interface_method_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    receiver: TypeId,
+    method: SemanticSymbolId,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, GenericInterfaceMemberError> {
     let targets = CanonicalArrayTargets::from_global_types(global_types);
     let plan = plan_published_interface_method(store, Some(targets), receiver, method)?;
     if let Some(cached) = cached_published_interface_method(store, &plan, targets)? {
@@ -701,7 +719,6 @@ pub(super) fn instantiate_published_generic_interface_method(
     let mapper = store
         .new_type_mapper(plan.mapper_sources.clone(), plan.mapper_targets.clone())
         .ok_or(GenericInterfaceMemberError::Capacity(plan.receiver))?;
-    let mut session = InstantiationSession::new(InstantiationLimits::default());
     let mut signatures = Vec::with_capacity(plan.signatures.len());
     for source in &plan.signatures {
         let signature = instantiate_generic_method_signature(
@@ -711,7 +728,7 @@ pub(super) fn instantiate_published_generic_interface_method(
             source.return_type,
             mapper,
             Some(targets),
-            &mut session,
+            session,
             plan.method,
             plan.receiver,
         )?;
@@ -1638,7 +1655,7 @@ fn validate_published_interface_method_signature(
     Ok(())
 }
 
-fn property_instantiation_error(
+pub(super) fn property_instantiation_error(
     type_: TypeId,
     error: &InstantiationError,
 ) -> GenericInterfaceMemberError {
