@@ -3495,7 +3495,12 @@ fn display_array_type(
                 .is_some_and(|symbol| {
                     symbol
                         .flags()
-                        .intersects(SymbolFlags::CLASS | SymbolFlags::ENUM | SymbolFlags::MODULE)
+                        .intersects(SymbolFlags::CLASS | SymbolFlags::ENUM)
+                        || symbol.flags().intersects(SymbolFlags::MODULE)
+                            && symbol.value_declaration().is_some_and(|declaration| {
+                                store.source_node_kind(declaration)
+                                    == Some(SyntaxKind::ModuleDeclaration)
+                            })
                 });
         if composite_parentheses || function_parentheses || type_query_parentheses {
             element = format!("({element})");
@@ -5179,6 +5184,9 @@ fn is_unaliased_single_callable_type(store: &CanonicalTypeMapperStore, type_id: 
         return false;
     };
     single_callable_family(store, type_id).is_some()
+        || validated_declared_method_display(store, type_id, record).is_ok_and(|projection| {
+            projection.is_some_and(|projection| projection.call_signatures.len() == 1)
+        })
         || matches!(record.data(), TypeData::Object(_))
             && record.data().structured().is_some_and(|structured| {
                 structured.call_signature_count == 0
@@ -6517,6 +6525,70 @@ mod tests {
     }
 
     #[test]
+    fn declared_method_display_parenthesizes_functions_but_not_overload_objects() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Service { ",
+            "read(value: string): number; ",
+            "load(value: string): number; load(value: number): string; ",
+            "} declare const service: Service; ",
+            "const read = service.read; const load = service.load;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(220);
+        let mut context = parsed_context(
+            &parsed,
+            file,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let globals = context.global_types().clone();
+        let undefined = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_type;
+        for (node, record) in parsed.arena.iter() {
+            let NodeData::PropertyAccessExpression(access) = &record.data else {
+                continue;
+            };
+            let NodeData::Identifier(name) = &parsed.arena.get(access.name).unwrap().data else {
+                panic!("test methods have identifier names")
+            };
+            let type_ = context
+                .store()
+                .type_node_links(NodeRef::new(parsed.arena.id(), file, node))
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let (array_text, union_text) = match name.text.as_str() {
+                "read" => (
+                    "((value: string) => number)[]",
+                    "((value: string) => number) | undefined",
+                ),
+                "load" => (
+                    "{ (value: string): number; (value: number): string; }[]",
+                    "{ (value: string): number; (value: number): string; } | undefined",
+                ),
+                _ => unreachable!(),
+            };
+            let array = context
+                .store_mut_for_test()
+                .create_canonical_array_type(&globals, type_, false)
+                .unwrap();
+            let union = context
+                .store_mut_for_test()
+                .literal_union_type(&[type_, undefined], None)
+                .unwrap();
+            assert_eq!(context.type_to_string(array).unwrap(), array_text);
+            assert_eq!(context.type_to_string(union).unwrap(), union_text);
+        }
+    }
+
+    #[test]
     fn instantiated_method_display_names_only_validated_fresh_parameters() {
         let parsed = parse_source_file(concat!(
             "interface Box<T> { convert<U extends T = T>(value: U): U; } ",
@@ -7433,14 +7505,55 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Check namespace, array display, and export cache validation together.
     fn imported_module_namespaces_preserve_module_names_and_validate_export_targets() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
         let parsed = parse_source_file(concat!(
             "export declare const first: number; ",
             "export declare const second: string;",
         ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(196);
-        let mut context = external_parsed_context(&parsed, file);
+        let library_file = FileId::new(221);
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, path, state) in [
+            (
+                library_file,
+                &library,
+                "\"/formatter-arrays.ts\"",
+                CanonicalModuleState::Script,
+            ),
+            (
+                file,
+                &parsed,
+                "\"/formatter-external.ts\"",
+                CanonicalModuleState::External,
+            ),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(library_file, &library.arena), (file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
         let (module, first_export, second_export, number, string) = {
             let (_, bound) = context.file(file).unwrap();
             let module = bound.symbol(bound.source_file()).unwrap();
@@ -7509,6 +7622,17 @@ mod tests {
             context.type_to_string(namespace).unwrap(),
             "typeof import(\"formatter-external\")"
         );
+        let globals = context.global_types().clone();
+        for (readonly, expected) in [
+            (false, "typeof import(\"formatter-external\")[]"),
+            (true, "readonly typeof import(\"formatter-external\")[]"),
+        ] {
+            let array = context
+                .store_mut_for_test()
+                .create_canonical_array_type(&globals, namespace, readonly)
+                .unwrap();
+            assert_eq!(context.type_to_string(array).unwrap(), expected);
+        }
         assert!(type_to_string(context.store(), namespace).is_err());
         assert_eq!(
             context
