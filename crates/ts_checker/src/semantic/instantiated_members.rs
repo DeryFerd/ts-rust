@@ -39,7 +39,6 @@ use super::{
         instantiate_type_with_vector_and_session, instantiated_member_type_matches,
     },
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
-    mapper::TypeMapperApplication,
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
         validate_resolved_declared_property_object,
@@ -1906,66 +1905,39 @@ fn instantiated_function_member_owner(
     source: TypeId,
     mapper: TypeMapperId,
 ) -> Option<CanonicalArrayTargets> {
-    store.signatures().find_map(|(_, signature)| {
-        if signature.mapper() != Some(mapper) {
-            return None;
-        }
-        let original_id = signature.target()?;
-        if !store
-            .callable_signature_parameter_types(original_id)?
-            .contains(&source)
-        {
-            return None;
-        }
-        let method_type = store.interface_method_linked_type(original_id)?;
-        let method = store.type_payload(method_type)?.symbol()?;
-        let (owner, owner_type) = store.authenticated_interface_method_owner(method)?;
-        let owner_record = store.symbol(owner)?;
-        let globals = store.intrinsic_bootstrap()?.globals;
-        if !matches!(
-            owner_record.name().as_utf8(),
-            Some("Array" | "ReadonlyArray")
-        ) || store
-            .symbol_table(globals)?
-            .get(owner_record.name())
-            .and_then(|owner| store.get_merged_symbol(owner))
-            != Some(owner)
-        {
-            return None;
-        }
-        let original = store.signature(original_id)?;
-        let owner_mapper = if let Some(parameter) = original.type_parameters().first() {
-            let TypeMapperApplication::Composite { second, .. } =
-                store.mapper_application(mapper, *parameter)?
-            else {
-                return None;
-            };
-            second
-        } else {
-            mapper
-        };
-        let TypeData::Interface(interface) = store.type_payload(owner_type)?.data() else {
+    let method = function_member_declaring_method(store, source)?;
+    let (_, owner_type) = store.authenticated_interface_method_owner(method)?;
+    let method_source = store.value_symbol_links(method)?.resolved_type?;
+    let TypeData::Interface(interface) = store.type_payload(owner_type)?.data() else {
+        return None;
+    };
+    let this_type = interface.this_type?;
+    let targets = CanonicalArrayTargets::for_single_target_validation(owner_type);
+    store.types().find_map(|(method_type, record)| {
+        let TypeData::Object(object) = record.data() else {
             return None;
         };
-        let receiver = store.map_type(owner_mapper, interface.this_type?)?;
-        let targets = CanonicalArrayTargets::for_single_target_validation(owner_type);
+        if record.symbol() != Some(method) || object.target != Some(method_source) {
+            return None;
+        }
+        let receiver = store.map_type(object.mapper?, this_type)?;
         let plan = plan_published_interface_method(store, targets, receiver, method).ok()?;
-        if store.type_mapper_has_exact_endpoints(
-            owner_mapper,
-            &plan.mapper_sources,
-            &plan.mapper_targets,
-        ) != Some(true)
-            || validated_instantiated_method_mapper(
-                store,
-                original,
-                signature,
-                owner_mapper,
-                Some(targets),
-            ) != Some(mapper)
-        {
+        if cached_published_interface_method(store, &plan, targets).ok()? != Some(method_type) {
             return None;
         }
-        Some(targets)
+        object
+            .structured
+            .signatures
+            .as_deref()?
+            .iter()
+            .zip(&plan.signatures)
+            .any(|(&signature, original)| {
+                original.parameter_types.contains(&source)
+                    && store
+                        .signature(signature)
+                        .is_some_and(|signature| signature.mapper() == Some(mapper))
+            })
+            .then_some(targets)
     })
 }
 

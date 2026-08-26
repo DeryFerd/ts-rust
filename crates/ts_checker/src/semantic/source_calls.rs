@@ -9528,6 +9528,146 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep the forged signature and its valid mapper endpoints explicit.
+    fn array_method_queries_reject_raw_signature_callback_owners() {
+        let library = parsed(concat!(
+            "interface Array<T> { ",
+            "forEach(callbackfn: (value: T, index: number, array: T[]) => void, ",
+            "thisArg?: any): void; } interface ReadonlyArray<T> {}",
+        ));
+        let source = parsed("declare const values: number[]; values.forEach(value => value);");
+        let library_file = FileId::new(49_590);
+        let source_file = FileId::new(49_591);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+        context.check_source_file(source_file).unwrap();
+        let method_node = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let method = context
+            .store()
+            .symbol_node_links(method_node)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        let source_method = context
+            .store()
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let original_method = context
+            .store()
+            .type_payload(source_method)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .unwrap()[0];
+        let source_callback = context
+            .store()
+            .callable_signature_parameter_types(original_method)
+            .unwrap()[0];
+        let StoredSingleCallableValidation::Valid { callable, .. } =
+            validate_stored_single_callable(context.store(), source_callback)
+        else {
+            panic!("the real default-library callback must validate")
+        };
+        let source_callback_symbol = context
+            .store()
+            .type_payload(source_callback)
+            .and_then(TypeRecord::symbol)
+            .unwrap();
+        let globals = context.global_types().clone();
+        let Some(TypeData::Interface(interface)) = context
+            .store()
+            .type_payload(globals.array_type)
+            .map(TypeRecord::data)
+        else {
+            panic!("Array must retain its generic interface target")
+        };
+        let element = interface
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .unwrap()[0];
+        let this_type = interface.this_type.unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, number, void) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.void_type,
+        );
+        let store = context.store_mut_for_test();
+        let strings = store
+            .create_canonical_array_type(&globals, string, false)
+            .unwrap();
+        let mapper = store
+            .new_type_mapper(vec![element, this_type], vec![string, strings])
+            .unwrap();
+        let raw_owner = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(void),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(store.set_signature_target_and_mapper(
+            raw_owner,
+            Some(original_method),
+            Some(mapper)
+        ));
+        let signature = store
+            .instantiate_signature(callable.signature, mapper)
+            .unwrap();
+        let parameters = store.signature(signature).unwrap().parameters().to_vec();
+        for (parameter, type_) in parameters.into_iter().zip([string, number, strings]) {
+            let links = store.value_symbol_links(parameter).unwrap().clone();
+            assert!(store.set_value_symbol_links(
+                parameter,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..links
+                }
+            ));
+        }
+        assert!(store.set_signature_resolved_return_type(signature, Some(void)));
+        let forged = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(source_callback_symbol))
+            .unwrap();
+        assert!(store.set_object_target_and_mapper(forged, Some(source_callback), Some(mapper)));
+        assert!(store.set_structured_type_members(
+            forged,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None
+        ));
+        let before = (store.type_len(), store.signature_len(), store.mapper_len());
+
+        for _ in 0..2 {
+            assert!(matches!(
+                validate_stored_single_callable(store, forged),
+                StoredSingleCallableValidation::Malformed { .. }
+            ));
+            assert_eq!(
+                (store.type_len(), store.signature_len(), store.mapper_len()),
+                before
+            );
+        }
+    }
+
+    #[test]
     fn array_filter_accepts_the_authenticated_generic_boolean_constructor() {
         let library = parsed(concat!(
             "interface Array<T> { ",
