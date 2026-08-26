@@ -1,0 +1,15 @@
+--- a/internal/checker/checker.go
++++ b/internal/checker/checker.go
+@@ -579,3 +579,4 @@
+ type Checker struct {
++	projectOracleObjectWitness *projectOracleObjectWitnessState
+ 	id                                          uint32
+ 	program                                     Program
+@@ -13160,6 +13161,7 @@
+ 		if inDestructuringPattern {
+ 			c.patternForType[result] = node
+ 		}
++		c.projectOracleObjectLiteralProduced(node, result, checkMode, inDestructuringPattern, inConstContext, contextualTypeHasPattern)
+ 		return result
+ 	}
+ 	for _, memberDecl := range node.Properties() {

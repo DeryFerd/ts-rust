@@ -1,0 +1,838 @@
+package checker
+
+import (
+	"fmt"
+	"slices"
+
+	"github.com/microsoft/typescript-go/internal/ast"
+	"github.com/microsoft/typescript-go/internal/core"
+	"github.com/microsoft/typescript-go/internal/jsnum"
+)
+
+// Passes and query witnesses are issued and retained by one checker.
+type ProjectOracleObjectPass struct {
+	owner  *Checker
+	token  uint64
+	closed bool
+}
+
+type ProjectOracleObjectQueryWitness struct {
+	pass        *ProjectOracleObjectPass
+	token       uint64
+	node        *ast.Node
+	file        *ast.SourceFile
+	result      *Type
+	typeFloor   uint32
+	finished    bool
+	productions map[*Type]*objectWitnessProduction
+	closed      map[*Type]objectWitnessSnapshot
+	closeError  string
+}
+
+type ProjectOracleObjectRelation struct {
+	Called               bool    `json:"called"`
+	Identical            *bool   `json:"identical"`
+	ObservedChecks       int     `json:"observed_checks"`
+	RootObserved         bool    `json:"root_observed"`
+	Overflow             *bool   `json:"overflow"`
+	CachedBefore         uint32  `json:"cached_before"`
+	CachedAfter          uint32  `json:"cached_after"`
+	TypeAllocations      uint32  `json:"type_allocations"`
+	SymbolAllocations    uint32  `json:"symbol_allocations"`
+	SignatureAllocations uint32  `json:"signature_allocations"`
+	IdentityCacheDelta   int     `json:"identity_cache_delta"`
+	DiagnosticCodes      []int32 `json:"diagnostic_codes"`
+	SuggestionCodes      []int32 `json:"suggestion_codes"`
+	Panic                string  `json:"panic"`
+	WitnessDataChanged   bool    `json:"witness_data_changed"`
+}
+
+// Verified applies only to the bounded fresh object result, not project parity.
+type ProjectOracleObjectVerification struct {
+	State            string                      `json:"state"`
+	Reason           string                      `json:"reason"`
+	FreshObjects     int                         `json:"fresh_objects"`
+	StableCacheEdges int                         `json:"stable_cache_edges"`
+	Relation         ProjectOracleObjectRelation `json:"relation"`
+}
+
+type projectOracleObjectWitnessState struct {
+	sequence uint64
+	pass     *ProjectOracleObjectPass
+	query    *ProjectOracleObjectQueryWitness
+	issued   map[*ProjectOracleObjectQueryWitness]objectWitnessIssuedQuery
+	passes   map[*ProjectOracleObjectPass]objectWitnessIssuedPass
+	relation *objectWitnessRelationRun
+}
+
+type objectWitnessIssuedQuery struct {
+	pass      *ProjectOracleObjectPass
+	token     uint64
+	node      *ast.Node
+	file      *ast.SourceFile
+	result    *Type
+	typeFloor uint32
+}
+
+type objectWitnessIssuedPass struct {
+	token  uint64
+	closed bool
+}
+
+type objectWitnessRelationRun struct {
+	source, target *Type
+	checks         int
+	rootObserved   bool
+	overflow       bool
+}
+
+type objectWitnessNode struct {
+	ref, parent, name, initializer *ast.Node
+	symbol                         *ast.Symbol
+	kind                           ast.Kind
+	flags                          ast.NodeFlags
+	start, end                     int
+}
+
+type objectWitnessSymbol struct {
+	ref, parent, exportSymbol *ast.Symbol
+	flags                     ast.SymbolFlags
+	checkFlags                ast.CheckFlags
+	name                      string
+	declaration, value        *ast.Node
+	declarationCount          int
+	members, exports          int
+}
+
+type objectWitnessHeader struct {
+	ref         *Type
+	checker     *Checker
+	flags       TypeFlags
+	objectFlags ObjectFlags
+	id          TypeId
+	symbol      *ast.Symbol
+	alias       *TypeAlias
+	data        TypeData
+}
+
+type objectWitnessProperty struct {
+	key        string
+	symbol     objectWitnessSymbol
+	target     objectWitnessSymbol
+	decl       objectWitnessNode
+	name       objectWitnessNode
+	value      *ast.Node
+	links      ValueSymbolLinks
+	linksKnown bool
+}
+
+type objectWitnessSnapshot struct {
+	header                          objectWitnessHeader
+	node                            objectWitnessNode
+	owner                           objectWitnessSymbol
+	declarations                    []*ast.Node
+	properties                      []objectWitnessProperty
+	ordered                         []*ast.Symbol
+	signatures                      []*Signature
+	callCount                       int
+	indexes                         []*IndexInfo
+	target                          *Type
+	mapper                          *TypeMapper
+	instantiations                  int
+	baseConstraint, withoutAbstract *Type
+	cacheEdges                      map[*ast.Symbol]objectWitnessCacheEdge
+}
+
+type objectWitnessProduction struct {
+	query                                          *ProjectOracleObjectQueryWitness
+	queryToken                                     uint64
+	node                                           *ast.Node
+	result                                         *Type
+	mode                                           CheckMode
+	creationTypeCount                              uint32
+	destructuring, constContext, contextualPattern bool
+	birth                                          objectWitnessSnapshot
+	error                                          string
+}
+
+type objectWitnessIntrinsic struct {
+	header         objectWitnessHeader
+	anchor         string
+	name           string
+	value          any
+	fresh, regular *Type
+}
+
+type objectWitnessParameter struct {
+	node   objectWitnessNode
+	symbol objectWitnessSymbol
+	links  ValueSymbolLinks
+	type_  objectWitnessIntrinsic
+}
+
+type objectWitnessSignature struct {
+	ref              *Signature
+	id               SignatureId
+	flags            SignatureFlags
+	min, resolvedMin int32
+	declaration      *ast.Node
+	this             *ast.Symbol
+	returnType       *Type
+	predicate        *TypePredicate
+	target           *Signature
+	mapper           *TypeMapper
+	isolated         *Type
+	composite        *CompositeSignature
+}
+
+type objectWitnessCacheEdge struct {
+	intrinsic  *objectWitnessIntrinsic
+	owner      objectWitnessSymbol
+	ownerLinks ValueSymbolLinks
+	header     objectWitnessHeader
+	signature  objectWitnessSignature
+	parameters []objectWitnessParameter
+	returnType objectWitnessIntrinsic
+}
+
+func objectWitnessNodeSnapshot(node *ast.Node) objectWitnessNode {
+	if node == nil {
+		return objectWitnessNode{}
+	}
+	return objectWitnessNode{node, node.Parent, node.Name(), objectWitnessInitializer(node), node.Symbol(), node.Kind, node.Flags, node.Pos(), node.End()}
+}
+
+func objectWitnessInitializer(node *ast.Node) *ast.Node {
+	if node == nil {
+		return nil
+	}
+	switch node.Kind {
+	case ast.KindPropertyAssignment, ast.KindVariableDeclaration, ast.KindParameter,
+		ast.KindBindingElement, ast.KindPropertyDeclaration, ast.KindPropertySignature, ast.KindEnumMember:
+		return node.Initializer()
+	case ast.KindShorthandPropertyAssignment:
+		return node.AsShorthandPropertyAssignment().ObjectAssignmentInitializer
+	default:
+		return nil
+	}
+}
+
+func objectWitnessSymbolSnapshot(symbol *ast.Symbol) objectWitnessSymbol {
+	if symbol == nil {
+		return objectWitnessSymbol{}
+	}
+	var declaration *ast.Node
+	if len(symbol.Declarations) != 0 {
+		declaration = symbol.Declarations[0]
+	}
+	return objectWitnessSymbol{symbol, symbol.Parent, symbol.ExportSymbol, symbol.Flags, symbol.CheckFlags, symbol.Name,
+		declaration, symbol.ValueDeclaration, len(symbol.Declarations), len(symbol.Members), len(symbol.Exports)}
+}
+
+func objectWitnessTypeHeader(typ *Type) objectWitnessHeader {
+	if typ == nil {
+		return objectWitnessHeader{}
+	}
+	return objectWitnessHeader{typ, typ.checker, typ.flags, typ.objectFlags, typ.id, typ.symbol, typ.alias, typ.data}
+}
+
+// This reads parent and child edges, including a cycle check, before any query.
+func (c *Checker) objectWitnessSource(node *ast.Node) (*ast.SourceFile, error) {
+	seen := map[*ast.Node]bool{}
+	for current := node; current != nil; current = current.Parent {
+		if seen[current] {
+			return nil, fmt.Errorf("cyclic source parent edges")
+		}
+		seen[current] = true
+		if current.Kind == ast.KindSourceFile {
+			file := current.AsSourceFile()
+			if c.program.GetSourceFile(file.FileName()) != file {
+				return nil, fmt.Errorf("source file belongs to another program")
+			}
+			return file, nil
+		}
+		if current.Parent == nil {
+			break
+		}
+		found := false
+		current.Parent.ForEachChild(func(child *ast.Node) bool {
+			found = found || child == current
+			return found
+		})
+		if !found {
+			return nil, fmt.Errorf("source parent does not own the child")
+		}
+	}
+	return nil, fmt.Errorf("source file is missing")
+}
+
+// The caller holds the Program's exclusive checker lock for all observation calls.
+func (c *Checker) ProjectOracleBeginObjectPass() (*ProjectOracleObjectPass, error) {
+	if c.projectOracleObjectWitness == nil {
+		c.projectOracleObjectWitness = &projectOracleObjectWitnessState{
+			issued: map[*ProjectOracleObjectQueryWitness]objectWitnessIssuedQuery{}, passes: map[*ProjectOracleObjectPass]objectWitnessIssuedPass{},
+		}
+	}
+	state := c.projectOracleObjectWitness
+	if state.pass != nil || state.query != nil || state.relation != nil {
+		return nil, fmt.Errorf("an object observation or verification is active")
+	}
+	state.sequence++
+	pass := &ProjectOracleObjectPass{owner: c, token: state.sequence}
+	state.pass = pass
+	state.passes[pass] = objectWitnessIssuedPass{token: pass.token}
+	return pass, nil
+}
+
+// The wrapper owns the call and returned result. A caller cannot supply a claimed type.
+func (c *Checker) ProjectOracleObjectQuery(pass *ProjectOracleObjectPass, node *ast.Node) (*Type, *ProjectOracleObjectQueryWitness, error) {
+	state := c.projectOracleObjectWitness
+	if state == nil || pass == nil || pass.owner != c || state.pass != pass || pass.closed || state.query != nil {
+		return nil, nil, fmt.Errorf("object query pass is not active")
+	}
+	issuedPass, known := state.passes[pass]
+	if !known || issuedPass.token != pass.token || issuedPass.closed {
+		return nil, nil, fmt.Errorf("registered object pass token changed")
+	}
+	file, err := c.objectWitnessSource(node)
+	if err != nil {
+		return nil, nil, err
+	}
+	state.sequence++
+	query := &ProjectOracleObjectQueryWitness{
+		pass: pass, token: state.sequence, node: node, file: file,
+		typeFloor:   c.TypeCount,
+		productions: map[*Type]*objectWitnessProduction{},
+	}
+	state.query = query
+	defer func() { state.query = nil }()
+	result := c.GetTypeAtLocation(node)
+	query.result, query.finished = result, true
+	state.issued[query] = objectWitnessIssuedQuery{pass, query.token, node, file, result, query.typeFloor}
+	return result, query, nil
+}
+
+func (c *Checker) projectOracleObjectLiteralProduced(node *ast.Node, result *Type, mode CheckMode, destructuring, constContext, contextualPattern bool) {
+	state := c.projectOracleObjectWitness
+	if state == nil || state.query == nil {
+		return
+	}
+	query := state.query
+	production := &objectWitnessProduction{
+		query: query, queryToken: query.token, node: node, result: result, mode: mode,
+		creationTypeCount: c.TypeCount,
+		destructuring:     destructuring, constContext: constContext, contextualPattern: contextualPattern,
+	}
+	production.birth, production.error = c.objectWitnessSnapshot(production, false)
+	if query.productions[result] != nil {
+		production.error = "producer returned the same result more than once"
+	}
+	query.productions[result] = production
+}
+
+func (c *Checker) objectWitnessSnapshot(production *objectWitnessProduction, close bool) (objectWitnessSnapshot, string) {
+	typ, node := production.result, production.node
+	if typ == nil || node == nil {
+		return objectWitnessSnapshot{}, "producer result or node is missing"
+	}
+	data, ok := typ.data.(*ObjectType)
+	if !ok || data == nil || data.AsType() != typ {
+		return objectWitnessSnapshot{}, "producer result is not an owned object record"
+	}
+	result := objectWitnessSnapshot{
+		header: objectWitnessTypeHeader(typ), node: objectWitnessNodeSnapshot(node), owner: objectWitnessSymbolSnapshot(node.Symbol()),
+		declarations: slices.Clone(node.Properties()), ordered: slices.Clone(data.properties),
+		signatures: slices.Clone(data.signatures), callCount: data.callSignatureCount, indexes: slices.Clone(data.indexInfos),
+		target: data.target, mapper: data.mapper, instantiations: len(data.instantiations),
+		baseConstraint: data.resolvedBaseConstraint, withoutAbstract: data.objectTypeWithoutAbstractConstructSignatures,
+		cacheEdges: map[*ast.Symbol]objectWitnessCacheEdge{},
+	}
+	keys := make([]string, 0, len(data.members))
+	for key := range data.members {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	for _, key := range keys {
+		member := data.members[key]
+		property := objectWitnessProperty{key: key, symbol: objectWitnessSymbolSnapshot(member)}
+		if member != nil {
+			property.decl = objectWitnessNodeSnapshot(member.ValueDeclaration)
+			if member.ValueDeclaration != nil {
+				property.name = objectWitnessNodeSnapshot(member.ValueDeclaration.Name())
+				property.value = objectWitnessInitializer(member.ValueDeclaration)
+				if ast.IsShorthandPropertyAssignment(member.ValueDeclaration) {
+					property.value = member.ValueDeclaration.Name()
+				}
+			}
+			if links := c.valueSymbolLinks.TryGet(member); links != nil {
+				property.links, property.linksKnown = *links, true
+				property.target = objectWitnessSymbolSnapshot(links.target)
+				if close && production.query.productions[links.resolvedType] == nil {
+					if edge, known := c.objectWitnessCacheSnapshot(links.resolvedType, property.value); known {
+						result.cacheEdges[member] = edge
+					}
+				}
+			}
+		}
+		result.properties = append(result.properties, property)
+	}
+	return result, ""
+}
+
+// The phase owner calls this only after the pass's artifact observations finish.
+func (c *Checker) ProjectOracleEndObjectPass(pass *ProjectOracleObjectPass) error {
+	state := c.projectOracleObjectWitness
+	if state == nil || pass == nil || pass.owner != c || state.pass != pass || state.query != nil || pass.closed {
+		return fmt.Errorf("object pass cannot close in its current state")
+	}
+	issuedPass, known := state.passes[pass]
+	if !known || issuedPass.token != pass.token || issuedPass.closed {
+		return fmt.Errorf("registered object pass token changed")
+	}
+	for query, issued := range state.issued {
+		if issued.pass != pass {
+			continue
+		}
+		if issued != (objectWitnessIssuedQuery{query.pass, query.token, query.node, query.file, query.result, query.typeFloor}) {
+			return fmt.Errorf("registered object query changed before pass closure")
+		}
+		query.closed = map[*Type]objectWitnessSnapshot{}
+		for typ, production := range query.productions {
+			snapshot, failure := c.objectWitnessSnapshot(production, true)
+			if failure != "" {
+				query.closeError = failure
+			}
+			query.closed[typ] = snapshot
+		}
+	}
+	pass.closed = true
+	state.passes[pass] = objectWitnessIssuedPass{token: issuedPass.token, closed: true}
+	state.pass = nil
+	return nil
+}
+
+func objectWitnessUnwrap(node *ast.Node) *ast.Node {
+	seen := map[*ast.Node]bool{}
+	for node != nil && ast.IsParenthesizedExpression(node) {
+		if seen[node] {
+			return nil
+		}
+		seen[node] = true
+		node = node.Expression()
+	}
+	return node
+}
+
+func (c *Checker) objectWitnessIntrinsicSnapshot(typ *Type) (objectWitnessIntrinsic, bool) {
+	if typ == nil || typ.checker != c || typ.alias != nil {
+		return objectWitnessIntrinsic{}, false
+	}
+	result := objectWitnessIntrinsic{header: objectWitnessTypeHeader(typ)}
+	for _, known := range []struct {
+		typ          *Type
+		anchor, name string
+		flags        TypeFlags
+	}{
+		{c.anyType, "any", "any", TypeFlagsAny}, {c.errorType, "error", "error", TypeFlagsAny},
+		{c.unknownType, "unknown", "unknown", TypeFlagsUnknown}, {c.numberType, "number", "number", TypeFlagsNumber},
+		{c.stringType, "string", "string", TypeFlagsString}, {c.bigintType, "bigint", "bigint", TypeFlagsBigInt},
+		{c.esSymbolType, "symbol", "symbol", TypeFlagsESSymbol}, {c.voidType, "void", "void", TypeFlagsVoid},
+		{c.undefinedType, "undefined", "undefined", TypeFlagsUndefined},
+		{c.undefinedWideningType, "undefined_widening", "undefined", TypeFlagsUndefined},
+		{c.nullType, "null", "null", TypeFlagsNull}, {c.nullWideningType, "null_widening", "null", TypeFlagsNull},
+		{c.neverType, "never", "never", TypeFlagsNever},
+	} {
+		if typ == known.typ {
+			data, ok := typ.data.(*IntrinsicType)
+			if !ok || data == nil || typ.flags != known.flags || data.intrinsicName != known.name {
+				return objectWitnessIntrinsic{}, false
+			}
+			result.anchor, result.name = known.anchor, data.intrinsicName
+			return result, true
+		}
+	}
+	if typ == c.booleanType {
+		data, ok := typ.data.(*UnionType)
+		if !ok || data == nil || !slices.Equal(data.types, []*Type{c.regularFalseType, c.regularTrueType}) {
+			return objectWitnessIntrinsic{}, false
+		}
+		result.anchor = "boolean"
+		return result, true
+	}
+	data, ok := typ.data.(*LiteralType)
+	if !ok || data == nil || typ.flags&TypeFlagsEnumLiteral != 0 {
+		return objectWitnessIntrinsic{}, false
+	}
+	var regular *Type
+	switch value := data.value.(type) {
+	case string:
+		regular, result.anchor = c.stringLiteralTypes[value], "string_literal"
+	case jsnum.Number:
+		regular, result.anchor = c.numberLiteralTypes[value], "number_literal"
+	case jsnum.PseudoBigInt:
+		regular, result.anchor = c.bigintLiteralTypes[value], "bigint_literal"
+	case bool:
+		result.anchor = "boolean_literal"
+		regular = c.regularFalseType
+		if value {
+			regular = c.regularTrueType
+		}
+	default:
+		return objectWitnessIntrinsic{}, false
+	}
+	if regular == nil {
+		return objectWitnessIntrinsic{}, false
+	}
+	regularData, known := regular.data.(*LiteralType)
+	if !known || regularData == nil || (typ != regular && typ != regularData.freshType) || data.regularType != regular {
+		return objectWitnessIntrinsic{}, false
+	}
+	result.value, result.fresh, result.regular = data.value, data.freshType, data.regularType
+	return result, true
+}
+
+func (c *Checker) objectWitnessCacheSnapshot(typ *Type, expression *ast.Node) (objectWitnessCacheEdge, bool) {
+	if intrinsic, known := c.objectWitnessIntrinsicSnapshot(typ); known {
+		return objectWitnessCacheEdge{intrinsic: &intrinsic}, true
+	}
+	expression = objectWitnessUnwrap(expression)
+	if typ == nil || typ.checker != c || expression == nil || !ast.IsIdentifier(expression) {
+		return objectWitnessCacheEdge{}, false
+	}
+	read := c.symbolNodeLinks.TryGet(expression)
+	if read == nil || read.resolvedSymbol == nil {
+		return objectWitnessCacheEdge{}, false
+	}
+	owner := read.resolvedSymbol
+	links := c.valueSymbolLinks.TryGet(owner)
+	data, ok := typ.data.(*ObjectType)
+	if links == nil || links.resolvedType != typ || owner.Flags != ast.SymbolFlagsFunction ||
+		owner.CheckFlags != 0 || len(owner.Declarations) != 1 || owner.ValueDeclaration == nil ||
+		owner.Declarations[0] != owner.ValueDeclaration || owner.ValueDeclaration.Symbol() != owner ||
+		!ast.IsFunctionDeclaration(owner.ValueDeclaration) || len(owner.Exports) != 0 ||
+		!ok || data == nil || typ.flags != TypeFlagsObject || typ.symbol != owner || typ.alias != nil ||
+		typ.objectFlags&(ObjectFlagsAnonymous|ObjectFlagsMembersResolved) != ObjectFlagsAnonymous|ObjectFlagsMembersResolved ||
+		typ.objectFlags & ^(ObjectFlagsAnonymous|ObjectFlagsMembersResolved|ObjectFlagsCouldContainTypeVariablesComputed|ObjectFlagsCouldContainTypeVariables) != 0 ||
+		(typ.objectFlags&ObjectFlagsCouldContainTypeVariablesComputed != 0) != (typ.objectFlags&ObjectFlagsCouldContainTypeVariables != 0) ||
+		data.target != nil || data.mapper != nil || len(data.members) != 0 || len(data.properties) != 0 ||
+		len(data.indexInfos) != 0 || len(data.signatures) != 1 || data.callSignatureCount != 1 {
+		return objectWitnessCacheEdge{}, false
+	}
+	signature := data.signatures[0]
+	if signature == nil || signature.declaration != owner.ValueDeclaration ||
+		signature.flags & ^(SignatureFlagsHasRestParameter|SignatureFlagsHasLiteralTypes) != 0 ||
+		len(signature.typeParameters) != 0 || signature.thisParameter != nil || signature.target != nil ||
+		signature.mapper != nil || signature.composite != nil || signature.resolvedTypePredicate != c.noTypePredicate ||
+		len(signature.parameters) != len(owner.ValueDeclaration.Parameters()) {
+		return objectWitnessCacheEdge{}, false
+	}
+	returned, known := c.objectWitnessIntrinsicSnapshot(signature.resolvedReturnType)
+	if !known {
+		return objectWitnessCacheEdge{}, false
+	}
+	result := objectWitnessCacheEdge{
+		owner: objectWitnessSymbolSnapshot(owner), ownerLinks: *links, header: objectWitnessTypeHeader(typ), returnType: returned,
+		signature: objectWitnessSignature{signature, signature.id, signature.flags, signature.minArgumentCount,
+			signature.resolvedMinArgumentCount, signature.declaration, signature.thisParameter, signature.resolvedReturnType,
+			signature.resolvedTypePredicate, signature.target, signature.mapper, signature.isolatedSignatureType, signature.composite},
+	}
+	for index, parameter := range signature.parameters {
+		declaration := owner.ValueDeclaration.Parameters()[index]
+		parameterLinks := c.valueSymbolLinks.TryGet(parameter)
+		if parameter == nil || declaration.Symbol() != parameter || declaration.Parent != owner.ValueDeclaration ||
+			parameter.ValueDeclaration != declaration || len(parameter.Declarations) != 1 || parameter.Declarations[0] != declaration || parameterLinks == nil {
+			return objectWitnessCacheEdge{}, false
+		}
+		parameterType, known := c.objectWitnessIntrinsicSnapshot(parameterLinks.resolvedType)
+		if !known {
+			return objectWitnessCacheEdge{}, false
+		}
+		result.parameters = append(result.parameters, objectWitnessParameter{
+			objectWitnessNodeSnapshot(declaration), objectWitnessSymbolSnapshot(parameter), *parameterLinks, parameterType,
+		})
+	}
+	return result, true
+}
+
+func objectWitnessSameCache(left, right objectWitnessCacheEdge) bool {
+	if left.intrinsic != nil || right.intrinsic != nil {
+		return left.intrinsic != nil && right.intrinsic != nil && *left.intrinsic == *right.intrinsic
+	}
+	return left.owner == right.owner && left.ownerLinks == right.ownerLinks && left.header == right.header &&
+		left.signature == right.signature && left.returnType == right.returnType && slices.Equal(left.parameters, right.parameters)
+}
+
+func objectWitnessSameSnapshot(left, right objectWitnessSnapshot) bool {
+	return left.header == right.header && left.node == right.node && left.owner == right.owner &&
+		slices.Equal(left.declarations, right.declarations) && slices.Equal(left.properties, right.properties) &&
+		slices.Equal(left.ordered, right.ordered) && slices.Equal(left.signatures, right.signatures) &&
+		left.callCount == right.callCount && slices.Equal(left.indexes, right.indexes) &&
+		left.target == right.target && left.mapper == right.mapper && left.instantiations == right.instantiations &&
+		left.baseConstraint == right.baseConstraint && left.withoutAbstract == right.withoutAbstract
+}
+
+func objectWitnessResult(state, reason string) ProjectOracleObjectVerification {
+	return ProjectOracleObjectVerification{State: state, Reason: reason,
+		Relation: ProjectOracleObjectRelation{DiagnosticCodes: []int32{}, SuggestionCodes: []int32{}},
+	}
+}
+
+func (c *Checker) objectWitnessValidateProduction(production *objectWitnessProduction, snapshot objectWitnessSnapshot) (string, string) {
+	query, node := production.query, production.node
+	if production.error != "" {
+		return "incomplete", production.error
+	}
+	if production.mode != CheckModeTypeOnly || production.destructuring || production.constContext || production.contextualPattern ||
+		node.Kind != ast.KindObjectLiteralExpression || (query.file.ScriptKind != core.ScriptKindTS && query.file.ScriptKind != core.ScriptKindTSX) {
+		return "incomplete", "object literal producer context is not proved"
+	}
+	for _, declaration := range snapshot.declarations {
+		if !ast.IsPropertyAssignment(declaration) && !ast.IsShorthandPropertyAssignment(declaration) ||
+			declaration.Name() == nil || ast.IsComputedPropertyName(declaration.Name()) || declaration.Type() != nil ||
+			ast.IsShorthandPropertyAssignment(declaration) && declaration.AsShorthandPropertyAssignment().ObjectAssignmentInitializer != nil {
+			return "incomplete", "object literal member producer is not proved"
+		}
+	}
+	if snapshot.header.checker != c || snapshot.header.flags != TypeFlagsObject || snapshot.header.symbol != node.Symbol() ||
+		uint32(snapshot.header.id) <= query.typeFloor || uint32(snapshot.header.id) > production.creationTypeCount ||
+		snapshot.owner.ref == nil || snapshot.owner.flags != ast.SymbolFlagsObjectLiteral || snapshot.owner.checkFlags != 0 ||
+		snapshot.owner.declarationCount != 1 || snapshot.owner.declaration != node || snapshot.owner.value != node ||
+		snapshot.owner.exports != 0 || snapshot.owner.exportSymbol != nil || snapshot.owner.name != ast.InternalSymbolNameObject ||
+		snapshot.header.alias != nil || snapshot.target != nil || snapshot.mapper != nil || snapshot.instantiations != 0 ||
+		snapshot.baseConstraint != nil || snapshot.withoutAbstract != nil || len(snapshot.signatures) != 0 || snapshot.callCount != 0 || len(snapshot.indexes) != 0 ||
+		len(snapshot.properties) != len(snapshot.declarations) || len(snapshot.ordered) != len(snapshot.properties) || snapshot.owner.members != len(snapshot.properties) {
+		return "rejected", "object producer header or member ownership differs"
+	}
+	expectedFlags := ObjectFlagsAnonymous | ObjectFlagsMembersResolved | ObjectFlagsFreshLiteral | ObjectFlagsObjectLiteral | ObjectFlagsContainsObjectOrArrayLiteral
+	seen := map[*ast.Node]bool{}
+	for _, property := range snapshot.properties {
+		decl, target, member := property.decl.ref, property.target.ref, property.symbol.ref
+		if decl == nil || target == nil || member == nil || !slices.Contains(snapshot.declarations, decl) || seen[decl] ||
+			property.decl.parent != node || property.name.parent != decl || property.decl.symbol != target ||
+			property.target.parent != snapshot.owner.ref || node.Symbol().Members[property.key] != target ||
+			property.target.flags != ast.SymbolFlagsProperty || property.target.checkFlags != 0 || property.target.name != property.key ||
+			property.target.exportSymbol != nil || property.target.members != 0 || property.target.exports != 0 ||
+			property.target.declarationCount != 1 || property.target.declaration != decl || property.target.value != decl ||
+			property.symbol.name != property.key || property.symbol.flags != ast.SymbolFlagsProperty|ast.SymbolFlagsTransient || property.symbol.checkFlags != 0 ||
+			property.symbol.declarationCount != 1 || property.symbol.declaration != decl || property.symbol.value != decl ||
+			property.symbol.parent != property.target.parent || property.symbol.exportSymbol != nil || property.symbol.members != 0 || property.symbol.exports != 0 ||
+			!property.linksKnown || property.links.resolvedType == nil || property.links.resolvedType.checker != c ||
+			property.links.target != target || property.links.writeType != nil || property.links.mapper != nil || property.links.nameType != nil || property.links.containingType != nil ||
+			!slices.Contains(snapshot.ordered, member) {
+			return "rejected", "object property declarations, flags, parents, targets, or types differ"
+		}
+		seen[decl] = true
+		expectedFlags |= property.links.resolvedType.objectFlags & ObjectFlagsPropagatingFlags
+	}
+	if snapshot.header.objectFlags != expectedFlags {
+		return "rejected", "object producer flags differ"
+	}
+	return "", ""
+}
+
+func (c *Checker) ProjectOracleVerifyObjectsAfterArtifacts(cold, warm *ProjectOracleObjectQueryWitness) (result ProjectOracleObjectVerification) {
+	result = objectWitnessResult("incomplete", "object query witness is missing")
+	state := c.projectOracleObjectWitness
+	if state == nil || cold == nil || warm == nil {
+		return
+	}
+	if cold.pass == nil || warm.pass == nil {
+		return objectWitnessResult("incomplete", "query pass witness is missing")
+	}
+	if cold.pass.owner != c || warm.pass.owner != c {
+		return objectWitnessResult("rejected", "checker ownership differs")
+	}
+	for _, query := range []*ProjectOracleObjectQueryWitness{cold, warm} {
+		issued, known := state.issued[query]
+		pass, passKnown := state.passes[query.pass]
+		if !known || !passKnown {
+			return objectWitnessResult("incomplete", "query or pass token was not issued")
+		}
+		if issued != (objectWitnessIssuedQuery{query.pass, query.token, query.node, query.file, query.result, query.typeFloor}) || pass.token != query.pass.token || pass.closed != query.pass.closed {
+			return objectWitnessResult("rejected", "registered query or pass token changed")
+		}
+	}
+	if !cold.finished || !warm.finished || !cold.pass.closed || !warm.pass.closed || state.pass != nil || state.query != nil || state.relation != nil {
+		return objectWitnessResult("incomplete", "artifact observations are not closed")
+	}
+	if cold == warm || cold.pass == warm.pass || cold.token >= warm.token || cold.node != warm.node || cold.file != warm.file {
+		return objectWitnessResult("rejected", "query node, order, or pass ownership differs")
+	}
+	if file, err := c.objectWitnessSource(cold.node); err != nil || file != cold.file {
+		return objectWitnessResult("rejected", "query source ownership changed")
+	}
+	if cold.closeError != "" || warm.closeError != "" {
+		return objectWitnessResult("rejected", "producer metadata was lost before pass closure")
+	}
+	root := objectWitnessUnwrap(cold.node)
+	left, right := cold.productions[cold.result], warm.productions[warm.result]
+	if root == nil || left == nil || right == nil || left.node != root || right.node != root {
+		return objectWitnessResult("incomplete", "returned object has no matching producer observation")
+	}
+	result = objectWitnessResult("verified", "")
+	type pair struct{ left, right *Type }
+	visited := map[pair]bool{}
+	active := map[pair]bool{}
+	var visit func(*Type, *Type) (string, string)
+	visit = func(leftType, rightType *Type) (string, string) {
+		key := pair{leftType, rightType}
+		if active[key] {
+			return "incomplete", "fresh object graph is cyclic"
+		}
+		if visited[key] {
+			return "", ""
+		}
+		if len(active) >= 64 {
+			return "incomplete", "fresh object graph exceeds the verification depth"
+		}
+		l, r := cold.productions[leftType], warm.productions[rightType]
+		if l == nil || r == nil {
+			return "incomplete", "nested result producer is missing"
+		}
+		if l.query != cold || r.query != warm || l.queryToken != cold.token || r.queryToken != warm.token || l.result != leftType || r.result != rightType || l.node != r.node {
+			return "rejected", "producer query token, result, or node ownership differs"
+		}
+		lc, lok := cold.closed[leftType]
+		rc, rok := warm.closed[rightType]
+		if !lok || !rok {
+			return "incomplete", "closed producer snapshot is missing"
+		}
+		ll, le := c.objectWitnessSnapshot(l, true)
+		rl, re := c.objectWitnessSnapshot(r, true)
+		if le != "" || re != "" || !objectWitnessSameSnapshot(l.birth, lc) || !objectWitnessSameSnapshot(r.birth, rc) ||
+			!objectWitnessSameSnapshot(lc, ll) || !objectWitnessSameSnapshot(rc, rl) {
+			return "rejected", "producer metadata changed after its creation"
+		}
+		if kind, reason := c.objectWitnessValidateProduction(l, lc); kind != "" {
+			return kind, reason
+		}
+		if kind, reason := c.objectWitnessValidateProduction(r, rc); kind != "" {
+			return kind, reason
+		}
+		if lc.node != rc.node || lc.owner != rc.owner || lc.header.flags != rc.header.flags || lc.header.objectFlags != rc.header.objectFlags || len(lc.properties) != len(rc.properties) {
+			return "rejected", "fresh object shape or binder owner differs"
+		}
+		active[key] = true
+		defer delete(active, key)
+		for index, lp := range lc.properties {
+			rp := rc.properties[index]
+			if lp.key != rp.key || lp.target != rp.target || lp.decl != rp.decl || lp.name != rp.name || lp.value != rp.value || lp.symbol.flags != rp.symbol.flags || lp.symbol.checkFlags != rp.symbol.checkFlags || lp.symbol.parent != rp.symbol.parent {
+				return "rejected", "property names or binder metadata differ"
+			}
+			lf, rf := cold.productions[lp.links.resolvedType], warm.productions[rp.links.resolvedType]
+			if lf != nil || rf != nil {
+				if lf == nil || rf == nil {
+					return "incomplete", "fresh property producer is missing in one query"
+				}
+				if kind, reason := visit(lp.links.resolvedType, rp.links.resolvedType); kind != "" {
+					return kind, reason
+				}
+				if ast.IsShorthandPropertyAssignment(lp.decl.ref) || objectWitnessUnwrap(lp.value) != lf.node || objectWitnessUnwrap(rp.value) != rf.node {
+					return "incomplete", "nested object is not owned by the property initializer"
+				}
+			} else {
+				la, lknown := lc.cacheEdges[lp.symbol.ref]
+				ra, rknown := rc.cacheEdges[rp.symbol.ref]
+				liveLeft, liveLKnown := ll.cacheEdges[lp.symbol.ref]
+				liveRight, liveRKnown := rl.cacheEdges[rp.symbol.ref]
+				if !lknown || !rknown {
+					return "incomplete", "property type has no proved cache owner"
+				}
+				if !liveLKnown || !liveRKnown || lp.links.resolvedType != rp.links.resolvedType || !objectWitnessSameCache(la, ra) || !objectWitnessSameCache(la, liveLeft) || !objectWitnessSameCache(ra, liveRight) {
+					return "rejected", "cache-owned property type identity or signature changed"
+				}
+				result.StableCacheEdges++
+			}
+		}
+		visited[key] = true
+		result.FreshObjects++
+		return "", ""
+	}
+	if kind, reason := visit(cold.result, warm.result); kind != "" {
+		result.State, result.Reason = kind, reason
+		return
+	}
+	if result.FreshObjects != len(cold.productions) || result.FreshObjects != len(warm.productions) {
+		result.State, result.Reason = "incomplete", "query has unclaimed object producers"
+		return
+	}
+	result.Relation = c.objectWitnessIdentityAfterArtifacts(cold.result, warm.result)
+	for _, query := range []*ProjectOracleObjectQueryWitness{cold, warm} {
+		for typ, production := range query.productions {
+			current, failure := c.objectWitnessSnapshot(production, true)
+			closed := query.closed[typ]
+			if failure != "" || !objectWitnessSameSnapshot(current, closed) {
+				result.Relation.WitnessDataChanged = true
+			}
+			for member, before := range closed.cacheEdges {
+				after, known := current.cacheEdges[member]
+				if !known || !objectWitnessSameCache(before, after) {
+					result.Relation.WitnessDataChanged = true
+				}
+			}
+		}
+	}
+	if result.Relation.Overflow == nil || *result.Relation.Overflow || result.Relation.Panic != "" || len(result.Relation.DiagnosticCodes) != 0 || len(result.Relation.SuggestionCodes) != 0 {
+		result.State, result.Reason = "incomplete", "identity relation has missing evidence, overflow, or diagnostic side effects"
+	} else if result.Relation.WitnessDataChanged || (result.Relation.CachedBefore|result.Relation.CachedAfter)&uint32(RelationComparisonResultReportsMask) != 0 {
+		result.State, result.Reason = "incomplete", "identity relation changed witness data or reported unreliable evidence"
+	} else if result.Relation.Identical == nil || !*result.Relation.Identical {
+		result.State, result.Reason = "rejected", "pinned identity relation rejected the objects"
+	}
+	return
+}
+
+func (c *Checker) projectOracleObjectIdentityObserved(source, target *Type, relation *Relation, overflow bool) {
+	state := c.projectOracleObjectWitness
+	if state == nil || state.relation == nil || relation != c.identityRelation {
+		return
+	}
+	state.relation.checks++
+	state.relation.rootObserved = state.relation.rootObserved || source == state.relation.source && target == state.relation.target
+	state.relation.overflow = state.relation.overflow || overflow
+}
+
+func objectWitnessAddedCodes(before, after []*ast.Diagnostic) []int32 {
+	seen := map[*ast.Diagnostic]bool{}
+	for _, diagnostic := range before {
+		seen[diagnostic] = true
+	}
+	codes := []int32{}
+	for _, diagnostic := range after {
+		if !seen[diagnostic] {
+			codes = append(codes, diagnostic.Code())
+		}
+	}
+	return codes
+}
+
+func (c *Checker) objectWitnessIdentityAfterArtifacts(source, target *Type) (result ProjectOracleObjectRelation) {
+	result.Called = true
+	result.DiagnosticCodes, result.SuggestionCodes = []int32{}, []int32{}
+	run := &objectWitnessRelationRun{source: source, target: target}
+	c.projectOracleObjectWitness.relation = run
+	beforeDiagnostics, beforeSuggestions := c.diagnostics.GetDiagnostics(), c.suggestionDiagnostics.GetDiagnostics()
+	types, symbols, signatures, cacheSize := c.TypeCount, c.SymbolCount, c.SignatureCount, c.identityRelation.size()
+	key, _ := getRelationKey(source, target, IntersectionStateNone, true, false)
+	before := c.identityRelation.get(key)
+	result.CachedBefore = uint32(before)
+	defer func() {
+		if failure := recover(); failure != nil {
+			result.Panic = fmt.Sprint(failure)
+		}
+		c.projectOracleObjectWitness.relation = nil
+		after := c.identityRelation.get(key)
+		result.CachedAfter, result.ObservedChecks, result.RootObserved = uint32(after), run.checks, run.rootObserved
+		if run.rootObserved || before != RelationComparisonResultNone || after&RelationComparisonResultOverflow != 0 || source == target {
+			overflow := run.overflow || (before|after)&RelationComparisonResultOverflow != 0
+			result.Overflow = &overflow
+		}
+		result.TypeAllocations, result.SymbolAllocations, result.SignatureAllocations = c.TypeCount-types, c.SymbolCount-symbols, c.SignatureCount-signatures
+		result.IdentityCacheDelta = c.identityRelation.size() - cacheSize
+		result.DiagnosticCodes = objectWitnessAddedCodes(beforeDiagnostics, c.diagnostics.GetDiagnostics())
+		result.SuggestionCodes = objectWitnessAddedCodes(beforeSuggestions, c.suggestionDiagnostics.GetDiagnostics())
+	}()
+	identical := c.isTypeIdenticalTo(source, target)
+	result.Identical = &identical
+	return
+}
