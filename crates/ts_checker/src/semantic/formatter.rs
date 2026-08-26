@@ -6665,6 +6665,62 @@ mod tests {
     }
 
     #[test]
+    fn cold_class_names_do_not_resolve_heritage_or_generic_member_types() {
+        for (index, (source, expected)) in [
+            (
+                "declare class Base {} declare class Derived extends Base {}",
+                "Derived",
+            ),
+            ("declare class Model { convert<T>(value: T): T; }", "Model"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(231 + u32::try_from(index).unwrap());
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::ClassDeclaration(class) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &parsed.arena.get(class.name?)?.data else {
+                        return None;
+                    };
+                    (name.text == expected).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let instance = context.get_declared_type_of_symbol(symbol).unwrap();
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            );
+            for _ in 0..2 {
+                assert_eq!(context.type_to_string(instance).unwrap(), expected);
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
     fn cold_class_display_rejects_extra_nongeneric_instantiation_entries() {
         let parsed = parse_source_file("declare class Model {}");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);

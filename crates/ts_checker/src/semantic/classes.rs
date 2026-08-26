@@ -68,7 +68,7 @@
 //! Other nonempty executable bodies, general heritage, and non-primitive
 //! annotations remain later class stages.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
@@ -16010,18 +16010,272 @@ pub(super) fn validate_cold_class_instance_for_display(
     symbol: SemanticSymbolId,
     instance_type: TypeId,
 ) -> Result<(), ClassError> {
-    let plan = plan_nongeneric_class(store, host, symbol)?;
-    let state = shell_state(store, host, &plan)?;
-    let instance = exact_instance_identity(store, &plan, instance_type)
+    let owner = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
+    let [declaration] = owner.declarations().unwrap_or_default() else {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    };
+    let declaration_node = preflight_node(store, host, *declaration)?;
+    let NodeData::ClassDeclaration(class) = &declaration_node.data else {
+        return Err(invariant(ClassInvariant::InvalidDeclaration(*declaration)));
+    };
+    if owner.flags() != SymbolFlags::CLASS
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.value_declaration() != Some(*declaration)
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !host.symbol_matches(store, *declaration, symbol)
+        || host
+            .bound_file(*declaration)
+            .is_none_or(|bound| declaration_node.parent != Some(bound.source_file().node))
+        || class
+            .type_parameters
+            .as_ref()
+            .is_some_and(|parameters| !parameters.nodes.is_empty())
+    {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    }
+    let instance = exact_class_instance_identity(store, symbol, instance_type)
         .ok_or_else(|| invariant(ClassInvariant::InvalidInstanceCache(symbol)))?;
-    if state.instance != Some(instance_type)
-        || state.value != StaticShellState::Cold
+    if store
+        .declared_type_links(symbol)
+        .and_then(|links| links.declared_type)
+        != Some(instance_type)
+        || store.type_payload(instance_type).is_none_or(|record| {
+            record.object_flags() != (ObjectFlags::CLASS | ObjectFlags::REFERENCE)
+        })
         || instance.reference.resolved_type_arguments.as_deref() != Some(&[])
+        || instance.base_types_resolved
         || instance.resolved_base_constructor_type.is_some()
+        || instance.resolved_base_types.is_some()
+        || instance.declared_members_resolved
+        || instance.declared_members.is_some()
+        || instance.declared_call_signatures.is_some()
+        || instance.declared_construct_signatures.is_some()
+        || instance.declared_index_infos.is_some()
+        || instance.reference.object.structured != StructuredTypeData::default()
+        || store
+            .direct_class_heritage_provenance(instance_type)
+            .is_some()
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
     {
         return Err(invariant(ClassInvariant::InvalidInstanceCache(symbol)));
     }
+    validate_cold_class_binding_tables(store, host, symbol, *declaration, &class.members.nodes)
+}
+
+struct ColdClassMemberBinding {
+    declarations: Vec<NodeRef>,
+    flags: SymbolFlags,
+    value_declaration: Option<NodeRef>,
+    is_static: bool,
+    anonymous: bool,
+    readonly: bool,
+}
+
+#[allow(clippy::too_many_lines)] // Rebuild binder metadata without querying member or heritage types.
+fn validate_cold_class_binding_tables(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    members: &[ts_ast::NodeId],
+) -> Result<(), ClassError> {
+    let (arena, bound) = host
+        .source(declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(declaration)))?;
+    let owner = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
+    let exports = owner
+        .exports()
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPrototype(symbol)))?;
+    validate_prototype(store, symbol, exports)?;
+
+    let mut declarations = Vec::new();
+    for &member in members {
+        let member = NodeRef::new(declaration.arena, declaration.file, member);
+        let node = preflight_node(store, host, member)?;
+        if node.parent != Some(declaration.node) {
+            return Err(invariant(ClassInvariant::InvalidDeclaration(member)));
+        }
+        if matches!(
+            node.kind,
+            SyntaxKind::SemicolonClassElement | SyntaxKind::ClassStaticBlockDeclaration
+        ) {
+            continue;
+        }
+        declarations.push(member);
+        if let NodeData::ConstructorDeclaration(constructor) = &node.data {
+            for &parameter in &constructor.parameters.nodes {
+                if [
+                    SyntaxKind::PublicKeyword,
+                    SyntaxKind::PrivateKeyword,
+                    SyntaxKind::ProtectedKeyword,
+                    SyntaxKind::ReadonlyKeyword,
+                    SyntaxKind::OverrideKeyword,
+                ]
+                .into_iter()
+                .any(|modifier| {
+                    ts_binder::canonical_has_syntactic_modifier(arena, parameter, modifier)
+                }) {
+                    declarations.push(NodeRef::new(declaration.arena, declaration.file, parameter));
+                }
+            }
+        }
+    }
+
+    let mut bindings = HashMap::<SemanticSymbolId, ColdClassMemberBinding>::new();
+    for declaration in declarations {
+        let flags = cold_class_member_binding_flags(arena, declaration.node)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(declaration)))?;
+        let member = bound
+            .symbol(declaration)
+            .and_then(|member| store.get_merged_symbol(member))
+            .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(declaration)))?;
+        let record = store
+            .symbol(member)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
+        let is_static = ts_binder::canonical_has_syntactic_modifier(
+            arena,
+            declaration.node,
+            SyntaxKind::StaticKeyword,
+        );
+        let anonymous = record.name() == InternalSymbolName::Computed.as_ref();
+        let binding = bindings
+            .entry(member)
+            .or_insert_with(|| ColdClassMemberBinding {
+                declarations: Vec::new(),
+                flags: SymbolFlags::NONE,
+                value_declaration: None,
+                is_static,
+                anonymous,
+                readonly: false,
+            });
+        if binding.is_static != is_static || binding.anonymous != anonymous {
+            return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+        }
+        if flags.intersects(SymbolFlags::VALUE)
+            && binding.value_declaration.is_none_or(|previous| {
+                ts_binder::should_replace_value_declaration(
+                    arena
+                        .get(previous.node)
+                        .expect("a prior declaration was validated")
+                        .kind,
+                    arena
+                        .get(declaration.node)
+                        .expect("the member declaration was validated")
+                        .kind,
+                )
+            })
+        {
+            binding.value_declaration = Some(declaration);
+        }
+        binding.declarations.push(declaration);
+        binding.flags |= flags;
+        binding.readonly |= flags.contains(SymbolFlags::PROPERTY)
+            && ts_binder::canonical_has_syntactic_modifier(
+                arena,
+                declaration.node,
+                SyntaxKind::ReadonlyKeyword,
+            );
+    }
+
+    let mut instance_count = 0;
+    let mut static_count = 1;
+    for (member, binding) in bindings {
+        let record = store
+            .symbol(member)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
+        let allowed_checks = if binding.readonly {
+            CheckFlags::READONLY
+        } else {
+            CheckFlags::NONE
+        };
+        if record.flags() != binding.flags
+            || record.check_flags().bits() & !allowed_checks.bits() != 0
+            || record.declarations() != Some(binding.declarations.as_slice())
+            || record.value_declaration() != binding.value_declaration
+            || record.parent() != (!binding.anonymous).then_some(symbol)
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || store.get_merged_symbol(member) != Some(member)
+        {
+            return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+        }
+        if binding.anonymous {
+            continue;
+        }
+        let table = if binding.is_static {
+            static_count += 1;
+            Some(exports)
+        } else {
+            instance_count += 1;
+            owner.members()
+        };
+        if table
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get(record.name()))
+            != Some(member)
+        {
+            return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+        }
+    }
+    if owner.members().is_some() != (instance_count != 0)
+        || owner
+            .members()
+            .and_then(|table| store.symbol_table(table))
+            .is_some_and(|table| table.len() != instance_count)
+        || store
+            .symbol_table(exports)
+            .is_none_or(|table| table.len() != static_count)
+    {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    }
     Ok(())
+}
+
+fn cold_class_member_binding_flags(
+    arena: &ts_ast::NodeArena,
+    member: ts_ast::NodeId,
+) -> Option<SymbolFlags> {
+    let (flags, optional) = match &arena.get(member)?.data {
+        NodeData::PropertyDeclaration(data) => (
+            if ts_binder::canonical_has_syntactic_modifier(
+                arena,
+                member,
+                SyntaxKind::AccessorKeyword,
+            ) {
+                SymbolFlags::ACCESSOR
+            } else {
+                SymbolFlags::PROPERTY
+            },
+            data.postfix_token,
+        ),
+        NodeData::MethodDeclaration(data) => (SymbolFlags::METHOD, data.postfix_token),
+        NodeData::ConstructorDeclaration(_) => (SymbolFlags::CONSTRUCTOR, None),
+        NodeData::GetAccessorDeclaration(data) => (SymbolFlags::GET_ACCESSOR, data.postfix_token),
+        NodeData::SetAccessorDeclaration(data) => (SymbolFlags::SET_ACCESSOR, data.postfix_token),
+        NodeData::IndexSignatureDeclaration(_) => (SymbolFlags::SIGNATURE, None),
+        NodeData::ParameterDeclaration(data) => (SymbolFlags::PROPERTY, data.question_token),
+        _ => return None,
+    };
+    Some(
+        flags
+            | if optional
+                .and_then(|token| arena.get(token))
+                .is_some_and(|token| token.kind == SyntaxKind::QuestionToken)
+            {
+                SymbolFlags::OPTIONAL
+            } else {
+                SymbolFlags::NONE
+            },
+    )
 }
 
 /// Installs or validates the two exact class identities from a previously
