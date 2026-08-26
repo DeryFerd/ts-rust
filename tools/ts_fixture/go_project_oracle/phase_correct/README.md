@@ -59,6 +59,12 @@ All paths must be absolute. The output must be new. The launcher preserves
 the shared build lock, 16 GiB scope, one Go worker, copied module inputs,
 Go 1.26.5, and offline dependency policy.
 
+Set `GOMODCACHE` to a copied, verified module cache beneath the output's
+parent directory. The launcher does not download dependencies. For an
+archive project inside another Git repository, set
+`GIT_CEILING_DIRECTORIES` to the archive's parent so the helper does not
+attribute the input to that other repository.
+
 ```sh
 bash tools/ts_fixture/go_project_oracle/phase_correct/run.sh GO UPSTREAM CONFIG OUT controls
 bash tools/ts_fixture/go_project_oracle/phase_correct/run.sh GO UPSTREAM CONFIG OUT run
