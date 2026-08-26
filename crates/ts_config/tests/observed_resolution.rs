@@ -133,6 +133,10 @@ fn observes_inheritance_in_parse_and_merge_order() {
     ];
     let plain_fs = TestFileSystem::new(&files, true);
     let observed_fs = TestFileSystem::new(&files, true);
+    // MemoryFileSystem removes a BOM before returning text.
+    for fs in [&plain_fs, &observed_fs] {
+        fs.reply_to_reads("/repo/tsconfig.json", [ReadReply::Text(leaf)]);
+    }
     let plain = resolve_config_file(&plain_fs, "/repo/./tsconfig.json");
     let observed = resolve_config_file_with_observation(
         &observed_fs,
