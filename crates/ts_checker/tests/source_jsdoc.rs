@@ -4,7 +4,7 @@ use ts_binder::{
     EscapedName,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, TypeData,
     jsdoc::{
         JsDocCommentError, JsDocIntrinsicType, JsDocTagKind, JsDocType, JsDocTypeResolutionError,
         leading_jsdoc_comment, parse_jsdoc_comment_at, plan_javascript_source_jsdoc,
@@ -437,4 +437,84 @@ fn javascript_jsdoc_assignment_checks_only_the_annotated_declaration() {
 
     context.recheck_source_file(file).unwrap();
     assert_eq!(context.diagnostics().len(), 1);
+}
+
+#[test]
+fn callback_alias_keeps_declared_and_arrow_type_identities() {
+    for alias in ["Callback", "NS.MyCallback", "A.B.Callback"] {
+        let parsed = parse_javascript_source_file(&format!(
+            "/** @callback {alias}\n * @param {{string}} name\n * @returns {{void}}\n */\n\
+             /** @type {{{alias}}} */\nconst f = (name) => {{}};\nf('ok');",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(36);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/input.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let (name, arrow) = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, variable.name),
+                    NodeRef::new(parsed.arena.id(), file, variable.initializer?),
+                ))
+            })
+            .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let declared = context.get_type_at_location(name).unwrap();
+        let initializer = context.get_type_at_location(arrow).unwrap();
+        assert_ne!(declared, initializer);
+        assert_eq!(context.type_to_string(declared).unwrap(), alias);
+        assert_eq!(
+            context.type_to_string(initializer).unwrap(),
+            "(name: string) => void"
+        );
+        assert!(context.is_type_assignable_to(declared, declared).unwrap());
+        let [declared_signature, arrow_signature] = [declared, initializer].map(|type_| {
+            let TypeData::Object(object) = context.store().type_payload(type_).unwrap().data()
+            else {
+                panic!("expected a callable object")
+            };
+            object.structured.signatures.as_ref().unwrap()[0]
+        });
+        assert_ne!(declared_signature, arrow_signature);
+        assert_eq!(
+            context
+                .get_return_type_of_signature(declared_signature)
+                .unwrap(),
+            context.store().intrinsic_bootstrap().unwrap().void_type,
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.get_type_at_location(name).unwrap(), declared);
+        assert_eq!(context.get_type_at_location(arrow).unwrap(), initializer);
+        assert_eq!(context.type_to_string(declared).unwrap(), alias);
+    }
 }

@@ -30,7 +30,7 @@ use super::{
         TypePredicateId, TypedArena,
     },
     intersection_types::IntersectionTypeCacheKey,
-    jsdoc::SourceJsDocTypedefIdentity,
+    jsdoc::{SourceJsDocCallbackIdentity, SourceJsDocTypedefIdentity},
     links::{
         AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks, AssertionLinks, CheckerLinkStores,
         ContainingSymbolLinks, DeclaredTypeLinks, DecoratorSignatureState, DeferredSymbolLinks,
@@ -513,6 +513,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     direct_class_heritage_provenance: HashMap<TypeId, DirectClassHeritageProvenance>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
     source_jsdoc_typedefs: HashMap<TypeId, SourceJsDocTypedefIdentity>,
+    source_jsdoc_callbacks: HashMap<TypeId, SourceJsDocCallbackIdentity>,
     source_callable_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_callable_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
     source_callable_types_by_signature: HashMap<SignatureId, TypeId>,
@@ -641,6 +642,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             direct_class_heritage_provenance: HashMap::new(),
             source_callable_provenance: HashMap::new(),
             source_jsdoc_typedefs: HashMap::new(),
+            source_jsdoc_callbacks: HashMap::new(),
             source_callable_types_by_declaration: HashMap::new(),
             source_callable_types_by_owner: HashMap::new(),
             source_callable_types_by_signature: HashMap::new(),
@@ -1250,6 +1252,56 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     pub(super) fn try_reserve_source_jsdoc_typedefs(&mut self, additional: usize) -> bool {
         self.source_jsdoc_typedefs.try_reserve(additional).is_ok()
+    }
+
+    pub(super) fn try_reserve_source_jsdoc_callbacks(&mut self, additional: usize) -> bool {
+        self.source_jsdoc_callbacks.try_reserve(additional).is_ok()
+    }
+
+    pub(super) fn source_jsdoc_callback_type(
+        &self,
+        owner: NodeRef,
+        range: TextRange,
+    ) -> Option<TypeId> {
+        self.source_jsdoc_callbacks
+            .iter()
+            .find_map(|(type_, identity)| {
+                (identity.owner == owner && identity.definition.range() == range).then_some(*type_)
+            })
+    }
+
+    pub(super) fn source_jsdoc_callback_identity(
+        &self,
+        type_: TypeId,
+    ) -> Option<&SourceJsDocCallbackIdentity> {
+        self.source_jsdoc_callbacks.get(&type_)
+    }
+
+    pub(super) fn source_jsdoc_callback_type_for_signature(
+        &self,
+        signature: SignatureId,
+    ) -> Option<TypeId> {
+        self.source_jsdoc_callbacks
+            .iter()
+            .find_map(|(type_, identity)| (identity.signature == signature).then_some(*type_))
+    }
+
+    pub(super) fn publish_source_jsdoc_callback(
+        &mut self,
+        type_: TypeId,
+        identity: SourceJsDocCallbackIdentity,
+    ) -> bool {
+        if self.types.get(type_).is_none()
+            || self.source_node_kind(identity.owner).is_none()
+            || self.source_jsdoc_callbacks.contains_key(&type_)
+            || self
+                .source_jsdoc_callback_type(identity.owner, identity.definition.range())
+                .is_some()
+        {
+            return false;
+        }
+        self.source_jsdoc_callbacks.insert(type_, identity);
+        true
     }
 
     pub(super) fn source_jsdoc_typedef_type(
@@ -3652,6 +3704,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     fn symbol_is_callable_parameter(&self, symbol: SemanticSymbolId) -> bool {
+        if self
+            .source_jsdoc_callbacks
+            .values()
+            .any(|identity| identity.has_parameter(symbol))
+        {
+            return true;
+        }
         let Some([declaration]) = self.symbol(symbol).and_then(Symbol::declarations) else {
             return false;
         };
@@ -3680,6 +3739,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     fn signature_is_callable(&self, signature: SignatureId) -> bool {
+        if self
+            .source_jsdoc_callback_type_for_signature(signature)
+            .is_some()
+        {
+            return true;
+        }
         self.signature(signature)
             .and_then(Signature::declaration)
             .is_some_and(|declaration| {
@@ -3711,6 +3776,18 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     fn signature_owns_callable_type(&self, signature: SignatureId) -> bool {
+        if let Some(type_) = self.source_jsdoc_callback_type_for_signature(signature) {
+            return self.type_has_function_type_provenance(type_)
+                && self
+                    .signature(signature)
+                    .is_some_and(|record| record.declaration().is_none())
+                && self
+                    .source_jsdoc_callback_identity(type_)
+                    .is_some_and(|identity| {
+                        self.source_node_kind(identity.owner)
+                            == Some(SyntaxKind::VariableDeclaration)
+                    });
+        }
         let Some(declaration) = self.signature(signature).and_then(Signature::declaration) else {
             return false;
         };

@@ -2438,6 +2438,12 @@ pub(super) fn validate_stored_function_type(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> StoredFunctionTypeValidation {
+    if store.source_jsdoc_callback_identity(type_).is_some() {
+        return super::jsdoc::validate_stored_source_jsdoc_callback_type(store, type_).map_or(
+            StoredFunctionTypeValidation::Malformed,
+            StoredFunctionTypeValidation::Valid,
+        );
+    }
     let branded = store.type_has_function_type_provenance(type_);
     let not_function = || {
         if branded {

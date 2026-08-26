@@ -19968,6 +19968,28 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::InvalidFunctionSignature(signature),
             ));
         }
+        if let Some(type_) = self
+            .store
+            .source_jsdoc_callback_type_for_signature(signature)
+        {
+            self.reject_type_reference_alias_capabilities()?;
+            super::jsdoc::validate_source_jsdoc_callback_name(
+                self.store,
+                self.host,
+                self.global_types.as_ref(),
+                type_,
+            )
+            .map_err(|()| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+            })?;
+            return self
+                .store
+                .signature(signature)
+                .and_then(Signature::resolved_return_type)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+                });
+        }
         let instantiation = self
             .store
             .signature(signature)
