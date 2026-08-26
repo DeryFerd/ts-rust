@@ -6110,7 +6110,20 @@ mod tests {
             },
         );
         context.check_source_file(file).unwrap();
-        assert!(context.diagnostics().is_empty());
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!(
+                "the empty argument must report the pinned tuple diagnostic: {:?}",
+                context.diagnostics()
+            )
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            concat!(
+                "Argument of type '[]' is not assignable to parameter of type ",
+                "'[...string[], string]'.\n  Source has 0 element(s) but target requires 1.",
+            )
+        );
         let declaration = parsed
             .arena
             .iter()
@@ -6857,7 +6870,7 @@ mod tests {
             "interface Array<T> { ",
             "map<U>(callbackfn: (value: T, index: number, array: T[]) => U, ",
             "thisArg?: any): U[]; } interface ReadonlyArray<T> {} ",
-            "class Item {} [Item].map(ctor => new ctor());",
+            "declare const values: number[]; const method = values.map;",
         ));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(218);
