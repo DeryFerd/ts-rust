@@ -197,7 +197,7 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
         let request = &resolution.request;
         let resolved = resolution.result.resolved.as_ref().map(|target| json!({
             "fileName": path_identity(&target.resolved_file_name),
-            "extension": target.extension.map(|extension| extension.as_str()),
+            "extension": target.extension.map(ts_path::FileExtension::as_str),
             "resolvedUsingTsExtension": target.resolved_using_ts_extension,
             "externalLibraryImport": target.is_external_library_import,
             "packageJson": target.package_json.as_deref().map(path_identity),

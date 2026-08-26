@@ -453,6 +453,7 @@ impl SymbolStore {
     }
 
     /// Reads the bound symbol graph before the checker adopts its mutable records.
+    #[must_use]
     pub fn symbols(&self) -> impl ExactSizeIterator<Item = (SemanticSymbolId, &Symbol)> {
         self.symbols.iter().enumerate().map(|(index, symbol)| {
             let id = SemanticSymbolId {

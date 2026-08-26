@@ -74,33 +74,7 @@ impl ProjectRunProvenance {
         .into_iter()
         .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
         .collect();
-        let compiled_helper_digests = [
-            ("project.rs", include_bytes!("../project.rs").as_slice()),
-            (
-                "project_main.rs",
-                include_bytes!("../project_main.rs").as_slice(),
-            ),
-            (
-                "project/options.rs",
-                include_bytes!("options.rs").as_slice(),
-            ),
-            ("project/graph.rs", include_bytes!("graph.rs").as_slice()),
-            (
-                "project/provenance.rs",
-                include_bytes!("provenance.rs").as_slice(),
-            ),
-            (
-                "artifacts/mod.rs",
-                include_bytes!("../artifacts/mod.rs").as_slice(),
-            ),
-            (
-                "artifacts/project.rs",
-                include_bytes!("../artifacts/project.rs").as_slice(),
-            ),
-        ]
-        .into_iter()
-        .map(|(name, bytes)| (name.to_owned(), stable_digest(bytes)))
-        .collect();
+        let compiled_helper_digests = compiled_helper_digests();
         let executable = std::env::current_exe()
             .and_then(|path| digest_file(&path))
             .map_or_else(
@@ -183,10 +157,40 @@ impl ProjectRunProvenance {
     }
 }
 
+fn compiled_helper_digests() -> BTreeMap<String, String> {
+    [
+        ("project.rs", include_bytes!("../project.rs").as_slice()),
+        (
+            "project_main.rs",
+            include_bytes!("../project_main.rs").as_slice(),
+        ),
+        (
+            "project/options.rs",
+            include_bytes!("options.rs").as_slice(),
+        ),
+        ("project/graph.rs", include_bytes!("graph.rs").as_slice()),
+        (
+            "project/provenance.rs",
+            include_bytes!("provenance.rs").as_slice(),
+        ),
+        (
+            "artifacts/mod.rs",
+            include_bytes!("../artifacts/mod.rs").as_slice(),
+        ),
+        (
+            "artifacts/project.rs",
+            include_bytes!("../artifacts/project.rs").as_slice(),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, bytes)| (name.to_owned(), stable_digest(bytes)))
+    .collect()
+}
+
 fn digest_file(path: &Path) -> io::Result<ProjectFileDigest> {
     let mut input = File::open(path)?;
     let mut hash = Xxh3::new();
-    let mut buffer = [0; 65_536];
+    let mut buffer = vec![0; 65_536].into_boxed_slice();
     let mut byte_count = 0;
     loop {
         let count = input.read(&mut buffer)?;

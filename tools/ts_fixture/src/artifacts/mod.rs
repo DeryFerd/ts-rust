@@ -355,29 +355,7 @@ fn artifact_line(
             format!("semantic baseline references foreign node {reference:?}"),
         )
     })?;
-    let start = usize::try_from(node.range.start.get()).map_err(|_| {
-        ArtifactRenderError::invariant(
-            "INV.ARTIFACT.RANGE",
-            format!("semantic baseline position exceeds usize at {reference:?}"),
-        )
-    })?;
-    let end = usize::try_from(node.range.end.get()).map_err(|_| {
-        ArtifactRenderError::invariant(
-            "INV.ARTIFACT.RANGE",
-            format!("semantic baseline position exceeds usize at {reference:?}"),
-        )
-    })?;
-    let source_text = source
-        .source_text
-        .get(start..end)
-        .ok_or_else(|| {
-            ArtifactRenderError::invariant(
-                "INV.ARTIFACT.RANGE",
-                format!("semantic baseline node {reference:?} has an invalid source range"),
-            )
-        })?
-        .replace("\r\n", "")
-        .replace('\n', "");
+    let (start, source_text) = artifact_source_text(source, reference, node)?;
 
     let (value, identity) = match kind {
         SemanticArtifactKind::Types => {
@@ -460,6 +438,37 @@ fn artifact_line(
         }),
         identity,
     })
+}
+
+fn artifact_source_text(
+    source: &SourceFile,
+    reference: NodeRef,
+    node: &Node,
+) -> Result<(usize, String), ArtifactRenderError> {
+    let start = usize::try_from(node.range.start.get()).map_err(|_| {
+        ArtifactRenderError::invariant(
+            "INV.ARTIFACT.RANGE",
+            format!("semantic baseline position exceeds usize at {reference:?}"),
+        )
+    })?;
+    let end = usize::try_from(node.range.end.get()).map_err(|_| {
+        ArtifactRenderError::invariant(
+            "INV.ARTIFACT.RANGE",
+            format!("semantic baseline position exceeds usize at {reference:?}"),
+        )
+    })?;
+    let source_text = source
+        .source_text
+        .get(start..end)
+        .ok_or_else(|| {
+            ArtifactRenderError::invariant(
+                "INV.ARTIFACT.RANGE",
+                format!("semantic baseline node {reference:?} has an invalid source range"),
+            )
+        })?
+        .replace("\r\n", "")
+        .replace('\n', "");
+    Ok((start, source_text))
 }
 
 fn uses_intrinsic_any_name(
