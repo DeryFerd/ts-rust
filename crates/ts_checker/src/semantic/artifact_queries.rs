@@ -2555,6 +2555,7 @@ mod tests {
         let file = FileId::new(6_032);
         let mut context = context(&parsed, file);
         let source = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let source_file = context.source_file(file).unwrap();
         let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
         assert!(context.store_mut_for_test().set_type_node_links(
             source,
@@ -2567,7 +2568,7 @@ mod tests {
             context.store().type_len(),
             context.store().symbol_len(),
             context.store().checker_link_allocated_lengths(),
-            context.store().source_file_links(source).cloned(),
+            context.store().source_file_links(source_file).cloned(),
             context.diagnostics().len(),
         );
         assert_eq!(
@@ -2582,7 +2583,7 @@ mod tests {
                 context.store().type_len(),
                 context.store().symbol_len(),
                 context.store().checker_link_allocated_lengths(),
-                context.store().source_file_links(source).cloned(),
+                context.store().source_file_links(source_file).cloned(),
                 context.diagnostics().len(),
             ),
             before,
