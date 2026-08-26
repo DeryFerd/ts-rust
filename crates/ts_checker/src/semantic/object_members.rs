@@ -138,6 +138,424 @@ pub(super) fn resolve_object_property_by_key(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ComputedMemberKeyError {
+    Unsupported(NodeRef),
+    Invalid(NodeRef),
+    Capacity(NodeRef),
+}
+
+/// A computed key whose value comes from an exact unique-symbol annotation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PlannedComputedMemberKey {
+    pub(super) expression: NodeRef,
+    pub(super) key_symbol: SemanticSymbolId,
+    pub(super) type_node: NodeRef,
+}
+
+/// Plans a computed key without resolving its annotation or changing links.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn plan_computed_member_key(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    name: NodeRef,
+) -> Result<PlannedComputedMemberKey, ComputedMemberKeyError> {
+    let invalid = || ComputedMemberKeyError::Invalid(name);
+    let unsupported = || ComputedMemberKeyError::Unsupported(name);
+    let record = preflight_node(store, host, name).map_err(|_| invalid())?;
+    let NodeData::ComputedPropertyName(computed) = &record.data else {
+        return Err(unsupported());
+    };
+    let expression = NodeRef::new(name.arena, name.file, computed.expression);
+    let expression_record = preflight_node(store, host, expression).map_err(|_| invalid())?;
+    if record.kind != SyntaxKind::ComputedPropertyName
+        || record.flags.0 != 0
+        || computed.facts != 0
+        || expression_record.parent != Some(name.node)
+        || expression_record.flags.0 != 0
+    {
+        return Err(invalid());
+    }
+    match &expression_record.data {
+        NodeData::Identifier(identifier)
+            if expression_record.kind == SyntaxKind::Identifier
+                && identifier.flow_node.is_none()
+                && !identifier.text.is_empty() => {}
+        NodeData::PropertyAccessExpression(access)
+            if expression_record.kind == SyntaxKind::PropertyAccessExpression
+                && access.flow_node.is_none()
+                && access.question_dot_token.is_none()
+                && access.facts == 0 => {}
+        _ => return Err(unsupported()),
+    }
+    let mut resolver = host.name_resolver_host(store).map_err(|_| invalid())?;
+    let key_symbol = match resolver
+        .resolve_entity_name(expression, SymbolFlags::VALUE)
+        .map_err(|_| unsupported())?
+    {
+        Some(symbol) => store.get_merged_symbol(symbol).ok_or_else(invalid)?,
+        None => computed_member_property_symbol(store, host, expression)?,
+    };
+    let key = store.symbol(key_symbol).ok_or_else(invalid)?;
+    let declaration = key.value_declaration().ok_or_else(unsupported)?;
+    let declaration_record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+    if !host.symbol_matches(store, declaration, key_symbol)
+        || key
+            .declarations()
+            .is_none_or(|declarations| declarations != [declaration])
+        || key.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
+        || key.members().is_some()
+        || key.exports().is_some()
+        || key.export_symbol().is_some()
+    {
+        return Err(invalid());
+    }
+    let type_node = match &declaration_record.data {
+        NodeData::VariableDeclaration(variable)
+            if declaration_record.kind == SyntaxKind::VariableDeclaration
+                && key.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE =>
+        {
+            if key.check_flags() != CheckFlags::NONE {
+                return Err(invalid());
+            }
+            let parent = declaration_record.parent.ok_or_else(invalid)?;
+            let parent = NodeRef::new(declaration.arena, declaration.file, parent);
+            let parent_record = preflight_node(store, host, parent).map_err(|_| invalid())?;
+            if parent_record.kind != SyntaxKind::VariableDeclarationList
+                || parent_record.flags.0 & (1 << 1) == 0
+            {
+                return Err(unsupported());
+            }
+            variable.type_.ok_or_else(unsupported)?
+        }
+        NodeData::PropertyDeclaration(property)
+            if declaration_record.kind == SyntaxKind::PropertyDeclaration
+                && key.flags() == SymbolFlags::PROPERTY =>
+        {
+            let (arena, _) = host.source(declaration).ok_or_else(invalid)?;
+            let parent = declaration_record.parent.ok_or_else(invalid)?;
+            let parent = NodeRef::new(declaration.arena, declaration.file, parent);
+            let parent_kind = store.source_node_kind(parent);
+            if !ts_binder::canonical_has_syntactic_modifier(
+                arena,
+                declaration.node,
+                SyntaxKind::ReadonlyKeyword,
+            ) || !matches!(
+                parent_kind,
+                Some(SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral)
+            ) && !ts_binder::canonical_has_syntactic_modifier(
+                arena,
+                declaration.node,
+                SyntaxKind::StaticKeyword,
+            ) {
+                return Err(unsupported());
+            }
+            property.type_.ok_or_else(unsupported)?
+        }
+        NodeData::PropertySignatureDeclaration(property)
+            if declaration_record.kind == SyntaxKind::PropertySignature
+                && key.flags() == SymbolFlags::PROPERTY =>
+        {
+            let (arena, _) = host.source(declaration).ok_or_else(invalid)?;
+            if !ts_binder::canonical_has_syntactic_modifier(
+                arena,
+                declaration.node,
+                SyntaxKind::ReadonlyKeyword,
+            ) {
+                return Err(unsupported());
+            }
+            property.type_
+        }
+        _ => return Err(unsupported()),
+    };
+    let type_node = NodeRef::new(declaration.arena, declaration.file, type_node);
+    let annotation = preflight_node(store, host, type_node).map_err(|_| invalid())?;
+    let NodeData::TypeOperatorNode(operator) = &annotation.data else {
+        return Err(unsupported());
+    };
+    let operand = NodeRef::new(type_node.arena, type_node.file, operator.type_);
+    let operand_record = preflight_node(store, host, operand).map_err(|_| invalid())?;
+    if annotation.kind != SyntaxKind::TypeOperator
+        || annotation.parent != Some(declaration.node)
+        || annotation.flags.0 != 0
+        || operator.operator != SyntaxKind::UniqueKeyword
+        || operand_record.kind != SyntaxKind::SymbolKeyword
+        || operand_record.parent != Some(type_node.node)
+    {
+        return Err(unsupported());
+    }
+    let plan = PlannedComputedMemberKey {
+        expression,
+        key_symbol,
+        type_node,
+    };
+    resolved_computed_member_key(store, &plan)?;
+    Ok(plan)
+}
+
+fn computed_member_property_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+) -> Result<SemanticSymbolId, ComputedMemberKeyError> {
+    let invalid = || ComputedMemberKeyError::Invalid(expression);
+    let unsupported = || ComputedMemberKeyError::Unsupported(expression);
+    let record = preflight_node(store, host, expression).map_err(|_| invalid())?;
+    let NodeData::PropertyAccessExpression(access) = &record.data else {
+        return Err(unsupported());
+    };
+    let receiver = NodeRef::new(expression.arena, expression.file, access.expression);
+    let name = NodeRef::new(expression.arena, expression.file, access.name);
+    let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+    let receiver_record = preflight_node(store, host, receiver).map_err(|_| invalid())?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(expression.node)
+        || name_record.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || receiver_record.parent != Some(expression.node)
+    {
+        return Err(invalid());
+    }
+    let mut resolver = host.name_resolver_host(store).map_err(|_| invalid())?;
+    let receiver_symbol = resolver
+        .resolve_entity_name(receiver, SymbolFlags::VALUE)
+        .map_err(|_| unsupported())?
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(unsupported)?;
+    if store.symbol_node_links(receiver).is_some_and(|links| {
+        links
+            .resolved_symbol
+            .is_some_and(|symbol| symbol != receiver_symbol)
+    }) {
+        return Err(invalid());
+    }
+    let receiver_symbol_record = store.symbol(receiver_symbol).ok_or_else(invalid)?;
+    let receiver_value = store
+        .value_symbol_links(receiver_symbol)
+        .cloned()
+        .unwrap_or_default();
+    let receiver_type = store.type_node_links(receiver).cloned().unwrap_or_default();
+    if receiver_value
+        != (ValueSymbolLinks {
+            resolved_type: receiver_value.resolved_type,
+            ..ValueSymbolLinks::default()
+        })
+        || receiver_type
+            != (TypeNodeLinks {
+                resolved_type: receiver_type.resolved_type,
+                ..TypeNodeLinks::default()
+            })
+        || receiver_value
+            .resolved_type
+            .zip(receiver_type.resolved_type)
+            .is_some_and(|(value, expression)| value != expression)
+    {
+        return Err(invalid());
+    }
+    let cached_receiver = receiver_value.resolved_type.or(receiver_type.resolved_type);
+    let (member_owner, table) = if receiver_symbol_record.flags().contains(SymbolFlags::CLASS) {
+        if cached_receiver.is_some_and(|type_| {
+            super::classes::authenticated_class_constructor_value(store, receiver_symbol)
+                .is_none_or(|(value, _)| value != type_)
+        }) {
+            return Err(invalid());
+        }
+        (
+            receiver_symbol,
+            receiver_symbol_record.exports().ok_or_else(unsupported)?,
+        )
+    } else {
+        let declaration = receiver_symbol_record
+            .value_declaration()
+            .ok_or_else(unsupported)?;
+        let declaration_record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Err(unsupported());
+        };
+        let annotation = variable.type_.ok_or_else(unsupported)?;
+        let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+        let annotation_record = preflight_node(store, host, annotation).map_err(|_| invalid())?;
+        let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+            return Err(unsupported());
+        };
+        if annotation_record.parent != Some(declaration.node) || reference.type_arguments.is_some()
+        {
+            return Err(unsupported());
+        }
+        let type_name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+        let type_owner = resolver
+            .resolve_entity_name(type_name, SymbolFlags::TYPE)
+            .map_err(|_| unsupported())?
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(unsupported)?;
+        let owner = store.symbol(type_owner).ok_or_else(invalid)?;
+        if !owner.flags().contains(SymbolFlags::INTERFACE)
+            || owner.flags().contains(SymbolFlags::CLASS)
+        {
+            return Err(unsupported());
+        }
+        if cached_receiver.is_some_and(|type_| {
+            store
+                .declared_type_links(type_owner)
+                .and_then(|links| links.declared_type)
+                != Some(type_)
+        }) {
+            return Err(invalid());
+        }
+        (type_owner, owner.members().ok_or_else(unsupported)?)
+    };
+    let symbol = store
+        .symbol_table(table)
+        .ok_or_else(invalid)?
+        .get_source(&identifier.text)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(unsupported)?;
+    if store.symbol(symbol).is_none_or(|symbol| {
+        symbol.name().as_utf8() != Some(identifier.text.as_str())
+            || symbol
+                .parent()
+                .and_then(|parent| store.get_merged_symbol(parent))
+                != Some(member_owner)
+    }) {
+        return Err(invalid());
+    }
+    Ok(symbol)
+}
+
+/// Reads a planned key after its annotation has been resolved by the type query.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn resolved_computed_member_key(
+    store: &CanonicalTypeMapperStore,
+    plan: &PlannedComputedMemberKey,
+) -> Result<Option<(TypeId, EscapedName)>, ComputedMemberKeyError> {
+    let invalid = || ComputedMemberKeyError::Invalid(plan.expression);
+    let key = store.symbol(plan.key_symbol).ok_or_else(invalid)?;
+    if !matches!(
+        store.source_node_kind(plan.expression),
+        Some(SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression)
+    ) || store.source_node_kind(plan.type_node) != Some(SyntaxKind::TypeOperator)
+        || store.get_merged_symbol(plan.key_symbol) != Some(plan.key_symbol)
+    {
+        return Err(invalid());
+    }
+    let annotation = store
+        .type_node_links(plan.type_node)
+        .cloned()
+        .unwrap_or_default();
+    let value = store
+        .value_symbol_links(plan.key_symbol)
+        .cloned()
+        .unwrap_or_default();
+    let expression = store
+        .type_node_links(plan.expression)
+        .cloned()
+        .unwrap_or_default();
+    if annotation
+        != (TypeNodeLinks {
+            resolved_type: annotation.resolved_type,
+            ..TypeNodeLinks::default()
+        })
+        || value
+            != (ValueSymbolLinks {
+                resolved_type: value.resolved_type,
+                ..ValueSymbolLinks::default()
+            })
+        || expression
+            != (TypeNodeLinks {
+                resolved_type: expression.resolved_type,
+                ..TypeNodeLinks::default()
+            })
+        || store
+            .symbol_node_links(plan.expression)
+            .is_some_and(|links| {
+                links
+                    .resolved_symbol
+                    .is_some_and(|symbol| symbol != plan.key_symbol)
+            })
+    {
+        return Err(invalid());
+    }
+    let types = [
+        annotation.resolved_type,
+        value.resolved_type,
+        expression.resolved_type,
+    ];
+    let Some(type_) = types.into_iter().flatten().next() else {
+        return Ok(None);
+    };
+    if types.into_iter().flatten().any(|cached| cached != type_) {
+        return Err(invalid());
+    }
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let TypeData::UniqueEsSymbol(unique) = record.data() else {
+        return Err(invalid());
+    };
+    let global_id = store
+        .symbol_store()
+        .assigned_global_symbol_id(plan.key_symbol)
+        .ok_or_else(invalid)?;
+    let suffix = unique
+        .name
+        .as_bytes()
+        .strip_prefix(b"\xFE@")
+        .and_then(|name| name.strip_prefix(key.name().as_bytes()))
+        .and_then(|name| name.strip_prefix(b"@"));
+    if record.flags() != TypeFlags::UNIQUE_ES_SYMBOL
+        || record.object_flags() != ObjectFlags::NONE
+        || record.alias().is_some()
+        || record.symbol() != Some(plan.key_symbol)
+        || store.get_merged_symbol(plan.key_symbol) != Some(plan.key_symbol)
+        || suffix != Some(global_id.to_string().as_bytes())
+    {
+        return Err(invalid());
+    }
+    Ok(Some((type_, unique.name.clone())))
+}
+
+/// Publishes the key expression only after all key caches have passed validation.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn publish_computed_member_key_links(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PlannedComputedMemberKey,
+) -> Result<(TypeId, EscapedName), ComputedMemberKeyError> {
+    let result = resolved_computed_member_key(store, plan)?
+        .ok_or(ComputedMemberKeyError::Unsupported(plan.expression))?;
+    let (type_, _) = &result;
+    if !store.try_reserve_symbol_node_links(usize::from(
+        store.symbol_node_links(plan.expression).is_none(),
+    )) || !store.try_reserve_type_node_links(usize::from(
+        store.type_node_links(plan.expression).is_none(),
+    )) || !store.try_reserve_value_symbol_links(usize::from(
+        store.value_symbol_links(plan.key_symbol).is_none(),
+    )) {
+        return Err(ComputedMemberKeyError::Capacity(plan.expression));
+    }
+    assert!(store.set_symbol_node_links(
+        plan.expression,
+        SymbolNodeLinks {
+            resolved_symbol: Some(plan.key_symbol)
+        }
+    ));
+    assert!(store.set_type_node_links(
+        plan.expression,
+        TypeNodeLinks {
+            resolved_type: Some(*type_),
+            ..TypeNodeLinks::default()
+        }
+    ));
+    assert!(store.set_value_symbol_links(
+        plan.key_symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(*type_),
+            ..ValueSymbolLinks::default()
+        }
+    ));
+    Ok(result)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PropertyObjectKind {
     TypeLiteral,
     Interface,

@@ -5750,6 +5750,268 @@ mod tests {
     }
 
     #[test]
+    fn late_bound_unique_symbol_method_keys_plan_cold_and_publish_exact_source_symbols() {
+        for (index, source) in [
+            "declare const key: unique symbol; interface Box<T> { [key](): T; }",
+            concat!(
+                "interface SymbolConstructor { readonly iterator: unique symbol } ",
+                "declare var Symbol: SymbolConstructor; ",
+                "interface Box<T> { [Symbol.iterator]?(): T; }",
+            ),
+            concat!(
+                "declare class Keys { static readonly iterator: unique symbol; } ",
+                "interface Box<T> { [Keys.iterator](): T; }",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            use crate::semantic::{
+                DeclaredTypeHost,
+                object_members::{
+                    ComputedMemberKeyError, plan_computed_member_key,
+                    publish_computed_member_key_links, resolved_computed_member_key,
+                },
+                production::GlobalMergeCompletion,
+            };
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(6_230 + u32::try_from(index).unwrap());
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(ts_binder::CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let (declaration, name) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, method.name),
+                    ))
+                })
+                .unwrap();
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let plan = plan_computed_member_key(context.store(), &host, name).unwrap();
+            assert_eq!(
+                resolved_computed_member_key(context.store(), &plan),
+                Ok(None)
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            if let NodeData::PropertyAccessExpression(access) =
+                &parsed.arena.get(plan.expression.node).unwrap().data
+            {
+                let receiver = NodeRef::new(
+                    plan.expression.arena,
+                    plan.expression.file,
+                    access.expression,
+                );
+                let store = context.store_mut_for_test();
+                let number = store.intrinsic_bootstrap().unwrap().number_type;
+                assert!(store.set_type_node_links(
+                    receiver,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+                let before = (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths(),
+                );
+                assert_eq!(
+                    plan_computed_member_key(store, &host, name),
+                    Err(ComputedMemberKeyError::Invalid(plan.expression))
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.checker_link_allocated_lengths()
+                    ),
+                    before
+                );
+                assert!(store.set_type_node_links(receiver, TypeNodeLinks::default()));
+            }
+            let key_type = context.get_type_from_type_node(plan.type_node).unwrap();
+            let (published_key, escaped_name) =
+                publish_computed_member_key_links(context.store_mut_for_test(), &plan).unwrap();
+            assert_eq!(published_key, key_type);
+            let owner = source_symbol(&parsed, file, &context, "Box");
+            let early = bound.symbol(declaration).unwrap();
+            let store = context.store_mut_for_test();
+            let raw = store.symbol(owner).unwrap().members();
+            let members = match raw {
+                Some(table) => store.clone_symbol_table(table).unwrap(),
+                None => store.alloc_symbol_table(),
+            };
+            let incomplete = store.alloc_symbol_table();
+            let before = (store.symbol_len(), store.checker_link_allocated_lengths());
+            assert_eq!(
+                store.create_late_bound_property_symbol(owner, early, key_type, incomplete),
+                None
+            );
+            assert_eq!(
+                (store.symbol_len(), store.checker_link_allocated_lengths()),
+                before
+            );
+            let late = store
+                .create_late_bound_property_symbol(owner, early, key_type, members)
+                .unwrap();
+            let symbol = store.symbol(late).unwrap();
+            assert_eq!(symbol.name(), escaped_name.as_ref());
+            assert_eq!(
+                symbol.flags(),
+                store.symbol(early).unwrap().flags() | SymbolFlags::TRANSIENT
+            );
+            assert_eq!(symbol.check_flags(), CheckFlags::LATE);
+            assert_eq!(symbol.declarations(), Some(&[declaration][..]));
+            assert_eq!(symbol.parent(), Some(owner));
+            assert_eq!(
+                store
+                    .symbol_table(members)
+                    .unwrap()
+                    .get(escaped_name.as_ref()),
+                Some(late)
+            );
+            assert_eq!(
+                store.value_symbol_links(late).unwrap().name_type,
+                Some(key_type)
+            );
+            let warm = (store.symbol_len(), store.checker_link_allocated_lengths());
+            assert_eq!(plan_computed_member_key(store, &host, name), Ok(plan));
+            assert_eq!(
+                store.create_late_bound_property_symbol(owner, early, key_type, members),
+                Some(late)
+            );
+            assert_eq!(
+                (store.symbol_len(), store.checker_link_allocated_lengths()),
+                warm
+            );
+        }
+    }
+
+    #[test]
+    fn late_bound_unique_symbol_method_keys_reject_foreign_and_conflicting_caches() {
+        use crate::semantic::{
+            DeclaredTypeHost,
+            object_members::{
+                ComputedMemberKeyError, plan_computed_member_key, publish_computed_member_key_links,
+            },
+            production::GlobalMergeCompletion,
+        };
+        let parsed = parse_source_file(concat!(
+            "declare const key: unique symbol; declare const other: unique symbol; ",
+            "interface Box<T> { [key](): T; }",
+        ));
+        let file = FileId::new(6_233);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(ts_binder::CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let name = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ComputedPropertyName).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let plan = plan_computed_member_key(context.store(), &host, name).unwrap();
+        let key_type = context.get_type_from_type_node(plan.type_node).unwrap();
+        let other = source_symbol(&parsed, file, &context, "other");
+        let store = context.store_mut_for_test();
+        let other_type = store.alloc_unique_es_symbol_type(other).unwrap();
+        assert!(store.set_type_node_links(
+            plan.expression,
+            TypeNodeLinks {
+                resolved_type: Some(other_type),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            plan_computed_member_key(store, &host, name),
+            Err(ComputedMemberKeyError::Invalid(plan.expression))
+        );
+        assert_eq!(
+            publish_computed_member_key_links(store, &plan),
+            Err(ComputedMemberKeyError::Invalid(plan.expression))
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert!(store.set_type_node_links(plan.expression, TypeNodeLinks::default()));
+        assert_eq!(
+            publish_computed_member_key_links(store, &plan).unwrap().0,
+            key_type
+        );
+
+        let foreign = parse_source_file("interface Foreign { [key](): number; }");
+        let foreign_name = foreign
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ComputedPropertyName).then_some(NodeRef::new(
+                    foreign.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            plan_computed_member_key(store, &host, foreign_name),
+            Err(ComputedMemberKeyError::Invalid(foreign_name))
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths()
+            ),
+            before
+        );
+    }
+
+    #[test]
     fn malformed_late_bound_unique_symbol_members_fail_before_instantiation() {
         let parsed = parse_source_file(concat!(
             "declare const key: unique symbol;\n",

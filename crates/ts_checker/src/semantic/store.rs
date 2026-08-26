@@ -6814,13 +6814,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 }
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
-    /// Publishes the canonical late-bound symbol for one computed property.
+    /// Publishes the canonical late-bound symbol for one computed property or method.
     ///
     /// The declaration must retain its binder-owned `__computed` property,
     /// while `key_type` must be the already-created unique-symbol identity.
     /// `members` must be a checker-owned table separate from the binder's
-    /// original member table. Existing complete publication replays without
-    /// allocating another symbol or changing any links.
+    /// original member table. Methods require a resolved key expression from
+    /// the source key plan. Existing publication reuses the same symbol.
     ///
     /// # Panics
     ///
@@ -6850,7 +6850,58 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         };
         let key_symbol = key_record.symbol()?;
         let key = self.symbol(key_symbol)?;
-        let allowed_property_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+        let method = early.flags().contains(SymbolFlags::METHOD);
+        let member_flag = if method {
+            SymbolFlags::METHOD
+        } else {
+            SymbolFlags::PROPERTY
+        };
+        let allowed_property_flags = member_flag | SymbolFlags::OPTIONAL;
+        let key_property = key.flags() == SymbolFlags::PROPERTY;
+        let valid_key = if key_property {
+            let key_declaration = key.value_declaration()?;
+            let key_owner = key.parent()?;
+            let key_owner_record = self.symbol(key_owner)?;
+            let key_annotation = self.source_direct_type_annotation(key_declaration)?;
+            let key_facts = self.source_node_facts.get(&key_declaration.arena)?;
+            let annotation_facts = key_facts.get(key_annotation.node.index())?.as_ref()?;
+            let readonly = key_facts.iter().flatten().any(|facts| {
+                facts.parent == Some(key_declaration.node)
+                    && facts.kind == SyntaxKind::ReadonlyKeyword
+            });
+            let static_ = key_facts.iter().flatten().any(|facts| {
+                facts.parent == Some(key_declaration.node)
+                    && facts.kind == SyntaxKind::StaticKeyword
+            });
+            readonly
+                && annotation_facts.kind == SyntaxKind::TypeOperator
+                && annotation_facts.type_operator == Some(SyntaxKind::UniqueKeyword)
+                && key.declarations() == Some(&[key_declaration][..])
+                && (key_owner_record.flags().contains(SymbolFlags::INTERFACE)
+                    || key_owner_record.flags().contains(SymbolFlags::TYPE_LITERAL)
+                    || key_owner_record.flags().contains(SymbolFlags::CLASS) && static_)
+                && key.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
+                && matches!(
+                    self.source_node_kind(key_declaration),
+                    Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                )
+                && self
+                    .type_node_links(key_annotation)
+                    .and_then(|links| links.resolved_type)
+                    == Some(key_type)
+                && [key_owner_record.members(), key_owner_record.exports()]
+                    .into_iter()
+                    .flatten()
+                    .any(|table| {
+                        self.symbol_table(table)
+                            .and_then(|table| table.get(key.name()))
+                            .and_then(|symbol| self.get_merged_symbol(symbol))
+                            == Some(key_symbol)
+                    })
+        } else {
+            key.flags().contains(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+                && key.check_flags() == CheckFlags::NONE
+        };
         if !owner_record
             .flags()
             .intersects(SymbolFlags::LATE_BINDING_CONTAINER)
@@ -6861,7 +6912,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             || self.get_merged_symbol(owner) != Some(owner)
             || members == binder_members
             || self.symbol_table(members).is_none()
-            || !early.flags().contains(SymbolFlags::PROPERTY)
+            || !early.flags().contains(member_flag)
             || early.flags().without(allowed_property_flags) != SymbolFlags::NONE
             || early.check_flags() != CheckFlags::NONE
             || early.name() != InternalSymbolName::Computed.as_ref()
@@ -6874,10 +6925,14 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .and_then(|parent| self.get_merged_symbol(parent))
                 != Some(owner)
             || self.get_merged_symbol(early_symbol) != Some(early_symbol)
-            || !matches!(
-                self.source_node_kind(declaration),
-                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
-            )
+            || if method {
+                self.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature)
+            } else {
+                !matches!(
+                    self.source_node_kind(declaration),
+                    Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                )
+            }
             || !matches!(
                 self.source_node_kind(owner_declaration),
                 Some(SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral)
@@ -6886,8 +6941,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             || key_record.object_flags() != ObjectFlags::NONE
             || key_record.alias().is_some()
             || !unique.name.as_ref().is_late_bound()
-            || !key.flags().contains(SymbolFlags::BLOCK_SCOPED_VARIABLE)
-            || key.check_flags() != CheckFlags::NONE
+            || !valid_key
             || key.value_declaration().is_none()
             || self.get_merged_symbol(key_symbol) != Some(key_symbol)
             || self
@@ -6901,6 +6955,19 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                             resolved_type: Some(key_type),
                             ..ValueSymbolLinks::default()
                         })
+            })
+        {
+            return None;
+        }
+
+        if method
+            && self.symbol_table(binder_members).is_none_or(|raw| {
+                raw.iter().any(|(name, symbol)| {
+                    self.symbol_table(members)
+                        .and_then(|members| members.get(name))
+                        .and_then(|symbol| self.get_merged_symbol(symbol))
+                        != self.get_merged_symbol(symbol)
+                })
             })
         {
             return None;
@@ -6941,7 +7008,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             let Some(facts) = facts else {
                 continue;
             };
-            if facts.parent == Some(computed.node) && facts.kind == SyntaxKind::Identifier {
+            if facts.parent == Some(computed.node)
+                && matches!(
+                    facts.kind,
+                    SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
+                )
+            {
                 if key_expression.is_some() {
                     return None;
                 }
@@ -6953,6 +7025,20 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             }
         }
         let key_expression = key_expression?;
+        if (method
+            || key_property
+            || self.source_node_kind(key_expression) == Some(SyntaxKind::PropertyAccessExpression))
+            && (self
+                .symbol_node_links(key_expression)
+                .and_then(|links| links.resolved_symbol)
+                != Some(key_symbol)
+                || self
+                    .type_node_links(key_expression)
+                    .and_then(|links| links.resolved_type)
+                    != Some(key_type))
+        {
+            return None;
+        }
         if self.symbol_node_links(key_expression).is_some_and(|links| {
             links != &SymbolNodeLinks::default()
                 && links
