@@ -1971,9 +1971,6 @@ fn display_mapped_type_alias(
             if owner_record.name().as_utf8() != Some("Record")
                 || owner_links.declared_type != Some(declared_type)
                 || identity.type_arguments() != Some(type_arguments.as_slice())
-                || store
-                    .intrinsic_bootstrap()
-                    .is_none_or(|bootstrap| type_arguments[0] != bootstrap.string_type)
             {
                 return Err(TypeDisplayUnavailable::Alias { type_id, alias });
             }
@@ -6323,6 +6320,58 @@ mod tests {
             context.type_to_string(mapped).unwrap(),
             "Record<string, string>"
         );
+    }
+
+    #[test]
+    fn finite_record_alias_display_preserves_keys_and_rejects_changed_arguments() {
+        let parsed = parse_source_file(concat!(
+            "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+            "declare const value: Record<\"left\" | \"right\", number>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(224);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let mapped = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "value"))
+            .unwrap();
+        let expected = "Record<\"left\" | \"right\", number>";
+        assert_eq!(context.type_to_string(mapped).unwrap(), expected);
+        let properties = context
+            .store_mut_for_test()
+            .resolve_finite_record_mapped_projection(mapped)
+            .unwrap();
+        assert_eq!(properties.properties.len(), 2);
+        assert_eq!(context.type_to_string(mapped).unwrap(), expected);
+
+        let identity = context
+            .store()
+            .type_payload(mapped)
+            .unwrap()
+            .alias()
+            .unwrap();
+        let arguments = context
+            .store()
+            .type_alias(identity)
+            .unwrap()
+            .type_arguments()
+            .unwrap()
+            .to_vec();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias_arguments(identity, Some(vec![arguments[0], string]),)
+        );
+        assert_eq!(
+            context.type_to_string(mapped),
+            Err(TypeDisplayUnavailable::MalformedType(mapped))
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias_arguments(identity, Some(arguments))
+        );
+        assert_eq!(context.type_to_string(mapped).unwrap(), expected);
     }
 
     #[test]
