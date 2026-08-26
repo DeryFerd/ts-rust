@@ -6679,7 +6679,7 @@ mod tests {
             "interface Array<T> { ",
             "map<U>(callbackfn: (value: T, index: number, array: T[]) => U, ",
             "thisArg?: any): U[]; } interface ReadonlyArray<T> {} ",
-            "const mapped = [1].map(value => value);",
+            "class Item {} [Item].map(ctor => new ctor());",
         ));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(218);
