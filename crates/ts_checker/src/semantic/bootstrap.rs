@@ -3030,6 +3030,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let Some(record) = self.type_payload(type_) else {
             return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
         };
+        self.validate_union_class_declarations(type_, record)?;
         match record.data() {
             TypeData::Intrinsic(data) => {
                 self.validate_supported_intrinsic(type_, record, &data.intrinsic_name)
@@ -3584,14 +3585,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         left: TypeId,
         right: TypeId,
     ) -> Result<Ordering, LiteralTypeCacheError> {
-        let left_symbol = self
+        let left_type = self
             .type_payload(left)
-            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(left))?
-            .symbol();
-        let right_symbol = self
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(left))?;
+        let right_type = self
             .type_payload(right)
-            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(right))?
-            .symbol();
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(right))?;
+        self.validate_union_class_declarations(left, left_type)?;
+        self.validate_union_class_declarations(right, right_type)?;
+        let left_symbol = left_type.symbol();
+        let right_symbol = right_type.symbol();
         let (left_symbol, right_symbol) = match (left_symbol, right_symbol) {
             (left, right) if left == right => return Ok(Ordering::Equal),
             (Some(left), Some(right)) => (left, right),
@@ -3616,9 +3619,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 let right_start = self
                     .source_node_start(*right_node)
                     .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(right))?;
-                left_node
-                    .file
-                    .cmp(&right_node.file)
+                let left_rank = self
+                    .source_file_rank(left_node.file)
+                    .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(left))?;
+                let right_rank = self
+                    .source_file_rank(right_node.file)
+                    .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(right))?;
+                left_rank
+                    .cmp(&right_rank)
                     .then_with(|| left_start.cmp(&right_start))
             }
             (Some(_), None) => Ordering::Less,
@@ -3633,6 +3641,23 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     .cmp(right_record.name().as_bytes())
             })
             .then_with(|| left_symbol.cmp(&right_symbol)))
+    }
+
+    fn validate_union_class_declarations(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+    ) -> Result<(), LiteralTypeCacheError> {
+        if record.flags().contains(TypeFlags::OBJECT)
+            && record.symbol().is_some_and(|symbol| {
+                self.symbol(symbol)
+                    .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+                    && !self.source_symbol_declarations_match(symbol)
+            })
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+        }
+        Ok(())
     }
 
     fn compare_union_type_lists_worker(
@@ -3721,13 +3746,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 (None, None) => {}
             }
 
-            match (left_record.data(), right_record.data()) {
-                (TypeData::Object(_), TypeData::Object(_)) => {
-                    let symbols = self.compare_union_object_symbols(left, right)?;
-                    if symbols != Ordering::Equal {
-                        return Ok(symbols);
-                    }
+            if left_record.flags().contains(TypeFlags::OBJECT) {
+                let symbols = self.compare_union_object_symbols(left, right)?;
+                if symbols != Ordering::Equal {
+                    return Ok(symbols);
                 }
+            }
+
+            match (left_record.data(), right_record.data()) {
                 (TypeData::Literal(left_data), TypeData::Literal(right_data)) => {
                     let values = match (&left_data.value, &right_data.value) {
                         (LiteralValue::String(left), LiteralValue::String(right)) => {
@@ -8370,6 +8396,244 @@ mod tests {
                 store.intrinsic_bootstrap().unwrap().union_cache_len(),
             ),
             warm,
+        );
+    }
+
+    #[test]
+    fn constructor_union_order_uses_program_file_ranks() {
+        let high = parse_source_file("class Zebra {} const z = Zebra;");
+        let low = parse_source_file("class Alpha {} const a = Alpha;");
+        let middle = parse_source_file("class Middle {} const m = Middle;");
+        let files = [
+            (FileId::new(20), &high, "z", "typeof Zebra"),
+            (FileId::new(3), &low, "a", "typeof Alpha"),
+            (FileId::new(11), &middle, "m", "typeof Middle"),
+        ];
+        for order in [[0, 1, 2], [2, 1, 0]] {
+            let mut binder = CanonicalBinder::new();
+            for index in [1, 2, 0] {
+                let (file, parsed, _, _) = files[index];
+                assert!(parsed.diagnostics.is_empty());
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                            CanonicalSourceLanguage::TypeScript,
+                            false,
+                            CanonicalModuleState::Script,
+                        ),
+                    )
+                    .unwrap();
+            }
+            for (file, parsed, _, _) in files {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                order
+                    .map(|index| (files[index].0, &files[index].1.arena))
+                    .to_vec(),
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(context.file_order(), order.map(|index| files[index].0));
+            for (rank, index) in order.into_iter().enumerate() {
+                assert_eq!(context.store().source_file_rank(files[index].0), Some(rank));
+            }
+            let mut constructors = Vec::new();
+            for index in order.into_iter().rev() {
+                let (file, parsed, variable, _) = files[index];
+                constructors.push(
+                    context
+                        .get_type_at_location(variable_initializer(parsed, file, variable))
+                        .unwrap(),
+                );
+            }
+            let globals = context.global_types().clone();
+            let union = context
+                .store_mut_for_test()
+                .expression_union_type_with_global_types(
+                    &globals,
+                    &constructors,
+                    UnionReduction::None,
+                )
+                .unwrap();
+            assert_eq!(
+                context.type_to_string(union).unwrap(),
+                order.map(|index| files[index].3).join(" | "),
+            );
+            constructors.reverse();
+            assert_eq!(union_types(context.store(), union), constructors);
+        }
+    }
+
+    #[test]
+    fn constructor_union_order_is_transitive_across_object_payloads() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "class Zebra {} class Alpha {} const first = Zebra; const second = Alpha;",
+        ));
+        let file = FileId::new(149);
+        for nonempty in [false, true] {
+            let mut context = checker_context(file, &parsed);
+            let second = context
+                .get_type_at_location(variable_initializer(&parsed, file, "second"))
+                .unwrap();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let required = context
+                .store()
+                .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                .unwrap();
+            let element_types = [number];
+            let element_infos = [required];
+            let element_count = usize::from(nonempty);
+            let tuple = context
+                .store_mut_for_test()
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    &element_types[..element_count],
+                    &element_infos[..element_count],
+                    false,
+                ))
+                .unwrap();
+            let first = context
+                .get_type_at_location(variable_initializer(&parsed, file, "first"))
+                .unwrap();
+            assert!(second.get() < tuple.get() && tuple.get() < first.get());
+            assert!(
+                matches!(
+                    context.store().type_payload(tuple).unwrap().data(),
+                    TypeData::TypeReference(_) if nonempty
+                ) || matches!(
+                    context.store().type_payload(tuple).unwrap().data(),
+                    TypeData::Tuple(_) if !nonempty
+                )
+            );
+            let expected = [first, second, tuple];
+            let globals = context.global_types().clone();
+            let store = context.store_mut_for_test();
+            for (left_rank, left) in expected.into_iter().enumerate() {
+                for (right_rank, right) in expected.into_iter().enumerate() {
+                    assert_eq!(
+                        store.compare_union_types(left, right),
+                        Ok(left_rank.cmp(&right_rank)),
+                    );
+                }
+            }
+            let union = store
+                .expression_union_type_with_global_types(&globals, &expected, UnionReduction::None)
+                .unwrap();
+            let allocations = (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            );
+            for indices in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
+                let [left, middle, right] = indices.map(|index| expected[index]);
+                for inputs in [
+                    vec![left, middle, right],
+                    vec![left, middle, right, left, right],
+                ] {
+                    assert_eq!(
+                        store.expression_union_type_with_global_types(
+                            &globals,
+                            &inputs,
+                            UnionReduction::None,
+                        ),
+                        Ok(union),
+                    );
+                    assert_eq!(union_types(store, union), expected);
+                    assert_eq!(
+                        (
+                            store.type_len(),
+                            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                        ),
+                        allocations,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constructor_union_order_rejects_borrowed_class_declarations() {
+        let parsed = parse_source_file(
+            "class Zebra {} class Alpha {} const first = Zebra; const second = Alpha;",
+        );
+        let file = FileId::new(150);
+        let mut context = checker_context(file, &parsed);
+        let first = context
+            .get_type_at_location(variable_initializer(&parsed, file, "first"))
+            .unwrap();
+        let second = context
+            .get_type_at_location(variable_initializer(&parsed, file, "second"))
+            .unwrap();
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let first_symbol = store.type_payload(first).unwrap().symbol().unwrap();
+        let second_symbol = store.type_payload(second).unwrap().symbol().unwrap();
+        let first_record = store.symbol(first_symbol).unwrap();
+        let declarations = first_record.declarations().unwrap().to_vec();
+        let value_declaration = first_record.value_declaration();
+        let second_record = store.symbol(second_symbol).unwrap();
+        let borrowed = second_record.declarations().unwrap().to_vec();
+        let borrowed_value = second_record.value_declaration();
+        let union = store
+            .expression_union_type_with_global_types(
+                &globals,
+                &[first, second],
+                UnionReduction::None,
+            )
+            .unwrap();
+        let allocations = (
+            store.type_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+        assert!(store.set_symbol_declarations(first_symbol, Some(borrowed), borrowed_value));
+        assert!(!store.source_symbol_declarations_match(first_symbol));
+        assert_eq!(
+            store.validate_union_constituent_with_global_types(&globals, first),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(first)),
+        );
+        assert_eq!(
+            store.compare_union_types(first, second),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(first)),
+        );
+        assert!(
+            store
+                .expression_union_type_with_global_types(
+                    &globals,
+                    &[first, second],
+                    UnionReduction::None,
+                )
+                .is_err(),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            allocations,
+        );
+        assert!(store.set_symbol_declarations(first_symbol, Some(declarations), value_declaration));
+        assert!(store.source_symbol_declarations_match(first_symbol));
+        assert_eq!(
+            store.expression_union_type_with_global_types(
+                &globals,
+                &[second, first],
+                UnionReduction::None,
+            ),
+            Ok(union),
         );
     }
 
