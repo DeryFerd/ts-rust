@@ -2728,6 +2728,8 @@ impl Program {
         self.diagnostics = config_diagnostics;
     }
 
+    /// Returns files in storage order, where each index equals its `FileId`.
+    /// The canonical checker uses a separate semantic order.
     #[must_use]
     pub fn source_files(&self) -> &[SourceFile] {
         &self.source_files
@@ -4276,19 +4278,34 @@ impl Program {
         }
     }
 
+    fn canonical_semantic_sources(&self) -> Vec<&SourceFile> {
+        let mut sources = self.source_files.iter().collect::<Vec<_>>();
+        // Sort after graph loading so explicit roots and later reference-lib
+        // dependencies share one priority order without changing file identities.
+        sources.sort_by_key(|source| {
+            let priority = if source.is_default_library {
+                ts_bundled::library_priority(ts_path::base_file_name(&source.file_name))
+            } else {
+                0
+            };
+            (!source.is_default_library, priority)
+        });
+        sources
+    }
+
     #[allow(clippy::too_many_lines)]
     fn check_program_canonical<T>(
         &self,
         queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
     ) -> Result<(Vec<ProgramDiagnostic>, T), CanonicalProgramCheckError> {
         let mut binder = CanonicalBinder::new();
-        let source_facts = self
-            .source_files
+        let sources = self.canonical_semantic_sources();
+        let source_facts = sources
             .iter()
             .map(|source| canonical_source_file_facts(source, &self.options))
             .collect::<Result<Vec<_>, _>>()?;
 
-        for (source, facts) in self.source_files.iter().zip(source_facts) {
+        for (source, facts) in sources.iter().zip(source_facts) {
             binder
                 .bind_source_file_with_facts(
                     &source.parse.arena,
@@ -4302,7 +4319,7 @@ impl Program {
                 })?;
         }
 
-        for source in &self.source_files {
+        for source in &sources {
             let result = if is_javascript_file_name(&source.file_name) {
                 binder.bind_javascript_declaration_slice(&source.parse.arena, source.id)
             } else {
@@ -4315,7 +4332,7 @@ impl Program {
         }
 
         let mut diagnostics = Vec::new();
-        for source in &self.source_files {
+        for source in &sources {
             // Keep declaration files bound so their symbols remain available
             // to importers, but mirror pinned SkipTypeChecking by suppressing
             // their bind diagnostics together with checker diagnostics.
@@ -4351,13 +4368,11 @@ impl Program {
             }
         }
 
-        let ordered_arenas = self
-            .source_files
+        let ordered_arenas = sources
             .iter()
             .map(|source| (source.id, &source.parse.arena))
             .collect();
-        let check_files = self
-            .source_files
+        let check_files = sources
             .iter()
             .filter(|source| !source.is_default_library)
             .map(|source| {
@@ -9666,10 +9681,10 @@ mod tests {
 
     use super::{
         CanonicalBindError, CanonicalDeclarationError, CanonicalProgramCheckError,
-        CanonicalProgramCheckFailureClass, FileId, NodeData, Program, SourceFile, SyntaxKind,
-        bind_source_file_in_file, canonical_source_file_facts, defer_export_only_bundle_imports,
-        empty_check_result, parse_source_file, percent_encode_source_map_url,
-        source_file_is_external_module,
+        CanonicalProgramCheckFailureClass, CanonicalProgramQueries, FileId, NodeData, Program,
+        SourceFile, SyntaxKind, bind_source_file_in_file, canonical_source_file_facts,
+        defer_export_only_bundle_imports, empty_check_result, parse_source_file,
+        percent_encode_source_map_url, source_file_is_external_module,
     };
 
     fn plain_esm_bundler_options() -> CompilerOptions {
@@ -13014,6 +13029,244 @@ mod tests {
                 source.file_name
             );
         }
+    }
+
+    fn assert_canonical_semantic_order(
+        program: &Program,
+        queries: &CanonicalProgramQueries<'_>,
+        expected: &[&str],
+    ) {
+        let sources = program.canonical_semantic_sources();
+        let ids = sources.iter().map(|source| source.id).collect::<Vec<_>>();
+        assert_eq!(queries.context.file_order(), ids);
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| ts_path::base_file_name(&source.file_name))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(!program.source_files()[0].is_default_library);
+        for (index, source) in program.source_files().iter().enumerate() {
+            let id = FileId::new(u32::try_from(index).unwrap());
+            assert_eq!(source.id, id);
+            assert_eq!(source.binding.file_id(), Some(id));
+            assert_eq!(
+                program.source_file_by_id(id).unwrap().file_name,
+                source.file_name
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_semantic_library_order_matches_pinned_es2015_priority() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.ts", "export {};").unwrap();
+        let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["input.ts".to_owned()],
+            CompilerOptions {
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                assert_canonical_semantic_order(
+                    program,
+                    queries,
+                    &[
+                        "lib.es6.d.ts",
+                        "lib.es5.d.ts",
+                        "lib.es2015.d.ts",
+                        "lib.dom.d.ts",
+                        "lib.dom.iterable.d.ts",
+                        "lib.webworker.importscripts.d.ts",
+                        "lib.scripthost.d.ts",
+                        "lib.es2015.core.d.ts",
+                        "lib.es2015.collection.d.ts",
+                        "lib.es2015.generator.d.ts",
+                        "lib.es2015.iterable.d.ts",
+                        "lib.es2015.promise.d.ts",
+                        "lib.es2015.proxy.d.ts",
+                        "lib.es2015.reflect.d.ts",
+                        "lib.es2015.symbol.d.ts",
+                        "lib.es2015.symbol.wellknown.d.ts",
+                        "lib.es2018.asynciterable.d.ts",
+                        "lib.decorators.d.ts",
+                        "lib.decorators.legacy.d.ts",
+                        "input.ts",
+                    ],
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Some(()));
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+    }
+
+    #[test]
+    fn canonical_semantic_library_order_is_independent_of_explicit_roots() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.ts", "export {};").unwrap();
+        for roots in [
+            ["es2015.symbol.wellknown", "scripthost", "es5"],
+            ["es5", "scripthost", "es2015.symbol.wellknown"],
+        ] {
+            let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+                &fs,
+                "/project",
+                &["input.ts".to_owned()],
+                CompilerOptions {
+                    lib: Some(roots.map(str::to_owned).into()),
+                    ..CompilerOptions::default()
+                },
+                |program, queries| {
+                    assert_canonical_semantic_order(
+                        program,
+                        queries,
+                        &[
+                            "lib.es5.d.ts",
+                            "lib.scripthost.d.ts",
+                            "lib.es2015.symbol.d.ts",
+                            "lib.es2015.symbol.wellknown.d.ts",
+                            "lib.decorators.d.ts",
+                            "lib.decorators.legacy.d.ts",
+                            "input.ts",
+                        ],
+                    );
+                },
+            )
+            .unwrap();
+            assert_eq!(result, Some(()));
+            assert!(
+                program.diagnostics().is_empty(),
+                "{:?}",
+                program.diagnostics()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_semantic_library_order_includes_transitive_references() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.ts", "import './dependency'; export {};")
+            .unwrap();
+        fs.write_file("/project/other.ts", "export {};").unwrap();
+        fs.write_file(
+            "/project/dependency.ts",
+            concat!(
+                "/// <reference lib=\"es2015.symbol.wellknown\" />\n",
+                "/// <reference lib=\"scripthost\" />\n",
+                "export {};",
+            ),
+        )
+        .unwrap();
+        let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["input.ts".to_owned(), "other.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                module: ModuleKind::EsNext,
+                module_resolution: ModuleResolutionKind::Bundler,
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                assert_canonical_semantic_order(
+                    program,
+                    queries,
+                    &[
+                        "lib.es5.d.ts",
+                        "lib.scripthost.d.ts",
+                        "lib.es2015.symbol.d.ts",
+                        "lib.es2015.symbol.wellknown.d.ts",
+                        "lib.decorators.d.ts",
+                        "lib.decorators.legacy.d.ts",
+                        "input.ts",
+                        "other.ts",
+                        "dependency.ts",
+                    ],
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Some(()));
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+    }
+
+    #[test]
+    fn canonical_semantic_library_order_controls_merged_declarations() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.d.ts", "interface Array<T> { own: T; }")
+            .unwrap();
+        let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["input.d.ts".to_owned()],
+            CompilerOptions {
+                target: ScriptTarget::Es2015,
+                skip_lib_check: true,
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                for (name, expected) in [
+                    (
+                        "Date",
+                        vec![
+                            "lib.es5.d.ts",
+                            "lib.es5.d.ts",
+                            "lib.es5.d.ts",
+                            "lib.scripthost.d.ts",
+                            "lib.es2015.symbol.wellknown.d.ts",
+                        ],
+                    ),
+                    (
+                        "Array",
+                        vec![
+                            "lib.es5.d.ts",
+                            "lib.es5.d.ts",
+                            "lib.es2015.core.d.ts",
+                            "lib.es2015.iterable.d.ts",
+                            "lib.es2015.symbol.wellknown.d.ts",
+                            "input.d.ts",
+                        ],
+                    ),
+                ] {
+                    let symbol = queries
+                        .context
+                        .store()
+                        .symbol_table(queries.context.globals())
+                        .unwrap()
+                        .get_source(name)
+                        .unwrap();
+                    let declarations = queries.get_symbol_declarations(symbol).unwrap();
+                    let files = declarations
+                        .iter()
+                        .map(|declaration| {
+                            assert!(program.node(*declaration).is_some());
+                            let file = program.source_file_by_id(declaration.file).unwrap();
+                            ts_path::base_file_name(&file.file_name)
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(files, expected, "{name}");
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Some(()));
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
     }
 
     #[test]
