@@ -66,6 +66,7 @@ fn literal_annotation_tokens_use_their_production_type_without_checking_declarat
     for ((annotation, literal), expected) in literals.iter().zip(expected) {
         let type_ = context.get_type_at_location(*literal).unwrap();
         assert_eq!(context.type_to_string(type_).unwrap(), expected);
+        assert_eq!(context.get_type_at_location(*annotation), Ok(type_));
         assert_eq!(context.get_type_from_type_node(*annotation), Ok(type_));
         assert_eq!(context.get_symbol_at_location(*literal).unwrap(), None);
         assert!(context.store().type_node_links(*literal).is_none());

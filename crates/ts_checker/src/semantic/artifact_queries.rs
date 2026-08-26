@@ -198,7 +198,9 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
-        if let Some(type_) = self.cached_artifact_type(node)? {
+        if supports_type_location(&self.validated_artifact_node(node)?.2.data)
+            && let Some(type_) = self.cached_artifact_type(node)?
+        {
             return Ok(type_);
         }
 
@@ -718,25 +720,33 @@ impl CanonicalCheckerContext<'_> {
         &mut self,
         node: NodeRef,
     ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
-        let annotation = {
+        let (annotation, literal) = {
             let (_, _, record) = self.validated_artifact_node(node)?;
-            let Some(parent) = record.parent else {
-                return Ok(None);
-            };
-            let parent = NodeRef::new(node.arena, node.file, parent);
-            let (_, _, parent_record) = self.validated_artifact_node(parent)?;
-            let NodeData::LiteralTypeNode(literal) = &parent_record.data else {
-                return Ok(None);
-            };
-            if literal.literal != node.node {
-                return Err(CanonicalArtifactQueryError::ForeignNode(node));
+            if let NodeData::LiteralTypeNode(literal) = &record.data {
+                let literal = NodeRef::new(node.arena, node.file, literal.literal);
+                if self.validated_artifact_node(literal)?.2.parent != Some(node.node) {
+                    return Err(CanonicalArtifactQueryError::ForeignNode(literal));
+                }
+                (node, literal)
+            } else {
+                let Some(parent) = record.parent else {
+                    return Ok(None);
+                };
+                let parent = NodeRef::new(node.arena, node.file, parent);
+                let (_, _, parent_record) = self.validated_artifact_node(parent)?;
+                let NodeData::LiteralTypeNode(literal) = &parent_record.data else {
+                    return Ok(None);
+                };
+                if literal.literal != node.node {
+                    return Err(CanonicalArtifactQueryError::ForeignNode(node));
+                }
+                (parent, node)
             }
-            parent
         };
 
         // Type-node queries cache the annotation, not its literal child.
         // Check both against the literal table before resolving a cold query.
-        for location in [node, annotation] {
+        for location in [literal, annotation] {
             let cached = self.cached_artifact_type(location)?;
             if self
                 .store()
@@ -749,7 +759,7 @@ impl CanonicalCheckerContext<'_> {
                 });
             }
             if let Some(cached) = cached
-                && (self.cached_literal_annotation_identity(node)? != Some(cached)
+                && (self.cached_literal_annotation_identity(literal)? != Some(cached)
                     || self.store().validate_union_constituent(cached).is_err())
             {
                 return Err(CanonicalArtifactQueryError::InvalidType {
@@ -1905,15 +1915,18 @@ fn supports_type_location(data: &NodeData) -> bool {
             NodeData::ArrayLiteralExpression(_)
                 | NodeData::ArrowFunction(_)
                 | NodeData::AsExpression(_)
+                | NodeData::AwaitExpression(_)
                 | NodeData::BigIntLiteral(_)
                 | NodeData::BinaryExpression(_)
                 | NodeData::CallExpression(_)
                 | NodeData::ClassDeclaration(_)
                 | NodeData::ClassExpression(_)
                 | NodeData::ConditionalExpression(_)
+                | NodeData::DeleteExpression(_)
                 | NodeData::ElementAccessExpression(_)
                 | NodeData::EnumDeclaration(_)
                 | NodeData::EnumMember(_)
+                | NodeData::ExpressionWithTypeArguments(_)
                 | NodeData::FunctionDeclaration(_)
                 | NodeData::FunctionExpression(_)
                 | NodeData::GetAccessorDeclaration(_)
@@ -1921,7 +1934,17 @@ fn supports_type_location(data: &NodeData) -> bool {
                 | NodeData::ImportClause(_)
                 | NodeData::ImportSpecifier(_)
                 | NodeData::InterfaceDeclaration(_)
+                | NodeData::JsxAttribute(_)
+                | NodeData::JsxClosingElement(_)
+                | NodeData::JsxClosingFragment(_)
+                | NodeData::JsxElement(_)
+                | NodeData::JsxExpression(_)
+                | NodeData::JsxFragment(_)
+                | NodeData::JsxOpeningElement(_)
+                | NodeData::JsxOpeningFragment(_)
+                | NodeData::JsxSelfClosingElement(_)
                 | NodeData::KeywordExpression(_)
+                | NodeData::MetaProperty(_)
                 | NodeData::MethodDeclaration(_)
                 | NodeData::MethodSignatureDeclaration(_)
                 | NodeData::NewExpression(_)
@@ -1929,6 +1952,7 @@ fn supports_type_location(data: &NodeData) -> bool {
                 | NodeData::NonNullExpression(_)
                 | NodeData::NumericLiteral(_)
                 | NodeData::ObjectLiteralExpression(_)
+                | NodeData::OmittedExpression(_)
                 | NodeData::ParameterDeclaration(_)
                 | NodeData::ParenthesizedExpression(_)
                 | NodeData::PostfixUnaryExpression(_)
@@ -1939,15 +1963,21 @@ fn supports_type_location(data: &NodeData) -> bool {
                 | NodeData::PropertyDeclaration(_)
                 | NodeData::PropertySignatureDeclaration(_)
                 | NodeData::QualifiedName(_)
+                | NodeData::RegularExpressionLiteral(_)
                 | NodeData::SatisfiesExpression(_)
                 | NodeData::SetAccessorDeclaration(_)
                 | NodeData::ShorthandPropertyAssignment(_)
+                | NodeData::SpreadElement(_)
                 | NodeData::StringLiteral(_)
+                | NodeData::TaggedTemplateExpression(_)
+                | NodeData::TemplateExpression(_)
                 | NodeData::TypeAliasDeclaration(_)
                 | NodeData::TypeAssertion(_)
                 | NodeData::TypeOfExpression(_)
                 | NodeData::TypeParameterDeclaration(_)
                 | NodeData::VariableDeclaration(_)
+                | NodeData::VoidExpression(_)
+                | NodeData::YieldExpression(_)
         )
 }
 
@@ -2198,6 +2228,111 @@ mod tests {
                 assert_eq!(context.get_type_from_type_node(annotation), Ok(resolved));
             }
         }
+    }
+
+    #[test]
+    fn literal_wrappers_reject_same_store_substitution_before_resolving_the_source() {
+        let parsed = parse_source_file("interface Shape { first: 'ready'; second: 'wrong'; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_031);
+        let mut context = declaration_context(&parsed, file);
+        let annotations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                matches!(record.data, NodeData::LiteralTypeNode(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [first, second] = annotations.as_slice() else {
+            panic!("expected two literal annotations")
+        };
+        let wrong = context.get_type_at_location(*second).unwrap();
+        assert!(context.store_mut_for_test().set_type_node_links(
+            *first,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().len(),
+        );
+        assert_eq!(
+            context.get_type_at_location(*first),
+            Err(CanonicalArtifactQueryError::InvalidType {
+                node: *first,
+                type_: wrong,
+            }),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            ),
+            before,
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(*first, TypeNodeLinks::default()),
+        );
+        let ready = context.get_type_at_location(*first).unwrap();
+        assert_ne!(ready, wrong);
+        assert_eq!(context.type_to_string(ready).unwrap(), "\"ready\"");
+    }
+
+    #[test]
+    fn unsupported_type_locations_do_not_adopt_same_store_caches() {
+        let parsed = parse_source_file("interface Shape { value: string; }");
+        let file = FileId::new(6_032);
+        let mut context = declaration_context(&parsed, file);
+        let source = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            source,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().len(),
+        );
+        assert_eq!(
+            context.get_type_at_location(source),
+            Err(CanonicalArtifactQueryError::UnsupportedNode {
+                node: source,
+                kind: SyntaxKind::SourceFile,
+            }),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            ),
+            before,
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(source)
+                .and_then(|links| links.resolved_type),
+            Some(wrong),
+        );
     }
 
     #[test]
