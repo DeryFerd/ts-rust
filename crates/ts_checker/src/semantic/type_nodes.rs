@@ -15418,33 +15418,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         }
         let declaration = declarations[0];
-        if (declaration.arena != node.arena || declaration.file != node.file)
-            && !(self.global_symbol_has_name(symbol, "ConcatArray")
-                && self
-                    .host
-                    .bound_file(declaration)
-                    .and_then(ts_binder::BoundFile::source_facts)
-                    .is_some_and(ts_binder::CanonicalSourceFileFacts::is_default_library)
-                || self.global_symbol_has_name(symbol, "PromiseLike")
-                    && self
-                        .host
-                        .bound_file(declaration)
-                        .and_then(ts_binder::BoundFile::source_facts)
-                        .is_some_and(|facts| {
-                            facts.is_default_library() && facts.is_declaration_file()
-                        })
-                    && self
-                        .host
-                        .bound_file(node)
-                        .and_then(ts_binder::BoundFile::source_facts)
-                        .is_some_and(|facts| {
-                            facts.is_default_library() && facts.is_declaration_file()
-                        }))
-        {
-            return Err(unsupported());
-        }
         let declaration_node = preflight_node(self.store, self.host, declaration)?;
         if declaration_node.flags.0 & NODE_FLAG_JSDOC != 0 {
+            return Err(unsupported());
+        }
+        let ordinary_interface = declarations.len() == 1
+            && matches!(declaration_node.data, NodeData::InterfaceDeclaration(_));
+        if ordinary_interface {
+            self.preflight_direct_generic_interface_reference_owner(node, symbol, declaration)?;
+        } else if !declaration.is_for(node.arena, node.file) {
             return Err(unsupported());
         }
         let parameters = match &declaration_node.data {
@@ -15492,7 +15474,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if source_class {
             self.preflight_source_generic_class_reference_owner(node, symbol, declaration)?;
         }
-        let parameter_members = (namespace_owned || source_class)
+        let parameter_members = (namespace_owned || source_class || ordinary_interface)
             .then(|| {
                 self.store
                     .symbol(symbol)
@@ -15518,7 +15500,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             if parameter_node.parent != Some(declaration.node)
                 || parameter_node.flags.0 & NODE_FLAG_JSDOC != 0
                 || parameter_data.default_type.is_some()
-                    && !(source_class || react_interface_defaults)
+                    && !(source_class || react_interface_defaults || ordinary_interface)
                 || parameter_data.expression.is_some()
                 || parameter_data.modifiers.is_some()
             {
@@ -15541,7 +15523,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 {
                     return Err(unsupported());
                 }
-                if source_class || react_interface_defaults {
+                if source_class || react_interface_defaults || ordinary_interface {
                     let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
                     let name_record = preflight_node(self.store, self.host, name)?;
                     let NodeData::Identifier(identifier) = &name_record.data else {
@@ -15646,7 +15628,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     if constraint_record.kind != SyntaxKind::TypeReference
                         || constraint_record.parent != Some(parameter.node)
                         || constraint_record.flags.0 != 0
-                        || constraint_record.range.end != parameter_node.range.end
+                        || constraint_record.range.end > parameter_node.range.end
+                        || parameter_data.default_type.is_none()
+                            && constraint_record.range.end != parameter_node.range.end
                         || name_record.kind != SyntaxKind::Identifier
                         || name_record.parent != Some(constraint.node)
                     {
@@ -15781,9 +15765,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     default,
                     &previous_parameters,
                     react_interface_defaults,
+                    ordinary_interface,
                 )?);
             } else {
-                if react_interface_defaults && !defaults.is_empty() {
+                if (react_interface_defaults || ordinary_interface) && !defaults.is_empty() {
                     return Err(unsupported());
                 }
                 minimum_type_arguments = index + 1;
@@ -15795,6 +15780,86 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             defaults,
             minimum_type_arguments,
         })
+    }
+
+    /// Validates a direct interface target without resolving its member types.
+    fn preflight_direct_generic_interface_reference_owner(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+        declaration: NodeRef,
+    ) -> Result<(), DeclaredTypeError> {
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol })
+        };
+        let bound = self.host.bound_file(declaration).ok_or_else(&unsupported)?;
+        let facts = bound.source_facts().ok_or_else(&unsupported)?;
+        let owner = self.store.symbol(symbol).ok_or_else(&unsupported)?;
+        let record = preflight_node(self.store, self.host, declaration)?;
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return Err(unsupported());
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
+        let name_record = preflight_node(self.store, self.host, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(unsupported());
+        };
+        let parent = object_members::declared_type_declaration_parent(
+            self.store,
+            self.host,
+            declaration,
+            symbol,
+            name,
+            interface.modifiers.as_ref(),
+        )
+        .map_err(|()| unsupported())?;
+        if facts.is_javascript_file()
+            || record.kind != SyntaxKind::InterfaceDeclaration
+            || record.flags.0 != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration().is_some()
+            || owner.members().is_none()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || self.store.get_parent_of_symbol(symbol) != parent
+            || self.store.get_merged_symbol(symbol) != Some(symbol)
+            || !self.host.symbol_matches(self.store, declaration, symbol)
+            || bound
+                .symbol(declaration)
+                .and_then(|owner| self.store.get_merged_symbol(owner))
+                != Some(symbol)
+            || interface.flow_node.is_some()
+            || interface.local_symbol.is_some()
+            || interface.symbol.is_some()
+            || interface.members.has_trailing_comma
+            || interface.members.range.start < record.range.start
+            || interface.members.range.end != record.range.end
+        {
+            return Err(unsupported());
+        }
+        if parent.is_none()
+            && (record.parent != Some(bound.source_file().node)
+                || bound
+                    .locals(bound.source_file())
+                    .and_then(|locals| self.store.symbol_table(locals))
+                    .and_then(|locals| locals.get_source(&identifier.text))
+                    .and_then(|local| self.store.get_merged_symbol(local))
+                    != Some(symbol)
+                || !declaration.is_for(node.arena, node.file)
+                    && (facts.is_external_or_common_js_module()
+                        || !self.global_symbol_has_name(symbol, &identifier.text)))
+        {
+            return Err(unsupported());
+        }
+        Ok(())
     }
 
     fn preflight_source_generic_class_reference_owner(
@@ -15863,6 +15928,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         default: NodeRef,
         earlier_parameters: &[SemanticSymbolId],
         react_interface: bool,
+        ordinary_interface: bool,
     ) -> Result<PlannedDirectGenericDefault, DeclaredTypeError> {
         let unsupported = || {
             type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol })
@@ -15879,19 +15945,33 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
 
         let (earlier_parameter, expected) = match &default_record.data {
-            NodeData::KeywordTypeNode(_) if default_record.kind == SyntaxKind::AnyKeyword => (
-                None,
-                Some(
+            NodeData::KeywordTypeNode(_)
+                if default_record.kind == SyntaxKind::AnyKeyword || ordinary_interface =>
+            {
+                let bootstrap =
                     self.store
                         .intrinsic_bootstrap()
                         .ok_or(DeclaredTypeError::Unavailable(
                             DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
-                        ))?
-                        .any_type,
-                ),
-            ),
+                        ))?;
+                let type_ = match default_record.kind {
+                    SyntaxKind::AnyKeyword => bootstrap.any_type,
+                    SyntaxKind::UnknownKeyword => bootstrap.unknown_type,
+                    SyntaxKind::StringKeyword => bootstrap.string_type,
+                    SyntaxKind::NumberKeyword => bootstrap.number_type,
+                    SyntaxKind::BigIntKeyword => bootstrap.bigint_type,
+                    SyntaxKind::BooleanKeyword => bootstrap.boolean_type,
+                    SyntaxKind::SymbolKeyword => bootstrap.es_symbol_type,
+                    SyntaxKind::VoidKeyword => bootstrap.void_type,
+                    SyntaxKind::UndefinedKeyword => bootstrap.undefined_type,
+                    SyntaxKind::NeverKeyword => bootstrap.never_type,
+                    SyntaxKind::ObjectKeyword => bootstrap.non_primitive_type,
+                    _ => return Err(unsupported()),
+                };
+                (None, Some(type_))
+            }
             NodeData::TypeLiteralNode(empty)
-                if react_interface
+                if (react_interface || ordinary_interface)
                     && default_record.kind == SyntaxKind::TypeLiteral
                     && empty.members.nodes.is_empty()
                     && !empty.members.has_trailing_comma
@@ -16037,6 +16117,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             _ => return Err(unsupported()),
         };
+
+        if self.store.type_node_links(default).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links
+                    .resolved_type
+                    .is_some_and(|cached| Some(cached) != expected)
+        }) || !matches!(default_record.data, NodeData::TypeReferenceNode(_))
+            && self
+                .store
+                .symbol_node_links(default)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return Err(invalid());
+        }
 
         if let Some(parameter_type) = self
             .store
@@ -24760,6 +24854,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         == Some(default.parameter)
                 })
                 .ok_or_else(&invalid)?;
+            if index < type_arguments.len() {
+                continue;
+            }
             let expected = self.execute_type_node(default.node, plan, prepared)?;
             if default.earlier_parameter.is_some_and(|earlier| {
                 cached_ordinary_type_parameter_owner(self.store, expected) != Some(earlier)
@@ -38423,6 +38520,334 @@ mod tests {
             Ok(forwarded_type),
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn direct_generic_interface_references_use_real_iterable_library_defaults() {
+        let library = parse_source_file(include_str!(
+            "../../../ts_bundled/libs/lib.es2015.iterable.d.ts"
+        ));
+        let source = parse_source_file(concat!(
+            "let explicit: Iterable<number, string, undefined>; ",
+            "let second: Iterable<string, void, number>; ",
+            "let defaults: Iterable<number>; ",
+            "let partial: Iterable<number, string>; ",
+            "let iterator: Iterator<number>;",
+        ));
+        let (mut context, library_file, source_file) =
+            default_library_interface_context(&library, &source, true);
+        let nodes = source
+            .arena
+            .iter()
+            .filter_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some((
+                    identifier_text(&source.arena, variable.name)?.to_owned(),
+                    NodeRef::new(source.arena.id(), source_file, variable.type_?),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let (any, string, number, undefined, void) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.any_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.undefined_type,
+                bootstrap.void_type,
+            )
+        };
+        let mut resolved = Vec::new();
+        for (name, arguments) in [
+            ("explicit", [number, string, undefined]),
+            ("second", [string, void, number]),
+            ("defaults", [number, any, any]),
+            ("partial", [number, string, any]),
+            ("iterator", [number, any, any]),
+        ] {
+            let node = nodes[name];
+            let type_ = context.get_type_from_type_node(node).unwrap();
+            let reference = validate_direct_generic_reference(context.store(), type_).unwrap();
+            assert_eq!(reference.type_arguments, arguments, "reference: {name}");
+            let target = context.store().type_payload(reference.target).unwrap();
+            let owner = context.store().symbol(target.symbol().unwrap()).unwrap();
+            assert_eq!(owner.declarations().unwrap()[0].file, library_file);
+            let TypeData::Interface(interface) = target.data() else {
+                panic!("the library reference must retain its interface target")
+            };
+            assert!(!interface.declared_members_resolved);
+            let parameters = interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .unwrap();
+            for parameter in &parameters[1..] {
+                let TypeData::TypeParameter(parameter) =
+                    context.store().type_payload(*parameter).unwrap().data()
+                else {
+                    panic!("the target must retain its declaration-owned parameter")
+                };
+                assert_eq!(
+                    parameter.resolved_default_type,
+                    (!matches!(name, "explicit" | "second")).then_some(any),
+                );
+            }
+            resolved.push((node, type_));
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = store_state(context.store());
+        for (node, expected) in resolved {
+            assert_eq!(context.get_type_from_type_node(node), Ok(expected));
+        }
+        assert_eq!(store_state(context.store()), warm);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn direct_generic_interface_defaults_forward_parameters_without_library_name_rules() {
+        let library = parse_source_file(concat!(
+            "interface Channel<Value, Result = unknown, Next = Value> {} ",
+            "interface Empty<Value = {}> {} ",
+            "interface Scalar<Value = string, Other = number, Last = undefined> {}",
+        ));
+        let source = parse_source_file(concat!(
+            "let channel: Channel<string>; ",
+            "let explicit: Channel<string, unknown, string>; ",
+            "let empty: Empty; ",
+            "let scalar: Scalar;",
+        ));
+        let (mut context, _, source_file) =
+            default_library_interface_context(&library, &source, false);
+        let nodes = source
+            .arena
+            .iter()
+            .filter_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some((
+                    identifier_text(&source.arena, variable.name)?.to_owned(),
+                    NodeRef::new(source.arena.id(), source_file, variable.type_?),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let (unknown, string, number, undefined, empty) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.unknown_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.undefined_type,
+                bootstrap.empty_type_literal_type,
+            )
+        };
+        let channel = context.get_type_from_type_node(nodes["channel"]).unwrap();
+        assert_eq!(
+            context.get_type_from_type_node(nodes["explicit"]),
+            Ok(channel),
+        );
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), channel)
+                .unwrap()
+                .type_arguments,
+            [string, unknown, string],
+        );
+        let empty_type = context.get_type_from_type_node(nodes["empty"]).unwrap();
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), empty_type)
+                .unwrap()
+                .type_arguments,
+            [empty],
+        );
+        let scalar = context.get_type_from_type_node(nodes["scalar"]).unwrap();
+        assert_eq!(
+            validate_direct_generic_reference(context.store(), scalar)
+                .unwrap()
+                .type_arguments,
+            [string, number, undefined],
+        );
+        let warm = store_state(context.store());
+        assert_eq!(
+            context.get_type_from_type_node(nodes["channel"]),
+            Ok(channel)
+        );
+        assert_eq!(
+            context.get_type_from_type_node(nodes["empty"]),
+            Ok(empty_type)
+        );
+        assert_eq!(context.get_type_from_type_node(nodes["scalar"]), Ok(scalar));
+        assert_eq!(store_state(context.store()), warm);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn direct_generic_interface_library_defaults_reject_poison_before_writes() {
+        let library = parse_source_file(include_str!(
+            "../../../ts_bundled/libs/lib.es2015.iterable.d.ts"
+        ));
+        let source = parse_source_file("let value: Iterable<number>;");
+        let (mut context, library_file, source_file) =
+            default_library_interface_context(&library, &source, true);
+        let node = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::VariableDeclaration(variable) => variable
+                    .type_
+                    .map(|node| NodeRef::new(source.arena.id(), source_file, node)),
+                _ => None,
+            })
+            .unwrap();
+        let resolved = context.get_type_from_type_node(node).unwrap();
+        let reference = validate_direct_generic_reference(context.store(), resolved).unwrap();
+        let parameters = validate_direct_generic_reference(context.store(), reference.target)
+            .unwrap()
+            .type_arguments;
+        let parameter = parameters[1];
+        let parameter_symbol =
+            cached_ordinary_type_parameter_owner(context.store(), parameter).unwrap();
+        let declaration = context
+            .store()
+            .symbol(parameter_symbol)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        assert_eq!(declaration.file, library_file);
+        let NodeData::TypeParameterDeclaration(parameter_data) =
+            &library.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the library must retain its return parameter")
+        };
+        let default = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            parameter_data.default_type.unwrap(),
+        );
+        let original = context.store().type_node_links(default).cloned().unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            default,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = store_state(context.store());
+        assert!(context.get_type_from_type_node(node).is_err());
+        assert_eq!(store_state(context.store()), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(default, original)
+        );
+        assert_eq!(context.get_type_from_type_node(node), Ok(resolved));
+
+        let TypeData::TypeParameter(parameter_data) =
+            context.store().type_payload(parameter).unwrap().data()
+        else {
+            panic!("the return parameter must retain its canonical type")
+        };
+        let constraint = parameter_data.constraint;
+        let original_default = parameter_data.resolved_default_type;
+        assert!(context.store_mut_for_test().set_type_parameter_resolution(
+            parameter,
+            constraint,
+            None,
+            None,
+            Some(number),
+        ));
+        let poisoned = store_state(context.store());
+        assert!(context.get_type_from_type_node(node).is_err());
+        assert_eq!(store_state(context.store()), poisoned);
+        assert!(context.store_mut_for_test().set_type_parameter_resolution(
+            parameter,
+            constraint,
+            None,
+            None,
+            original_default,
+        ));
+        assert_eq!(context.get_type_from_type_node(node), Ok(resolved));
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn direct_generic_interface_library_parameters_require_their_exact_owner() {
+        let library = parse_source_file(include_str!(
+            "../../../ts_bundled/libs/lib.es2015.iterable.d.ts"
+        ));
+        let source = parse_source_file("let value: Iterable<number>;");
+        let (mut context, _, source_file) =
+            default_library_interface_context(&library, &source, true);
+        let node = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::VariableDeclaration(variable) => variable
+                    .type_
+                    .map(|node| NodeRef::new(source.arena.id(), source_file, node)),
+                _ => None,
+            })
+            .unwrap();
+        let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+        let globals = context.store().symbol_table(globals).unwrap();
+        let iterable = globals.get_source("Iterable").unwrap();
+        let foreign = globals.get_source("Iterator").unwrap();
+        let parameter = context
+            .store()
+            .symbol(iterable)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("TReturn"))
+            .unwrap();
+        let owner = context.store().symbol(parameter).unwrap();
+        let original = (
+            owner.members(),
+            owner.exports(),
+            owner.parent(),
+            owner.export_symbol(),
+        );
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            parameter,
+            original.0,
+            original.1,
+            Some(foreign),
+            original.3,
+        ));
+        let poisoned = store_state(context.store());
+        assert!(context.get_type_from_type_node(node).is_err());
+        assert_eq!(store_state(context.store()), poisoned);
+        assert!(
+            context.store_mut_for_test().set_symbol_relationships(
+                parameter, original.0, original.1, original.2, original.3,
+            )
+        );
+        assert!(context.get_type_from_type_node(node).is_ok());
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn direct_generic_interface_defaults_keep_unsupported_defaults_atomic() {
+        for source in [
+            "interface Bad<Value = Later, Later = number> {} let value: Bad;",
+            "interface Bad<Value = number[]> {} let value: Bad;",
+            "interface Bad<Value = unknown, Later> {} let value: Bad<string, number>;",
+        ] {
+            let mut fixture = fixture(source);
+            let node = variable_type_node(&fixture, "value");
+            let before = store_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert!(matches!(
+                query_node(&mut fixture, node, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::GenericReferenceUnsupported { .. }
+                )),
+            ));
+            assert_eq!(store_state(&fixture.store), before, "source: {source}");
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]
