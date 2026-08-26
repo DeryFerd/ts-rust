@@ -1977,7 +1977,7 @@ fn source_jsdoc_typedef_shape(
                     let property_type = links.resolved_type?;
                     properties.push(SourceJsDocTypedefProperty {
                         symbol: *property,
-                        name: symbol.name().clone(),
+                        name: symbol.name().to_owned(),
                         flags: symbol.flags(),
                         check_flags: symbol.check_flags(),
                         links: links.clone(),
