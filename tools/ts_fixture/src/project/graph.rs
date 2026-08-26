@@ -1,10 +1,13 @@
 use serde::Serialize;
 use serde_json::{Value, json};
+use ts_ast::NodeRef;
 use ts_checker::semantic::{CanonicalModuleResolutionInput, CanonicalModuleResolutionMode};
 use ts_compiler::{
-    Program, ProgramGraphMissingEvidence, ProgramGraphReferenceKind, ProgramGraphResolutionKind,
+    CanonicalProgramCheckError, Program, ProgramGraphMissingEvidence, ProgramGraphReferenceKind,
+    ProgramGraphResolutionKind,
 };
 use ts_module::{FailedLookupKind, ModuleFormat, ResolutionMode};
+use ts_options::ModuleResolutionKind;
 
 use super::{
     ProjectStage,
@@ -46,6 +49,119 @@ const fn format_name(mode: ModuleFormat) -> &'static str {
         ModuleFormat::CommonJs => "commonjs",
         ModuleFormat::Esm => "esm",
     }
+}
+
+fn manifest_node_location(program: &Program, reference: NodeRef) -> Value {
+    let source = program
+        .source_file_by_id(reference.file)
+        .filter(|source| reference.is_for(source.parse.arena.id(), source.id));
+    let node = source.and_then(|_| program.node(reference));
+    json!({
+        "containingFile": source.map(|source| path_identity(&source.file_name)),
+        "range": node.map(|node| json!({
+            "startByte": node.range.start.get(),
+            "endByte": node.range.end.get(),
+        })),
+    })
+}
+
+#[allow(clippy::too_many_lines)] // Each manifest error retains its typed fields without raw IDs.
+fn manifest_failure(
+    program: &Program,
+    error: &CanonicalProgramCheckError,
+) -> ProjectStage<Vec<Value>> {
+    let detail = match error {
+        CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(node) => json!({
+            "kind": "module_specifier_resolution_mode_unsupported",
+            "location": manifest_node_location(program, *node),
+        }),
+        CanonicalProgramCheckError::InvalidModuleSourceFile(node) => json!({
+            "kind": "invalid_module_source_file",
+            "location": manifest_node_location(program, *node),
+        }),
+        CanonicalProgramCheckError::InvalidModuleSpecifier(node) => json!({
+            "kind": "invalid_module_specifier",
+            "location": manifest_node_location(program, *node),
+        }),
+        CanonicalProgramCheckError::ExternalModuleTargetUnsupported {
+            specifier,
+            target_file_name,
+        } => json!({
+            "kind": "external_module_target_unsupported",
+            "location": manifest_node_location(program, *specifier),
+            "targetFile": path_identity(target_file_name),
+        }),
+        CanonicalProgramCheckError::MissingResolvedModuleTarget {
+            containing_file,
+            specifier,
+            resolved_file_name,
+        } => json!({
+            "kind": "missing_resolved_module_target",
+            "containingFile": path_identity(containing_file),
+            "location": manifest_node_location(program, *specifier),
+            "targetFile": path_identity(resolved_file_name),
+        }),
+        CanonicalProgramCheckError::PlainEsmModuleResolutionUnsupported {
+            file_name,
+            module,
+            module_resolution,
+        } => json!({
+            "kind": "plain_esm_module_resolution_unsupported",
+            "fileName": path_identity(file_name),
+            "module": module_name(*module),
+            "moduleResolution": match module_resolution {
+                ModuleResolutionKind::Classic => "classic",
+                ModuleResolutionKind::Node10 => "node10",
+                ModuleResolutionKind::Node16 => "node16",
+                ModuleResolutionKind::NodeNext => "nodenext",
+                ModuleResolutionKind::Bundler => "bundler",
+            },
+        }),
+        CanonicalProgramCheckError::UnsupportedSourceKind {
+            file_name,
+            script_kind,
+        } => json!({
+            "kind": "unsupported_source_kind",
+            "fileName": path_identity(file_name),
+            "scriptKind": match script_kind {
+                ts_path::ScriptKind::Unknown => "unknown",
+                ts_path::ScriptKind::Js => "js",
+                ts_path::ScriptKind::Jsx => "jsx",
+                ts_path::ScriptKind::Ts => "ts",
+                ts_path::ScriptKind::Tsx => "tsx",
+                ts_path::ScriptKind::External => "external",
+                ts_path::ScriptKind::Json => "json",
+                ts_path::ScriptKind::Deferred => "deferred",
+            },
+        }),
+        CanonicalProgramCheckError::ImportMetaModuleIndicatorUnsupported { file_name } => json!({
+            "kind": "import_meta_module_indicator_unsupported",
+            "fileName": path_identity(file_name),
+        }),
+        CanonicalProgramCheckError::FixedModuleFormatUnsupported { .. }
+        | CanonicalProgramCheckError::NodeModuleFactsUnsupported { .. }
+        | CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { .. }
+        | CanonicalProgramCheckError::ProjectReferencesUnsupported { .. }
+        | CanonicalProgramCheckError::Bind { .. }
+        | CanonicalProgramCheckError::DeclarationBind { .. }
+        | CanonicalProgramCheckError::Context(_)
+        | CanonicalProgramCheckError::SourceCheck { .. }
+        | CanonicalProgramCheckError::MissingBoundFile { .. }
+        | CanonicalProgramCheckError::InvalidDiagnosticNode(_)
+        | CanonicalProgramCheckError::InvalidDiagnosticRange { .. }
+        | CanonicalProgramCheckError::InvalidRelatedDiagnosticNode { .. }
+        | CanonicalProgramCheckError::DiagnosticFormat(_) => {
+            return ProjectStage::Invariant {
+                code: "INV.PROJECT.MANIFEST_FAILURE_KIND".to_owned(),
+                detail: json!({
+                    "kind": "unhandled_manifest_failure",
+                    "compilerFailureCode": error.failure_class().code(),
+                })
+                .to_string(),
+            };
+        }
+    };
+    ProjectStage::failure(error.failure_class(), detail.to_string())
 }
 
 #[allow(clippy::too_many_lines)] // The report retains each graph field without debug serialization.
@@ -211,7 +327,7 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
         "artifactFileOrder": ordered_artifact_files,
     });
     let module_resolution_manifest = match &graph.module_resolution_manifest {
-        Err(error) => ProjectStage::compiler_failure(error),
+        Err(error) => manifest_failure(program, error),
         Ok(manifest) => {
             let entries = manifest.entries().iter().map(|entry| {
                 let specifier = entry.specifier();
@@ -280,12 +396,12 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
     use ts_compiler::Program;
     use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind};
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
-    use super::snapshot_report;
+    use super::{ProjectStage, snapshot_report};
 
     fn graph_options() -> CompilerOptions {
         CompilerOptions {
@@ -366,5 +482,59 @@ mod tests {
         assert_eq!(before.missing_evidence, after.missing_evidence);
         assert_ne!(before.digest, after.digest);
         assert_eq!(after, snapshot_report(&build()));
+    }
+
+    #[test]
+    fn graph_report_manifest_failures_are_stable_across_rebuilt_programs() {
+        let filesystem = MemoryFileSystem::new(true);
+        filesystem
+            .write_file("/project/script.ts", "const value = 1;")
+            .unwrap();
+        for (text, expected_code, expected_kind, target) in [
+            (
+                "import { value } from './script';",
+                "M00.EXTERNAL_MODULE_TARGET",
+                "external_module_target_unsupported",
+                Some("/project/script.ts"),
+            ),
+            (
+                "import type { value } from './script' with { 'resolution-mode': 'invalid' };",
+                "M00.SPECIFIER_RESOLUTION_MODE",
+                "module_specifier_resolution_mode_unsupported",
+                None,
+            ),
+        ] {
+            filesystem.write_file("/project/main.ts", text).unwrap();
+            let roots = ["/project/main.ts".to_owned()];
+            let first = Program::new_with_options(&filesystem, "/", &roots, graph_options());
+            let second = Program::new_with_options(&filesystem, "/", &roots, graph_options());
+            assert!(first.options().no_check);
+            assert_ne!(
+                first.project_graph_snapshot().module_resolution_manifest,
+                second.project_graph_snapshot().module_resolution_manifest,
+            );
+            let first_report = snapshot_report(&first);
+            let second_report = snapshot_report(&second);
+            assert_eq!(first_report, second_report);
+
+            let ProjectStage::Unsupported { code, detail } =
+                &first_report.module_resolution_manifest
+            else {
+                panic!("expected an unsupported manifest: {first_report:?}");
+            };
+            assert_eq!(code, expected_code);
+            let start = text.find("'./script'").unwrap();
+            let mut expected = json!({
+                "kind": expected_kind,
+                "location": {
+                    "containingFile": "/project/main.ts",
+                    "range": {"startByte": start, "endByte": start + "'./script'".len()},
+                },
+            });
+            if let Some(target) = target {
+                expected["targetFile"] = json!(target);
+            }
+            assert_eq!(serde_json::from_str::<Value>(detail).unwrap(), expected);
+        }
     }
 }
