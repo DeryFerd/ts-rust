@@ -889,15 +889,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 expected_flags |= original.flags.without(SymbolFlags::TRANSIENT);
             }
         }
+        let actual = declarations.iter().copied().collect::<HashSet<_>>();
         !expected.is_empty()
-            && expected.len() == declarations.len()
+            && actual.len() == declarations.len()
+            && actual == expected
             && self.symbol(symbol).is_some_and(|record| {
                 record.flags().without(SymbolFlags::TRANSIENT) == expected_flags
             })
-            && declarations.iter().all(|declaration| {
-                expected.contains(declaration)
-                    && self.source_declaration_belongs_to_symbol(*declaration, symbol)
-            })
+            && declarations
+                .iter()
+                .all(|declaration| self.source_declaration_belongs_to_symbol(*declaration, symbol))
     }
 
     /// Parses and copies one exact standalone `Identifier | QualifiedName`

@@ -24671,6 +24671,77 @@ mod generic_publication_tests {
     }
 
     #[test]
+    fn date_unions_reject_duplicate_constructor_declarations_without_writes() {
+        let library = parse_source_file(DATE_UNION_LIBRARY);
+        let augmentation = parse_source_file(concat!(
+            "interface Date { toJSON(key?: any): string; } ",
+            "interface DateConstructor { new(value: string): Date; }",
+        ));
+        for warm in [false, true] {
+            let mut fixture = date_union_fixture(&library, &augmentation, true);
+            let store = fixture.context.store_mut_for_test();
+            let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+            let constructor = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .and_then(|globals| globals.get_source("DateConstructor"))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let declarations = store
+                .symbol(constructor)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            assert_eq!(declarations.len(), 2);
+            assert_ne!(declarations[0], declarations[1]);
+            let cached = warm.then(|| {
+                store
+                    .expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal)
+                    .unwrap()
+            });
+            assert!(store.set_symbol_declarations(
+                constructor,
+                Some(vec![declarations[0], declarations[0]]),
+                None,
+            ));
+            let before = (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths(),
+            );
+            assert!(!store.source_merged_symbol_declarations_match(constructor));
+            assert!(matches!(
+                validate_resolved_declared_property_type_graph(store, fixture.type_),
+                DeclaredPropertyTypeGraphValidation::Malformed,
+            ));
+            assert!(
+                store
+                    .expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal)
+                    .is_err()
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before
+            );
+            assert!(store.set_symbol_declarations(constructor, Some(declarations), None));
+            let restored = store
+                .expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal)
+                .unwrap();
+            if let Some(cached) = cached {
+                assert_eq!(restored, cached);
+            }
+        }
+    }
+
+    #[test]
     fn date_unions_reject_nonlibrary_owners_and_late_file_reclassification() {
         let library = parse_source_file(DATE_UNION_LIBRARY);
         let augmentation = parse_source_file(DATE_UNION_AUGMENTATION);
