@@ -1099,6 +1099,35 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         .get_declared_type_of_symbol(symbol)
     }
 
+    /// Returns a declared module's value type without checking its exports.
+    ///
+    /// Pure modules retain one anonymous identity. Namespace-only declarations
+    /// return the canonical error type, as in the upstream value-symbol query.
+    /// Source-file modules and bodyless ambient modules are not supported here.
+    ///
+    /// # Errors
+    ///
+    /// Rejects foreign declarations, changed caches, and modules merged with
+    /// class, function, or enum values that require another value provider.
+    pub fn get_type_of_module_value(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<TypeId, SourceCheckError> {
+        let Self {
+            options,
+            files,
+            store,
+            ..
+        } = self;
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?;
+        super::source_namespaces::get_type_of_module_value(store, &host, symbol)
+    }
+
     /// Installs or validates the exact instance and static identities for one
     /// local nongeneric class declaration.
     ///

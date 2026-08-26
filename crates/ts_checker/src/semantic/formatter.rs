@@ -1766,6 +1766,29 @@ fn display_validated_module_namespace(
     let TypeData::Object(object) = record.data() else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     };
+    if let Some(&declaration) = owner_record.declarations().and_then(|nodes| nodes.first())
+        && let Some(NodeData::ModuleDeclaration(module)) =
+            host.node(declaration).map(|node| &node.data)
+    {
+        super::source_namespaces::validate_module_value_identity(store, host, type_id)
+            .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+        let name = NodeRef::new(declaration.arena, declaration.file, module.name);
+        let name = match host.node(name).map(|node| &node.data) {
+            Some(NodeData::Identifier(identifier))
+                if module.keyword == SyntaxKind::GlobalKeyword =>
+            {
+                identifier.text.clone()
+            }
+            Some(NodeData::Identifier(_)) => namespace_qualified_alias_name(store, host, owner)
+                .map_err(|()| TypeDisplayUnavailable::MalformedType(type_id))?,
+            Some(NodeData::StringLiteral(literal)) => {
+                format!("import({})", quote_string_literal(&literal.text, '"'))
+            }
+            _ => return Err(TypeDisplayUnavailable::MalformedType(type_id)),
+        };
+        state.add(name.len().saturating_add(7));
+        return Ok(Some(format!("typeof {name}")));
+    }
     let [declaration] = owner_record.declarations().unwrap_or_default() else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     };

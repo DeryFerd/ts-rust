@@ -52,6 +52,7 @@ use super::{
     source_callables::{
         SourceCallableTypeParameterSyntaxProof, source_type_parameter_default_is_assignable,
     },
+    source_namespaces::ModuleValueIdentity,
     type_nodes::UnionAliasInstantiationProof,
     type_records::{
         CacheHashKey, ConditionalRoot, ConstrainedTypeData, LiteralValue, TypeAlias,
@@ -517,6 +518,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_callable_types_by_signature: HashMap<SignatureId, TypeId>,
     source_callable_type_parameters:
         HashMap<SignatureId, Box<[SourceCallableTypeParameterProvenance]>>,
+    module_value_identities: HashMap<SemanticSymbolId, ModuleValueIdentity>,
     source_overload_provenance: HashMap<TypeId, SourceOverloadProvenance>,
     source_overload_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_overload_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
@@ -643,6 +645,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_types_by_owner: HashMap::new(),
             source_callable_types_by_signature: HashMap::new(),
             source_callable_type_parameters: HashMap::new(),
+            module_value_identities: HashMap::new(),
             source_overload_provenance: HashMap::new(),
             source_overload_types_by_declaration: HashMap::new(),
             source_overload_types_by_owner: HashMap::new(),
@@ -2728,6 +2731,31 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.canonical_union_creations.get(&type_)
     }
 
+    pub(super) fn module_value_identity(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&ModuleValueIdentity> {
+        self.module_value_identities.get(&symbol)
+    }
+
+    pub(super) fn try_reserve_module_value_identities(&mut self, additional: usize) -> bool {
+        self.module_value_identities.try_reserve(additional).is_ok()
+    }
+
+    pub(super) fn record_module_value_identity(&mut self, identity: ModuleValueIdentity) -> bool {
+        if self.symbol(identity.symbol()).is_none() || self.type_payload(identity.type_()).is_none()
+        {
+            return false;
+        }
+        match self.module_value_identities.entry(identity.symbol()) {
+            std::collections::hash_map::Entry::Occupied(existing) => existing.get() == &identity,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(identity);
+                true
+            }
+        }
+    }
+
     pub(super) fn record_canonical_union_creation(
         &mut self,
         proof: CanonicalUnionCreationProof,
@@ -4330,6 +4358,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 })
         });
         self.links.value_symbol.replace_key(symbol, links);
+        if let Some(type_) = published_type
+            && let Some(identity) = self.module_value_identities.get_mut(&symbol)
+            && identity.type_() == type_
+        {
+            identity.mark_published();
+        }
         if changed {
             self.invalidate_inferred_return_cycles_for_symbol(symbol, published_type);
         }

@@ -215,16 +215,6 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
-        if supports_type_location(&self.validated_artifact_node(node)?.2.data)
-            && let Some(type_) = self.cached_artifact_type(node)?
-        {
-            return Ok(type_);
-        }
-
-        if let Some((type_, _)) = self.heritage_artifact_target(node)? {
-            return self.validate_artifact_type(node, type_);
-        }
-
         let (kind, is_type_node, parent) = {
             let (arena, bound, record) = self.validated_artifact_node(node)?;
             (
@@ -235,9 +225,19 @@ impl CanonicalCheckerContext<'_> {
         };
 
         if let Some(LocationParent::Declaration(declaration)) = parent
-            && let Some(type_) = self.global_augmentation_artifact_type(node, declaration)?
+            && let Some(type_) = self.module_declaration_artifact_type(node, declaration)?
         {
             return Ok(type_);
+        }
+
+        if supports_type_location(&self.validated_artifact_node(node)?.2.data)
+            && let Some(type_) = self.cached_artifact_type(node)?
+        {
+            return Ok(type_);
+        }
+
+        if let Some((type_, _)) = self.heritage_artifact_target(node)? {
+            return self.validate_artifact_type(node, type_);
         }
 
         if is_type_node {
@@ -1160,8 +1160,8 @@ impl CanonicalCheckerContext<'_> {
             .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })
     }
 
-    fn global_augmentation_artifact_type(
-        &self,
+    fn module_declaration_artifact_type(
+        &mut self,
         node: NodeRef,
         declaration: NodeRef,
     ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
@@ -1169,7 +1169,7 @@ impl CanonicalCheckerContext<'_> {
         let NodeData::ModuleDeclaration(module) = &record.data else {
             return Ok(None);
         };
-        if module.keyword != SyntaxKind::GlobalKeyword || module.name != node.node {
+        if module.name != node.node || module.body.is_none() {
             return Ok(None);
         }
         let Some(symbol) = bound.symbol(declaration) else {
@@ -1180,16 +1180,16 @@ impl CanonicalCheckerContext<'_> {
             .store()
             .symbol(symbol)
             .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?;
-        if record.name() != InternalSymbolName::Global.as_ref() {
+        if module.keyword == SyntaxKind::GlobalKeyword
+            && record.name() != InternalSymbolName::Global.as_ref()
+        {
             return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
         }
-        if record.flags().intersects(SymbolFlags::VALUE_MODULE) {
+        if !super::source_namespaces::has_pure_module_flags(record.flags()) {
             return Ok(None);
         }
-        self.store()
-            .intrinsic_bootstrap()
-            .map(|bootstrap| self.validate_artifact_type(node, bootstrap.error_type))
-            .transpose()
+        let type_ = self.get_type_of_module_value(symbol)?;
+        self.validate_artifact_type(node, type_).map(Some)
     }
 
     fn shorthand_artifact_symbol(
@@ -1832,6 +1832,20 @@ impl CanonicalCheckerContext<'_> {
             .map(|record| (record.flags(), record.export_symbol()))
             .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?;
 
+        if super::source_namespaces::has_pure_module_flags(flags)
+            && let Some(declaration) = self
+                .store()
+                .symbol(symbol)
+                .and_then(|record| record.declarations())
+                .and_then(|declarations| declarations.first())
+                .copied()
+            && matches!(&self.validated_artifact_node(declaration)?.2.data,
+                NodeData::ModuleDeclaration(module) if module.body.is_some())
+        {
+            let type_ = self.get_type_of_module_value(symbol)?;
+            return self.validate_artifact_type(node, type_).map(Some);
+        }
+
         if let Some(type_) = self
             .store()
             .value_symbol_links(symbol)
@@ -2306,6 +2320,7 @@ mod tests {
         CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
         CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, IntrinsicBootstrapOptions,
         ModuleSymbolLinks, SymbolNodeLinks, TypeData, TypeNodeLinks, ValueSymbolLinks,
+        types::ObjectFlags,
     };
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -3762,10 +3777,10 @@ mod tests {
     }
 
     #[test]
-    fn global_augmentation_value_names_do_not_fabricate_any_types() {
+    fn global_augmentation_value_queries_keep_identity_without_resolving_exports() {
         let parsed = parse_source_file(concat!(
             "export {};\n",
-            "declare global { var marker: 'ready'; }\n",
+            "declare global { var marker: 'ready'; var unrelated: Missing; }\n",
         ));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(6_062);
@@ -3815,18 +3830,42 @@ mod tests {
                 .contains(SymbolFlags::VALUE_MODULE)
         );
 
+        let before_types = context.store().type_len();
+        let before_diagnostics = context.diagnostics().len();
+        let type_ = context.get_type_at_location(name).unwrap();
+        assert_eq!(context.store().type_len(), before_types + 1);
+        let record = context.store().type_payload(type_).unwrap();
+        assert_eq!(record.symbol(), Some(symbol));
+        assert_eq!(record.object_flags(), ObjectFlags::ANONYMOUS);
+        assert_ne!(type_, context.global_types().global_this_value_type);
+        assert_eq!(context.type_to_string(type_).unwrap(), "typeof global");
         for _ in 0..2 {
             assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(symbol));
-            assert_eq!(
-                context.get_type_at_location(name),
-                Err(CanonicalArtifactQueryError::MissingType {
-                    node: name,
-                    kind: SyntaxKind::Identifier,
-                })
-            );
+            assert_eq!(context.get_type_at_location(name).unwrap(), type_);
+            assert_eq!(context.get_type_at_location(declaration).unwrap(), type_);
+            assert_eq!(context.get_type_of_module_value(symbol).unwrap(), type_);
+            assert_eq!(context.store().type_len(), before_types + 1);
             assert!(context.store().type_node_links(name).is_none());
-            assert!(context.store().value_symbol_links(symbol).is_none());
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(type_)
+            );
         }
+        for (node, record) in parsed.arena.iter() {
+            let NodeData::VariableDeclaration(variable) = &record.data else {
+                continue;
+            };
+            let declaration = NodeRef::new(parsed.arena.id(), file, node);
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let annotation = NodeRef::new(parsed.arena.id(), file, variable.type_.unwrap());
+            assert!(context.store().value_symbol_links(symbol).is_none());
+            assert!(context.store().type_node_links(annotation).is_none());
+        }
+        assert_eq!(context.diagnostics().len(), before_diagnostics);
     }
 
     #[test]
