@@ -88,6 +88,12 @@ struct SourceNodeFacts {
 }
 
 #[derive(Debug)]
+struct SourceSymbolDeclarations {
+    declarations: Box<[NodeRef]>,
+    value_declaration: Option<NodeRef>,
+}
+
+#[derive(Debug)]
 struct CachedSignatureEntry {
     type_arguments: Box<[TypeId]>,
     instantiated: SignatureId,
@@ -490,8 +496,11 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     conditional_query_productions: HashMap<ConditionalQueryKey, ConditionalQueryProduction>,
     entity_names: Vec<EntityNameNode>,
     source_files: BTreeMap<FileId, SourceFileRef>,
+    source_file_ranks: BTreeMap<FileId, usize>,
     source_files_by_arena: BTreeMap<NodeArenaId, SourceFileRef>,
     source_node_facts: BTreeMap<NodeArenaId, Vec<Option<SourceNodeFacts>>>,
+    source_symbol_declarations: HashMap<SemanticSymbolId, SourceSymbolDeclarations>,
+    source_declaration_owners: HashMap<NodeRef, Vec<SemanticSymbolId>>,
     type_alias_declared_type_owners: HashMap<TypeId, HashSet<SemanticSymbolId>>,
     merged_symbols: HashMap<SemanticSymbolId, SemanticSymbolId>,
     links: CheckerLinkStores,
@@ -581,6 +590,26 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     #[must_use]
     pub fn from_symbol_store(symbols: SymbolStore) -> Self {
         let id = symbols.id();
+        let mut source_symbol_declarations = HashMap::new();
+        let mut source_declaration_owners = HashMap::<NodeRef, Vec<SemanticSymbolId>>::new();
+        for (symbol, record) in symbols.symbols() {
+            let Some(declarations) = record.declarations() else {
+                continue;
+            };
+            for declaration in declarations {
+                source_declaration_owners
+                    .entry(*declaration)
+                    .or_default()
+                    .push(symbol);
+            }
+            source_symbol_declarations.insert(
+                symbol,
+                SourceSymbolDeclarations {
+                    declarations: declarations.into(),
+                    value_declaration: record.value_declaration(),
+                },
+            );
+        }
         Self {
             symbols,
             types: TypedArena::new(id),
@@ -594,8 +623,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             conditional_query_productions: HashMap::new(),
             entity_names: Vec::new(),
             source_files: BTreeMap::new(),
+            source_file_ranks: BTreeMap::new(),
             source_files_by_arena: BTreeMap::new(),
             source_node_facts: BTreeMap::new(),
+            source_symbol_declarations,
+            source_declaration_owners,
             type_alias_declared_type_owners: HashMap::new(),
             merged_symbols: HashMap::new(),
             links: CheckerLinkStores::default(),
@@ -756,10 +788,51 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.symbols.register_ast_scope(AstScope::new(file, arena)) {
             return None;
         }
+        let next_rank = self.source_files.len();
+        self.source_file_ranks.entry(file).or_insert(next_rank);
         self.source_files.insert(file, source);
         self.source_files_by_arena.insert(arena.id(), source);
         self.source_node_facts.insert(arena.id(), node_facts);
         Some(source)
+    }
+
+    /// Source registration follows the caller's Program order, not numeric file IDs.
+    #[must_use]
+    pub(super) fn source_file_rank(&self, file: FileId) -> Option<usize> {
+        self.source_file_ranks.get(&file).copied()
+    }
+
+    /// Checks immutable binder ownership, including canonical merged-symbol redirects.
+    #[must_use]
+    pub(super) fn source_declaration_belongs_to_symbol(
+        &self,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> bool {
+        self.source_node_fact(declaration).is_some()
+            && self
+                .source_declaration_owners
+                .get(&declaration)
+                .is_some_and(|owners| {
+                    owners
+                        .iter()
+                        .any(|owner| self.get_merged_symbol(*owner) == Some(symbol))
+                })
+    }
+
+    /// Checks declarations against the symbol graph adopted from the binder.
+    #[must_use]
+    pub(super) fn source_symbol_declarations_match(&self, symbol: SemanticSymbolId) -> bool {
+        let Some(source) = self.source_symbol_declarations.get(&symbol) else {
+            return false;
+        };
+        self.symbol(symbol).is_some_and(|record| {
+            record.declarations() == Some(source.declarations.as_ref())
+                && record.value_declaration() == source.value_declaration
+                && source.declarations.iter().all(|declaration| {
+                    self.source_declaration_belongs_to_symbol(*declaration, symbol)
+                })
+        })
     }
 
     /// Parses and copies one exact standalone `Identifier | QualifiedName`
@@ -9958,6 +10031,80 @@ mod tests {
             .find_map(|(id, node)| (node.kind == kind).then_some(id))
             .unwrap_or_else(|| panic!("parsed source must contain {kind:?}"));
         NodeRef::new(arena.id(), file, node)
+    }
+
+    #[test]
+    fn union_order_source_ownership_preserves_global_merges_and_rejects_module_borrows() {
+        let first = parse_source_file("interface Shared { first: string }");
+        let second = parse_source_file("interface Shared { second: number }");
+        let module = parse_source_file("export interface Shared { local: boolean }");
+        let files = [
+            (FileId::new(20), &first, CanonicalModuleState::Script),
+            (FileId::new(3), &second, CanonicalModuleState::Script),
+            (FileId::new(11), &module, CanonicalModuleState::External),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, state) in files {
+            assert!(parsed.diagnostics.is_empty());
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let declarations = files.map(|(file, parsed, _)| {
+            node_ref_of_kind(&parsed.arena, file, SyntaxKind::InterfaceDeclaration)
+        });
+        let symbols =
+            declarations.map(|node| binder.file(node.file).unwrap().symbol(node).unwrap());
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(file, parsed, _)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let merged = store.get_merged_symbol(symbols[0]).unwrap();
+        assert_eq!(store.get_merged_symbol(symbols[1]), Some(merged));
+        assert_ne!(store.get_merged_symbol(symbols[2]), Some(merged));
+        assert!(store.source_declaration_belongs_to_symbol(declarations[0], merged));
+        assert!(store.source_declaration_belongs_to_symbol(declarations[1], merged));
+        assert!(!store.source_declaration_belongs_to_symbol(declarations[2], merged));
+        assert!(store.source_declaration_belongs_to_symbol(declarations[2], symbols[2]));
+        assert!(store.set_symbol_declarations(merged, Some(vec![declarations[2]]), None));
+        assert!(!store.source_declaration_belongs_to_symbol(declarations[2], merged));
+        let fabricated = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::INTERFACE,
+                EscapedName::source("Shared"),
+            ))
+            .unwrap();
+        assert!(store.set_symbol_declarations(fabricated, Some(vec![declarations[0]]), None));
+        assert!(!store.source_declaration_belongs_to_symbol(declarations[0], fabricated));
+        for (file, parsed, _) in files.into_iter().rev() {
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some()
+            );
+        }
+        for (rank, (file, _, _)) in files.into_iter().enumerate() {
+            assert_eq!(store.source_file_rank(file), Some(rank));
+        }
     }
 
     struct GlobalInterfaceMethodFixture {
