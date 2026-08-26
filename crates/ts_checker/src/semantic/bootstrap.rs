@@ -1545,6 +1545,34 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(())
     }
 
+    /// Validates an anonymous union's exact cache identity without following its constituents.
+    /// The caller must validate each constituent independently.
+    pub(super) fn validate_canonical_union_metadata(
+        &self,
+        union: TypeId,
+        expected: &[TypeId],
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_union_structure(union)?;
+        let record = self
+            .type_payload(union)
+            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+        let TypeData::Union(data) = record.data() else {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        };
+        if record.alias().is_some()
+            || data.origin.is_some()
+            || data.union.types != expected
+            || self
+                .intrinsic_bootstrap
+                .as_ref()
+                .and_then(|bootstrap| bootstrap.cached_union_type(expected))
+                != Some(union)
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_union_constituent(
         &self,
         type_: TypeId,

@@ -13022,6 +13022,56 @@ fn validate_resolved_call_signature(
     Some(signature)
 }
 
+/// Returns the callable and value identities of one declared method.
+/// The caller must validate the returned callable's signatures and owner graph.
+pub(super) fn declared_method_value_types(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> Option<(TypeId, TypeId)> {
+    let method = store.symbol(symbol)?;
+    if !method.flags().contains(SymbolFlags::METHOD) {
+        return None;
+    }
+    let links = store.value_symbol_links(symbol)?;
+    let value = links.resolved_type?;
+    if links
+        != &(ValueSymbolLinks {
+            resolved_type: Some(value),
+            ..ValueSymbolLinks::default()
+        })
+    {
+        return None;
+    }
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let callable =
+        if bootstrap.options.strict_null_checks && method.flags().contains(SymbolFlags::OPTIONAL) {
+            let TypeData::Union(union) = store.type_payload(value)?.data() else {
+                return None;
+            };
+            let sentinel = bootstrap.undefined_or_missing_type;
+            let [first, second] = union.union.types.as_slice() else {
+                return None;
+            };
+            let callable = match (*first == sentinel, *second == sentinel) {
+                (true, false) => *second,
+                (false, true) => *first,
+                _ => return None,
+            };
+            let mut expected = [callable, sentinel];
+            expected.sort_unstable();
+            store
+                .validate_canonical_union_metadata(value, &expected)
+                .ok()?;
+            store.validate_union_constituent(sentinel).ok()?;
+            callable
+        } else {
+            value
+        };
+    let record = store.type_payload(callable)?;
+    (record.symbol() == Some(symbol) && matches!(record.data(), TypeData::Object(_)))
+        .then_some((callable, value))
+}
+
 fn resolved_interface_method_value(
     store: &CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
@@ -13030,7 +13080,7 @@ fn resolved_interface_method_value(
     let method_record = store.symbol(symbol)?;
     let declarations = method_record.declarations()?;
     let links = store.value_symbol_links(symbol)?;
-    let type_ = links.resolved_type?;
+    let (type_, value) = declared_method_value_types(store, symbol)?;
     let record = store.type_payload(type_)?;
     let TypeData::Object(object) = record.data() else {
         return None;
@@ -13043,7 +13093,7 @@ fn resolved_interface_method_value(
         || store.get_parent_of_symbol(symbol) != Some(plan.symbol)
         || links
             != &(ValueSymbolLinks {
-                resolved_type: Some(type_),
+                resolved_type: Some(value),
                 ..ValueSymbolLinks::default()
             })
         || record.flags() != TypeFlags::OBJECT
@@ -13138,7 +13188,7 @@ fn resolved_interface_method_value(
             }
         }
     }
-    Some(type_)
+    Some(value)
 }
 
 fn resolved_interface_method_type_parameters(
@@ -13343,8 +13393,11 @@ pub(super) fn publish_interface_method_values(
             else {
                 return Err(invalid_cache(plan, owner_type));
             };
+            let callable = declared_method_value_types(store, group.symbol)
+                .map(|(callable, _)| callable)
+                .ok_or_else(|| invalid_cache(plan, owner_type))?;
             let signatures = store
-                .type_payload(callable_type)
+                .type_payload(callable)
                 .and_then(|record| record.data().structured())
                 .and_then(|structured| structured.signatures.as_deref())
                 .ok_or_else(|| invalid_cache(plan, owner_type))?;
@@ -20254,6 +20307,90 @@ mod generic_publication_tests {
                 ),
                 before,
             );
+        }
+    }
+
+    #[test]
+    fn canonical_optional_method_union_metadata_rejects_unregistered_or_wrong_members() {
+        let mut fixture = interface_fixture("interface I {}", 3_930);
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let mut expected = [bootstrap.string_type, bootstrap.number_type];
+        expected.sort_unstable();
+        let union = fixture.store.literal_union_type(&expected, None).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .validate_canonical_union_metadata(union, &expected),
+            Ok(())
+        );
+        let mut reversed = expected;
+        reversed.reverse();
+        assert!(
+            fixture
+                .store
+                .validate_canonical_union_metadata(union, &reversed)
+                .is_err()
+        );
+        let flags = fixture.store.type_payload(union).unwrap().object_flags();
+        let unregistered = fixture
+            .store
+            .alloc_union_type(flags, expected.to_vec())
+            .unwrap();
+        assert_ne!(unregistered, union);
+        assert!(
+            fixture
+                .store
+                .validate_canonical_union_metadata(unregistered, &expected)
+                .is_err()
+        );
+        let wrong = [
+            expected[0],
+            fixture.store.intrinsic_bootstrap().unwrap().undefined_type,
+        ];
+        assert!(
+            fixture
+                .store
+                .validate_canonical_union_metadata(union, &wrong)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn strict_optional_method_value_rejects_a_bare_callable_cache() {
+        for exact_optional_property_types in [false, true] {
+            let mut fixture = interface_fixture_with_bootstrap(
+                "interface I { maybe?(): void; }",
+                3_931,
+                CanonicalModuleState::Script,
+                IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types,
+                },
+            );
+            let method = fixture
+                .store
+                .symbol(fixture.symbol)
+                .unwrap()
+                .members()
+                .and_then(|members| fixture.store.symbol_table(members))
+                .and_then(|members| members.get_source("maybe"))
+                .unwrap();
+            assert_eq!(
+                fixture.store.symbol(method).unwrap().flags(),
+                SymbolFlags::METHOD | SymbolFlags::OPTIONAL
+            );
+            let bare = fixture
+                .store
+                .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+                .unwrap();
+            assert!(fixture.store.set_value_symbol_links(
+                method,
+                ValueSymbolLinks {
+                    resolved_type: Some(bare),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            assert_eq!(declared_method_value_types(&fixture.store, method), None);
         }
     }
 
