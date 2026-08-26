@@ -636,11 +636,13 @@ pub(super) fn published_method_requires_instantiation(
             })
             .chain(std::iter::once(Ok(return_type)));
         for type_ in types {
-            requires |= member_type_requires_instantiation(
+            requires |= member_type_requires_instantiation_worker(
                 store,
                 type_?,
                 &parameters,
                 Some(CanonicalArrayTargets::from_global_types(global_types)),
+                &mut HashSet::new(),
+                true,
             )?;
         }
     }
@@ -1531,6 +1533,21 @@ fn function_member_signature(
     store: &CanonicalTypeMapperStore,
     source: TypeId,
 ) -> Option<(SemanticSymbolId, PublishedInterfaceMethodSignature)> {
+    let (symbol, signature, parameter_types) = function_member_parameters(store, source)?;
+    Some((
+        symbol,
+        PublishedInterfaceMethodSignature {
+            source: signature,
+            parameter_types,
+            return_type: store.signature(signature)?.resolved_return_type()?,
+        },
+    ))
+}
+
+fn function_member_parameters(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+) -> Option<(SemanticSymbolId, SignatureId, Vec<TypeId>)> {
     if !matches!(
         validate_stored_function_type(store, source),
         StoredFunctionTypeValidation::Valid(_)
@@ -1551,14 +1568,7 @@ fn function_member_signature(
     {
         return None;
     }
-    Some((
-        record.symbol()?,
-        PublishedInterfaceMethodSignature {
-            source: *signature,
-            parameter_types: parameter_types.to_vec(),
-            return_type: signature_record.resolved_return_type()?,
-        },
-    ))
+    Some((record.symbol()?, *signature, parameter_types.to_vec()))
 }
 
 /// The installed function-type mapping covers direct global Array method parameters.
@@ -2732,6 +2742,7 @@ fn member_type_requires_instantiation(
         mapper_parameters,
         array_targets,
         &mut HashSet::new(),
+        false,
     )
 }
 
@@ -2741,6 +2752,7 @@ fn member_type_requires_instantiation_worker(
     mapper_parameters: &[TypeId],
     array_targets: Option<CanonicalArrayTargets>,
     active: &mut HashSet<TypeId>,
+    classify_only: bool,
 ) -> Result<bool, GenericInterfaceMemberError> {
     if !active.insert(type_) {
         return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_));
@@ -2751,39 +2763,87 @@ fn member_type_requires_instantiation_worker(
         mapper_parameters,
         array_targets,
         active,
+        classify_only,
     );
     active.remove(&type_);
     result
 }
 
+#[allow(clippy::too_many_lines)] // Keep fixed tuple reuse and callback parameter checks in one walk.
 fn member_type_requires_instantiation_inner(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     mapper_parameters: &[TypeId],
     array_targets: Option<CanonicalArrayTargets>,
     active: &mut HashSet<TypeId>,
+    classify_only: bool,
 ) -> Result<bool, GenericInterfaceMemberError> {
+    // Closed tuple signatures can be reused. Mapping tuples still requires a separate preflight.
+    if classify_only {
+        if let Some(tuple) = store
+            .canonical_tuple_shape(type_)
+            .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?
+        {
+            let mut requires = false;
+            for &element in tuple.element_types() {
+                requires |= member_type_requires_instantiation_worker(
+                    store,
+                    element,
+                    mapper_parameters,
+                    array_targets,
+                    active,
+                    true,
+                )?;
+            }
+            return Ok(requires);
+        }
+        if let Some(targets) = array_targets
+            && let Some(array) = store
+                .canonical_array_reference_with_targets(targets, type_)
+                .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?
+        {
+            return member_type_requires_instantiation_worker(
+                store,
+                array.element_type,
+                mapper_parameters,
+                array_targets,
+                active,
+                true,
+            );
+        }
+    }
     if store.type_has_function_type_provenance(type_) {
-        let (_, function) = function_member_signature(store, type_)
+        let (_, signature, parameters) = function_member_parameters(store, type_)
             .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(type_))?;
+        let return_type = store
+            .signature(signature)
+            .and_then(super::signatures::Signature::resolved_return_type);
+        let fixed_pending_return = classify_only
+            && store
+                .function_signature_return_annotation(signature)
+                .is_some_and(|(annotation, jsdoc)| {
+                    !jsdoc
+                        && store
+                            .source_node_kind(annotation)
+                            .is_some_and(SyntaxKind::is_keyword_type)
+                });
+        if return_type.is_none() && !fixed_pending_return {
+            return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_));
+        }
         let narrowed = store
-            .signature(function.source)
+            .signature(signature)
             .and_then(super::signatures::Signature::resolved_type_predicate)
             .and_then(|predicate| store.type_predicate(predicate))
             .and_then(super::signatures::TypePredicate::type_id);
         let mut requires = false;
-        for type_ in function
-            .parameter_types
-            .into_iter()
-            .chain([function.return_type])
-            .chain(narrowed)
-        {
+        for type_ in parameters.into_iter().chain(return_type).chain(narrowed) {
             requires |= member_type_requires_instantiation_worker(
                 store,
                 type_,
                 mapper_parameters,
                 array_targets,
                 active,
+                classify_only,
             )?;
         }
         return Ok(requires);
@@ -2801,6 +2861,7 @@ fn member_type_requires_instantiation_inner(
             mapper_parameters,
             array_targets,
             active,
+            classify_only,
         )?;
         member_type_requires_instantiation_worker(
             store,
@@ -2808,6 +2869,7 @@ fn member_type_requires_instantiation_inner(
             mapper_parameters,
             array_targets,
             active,
+            classify_only,
         )?;
         return Ok(true);
     }
