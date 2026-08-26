@@ -7879,12 +7879,15 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             .get(&type_)
             .copied()
     }
+}
 
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     /// Publishes one or two source-planned direct-base edges exactly once.
     ///
     /// Callers reserve the map slot before beginning their semantic transaction.
     /// Every declared-type link is authoritative by the time heritage members
-    /// resolve. A second base must be a distinct, resolved, nongeneric
+    /// resolve. The first base may be a canonical reference to its declared
+    /// interface. A second base must be a distinct, resolved, nongeneric
     /// property-only interface.
     pub(super) fn publish_direct_interface_heritage_provenance(
         &mut self,
@@ -7899,16 +7902,22 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             && self
                 .declared_type_links(provenance.owner_symbol)
                 .is_some_and(|links| links.declared_type == Some(type_));
-        let base_is_exact = self
-            .type_payload(provenance.base_type)
-            .is_some_and(|record| {
-                matches!(record.data(), TypeData::Interface(_))
-                    && record.symbol() == Some(provenance.base_symbol)
-            })
-            && self.get_merged_symbol(provenance.base_symbol) == Some(provenance.base_symbol)
+        let base_is_exact = self.get_merged_symbol(provenance.base_symbol)
+            == Some(provenance.base_symbol)
             && self
                 .declared_type_links(provenance.base_symbol)
-                .is_some_and(|links| links.declared_type == Some(provenance.base_type));
+                .and_then(|links| links.declared_type)
+                .is_some_and(|target| {
+                    self.type_payload(target).is_some_and(|record| {
+                        matches!(record.data(), TypeData::Interface(_))
+                            && record.symbol() == Some(provenance.base_symbol)
+                    }) && (target == provenance.base_type
+                        || super::reference_types::validate_direct_generic_reference(
+                            self,
+                            provenance.base_type,
+                        )
+                        .is_ok_and(|reference| reference.target == target))
+                });
         let second_base_is_exact = provenance
             .second_base
             .is_none_or(|(base_symbol, base_type)| {
@@ -7973,7 +7982,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         }
         true
     }
+}
 
+impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     pub(super) fn try_reserve_direct_class_heritage_provenance(
         &mut self,
         additional: usize,

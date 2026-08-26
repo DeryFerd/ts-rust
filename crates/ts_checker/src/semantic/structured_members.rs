@@ -2500,6 +2500,146 @@ mod tests {
         );
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)] // Every forged edge must preserve the same unpublished state.
+    fn concrete_base_provenance_authenticates_reference_cache_and_target() {
+        for corruption in [
+            "none",
+            "wrong-owner",
+            "wrong-target",
+            "wrong-arguments",
+            "uncached-reference",
+            "sibling-cache",
+        ] {
+            let mut fixture = fixture_with_source(
+                concat!(
+                    "interface Base<T> { value: T } ",
+                    "interface Other<T> { value: T } ",
+                    "interface Derived extends Base<number> {}",
+                ),
+                862,
+            );
+            let base = interface_symbol(&fixture, "Base");
+            let other = interface_symbol(&fixture, "Other");
+            let derived = interface_symbol(&fixture, "Derived");
+            let host = host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let [base_type, other_type, derived_type] = [base, other, derived].map(|symbol| {
+                get_declared_class_interface_or_type_parameter(
+                    &mut fixture.store,
+                    &host,
+                    symbol,
+                    SymbolFlags::INTERFACE,
+                )
+                .unwrap()
+                .unwrap()
+            });
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let (number, string) = (bootstrap.number_type, bootstrap.string_type);
+            let reference = fixture
+                .store
+                .create_direct_generic_reference_type(base_type, &[number])
+                .unwrap();
+            let sibling = fixture
+                .store
+                .create_direct_generic_reference_type(base_type, &[string])
+                .unwrap();
+            let mut provenance = DirectInterfaceHeritageProvenance {
+                owner_symbol: derived,
+                base_symbol: base,
+                base_type: reference,
+                second_base: None,
+            };
+            match corruption {
+                "none" => {}
+                "wrong-owner" => provenance.base_symbol = other,
+                "wrong-target" => assert!(fixture.store.set_object_target_and_mapper(
+                    reference,
+                    Some(other_type),
+                    None,
+                )),
+                "wrong-arguments" => assert!(fixture.store.set_type_reference_resolution(
+                    reference,
+                    None,
+                    Some(vec![string]),
+                )),
+                "uncached-reference" => {
+                    let uncached = fixture
+                        .store
+                        .alloc_type_reference(ObjectFlags::NONE, Some(base))
+                        .unwrap();
+                    assert!(fixture.store.set_object_target_and_mapper(
+                        uncached,
+                        Some(base_type),
+                        None,
+                    ));
+                    assert!(fixture.store.set_type_reference_resolution(
+                        uncached,
+                        None,
+                        Some(vec![number]),
+                    ));
+                    provenance.base_type = uncached;
+                }
+                "sibling-cache" => assert!(fixture.store.set_type_reference_resolution(
+                    sibling,
+                    None,
+                    Some(vec![number]),
+                )),
+                _ => unreachable!(),
+            }
+            assert!(
+                fixture
+                    .store
+                    .try_reserve_direct_interface_heritage_provenance(1)
+            );
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.relation_state_snapshot(),
+            );
+            let accepted = fixture
+                .store
+                .publish_direct_interface_heritage_provenance(derived_type, provenance);
+            assert_eq!(accepted, corruption == "none", "{corruption}");
+            assert_eq!(
+                fixture
+                    .store
+                    .direct_interface_heritage_provenance(derived_type),
+                accepted.then_some(provenance),
+                "{corruption}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.mapper_len(),
+                    fixture.store.symbol_store().symbol_table_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                    fixture.store.relation_state_snapshot(),
+                ),
+                before,
+                "{corruption}",
+            );
+            if accepted {
+                assert_ne!(reference, base_type);
+                assert!(
+                    !fixture
+                        .store
+                        .publish_direct_interface_heritage_provenance(derived_type, provenance,)
+                );
+                assert_eq!(
+                    fixture
+                        .store
+                        .direct_interface_heritage_provenance(derived_type),
+                    Some(provenance),
+                );
+            }
+        }
+    }
+
     fn prepare() -> PreparedFixture {
         prepare_fixture(fixture())
     }
