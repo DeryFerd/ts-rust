@@ -1,0 +1,537 @@
+package tsbaseline
+
+import (
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/microsoft/typescript-go/internal/ast"
+	"github.com/microsoft/typescript-go/internal/compiler"
+	"github.com/microsoft/typescript-go/internal/core"
+	upstreamjson "github.com/microsoft/typescript-go/internal/json"
+	"github.com/microsoft/typescript-go/internal/module"
+	"github.com/microsoft/typescript-go/internal/testutil/harnessutil"
+	"github.com/microsoft/typescript-go/internal/tsoptions"
+	"github.com/microsoft/typescript-go/internal/tspath"
+	"github.com/microsoft/typescript-go/internal/vfs"
+)
+
+type projectOracleRoot struct {
+	RequestedName string  `json:"requested_name"`
+	FileName      *string `json:"file_name"`
+}
+
+type projectOracleSource struct {
+	FileName             string `json:"file_name"`
+	RawFileName          string `json:"raw_file_name"`
+	SHA256               string `json:"sha256"`
+	Bytes                int    `json:"bytes"`
+	Declaration          bool   `json:"declaration"`
+	DefaultLibrary       bool   `json:"default_library"`
+	ExternalLibrary      bool   `json:"external_library"`
+	SkipTypeChecking     bool   `json:"skip_type_checking"`
+	PackageJSONDirectory string `json:"package_json_directory"`
+	PackageJSONType      string `json:"package_json_type"`
+	ImpliedNodeFormat    string `json:"implied_node_format"`
+	EmitModuleMode       string `json:"emit_module_mode"`
+}
+
+type projectOracleFileRead struct {
+	Path   string  `json:"path"`
+	Phase  string  `json:"phase"`
+	Found  bool    `json:"found"`
+	SHA256 *string `json:"sha256"`
+	Bytes  *int    `json:"bytes"`
+}
+
+type projectOracleConfigInput struct {
+	Path  string                  `json:"path"`
+	Role  string                  `json:"role"`
+	Reads []projectOracleFileRead `json:"reads"`
+}
+
+type projectOracleRealpath struct {
+	Path   string `json:"path"`
+	Result string `json:"result"`
+}
+
+type projectOracleLookup struct {
+	Path      string `json:"path"`
+	Operation string `json:"operation"`
+	Found     bool   `json:"found"`
+}
+
+type projectOraclePackage struct {
+	Name             string `json:"name"`
+	SubModuleName    string `json:"submodule_name"`
+	Version          string `json:"version"`
+	PeerDependencies string `json:"peer_dependencies"`
+}
+
+type projectOracleResolution struct {
+	Kind                       string                    `json:"kind"`
+	Source                     string                    `json:"source"`
+	Specifier                  string                    `json:"specifier"`
+	Start                      *int                      `json:"start"`
+	End                        *int                      `json:"end"`
+	RequestMode                string                    `json:"request_mode"`
+	Resolved                   bool                      `json:"resolved"`
+	ResolvedPath               *string                   `json:"resolved_path"`
+	OriginalPath               *string                   `json:"original_path"`
+	AlternateResult            *string                   `json:"alternate_result"`
+	Primary                    *bool                     `json:"primary"`
+	LoadedTarget               *string                   `json:"loaded_target"`
+	TargetMode                 *string                   `json:"target_mode"`
+	Extension                  *string                   `json:"extension"`
+	ExternalLibrary            bool                      `json:"external_library"`
+	ResolvedUsingTSExtension    bool                      `json:"resolved_using_ts_extension"`
+	Package                    *projectOraclePackage     `json:"package"`
+	Diagnostics                []projectOracleDiagnostic `json:"diagnostics"`
+}
+
+type projectOracleReference struct {
+	Kind      string   `json:"kind"`
+	Source    string   `json:"source"`
+	Specifier string   `json:"specifier"`
+	Start     int      `json:"start"`
+	End       int      `json:"end"`
+	Skipped   bool     `json:"skipped"`
+	Targets   []string `json:"targets"`
+}
+
+type projectOracleGraph struct {
+	ConfigPath       string                     `json:"config_path"`
+	CurrentDirectory string                     `json:"current_directory"`
+	CaseSensitive    bool                       `json:"case_sensitive"`
+	Roots            []projectOracleRoot        `json:"roots"`
+	Sources          []projectOracleSource      `json:"sources"`
+	ArtifactOrder    []string                   `json:"artifact_order"`
+	ConfigInputs     []projectOracleConfigInput `json:"config_inputs"`
+	FileReads        []projectOracleFileRead    `json:"file_reads"`
+	PackageJSONReads []projectOracleFileRead    `json:"package_json_reads"`
+	Lookups          []projectOracleLookup      `json:"lookups"`
+	Realpaths        []projectOracleRealpath    `json:"realpaths"`
+	SymlinkEntries   []string                   `json:"symlink_entries"`
+	Resolutions      []projectOracleResolution  `json:"resolutions"`
+	References       []projectOracleReference   `json:"references"`
+	CompilerOptions  json.RawMessage            `json:"compiler_options"`
+	EffectiveOptions map[string]any             `json:"effective_options"`
+	ProjectReferences json.RawMessage           `json:"project_references"`
+	MissingEvidence  []string                   `json:"missing_evidence"`
+}
+
+type projectOracleFS struct {
+	vfs.FS
+	mu              sync.Mutex
+	phase           string
+	reads           map[string]projectOracleFileRead
+	lookups         map[projectOracleLookup]struct{}
+	realpaths       map[projectOracleRealpath]struct{}
+	symlinks        map[string]struct{}
+	unknownSymlinks bool
+}
+
+func newProjectOracleFS(inner vfs.FS) *projectOracleFS {
+	return &projectOracleFS{
+		FS: inner, phase: "config", reads: map[string]projectOracleFileRead{},
+		lookups: map[projectOracleLookup]struct{}{}, realpaths: map[projectOracleRealpath]struct{}{}, symlinks: map[string]struct{}{},
+	}
+}
+
+func (fs *projectOracleFS) setPhase(phase string) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.phase = phase
+}
+
+func (fs *projectOracleFS) ReadFile(path string) (string, bool) {
+	content, found := fs.FS.ReadFile(path)
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	read := projectOracleFileRead{Path: projectOraclePath(path), Phase: fs.phase, Found: found}
+	if found {
+		read.SHA256 = projectOracleString(projectOracleHash([]byte(content)))
+		size := len(content)
+		read.Bytes = &size
+	}
+	key := path + "\x00" + fs.phase + "\x00missing"
+	if read.SHA256 != nil {
+		key = path + "\x00" + fs.phase + "\x00" + *read.SHA256
+	}
+	fs.reads[key] = read
+	return content, found
+}
+
+func (fs *projectOracleFS) FileExists(path string) bool {
+	found := fs.FS.FileExists(path)
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.lookups[projectOracleLookup{projectOraclePath(path), "file_exists", found}] = struct{}{}
+	return found
+}
+
+func (fs *projectOracleFS) DirectoryExists(path string) bool {
+	found := fs.FS.DirectoryExists(path)
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.lookups[projectOracleLookup{projectOraclePath(path), "directory_exists", found}] = struct{}{}
+	return found
+}
+
+func (fs *projectOracleFS) Realpath(path string) string {
+	result := fs.FS.Realpath(path)
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.realpaths[projectOracleRealpath{projectOraclePath(path), projectOraclePath(result)}] = struct{}{}
+	return result
+}
+
+func (fs *projectOracleFS) GetAccessibleEntries(path string) vfs.Entries {
+	entries := fs.FS.GetAccessibleEntries(path)
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if entries.Symlinks == nil {
+		fs.unknownSymlinks = true
+	}
+	for name := range entries.Symlinks {
+		fs.symlinks[projectOraclePath(tspath.CombinePaths(path, name))] = struct{}{}
+	}
+	return entries
+}
+
+func (*projectOracleFS) WriteFile(path, _ string) error {
+	return fmt.Errorf("project oracle denies writing compiler input %q", path)
+}
+
+func (*projectOracleFS) AppendFile(path, _ string) error {
+	return fmt.Errorf("project oracle denies appending compiler input %q", path)
+}
+
+func (*projectOracleFS) Remove(path string) error {
+	return fmt.Errorf("project oracle denies removing compiler input %q", path)
+}
+
+func (*projectOracleFS) Chtimes(path string, _, _ time.Time) error {
+	return fmt.Errorf("project oracle denies changing compiler input times %q", path)
+}
+
+func projectOraclePath(path string) string {
+	if name, ok := strings.CutPrefix(path, "bundled:///libs/"); ok {
+		return "/__typescript/lib/" + name
+	}
+	return path
+}
+
+func projectOracleArtifactFiles(program *compiler.Program) []*harnessutil.TestFile {
+	files := []*harnessutil.TestFile{}
+	seen := map[*ast.SourceFile]bool{}
+	appendFile := func(file *ast.SourceFile) {
+		if file == nil || seen[file] || program.IsSourceFileDefaultLibrary(file.Path()) {
+			return
+		}
+		seen[file] = true
+		files = append(files, &harnessutil.TestFile{UnitName: file.FileName(), Content: file.Text()})
+	}
+	for _, name := range program.CommandLine().FileNames() {
+		appendFile(program.GetSourceFile(name))
+	}
+	remaining := slices.Clone(program.SourceFiles())
+	slices.SortFunc(remaining, func(left, right *ast.SourceFile) int { return strings.Compare(left.FileName(), right.FileName()) })
+	for _, file := range remaining {
+		appendFile(file)
+	}
+	return files
+}
+
+func projectOracleUnloadedGraph(configPath string, fs *projectOracleFS) *projectOracleGraph {
+	graph := &projectOracleGraph{
+		ConfigPath: filepath.ToSlash(configPath), CurrentDirectory: filepath.ToSlash(filepath.Dir(configPath)),
+		CaseSensitive: fs.UseCaseSensitiveFileNames(), Roots: []projectOracleRoot{}, Sources: []projectOracleSource{},
+		ArtifactOrder: []string{}, ConfigInputs: []projectOracleConfigInput{}, FileReads: []projectOracleFileRead{},
+		PackageJSONReads: []projectOracleFileRead{}, Lookups: []projectOracleLookup{}, Realpaths: []projectOracleRealpath{},
+		SymlinkEntries: []string{}, Resolutions: []projectOracleResolution{}, References: []projectOracleReference{},
+		CompilerOptions: json.RawMessage("null"), EffectiveOptions: map[string]any{}, ProjectReferences: json.RawMessage("null"),
+		MissingEvidence: []string{},
+	}
+	projectOracleCopyReads(graph, fs)
+	graph.ConfigInputs = append(graph.ConfigInputs, projectOracleConfigRead(graph.ConfigPath, "selected", graph.FileReads))
+	return graph
+}
+
+func projectOracleSnapshotGraph(program *compiler.Program, fs *projectOracleFS, artifacts []*harnessutil.TestFile) *projectOracleGraph {
+	config := program.CommandLine()
+	graph := projectOracleUnloadedGraph(config.ConfigName(), fs)
+	graph.CurrentDirectory = program.GetCurrentDirectory()
+	graph.CompilerOptions = projectOracleUpstreamJSON(program.Options())
+	graph.EffectiveOptions = projectOracleEffectiveOptions(program.Options())
+	graph.ProjectReferences = projectOracleUpstreamJSON(config.ProjectReferences())
+	graph.MissingEvidence = append(graph.MissingEvidence,
+		"per-resolution failed lookup paths are not exposed by the pinned Program API",
+		"per-call module resolution order is not retained in the pinned resolution cache",
+		"source realpaths are recorded only when the normal compiler host calls Realpath",
+	)
+	for _, input := range config.ExtendedSourceFiles() {
+		graph.ConfigInputs = append(graph.ConfigInputs, projectOracleConfigRead(projectOraclePath(input), "extends", graph.FileReads))
+	}
+	for _, root := range config.FileNames() {
+		record := projectOracleRoot{RequestedName: projectOraclePath(root)}
+		if file := program.GetSourceFile(root); file != nil {
+			record.FileName = projectOracleString(projectOraclePath(file.FileName()))
+		}
+		graph.Roots = append(graph.Roots, record)
+	}
+	for _, file := range program.SourceFiles() {
+		meta := program.GetSourceFileMetaData(file.Path())
+		graph.Sources = append(graph.Sources, projectOracleSource{
+			FileName: projectOraclePath(file.FileName()), RawFileName: file.FileName(),
+			SHA256: projectOracleHash([]byte(file.Text())), Bytes: len(file.Text()), Declaration: file.IsDeclarationFile,
+			DefaultLibrary: program.IsSourceFileDefaultLibrary(file.Path()), ExternalLibrary: program.IsSourceFileFromExternalLibrary(file),
+			SkipTypeChecking: program.SkipTypeChecking(file, false), PackageJSONDirectory: projectOraclePath(meta.PackageJsonDirectory),
+			PackageJSONType: meta.PackageJsonType, ImpliedNodeFormat: projectOracleMode(meta.ImpliedNodeFormat),
+			EmitModuleMode: strings.ToLower(program.GetEmitModuleFormatOfFile(file).String()),
+		})
+		projectOracleSourceResolutions(graph, program, file)
+		projectOracleSourceReferences(graph, program, file)
+	}
+	for _, file := range artifacts {
+		graph.ArtifactOrder = append(graph.ArtifactOrder, projectOraclePath(file.UnitName))
+	}
+	projectOracleTypeResolutions(graph, program)
+	for _, input := range graph.ConfigInputs {
+		if len(input.Reads) == 0 {
+			graph.MissingEvidence = append(graph.MissingEvidence, "config input was not observed by ReadFile: "+input.Path)
+		}
+	}
+	return graph
+}
+
+func projectOracleCopyReads(graph *projectOracleGraph, fs *projectOracleFS) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	for _, read := range fs.reads {
+		graph.FileReads = append(graph.FileReads, read)
+	}
+	slices.SortFunc(graph.FileReads, func(left, right projectOracleFileRead) int {
+		if result := strings.Compare(left.Path, right.Path); result != 0 { return result }
+		if result := strings.Compare(left.Phase, right.Phase); result != 0 { return result }
+		if left.SHA256 == nil { if right.SHA256 == nil { return 0 }; return -1 }
+		if right.SHA256 == nil { return 1 }
+		return strings.Compare(*left.SHA256, *right.SHA256)
+	})
+	for _, read := range graph.FileReads {
+		if tspath.GetBaseFileName(read.Path) == "package.json" {
+			graph.PackageJSONReads = append(graph.PackageJSONReads, read)
+		}
+	}
+	for lookup := range fs.lookups { graph.Lookups = append(graph.Lookups, lookup) }
+	slices.SortFunc(graph.Lookups, func(left, right projectOracleLookup) int {
+		if result := strings.Compare(left.Path, right.Path); result != 0 { return result }
+		if result := strings.Compare(left.Operation, right.Operation); result != 0 { return result }
+		if left.Found == right.Found { return 0 }; if left.Found { return 1 }; return -1
+	})
+	for realpath := range fs.realpaths { graph.Realpaths = append(graph.Realpaths, realpath) }
+	slices.SortFunc(graph.Realpaths, func(left, right projectOracleRealpath) int {
+		if result := strings.Compare(left.Path, right.Path); result != 0 { return result }
+		return strings.Compare(left.Result, right.Result)
+	})
+	for link := range fs.symlinks { graph.SymlinkEntries = append(graph.SymlinkEntries, link) }
+	slices.Sort(graph.SymlinkEntries)
+	if fs.unknownSymlinks {
+		graph.MissingEvidence = append(graph.MissingEvidence, "some directory reads did not expose symlink membership")
+	}
+}
+
+func projectOracleConfigRead(path, role string, reads []projectOracleFileRead) projectOracleConfigInput {
+	result := projectOracleConfigInput{Path: path, Role: role, Reads: []projectOracleFileRead{}}
+	for _, read := range reads {
+		if read.Path == path { result.Reads = append(result.Reads, read) }
+	}
+	return result
+}
+
+func projectOracleSourceResolutions(graph *projectOracleGraph, program *compiler.Program, file *ast.SourceFile) {
+	appendUsage := func(kind string, specifier *ast.Node) {
+		if specifier == nil || specifier.Text() == "" { return }
+		mode := program.GetModeForUsageLocation(file, specifier)
+		record := projectOracleModuleResolution(program, kind, string(file.Path()), specifier.Text(), mode, program.GetResolvedModule(file, specifier.Text(), mode))
+		start, end := specifier.Pos(), specifier.End()
+		record.Start, record.End = &start, &end
+		graph.Resolutions = append(graph.Resolutions, record)
+	}
+	appendUsage("import_helpers", program.GetImportHelpersImportSpecifier(file.Path()))
+	_, jsx := program.GetJSXRuntimeImportSpecifier(file.Path())
+	appendUsage("jsx_runtime", jsx)
+	for _, specifier := range file.Imports() { appendUsage("module", specifier) }
+	for _, specifier := range file.ModuleAugmentations {
+		if specifier.Kind == ast.KindStringLiteral { appendUsage("module_augmentation", specifier) }
+	}
+}
+
+func projectOracleModuleResolution(program *compiler.Program, kind, source, specifier string, mode core.ResolutionMode, resolved *module.ResolvedModule) projectOracleResolution {
+	record := projectOracleResolution{
+		Kind: kind, Source: projectOraclePath(source), Specifier: specifier, RequestMode: projectOracleMode(mode),
+		Diagnostics: []projectOracleDiagnostic{},
+	}
+	if resolved == nil { return record }
+	record.Resolved = resolved.IsResolved()
+	record.ResolvedPath = projectOracleNonemptyPath(resolved.ResolvedFileName)
+	record.OriginalPath = projectOracleNonemptyPath(resolved.OriginalPath)
+	record.AlternateResult = projectOracleNonemptyPath(resolved.AlternateResult)
+	record.Extension = projectOracleNonempty(resolved.Extension)
+	record.ExternalLibrary = resolved.IsExternalLibraryImport
+	record.ResolvedUsingTSExtension = resolved.ResolvedUsingTsExtension
+	record.Package = projectOraclePackageID(resolved.PackageId)
+	record.Diagnostics = projectOracleDiagnostics(resolved.ResolutionDiagnostics)
+	projectOracleResolutionTarget(program, &record, resolved.ResolvedFileName)
+	return record
+}
+
+func projectOracleTypeResolutions(graph *projectOracleGraph, program *compiler.Program) {
+	records := []projectOracleResolution{}
+	program.ForEachResolvedTypeReferenceDirective(func(resolved *module.ResolvedTypeReferenceDirective, name string, mode core.ResolutionMode, path tspath.Path) {
+		kind := "type_reference"
+		if tspath.GetBaseFileName(string(path)) == module.InferredTypesContainingFile { kind = "automatic_type_directive" }
+		record := projectOracleResolution{Kind: kind, Source: projectOraclePath(string(path)), Specifier: name, RequestMode: projectOracleMode(mode), Diagnostics: []projectOracleDiagnostic{}}
+		if resolved != nil {
+			record.Resolved = resolved.IsResolved()
+			record.ResolvedPath = projectOracleNonemptyPath(resolved.ResolvedFileName)
+			record.OriginalPath = projectOracleNonemptyPath(resolved.OriginalPath)
+			primary := resolved.Primary
+			record.Primary = &primary
+			record.ExternalLibrary = resolved.IsExternalLibraryImport
+			record.Package = projectOraclePackageID(resolved.PackageId)
+			record.Diagnostics = projectOracleDiagnostics(resolved.ResolutionDiagnostics)
+			projectOracleResolutionTarget(program, &record, resolved.ResolvedFileName)
+		}
+		found := false
+		if file := program.GetSourceFileByPath(path); file != nil {
+			for _, ref := range file.TypeReferenceDirectives {
+				refMode := ref.ResolutionMode
+				if refMode == core.ResolutionModeNone { refMode = program.GetDefaultResolutionModeForFile(file) }
+				if ref.FileName == name && refMode == mode {
+					start, end := ref.Pos(), ref.End()
+					withRange := record
+					withRange.Start, withRange.End = &start, &end
+					records = append(records, withRange)
+					found = true
+				}
+			}
+		}
+		if !found { records = append(records, record) }
+	}, nil)
+	slices.SortFunc(records, func(left, right projectOracleResolution) int {
+		if result := strings.Compare(left.Source, right.Source); result != 0 { return result }
+		if result := strings.Compare(left.Specifier, right.Specifier); result != 0 { return result }
+		if result := strings.Compare(left.RequestMode, right.RequestMode); result != 0 { return result }
+		if left.Start == nil { if right.Start == nil { return 0 }; return -1 }
+		if right.Start == nil { return 1 }
+		if *left.Start < *right.Start { return -1 }
+		if *left.Start > *right.Start { return 1 }
+		return 0
+	})
+	graph.Resolutions = append(graph.Resolutions, records...)
+}
+
+func projectOracleResolutionTarget(program *compiler.Program, record *projectOracleResolution, path string) {
+	if path == "" { return }
+	if target := program.GetSourceFileForResolvedModule(path); target != nil {
+		record.LoadedTarget = projectOracleString(projectOraclePath(target.FileName()))
+		record.TargetMode = projectOracleString(strings.ToLower(program.GetEmitModuleFormatOfFile(target).String()))
+	}
+}
+
+func projectOraclePackageID(id module.PackageId) *projectOraclePackage {
+	if id == (module.PackageId{}) { return nil }
+	return &projectOraclePackage{Name: id.Name, SubModuleName: id.SubModuleName, Version: id.Version, PeerDependencies: id.PeerDependencies}
+}
+
+func projectOracleSourceReferences(graph *projectOracleGraph, program *compiler.Program, file *ast.SourceFile) {
+	for _, ref := range file.ReferencedFiles {
+		record := projectOracleReference{Kind: "path", Source: projectOraclePath(file.FileName()), Specifier: ref.FileName, Start: ref.Pos(), End: ref.End(), Skipped: program.Options().NoResolve.IsTrue(), Targets: []string{}}
+		if !record.Skipped {
+			if target := program.GetSourceFileFromReference(file, ref); target != nil { record.Targets = append(record.Targets, projectOraclePath(target.FileName())) }
+		}
+		graph.References = append(graph.References, record)
+	}
+	for _, ref := range file.LibReferenceDirectives {
+		record := projectOracleReference{Kind: "library", Source: projectOraclePath(file.FileName()), Specifier: ref.FileName, Start: ref.Pos(), End: ref.End(), Skipped: program.Options().NoLib.IsTrue(), Targets: []string{}}
+		if !record.Skipped {
+			if name, ok := tsoptions.GetLibFileName(ref.FileName); ok {
+				for _, target := range program.SourceFiles() {
+					if lib := program.GetDefaultLibFile(target.Path()); lib != nil && lib.Name == name { record.Targets = append(record.Targets, projectOraclePath(target.FileName())) }
+				}
+			}
+		}
+		graph.References = append(graph.References, record)
+	}
+}
+
+func projectOracleMode(mode core.ResolutionMode) string {
+	switch mode {
+	case core.ResolutionModeNone: return "default"
+	case core.ResolutionModeCommonJS: return "require"
+	case core.ResolutionModeESM: return "import"
+	default: panic(fmt.Sprintf("unexpected resolution mode %d", mode))
+	}
+}
+
+func projectOracleNonempty(value string) *string {
+	if value == "" { return nil }
+	return &value
+}
+
+func projectOracleNonemptyPath(path string) *string { return projectOracleNonempty(projectOraclePath(path)) }
+
+func projectOracleUpstreamJSON(value any) json.RawMessage {
+	data, err := upstreamjson.Marshal(value, upstreamjson.Deterministic(true))
+	if err != nil { panic(err) }
+	return json.RawMessage(data)
+}
+
+// Retain every declared option, then replace computed defaults with upstream getters.
+func projectOracleEffectiveOptions(options *core.CompilerOptions) map[string]any {
+	result := map[string]any{}
+	tsoptions.ForEachCompilerOptionValue(options, func(*tsoptions.CommandLineOption) bool { return true }, func(option *tsoptions.CommandLineOption, value reflect.Value, _ int) bool {
+		if tristate, ok := value.Interface().(core.Tristate); ok {
+			if tristate.IsUnknown() { result[option.Name] = nil } else { result[option.Name] = tristate.IsTrue() }
+		} else if enum := option.EnumMap(); enum != nil && value.CanInt() {
+			var name *string
+			for key, item := range enum.Entries() {
+				other := reflect.ValueOf(item)
+				if other.CanInt() && other.Int() == value.Int() { name = projectOracleString(key); break }
+			}
+			result[option.Name] = name
+		} else {
+			result[option.Name] = projectOracleUpstreamJSON(value.Interface())
+		}
+		return false
+	})
+	result["target"] = strings.ToLower(options.GetEmitScriptTarget().String())
+	result["module"] = strings.ToLower(options.GetEmitModuleKind().String())
+	result["moduleResolution"] = strings.ToLower(options.GetModuleResolutionKind().String())
+	result["moduleDetection"] = map[core.ModuleDetectionKind]string{core.ModuleDetectionKindLegacy: "legacy", core.ModuleDetectionKindAuto: "auto", core.ModuleDetectionKindForce: "force"}[options.GetEmitModuleDetectionKind()]
+	result["strict"] = options.Strict.IsTrueOrUnknown()
+	for name, value := range map[string]core.Tristate{
+		"strictNullChecks": options.StrictNullChecks, "strictFunctionTypes": options.StrictFunctionTypes,
+		"strictBindCallApply": options.StrictBindCallApply, "strictPropertyInitialization": options.StrictPropertyInitialization,
+		"strictBuiltinIteratorReturn": options.StrictBuiltinIteratorReturn, "noImplicitAny": options.NoImplicitAny,
+		"noImplicitThis": options.NoImplicitThis, "useUnknownInCatchVariables": options.UseUnknownInCatchVariables,
+	} { result[name] = options.GetStrictOptionValue(value) }
+	result["allowJs"] = options.GetAllowJS()
+	result["allowImportingTsExtensions"] = options.GetAllowImportingTsExtensions()
+	result["resolveJsonModule"] = options.GetResolveJsonModule()
+	result["resolvePackageJsonExports"] = options.GetResolvePackageJsonExports()
+	result["resolvePackageJsonImports"] = options.GetResolvePackageJsonImports()
+	result["isolatedModules"] = options.GetIsolatedModules()
+	result["preserveConstEnums"] = options.ShouldPreserveConstEnums()
+	result["incremental"] = options.IsIncremental()
+	result["useDefineForClassFields"] = options.GetUseDefineForClassFields()
+	result["declaration"] = options.GetEmitDeclarations()
+	result["declarationMap"] = options.GetAreDeclarationMapsEnabled()
+	return result
+}
