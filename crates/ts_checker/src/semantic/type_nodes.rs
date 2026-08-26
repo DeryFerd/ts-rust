@@ -9604,11 +9604,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         )
                     {
                         if initializer_type != Some(type_)
-                            || value_type != Some(type_)
                             || self.store.source_node_kind(initializer)
                                 != Some(SyntaxKind::ArrowFunction)
                         {
                             return Err(unsupported());
+                        }
+                        if value_type.is_none() && self.store.value_symbol_links(symbol).is_some() {
+                            return Err(invalid());
                         }
                         let owner = bound
                             .symbol(initializer)
@@ -42772,12 +42774,132 @@ mod tests {
     }
 
     #[test]
+    fn value_type_query_reuses_staged_source_arrow_without_publishing_variable_links() {
+        let mut fixture = fixture("const value = () => 1; let result: typeof value;");
+        let variable = fixture
+            .store
+            .get_merged_symbol(named_symbol(
+                &fixture,
+                SyntaxKind::VariableDeclaration,
+                "value",
+            ))
+            .unwrap();
+        let arrow = variable_initializer_node(&fixture, "value");
+        let owner = node_symbol(&fixture, arrow);
+        let query = variable_type_node(&fixture, "result");
+        let name = type_query_name(&fixture, query);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let expected = query_source_callable(&mut fixture, arrow, owner, &mut diagnostics).unwrap();
+        let signature = function_signature(&fixture.store, arrow);
+        assert!(fixture.store.set_type_node_links(
+            arrow,
+            TypeNodeLinks {
+                resolved_type: Some(expected),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(fixture.store.value_symbol_links(variable).is_none());
+
+        let pending = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(query),
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), pending);
+
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let plan =
+            source_callables::plan_source_callable(&fixture.store, &host, arrow, owner, None)
+                .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        source_callables::publish_inferred_source_callable_return(
+            &mut fixture.store,
+            &plan,
+            signature,
+            number,
+        )
+        .unwrap();
+
+        let before = store_state(&fixture.store);
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .preflight_type_from_type_node(query)
+        .unwrap();
+        assert_eq!(store_state(&fixture.store), before);
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Ok(expected),
+        );
+        assert_eq!(
+            fixture.store.type_node_links(query),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(expected),
+                ..TypeNodeLinks::default()
+            }),
+        );
+        assert_eq!(
+            fixture.store.symbol_node_links(name),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(variable),
+            }),
+        );
+        assert!(fixture.store.value_symbol_links(variable).is_none());
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Ok(expected),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(fixture.store.value_symbol_links(variable).is_none());
+
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(variable, ValueSymbolLinks::default())
+        );
+        let poisoned = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(query),
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), poisoned);
+
+        assert!(fixture.store.set_value_symbol_links(
+            variable,
+            ValueSymbolLinks {
+                resolved_type: Some(expected),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let published = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Ok(expected),
+        );
+        assert_eq!(store_state(&fixture.store), published);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn published_arrow_value_type_query_rejects_forged_caches_and_provenance() {
         for poison in [
             "initializer",
             "missing-initializer",
             "value",
-            "missing-value",
+            "empty-value",
             "declaration-index",
             "family",
             "declaration",
@@ -42861,7 +42983,7 @@ mod tests {
                         ..ValueSymbolLinks::default()
                     },
                 )),
-                "missing-value" => assert!(
+                "empty-value" => assert!(
                     fixture
                         .store
                         .set_value_symbol_links(variable, ValueSymbolLinks::default())
@@ -42908,7 +43030,7 @@ mod tests {
                 store_state(&fixture.store),
                 fixture.store.source_callable_provenance_lengths(),
             );
-            let expected_error = if matches!(poison, "missing-initializer" | "missing-value") {
+            let expected_error = if poison == "missing-initializer" {
                 TypeNodeUnavailable::UnsupportedSyntax {
                     node: query,
                     kind: SyntaxKind::TypeQuery,
