@@ -1721,37 +1721,73 @@ fn plan_global_date_constructor(
         }
     }
 
+    let mut groups: Vec<(NodeRef, Vec<NodeRef>)> = Vec::new();
     for &signature_declaration in signature_declarations {
-        let Some(record) = host.node(signature_declaration) else {
-            continue;
-        };
+        let record = host.node(signature_declaration).ok_or_else(reject)?;
         let NodeData::ConstructSignatureDeclaration(signature) = &record.data else {
-            continue;
+            return Err(reject());
         };
-        let Some(return_annotation) = signature.type_ else {
-            continue;
+        let parent = NodeRef::new(
+            signature_declaration.arena,
+            signature_declaration.file,
+            record.parent.ok_or_else(reject)?,
+        );
+        if record.kind != SyntaxKind::ConstructSignature || !owner_declarations.contains(&parent) {
+            return Err(reject());
+        }
+        if !signature.parameters.nodes.is_empty()
+            && !date_constructor_has_required_argument(
+                store,
+                host,
+                signature_declaration,
+                &signature.parameters.nodes,
+            )?
+        {
+            // Optional, rest, and unresolved parameter types can accept zero
+            // arguments or reorder as literal overloads. Do not skip them.
+            return Err(reject());
+        }
+        if let Some((last_parent, declarations)) = groups.last_mut()
+            && *last_parent == parent
+        {
+            declarations.push(signature_declaration);
+        } else {
+            groups.push((parent, vec![signature_declaration]));
+        }
+    }
+
+    // reorderCandidates puts later declaration groups first and keeps the
+    // signature order inside each group. Required parameters cannot match new().
+    for signature_declaration in groups
+        .into_iter()
+        .rev()
+        .flat_map(|(_, declarations)| declarations)
+    {
+        let record = host.node(signature_declaration).ok_or_else(reject)?;
+        let NodeData::ConstructSignatureDeclaration(signature) = &record.data else {
+            return Err(reject());
         };
+        if !signature.parameters.nodes.is_empty() {
+            continue;
+        }
+        let return_annotation = signature.type_.ok_or_else(reject)?;
         let return_annotation = NodeRef::new(
             signature_declaration.arena,
             signature_declaration.file,
             return_annotation,
         );
-        let Some(return_record) = host.node(return_annotation) else {
-            continue;
-        };
+        let return_record = host.node(return_annotation).ok_or_else(reject)?;
         let NodeData::TypeReferenceNode(return_reference) = &return_record.data else {
-            continue;
+            return Err(reject());
         };
         let return_name = NodeRef::new(
             return_annotation.arena,
             return_annotation.file,
             return_reference.type_name,
         );
-        let Some(return_name_record) = host.node(return_name) else {
-            continue;
-        };
+        let return_name_record = host.node(return_name).ok_or_else(reject)?;
         let NodeData::Identifier(return_identifier) = &return_name_record.data else {
-            continue;
+            return Err(reject());
         };
         if record.kind != SyntaxKind::ConstructSignature
             || !owner_declarations.iter().any(|owner_declaration| {
@@ -1768,7 +1804,7 @@ fn plan_global_date_constructor(
             || return_name_record.parent != Some(return_annotation.node)
             || return_identifier.text != "Date"
         {
-            continue;
+            return Err(reject());
         }
         return Ok(SourceGlobalDateConstructorPlan {
             annotation,
@@ -1779,6 +1815,118 @@ fn plan_global_date_constructor(
     }
 
     Err(reject())
+}
+
+fn date_constructor_has_required_argument(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameters: &[ts_ast::NodeId],
+) -> Result<bool, SourceNewError> {
+    for &parameter in parameters {
+        let parameter = NodeRef::new(declaration.arena, declaration.file, parameter);
+        let record = host
+            .node(parameter)
+            .ok_or_else(|| invariant(SourceNewInvariant::MissingNode(parameter)))?;
+        let NodeData::ParameterDeclaration(data) = &record.data else {
+            return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                parameter,
+            )));
+        };
+        if record.parent != Some(declaration.node) || record.kind != SyntaxKind::Parameter {
+            return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                parameter,
+            )));
+        }
+        if data.question_token.is_some()
+            || data.dot_dot_dot_token.is_some()
+            || data.initializer.is_some()
+        {
+            continue;
+        }
+        let Some(annotation) = data.type_ else {
+            continue;
+        };
+        let annotation = NodeRef::new(parameter.arena, parameter.file, annotation);
+        if date_constructor_parameter_type_has_no_void(store, host, annotation)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn date_constructor_parameter_type_has_no_void(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<bool, SourceNewError> {
+    let record = host
+        .node(node)
+        .ok_or_else(|| invariant(SourceNewInvariant::MissingNode(node)))?;
+    match &record.data {
+        NodeData::KeywordTypeNode(_) => Ok(record.kind != SyntaxKind::VoidKeyword),
+        NodeData::LiteralTypeNode(_)
+        | NodeData::ArrayTypeNode(_)
+        | NodeData::TupleTypeNode(_)
+        | NodeData::TypeLiteralNode(_)
+        | NodeData::FunctionTypeNode(_)
+        | NodeData::ConstructorTypeNode(_) => Ok(true),
+        NodeData::ParenthesizedTypeNode(parenthesized) => {
+            date_constructor_parameter_type_has_no_void(
+                store,
+                host,
+                NodeRef::new(node.arena, node.file, parenthesized.type_),
+            )
+        }
+        NodeData::UnionTypeNode(union) => {
+            for &type_ in &union.types.nodes {
+                if !date_constructor_parameter_type_has_no_void(
+                    store,
+                    host,
+                    NodeRef::new(node.arena, node.file, type_),
+                )? {
+                    return Ok(false);
+                }
+            }
+            Ok(!union.types.nodes.is_empty())
+        }
+        NodeData::TypeReferenceNode(reference) => {
+            let name = NodeRef::new(node.arena, node.file, reference.type_name);
+            let Some(NodeData::Identifier(identifier)) = host.node(name).map(|node| &node.data)
+            else {
+                return Ok(false);
+            };
+            let (arena, bound) = host
+                .source(name)
+                .ok_or_else(|| invariant(SourceNewInvariant::MissingNode(name)))?;
+            let mut callback_host = host.name_resolver_host(store)?;
+            let symbol =
+                CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+                    .map_err(|error| {
+                        invariant(SourceNewInvariant::NameResolution { node: name, error })
+                    })?
+                    .resolve(
+                        Some(CanonicalResolutionLocation::Bound(name)),
+                        &identifier.text,
+                        SymbolFlags::TYPE,
+                        None,
+                        false,
+                        false,
+                    )
+                    .map_err(|error| {
+                        invariant(SourceNewInvariant::NameResolution { node: name, error })
+                    })?
+                    .and_then(|symbol| store.get_merged_symbol(symbol));
+            Ok(symbol
+                .and_then(|symbol| store.symbol(symbol))
+                .is_some_and(|symbol| {
+                    symbol
+                        .flags()
+                        .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+                }))
+        }
+        _ => Ok(false),
+    }
 }
 
 #[allow(clippy::too_many_lines)] // Preserve the global, generic signature, and executor proof.
@@ -8849,6 +8997,122 @@ mod tests {
                 ClassHeritageMembersValidation::Valid,
                 "case {poison}",
             );
+        }
+    }
+
+    #[test]
+    fn global_date_overloads_use_later_groups_and_preserve_group_order() {
+        for (index, declarations, selected) in [
+            (
+                0,
+                concat!(
+                    "interface DateConstructor { new(): string; } ",
+                    "interface DateConstructor { new(): Date; } ",
+                ),
+                1,
+            ),
+            (
+                1,
+                concat!(
+                    "interface DateConstructor { new(): Date; new(): string; } ",
+                    "interface DateConstructor { new(value: number): string; } ",
+                ),
+                0,
+            ),
+        ] {
+            let library = parse_source_file(&format!(
+                "interface Date {{}} {declarations} declare var Date: DateConstructor;",
+            ));
+            let source = parse_source_file("const value = new Date();");
+            let library_file = FileId::new(1_905 + index * 2);
+            let source_file = FileId::new(1_906 + index * 2);
+            let declarations = library
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ConstructSignature).then_some(NodeRef::new(
+                        library.arena.id(),
+                        library_file,
+                        node,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let mut context =
+                global_object_constructor_context(&library, &source, library_file, source_file);
+            let (expression, _) = variable_new(&source, source_file, "value");
+
+            context.check_source_file(source_file).unwrap();
+
+            let signature = context
+                .store()
+                .signature_links(expression)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            assert_eq!(
+                context.store().signature(signature).unwrap().declaration(),
+                Some(declarations[selected]),
+            );
+            let instance =
+                authenticated_global_date_constructor_return(context.store(), signature).unwrap();
+            assert_eq!(context.type_to_string(instance).unwrap(), "Date");
+            let warm = (context.store().type_len(), context.store().signature_len());
+            context.recheck_source_file(source_file).unwrap();
+            assert_eq!(
+                (context.store().type_len(), context.store().signature_len()),
+                warm
+            );
+        }
+    }
+
+    #[test]
+    fn global_date_overload_competitors_reject_before_cache_publication() {
+        for overload in [
+            "new(): string;",
+            "new(value?: number): string;",
+            "new(...values: number[]): string;",
+            "new(value: void): string;",
+            "new<Value>(): Date;",
+        ] {
+            let library = parse_source_file(&format!(
+                concat!(
+                    "interface Date {{}} ",
+                    "interface DateConstructor {{ new(): Date; }} ",
+                    "interface DateConstructor {{ {} }} ",
+                    "declare var Date: DateConstructor;",
+                ),
+                overload,
+            ));
+            let source = parse_source_file("const value = new Date();");
+            let library_file = FileId::new(1_911);
+            let source_file = FileId::new(1_912);
+            let mut context =
+                global_object_constructor_context(&library, &source, library_file, source_file);
+            let (expression, _) = variable_new(&source, source_file, "value");
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                matches!(
+                    context.check_source_file(source_file),
+                    Err(super::super::SourceCheckError::Unsupported(_))
+                ),
+                "{overload}"
+            );
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+                "{overload}",
+            );
+            assert!(context.store().type_node_links(expression).is_none());
+            assert!(context.store().signature_links(expression).is_none());
         }
     }
 
