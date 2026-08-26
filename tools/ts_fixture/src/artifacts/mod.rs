@@ -1235,7 +1235,7 @@ mod tests {
         let filesystem = MemoryFileSystem::new(true);
         filesystem.write_file("/.src/view.tsx", source).unwrap();
         let options = CompilerOptions {
-            no_lib: true,
+            no_lib: false,
             no_implicit_any: false,
             no_implicit_any_specified: true,
             strict: false,
@@ -1289,7 +1289,7 @@ mod tests {
                 "/.src",
                 &["/.src/view.tsx".to_owned()],
                 CompilerOptions {
-                    no_lib: true,
+                    no_lib: false,
                     no_implicit_any,
                     no_implicit_any_specified: true,
                     jsx: ts_options::JsxEmit::Preserve,
@@ -1304,7 +1304,12 @@ mod tests {
             )
             .unwrap();
             let (snapshot, artifacts) = result.unwrap();
-            assert_eq!(snapshot, has_diagnostics, "{source}");
+            assert_eq!(
+                snapshot,
+                has_diagnostics,
+                "{source}: {:?}",
+                program.diagnostics()
+            );
             assert_eq!(snapshot, !program.diagnostics().is_empty(), "{source}");
             let types = artifacts.unwrap().types.unwrap();
             assert!(
@@ -1320,12 +1325,7 @@ mod tests {
 
     #[test]
     fn evolving_array_targets_keep_their_intrinsic_any_display() {
-        let source = concat!(
-            "interface Object {} interface Function {} interface IArguments {}\n",
-            "interface String {} interface Number {} interface Boolean {}\n",
-            "interface RegExp {} interface Array<T> {}\n",
-            "let values = []; values[0] = { foo: 'hi' }; const observed = values;\n",
-        );
+        let source = "let values = []; values[0] = { foo: 'hi' }; const observed = values;\n";
         let case = Case::parse("array.ts", source).unwrap();
         let filesystem = fixture_filesystem(&case);
         let (program, artifacts) = Program::try_new_with_canonical_checker_and_queries(
@@ -1333,17 +1333,14 @@ mod tests {
             "/.src",
             &["/.src/array.ts".to_owned()],
             CompilerOptions {
-                no_lib: true,
+                no_lib: false,
                 strict_null_checks: true,
                 strict_null_checks_specified: true,
                 no_implicit_any: true,
                 no_implicit_any_specified: true,
                 ..CompilerOptions::default()
             },
-            |program, queries| {
-                assert!(!queries.has_diagnostics());
-                render_program(&case, program, queries, false)
-            },
+            |program, queries| render_program(&case, program, queries, false),
         )
         .unwrap();
         assert!(

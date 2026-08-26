@@ -3748,6 +3748,16 @@ fn declaration_family_supported(
     })
 }
 
+/// Reports whether a module declaration has a value meaning in type queries.
+#[must_use]
+pub fn module_declaration_has_value_meaning(arena: &NodeArena, node: NodeId) -> bool {
+    matches!(
+        arena.get(node).map(|node| &node.data),
+        Some(NodeData::ModuleDeclaration(_))
+    ) && (is_ambient_module(arena, node)
+        || get_module_instance_state(arena, node) == ModuleInstanceState::Instantiated)
+}
+
 fn get_module_instance_state(arena: &NodeArena, node: NodeId) -> ModuleInstanceState {
     let mut visited = HashMap::new();
     get_module_instance_state_worker_for_declaration(arena, node, &mut visited)
@@ -8837,6 +8847,54 @@ export = equalsValue;
         }
         assert!(exports.get_source("selected").is_some());
         assert!(bound.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn module_value_meaning_uses_each_declaration_body() {
+        let parsed = parse_source_file(concat!(
+            "namespace Types { export interface Shape {} }\n",
+            "namespace Merged { export type Shape = string; }\n",
+            "namespace Merged { export const value = 1; }\n",
+            "namespace Constants { export const enum E { A } }\n",
+            "namespace Runtime { export enum E { A } }\n",
+            "declare module 'pkg' { export interface Shape {} }\n",
+            "declare global { interface Shape {} }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let meanings = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return None;
+                };
+                let name = match &parsed.arena.get(module.name).unwrap().data {
+                    NodeData::Identifier(name) => name.text.as_str(),
+                    NodeData::StringLiteral(name) => name.text.as_str(),
+                    other => panic!("unexpected module name: {other:?}"),
+                };
+                Some((
+                    name,
+                    super::module_declaration_has_value_meaning(&parsed.arena, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            meanings,
+            [
+                ("Types", false),
+                ("Merged", false),
+                ("Merged", true),
+                ("Constants", false),
+                ("Runtime", true),
+                ("pkg", true),
+                ("global", true),
+            ],
+        );
+        assert!(!super::module_declaration_has_value_meaning(
+            &parsed.arena,
+            parsed.source_file
+        ));
     }
 
     #[test]

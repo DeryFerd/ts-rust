@@ -50,6 +50,11 @@ pub(super) fn includes(
     {
         return true;
     }
+    if parent.kind == SyntaxKind::ModuleDeclaration {
+        return node.parent.is_some_and(|declaration| {
+            ts_binder::module_declaration_has_value_meaning(arena, declaration)
+        });
+    }
 
     !matches!(
         parent.kind,

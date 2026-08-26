@@ -11,6 +11,7 @@ pub use canonical::{
     CanonicalDeclarationError, CanonicalExtractionError, CanonicalModuleAugmentation,
     CanonicalModuleState, CanonicalPatternAmbientModule, CanonicalProgramBindings,
     CanonicalRelatedInformation, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+    module_declaration_has_value_meaning,
 };
 pub use escaped_name::{
     EscapedDisplay, EscapedName, EscapedNameRef, INTERNAL_SYMBOL_NAME_PREFIX, InternalSymbolName,

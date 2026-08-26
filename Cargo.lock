@@ -311,6 +311,7 @@ dependencies = [
  "ts_jsnum",
  "ts_parser",
  "ts_path",
+ "ts_scanner",
  "xxhash-rust",
 ]
 
@@ -408,6 +409,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ts_ast",
+ "ts_binder",
  "ts_compiler",
  "ts_config",
  "ts_core",
