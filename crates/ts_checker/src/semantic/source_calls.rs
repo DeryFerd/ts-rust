@@ -1599,7 +1599,7 @@ fn valid_global_array_callback_predicate(
     valid_planned_callable_type_predicate(store, signature, annotation, overload.callback_predicate)
 }
 
-/// Maps a real `Array` callback's first generic parameter to its typed receiver.
+/// Checks an Array callback's contextual parameter against its receiver.
 pub(super) fn array_callback_contextual_parameter_type(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1642,41 +1642,28 @@ pub(super) fn array_callback_contextual_parameter_type(
     } else {
         global_types.array_type
     };
-    let [source_parameter] = store
-        .type_payload(target)
-        .and_then(|record| match record.data() {
-            TypeData::Interface(interface) => {
-                interface.reference.resolved_type_arguments.as_deref()
-            }
-            _ => None,
-        })
-        .ok_or(SourceCheckError::Call(call))?
-    else {
-        return Err(SourceCheckError::Call(call));
-    };
     let method = store
         .symbol_node_links(property)
         .and_then(|links| links.resolved_symbol)
         .ok_or(SourceCheckError::Call(call))?;
+    let callee_type = store
+        .type_node_links(property)
+        .and_then(|links| links.resolved_type)
+        .ok_or(SourceCheckError::Call(call))?;
+    let StoredCallableSetValidation::Valid { projection, .. } =
+        validate_stored_callable_set(store, callee_type)
+    else {
+        return Err(SourceCheckError::Call(call));
+    };
     if store
         .authenticated_interface_method_owner(method)
         .is_none_or(|(_, owner)| owner != target)
-        || store
-            .value_symbol_links(method)
-            .and_then(|links| links.resolved_type)
-            .and_then(|type_| store.type_payload(type_))
-            .and_then(|record| record.data().structured())
-            .and_then(|structured| structured.signatures.as_deref())
-            .is_none_or(|signatures| {
-                signatures.iter().all(|signature| {
-                    store
-                        .callable_signature_parameter_types(*signature)
-                        .and_then(|parameters| parameters.first())
-                        .copied()
-                        != Some(contextual_type)
-                })
-            })
-        || parameter_type != *source_parameter
+        || store.type_payload(callee_type).and_then(TypeRecord::symbol) != Some(method)
+        || projection
+            .call_signatures
+            .iter()
+            .all(|signature| signature.parameters.first().copied() != Some(contextual_type))
+        || parameter_type != array.element_type
     {
         return Err(SourceCheckError::Call(call));
     }
@@ -1690,6 +1677,17 @@ pub(super) fn authenticated_array_callback_contextual_target(
     source_parameter: TypeId,
     actual_parameter: TypeId,
 ) -> bool {
+    if source_parameter == actual_parameter
+        && let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+            super::instantiated_members::validate_instantiated_function_member_callable(
+                store, target,
+            )
+        && projection.call_signatures.first().is_some_and(|signature| {
+            signature.parameters.first().copied() == Some(actual_parameter)
+        })
+    {
+        return true;
+    }
     let Some(parameter_symbol) =
         super::declared::cached_ordinary_type_parameter_owner(store, source_parameter)
     else {
@@ -1791,10 +1789,6 @@ fn check_authenticated_array_callback_call(
     };
     if method_record.flags() != SymbolFlags::METHOD
         || !matches!(method_name, "map" | "filter" | "find" | "forEach")
-        || store
-            .value_symbol_links(method)
-            .and_then(|links| links.resolved_type)
-            != Some(callee_type)
     {
         return Ok(None);
     }
@@ -1817,6 +1811,14 @@ fn check_authenticated_array_callback_call(
     if store
         .authenticated_interface_method_owner(method)
         .is_none_or(|(_, owner)| owner != target)
+        || super::instantiated_members::instantiate_published_generic_interface_method(
+            store,
+            global_types,
+            receiver,
+            method,
+        )
+        .map_err(|_| SourceCheckError::Call(plan.node))?
+            != callee_type
     {
         return Err(SourceCheckError::Call(plan.node));
     }
@@ -2001,8 +2003,8 @@ fn check_authenticated_array_callback_call(
         }
         signature.signature
     } else {
-        let mut mapper_sources = vec![source_element];
-        let mut mapper_targets = vec![array.element_type];
+        let mut mapper_sources = Vec::new();
+        let mut mapper_targets = Vec::new();
         if let Some(parameter) = generic_parameter {
             let inferred = if method_name == "map" {
                 callback_return
@@ -2041,7 +2043,22 @@ fn check_authenticated_array_callback_call(
                     .any(|(parameter, target)| {
                         parameter != target
                             && store.value_symbol_links(parameter).is_none_or(|links| {
-                                links.target != Some(target) || links.mapper != Some(mapper)
+                                let inherited = store.value_symbol_links(target).and_then(|links| {
+                                    Some((links.target?, links.mapper?))
+                                });
+                                match inherited {
+                                    Some((target, previous_mapper)) => {
+                                        links.target != Some(target)
+                                            || links.mapper.is_none_or(|parameter_mapper| {
+                                                !matches!(
+                                                    store.mapper_application(parameter_mapper, source_element),
+                                                    Some(super::mapper::TypeMapperApplication::Composite { first, second })
+                                                        if first == previous_mapper && second == mapper
+                                                )
+                                            })
+                                    }
+                                    None => links.target != Some(target) || links.mapper != Some(mapper),
+                                }
                             })
                     })
             {
@@ -9053,6 +9070,260 @@ mod tests {
                 warm,
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both Array owners must retain source signatures and warm identities.
+    fn array_method_queries_specialize_receiver_types_without_replacing_method_parameters() {
+        let library = parsed(concat!(
+            "interface Array<T> { ",
+            "map<U>(callbackfn: (value: T, index: number, array: T[]) => U, ",
+            "thisArg?: any): U[]; ",
+            "forEach(callbackfn: (value: T, index: number, array: T[]) => void, ",
+            "thisArg?: any): void; } ",
+            "interface ReadonlyArray<T> { ",
+            "map<U>(callbackfn: (value: T, index: number, array: readonly T[]) => U, ",
+            "thisArg?: any): U[]; ",
+            "forEach(callbackfn: (value: T, index: number, array: readonly T[]) => void, ",
+            "thisArg?: any): void; }",
+        ));
+        for (index, receiver, expected_map, expected_for_each) in [
+            (
+                0,
+                "(string | number)[]",
+                concat!(
+                    "<U>(callbackfn: (value: string | number, index: number, ",
+                    "array: (string | number)[]) => U, thisArg?: any) => U[]",
+                ),
+                concat!(
+                    "(callbackfn: (value: string | number, index: number, ",
+                    "array: (string | number)[]) => void, thisArg?: any) => void",
+                ),
+            ),
+            (
+                1,
+                "ReadonlyArray<string | number>",
+                concat!(
+                    "<U>(callbackfn: (value: string | number, index: number, ",
+                    "array: readonly (string | number)[]) => U, thisArg?: any) => U[]",
+                ),
+                concat!(
+                    "(callbackfn: (value: string | number, index: number, ",
+                    "array: readonly (string | number)[]) => void, thisArg?: any) => void",
+                ),
+            ),
+        ] {
+            let source = parsed(&format!(
+                "declare const values: {receiver}; values.map(value => value); \
+                 values.forEach(value => value); values.map(value => value);",
+            ));
+            let library_file = FileId::new(49_560 + index * 2);
+            let source_file = FileId::new(49_561 + index * 2);
+            let mut context =
+                context_with_default_library(&library, library_file, &source, source_file);
+
+            context.check_source_file(source_file).unwrap();
+
+            assert!(
+                context.diagnostics().is_empty(),
+                "{:?}",
+                context.diagnostics()
+            );
+            let accesses = source
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    let NodeData::PropertyAccessExpression(access) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &source.arena.get(access.name)?.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(source.arena.id(), source_file, node),
+                        name.text.as_str(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let mut mapped_type = None;
+            for &(node, name) in &accesses {
+                let type_ = context
+                    .store()
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                assert_eq!(
+                    context.type_to_string(type_).unwrap(),
+                    if name == "map" {
+                        expected_map
+                    } else {
+                        expected_for_each
+                    }
+                );
+                let method = context
+                    .store()
+                    .symbol_node_links(node)
+                    .and_then(|links| links.resolved_symbol)
+                    .unwrap();
+                let original = context
+                    .store()
+                    .value_symbol_links(method)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                assert_ne!(type_, original);
+                if name != "map" {
+                    continue;
+                }
+                if let Some(previous) = mapped_type.replace(type_) {
+                    assert_eq!(previous, type_);
+                }
+                let StoredCallableSetValidation::Valid { projection, .. } =
+                    validate_stored_callable_set(context.store(), type_)
+                else {
+                    panic!("the mapped Array method must validate")
+                };
+                let [callable] = projection.call_signatures.as_ref() else {
+                    panic!("map must have one call signature")
+                };
+                let signature = context.store().signature(callable.signature).unwrap();
+                let source_signature = context
+                    .store()
+                    .signature(signature.target().unwrap())
+                    .unwrap();
+                assert_eq!(signature.type_parameters().len(), 1);
+                assert_ne!(
+                    signature.type_parameters(),
+                    source_signature.type_parameters()
+                );
+                let source_callback = context
+                    .store()
+                    .callable_signature_parameter_types(signature.target().unwrap())
+                    .unwrap()[0];
+                assert_ne!(callable.parameters[0], source_callback);
+                assert!(matches!(
+                    validate_stored_single_callable(context.store(), source_callback),
+                    StoredSingleCallableValidation::Valid { .. }
+                ));
+            }
+            assert_eq!(accesses.len(), 3);
+            let call_nodes = calls(&source, source_file);
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                call_nodes
+                    .iter()
+                    .map(|call| call_publication_state(&context, *call))
+                    .collect::<Vec<_>>(),
+            );
+
+            context.recheck_source_file(source_file).unwrap();
+
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    call_nodes
+                        .iter()
+                        .map(|call| call_publication_state(&context, *call))
+                        .collect::<Vec<_>>(),
+                ),
+                warm
+            );
+        }
+    }
+
+    #[test]
+    fn array_method_queries_reject_paired_callback_mapper_changes() {
+        let library = array_callback_default_library();
+        let source = parsed("declare const values: number[]; values.map(value => value);");
+        let library_file = FileId::new(49_570);
+        let source_file = FileId::new(49_571);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+        context.check_source_file(source_file).unwrap();
+        let method_node = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let method = context
+            .store()
+            .type_node_links(method_node)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(context.store(), method)
+        else {
+            panic!("the mapped Array method must validate")
+        };
+        let callback = projection.call_signatures[0].parameters[0];
+        let StoredSingleCallableValidation::Valid { callable, .. } =
+            validate_stored_single_callable(context.store(), callback)
+        else {
+            panic!("the mapped callback must validate")
+        };
+        let callback_signature = context.store().signature(callable.signature).unwrap();
+        let original_signature = callback_signature.target().unwrap();
+        let parameter = callback_signature.parameters()[0];
+        let Some(TypeData::Object(object)) =
+            context.store().type_payload(callback).map(TypeRecord::data)
+        else {
+            panic!("the callback must retain its source function type")
+        };
+        let source_callback = object.target.unwrap();
+        let original_parameter_type = context
+            .store()
+            .callable_signature_parameter_types(original_signature)
+            .unwrap()[0];
+        let boolean = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+        let mapper = context
+            .store_mut_for_test()
+            .new_simple_type_mapper(original_parameter_type, boolean)
+            .unwrap();
+        let mut links = context
+            .store()
+            .value_symbol_links(parameter)
+            .unwrap()
+            .clone();
+        links.mapper = Some(mapper);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(parameter, links)
+        );
+        assert!(context.store_mut_for_test().set_object_target_and_mapper(
+            callback,
+            Some(source_callback),
+            Some(mapper)
+        ));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_target_and_mapper(
+                    callable.signature,
+                    Some(original_signature),
+                    Some(mapper)
+                )
+        );
+
+        assert!(matches!(
+            validate_stored_single_callable(context.store(), callback),
+            StoredSingleCallableValidation::Malformed { .. }
+        ));
+        assert!(matches!(
+            validate_stored_callable_set(context.store(), method),
+            StoredCallableSetValidation::Malformed { .. }
+        ));
+        assert!(context.recheck_source_file(source_file).is_err());
     }
 
     #[test]

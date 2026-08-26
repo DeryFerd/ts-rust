@@ -78,6 +78,11 @@ pub(super) fn validate_stored_callable_set(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> StoredCallableSetValidation {
+    if let Some(validation) =
+        super::instantiated_members::validate_instantiated_function_member_callable(store, type_)
+    {
+        return validation;
+    }
     match validate_stored_single_callable_provider(store, type_) {
         StoredSingleCallableValidation::NotCallable => {}
         StoredSingleCallableValidation::Pending { family } => {
@@ -1342,6 +1347,15 @@ pub(super) fn instantiated_method_type_matches(
     mapper: super::TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
+    if store.type_has_function_type_provenance(template) {
+        return super::instantiated_members::instantiated_function_member_type_matches(
+            store,
+            template,
+            actual,
+            mapper,
+            array_targets,
+        );
+    }
     if instantiated_member_type_matches(store, template, actual, mapper, array_targets)
         .unwrap_or(false)
     {

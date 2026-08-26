@@ -1670,39 +1670,24 @@ fn resolve_published_canonical_array_property(
     if is_method {
         validate_published_canonical_array_method(store, plan.node, symbol, declarations, type_)?;
     }
-    let element_parameter = interface
-        .reference
-        .resolved_type_arguments
-        .as_deref()
-        .and_then(|parameters| match parameters {
-            [parameter] => Some(*parameter),
-            _ => None,
-        });
-    let requires_method_instantiation = is_method
-        && !matches!(plan.name.as_str(), "map" | "filter" | "find" | "forEach")
-        && store
-            .type_payload(type_)
-            .and_then(|record| record.data().structured())
-            .and_then(|structured| structured.signatures.as_deref())
-            .is_some_and(|signatures| {
-                signatures.iter().any(|signature| {
-                    store
-                        .signature(*signature)
-                        .and_then(super::signatures::Signature::resolved_return_type)
-                        .is_some_and(|return_type| {
-                            return_type == target || Some(return_type) == element_parameter
-                        })
-                })
-            });
-    let instantiation = if requires_method_instantiation {
-        Some(
-            super::instantiated_members::instantiate_published_generic_interface_method(
-                store,
-                global_types,
-                receiver_type,
-                symbol,
-            ),
-        )
+    let instantiation = if is_method {
+        let requires = super::instantiated_members::published_method_requires_instantiation(
+            store,
+            global_types,
+            symbol,
+        );
+        Some(requires.and_then(|requires| {
+            if requires {
+                super::instantiated_members::instantiate_published_generic_interface_method(
+                    store,
+                    global_types,
+                    receiver_type,
+                    symbol,
+                )
+            } else {
+                Ok(type_)
+            }
+        }))
     } else if is_property && store.type_has_function_type_provenance(type_) {
         Some(
             super::instantiated_members::instantiate_published_generic_array_property_callable(

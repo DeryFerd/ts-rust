@@ -117,6 +117,11 @@ pub(super) fn single_callable_family(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> Option<CallableFamily> {
+    if super::instantiated_members::validate_instantiated_function_member_callable(store, type_)
+        .is_some()
+    {
+        return Some(CallableFamily::FunctionType);
+    }
     if store.type_has_function_type_provenance(type_) {
         Some(CallableFamily::FunctionType)
     } else {
@@ -241,6 +246,16 @@ pub(super) fn single_callable_display_projection(
     type_: TypeId,
     global_types: Option<&CanonicalGlobalTypes>,
 ) -> Result<Option<ValidatedSingleCallSignatureDisplay>, SingleCallableDisplayError> {
+    if let Some(display) = super::instantiated_members::instantiated_function_member_display(
+        store,
+        host,
+        type_,
+        global_types.map(CanonicalArrayTargets::from_global_types),
+    ) {
+        return display
+            .map(Some)
+            .map_err(SingleCallableDisplayError::FunctionType);
+    }
     let Some(family) = single_callable_family(store, type_) else {
         return Ok(None);
     };
