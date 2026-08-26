@@ -2184,9 +2184,6 @@ fn publish_global_array_augmentation_methods(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
-    options: CanonicalCheckerOptions,
-    session: &mut InstantiationSession,
-    diagnostics: &mut CanonicalCheckerDiagnostics,
     interface: NodeRef,
     owner: SemanticSymbolId,
     generic: &SourceNamespaceGenericInterfacePlan,
@@ -2280,18 +2277,20 @@ fn publish_global_array_augmentation_methods(
         methods.push((symbol, declaration, return_node, is_cold));
     }
 
+    let missing_return_types = methods
+        .iter()
+        .filter(|(_, _, return_node, _)| store.type_node_links(*return_node).is_none())
+        .count();
+    if !store.try_reserve_type_node_links(missing_return_types) {
+        return Err(invalid());
+    }
     for &(_, _, return_node, _) in &methods {
-        session.reset_query();
-        if CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-        )?
-        .get_type_from_type_node(return_node)?
-            != element
+        let expected = TypeNodeLinks {
+            resolved_type: Some(element),
+            ..TypeNodeLinks::default()
+        };
+        if store.type_node_links(return_node) != Some(&expected)
+            && !store.set_type_node_links(return_node, expected)
         {
             return Err(invalid());
         }
@@ -12355,6 +12354,31 @@ pub(super) fn execute_source_namespace(
                 generic,
                 ..
             } => {
+                if let Some(generic) = generic
+                    && store
+                        .declared_type_links(*symbol)
+                        .and_then(|links| links.declared_type)
+                        == Some(global_types.array_type)
+                    && global_augmentation_array_interface_members_are_exact(
+                        arena,
+                        bound,
+                        store,
+                        *declaration,
+                        plan.symbol,
+                        *symbol,
+                        generic,
+                    )
+                {
+                    publish_global_array_augmentation_methods(
+                        store,
+                        host,
+                        global_types,
+                        *declaration,
+                        *symbol,
+                        generic,
+                    )?;
+                    continue;
+                }
                 let heritage = host.node(*declaration).is_some_and(|record| {
                     matches!(
                         &record.data,
@@ -12376,30 +12400,6 @@ pub(super) fn execute_source_namespace(
                     .get_declared_type_of_symbol(*symbol)?
                 };
                 if let Some(generic) = generic {
-                    if target == global_types.array_type
-                        && global_augmentation_array_interface_members_are_exact(
-                            arena,
-                            bound,
-                            store,
-                            *declaration,
-                            plan.symbol,
-                            *symbol,
-                            generic,
-                        )
-                    {
-                        publish_global_array_augmentation_methods(
-                            store,
-                            host,
-                            global_types,
-                            options,
-                            session,
-                            diagnostics,
-                            *declaration,
-                            *symbol,
-                            generic,
-                        )?;
-                        continue;
-                    }
                     if !generic.call_signatures.is_empty()
                         || !generic.construct_signatures.is_empty()
                         || !generic.index_signatures.is_empty()
@@ -20227,6 +20227,15 @@ mod tests {
                 ))
             })
             .unwrap();
+        let NodeData::MethodSignatureDeclaration(method_signature) = &augmentation
+            .arena
+            .get(method_declaration.node)
+            .unwrap()
+            .data
+        else {
+            panic!("the global Array contribution must retain its method signature")
+        };
+        let return_annotation = child(method_declaration, method_signature.type_.unwrap());
         let method = bound
             .symbol(method_declaration)
             .and_then(|symbol| context.store().get_merged_symbol(symbol))
@@ -20277,6 +20286,8 @@ mod tests {
         };
         assert_eq!(*symbol, array);
         assert_eq!(generic.methods.as_slice(), [method]);
+        assert!(generic.annotation_is_deferred(return_annotation));
+        assert!(context.store().type_node_links(return_annotation).is_none());
 
         context.check_source_file(augmentation_file).unwrap();
         assert!(context.diagnostics().is_empty());
@@ -20284,6 +20295,13 @@ mod tests {
         let element = validate_direct_generic_reference(context.store(), array_type)
             .unwrap()
             .type_arguments[0];
+        assert_eq!(
+            context.store().type_node_links(return_annotation),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(element),
+                ..TypeNodeLinks::default()
+            }),
+        );
         let callable = context
             .store()
             .value_symbol_links(method)
