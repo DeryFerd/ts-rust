@@ -5157,6 +5157,14 @@ impl<'store> RelaterSession<'store> {
         if record.flags() != TypeFlags::OBJECT || !self.supports_property_object_alias(type_id) {
             return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
         }
+        if self
+            .store
+            .direct_interface_heritage_provenance(type_id)
+            .is_some()
+        {
+            validate_direct_interface_heritage_relation_endpoint(self.store, type_id)?;
+            return Ok(());
+        }
         if record.object_flags().intersects(ObjectFlags::REFERENCE) {
             let reference_target = match record.data() {
                 TypeData::TypeReference(reference) => reference.object.target,
