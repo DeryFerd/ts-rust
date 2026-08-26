@@ -1399,6 +1399,31 @@ enum SourceDependencyOrder {
     DynamicImport(TextPos),
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ResolvedModuleKey {
+    containing_file: String,
+    specifier: String,
+    mode: Option<ModuleFormat>,
+}
+
+impl ResolvedModuleKey {
+    fn new(
+        containing_file: String,
+        specifier: String,
+        mode: CanonicalModuleResolutionMode,
+    ) -> Self {
+        Self {
+            containing_file,
+            specifier,
+            mode: match mode {
+                CanonicalModuleResolutionMode::CommonJs => Some(ModuleFormat::CommonJs),
+                CanonicalModuleResolutionMode::Esm => Some(ModuleFormat::Esm),
+                CanonicalModuleResolutionMode::None => None,
+            },
+        }
+    }
+}
+
 /// A compilation's parsed source-file graph.
 #[derive(Debug, Default)]
 pub struct Program {
@@ -1407,7 +1432,7 @@ pub struct Program {
     root_file_names: BTreeSet<String>,
     ordered_root_file_names: Vec<String>,
     source_dependencies: BTreeMap<FileId, Vec<(SourceDependencyOrder, FileId)>>,
-    resolved_modules: BTreeMap<(String, String), String>,
+    resolved_modules: BTreeMap<ResolvedModuleKey, String>,
     graph_resolution_options: Option<ResolutionOptions>,
     graph_resolutions: Vec<ProgramGraphResolution>,
     graph_references: Vec<ProgramGraphReference>,
@@ -1881,8 +1906,14 @@ impl Program {
                         &self.current_directory,
                         self.case_sensitivity,
                     );
-                    self.resolved_modules
-                        .insert((containing, specifier), target);
+                    self.resolved_modules.insert(
+                        ResolvedModuleKey::new(
+                            containing,
+                            specifier,
+                            CanonicalModuleResolutionMode::Esm,
+                        ),
+                        target,
+                    );
                     self.load_file(file_system, &resolved.resolved_file_name, false);
                     self.record_source_dependency(
                         containing_id,
@@ -1928,8 +1959,14 @@ impl Program {
                         &self.current_directory,
                         self.case_sensitivity,
                     );
-                    self.resolved_modules
-                        .insert((containing, "tslib".to_owned()), target);
+                    self.resolved_modules.insert(
+                        ResolvedModuleKey::new(
+                            containing,
+                            "tslib".to_owned(),
+                            CanonicalModuleResolutionMode::CommonJs,
+                        ),
+                        target,
+                    );
                     self.load_file(file_system, &resolved.resolved_file_name, false);
                     self.record_source_dependency(
                         containing_id,
@@ -2040,8 +2077,10 @@ impl Program {
                         &self.current_directory,
                         self.case_sensitivity,
                     );
-                    self.resolved_modules
-                        .insert((containing, specifier.clone()), target);
+                    self.resolved_modules.insert(
+                        ResolvedModuleKey::new(containing, specifier.clone(), mode),
+                        target,
+                    );
                     let source_count_before_import = self.source_files.len();
                     self.load_file(file_system, &resolved.resolved_file_name, false);
                     if let Some(order) = dependency_order {
@@ -2065,8 +2104,10 @@ impl Program {
                         &self.current_directory,
                         self.case_sensitivity,
                     );
-                    self.resolved_modules
-                        .insert((containing, specifier.clone()), target);
+                    self.resolved_modules.insert(
+                        ResolvedModuleKey::new(containing, specifier.clone(), mode),
+                        target,
+                    );
                 } else if !(self.options.no_check
                     || side_effect_only && !self.options.no_unchecked_side_effect_imports
                     || self.options.skip_lib_check
@@ -3956,8 +3997,8 @@ impl Program {
                     visit(program, *target, visited, ordered);
                 }
             }
-            for ((containing, _), target) in &program.resolved_modules {
-                if containing != &canonical {
+            for (key, target) in &program.resolved_modules {
+                if key.containing_file != canonical {
                     continue;
                 }
                 if let Some(target) = program.file_index.get(target) {
@@ -4078,7 +4119,7 @@ impl Program {
         );
         self.resolved_modules
             .iter()
-            .filter(|((source, _), _)| source == &containing)
+            .filter(|(key, _)| key.containing_file == containing)
             .filter_map(|(_, target)| self.file_index.get(target))
             .filter_map(|index| self.source_files.get(*index))
             .any(source_has_external_module_augmentation)
@@ -4101,8 +4142,8 @@ impl Program {
         );
         self.resolved_modules
             .iter()
-            .filter(|((source, _), _)| source == &containing)
-            .filter_map(|((_, specifier), target)| {
+            .filter(|(key, _)| key.containing_file == containing)
+            .filter_map(|(key, target)| {
                 let target = self
                     .file_index
                     .get(target)
@@ -4111,7 +4152,7 @@ impl Program {
                     return None;
                 }
                 Some((
-                    specifier.clone(),
+                    key.specifier.clone(),
                     amd_bundle_module_name(target, bundle_root),
                 ))
             })
@@ -4158,8 +4199,8 @@ impl Program {
         );
         self.resolved_modules
             .iter()
-            .filter(|((source, _), _)| source == &containing)
-            .filter_map(|((_, specifier), target)| {
+            .filter(|(key, _)| key.containing_file == containing)
+            .filter_map(|(key, target)| {
                 let target = self
                     .file_index
                     .get(target)
@@ -4170,7 +4211,7 @@ impl Program {
                     return None;
                 }
                 Some((
-                    specifier,
+                    &key.specifier,
                     bundle_declaration_module_name(target, bundle_root, module),
                 ))
             })
@@ -4212,13 +4253,22 @@ impl Program {
             else {
                 continue;
             };
-            let Some((specifier, _)) = string_literal(&source.parse.arena, import.module_specifier)
+            let Some((_, specifier, requested_mode)) =
+                source.parse.arena.get(*statement).and_then(|node| {
+                    canonical_static_module_specifier(source, node)
+                        .ok()
+                        .flatten()
+                })
             else {
                 continue;
             };
             let Some(target) = self
                 .resolved_modules
-                .get(&(containing.clone(), specifier))
+                .get(&ResolvedModuleKey::new(
+                    containing.clone(),
+                    specifier,
+                    requested_mode.unwrap_or_else(|| self.canonical_emit_module_mode(source)),
+                ))
                 .and_then(|target| self.file_index.get(target))
                 .and_then(|index| self.source_files.get(*index))
             else {
@@ -4352,23 +4402,29 @@ impl Program {
             &self.current_directory,
             self.case_sensitivity,
         );
-        self.resolved_modules
-            .iter()
-            .any(|((owner, specifier), resolved)| {
-                owner == &containing
-                    && resolved == target
-                    && source.parse.arena.iter().any(|(_, node)| {
-                        matches!(
-                            &node.data,
-                            NodeData::ExportDeclaration(export)
-                                if export.export_clause.is_none()
-                                    && export.module_specifier.is_some_and(|module| {
-                                        string_literal(&source.parse.arena, module)
-                                            .is_some_and(|(text, _)| &text == specifier)
+        self.resolved_modules.iter().any(|(key, resolved)| {
+            key.containing_file == containing
+                && resolved == target
+                && source.parse.arena.iter().any(|(_, node)| {
+                    matches!(
+                        &node.data,
+                        NodeData::ExportDeclaration(export)
+                            if export.export_clause.is_none()
+                                && canonical_static_module_specifier(source, node)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|(_, specifier, requested_mode)| {
+                                        *key == ResolvedModuleKey::new(
+                                            containing.clone(),
+                                            specifier,
+                                            requested_mode.unwrap_or_else(|| {
+                                                self.canonical_emit_module_mode(source)
+                                            }),
+                                        )
                                     })
-                        )
-                    })
-            })
+                    )
+                })
+        })
     }
 
     fn canonical_module_resolution_manifest(
@@ -4388,7 +4444,9 @@ impl Program {
                 self.case_sensitivity,
             );
             for (specifier, text, requested_mode) in specifiers {
-                let key = (containing.clone(), text);
+                let usage_mode =
+                    requested_mode.unwrap_or_else(|| self.canonical_emit_module_mode(source));
+                let key = ResolvedModuleKey::new(containing.clone(), text, usage_mode);
                 let Some(resolved_file_name) = self.resolved_modules.get(&key) else {
                     entries.push(CanonicalModuleResolutionEntry::unresolved(specifier));
                     continue;
@@ -4409,7 +4467,7 @@ impl Program {
                     .is_external_or_common_js_module()
                     && ts_checker::semantic::module_resolution::ambient_module_declaration(
                         &target.parse.arena,
-                        &key.1,
+                        &key.specifier,
                     )
                     .is_none()
                 {
@@ -4420,8 +4478,6 @@ impl Program {
                         },
                     );
                 }
-                let usage_mode =
-                    requested_mode.unwrap_or_else(|| self.canonical_emit_module_mode(source));
                 entries.push(CanonicalModuleResolutionEntry::resolved(
                     specifier,
                     CanonicalResolvedModuleInput::new(
@@ -4718,7 +4774,11 @@ impl Program {
                 );
                 let resolved_module = self
                     .resolved_modules
-                    .get(&(containing, module_specifier.to_owned()))
+                    .get(&ResolvedModuleKey::new(
+                        containing,
+                        module_specifier.to_owned(),
+                        CanonicalModuleResolutionMode::Esm,
+                    ))
                     .and_then(|target| self.file_index.get(target))
                     .and_then(|index| self.source_files.get(*index))
                     .and_then(|target| context.file(target.id))
@@ -5050,7 +5110,11 @@ impl Program {
         );
         let Some(target) = self
             .resolved_modules
-            .get(&(containing, "tslib".to_owned()))
+            .get(&ResolvedModuleKey::new(
+                containing,
+                "tslib".to_owned(),
+                CanonicalModuleResolutionMode::CommonJs,
+            ))
             .and_then(|file_name| self.source_file(file_name))
         else {
             let message = message_by_code(2354).expect("TS2354 must be in the diagnostic catalog");
@@ -5438,11 +5502,11 @@ impl Program {
                 );
                 self.resolved_modules
                     .iter()
-                    .filter_map(|((source, specifier), target)| {
-                        (source == &containing).then(|| {
+                    .filter_map(|(key, target)| {
+                        (key.containing_file == containing).then(|| {
                             self.file_index
                                 .get(target)
-                                .map(|index| (specifier.clone(), *index))
+                                .map(|index| (key.specifier.clone(), *index))
                         })?
                     })
                     .collect::<BTreeMap<_, _>>()
@@ -5630,10 +5694,11 @@ impl Program {
                     else {
                         continue;
                     };
-                    let Some(target_name) = self
-                        .resolved_modules
-                        .get(&(containing.clone(), specifier.clone()))
-                    else {
+                    let Some(target_name) = self.resolved_modules.get(&ResolvedModuleKey::new(
+                        containing.clone(),
+                        specifier.clone(),
+                        self.canonical_emit_module_mode(source),
+                    )) else {
                         continue;
                     };
                     let Some(target) = self
@@ -5683,9 +5748,11 @@ impl Program {
         let (_, _, specifier) = imports
             .iter()
             .find(|(_, imported, _)| imported == "default")?;
-        let target_name = self
-            .resolved_modules
-            .get(&(containing.to_owned(), specifier.clone()))?;
+        let target_name = self.resolved_modules.get(&ResolvedModuleKey::new(
+            containing.to_owned(),
+            specifier.clone(),
+            self.canonical_emit_module_mode(source),
+        ))?;
         let target = self
             .file_index
             .get(target_name)
@@ -5767,10 +5834,11 @@ impl Program {
                     } else {
                         imported
                     };
-                    let Some(target_name) = self
-                        .resolved_modules
-                        .get(&(containing.clone(), specifier.clone()))
-                    else {
+                    let Some(target_name) = self.resolved_modules.get(&ResolvedModuleKey::new(
+                        containing.clone(),
+                        specifier.clone(),
+                        self.canonical_emit_module_mode(source),
+                    )) else {
                         continue;
                     };
                     let Some(target) = self
@@ -7807,9 +7875,11 @@ fn nested_namespace_import_reference(
         .into_iter()
         .filter(|(_, imported, _)| imported == "*")
         .find_map(|(local, _, specifier)| {
-            let resolved = program
-                .resolved_modules
-                .get(&(containing.clone(), specifier))?;
+            let resolved = program.resolved_modules.get(&ResolvedModuleKey::new(
+                containing.clone(),
+                specifier,
+                program.canonical_emit_module_mode(target),
+            ))?;
             if resolved.match_indices("/node_modules/").count() < 2 {
                 return None;
             }
@@ -7842,9 +7912,11 @@ fn nonportable_return_import(
     let nested_imports = source_import_bindings(target)
         .into_iter()
         .filter_map(|(local, imported, specifier)| {
-            let resolved = program
-                .resolved_modules
-                .get(&(containing.clone(), specifier))?;
+            let resolved = program.resolved_modules.get(&ResolvedModuleKey::new(
+                containing.clone(),
+                specifier,
+                program.canonical_emit_module_mode(target),
+            ))?;
             (resolved.match_indices("/node_modules/").count() >= 2).then(|| {
                 let relative = resolved.split_once("/node_modules/").unwrap().1;
                 let module = ts_path::remove_file_extension(relative)
@@ -16088,7 +16160,11 @@ mod tests {
         assert_eq!(
             program
                 .resolved_modules
-                .get(&("/project/main.ts".to_owned(), "M".to_owned()))
+                .get(&super::ResolvedModuleKey::new(
+                    "/project/main.ts".to_owned(),
+                    "M".to_owned(),
+                    CanonicalModuleResolutionMode::CommonJs,
+                ))
                 .map(String::as_str),
             Some("/project/ambient.ts")
         );
@@ -16127,7 +16203,11 @@ export function create() { return new M.Value(); }"#,
         assert_eq!(
             program
                 .resolved_modules
-                .get(&("/project/main.ts".to_owned(), "M".to_owned()))
+                .get(&super::ResolvedModuleKey::new(
+                    "/project/main.ts".to_owned(),
+                    "M".to_owned(),
+                    CanonicalModuleResolutionMode::CommonJs,
+                ))
                 .map(String::as_str),
             Some("/project/ambient.ts")
         );
