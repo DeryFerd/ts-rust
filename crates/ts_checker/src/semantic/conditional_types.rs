@@ -1714,9 +1714,13 @@ fn deferred_conditional(
                 .ok_or(ConditionalTypeError::InvalidInstantiationCache(root))?,
         )
     };
-    store
-        .alloc_conditional_type(root, check_type, extends_type, mapper, alias)
-        .ok_or(ConditionalTypeError::InvalidRoot(root))
+    let conditional = store
+        .alloc_conditional_type(root, check_type, extends_type, mapper, None)
+        .ok_or(ConditionalTypeError::InvalidRoot(root))?;
+    if !store.set_type_alias(conditional, alias) {
+        return Err(ConditionalTypeError::InvalidConditional(conditional));
+    }
+    Ok(conditional)
 }
 
 fn validate_request(
