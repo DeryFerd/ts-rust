@@ -8,7 +8,9 @@ use ts_compiler::{
 };
 
 use crate::{
-    Case, baseline_unit_name, is_default_library_file, remove_test_path_prefixes, virtual_unit_path,
+    Case, Unit, baseline_unit_name, is_default_library_file, pinned_project_config,
+    project_config_unit, project_root_unit_indices, remove_test_path_prefixes,
+    unit_uses_implicit_references, virtual_unit_path,
 };
 
 pub(crate) mod symbols;
@@ -36,7 +38,7 @@ impl SemanticArtifactKind {
     }
 }
 
-/// Nodes visited by each pinned baseline walk, grouped in fixture-file order.
+/// Nodes visited by each pinned baseline walk, grouped in harness input order.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SemanticArtifactWalk {
     pub(crate) types: Vec<NodeRef>,
@@ -126,16 +128,50 @@ impl fmt::Display for ArtifactWalkError {
 
 impl Error for ArtifactWalkError {}
 
+fn source_files<'a>(
+    case: &'a Case,
+    program: &'a Program,
+) -> impl Iterator<Item = (usize, &'a Unit, &'a SourceFile)> + 'a {
+    let mut order = (0..case.units.len()).collect::<Vec<_>>();
+    let config_path = project_config_unit(case).map(|(path, _)| path);
+    // The pinned compiler runner writes toBeCompiled, then otherFiles. Both
+    // groups retain fixture order, independent of the Program's load order.
+    if let Some(config) = pinned_project_config(case) {
+        // Project files are selected before harness option overrides apply.
+        let options = ts_options::parse_project_options(&config).options;
+        let roots = project_root_unit_indices(case, &config, &options);
+        order.sort_by_key(|index| !roots.contains(index));
+    } else if config_path.is_none()
+        && (case
+            .directive_values("noImplicitReferences")
+            .last()
+            .is_some_and(|value| !value.is_empty())
+            || case.units.last().is_some_and(unit_uses_implicit_references))
+        && !order.is_empty()
+    {
+        order.rotate_right(1);
+    }
+
+    order.into_iter().filter_map(move |index| {
+        let unit = &case.units[index];
+        let file_name = virtual_unit_path(case, unit, index);
+        if config_path.as_deref() == Some(file_name.as_str()) {
+            return None;
+        }
+        // Only loaded fixture files have sections. Libraries loaded from the
+        // compiler or harness filesystem do not belong to this list.
+        program
+            .source_file(&file_name)
+            .map(|source| (index, unit, source))
+    })
+}
+
 pub(crate) fn walk_program(
     case: &Case,
     program: &Program,
 ) -> Result<SemanticArtifactWalk, ArtifactWalkError> {
     let mut result = SemanticArtifactWalk::default();
-    for (index, unit) in case.units.iter().enumerate() {
-        let file_name = virtual_unit_path(case, unit, index);
-        let Some(source) = program.source_file(&file_name) else {
-            continue;
-        };
+    for (_, _, source) in source_files(case, program) {
         walk_source(source, SemanticArtifactKind::Types, &mut result.types)?;
         walk_source(source, SemanticArtifactKind::Symbols, &mut result.symbols)?;
     }
@@ -177,11 +213,7 @@ fn render_baseline(
     nodes: &[NodeRef],
 ) -> Result<String, String> {
     let mut sections = String::new();
-    for (index, unit) in case.units.iter().enumerate() {
-        let file_name = virtual_unit_path(case, unit, index);
-        let Some(source) = program.source_file(&file_name) else {
-            continue;
-        };
+    for (index, unit, source) in source_files(case, program) {
         let lines = nodes
             .iter()
             .copied()
@@ -839,9 +871,248 @@ mod tests {
     use ts_options::CompilerOptions;
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
-    use crate::Case;
+    use crate::{Case, fixture_case_sensitive, virtual_harness_path, virtual_unit_path};
 
-    use super::{declaration_full_start, ecma_line_and_utf16_column, render_program, walk_program};
+    use super::{
+        SemanticArtifactWalk, declaration_full_start, ecma_line_and_utf16_column, render_program,
+        source_files, walk_program,
+    };
+
+    fn fixture_filesystem(case: &Case) -> MemoryFileSystem {
+        let filesystem = MemoryFileSystem::new(fixture_case_sensitive(case));
+        for (index, unit) in case.units.iter().enumerate() {
+            filesystem
+                .write_file(
+                    &virtual_unit_path(case, unit, index),
+                    unit.source_text.as_scannable_str(),
+                )
+                .unwrap();
+        }
+        filesystem
+    }
+
+    fn assert_walk_file_order(program: &Program, walk: &SemanticArtifactWalk, paths: &[String]) {
+        let expected = paths
+            .iter()
+            .map(|path| program.source_file(path).unwrap().id)
+            .collect::<Vec<_>>();
+        for nodes in [&walk.types, &walk.symbols] {
+            let mut actual = nodes.iter().map(|node| node.file).collect::<Vec<_>>();
+            actual.dedup();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    fn assert_rendered_file_order(case: &Case, roots: &[&str], expected: &[&str]) {
+        let filesystem = fixture_filesystem(case);
+        let roots = roots
+            .iter()
+            .map(|path| virtual_harness_path(case, path))
+            .collect::<Vec<_>>();
+        let expected_paths = expected
+            .iter()
+            .map(|path| virtual_harness_path(case, path))
+            .collect::<Vec<_>>();
+        let (_, artifacts) = Program::try_new_with_canonical_checker_and_queries(
+            &filesystem,
+            "/.src",
+            &roots,
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                render_program(case, program, queries).inspect(|artifacts| {
+                    assert_walk_file_order(program, &artifacts.walk, &expected_paths);
+                })
+            },
+        )
+        .unwrap();
+        let artifacts = artifacts.unwrap().unwrap();
+        let expected = expected
+            .iter()
+            .map(|name| format!("=== {name} ==="))
+            .collect::<Vec<_>>();
+        for baseline in [artifacts.types, artifacts.symbols] {
+            let baseline = baseline.unwrap();
+            let sections = baseline
+                .lines()
+                .filter(|line| line.starts_with("=== "))
+                .collect::<Vec<_>>();
+            assert_eq!(sections, expected);
+        }
+    }
+
+    #[test]
+    fn semantic_artifacts_keep_fixture_order_for_unreferenced_roots() {
+        let case = Case::parse(
+            "roots.ts",
+            concat!(
+                "// @filename: second.ts\n",
+                "const second = 2;\n",
+                "// @filename: first.ts\n",
+                "const first = 1;\n",
+            ),
+        )
+        .unwrap();
+        assert_rendered_file_order(
+            &case,
+            &["second.ts", "first.ts"],
+            &["second.ts", "first.ts"],
+        );
+    }
+
+    #[test]
+    fn semantic_artifacts_put_implicit_reference_root_before_dependencies() {
+        let case = Case::parse(
+            "references.ts",
+            concat!(
+                "// @filename: first.ts\n",
+                "const first = 1;\n",
+                "// @filename: ignored.ts\n",
+                "const ignored = 0;\n",
+                "// @filename: second.ts\n",
+                "const second = 2;\n",
+                "// @filename: entry.ts\n",
+                "/// <reference path=\"./second.ts\" />\n",
+                "/// <reference path=\"./first.ts\" />\n",
+                "const entry = 3;\n",
+            ),
+        )
+        .unwrap();
+        assert_rendered_file_order(&case, &["entry.ts"], &["entry.ts", "first.ts", "second.ts"]);
+    }
+
+    #[test]
+    fn semantic_artifacts_partition_project_roots_in_fixture_order() {
+        let case = Case::parse(
+            "project.ts",
+            concat!(
+                "// @noImplicitReferences: true\n",
+                "// @filename: /app/dep-a.ts\n",
+                "const dependencyA = 1;\n",
+                "// @filename: /app/src/second.ts\n",
+                "/// <reference path=\"../dep-b.ts\" />\n",
+                "const second = 2;\n",
+                "// @filename: /app/tsconfig.json\n",
+                "{ \"files\": [\"src/first.ts\", \"src/second.ts\"] }\n",
+                "// @filename: /app/dep-b.ts\n",
+                "const dependencyB = 2;\n",
+                "// @filename: /app/src/first.ts\n",
+                "/// <reference path=\"../dep-a.ts\" />\n",
+                "const first = 1;\n",
+            ),
+        )
+        .unwrap();
+        assert_rendered_file_order(
+            &case,
+            &["/app/src/second.ts", "/app/src/first.ts"],
+            &[
+                "/app/src/second.ts",
+                "/app/src/first.ts",
+                "/app/dep-a.ts",
+                "/app/dep-b.ts",
+            ],
+        );
+    }
+
+    #[test]
+    fn semantic_artifacts_keep_project_membership_before_harness_overrides() {
+        let case = Case::parse(
+            "projectOverride.ts",
+            concat!(
+                "// @allowJs: true\n",
+                "// @filename: dependency.js\n",
+                "export const dependency = 1;\n",
+                "// @filename: tsconfig.json\n",
+                "{}\n",
+                "// @filename: entry.ts\n",
+                "import './dependency.js';\n",
+                "export const entry = 1;\n",
+            ),
+        )
+        .unwrap();
+        let filesystem = fixture_filesystem(&case);
+        let program = Program::new_with_options(
+            &filesystem,
+            "/.src",
+            &["/.src/entry.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                allow_js: true,
+                allow_js_specified: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let paths = [
+            "/.src/entry.ts".to_owned(),
+            "/.src/dependency.js".to_owned(),
+        ];
+        assert_eq!(
+            source_files(&case, &program)
+                .map(|(_, _, source)| &source.file_name)
+                .collect::<Vec<_>>(),
+            paths.iter().collect::<Vec<_>>(),
+        );
+        assert_walk_file_order(&program, &walk_program(&case, &program).unwrap(), &paths);
+    }
+
+    #[test]
+    fn semantic_artifacts_skip_non_fixture_libraries_but_keep_fixture_declarations() {
+        let case = Case::parse(
+            "libraries.ts",
+            concat!(
+                "// @filename: lib.fixture.d.ts\n",
+                "declare const fixtureValue: number;\n",
+                "// @filename: lib.unloaded.d.ts\n",
+                "declare const unloaded: number;\n",
+                "// @filename: entry.ts\n",
+                "/// <reference path=\"./lib.fixture.d.ts\" />\n",
+                "/// <reference path=\"/.lib/harness.d.ts\" />\n",
+                "const entry = 1;\n",
+            ),
+        )
+        .unwrap();
+        let filesystem = fixture_filesystem(&case);
+        filesystem
+            .write_file(
+                "/.lib/harness.d.ts",
+                "declare const harnessValue: number;\n",
+            )
+            .unwrap();
+        let program = Program::new_with_options(
+            &filesystem,
+            "/.src",
+            &["/.src/entry.ts".to_owned()],
+            CompilerOptions {
+                skip_lib_check: true,
+                skip_default_lib_check: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program
+                .source_files()
+                .iter()
+                .any(|source| source.is_default_library)
+        );
+        assert!(program.source_file("/.lib/harness.d.ts").is_some());
+        assert!(program.source_file("/.src/lib.unloaded.d.ts").is_none());
+        assert_eq!(
+            source_files(&case, &program)
+                .map(|(_, _, source)| source.file_name.as_str())
+                .collect::<Vec<_>>(),
+            ["/.src/entry.ts", "/.src/lib.fixture.d.ts"],
+        );
+        assert_walk_file_order(
+            &program,
+            &walk_program(&case, &program).unwrap(),
+            &[
+                "/.src/entry.ts".to_owned(),
+                "/.src/lib.fixture.d.ts".to_owned(),
+            ],
+        );
+    }
 
     #[test]
     fn declaration_positions_include_leading_line_and_jsdoc_comments() {
