@@ -52678,7 +52678,11 @@ mod tests {
                 &fixture.parsed.arena,
                 fixture.files.get(&fixture.file).unwrap(),
             );
-            assert!(object_members::plan_interface(&fixture.store, &host, template).is_err());
+            let cold = store_state(&fixture.store);
+            let plan = object_members::plan_interface(&fixture.store, &host, template).unwrap();
+            assert_eq!(plan.symbol, template);
+            assert!(plan.heritage.is_some());
+            assert_eq!(store_state(&fixture.store), cold);
 
             let mut diagnostics = CanonicalCheckerDiagnostics::default();
             let expected = if direct_declared_query {
