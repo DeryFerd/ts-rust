@@ -35574,6 +35574,63 @@ fn inferred_variable_type(
         .map_err(Into::into)
 }
 
+/// Resolves a cold global iterator key through its declared value annotation.
+#[allow(clippy::too_many_arguments)] // Uses the active source query and staged diagnostic owner.
+pub(super) fn source_iterator_key(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    node: NodeRef,
+) -> Result<EscapedName, SourceCheckError> {
+    use super::object_members::{KnownSymbolKeyError, iterator_key_with_global_types};
+
+    let mut demanded = HashSet::new();
+    loop {
+        match iterator_key_with_global_types(store, global_types) {
+            Ok(key) => return Ok(key),
+            Err(KnownSymbolKeyError::NeedsValueType {
+                symbol,
+                annotation: Some(annotation),
+            }) => {
+                if !demanded.insert(symbol) {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Element(node),
+                    ));
+                }
+                let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                )?;
+                query.preflight_type_from_type_node(annotation)?;
+                query.get_type_from_type_node(annotation)?;
+            }
+            Err(KnownSymbolKeyError::NeedsValueType {
+                annotation: None, ..
+            }) => {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Element(node),
+                ));
+            }
+            Err(KnownSymbolKeyError::Relation(error)) => return Err(error.into()),
+            Err(KnownSymbolKeyError::MissingBootstrap) => {
+                return Err(RelationUnavailable::MissingBootstrap.into());
+            }
+            Err(
+                KnownSymbolKeyError::MissingGlobalTypes
+                | KnownSymbolKeyError::InvalidSymbol(_)
+                | KnownSymbolKeyError::InvalidType(_),
+            ) => return Err(SourceCheckError::Element(node)),
+        }
+    }
+}
+
 /// Resolves arrays, strings, and iterable unions without accepting invalid union members.
 fn source_for_of_iteration_type(
     store: &mut CanonicalTypeMapperStore,

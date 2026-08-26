@@ -171,9 +171,17 @@ mod tests {
             receiver: TypeId,
             name: EscapedNameRef<'_>,
         ) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
-            store
-                .resolved_own_property_by_key(receiver, name)
-                .map_err(Into::into)
+            let mut session = crate::semantic::instantiate::InstantiationSession::new(
+                crate::semantic::instantiate::InstantiationLimits::default(),
+            );
+            crate::semantic::object_members::resolve_object_property_by_key(
+                store,
+                None,
+                receiver,
+                name,
+                &mut session,
+            )
+            .map_err(Into::into)
         }
     }
 
@@ -352,6 +360,110 @@ mod tests {
             assert_eq!(diagnostic.diagnostic.arguments, ["undefined", "number"]);
             assert!(diagnostic.related_information.is_empty());
         }
+    }
+
+    #[test]
+    fn real_library_iterator_key_uses_normal_value_demand() {
+        let library = standard_library();
+        let source = parsed("declare var input: string[];");
+        let source_file = FileId::new(22_599);
+        let mut files = library
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (FileId::new(22_500 + u32::try_from(index).unwrap()), file))
+            .collect::<Vec<_>>();
+        files.push((source_file, &source));
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&files, library.len(), options);
+        let global_types = context.global_types().clone();
+        let bound = files
+            .iter()
+            .map(|(file, _)| context.file(*file).unwrap().1.clone())
+            .collect::<Vec<_>>();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            files
+                .iter()
+                .zip(&bound)
+                .map(|((_, file), bound)| (&file.arena, bound)),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let node = annotation(&source, source_file, "input");
+        let store = context.store_mut_for_test();
+        let mut diagnostics = crate::semantic::CanonicalCheckerDiagnostics::default();
+        let mut session = crate::semantic::instantiate::InstantiationSession::new(
+            crate::semantic::instantiate::InstantiationLimits::default(),
+        );
+        let key = crate::semantic::source::source_iterator_key(
+            store,
+            &host,
+            &global_types,
+            options,
+            &mut session,
+            &mut diagnostics,
+            node,
+        )
+        .unwrap();
+        assert_ne!(
+            key,
+            ts_binder::semantic::SymbolStore::known_symbol_name("iterator")
+        );
+        let constructor = store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .unwrap()
+            .get_source("SymbolConstructor")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .unwrap();
+        let iterator = store
+            .symbol(constructor)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("iterator"))
+            .unwrap();
+        let key_type = store
+            .value_symbol_links(iterator)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let TypeData::UniqueEsSymbol(unique) = store.type_payload(key_type).unwrap().data() else {
+            panic!("the standard iterator key is a unique symbol")
+        };
+        assert_eq!(key, unique.name);
+        assert!(diagnostics.is_empty());
+        let state = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            crate::semantic::source::source_iterator_key(
+                store,
+                &host,
+                &global_types,
+                options,
+                &mut session,
+                &mut diagnostics,
+                node,
+            )
+            .unwrap(),
+            key,
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            state,
+        );
     }
 
     #[test]
