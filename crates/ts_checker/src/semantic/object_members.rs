@@ -246,6 +246,8 @@ struct SourceMemberName {
 }
 
 /// Resolves one source member without preparing sibling type annotations.
+/// The symbol remains the declaration symbol when its type is instantiated.
+/// Use this result for type reads, not union-property or member-table publication.
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)] // Keep the source query's diagnostics and instantiation limits.
 pub(super) fn resolve_object_property_by_key_with_source(
@@ -272,17 +274,50 @@ pub(super) fn resolve_object_property_by_key_with_source(
             return Err(RelationUnavailable::UnsupportedStructuredType(receiver).into());
         }
         let readonly = tuple.is_readonly();
-        let optional = tuple
-            .combined_flags()
-            .intersects(super::signatures::ElementFlags::OPTIONAL);
-        let mut elements = tuple.element_types().to_vec();
-        if optional && options.intrinsic.strict_null_checks {
-            elements.push(
-                store
-                    .intrinsic_bootstrap()
-                    .ok_or(RelationUnavailable::MissingBootstrap)?
-                    .undefined_type,
-            );
+        let elements = tuple.element_types().to_vec();
+        let array_target = if readonly {
+            global_types.readonly_array_type
+        } else {
+            global_types.array_type
+        };
+        let target = store
+            .canonical_array_reference(global_types, array_target)?
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(array_target))?;
+        let target_record = store
+            .type_payload(target.base_type)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(array_target))?;
+        let TypeData::Interface(interface) = target_record.data() else {
+            return Err(RelationUnavailable::InvalidStructuredMembers(array_target).into());
+        };
+        if interface.declared_members_resolved {
+            validate_generic_interface_members(
+                store,
+                array_target,
+                Some(CanonicalArrayTargets::from_global_types(global_types)),
+            )
+            .map_err(|error| source_generic_member_error(array_target, &error))?;
+        } else {
+            if !valid_cold_declared_member_cache(interface) {
+                return Err(RelationUnavailable::InvalidStructuredMembers(array_target).into());
+            }
+            let owner = target_record
+                .symbol()
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(array_target))?;
+            if preflight_source_member_selection(
+                store,
+                host,
+                global_types,
+                options,
+                owner,
+                array_target,
+                name,
+                session,
+                diagnostics,
+            )?
+            .is_none()
+            {
+                return Ok(None);
+            }
         }
         let element = store.expression_union_type_with_global_types(
             global_types,
@@ -356,11 +391,7 @@ pub(super) fn resolve_object_property_by_key_with_source(
             .data()
             .structured()
             .is_none_or(|members| members != &StructuredTypeData::default())
-            || interface.reference.object.structured != StructuredTypeData::default()
-            || interface.declared_members.is_some()
-            || interface.declared_call_signatures.is_some()
-            || interface.declared_construct_signatures.is_some()
-            || interface.declared_index_infos.is_some()
+            || !valid_cold_declared_member_cache(interface)
         {
             return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
         }
@@ -411,16 +442,25 @@ pub(super) fn resolve_object_property_by_key_with_source(
             .map_err(Into::into);
         }
         match record.data() {
-            TypeData::Interface(_)
-                if super::declared::cached_interface_type(store, owner)? != Some(receiver) =>
-            {
-                return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
+            TypeData::Interface(interface) => {
+                if super::declared::cached_interface_type(store, owner)? != Some(receiver)
+                    || !valid_cold_declared_member_cache(interface)
+                    || interface.resolved_base_types.is_some()
+                    || interface.resolved_base_constructor_type.is_some()
+                {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
+                }
             }
             TypeData::Object(object) => {
                 let declaration = store
                     .symbol(owner)
                     .and_then(ts_binder::semantic::Symbol::declarations)
-                    .and_then(|declarations| (declarations.len() == 1).then_some(declarations[0]))
+                    .and_then(|declarations| {
+                        declarations
+                            .first()
+                            .copied()
+                            .filter(|_| declarations.len() == 1)
+                    })
                     .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
                 if store
                     .type_node_links(declaration)
@@ -439,59 +479,20 @@ pub(super) fn resolve_object_property_by_key_with_source(
         }
         (owner, Vec::new(), Vec::new())
     };
-    let (mut names, has_heritage) = plan_source_member_names(store, host, owner)?;
-    for key in names.iter().filter_map(|member| member.computed) {
-        let query = CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-        )?;
-        query.preflight_type_from_type_node(key.type_node)?;
-    }
-    for member in &mut names {
-        if let Some(key) = member.computed {
-            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                diagnostics,
-            )?;
-            query.get_type_from_type_node(key.type_node)?;
-            member.name = Some(
-                resolved_computed_member_key(store, &key)
-                    .map_err(source_computed_key_error)?
-                    .ok_or(RelationUnavailable::UnsupportedProperty(member.symbol))?
-                    .1,
-            );
-        }
-    }
-    validate_source_member_name_cache(store, owner, &names)?;
-    let selected = names
-        .iter()
-        .filter(|member| {
-            member
-                .name
-                .as_ref()
-                .is_some_and(|candidate| candidate.as_ref() == name)
-        })
-        .collect::<Vec<_>>();
-    let Some(first) = selected.first() else {
-        if has_heritage {
-            return Err(RelationUnavailable::UnsupportedStructuredType(receiver).into());
-        }
+    let Some(symbol) = preflight_source_member_selection(
+        store,
+        host,
+        global_types,
+        options,
+        owner,
+        receiver,
+        name,
+        session,
+        diagnostics,
+    )?
+    else {
         return Ok(None);
     };
-    let symbol = first.symbol;
-    if selected.iter().any(|member| member.symbol != symbol) {
-        return Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Element(first.declaration),
-        ));
-    }
     let method = store
         .symbol(symbol)
         .ok_or(RelationUnavailable::Symbol(symbol))?
@@ -506,10 +507,8 @@ pub(super) fn resolve_object_property_by_key_with_source(
         diagnostics,
     )?;
     let template = if method {
-        query.preflight_type_of_interface_method(symbol)?;
         query.get_type_of_interface_method(symbol)?
     } else {
-        query.preflight_type_of_declared_value(symbol)?;
         query.get_type_of_declared_value(symbol)?
     };
     let symbol = store
@@ -556,6 +555,99 @@ pub(super) fn resolve_object_property_by_key_with_source(
     }))
 }
 
+fn valid_cold_declared_member_cache(interface: &InterfaceTypeData) -> bool {
+    !interface.declared_members_resolved
+        && interface.declared_members.is_none()
+        && interface.declared_call_signatures.is_none()
+        && interface.declared_construct_signatures.is_none()
+        && interface.declared_index_infos.is_none()
+        && interface.reference.object.structured == StructuredTypeData::default()
+}
+
+#[allow(clippy::too_many_arguments)] // The preflight uses the same source query context as execution.
+fn preflight_source_member_selection(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    owner: SemanticSymbolId,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+    let (names, has_heritage) = plan_source_member_names(store, host, owner)?;
+    validate_source_member_name_cache(store, host, owner, &names)?;
+    let mut selected = None;
+    for member in &names {
+        if !source_member_name_matches(store, member, name)? {
+            continue;
+        }
+        if selected.is_some_and(|symbol| symbol != member.symbol) {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Element(member.declaration),
+            ));
+        }
+        selected = Some(member.symbol);
+    }
+    let Some(symbol) = selected else {
+        return if has_heritage {
+            Err(RelationUnavailable::UnsupportedStructuredType(receiver).into())
+        } else {
+            Ok(None)
+        };
+    };
+    let method = store
+        .symbol(symbol)
+        .ok_or(RelationUnavailable::Symbol(symbol))?
+        .flags()
+        .contains(SymbolFlags::METHOD);
+    let query = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )?;
+    if method {
+        query.preflight_type_of_interface_method(symbol)?;
+    } else {
+        query.preflight_type_of_declared_value(symbol)?;
+    }
+    Ok(Some(symbol))
+}
+
+fn source_member_name_matches(
+    store: &CanonicalTypeMapperStore,
+    member: &SourceMemberName,
+    requested: EscapedNameRef<'_>,
+) -> Result<bool, SourceCheckError> {
+    if let Some(name) = &member.name {
+        return Ok(name.as_ref() == requested);
+    }
+    let key = member
+        .computed
+        .ok_or(RelationUnavailable::Symbol(member.symbol))?;
+    let record = store
+        .symbol(key.key_symbol)
+        .ok_or(RelationUnavailable::Symbol(key.key_symbol))?;
+    // A unique-symbol query key already carries an assigned identity. Do not
+    // create identities or resolve unrelated key annotations during selection.
+    let Some(identity) = store
+        .symbol_store()
+        .assigned_global_symbol_id(key.key_symbol)
+    else {
+        return Ok(false);
+    };
+    let suffix = requested
+        .as_bytes()
+        .strip_prefix(b"\xFE@")
+        .and_then(|name| name.strip_prefix(record.name().as_bytes()))
+        .and_then(|name| name.strip_prefix(b"@"));
+    Ok(suffix == Some(identity.to_string().as_bytes()))
+}
+
 fn source_generic_member_error(
     receiver: TypeId,
     error: &GenericInterfaceMemberError,
@@ -594,43 +686,107 @@ fn source_computed_key_error(error: ComputedMemberKeyError) -> SourceCheckError 
 
 fn validate_source_member_name_cache(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     owner: SemanticSymbolId,
     names: &[SourceMemberName],
 ) -> Result<(), SourceCheckError> {
     let invalid = || RelationUnavailable::Symbol(owner);
-    let raw = store
-        .symbol(owner)
-        .ok_or_else(invalid)?
-        .members()
-        .and_then(|members| store.symbol_table(members));
-    let Some(resolved) = store.members_and_exports_links(owner).and_then(|links| {
+    let raw = store.symbol(owner).ok_or_else(invalid)?.members();
+    let resolved = store.members_and_exports_links(owner).and_then(|links| {
         links.table(super::links::MembersOrExportsResolutionKind::ResolvedMembers)
-    }) else {
-        return Ok(());
-    };
-    let resolved = store.symbol_table(resolved).ok_or_else(invalid)?;
-    for (name, symbol) in resolved.iter() {
-        if raw.and_then(|table| table.get(name)) == Some(symbol) {
+    });
+    if resolved
+        .is_some_and(|resolved| !valid_partial_member_name_table(store, owner, raw, resolved))
+    {
+        return Err(invalid().into());
+    }
+    let table = resolved.and_then(|table| store.symbol_table(table));
+    for member in names.iter().filter(|member| member.computed.is_some()) {
+        let late = store
+            .late_bound_links(member.symbol)
+            .and_then(|links| links.late_symbol);
+        let Some(late) = late else {
+            if store
+                .symbol_node_links(member.declaration)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+                || store
+                    .value_symbol_links(member.symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+            {
+                return Err(invalid().into());
+            }
             continue;
+        };
+        let source = store.symbol(member.symbol).ok_or_else(invalid)?;
+        let declarations = source.declarations().ok_or_else(invalid)?;
+        let links = store.value_symbol_links(late).ok_or_else(invalid)?;
+        if !super::structured_members::valid_late_bound_unique_symbol_member(
+            store,
+            owner,
+            late,
+            declarations,
+            links,
+            table,
+        ) {
+            return Err(invalid().into());
         }
-        if !names.iter().any(|member| {
-            member.computed.is_some()
-                && member
-                    .name
-                    .as_ref()
-                    .is_some_and(|expected| expected.as_ref() == name)
-                && store
-                    .late_bound_links(member.symbol)
-                    .and_then(|links| links.late_symbol)
-                    == Some(symbol)
-                && store
-                    .symbol(symbol)
-                    .is_some_and(|symbol| symbol.name() == name)
-        }) {
+        let value = links.resolved_type.ok_or_else(invalid)?;
+        if source.flags().contains(SymbolFlags::METHOD) {
+            let plan = plan_selected_interface_method(store, host, member.symbol)
+                .map_err(|_| invalid())?;
+            if interface_method_value_state(store, &plan).map_err(|_| invalid())? != Some(value) {
+                return Err(invalid().into());
+            }
+        } else if store
+            .source_direct_type_annotation(member.declaration)
+            .is_none_or(|annotation| {
+                !store.source_direct_type_annotation_is_exact(annotation, value)
+            })
+        {
             return Err(invalid().into());
         }
     }
     Ok(())
+}
+
+/// Checks the shared raw entries and every published computed-name entry.
+fn valid_partial_member_name_table(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    raw: Option<SymbolTableId>,
+    cached: SymbolTableId,
+) -> bool {
+    let Some(members) = store.symbol_table(cached) else {
+        return false;
+    };
+    let binder = raw.and_then(|table| store.symbol_table(table));
+    Some(cached) != raw
+        && raw.is_some() == binder.is_some()
+        && binder.is_none_or(|binder| {
+            binder
+                .iter()
+                .all(|(name, symbol)| members.get(name) == Some(symbol))
+        })
+        && members.iter().all(|(name, symbol)| {
+            if binder.and_then(|binder| binder.get(name)) == Some(symbol) {
+                return true;
+            }
+            store.symbol(symbol).is_some_and(|record| {
+                record.name() == name
+                    && store.value_symbol_links(symbol).is_some_and(|value| {
+                        record.declarations().is_some_and(|declarations| {
+                            super::structured_members::valid_late_bound_unique_symbol_member(
+                                store,
+                                owner,
+                                symbol,
+                                declarations,
+                                value,
+                                Some(members),
+                            )
+                        })
+                    })
+            })
+        })
 }
 
 fn plan_source_member_names(
@@ -803,13 +959,14 @@ fn plan_source_member_names(
                     };
                     match static_name {
                         Some(name) => (Some(name), None),
-                        None => (
-                            None,
-                            Some(
-                                plan_computed_member_key(store, host, name_node)
-                                    .map_err(source_computed_key_error)?,
-                            ),
-                        ),
+                        None => {
+                            let key = plan_computed_member_key(store, host, name_node)
+                                .map_err(source_computed_key_error)?;
+                            let cached = resolved_computed_member_key(store, &key)
+                                .map_err(source_computed_key_error)?
+                                .map(|(_, name)| name);
+                            (cached, Some(key))
+                        }
                     }
                 }
                 _ => (source_static_member_name(store, host, name_node)?, None),
@@ -9628,39 +9785,10 @@ pub(super) fn publish_interface_method_names(
         .cloned()
         .unwrap_or_default();
     let cached = links.table(super::links::MembersOrExportsResolutionKind::ResolvedMembers);
-    if let Some(cached) = cached {
-        let members = store
-            .symbol_table(cached)
-            .ok_or_else(|| invalid_plan(plan))?;
-        let binder = raw.and_then(|table| store.symbol_table(table));
-        if Some(cached) == raw
-            || binder.is_some_and(|binder| {
-                binder
-                    .iter()
-                    .any(|(name, symbol)| members.get(name) != Some(symbol))
-            })
-            || members.iter().any(|(name, symbol)| {
-                if binder.and_then(|binder| binder.get(name)) == Some(symbol) {
-                    return false;
-                }
-                store.symbol(symbol).is_none_or(|record| {
-                    store.value_symbol_links(symbol).is_none_or(|value| {
-                        record.declarations().is_none_or(|declarations| {
-                            !super::structured_members::valid_late_bound_unique_symbol_member(
-                                store,
-                                plan.symbol,
-                                symbol,
-                                declarations,
-                                value,
-                                Some(members),
-                            )
-                        })
-                    })
-                })
-            })
-        {
-            return Err(invalid_plan(plan));
-        }
+    if cached
+        .is_some_and(|cached| !valid_partial_member_name_table(store, plan.symbol, raw, cached))
+    {
+        return Err(invalid_plan(plan));
     }
     if !store.try_reserve_checker_symbol_allocations(1, usize::from(cached.is_none())) {
         return Err(PropertyObjectError::Capacity(plan.node));
@@ -18585,6 +18713,14 @@ mod selected_source_member_tests {
         files: &[(FileId, &'arena ParseResult)],
         library_count: usize,
     ) -> CanonicalCheckerContext<'arena> {
+        context_with_options(files, library_count, options())
+    }
+
+    fn context_with_options<'arena>(
+        files: &[(FileId, &'arena ParseResult)],
+        library_count: usize,
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'arena> {
         let mut binder = CanonicalBinder::new();
         for (index, &(file, parsed)) in files.iter().enumerate() {
             binder
@@ -18613,7 +18749,7 @@ mod selected_source_member_tests {
                 .iter()
                 .map(|(file, parsed)| (*file, &parsed.arena))
                 .collect(),
-            options(),
+            options,
         )
         .unwrap()
     }
@@ -18646,12 +18782,13 @@ mod selected_source_member_tests {
             .unwrap()
     }
 
-    fn state(store: &CanonicalTypeMapperStore) -> (usize, usize, usize, usize, [usize; 26]) {
+    fn state(store: &CanonicalTypeMapperStore) -> (usize, usize, usize, usize, usize, [usize; 26]) {
         (
             store.type_len(),
             store.mapper_len(),
             store.signature_len(),
             store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
             store.checker_link_allocated_lengths(),
         )
     }
@@ -18991,8 +19128,453 @@ mod selected_source_member_tests {
     }
 
     #[test]
-    fn selected_source_member_uses_the_real_array_iterator_without_sibling_annotations() {
-        let library = [
+    fn selected_source_member_preflights_before_cold_key_or_tuple_writes() {
+        for (body, request, tuple) in [
+            (
+                "interface Box<T> { [key](): T; bad: Missing; } declare var input: Box<number>;",
+                "bad",
+                false,
+            ),
+            (
+                "interface Box<T> { [key](): Missing; } declare var input: Box<number>;",
+                "key",
+                false,
+            ),
+            (
+                "interface Array<T> { [key](): Missing; } declare var input: [number, string];",
+                "key",
+                true,
+            ),
+        ] {
+            let library = parsed(BASE);
+            let source = parsed(&format!("declare const key: unique symbol; {body}"));
+            let file = FileId::new(28_551);
+            let files = [(FileId::new(28_550), &library), (file, &source)];
+            let mut context = context(&files, 1);
+            let receiver = context
+                .get_type_from_type_node(annotation(&source, file, "input"))
+                .unwrap();
+            let globals = context.global_types().clone();
+            let bound = files
+                .iter()
+                .map(|(file, _)| context.file(*file).unwrap().1.clone())
+                .collect::<Vec<_>>();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                files
+                    .iter()
+                    .zip(&bound)
+                    .map(|((_, file), bound)| (&file.arena, bound)),
+                GlobalMergeCompletion::for_test(options().name_resolution),
+            )
+            .unwrap();
+            let store = context.store_mut_for_test();
+            let key_symbol = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap()
+                .get_source("key")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let key = if request == "key" {
+                store.unique_symbol_name(key_symbol).unwrap()
+            } else {
+                EscapedName::source(request)
+            };
+            let key_annotation = annotation(&source, file, "key");
+            assert!(store.type_node_links(key_annotation).is_none());
+            let identity = store.symbol_store().assigned_global_symbol_id(key_symbol);
+            let before = state(store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            assert!(
+                resolve_object_property_by_key_with_source(
+                    store,
+                    &host,
+                    &globals,
+                    options(),
+                    receiver,
+                    key.as_ref(),
+                    &mut session,
+                    &mut diagnostics
+                )
+                .is_err(),
+                "body: {body}"
+            );
+            assert_eq!(state(store), before, "body: {body}");
+            assert!(store.type_node_links(key_annotation).is_none());
+            assert_eq!(
+                store.symbol_store().assigned_global_symbol_id(key_symbol),
+                identity
+            );
+            assert!(diagnostics.is_empty());
+            assert_eq!(
+                store.canonical_tuple_shape(receiver).unwrap().is_some(),
+                tuple
+            );
+        }
+    }
+
+    #[test]
+    fn selected_source_member_accepts_a_cold_key_with_an_assigned_identity() {
+        let library = parsed(BASE);
+        let source = parsed(concat!(
+            "declare const key: unique symbol; interface Box<T> { [key](): T; bad: Missing; } ",
+            "declare var input: Box<number>;",
+        ));
+        let file = FileId::new(28_561);
+        let files = [(FileId::new(28_560), &library), (file, &source)];
+        let mut context = context(&files, 1);
+        let receiver = context
+            .get_type_from_type_node(annotation(&source, file, "input"))
+            .unwrap();
+        let globals = context.global_types().clone();
+        let bound = files
+            .iter()
+            .map(|(file, _)| context.file(*file).unwrap().1.clone())
+            .collect::<Vec<_>>();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            files
+                .iter()
+                .zip(&bound)
+                .map(|((_, file), bound)| (&file.arena, bound)),
+            GlobalMergeCompletion::for_test(options().name_resolution),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let key_symbol = store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .unwrap()
+            .get_source("key")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .unwrap();
+        let key = store.unique_symbol_name(key_symbol).unwrap();
+        assert!(
+            store
+                .type_node_links(annotation(&source, file, "key"))
+                .is_none()
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let selected = resolve_object_property_by_key_with_source(
+            store,
+            &host,
+            &globals,
+            options(),
+            receiver,
+            key.as_ref(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .unwrap();
+        let signature = store
+            .type_payload(selected.type_)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            Some(store.intrinsic_bootstrap().unwrap().number_type)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn selected_source_member_rejects_incomplete_or_forged_computed_name_caches() {
+        use crate::semantic::links::{LateBoundLinks, MembersOrExportsResolutionKind};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Poison {
+            Empty,
+            Reduced,
+            RawAlias,
+            MissingTable,
+            WrongOwner,
+            WrongDeclaration,
+            MissingValue,
+            WrongValue,
+            ReverseLink,
+            DeclarationLink,
+            ExtraAlias,
+        }
+        for generic in [true, false] {
+            for poison in [
+                Poison::Empty,
+                Poison::Reduced,
+                Poison::RawAlias,
+                Poison::MissingTable,
+                Poison::WrongOwner,
+                Poison::WrongDeclaration,
+                Poison::MissingValue,
+                Poison::WrongValue,
+                Poison::ReverseLink,
+                Poison::DeclarationLink,
+                Poison::ExtraAlias,
+            ] {
+                let library = parsed(BASE);
+                let source = parsed(if generic {
+                    concat!(
+                        "declare const key: unique symbol; interface Box<T> { [key](): T; bad: Missing; } ",
+                        "interface Other {} declare var input: Box<number>;",
+                    )
+                } else {
+                    concat!(
+                        "declare const key: unique symbol; interface Box { [key](): number; } ",
+                        "interface Other {} declare var input: Box;",
+                    )
+                });
+                let file = FileId::new(28_571);
+                let files = [(FileId::new(28_570), &library), (file, &source)];
+                let mut context = context(&files, 1);
+                let receiver = generic.then(|| {
+                    context
+                        .get_type_from_type_node(annotation(&source, file, "input"))
+                        .unwrap()
+                });
+                let globals = context.global_types().clone();
+                let bound = files
+                    .iter()
+                    .map(|(file, _)| context.file(*file).unwrap().1.clone())
+                    .collect::<Vec<_>>();
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    files
+                        .iter()
+                        .zip(&bound)
+                        .map(|((_, file), bound)| (&file.arena, bound)),
+                    GlobalMergeCompletion::for_test(options().name_resolution),
+                )
+                .unwrap();
+                let store = context.store_mut_for_test();
+                let globals_table = store.intrinsic_bootstrap().unwrap().globals;
+                let key_symbol = store
+                    .symbol_table(globals_table)
+                    .unwrap()
+                    .get_source("key")
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap();
+                let other = store
+                    .symbol_table(globals_table)
+                    .unwrap()
+                    .get_source("Other")
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap();
+                let owner = store
+                    .symbol_table(globals_table)
+                    .unwrap()
+                    .get_source("Box")
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap();
+                let receiver = receiver
+                    .unwrap_or_else(|| store.get_declared_type_of_symbol(&host, owner).unwrap());
+                let key = store.unique_symbol_name(key_symbol).unwrap();
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let mut session = InstantiationSession::new(InstantiationLimits::default());
+                let selected = resolve_object_property_by_key_with_source(
+                    store,
+                    &host,
+                    &globals,
+                    options(),
+                    receiver,
+                    key.as_ref(),
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .unwrap();
+                let late = selected.symbol;
+                let early = store.late_bound_method_source(late).unwrap();
+                let declaration = store.symbol(early).unwrap().declarations().unwrap()[0];
+                let owner = store.get_parent_of_symbol(early).unwrap();
+                let raw = store.symbol(owner).unwrap().members();
+                let mut tables = store.members_and_exports_links(owner).unwrap().clone();
+                let resolved = tables
+                    .table(MembersOrExportsResolutionKind::ResolvedMembers)
+                    .unwrap();
+                let string = store.intrinsic_bootstrap().unwrap().string_type;
+                match poison {
+                    Poison::Empty | Poison::Reduced | Poison::RawAlias | Poison::MissingTable => {
+                        tables.tables[MembersOrExportsResolutionKind::ResolvedMembers as usize] =
+                            match poison {
+                                Poison::Empty => Some(store.alloc_symbol_table()),
+                                Poison::Reduced => Some(
+                                    raw.map(|raw| store.clone_symbol_table(raw).unwrap())
+                                        .unwrap_or_else(|| store.alloc_symbol_table()),
+                                ),
+                                Poison::RawAlias => raw,
+                                Poison::MissingTable => None,
+                                _ => unreachable!(),
+                            };
+                        assert!(store.set_members_and_exports_links(owner, tables));
+                    }
+                    Poison::WrongOwner => {
+                        assert!(store.set_symbol_relationships(late, None, None, Some(other), None))
+                    }
+                    Poison::WrongDeclaration => {
+                        let foreign = store
+                            .symbol(key_symbol)
+                            .unwrap()
+                            .value_declaration()
+                            .unwrap();
+                        assert!(store.set_symbol_declarations(
+                            late,
+                            Some(vec![foreign]),
+                            Some(foreign)
+                        ));
+                    }
+                    Poison::MissingValue | Poison::WrongValue => {
+                        let mut links = store.value_symbol_links(late).unwrap().clone();
+                        links.resolved_type =
+                            matches!(poison, Poison::WrongValue).then_some(string);
+                        assert!(store.set_value_symbol_links(late, links));
+                    }
+                    Poison::ReverseLink => {
+                        assert!(store.set_late_bound_links(early, LateBoundLinks::default()))
+                    }
+                    Poison::DeclarationLink => assert!(
+                        store.set_symbol_node_links(declaration, SymbolNodeLinks::default())
+                    ),
+                    Poison::ExtraAlias => assert_eq!(
+                        store.insert_symbol(resolved, EscapedName::source("alias"), late),
+                        Some(None)
+                    ),
+                }
+                let before = state(store);
+                assert!(
+                    resolve_object_property_by_key_with_source(
+                        store,
+                        &host,
+                        &globals,
+                        options(),
+                        receiver,
+                        EscapedNameRef::source("absent"),
+                        &mut session,
+                        &mut diagnostics
+                    )
+                    .is_err(),
+                    "{poison:?}"
+                );
+                assert_eq!(state(store), before, "{poison:?}");
+                assert!(diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn selected_source_member_rejects_cold_nongeneric_receiver_cache_payloads() {
+        for poison in 0..6 {
+            let library = parsed(BASE);
+            let source = parsed("interface Box { good: number; } declare var input: Box;");
+            let file = FileId::new(28_581);
+            let files = [(FileId::new(28_580), &library), (file, &source)];
+            let mut context = context(&files, 1);
+            let globals = context.global_types().clone();
+            let bound = files
+                .iter()
+                .map(|(file, _)| context.file(*file).unwrap().1.clone())
+                .collect::<Vec<_>>();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                files
+                    .iter()
+                    .zip(&bound)
+                    .map(|((_, file), bound)| (&file.arena, bound)),
+                GlobalMergeCompletion::for_test(options().name_resolution),
+            )
+            .unwrap();
+            let store = context.store_mut_for_test();
+            let owner = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap()
+                .get_source("Box")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let receiver = store.get_declared_type_of_symbol(&host, owner).unwrap();
+            let raw = store.symbol(owner).unwrap().members().unwrap();
+            let good = store.symbol_table(raw).unwrap().get_source("good").unwrap();
+            match poison {
+                0 => assert!(store.set_interface_declared_members(
+                    receiver,
+                    false,
+                    Some(raw),
+                    None,
+                    None,
+                    None
+                )),
+                1 => assert!(store.set_interface_declared_members(
+                    receiver,
+                    true,
+                    Some(raw),
+                    None,
+                    None,
+                    None
+                )),
+                2 => assert!(store.set_structured_type_members(
+                    receiver,
+                    Some(raw),
+                    Some(vec![good]),
+                    None,
+                    None,
+                    None
+                )),
+                3 => assert!(store.set_structured_type_members(
+                    receiver,
+                    None,
+                    None,
+                    Some(vec![store.intrinsic_bootstrap().unwrap().any_signature]),
+                    None,
+                    None
+                )),
+                4 => assert!(store.set_interface_declared_members(
+                    receiver,
+                    false,
+                    None,
+                    None,
+                    None,
+                    Some(vec![])
+                )),
+                5 => {
+                    assert!(store.set_interface_base_resolution(receiver, true, None, Some(vec![])))
+                }
+                _ => unreachable!(),
+            }
+            assert!(store.set_type_object_flags(receiver, ObjectFlags::INTERFACE));
+            let TypeData::Interface(payload) = store.type_payload(receiver).unwrap().data() else {
+                panic!("the receiver must retain its interface cache")
+            };
+            let payload = payload.clone();
+            let before = state(store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            for name in ["good", "absent"] {
+                assert!(
+                    resolve_object_property_by_key_with_source(
+                        store,
+                        &host,
+                        &globals,
+                        options(),
+                        receiver,
+                        EscapedNameRef::source(name),
+                        &mut session,
+                        &mut diagnostics
+                    )
+                    .is_err(),
+                    "poison {poison}, name {name}"
+                );
+                assert_eq!(state(store), before);
+                let TypeData::Interface(current) = store.type_payload(receiver).unwrap().data()
+                else {
+                    panic!("the query must not replace the interface cache")
+                };
+                assert_eq!(current, &payload);
+            }
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    fn standard_library() -> Vec<ParseResult> {
+        [
             include_str!("../../../ts_bundled/libs/lib.es6.d.ts"),
             include_str!("../../../ts_bundled/libs/lib.es2015.d.ts"),
             include_str!("../../../ts_bundled/libs/lib.es5.d.ts"),
@@ -19015,7 +19597,118 @@ mod selected_source_member_tests {
         ]
         .into_iter()
         .map(parsed)
-        .collect::<Vec<_>>();
+        .collect()
+    }
+
+    #[test]
+    fn selected_source_member_preserves_exact_optional_tuple_base_argument() {
+        let library = standard_library();
+        let source = parsed("declare var input: [number?];");
+        let file = FileId::new(28_699);
+        let mut files = library
+            .iter()
+            .enumerate()
+            .map(|(index, parsed)| (FileId::new(28_600 + u32::try_from(index).unwrap()), parsed))
+            .collect::<Vec<_>>();
+        files.push((file, &source));
+        let mut checker_options = options();
+        checker_options.intrinsic.exact_optional_property_types = true;
+        let mut context = context_with_options(&files, library.len(), checker_options);
+        let receiver = context
+            .get_type_from_type_node(annotation(&source, file, "input"))
+            .unwrap();
+        let globals = context.global_types().clone();
+        let bound = files
+            .iter()
+            .map(|(file, _)| context.file(*file).unwrap().1.clone())
+            .collect::<Vec<_>>();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            files
+                .iter()
+                .zip(&bound)
+                .map(|((_, file), bound)| (&file.arena, bound)),
+            GlobalMergeCompletion::for_test(checker_options.name_resolution),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let element = store
+            .canonical_tuple_shape(receiver)
+            .unwrap()
+            .unwrap()
+            .element_types()[0];
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let missing = bootstrap.undefined_or_missing_type;
+        assert_ne!(missing, bootstrap.undefined_type);
+        let TypeData::Union(elements) = store.type_payload(element).unwrap().data() else {
+            panic!("optional element must retain its missing type")
+        };
+        assert!(elements.union.types.contains(&missing));
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let key = crate::semantic::source::source_iterator_key(
+            store,
+            &host,
+            &globals,
+            checker_options,
+            &mut session,
+            &mut diagnostics,
+            annotation(&source, file, "input"),
+        )
+        .unwrap();
+        let selected = resolve_object_property_by_key_with_source(
+            store,
+            &host,
+            &globals,
+            checker_options,
+            receiver,
+            key.as_ref(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .unwrap();
+        let signature = store
+            .type_payload(selected.type_)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        let returned = store
+            .signature(signature)
+            .unwrap()
+            .resolved_return_type()
+            .unwrap();
+        assert_eq!(
+            validate_direct_generic_reference(store, returned)
+                .unwrap()
+                .type_arguments,
+            [element]
+        );
+        let before = state(store);
+        assert_eq!(
+            resolve_object_property_by_key_with_source(
+                store,
+                &host,
+                &globals,
+                checker_options,
+                receiver,
+                key.as_ref(),
+                &mut session,
+                &mut diagnostics
+            )
+            .unwrap(),
+            Some(selected)
+        );
+        assert_eq!(state(store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn selected_source_member_uses_the_real_array_iterator_without_sibling_annotations() {
+        let library = standard_library();
         let source = parsed("declare var input: number[]; declare var tuple: [number, string];");
         let file = FileId::new(28_499);
         let mut files = library
