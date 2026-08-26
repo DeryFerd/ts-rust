@@ -425,6 +425,12 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             let Some(source_file) = store.register_source_file(arena, source.node, file) else {
                 return Err(CanonicalCheckerContextError::SourceRegistrationFailed(file));
             };
+            if bound
+                .source_facts()
+                .is_none_or(|facts| !store.register_source_file_facts(source_file, facts))
+            {
+                return Err(CanonicalCheckerContextError::SourceRegistrationFailed(file));
+            }
             registered.push((file, arena, source_file));
         }
 

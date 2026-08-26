@@ -11902,6 +11902,10 @@ pub(super) fn validate_resolved_declared_property_type_graph(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> DeclaredPropertyTypeGraphValidation {
+    match validate_global_date_interface_type_graph(store, type_) {
+        DeclaredPropertyTypeGraphValidation::Opaque => {}
+        validation => return validation,
+    }
     match validate_resolved_declared_property_object_detailed(store, type_) {
         DetailedDeclaredPropertyObjectValidation::Valid(_)
         | DetailedDeclaredPropertyObjectValidation::TraversableBoundary(_) => {
@@ -11917,6 +11921,361 @@ pub(super) fn validate_resolved_declared_property_type_graph(
             DeclaredPropertyTypeGraphValidation::Malformed
         }
     }
+}
+
+/// Validates Date's instance graph without reading its constructor or cold method types.
+fn validate_global_date_interface_type_graph(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> DeclaredPropertyTypeGraphValidation {
+    use super::callable_sets::{
+        StoredCallableSetValidation, validate_stored_declared_method_callable_set,
+    };
+    use DeclaredPropertyTypeGraphValidation::{Malformed, Opaque, Traversable};
+
+    let Some(record) = store.type_payload(type_) else {
+        return Opaque;
+    };
+    let TypeData::Interface(interface) = record.data() else {
+        return Opaque;
+    };
+    let Some(owner) = record.symbol().and_then(|symbol| store.symbol(symbol)) else {
+        return Opaque;
+    };
+    if owner.name().as_utf8() != Some("Date")
+        || !owner
+            .flags()
+            .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+    {
+        return Opaque;
+    }
+    let declarations = owner.declarations().unwrap_or_default();
+    if declarations
+        .iter()
+        .any(|declaration| !store.source_is_default_library_declaration(*declaration))
+    {
+        return Opaque;
+    }
+    let valid = (|| {
+        let symbol = record.symbol()?;
+        let bootstrap = store.intrinsic_bootstrap()?;
+        let globals = store.symbol_table(bootstrap.globals)?;
+        let constructor = globals
+            .get_source("DateConstructor")
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let allowed =
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+        if owner.flags().without(SymbolFlags::TRANSIENT)
+            != SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || owner.flags().without(allowed) != SymbolFlags::NONE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.parent().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || !store.source_merged_symbol_declarations_match(symbol)
+            || globals
+                .get_source("Date")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(symbol)
+            || store.declared_type_initialization_in_progress(symbol)
+            || store.declared_type_links(symbol)?.declared_type != Some(type_)
+            || record.flags() != TypeFlags::OBJECT
+            || record.alias().is_some()
+            || !valid_thisless_interface_identity(interface)
+        {
+            return None;
+        }
+        let mut interface_declarations = Vec::new();
+        let mut value_declaration = None;
+        let mut unique = HashSet::new();
+        for &declaration in declarations {
+            if !unique.insert(declaration)
+                || !store.source_declaration_belongs_to_symbol(declaration, symbol)
+            {
+                return None;
+            }
+            match store.source_node_kind(declaration)? {
+                SyntaxKind::InterfaceDeclaration => {
+                    if !default_library_interface_declaration_matches(
+                        store,
+                        symbol,
+                        declaration,
+                        "Date",
+                    ) {
+                        return None;
+                    }
+                    interface_declarations.push(declaration);
+                }
+                SyntaxKind::VariableDeclaration
+                    if value_declaration.replace(declaration).is_none() => {}
+                _ => return None,
+            }
+        }
+        let value_declaration = value_declaration?;
+        if interface_declarations.is_empty()
+            || owner.value_declaration() != Some(value_declaration)
+            || !global_date_value_binding_matches(store, symbol, constructor, value_declaration)
+        {
+            return None;
+        }
+
+        let cold = record.object_flags() == ObjectFlags::INTERFACE
+            && valid_unresolved_interface_members(interface);
+        let structured = &interface.reference.object.structured;
+        let resolved = record.object_flags()
+            == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+            && interface.base_types_resolved
+            && interface.resolved_base_constructor_type.is_none()
+            && interface.resolved_base_types.is_none()
+            && interface.declared_members_resolved
+            && interface.declared_members == owner.members()
+            && interface.declared_members == structured.members
+            && interface.declared_call_signatures.is_none()
+            && interface.declared_construct_signatures.is_none()
+            && interface.declared_index_infos.is_none()
+            && valid_resolved_declared_structured_shell(&interface.reference.object);
+        if !cold && !resolved {
+            return None;
+        }
+        let table = store.symbol_table(owner.members()?)?;
+        let mut expected_declarations = HashSet::new();
+        for declaration in &interface_declarations {
+            for child in store.source_direct_children(*declaration)? {
+                match store.source_node_kind(child)? {
+                    SyntaxKind::Identifier | SyntaxKind::DeclareKeyword => {}
+                    SyntaxKind::MethodSignature if expected_declarations.insert(child) => {}
+                    _ => return None,
+                }
+            }
+        }
+        let mut seen_declarations = HashSet::new();
+        let mut methods = Vec::with_capacity(table.len());
+        let mut edges = Vec::new();
+        let mut marker = None;
+        for (name, raw_method) in table.iter() {
+            let method = store.get_merged_symbol(raw_method)?;
+            let method_record = store.symbol(method)?;
+            let method_declarations = method_record.declarations()?;
+            if method_record.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::METHOD
+                || method_record.check_flags() != CheckFlags::NONE
+                || method_record.name() != name
+                || name.as_utf8().is_none()
+                || name.is_reserved_member_name()
+                || name.is_private_identifier()
+                || name.is_late_bound()
+                || store.authenticated_interface_method_owner(method) != Some((symbol, type_))
+                || !store.source_merged_symbol_declarations_match(method)
+            {
+                return None;
+            }
+            for &declaration in method_declarations {
+                if !seen_declarations.insert(declaration)
+                    || !expected_declarations.contains(&declaration)
+                    || !store.source_declaration_belongs_to_symbol(declaration, method)
+                    || store
+                        .source_child_with_kind(declaration, SyntaxKind::TypeParameter)
+                        .is_some()
+                    || store
+                        .source_child_with_kind(declaration, SyntaxKind::Identifier)
+                        .and_then(|name| store.source_identifier_text(name))
+                        != name.as_utf8()
+                {
+                    return None;
+                }
+            }
+            if name.as_utf8() == Some("toISOString") {
+                let [declaration] = method_declarations else {
+                    return None;
+                };
+                if marker.replace(method).is_some()
+                    || method_record.flags() != SymbolFlags::METHOD
+                    || store.source_direct_children(*declaration)?.len() != 2
+                    || store
+                        .source_direct_type_annotation(*declaration)
+                        .and_then(|annotation| store.source_node_kind(annotation))
+                        != Some(SyntaxKind::StringKeyword)
+                {
+                    return None;
+                }
+            }
+            match store
+                .value_symbol_links(method)
+                .and_then(|links| links.resolved_type)
+            {
+                Some(_) => {
+                    let (callable, value) = declared_method_value_types(store, method)?;
+                    if !matches!(
+                        validate_stored_declared_method_callable_set(store, callable),
+                        Some(StoredCallableSetValidation::Valid { .. })
+                    ) {
+                        return None;
+                    }
+                    edges.push(value);
+                }
+                None => {
+                    if resolved
+                        || store
+                            .value_symbol_links(method)
+                            .is_some_and(|links| links != &ValueSymbolLinks::default())
+                        || method_declarations.iter().any(|declaration| {
+                            store
+                                .signature_links(*declaration)
+                                .is_some_and(|links| links != &SignatureLinks::default())
+                        })
+                    {
+                        return None;
+                    }
+                }
+            }
+            methods.push(method);
+        }
+        if marker.is_none()
+            || seen_declarations != expected_declarations
+            || resolved && structured.properties.as_deref() != Some(methods.as_slice())
+        {
+            return None;
+        }
+        Some(edges)
+    })();
+    valid.map_or(Malformed, Traversable)
+}
+
+fn default_library_interface_declaration_matches(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    name: &str,
+) -> bool {
+    store.source_is_default_library_declaration(declaration)
+        && store.source_declaration_belongs_to_symbol(declaration, symbol)
+        && store.source_node_kind(declaration) == Some(SyntaxKind::InterfaceDeclaration)
+        && matches!(store.source_node_parent(declaration), Some(SourceNodeParent::Parent(source))
+            if store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
+                && store.source_node_parent(source) == Some(SourceNodeParent::Root))
+        && store.source_node_is_exported(declaration) == Some(false)
+        && store
+            .source_child_with_kind(declaration, SyntaxKind::Identifier)
+            .and_then(|identifier| store.source_identifier_text(identifier))
+            == Some(name)
+        && store
+            .source_child_with_kind(declaration, SyntaxKind::TypeParameter)
+            .is_none()
+        && store
+            .source_child_with_kind(declaration, SyntaxKind::HeritageClause)
+            .is_none()
+}
+
+fn global_date_value_binding_matches(
+    store: &CanonicalTypeMapperStore,
+    date: SemanticSymbolId,
+    constructor: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
+    let valid = (|| {
+        let constructor_record = store.symbol(constructor)?;
+        if constructor_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || constructor_record.check_flags() != CheckFlags::NONE
+            || constructor_record.name().as_utf8() != Some("DateConstructor")
+            || constructor_record.parent().is_some()
+            || constructor_record.exports().is_some()
+            || constructor_record.export_symbol().is_some()
+            || constructor_record.value_declaration().is_some()
+            || store.get_merged_symbol(constructor) != Some(constructor)
+            || !store.source_merged_symbol_declarations_match(constructor)
+            || constructor_record.declarations()?.is_empty()
+            || !constructor_record
+                .declarations()?
+                .iter()
+                .all(|declaration| {
+                    default_library_interface_declaration_matches(
+                        store,
+                        constructor,
+                        *declaration,
+                        "DateConstructor",
+                    )
+                })
+        {
+            return None;
+        }
+        let SourceNodeParent::Parent(list) = store.source_node_parent(declaration)? else {
+            return None;
+        };
+        let SourceNodeParent::Parent(statement) = store.source_node_parent(list)? else {
+            return None;
+        };
+        let SourceNodeParent::Parent(source) = store.source_node_parent(statement)? else {
+            return None;
+        };
+        let children = store.source_direct_children(declaration)?;
+        let [name, annotation] = children.as_slice() else {
+            return None;
+        };
+        let annotation_children = store.source_direct_children(*annotation)?;
+        let [constructor_name] = annotation_children.as_slice() else {
+            return None;
+        };
+        if store.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+            || store.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+            || store.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || store.source_node_parent(source) != Some(SourceNodeParent::Root)
+            || store.source_identifier_text(*name) != Some("Date")
+            || store.source_node_kind(*annotation) != Some(SyntaxKind::TypeReference)
+            || store.source_direct_type_annotation(declaration) != Some(*annotation)
+            || store.source_identifier_text(*constructor_name) != Some("DateConstructor")
+            || store.symbol_node_links(*annotation).is_some_and(|links| {
+                links
+                    .resolved_symbol
+                    .is_some_and(|symbol| store.get_merged_symbol(symbol) != Some(constructor))
+            })
+        {
+            return None;
+        }
+        let constructor_type = store
+            .declared_type_links(constructor)
+            .and_then(|links| links.declared_type);
+        if let Some(constructor_type) = constructor_type {
+            let record = store.type_payload(constructor_type)?;
+            if record.symbol() != Some(constructor)
+                || record.alias().is_some()
+                || !matches!(record.data(), TypeData::Interface(_))
+                || store.declared_type_initialization_in_progress(constructor)
+                || super::declared::preflight_class_or_interface_reference(
+                    store,
+                    &DeclaredTypeHost::default(),
+                    constructor,
+                    constructor_record.flags(),
+                )
+                .ok()
+                    != Some(0)
+            {
+                return None;
+            }
+        }
+        if store.value_symbol_links(date).is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && constructor_type.is_none_or(|type_| {
+                    links
+                        != &ValueSymbolLinks {
+                            resolved_type: Some(type_),
+                            ..ValueSymbolLinks::default()
+                        }
+                })
+        }) || store.type_node_links(*annotation).is_some_and(|links| {
+            links != &TypeNodeLinks::default()
+                && constructor_type.is_none_or(|type_| {
+                    links
+                        != &TypeNodeLinks {
+                            resolved_type: Some(type_),
+                            ..TypeNodeLinks::default()
+                        }
+                })
+        }) {
+            return None;
+        }
+        Some(())
+    })();
+    valid.is_some()
 }
 
 /// Returns the store-owned property types behind an already validated
@@ -24003,6 +24362,356 @@ mod generic_publication_tests {
             warm,
         );
         assert!(diagnostics.is_empty());
+    }
+
+    struct DateUnionFixture<'arena> {
+        context: crate::semantic::CanonicalCheckerContext<'arena>,
+        sources: Vec<(&'arena ts_ast::NodeArena, BoundFile)>,
+        date: SemanticSymbolId,
+        type_: TypeId,
+        marker: SemanticSymbolId,
+        sibling: SemanticSymbolId,
+    }
+
+    fn date_union_file_facts(file: FileId, default_library: bool) -> CanonicalSourceFileFacts {
+        CanonicalSourceFileFacts::new_with_default_library(
+            EscapedName::source(format!("\"/lib/date-union-{}.d.ts\"", file.index())),
+            CanonicalSourceLanguage::TypeScript,
+            true,
+            default_library,
+            CanonicalModuleState::Script,
+        )
+    }
+
+    fn date_union_fixture<'arena>(
+        library: &'arena ParseResult,
+        augmentation: &'arena ParseResult,
+        default_library: bool,
+    ) -> DateUnionFixture<'arena> {
+        let mut binder = CanonicalBinder::new();
+        let mut arenas = Vec::new();
+        for (parsed, file) in [
+            (library, FileId::new(9_950)),
+            (augmentation, FileId::new(9_951)),
+        ] {
+            assert!(parsed.diagnostics.is_empty());
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    date_union_file_facts(file, default_library),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            arenas.push((file, &parsed.arena));
+        }
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            arenas.clone(),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let sources: Vec<_> = arenas
+            .iter()
+            .map(|(file, arena)| (*arena, context.file(*file).unwrap().1.clone()))
+            .collect();
+        let date = context
+            .store()
+            .symbol_table(context.store().intrinsic_bootstrap().unwrap().globals)
+            .and_then(|globals| globals.get_source("Date"))
+            .and_then(|symbol| context.store().get_merged_symbol(symbol))
+            .unwrap();
+        let type_ = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                sources.iter().map(|(arena, bound)| (*arena, bound)),
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            context
+                .store_mut_for_test()
+                .get_declared_type_of_symbol(&host, date)
+                .unwrap()
+        };
+        let table = context
+            .store()
+            .symbol(date)
+            .unwrap()
+            .members()
+            .and_then(|members| context.store().symbol_table(members))
+            .unwrap();
+        let marker = context
+            .store()
+            .get_merged_symbol(table.get_source("toISOString").unwrap())
+            .unwrap();
+        let sibling = context
+            .store()
+            .get_merged_symbol(table.get_source("toJSON").unwrap())
+            .unwrap();
+        DateUnionFixture {
+            context,
+            sources,
+            date,
+            type_,
+            marker,
+            sibling,
+        }
+    }
+
+    fn publish_date_union_marker(fixture: &mut DateUnionFixture<'_>) -> TypeId {
+        let host = DeclaredTypeHost::new_after_global_merge(
+            fixture.sources.iter().map(|(arena, bound)| (*arena, bound)),
+            GlobalMergeCompletion::for_test(fixture.context.options().name_resolution),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = CanonicalTypeQuery::new(
+            fixture.context.store_mut_for_test(),
+            &host,
+            crate::semantic::type_nodes::CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_interface_method(fixture.marker)
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        callable
+    }
+
+    const DATE_UNION_LIBRARY: &str = concat!(
+        "interface Date { toISOString(): string; } ",
+        "interface DateConstructor { new(): Date; readonly prototype: Date; } ",
+        "declare var Date: DateConstructor;",
+    );
+    const DATE_UNION_AUGMENTATION: &str = "interface Date { toJSON(key?: any): string; }";
+
+    #[test]
+    fn date_unions_keep_cold_and_warm_identity_without_demanding_sibling_methods() {
+        let library = parse_source_file(DATE_UNION_LIBRARY);
+        let augmentation = parse_source_file(DATE_UNION_AUGMENTATION);
+        let mut fixture = date_union_fixture(&library, &augmentation, true);
+        let store = fixture.context.store_mut_for_test();
+        assert!(store.source_merged_symbol_declarations_match(fixture.date));
+        assert!(store.value_symbol_links(fixture.marker).is_none());
+        assert!(store.value_symbol_links(fixture.sibling).is_none());
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let null = store.intrinsic_bootstrap().unwrap().null_type;
+        let signatures = store.signature_len();
+        let symbols = store.symbol_len();
+        let optional = store
+            .expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal)
+            .unwrap();
+        let nullable = store
+            .expression_union_type(&[fixture.type_, null], UnionReduction::Literal)
+            .unwrap();
+        assert_eq!(store.signature_len(), signatures);
+        assert_eq!(store.symbol_len(), symbols);
+        assert!(store.value_symbol_links(fixture.marker).is_none());
+        assert!(store.value_symbol_links(fixture.sibling).is_none());
+        assert!(store.value_symbol_links(fixture.date).is_none());
+        publish_date_union_marker(&mut fixture);
+        let store = fixture.context.store_mut_for_test();
+        assert!(store.value_symbol_links(fixture.sibling).is_none());
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            store.expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal),
+            Ok(optional)
+        );
+        assert_eq!(
+            store.expression_union_type(&[fixture.type_, null], UnionReduction::Literal),
+            Ok(nullable)
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            before
+        );
+        assert!(store.value_symbol_links(fixture.sibling).is_none());
+        assert!(store.value_symbol_links(fixture.date).is_none());
+        let TypeData::Interface(interface) = store.type_payload(fixture.type_).unwrap().data()
+        else {
+            panic!("Date must retain its declared interface identity")
+        };
+        assert!(!interface.declared_members_resolved);
+    }
+
+    #[test]
+    fn date_unions_reject_forged_owners_and_poisoned_method_caches_before_writes() {
+        let library = parse_source_file(DATE_UNION_LIBRARY);
+        let augmentation = parse_source_file(DATE_UNION_AUGMENTATION);
+        let mut fixture = date_union_fixture(&library, &augmentation, true);
+        publish_date_union_marker(&mut fixture);
+        let store = fixture.context.store_mut_for_test();
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let union = store
+            .expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal)
+            .unwrap();
+        let original = store.symbol(fixture.date).unwrap();
+        let original_flags = original.flags();
+        let declarations = original.declarations().unwrap().to_vec();
+        let value_declaration = original.value_declaration();
+        let mut copied = SymbolData::new(original.flags(), original.name().to_owned());
+        copied.declarations = Some(declarations.clone());
+        copied.value_declaration = value_declaration;
+        copied.members = original.members();
+        let forged = store.alloc_symbol(copied).unwrap();
+        assert!(store.set_type_symbol(fixture.type_, Some(forged)));
+        assert!(store.set_declared_type_links(
+            forged,
+            crate::semantic::DeclaredTypeLinks {
+                declared_type: Some(fixture.type_),
+                ..crate::semantic::DeclaredTypeLinks::default()
+            }
+        ));
+        assert_eq!(
+            store.insert_symbol(globals, EscapedName::source("Date"), forged),
+            Some(Some(fixture.date))
+        );
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let before = snapshot(store);
+        assert!(!store.source_merged_symbol_declarations_match(forged));
+        assert!(
+            store
+                .expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal)
+                .is_err()
+        );
+        assert_eq!(snapshot(store), before);
+        assert!(store.set_type_symbol(fixture.type_, Some(fixture.date)));
+        assert_eq!(
+            store.insert_symbol(globals, EscapedName::source("Date"), fixture.date),
+            Some(Some(forged))
+        );
+        assert_eq!(
+            store.expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal),
+            Ok(union)
+        );
+
+        assert!(store.set_symbol_flags(
+            fixture.date,
+            original_flags.without(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                | SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            CheckFlags::NONE,
+        ));
+        let before = snapshot(store);
+        assert!(!store.source_merged_symbol_declarations_match(fixture.date));
+        assert!(
+            store
+                .expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal)
+                .is_err()
+        );
+        assert_eq!(snapshot(store), before);
+        assert!(store.set_symbol_flags(fixture.date, original_flags, CheckFlags::NONE));
+        assert_eq!(
+            store.expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal),
+            Ok(union)
+        );
+
+        let shortened = declarations
+            .iter()
+            .copied()
+            .filter(|node| node.file != FileId::new(9_951))
+            .collect();
+        assert!(store.set_symbol_declarations(fixture.date, Some(shortened), value_declaration));
+        let before = snapshot(store);
+        assert!(!store.source_merged_symbol_declarations_match(fixture.date));
+        assert!(
+            store
+                .expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal)
+                .is_err()
+        );
+        assert_eq!(snapshot(store), before);
+        assert!(store.set_symbol_declarations(fixture.date, Some(declarations), value_declaration));
+        assert_eq!(
+            store.expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal),
+            Ok(union)
+        );
+
+        let original_links = store.value_symbol_links(fixture.marker).cloned().unwrap();
+        assert!(store.set_value_symbol_links(fixture.marker, ValueSymbolLinks::default()));
+        let before = snapshot(store);
+        assert!(
+            store
+                .expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal)
+                .is_err()
+        );
+        assert_eq!(snapshot(store), before);
+        assert!(store.set_value_symbol_links(fixture.marker, original_links));
+        assert_eq!(
+            store.expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal),
+            Ok(union)
+        );
+    }
+
+    #[test]
+    fn date_unions_reject_nonlibrary_owners_and_late_file_reclassification() {
+        let library = parse_source_file(DATE_UNION_LIBRARY);
+        let augmentation = parse_source_file(DATE_UNION_AUGMENTATION);
+        let mut fixture = date_union_fixture(&library, &augmentation, false);
+        let store = fixture.context.store_mut_for_test();
+        let source = store
+            .register_source_file(&library.arena, library.source_file, FileId::new(9_950))
+            .unwrap();
+        assert!(
+            !store.register_source_file_facts(
+                source,
+                &date_union_file_facts(FileId::new(9_950), true)
+            )
+        );
+        let declaration = store
+            .symbol(fixture.date)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        assert!(!store.source_is_default_library_declaration(declaration));
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert!(matches!(
+            store.expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal),
+            Err(crate::semantic::bootstrap::LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
+                if type_ == fixture.type_,
+        ));
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths()
+            ),
+            before
+        );
     }
 
     #[test]

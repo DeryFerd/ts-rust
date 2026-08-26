@@ -11,8 +11,8 @@ use std::{
 
 use ts_ast::{FileId, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
-    AstScope, CheckFlags, EscapedName, InternalSymbolName, SemanticStoreId, SemanticSymbolId,
-    SymbolData, SymbolFlags, SymbolStore, SymbolTableId,
+    AstScope, CanonicalSourceFileFacts, CheckFlags, EscapedName, InternalSymbolName,
+    SemanticStoreId, SemanticSymbolId, SymbolData, SymbolFlags, SymbolStore, SymbolTableId,
     semantic::{PreparedSymbolTable, Symbol, SymbolTable},
 };
 use ts_core::TextRange;
@@ -90,6 +90,7 @@ struct SourceNodeFacts {
 
 #[derive(Debug)]
 struct SourceSymbolDeclarations {
+    flags: SymbolFlags,
     declarations: Box<[NodeRef]>,
     value_declaration: Option<NodeRef>,
 }
@@ -497,6 +498,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     conditional_query_productions: HashMap<ConditionalQueryKey, ConditionalQueryProduction>,
     entity_names: Vec<EntityNameNode>,
     source_files: BTreeMap<FileId, SourceFileRef>,
+    source_file_facts: BTreeMap<FileId, CanonicalSourceFileFacts>,
     source_file_ranks: BTreeMap<FileId, usize>,
     source_files_by_arena: BTreeMap<NodeArenaId, SourceFileRef>,
     source_node_facts: BTreeMap<NodeArenaId, Vec<Option<SourceNodeFacts>>>,
@@ -608,6 +610,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_symbol_declarations.insert(
                 symbol,
                 SourceSymbolDeclarations {
+                    flags: record.flags(),
                     declarations: declarations.into(),
                     value_declaration: record.value_declaration(),
                 },
@@ -626,6 +629,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             conditional_query_productions: HashMap::new(),
             entity_names: Vec::new(),
             source_files: BTreeMap::new(),
+            source_file_facts: BTreeMap::new(),
             source_file_ranks: BTreeMap::new(),
             source_files_by_arena: BTreeMap::new(),
             source_node_facts: BTreeMap::new(),
@@ -807,6 +811,35 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_file_ranks.get(&file).copied()
     }
 
+    /// Retains the binder's file facts once for semantic-only ownership checks.
+    pub(super) fn register_source_file_facts(
+        &mut self,
+        source: SourceFileRef,
+        facts: &CanonicalSourceFileFacts,
+    ) -> bool {
+        if !self.contains_source_file(source) {
+            return false;
+        }
+        match self.source_file_facts.entry(source.file()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.get() == facts,
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(facts.clone());
+                true
+            }
+        }
+    }
+
+    #[must_use]
+    pub(super) fn source_is_default_library_declaration(&self, node: NodeRef) -> bool {
+        self.contains_node_ref(node)
+            && self.source_file_facts.get(&node.file).is_some_and(|facts| {
+                facts.is_default_library()
+                    && facts.is_declaration_file()
+                    && !facts.is_javascript_file()
+                    && !facts.is_external_or_common_js_module()
+            })
+    }
+
     /// Checks immutable binder ownership, including canonical merged-symbol redirects.
     #[must_use]
     pub(super) fn source_declaration_belongs_to_symbol(
@@ -838,6 +871,33 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     self.source_declaration_belongs_to_symbol(*declaration, symbol)
                 })
         })
+    }
+
+    /// Checks complete binder declarations and flags after canonical symbol merges.
+    #[must_use]
+    pub(super) fn source_merged_symbol_declarations_match(&self, symbol: SemanticSymbolId) -> bool {
+        let Some(declarations) = self.symbol(symbol).and_then(Symbol::declarations) else {
+            return false;
+        };
+        let mut expected = HashSet::new();
+        let mut expected_flags = SymbolFlags::NONE;
+        for source in std::iter::once(symbol).chain(self.merged_symbols.keys().copied()) {
+            if self.get_merged_symbol(source) == Some(symbol)
+                && let Some(original) = self.source_symbol_declarations.get(&source)
+            {
+                expected.extend(original.declarations.iter().copied());
+                expected_flags |= original.flags.without(SymbolFlags::TRANSIENT);
+            }
+        }
+        !expected.is_empty()
+            && expected.len() == declarations.len()
+            && self.symbol(symbol).is_some_and(|record| {
+                record.flags().without(SymbolFlags::TRANSIENT) == expected_flags
+            })
+            && declarations.iter().all(|declaration| {
+                expected.contains(declaration)
+                    && self.source_declaration_belongs_to_symbol(*declaration, symbol)
+            })
     }
 
     /// Parses and copies one exact standalone `Identifier | QualifiedName`
