@@ -20617,7 +20617,7 @@ fn stored_class_parts(
         .reference
         .resolved_type_arguments
         .as_deref()
-        .is_some_and(|arguments| arguments.is_empty())
+        .is_some_and(<[TypeId]>::is_empty)
         && store.value_symbol_links(prototype).is_some_and(|links| {
             links != &ValueSymbolLinks::default()
                 && links

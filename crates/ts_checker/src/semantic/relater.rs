@@ -8596,7 +8596,8 @@ mod tests {
         SignatureLinks, TypeAliasLinks, TypeId, TypeNodeLinks, ValueSymbolLinks,
         array_types::CanonicalArrayTargets,
         classes::{
-            ClassMembers, execute_nongeneric_class_member_query, plan_nongeneric_class_member_query,
+            ClassHeritageMembersValidation, ClassMembers, execute_nongeneric_class_member_query,
+            plan_nongeneric_class_member_query, validate_class_heritage_members,
         },
         declared::type_list_key,
         global_types::create_type_from_generic_global_type,
