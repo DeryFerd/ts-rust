@@ -1038,12 +1038,19 @@ mod tests {
             "declare var missing: {}; ",
             "declare var result: { next(): { done: false } }; ",
             "declare var method: { next(): { value: string }; return: number }; ",
-            "declare var dynamic: { next: any };",
+            "declare var dynamic: { next: any }; ",
+            "declare var optional: { next?(): { value: string } };",
         ));
         let file = FileId::new(22_022);
-        let options = CanonicalCheckerOptions::default();
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
         let mut context = context(&[(file, &source)], 0, options);
-        let inputs = ["missing", "result", "method", "dynamic"].map(|name| {
+        let inputs = ["missing", "result", "method", "dynamic", "optional"].map(|name| {
             context
                 .get_type_from_type_node(annotation(&source, file, name))
                 .unwrap()
@@ -1091,6 +1098,9 @@ mod tests {
         let dynamic = query.iterator(inputs[3], true).unwrap();
         assert_eq!(dynamic.types, IterationTypes::any(any));
         assert!(dynamic.diagnostics.is_empty());
+        let optional = query.iterator(inputs[4], true).unwrap();
+        assert_eq!(optional.types, IterationTypes::default());
+        assert_eq!(optional.diagnostics, [IterationDiagnostic::MissingNext]);
     }
 
     #[test]

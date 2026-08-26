@@ -23,7 +23,10 @@ use super::{
     ResolvedSignatureState, SignatureLinks,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
-    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+    callable_sets::{
+        StoredCallableSetValidation, validate_stored_callable_set,
+        validate_stored_declared_method_callable_set,
+    },
     callables::{
         CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
         validate_stored_single_callable,
@@ -4766,25 +4769,16 @@ impl<'store> RelaterSession<'store> {
             self.validated_class_method_callable(symbol)?;
             return Ok(record);
         }
-        if matches!(origin, ObjectPropertyOrigin::Declared) && record.flags() == SymbolFlags::METHOD
+        if matches!(origin, ObjectPropertyOrigin::Declared)
+            && record.flags().contains(SymbolFlags::METHOD)
         {
-            let links = self
-                .store
-                .value_symbol_links(symbol)
-                .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
-            let type_ = links
-                .resolved_type
-                .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
-            return if links
-                == &(ValueSymbolLinks {
-                    resolved_type: Some(type_),
-                    ..ValueSymbolLinks::default()
-                })
-                && super::structured_members::valid_interface_method_value(
-                    self.store, symbol, type_,
-                )
-                .is_some()
-            {
+            let (callable, _) =
+                super::object_members::declared_method_value_types(self.store, symbol)
+                    .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
+            return if matches!(
+                validate_stored_declared_method_callable_set(self.store, callable),
+                Some(StoredCallableSetValidation::Valid { .. })
+            ) {
                 Ok(record)
             } else {
                 Err(RelationUnavailable::UnsupportedProperty(symbol))
