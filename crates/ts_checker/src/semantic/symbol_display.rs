@@ -480,7 +480,7 @@ impl SymbolDisplayContext {
                 && (same_reference(store, direct, symbol)?
                     || store
                         .symbol(direct)
-                        .and_then(|record| record.export_symbol())
+                        .and_then(ts_binder::semantic::Symbol::export_symbol)
                         .is_some_and(|export| {
                             same_reference(store, export, symbol).unwrap_or(false)
                         }))
@@ -773,7 +773,10 @@ fn scope_tables(
                 if record.kind != SyntaxKind::SourceFile || external =>
             {
                 let owner = owner.ok_or(SymbolDisplayError::InvalidLocation(node))?;
-                if let Some(id) = store.symbol(owner).and_then(|record| record.exports()) {
+                if let Some(id) = store
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::exports)
+                {
                     tables.push(ScopeTable {
                         id,
                         types_only: false,
@@ -785,7 +788,10 @@ fn scope_tables(
             | SyntaxKind::ClassExpression
             | SyntaxKind::InterfaceDeclaration => {
                 let owner = owner.ok_or(SymbolDisplayError::InvalidLocation(node))?;
-                if let Some(id) = store.symbol(owner).and_then(|record| record.members()) {
+                if let Some(id) = store
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::members)
+                {
                     tables.push(ScopeTable {
                         id,
                         types_only: true,
