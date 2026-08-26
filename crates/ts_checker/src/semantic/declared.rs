@@ -544,7 +544,7 @@ pub(super) fn cached_class_type(
     cached_class_or_interface_type(store, symbol, ObjectFlags::CLASS)
 }
 
-fn cached_interface_type(
+pub(super) fn cached_interface_type(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     symbol: SemanticSymbolId,
 ) -> Result<Option<TypeId>, DeclaredTypeError> {
