@@ -11,6 +11,7 @@ M00.EXTERNAL_MODULE_TARGET	M00	An external module target requires unported canon
 M00.FIXED_MODULE_FORMAT	M00	The canonical Program adapter cannot retain required fixed module-format facts.	S1	1	active	-
 M00.NODE_MODULE_FACTS	M00	The canonical Program adapter cannot derive required Node module facts.	S1	1	active	-
 M00.PLAIN_ESM_MODE	M00	The module configuration falls outside the currently supported plain ESM mode.	S1	1	active	-
+M00.PROJECT_REFERENCES	M00	Canonical project configuration loading does not support project references.	S1	1	active	-
 M00.SPECIFIER_RESOLUTION_MODE	M00	A module specifier requires an unported resolution-mode fact.	S1	1	active	-
 M03.IMPORT_META_MODULE_MODE	M03	The import.meta module indicator is not retained by the canonical Program adapter.	S1	1	active	-
 R01.RELATION	R01	Source checking requires an unported type-relation operation.	S2	1	active	-

@@ -247,6 +247,9 @@ pub enum CanonicalProgramCheckError {
     DeclarationFileCheckingUnsupported {
         file_name: String,
     },
+    ProjectReferencesUnsupported {
+        config_path: String,
+    },
     Bind {
         file_name: String,
         error: CanonicalBindError,
@@ -360,6 +363,9 @@ fn canonical_program_capability_code(error: &CanonicalProgramCheckError) -> Opti
         }
         CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { .. } => {
             Some("M00.DECLARATION_FILE")
+        }
+        CanonicalProgramCheckError::ProjectReferencesUnsupported { .. } => {
+            Some("M00.PROJECT_REFERENCES")
         }
         CanonicalProgramCheckError::DeclarationBind { error, .. }
             if canonical_declaration_error_is_unsupported(error) =>
@@ -477,6 +483,7 @@ fn canonical_program_invariant_code(error: &CanonicalProgramCheckError) -> &'sta
         | CanonicalProgramCheckError::PlainEsmModuleResolutionUnsupported { .. }
         | CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(_)
         | CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { .. }
+        | CanonicalProgramCheckError::ProjectReferencesUnsupported { .. }
         | CanonicalProgramCheckError::ExternalModuleTargetUnsupported { .. } => {
             "INV.PROGRAM.FAILURE_CLASSIFICATION"
         }
@@ -922,6 +929,10 @@ impl std::fmt::Display for CanonicalProgramCheckError {
                 formatter,
                 "canonical checking of declaration file '{file_name}' requires skipLibCheck"
             ),
+            Self::ProjectReferencesUnsupported { config_path } => write!(
+                formatter,
+                "canonical checking does not support project references in '{config_path}'"
+            ),
             Self::Bind { file_name, error } => {
                 write!(
                     formatter,
@@ -1009,6 +1020,7 @@ impl std::error::Error for CanonicalProgramCheckError {
             | Self::ModuleSpecifierResolutionModeUnsupported(_)
             | Self::ExternalModuleTargetUnsupported { .. }
             | Self::DeclarationFileCheckingUnsupported { .. }
+            | Self::ProjectReferencesUnsupported { .. }
             | Self::MissingBoundFile { .. }
             | Self::InvalidModuleSourceFile(_)
             | Self::InvalidModuleSpecifier(_)
@@ -1039,6 +1051,7 @@ struct ProgramConfigInputs {
     config_path: String,
     current_directory: String,
     root_names: Vec<String>,
+    has_project_references: bool,
     options: CompilerOptions,
     diagnostics: Vec<ProgramDiagnostic>,
 }
@@ -2252,7 +2265,8 @@ impl Program {
     ///
     /// Returns the same construction failures as
     /// [`Self::try_new_with_canonical_checker_and_queries`]. Config diagnostics
-    /// remain on the returned Program.
+    /// remain on the returned Program. Project references return
+    /// [`CanonicalProgramCheckError::ProjectReferencesUnsupported`].
     pub fn try_from_config_with_canonical_checker_and_queries<T>(
         file_system: &dyn FileSystem,
         config_path: &str,
@@ -2262,6 +2276,7 @@ impl Program {
             config_path,
             current_directory,
             root_names,
+            has_project_references,
             options,
             mut diagnostics,
         } = match Self::load_config_inputs(
@@ -2283,6 +2298,9 @@ impl Program {
                 ));
             }
         };
+        if has_project_references {
+            return Err(CanonicalProgramCheckError::ProjectReferencesUnsupported { config_path });
+        }
         let mut program = Self::new_unchecked_with_options_and_checker(
             file_system,
             &current_directory,
@@ -2323,6 +2341,7 @@ impl Program {
             root_names,
             options,
             mut diagnostics,
+            ..
         } = match Self::load_config_inputs(file_system, config_path, overrides, command_line) {
             Ok(inputs) => inputs,
             Err(diagnostics) => {
@@ -2361,6 +2380,34 @@ impl Program {
             .map_or(".", |(directory, _)| directory);
         let mut options_result = parse_project_options(&config);
         let config_source = file_system.read_file(&config.path).ok();
+        let empty_files = config
+            .raw
+            .get("files")
+            .and_then(ts_config::JsonValue::as_array)
+            .is_some_and(|files| files.is_empty());
+        let no_references = config
+            .raw
+            .get("references")
+            .and_then(ts_config::JsonValue::as_array)
+            .is_none_or(|references| references.is_empty());
+        if empty_files && no_references {
+            // Resolution removes extends, but it suppresses TS18002 on the leaf config.
+            let has_extends = config_source
+                .as_deref()
+                .and_then(|source| ts_config::parse_config_text(&config.path, source).value)
+                .is_some_and(|config| {
+                    config
+                        .raw
+                        .get("extends")
+                        .is_some_and(|value| !matches!(value, ts_config::JsonValue::Null))
+                });
+            if !has_extends {
+                config_diagnostics.push(Self::empty_files_config_diagnostic(
+                    &config.path,
+                    config_source.as_deref(),
+                ));
+            }
+        }
         config_diagnostics.extend(options_result.diagnostics.iter().map(|diagnostic| {
             ProgramDiagnostic {
                 file_name: Some(config.path.clone()),
@@ -2393,12 +2440,13 @@ impl Program {
                 .apply_overrides(command_line_options, specified_options);
         }
         let mut discovery = DiscoveryOptions::new(config_directory);
+        let has_files = config.files.is_some();
         discovery.files = config.files.unwrap_or_default();
         discovery.include = config.include.unwrap_or_else(|| {
-            if discovery.files.is_empty() {
-                vec!["**/*".to_owned()]
-            } else {
+            if has_files {
                 Vec::new()
+            } else {
+                vec!["**/*".to_owned()]
             }
         });
         discovery.exclude = config.exclude.unwrap_or_default();
@@ -2465,9 +2513,53 @@ impl Program {
             current_directory: config_directory.to_owned(),
             config_path: config.path,
             root_names: roots,
+            has_project_references: !config.references.is_empty(),
             options: options_result.options,
             diagnostics: config_diagnostics,
         })
+    }
+
+    fn empty_files_config_diagnostic(config_path: &str, source: Option<&str>) -> ProgramDiagnostic {
+        let range = source.and_then(|source| {
+            let mut scanner = Scanner::new(source);
+            let mut object_depth = 0usize;
+            loop {
+                let token = scanner.scan();
+                match token.kind {
+                    SyntaxKind::EndOfFile => return None,
+                    SyntaxKind::OpenBraceToken => object_depth = object_depth.checked_add(1)?,
+                    SyntaxKind::CloseBraceToken => object_depth = object_depth.checked_sub(1)?,
+                    SyntaxKind::StringLiteral
+                        if object_depth == 1
+                            && token.value.as_ref()?.to_string_lossy() == "files" =>
+                    {
+                        let checkpoint = scanner.mark();
+                        if scanner.scan().kind == SyntaxKind::ColonToken {
+                            let open = scanner.scan();
+                            let close = scanner.scan();
+                            if open.kind == SyntaxKind::OpenBracketToken
+                                && close.kind == SyntaxKind::CloseBracketToken
+                            {
+                                return Some(TextRange::new(open.range.start, close.range.end));
+                            }
+                        }
+                        scanner.rewind(checkpoint);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let message = message_by_code(18_002).expect("TS18002 must be in the generated catalog");
+        ProgramDiagnostic {
+            file_name: Some(config_path.to_owned()),
+            range,
+            code: Some(message.code()),
+            category: message.category(),
+            message: message
+                .format(&[config_path.to_owned()])
+                .expect("TS18002 has one formatting argument"),
+            related_information: Vec::new(),
+        }
     }
 
     fn add_config_diagnostics(&mut self, mut config_diagnostics: Vec<ProgramDiagnostic>) {

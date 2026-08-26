@@ -730,7 +730,7 @@ const CANONICAL_CHECKER_PANIC_INVARIANT: &str = "INV.CHECKER.PANIC";
 const CAPABILITY_REGISTRY: &str = include_str!("../../../docs/typechecker-capabilities.tsv");
 const TYPECHECKER_PORT_MAP: &str = include_str!("../../../docs/typechecker-port-map.tsv");
 
-const TYPED_CHECKER_CAPABILITY_CODES: [&str; 20] = [
+const TYPED_CHECKER_CAPABILITY_CODES: [&str; 21] = [
     "B02.DECLARATION_FAMILY",
     "B03.NAME_RESOLUTION",
     "C00.SOURCE_KIND",
@@ -742,6 +742,7 @@ const TYPED_CHECKER_CAPABILITY_CODES: [&str; 20] = [
     "M00.FIXED_MODULE_FORMAT",
     "M00.NODE_MODULE_FACTS",
     "M00.PLAIN_ESM_MODE",
+    "M00.PROJECT_REFERENCES",
     "M00.SPECIFIER_RESOLUTION_MODE",
     "M03.IMPORT_META_MODULE_MODE",
     "R01.RELATION",

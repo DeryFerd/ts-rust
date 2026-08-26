@@ -351,3 +351,208 @@ fn canonical_config_preserves_emit_options_without_writing_outputs() {
     assert!(program.options().declaration);
     assert!(!directory.0.join("out").exists());
 }
+
+#[test]
+fn canonical_config_rejects_project_references_before_queries() {
+    for dependency_exists in [false, true] {
+        for no_check in [false, true] {
+            let filesystem = MemoryFileSystem::new(true);
+            let config = serde_json::json!({
+                "files": [],
+                "references": [{"path": "./dependency"}],
+                "compilerOptions": {"noCheck": no_check, "noEmit": true}
+            });
+            filesystem
+                .write_file("/project/tsconfig.json", &config.to_string())
+                .unwrap();
+            if dependency_exists {
+                filesystem
+                    .write_file(
+                        "/project/dependency/tsconfig.json",
+                        r#"{"files":["index.ts"],"compilerOptions":{"composite":true}}"#,
+                    )
+                    .unwrap();
+                filesystem
+                    .write_file("/project/dependency/index.ts", "export const value = 1;")
+                    .unwrap();
+            }
+            let mut called = false;
+            let error = Program::try_from_config_with_canonical_checker_and_queries(
+                &filesystem,
+                "/project/tsconfig.json",
+                |_, _| called = true,
+            )
+            .unwrap_err();
+
+            assert!(!called);
+            assert_eq!(
+                error,
+                CanonicalProgramCheckError::ProjectReferencesUnsupported {
+                    config_path: "/project/tsconfig.json".to_owned()
+                }
+            );
+            assert!(error.is_unsupported_boundary());
+            assert_eq!(error.failure_class().code(), "M00.PROJECT_REFERENCES");
+        }
+    }
+}
+
+#[test]
+fn canonical_config_empty_files_does_not_discover_unrelated_sources() {
+    let filesystem = MemoryFileSystem::new(true);
+    let config = r#"{
+        "files": [ /* empty */ ],
+        "compilerOptions": {"lib":["es5"],"types":[],"noEmit":true}
+    }"#;
+    filesystem
+        .write_file("/project/tsconfig.json", config)
+        .unwrap();
+    filesystem
+        .write_file("/project/unrelated.ts", "not valid TypeScript")
+        .unwrap();
+
+    let (program, queried) = Program::try_from_config_with_canonical_checker_and_queries(
+        &filesystem,
+        "/project/tsconfig.json",
+        |program, queries| {
+            assert!(queries.has_diagnostics());
+            program.diagnostics().to_vec()
+        },
+    )
+    .unwrap();
+    assert_eq!(program.diagnostics(), queried.unwrap());
+
+    let legacy = Program::from_config(&filesystem, "/project/tsconfig.json");
+    for program in [&program, &legacy] {
+        assert!(program.source_file("/project/unrelated.ts").is_none());
+        assert!(
+            program
+                .source_files()
+                .iter()
+                .all(|source| source.is_default_library)
+        );
+        let [diagnostic] = program.diagnostics() else {
+            panic!("expected TS18002: {:?}", program.diagnostics());
+        };
+        assert_eq!(diagnostic.code, Some(18_002));
+        assert_eq!(
+            diagnostic.file_name.as_deref(),
+            Some("/project/tsconfig.json")
+        );
+        assert_eq!(
+            diagnostic.message,
+            "The 'files' list in config file '/project/tsconfig.json' is empty."
+        );
+        let range = diagnostic.range.unwrap();
+        assert_eq!(
+            &config[range.start.get() as usize..range.end.get() as usize],
+            "[ /* empty */ ]"
+        );
+    }
+}
+
+#[test]
+fn canonical_config_empty_files_keeps_explicit_include_patterns() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files":[],"include":["src/*.ts"],"references":[],"extends":null,
+                "compilerOptions":{"lib":["es5"],"types":[],"noEmit":true}
+            }"#,
+        )
+        .unwrap();
+    filesystem
+        .write_file("/project/src/main.ts", "const value: number = 1;")
+        .unwrap();
+    filesystem
+        .write_file("/project/unrelated.ts", "not valid TypeScript")
+        .unwrap();
+
+    let (program, queried) = Program::try_from_config_with_canonical_checker_and_queries(
+        &filesystem,
+        "/project/tsconfig.json",
+        |_, queries| queries.has_diagnostics(),
+    )
+    .unwrap();
+
+    assert_eq!(queried, Some(true));
+    assert!(program.source_file("/project/src/main.ts").is_some());
+    assert!(program.source_file("/project/unrelated.ts").is_none());
+    assert_eq!(
+        program
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>(),
+        [Some(18_002)]
+    );
+}
+
+#[test]
+fn canonical_config_inherited_empty_files_preserves_presence() {
+    for override_files in [false, true] {
+        let filesystem = MemoryFileSystem::new(true);
+        let base = serde_json::json!({
+            "files": if override_files { vec!["main.ts"] } else { Vec::new() },
+            "compilerOptions": {"lib": ["es5"], "types": [], "noEmit": true}
+        });
+        let mut config = serde_json::json!({"extends": "./base.json"});
+        if override_files {
+            config["files"] = serde_json::json!([]);
+        }
+        filesystem
+            .write_file("/project/base.json", &base.to_string())
+            .unwrap();
+        filesystem
+            .write_file("/project/tsconfig.json", &config.to_string())
+            .unwrap();
+        filesystem
+            .write_file("/project/main.ts", "not valid TypeScript")
+            .unwrap();
+
+        let (program, queried) = Program::try_from_config_with_canonical_checker_and_queries(
+            &filesystem,
+            "/project/tsconfig.json",
+            |_, queries| queries.has_diagnostics(),
+        )
+        .unwrap();
+
+        assert_eq!(queried, Some(false));
+        assert!(program.diagnostics().is_empty());
+        assert!(program.source_file("/project/main.ts").is_none());
+        assert!(
+            program
+                .source_files()
+                .iter()
+                .all(|source| source.is_default_library)
+        );
+    }
+}
+
+#[test]
+fn canonical_config_absent_or_null_files_keeps_default_discovery() {
+    for mut config in [serde_json::json!({}), serde_json::json!({"files": null})] {
+        let filesystem = MemoryFileSystem::new(true);
+        config["compilerOptions"] =
+            serde_json::json!({"lib": ["es5"], "types": [], "noEmit": true});
+        filesystem
+            .write_file("/project/tsconfig.json", &config.to_string())
+            .unwrap();
+        filesystem
+            .write_file("/project/main.ts", "const value: number = 1;")
+            .unwrap();
+
+        let (program, queried) = Program::try_from_config_with_canonical_checker_and_queries(
+            &filesystem,
+            "/project/tsconfig.json",
+            |_, queries| queries.has_diagnostics(),
+        )
+        .unwrap();
+
+        assert_eq!(queried, Some(false));
+        assert!(program.diagnostics().is_empty());
+        assert!(program.source_file("/project/main.ts").is_some());
+    }
+}
