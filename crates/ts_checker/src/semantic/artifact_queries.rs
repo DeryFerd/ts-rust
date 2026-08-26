@@ -909,7 +909,7 @@ impl CanonicalCheckerContext<'_> {
         &self,
         node: NodeRef,
     ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
-        let (symbol, is_enum) = {
+        let (symbol, declaration, is_enum) = {
             let (arena, bound, record) = self.validated_artifact_node(node)?;
             let declaration = if matches!(
                 record.data,
@@ -940,6 +940,7 @@ impl CanonicalCheckerContext<'_> {
                     })?;
             (
                 self.merged_artifact_symbol(node, symbol)?,
+                declaration,
                 matches!(
                     self.validated_artifact_node(declaration)?.2.data,
                     NodeData::EnumDeclaration(_)
@@ -948,6 +949,18 @@ impl CanonicalCheckerContext<'_> {
         };
         let cached = self.cached_artifact_type(node)?;
         if is_enum {
+            let owner = self
+                .store()
+                .symbol(symbol)
+                .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?;
+            let declarations = owner.declarations().unwrap_or_default();
+            if !declarations.contains(&declaration)
+                || !owner
+                    .value_declaration()
+                    .is_some_and(|value| declarations.contains(&value))
+            {
+                return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+            }
             let declared = self
                 .store()
                 .declared_type_links(symbol)
@@ -2768,6 +2781,78 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn enum_declaration_queries_reject_unrelated_merge_redirects() {
+        let parsed = parse_source_file("declare enum First {} declare enum Second { Value = 1 }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_070);
+        let declarations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, enumeration.name),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [(first, first_name), (second, second_name)] = declarations.as_slice() else {
+            panic!("expected two enum declarations");
+        };
+        for declaration_file in [false, true] {
+            for warm in [false, true] {
+                let mut context = context_with_source_kind(
+                    &parsed,
+                    file,
+                    CanonicalCheckerOptions::default(),
+                    declaration_file,
+                );
+                let first_owner = context.file(file).unwrap().1.symbol(*first).unwrap();
+                let second_owner = context.file(file).unwrap().1.symbol(*second).unwrap();
+                if warm {
+                    context.get_type_at_location(*first_name).unwrap();
+                    context.get_type_at_location(*second_name).unwrap();
+                }
+                context
+                    .store_mut_for_test()
+                    .record_merged_symbol(second_owner, first_owner)
+                    .unwrap();
+                let source = context.source_file(file).unwrap();
+                let before = (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().source_file_links(source).cloned(),
+                    context.store().declared_type_links(second_owner).cloned(),
+                    context.diagnostics().len(),
+                );
+                for node in [*first, *first_name] {
+                    assert_eq!(
+                        context.get_type_at_location(node),
+                        Err(CanonicalArtifactQueryError::InvalidSymbol {
+                            node,
+                            symbol: second_owner,
+                        }),
+                    );
+                }
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.store().source_file_links(source).cloned(),
+                        context.store().declared_type_links(second_owner).cloned(),
+                        context.diagnostics().len(),
+                    ),
+                    before,
+                );
             }
         }
     }
