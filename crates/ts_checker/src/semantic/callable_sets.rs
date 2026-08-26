@@ -1361,6 +1361,9 @@ pub(super) fn instantiated_method_type_matches(
     {
         return true;
     }
+    if instantiated_method_union_expansion_matches(store, template, actual, mapper, array_targets) {
+        return true;
+    }
     if !matches!(
         store.mapper_application(mapper, template),
         Some(TypeMapperApplication::Composite { .. })
@@ -1368,6 +1371,95 @@ pub(super) fn instantiated_method_type_matches(
         return false;
     }
     instantiated_composite_method_type_matches(store, template, actual, mapper, &mut HashSet::new())
+}
+
+/// Validates flattened unions after an interface parameter maps to a union.
+fn instantiated_method_union_expansion_matches(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    actual: TypeId,
+    mapper: super::TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    let Some(record) = store.type_payload(template) else {
+        return false;
+    };
+    let TypeData::Union(union) = record.data() else {
+        return false;
+    };
+    if record.alias().is_some() || union.origin.is_some() {
+        return false;
+    }
+    let mapped = union
+        .union
+        .types
+        .iter()
+        .map(|&type_| match store.type_payload(type_)?.data() {
+            TypeData::TypeParameter(_) => mapped_method_type_parameter(store, mapper, type_),
+            TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
+                Some(type_)
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(mut mapped) = mapped else {
+        return false;
+    };
+    if !mapped.iter().any(|type_| {
+        matches!(
+            store.type_payload(*type_).map(super::TypeRecord::data),
+            Some(TypeData::Union(_))
+        )
+    }) {
+        return false;
+    }
+    let valid = |type_| match array_targets {
+        Some(targets) => store
+            .validate_cached_union_result_with_array_targets(targets, type_, None)
+            .is_ok(),
+        None => store.validate_cached_union_result(type_, None).is_ok(),
+    };
+    if !valid(template) || !valid(actual) || !mapped.iter().copied().all(valid) {
+        return false;
+    }
+    if let Some(bootstrap) = store.intrinsic_bootstrap()
+        && let [first, second] = mapped.as_slice()
+    {
+        let base = if *first == bootstrap.undefined_type {
+            Some(*second)
+        } else if *second == bootstrap.undefined_type {
+            Some(*first)
+        } else {
+            None
+        };
+        if let Some(base) = base
+            && store
+                .validate_optional_union_of_union_result(
+                    array_targets,
+                    base,
+                    bootstrap.undefined_type,
+                    actual,
+                )
+                .is_ok()
+        {
+            return true;
+        }
+    }
+    if store.cached_template_result_union(&mapped).ok().flatten() == Some(actual) {
+        return true;
+    }
+    if store
+        .intrinsic_bootstrap()
+        .is_some_and(|bootstrap| !bootstrap.options.strict_null_checks)
+    {
+        mapped.retain(|type_| {
+            store
+                .type_payload(*type_)
+                .is_some_and(|record| !record.flags().intersects(TypeFlags::NULLABLE))
+        });
+        return store.cached_template_result_union(&mapped).ok().flatten() == Some(actual);
+    }
+    false
 }
 
 fn instantiated_composite_method_type_matches(

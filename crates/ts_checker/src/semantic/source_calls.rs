@@ -9463,7 +9463,7 @@ mod tests {
 
     #[test]
     fn array_method_queries_reject_unsupported_function_origins_before_instance_writes() {
-        for (index, library, source) in [
+        for (index, (library, source)) in [
             (
                 "interface Array<T> {} interface ReadonlyArray<T> {}",
                 concat!(
