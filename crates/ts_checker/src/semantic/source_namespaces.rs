@@ -4704,7 +4704,7 @@ fn ambient_module_owns_member(
     owned().is_some()
 }
 
-/// Keeps React's complete imported prop-type value map cold until it is used.
+/// Proves React's imported prop-type map and returns cached annotations to preflight.
 #[allow(clippy::too_many_lines)] // Namespace, import, exports, members, and caches form one proof.
 fn authenticated_deferred_react_prop_types_interface(
     arena: &NodeArena,
@@ -4713,7 +4713,7 @@ fn authenticated_deferred_react_prop_types_interface(
     namespace: SemanticSymbolId,
     symbol: SemanticSymbolId,
     declaration: NodeRef,
-) -> bool {
+) -> Option<Vec<NodeRef>> {
     const MEMBERS: [&str; 16] = [
         "any",
         "array",
@@ -4743,10 +4743,10 @@ fn authenticated_deferred_react_prop_types_interface(
             .and_then(|owner| owner.name().as_utf8())
             != Some("ReactPropTypes")
     {
-        return false;
+        return None;
     }
 
-    let valid = || -> Option<()> {
+    let valid = || -> Option<Vec<NodeRef>> {
         let facts = bound.source_facts()?;
         let namespace_owner = store.symbol(namespace)?;
         let interface_owner = store.symbol(symbol)?;
@@ -4981,6 +4981,7 @@ fn authenticated_deferred_react_prop_types_interface(
             return None;
         }
 
+        let mut cached_annotations = Vec::new();
         for (index, (&member, expected_name)) in
             interface.members.nodes.iter().zip(MEMBERS).enumerate()
         {
@@ -5128,7 +5129,7 @@ fn authenticated_deferred_react_prop_types_interface(
             let source_type = match &imported_declaration_record.data {
                 NodeData::VariableDeclaration(variable) if index < VALUE_COUNT => {
                     let source = child(imported_declaration, variable.type_?);
-                    match store.type_node_links(source) {
+                    let source_type = match store.type_node_links(source) {
                         None => None,
                         Some(links) if links.outer_type_parameters.is_some() => return None,
                         Some(links) => {
@@ -5140,7 +5141,14 @@ fn authenticated_deferred_react_prop_types_interface(
                             }
                             links.resolved_type
                         }
+                    };
+                    if let Some(cached) = source_type.or(imported_type) {
+                        if !store.source_direct_type_annotation_is_exact(source, cached) {
+                            return None;
+                        }
+                        cached_annotations.push(source);
                     }
+                    source_type
                 }
                 NodeData::FunctionDeclaration(_) if index >= VALUE_COUNT => None,
                 _ => return None,
@@ -5192,10 +5200,10 @@ fn authenticated_deferred_react_prop_types_interface(
             }
         }
 
-        Some(())
+        Some(cached_annotations)
     };
 
-    valid().is_some()
+    valid()
 }
 
 fn plan_interface_member(
@@ -5244,7 +5252,8 @@ fn plan_interface_member(
         owner,
         symbol,
         declaration,
-    );
+    )
+    .is_some();
 
     let mut annotations = Vec::new();
     let mut generic = interface
@@ -5854,14 +5863,16 @@ fn authenticated_deferred_react_prop_types_alias(
             return None;
         };
         let prop_types_declaration = *prop_types_declaration;
-        if !authenticated_deferred_react_prop_types_interface(
+        if authenticated_deferred_react_prop_types_interface(
             arena,
             bound,
             store,
             namespace,
             prop_types,
             prop_types_declaration,
-        ) {
+        )
+        .is_none()
+        {
             return None;
         }
 
@@ -12859,24 +12870,41 @@ pub(super) fn execute_source_namespace(
         &mut declarations,
         &mut planned_diagnostics,
     );
-    // Cached aliases must pass the normal type proof before imports publish links.
-    annotations.extend(
-        declarations
-            .iter()
-            .filter_map(|declaration| match declaration {
-                SourceNamespaceMemberPlan::TypeAlias {
-                    symbol,
-                    annotation,
-                    deferred: true,
-                    ..
-                } if store.type_alias_links(*symbol).is_some()
-                    || store.type_node_links(*annotation).is_some() =>
+    // Cached declarations must pass the source type proof before imports publish links.
+    for declaration in &declarations {
+        match declaration {
+            SourceNamespaceMemberPlan::TypeAlias {
+                symbol,
+                annotation,
+                deferred: true,
+                ..
+            } if store.type_alias_links(*symbol).is_some()
+                || store.type_node_links(*annotation).is_some() =>
+            {
+                annotations.push(*annotation);
+            }
+            SourceNamespaceMemberPlan::Interface {
+                declaration,
+                symbol,
+                generic: None,
+                ..
+            } => {
+                if let Some(namespace) = store.get_parent_of_symbol(*symbol)
+                    && let Some(cached) = authenticated_deferred_react_prop_types_interface(
+                        arena,
+                        bound,
+                        store,
+                        namespace,
+                        *symbol,
+                        *declaration,
+                    )
                 {
-                    Some(*annotation)
+                    annotations.extend(cached);
                 }
-                _ => None,
-            }),
-    );
+            }
+            _ => {}
+        }
+    }
     namespace_implicit_variables(plan, &mut implicit_variables);
     namespace_ambient_variables(plan, &mut ambient_variables);
     namespace_object_initializers(plan, &mut object_initializers);
@@ -13311,6 +13339,7 @@ pub(super) fn execute_source_namespace(
                                 *symbol,
                                 *declaration,
                             )
+                            .is_some()
                         });
                 let target = if heritage || defer_react_prop_types {
                     store.get_declared_type_of_symbol(host, *symbol)?
@@ -17470,14 +17499,15 @@ mod tests {
             );
             let (arena, bound) = fixture.context.file(fixture.file).unwrap();
             assert!(
-                !authenticated_deferred_react_prop_types_interface(
+                authenticated_deferred_react_prop_types_interface(
                     arena,
                     bound,
                     fixture.context.store(),
                     react_symbol,
                     interface_symbol,
                     interface_declaration,
-                ),
+                )
+                .is_none(),
                 "mutation {mutation}",
             );
             assert!(
@@ -17625,6 +17655,155 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Check primitive and generic imports before and after paired cache changes.
+    fn ambient_react_imported_variables_check_warm_types_before_import_publication() {
+        for type_syntax in ["string", "Requireable<string>"] {
+            for poisoned in [false, true] {
+                let original = react_prop_types_fixture();
+                let source = original.parsed.arena.source_text().unwrap().replace(
+                    "export const any: string;",
+                    &format!("export const any: {type_syntax};"),
+                );
+                let mut fixture = declaration_fixture(
+                    Box::leak(source.into_boxed_str()),
+                    CanonicalModuleState::Script,
+                );
+                let namespace = plan(&fixture, 1);
+                let import = namespace
+                    .imports
+                    .iter()
+                    .find(|import| import.name_text == "PropTypes")
+                    .unwrap();
+                let imported = fixture
+                    .context
+                    .store()
+                    .symbol(import.ambient_target.unwrap())
+                    .and_then(ts_binder::semantic::Symbol::exports)
+                    .and_then(|exports| fixture.context.store().symbol_table(exports))
+                    .and_then(|exports| exports.get_source("any"))
+                    .unwrap();
+                let declaration = fixture
+                    .context
+                    .store()
+                    .symbol(imported)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    .unwrap();
+                let NodeData::VariableDeclaration(variable) =
+                    &fixture.parsed.arena.get(declaration.node).unwrap().data
+                else {
+                    panic!("the imported value must retain its variable declaration")
+                };
+                let annotation = child(declaration, variable.type_.unwrap());
+                let bound = fixture.context.file(fixture.file).unwrap().1.clone();
+                let globals = fixture.context.global_types().clone();
+                let options = fixture.context.options();
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&fixture.parsed.arena, &bound)],
+                    GlobalMergeCompletion::for_test(options.name_resolution),
+                )
+                .unwrap();
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let type_ = CanonicalTypeQuery::new_with_global_types(
+                    fixture.context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(annotation)
+                .unwrap();
+                assert!(diagnostics.is_empty());
+                let store = fixture.context.store_mut_for_test();
+                let cached = if poisoned {
+                    let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
+                    assert_ne!(boolean, type_);
+                    assert!(store.set_type_node_links(
+                        annotation,
+                        TypeNodeLinks {
+                            resolved_type: Some(boolean),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    boolean
+                } else {
+                    type_
+                };
+                assert!(store.set_value_symbol_links(
+                    imported,
+                    ValueSymbolLinks {
+                        resolved_type: Some(cached),
+                        ..ValueSymbolLinks::default()
+                    },
+                ));
+                let before = (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.type_resolution_internal_state(),
+                );
+                let value_links = store.value_symbol_links(imported).cloned();
+                let annotation_links = store.type_node_links(annotation).cloned();
+                assert!(
+                    namespace
+                        .imports
+                        .iter()
+                        .all(|import| store.alias_symbol_links(import.symbol).is_none())
+                );
+
+                let result = execute(&mut fixture, &namespace);
+                if poisoned {
+                    assert!(result.is_err(), "{type_syntax}");
+                    let store = fixture.context.store();
+                    assert_eq!(
+                        (
+                            store.type_len(),
+                            store.mapper_len(),
+                            store.symbol_len(),
+                            store.checker_link_allocated_lengths(),
+                            store.type_resolution_internal_state(),
+                        ),
+                        before,
+                        "{type_syntax}",
+                    );
+                    assert!(
+                        namespace
+                            .imports
+                            .iter()
+                            .all(|import| store.alias_symbol_links(import.symbol).is_none())
+                    );
+                } else {
+                    assert!(result.unwrap().is_empty());
+                    let warm = (
+                        fixture.context.store().type_len(),
+                        fixture.context.store().symbol_len(),
+                        fixture.context.store().checker_link_allocated_lengths(),
+                    );
+                    assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+                    assert_eq!(
+                        (
+                            fixture.context.store().type_len(),
+                            fixture.context.store().symbol_len(),
+                            fixture.context.store().checker_link_allocated_lengths(),
+                        ),
+                        warm,
+                        "{type_syntax}",
+                    );
+                }
+                assert_eq!(
+                    fixture.context.store().value_symbol_links(imported),
+                    value_links.as_ref(),
+                );
+                assert_eq!(
+                    fixture.context.store().type_node_links(annotation),
+                    annotation_links.as_ref(),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ambient_react_prop_type_imports_reject_a_replaced_module_table_entry() {
         let original = react_prop_types_fixture();
         let source = original.parsed.arena.source_text().unwrap().replace(
@@ -17673,14 +17852,17 @@ mod tests {
             })
             .unwrap();
         let (arena, bound) = fixture.context.file(fixture.file).unwrap();
-        assert!(!authenticated_deferred_react_prop_types_interface(
-            arena,
-            bound,
-            fixture.context.store(),
-            react.symbol,
-            symbol,
-            declaration,
-        ));
+        assert!(
+            authenticated_deferred_react_prop_types_interface(
+                arena,
+                bound,
+                fixture.context.store(),
+                react.symbol,
+                symbol,
+                declaration,
+            )
+            .is_none()
+        );
         assert!(react.members.iter().all(|member| !matches!(
             member,
             SourceNamespaceMemberPlan::TypeAlias { deferred: true, .. }
