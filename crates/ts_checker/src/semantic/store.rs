@@ -4231,6 +4231,19 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .flatten()
     }
 
+    pub(super) fn checkpoint_alias_symbol_links(
+        &self,
+    ) -> super::links::LinkStoreCheckpoint<SemanticSymbolId, AliasSymbolLinks> {
+        self.links.alias_symbol.checkpoint()
+    }
+
+    pub(super) fn restore_alias_symbol_links(
+        &mut self,
+        checkpoint: super::links::LinkStoreCheckpoint<SemanticSymbolId, AliasSymbolLinks>,
+    ) -> bool {
+        self.links.alias_symbol.restore_checkpoint(checkpoint)
+    }
+
     pub fn ensure_alias_symbol_links(&mut self, symbol: SemanticSymbolId) -> bool {
         if !self.symbols.contains_symbol(symbol) {
             return false;

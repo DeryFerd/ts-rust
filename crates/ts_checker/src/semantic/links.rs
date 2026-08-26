@@ -916,11 +916,20 @@ impl<V> Hash for LinkHandle<V> {
 ///
 /// `get` allocates exactly one default record per new key. `has` and
 /// `try_get` never allocate. There is intentionally no delete or iteration
-/// API. Mutation is replacement by stable handle, which lets callers snapshot
+/// public API. Internal query checkpoints can restore the allocation state.
+/// Mutation is replacement by stable handle, which lets callers snapshot
 /// state, install a recursion sentinel, recurse after the borrow ends, and
 /// finally refetch/commit.
 #[derive(Debug)]
 pub struct LinkStore<K, V> {
+    id: LinkStoreId,
+    entries: HashMap<K, usize>,
+    arena: Vec<V>,
+}
+
+/// Private query checkpoint. No handle allocated after it may escape the query.
+#[derive(Debug)]
+pub(super) struct LinkStoreCheckpoint<K, V> {
     id: LinkStoreId,
     entries: HashMap<K, usize>,
     arena: Vec<V>,
@@ -951,6 +960,27 @@ impl<K: Eq + Hash, V: Default> LinkStore<K, V> {
 }
 
 impl<K: Eq + Hash, V> LinkStore<K, V> {
+    pub(super) fn checkpoint(&self) -> LinkStoreCheckpoint<K, V>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        LinkStoreCheckpoint {
+            id: self.id,
+            entries: self.entries.clone(),
+            arena: self.arena.clone(),
+        }
+    }
+
+    pub(super) fn restore_checkpoint(&mut self, checkpoint: LinkStoreCheckpoint<K, V>) -> bool {
+        if checkpoint.id != self.id {
+            return false;
+        }
+        self.entries = checkpoint.entries;
+        self.arena = checkpoint.arena;
+        true
+    }
+
     /// Reserves one dependency-closed publication suffix without allocating a
     /// semantic link record. Capacity growth is intentionally unobservable.
     pub(super) fn try_reserve(&mut self, additional: usize) -> bool {
@@ -1494,6 +1524,25 @@ mod tests {
         assert_eq!(first.value(second_handle), None);
         assert!(!first.replace(second_handle, 9));
         assert_eq!(first.value(first_handle), Some(&0));
+    }
+
+    #[test]
+    fn display_alias_checkpoint_restores_prefix_and_absent_entries() {
+        let mut store = LinkStore::<u32, u32>::default();
+        let existing = store.get(1);
+        assert!(store.replace(existing, 7));
+        let checkpoint = store.checkpoint();
+        assert!(store.replace(existing, 99));
+        let added = store.get(2);
+        assert!(store.replace(added, 11));
+        assert!(store.restore_checkpoint(checkpoint));
+        assert_eq!(store.value(existing), Some(&7));
+        assert_eq!(store.try_get(&2), None);
+        assert_eq!(store.allocated_len(), 1);
+        let foreign = LinkStore::<u32, u32>::default().checkpoint();
+        assert!(!store.restore_checkpoint(foreign));
+        assert_eq!(store.value(existing), Some(&7));
+        assert_eq!(store.allocated_len(), 1);
     }
 
     #[test]

@@ -694,6 +694,17 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         enclosing: NodeRef,
         flags: CanonicalTypeFormatFlags,
     ) -> Result<String, TypeDisplayUnavailable> {
+        self.with_display_alias_transaction(|context| {
+            context.type_to_string_at_location_worker(type_id, enclosing, flags)
+        })
+    }
+
+    fn type_to_string_at_location_worker(
+        &mut self,
+        type_id: TypeId,
+        enclosing: NodeRef,
+        flags: CanonicalTypeFormatFlags,
+    ) -> Result<String, TypeDisplayUnavailable> {
         if self.store.type_payload(type_id).is_none() {
             return Err(TypeDisplayUnavailable::Type(type_id));
         }
@@ -714,6 +725,21 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             self.type_format_flags(flags),
             location,
         )
+    }
+
+    pub(super) fn with_display_alias_transaction<T, E>(
+        &mut self,
+        query: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let checkpoint = self.store.checkpoint_alias_symbol_links();
+        let result = query(self);
+        if result.is_err() {
+            assert!(
+                self.store.restore_alias_symbol_links(checkpoint),
+                "display owns its alias checkpoint"
+            );
+        }
+        result
     }
 
     /// Retains a public module specifier supplied by the Program's package resolver.

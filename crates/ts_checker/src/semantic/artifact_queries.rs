@@ -638,6 +638,16 @@ impl CanonicalCheckerContext<'_> {
         symbol: SemanticSymbolId,
         enclosing: NodeRef,
     ) -> Result<String, CanonicalArtifactQueryError> {
+        self.with_display_alias_transaction(|context| {
+            context.symbol_to_string_at_location_worker(symbol, enclosing)
+        })
+    }
+
+    fn symbol_to_string_at_location_worker(
+        &mut self,
+        symbol: SemanticSymbolId,
+        enclosing: NodeRef,
+    ) -> Result<String, CanonicalArtifactQueryError> {
         self.validated_artifact_node(enclosing)?;
         self.get_symbol_declarations(symbol)?;
         let record = self

@@ -164,7 +164,14 @@ impl SymbolDisplayContext {
                 })
                 .collect::<Vec<_>>();
             for alias in aliases {
+                let checkpoint = store.checkpoint_alias_symbol_links();
                 let result = checked_alias_target(store, alias_host, alias, &mut HashSet::new());
+                if result.is_err() {
+                    assert!(
+                        store.restore_alias_symbol_links(checkpoint),
+                        "alias lookup owns its checkpoint"
+                    );
+                }
                 if let Ok(target) = result
                     && let Some(table) = exports(store, target)?
                 {
@@ -675,10 +682,10 @@ fn checked_alias_target(
     if !visiting.insert(alias) {
         return Err(SymbolDisplayError::CyclicAlias(alias));
     }
+    let original = store.alias_symbol_links(alias).cloned();
     if !store.ensure_alias_symbol_links(alias) {
         return Err(SymbolDisplayError::InvalidAliasCache(alias));
     }
-    let original = store.alias_symbol_links(alias).cloned();
     let result = (|| {
         let (immediate, type_only) = host
             .get_target_and_type_only_of_alias_declaration(store, alias)
@@ -738,12 +745,6 @@ fn checked_alias_target(
         Ok(target)
     })();
     visiting.remove(&alias);
-    if result.is_err()
-        && let Some(original) = original
-        && !store.set_alias_symbol_links(alias, original)
-    {
-        return Err(SymbolDisplayError::InvalidAliasCache(alias));
-    }
     result
 }
 
@@ -951,6 +952,18 @@ mod tests {
     fn symbol(context: &CanonicalCheckerContext<'_>, node: NodeRef) -> SemanticSymbolId {
         let symbol = context.file(node.file).unwrap().1.symbol(node).unwrap();
         context.store().get_merged_symbol(symbol).unwrap()
+    }
+
+    fn alias_declaration(parsed: &ParseResult, file: FileId, name: &str) -> NodeRef {
+        parsed.arena.iter().find_map(|(id, record)| {
+            let name_id = match &record.data {
+                NodeData::ImportSpecifier(specifier) => specifier.name,
+                NodeData::ExportSpecifier(specifier) => specifier.name,
+                _ => return None,
+            };
+            matches!(&parsed.arena.get(name_id)?.data, NodeData::Identifier(identifier) if identifier.text == name)
+                .then_some(NodeRef::new(parsed.arena.id(), file, id))
+        }).unwrap()
     }
 
     fn bind(
@@ -1358,6 +1371,93 @@ mod tests {
                 SymbolDisplayError::InvalidLocation(foreign_location)
             ))
         );
+    }
+
+    #[test]
+    fn failed_display_restores_visible_and_nested_aliases_as_one_query() {
+        let target = parse_source_file(
+            "interface Shape { value: number; } interface Other { text: string; } export { Shape, Other };",
+        );
+        let left = parse_source_file("import type { Shape as Bad, Other as Good } from './model';");
+        let right = parse_source_file("export {};");
+        let mut context = import_context(&target, &left, &right);
+        let target_file = FileId::new(41_010);
+        let left_file = FileId::new(41_011);
+        let shape = symbol(&context, declaration(&target, target_file, "Shape"));
+        let other = symbol(&context, declaration(&target, target_file, "Other"));
+        let bad = symbol(&context, alias_declaration(&left, left_file, "Bad"));
+        let good = symbol(&context, alias_declaration(&left, left_file, "Good"));
+        let exported_shape = symbol(&context, alias_declaration(&target, target_file, "Shape"));
+        let exported_other = symbol(&context, alias_declaration(&target, target_file, "Other"));
+        let type_ = context.get_declared_type_of_symbol(shape).unwrap();
+        let location = NodeRef::new(left.arena.id(), left_file, left.source_file);
+        let poison = crate::semantic::AliasSymbolLinks {
+            immediate_target: Some(other),
+            alias_target: AliasTargetState::Resolved(other),
+            ..crate::semantic::AliasSymbolLinks::default()
+        };
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_alias_symbol_links(bad, poison.clone())
+        );
+        let before = context.store().checker_link_allocated_lengths();
+        for _ in 0..2 {
+            assert_eq!(
+                context.type_to_string_at_location(type_, location),
+                Err(TypeDisplayUnavailable::SymbolDisplay(
+                    SymbolDisplayError::InvalidAliasCache(bad)
+                ))
+            );
+            assert_eq!(
+                context.symbol_to_string_at_location(shape, location),
+                Err(
+                    crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
+                        SymbolDisplayError::InvalidAliasCache(bad)
+                    )
+                )
+            );
+            assert_eq!(context.store().alias_symbol_links(bad), Some(&poison));
+            for cold in [good, exported_shape, exported_other] {
+                assert_eq!(context.store().alias_symbol_links(cold), None);
+            }
+            assert_eq!(context.store().checker_link_allocated_lengths(), before);
+        }
+    }
+
+    #[test]
+    fn failed_cold_alias_does_not_leave_a_default_link_entry() {
+        let target = parse_source_file(
+            "export interface Shape { value: number; } export interface Other { text: string; }",
+        );
+        let left =
+            parse_source_file("import type { Missing as Bad, Other as Good } from './model';");
+        let right = parse_source_file("export {};");
+        let mut context = import_context(&target, &left, &right);
+        let target_file = FileId::new(41_010);
+        let left_file = FileId::new(41_011);
+        let shape = symbol(&context, declaration(&target, target_file, "Shape"));
+        let bad = symbol(&context, alias_declaration(&left, left_file, "Bad"));
+        let good = symbol(&context, alias_declaration(&left, left_file, "Good"));
+        let type_ = context.get_declared_type_of_symbol(shape).unwrap();
+        let location = NodeRef::new(left.arena.id(), left_file, left.source_file);
+        let before = context.store().checker_link_allocated_lengths();
+        for _ in 0..2 {
+            assert!(
+                matches!(context.type_to_string_at_location(type_, location), Err(TypeDisplayUnavailable::SymbolDisplay(SymbolDisplayError::Alias(CanonicalAliasResolutionError::TargetUnavailable { alias, .. }))) if alias == bad)
+            );
+            assert_eq!(context.store().alias_symbol_links(bad), None);
+            assert_eq!(context.store().alias_symbol_links(good), None);
+            assert_eq!(context.store().checker_link_allocated_lengths(), before);
+        }
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context
+                .type_to_string_at_location(number, location)
+                .unwrap(),
+            "number"
+        );
+        assert_eq!(context.store().alias_symbol_links(bad), None);
     }
 
     #[test]
