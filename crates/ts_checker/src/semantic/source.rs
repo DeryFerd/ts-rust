@@ -46932,7 +46932,7 @@ pub(super) fn check_source_file(
             }
             continue;
         }
-        resolve_source_import_namespace_exports(store, alias_host, resolved)
+        resolve_source_import_namespace_exports(store, alias_host, host, resolved)
             .map_err(|error| SourcePlanner::import_plan_error(read.node, &error))?;
         materialize_imported_default_interface_return(
             store,
