@@ -8473,17 +8473,36 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Check allocation order, pairwise order, and cache replay together.
     fn constructor_union_order_is_transitive_across_object_payloads() {
         let parsed = parse_source_file(concat!(
             "interface Array<T> {} interface ReadonlyArray<T> {} ",
-            "class Zebra {} class Alpha {} const first = Zebra; const second = Alpha;",
+            "class Zebra {} class Alpha {}",
         ));
         let file = FileId::new(149);
         for nonempty in [false, true] {
             let mut context = checker_context(file, &parsed);
+            let classes = parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .map(|node| context.file(file).unwrap().1.symbol(node).unwrap())
+                .collect::<Vec<_>>();
+            let [first_symbol, second_symbol] = classes.as_slice() else {
+                panic!("the source must contain two class declarations")
+            };
+            // Source queries check the whole file, so publish each class directly.
             let second = context
-                .get_type_at_location(variable_initializer(&parsed, file, "second"))
-                .unwrap();
+                .get_nongeneric_class_members(*second_symbol)
+                .unwrap()
+                .shells()
+                .value_type();
             let number = context.store().intrinsic_bootstrap().unwrap().number_type;
             let required = context
                 .store()
@@ -8501,9 +8520,14 @@ mod tests {
                 ))
                 .unwrap();
             let first = context
-                .get_type_at_location(variable_initializer(&parsed, file, "first"))
-                .unwrap();
-            assert!(second.get() < tuple.get() && tuple.get() < first.get());
+                .get_nongeneric_class_members(*first_symbol)
+                .unwrap()
+                .shells()
+                .value_type();
+            assert!(
+                second.get() < tuple.get() && tuple.get() < first.get(),
+                "expected second < tuple < first, got {second:?}, {tuple:?}, {first:?}",
+            );
             assert!(
                 matches!(
                     context.store().type_payload(tuple).unwrap().data(),
