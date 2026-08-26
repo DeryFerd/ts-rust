@@ -37,7 +37,10 @@
 //! the alias value cache, and `getTypeOfVariableOrParameterOrProperty` obtains
 //! the annotated target value type.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 use ts_ast::{Node, NodeArena, NodeData, NodeFlags, NodeRef, SyntaxKind};
 use ts_binder::{
@@ -196,6 +199,14 @@ pub(super) struct ResolvedSourceImportBinding {
     pub(super) binding: SourceImportBindingPlan,
     pub(super) immediate_target_symbol: SemanticSymbolId,
     pub(super) target_symbol: SemanticSymbolId,
+    namespace_aliases: RefCell<Vec<StagedSourceImportNamespaceAlias>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StagedSourceImportNamespaceAlias {
+    declaration: NodeRef,
+    alias: SemanticSymbolId,
+    target: SemanticSymbolId,
 }
 
 /// One independently resolved type-only binding whose final target is a simple
@@ -354,6 +365,7 @@ enum PlannedSourceImportValueTarget {
         initializer: NodeRef,
         namespace_alias: SemanticSymbolId,
         module: SemanticSymbolId,
+        staged_alias: Option<StagedSourceImportNamespaceAlias>,
     },
     PublishedSpreadObject {
         declaration: NodeRef,
@@ -2271,7 +2283,14 @@ pub(super) fn resolve_source_import_namespace_exports(
     host: &DeclaredTypeHost<'_>,
     resolved: &ResolvedSourceImportBinding,
 ) -> Result<(), SourceImportError> {
-    resolve_imported_namespace_const_alias(store, alias_host, host, resolved.target_symbol)?;
+    let mut staged = Vec::new();
+    stage_imported_namespace_const_alias(
+        store,
+        alias_host,
+        host,
+        resolved.target_symbol,
+        &mut staged,
+    )?;
     if store.export_type_links(resolved.target_symbol).is_some() {
         authenticate_synthetic_import_namespace_identity(
             store,
@@ -2288,6 +2307,7 @@ pub(super) fn resolve_source_import_namespace_exports(
     if !module.flags().intersects(SymbolFlags::MODULE)
         || !module.flags().intersects(SymbolFlags::VALUE)
     {
+        *resolved.namespace_aliases.borrow_mut() = staged;
         return Ok(());
     }
     let Some(exports) = store
@@ -2308,7 +2328,7 @@ pub(super) fn resolve_source_import_namespace_exports(
             .symbol(symbol)
             .is_some_and(|record| record.flags() == SymbolFlags::ALIAS)
         {
-            resolve_imported_namespace_const_alias(store, alias_host, host, symbol)?;
+            stage_imported_namespace_const_alias(store, alias_host, host, symbol, &mut staged)?;
             continue;
         }
         let alias = symbol;
@@ -2332,16 +2352,18 @@ pub(super) fn resolve_source_import_namespace_exports(
             });
         }
         let (_, target) = independently_resolve_source_alias_chain(store, alias_host, alias)?;
-        resolve_imported_namespace_const_alias(store, alias_host, host, target)?;
+        stage_imported_namespace_const_alias(store, alias_host, host, target, &mut staged)?;
     }
+    *resolved.namespace_aliases.borrow_mut() = staged;
     Ok(())
 }
 
-fn resolve_imported_namespace_const_alias(
+fn stage_imported_namespace_const_alias(
     store: &mut CanonicalTypeMapperStore,
     alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
     host: &DeclaredTypeHost<'_>,
     target: SemanticSymbolId,
+    staged: &mut Vec<StagedSourceImportNamespaceAlias>,
 ) -> Result<(), SourceImportError> {
     let Some(target_record) = store.symbol(target) else {
         return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
@@ -2408,7 +2430,80 @@ fn resolve_imported_namespace_const_alias(
         .iter()
         .find(|binding| binding.alias_symbol == alias)
         .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
-    resolve_source_import_binding(store, alias_host, binding)?;
+    let immediate = alias_host
+        .get_target_of_alias_declaration(store, alias)
+        .map_err(|reason| {
+            SourceImportError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
+                alias,
+                reason,
+            })
+        })?;
+    let CanonicalImmediateAliasTarget::Resolved(target) = immediate else {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
+    };
+    if store
+        .symbol(target)
+        .is_none_or(|record| record.flags().intersects(SymbolFlags::ALIAS))
+    {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            binding.declaration,
+        )));
+    }
+    let candidate = StagedSourceImportNamespaceAlias {
+        declaration: binding.declaration,
+        alias,
+        target,
+    };
+    preflight_staged_namespace_alias(store, candidate)?;
+    if !staged.contains(&candidate) {
+        staged.push(candidate);
+    }
+    Ok(())
+}
+
+fn preflight_staged_namespace_alias(
+    store: &CanonicalTypeMapperStore,
+    staged: StagedSourceImportNamespaceAlias,
+) -> Result<(), SourceImportError> {
+    if store.symbol(staged.alias).is_none_or(|record| {
+        record.flags() != SymbolFlags::ALIAS
+            || record.declarations() != Some(&[staged.declaration])
+            || record.check_flags() != CheckFlags::NONE
+    }) || store.alias_symbol_links(staged.alias).is_some_and(|links| {
+        links
+            .immediate_target
+            .is_some_and(|cached| cached != staged.target)
+            || !matches!(links.alias_target, AliasTargetState::Unresolved)
+                && links.alias_target != AliasTargetState::Resolved(staged.target)
+            || links.type_only_declaration.is_some()
+    }) {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
+            staged.alias,
+        )));
+    }
+    Ok(())
+}
+
+fn publish_staged_namespace_aliases(
+    store: &mut CanonicalTypeMapperStore,
+    staged: &[StagedSourceImportNamespaceAlias],
+) -> Result<(), SourceImportError> {
+    for &alias in staged {
+        preflight_staged_namespace_alias(store, alias)?;
+    }
+    for alias in staged {
+        let mut links = store
+            .alias_symbol_links(alias.alias)
+            .cloned()
+            .unwrap_or_default();
+        links.immediate_target = Some(alias.target);
+        links.alias_target = AliasTargetState::Resolved(alias.target);
+        if !store.set_alias_symbol_links(alias.alias, links) {
+            return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
+                alias.alias,
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2724,6 +2819,7 @@ fn resolve_source_import_binding_phase(
         binding: binding.clone(),
         immediate_target_symbol: direct_target,
         target_symbol: resolved_target,
+        namespace_aliases: RefCell::default(),
     })
 }
 
@@ -3048,6 +3144,10 @@ pub(super) fn prepare_source_import_value(
     read: &PlannedSourceImportRead,
 ) -> Result<PreparedSourceImportValue, SourceImportError> {
     validate_planned_import_read(store, declared_host, resolved, read)?;
+    let namespace_aliases = resolved.namespace_aliases.borrow();
+    for &alias in namespace_aliases.iter() {
+        preflight_staged_namespace_alias(store, alias)?;
+    }
     let binding = &resolved.binding;
     let target = resolved.target_symbol;
     let alias_links = store
@@ -3103,6 +3203,7 @@ pub(super) fn prepare_source_import_value(
         binding.alias_symbol,
         target,
         None,
+        &namespace_aliases,
     );
     let planned_target = match planned_target {
         Ok(planned) => planned,
@@ -3136,6 +3237,7 @@ pub(super) fn prepare_source_import_value(
                 binding.alias_symbol,
                 target,
                 None,
+                &namespace_aliases,
             )?
         }
         Err(error) => return Err(error),
@@ -3426,6 +3528,7 @@ pub(super) fn prepare_source_import_value(
     };
     let target_links = prepare_value_links(store, target, type_, false)?;
     let alias_value_links = prepare_value_links(store, binding.alias_symbol, type_, true)?;
+    publish_staged_namespace_aliases(store, &namespace_aliases)?;
 
     Ok(PreparedSourceImportValue {
         binding: binding.clone(),
@@ -4278,6 +4381,7 @@ fn plan_direct_exported_type_target(
     Ok(declaration)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_direct_import_value_target(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -4286,6 +4390,7 @@ fn plan_direct_import_value_target(
     alias: SemanticSymbolId,
     target: SemanticSymbolId,
     namespace_module: Option<SemanticSymbolId>,
+    namespace_aliases: &[StagedSourceImportNamespaceAlias],
 ) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
     let record = store
         .symbol(target)
@@ -4335,6 +4440,7 @@ fn plan_direct_import_value_target(
             alias,
             target,
             namespace_module,
+            namespace_aliases,
         );
     }
     if flags == SymbolFlags::FUNCTION
@@ -4379,6 +4485,7 @@ fn plan_direct_import_value_target(
             options,
             alias,
             target,
+            namespace_aliases,
         );
     }
     Err(unsupported(SourceImportUnsupported::TargetSymbol {
@@ -5057,6 +5164,7 @@ fn plan_direct_imported_module_namespace(
     options: CanonicalCheckerOptions,
     alias: SemanticSymbolId,
     module: SemanticSymbolId,
+    namespace_aliases: &[StagedSourceImportNamespaceAlias],
 ) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
     let record = store
         .symbol(module)
@@ -5139,6 +5247,7 @@ fn plan_direct_imported_module_namespace(
             alias,
             value_symbol,
             Some(module),
+            namespace_aliases,
         )
         .map_err(|error| match error {
             SourceImportError::Callable(SourceCallableError::Invariant(_))
@@ -5920,44 +6029,12 @@ fn materialize_imported_module_namespace(
         let mut properties = Vec::with_capacity(existing_members.len());
         for (member, symbol, type_) in existing_members {
             let (namespace, recursive_const) = match member.target {
-                PlannedSourceImportValueTarget::ModuleNamespace {
-                    declaration,
-                    members,
-                } => {
-                    let (nested_type, properties) = materialize_imported_module_namespace(
-                        store,
-                        host,
-                        global_types,
-                        options,
-                        session,
-                        diagnostics,
-                        declaration,
-                        member.value_symbol,
-                        members,
-                        Some(type_),
-                    )?;
-                    if nested_type != type_ {
-                        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
-                    }
-                    (
-                        Some(Box::new(PreparedSourceImportNestedNamespace {
-                            declaration,
-                            properties,
-                            links: prepare_value_links(
-                                store,
-                                member.value_symbol,
-                                nested_type,
-                                false,
-                            )?,
-                        })),
-                        None,
-                    )
-                }
                 PlannedSourceImportValueTarget::RecursiveNamespaceConst {
                     declaration,
                     initializer,
                     namespace_alias,
                     module: recursive_module,
+                    staged_alias,
                 } => {
                     if recursive_module != module
                         || type_ != existing
@@ -5969,6 +6046,7 @@ fn materialize_imported_module_namespace(
                             namespace_alias,
                             module,
                             Some(existing),
+                            staged_alias,
                         )
                     {
                         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
@@ -5982,7 +6060,23 @@ fn materialize_imported_module_namespace(
                         }),
                     )
                 }
-                _ => (None, None),
+                target => {
+                    let (computed, namespace) = materialize_imported_module_member(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        member.value_symbol,
+                        target,
+                        Some(type_),
+                    )?;
+                    if computed != type_ {
+                        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
+                    }
+                    (namespace, None)
+                }
             };
             properties.push(PreparedSourceImportModuleProperty {
                 name: member.name,
@@ -6014,6 +6108,7 @@ fn materialize_imported_module_namespace(
             initializer,
             namespace_alias,
             module: recursive_module,
+            staged_alias,
         } = &member.target
         {
             if *recursive_module != module
@@ -6025,6 +6120,7 @@ fn materialize_imported_module_namespace(
                     *namespace_alias,
                     module,
                     None,
+                    *staged_alias,
                 )
             {
                 return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
@@ -6043,149 +6139,17 @@ fn materialize_imported_module_namespace(
             ));
             continue;
         }
-        let (type_, namespace) = match member.target {
-            PlannedSourceImportValueTarget::AnnotatedConst { type_node, .. } => (
-                CanonicalTypeQuery::new_with_global_types_and_session(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                )?
-                .get_type_from_type_node(type_node)?,
-                None,
-            ),
-            PlannedSourceImportValueTarget::AnnotatedFunction(callable) => {
-                let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                )?
-                .get_type_of_source_callable(callable.declaration, callable.owner_symbol)?;
-                let signature = store
-                    .source_callable_provenance(type_)
-                    .map(|provenance| provenance.signature)
-                    .ok_or_else(|| {
-                        invariant(SourceImportInvariant::InvalidTargetLinks(
-                            callable.owner_symbol,
-                        ))
-                    })?;
-                if callable.return_type.is_inferred()
-                    && store
-                        .signature(signature)
-                        .and_then(super::signatures::Signature::resolved_return_type)
-                        .is_none()
-                {
-                    let void = store
-                        .intrinsic_bootstrap()
-                        .map(|bootstrap| bootstrap.void_type)
-                        .ok_or_else(|| {
-                            invariant(SourceImportInvariant::InvalidTargetLinks(
-                                callable.owner_symbol,
-                            ))
-                        })?;
-                    publish_inferred_source_callable_return(store, &callable, signature, void)?;
-                }
-                CanonicalTypeQuery::new_with_global_types_and_session(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                )?
-                .get_return_type_of_signature(signature)?;
-                (type_, None)
-            }
-            PlannedSourceImportValueTarget::AmbientClass(class) => {
-                let members = execute_nongeneric_class_member_query(store, host, &class).map_err(
-                    |error| {
-                        imported_ambient_class_error(
-                            member.value_symbol,
-                            class.declaration(),
-                            error,
-                        )
-                    },
-                )?;
-                (members.shells().value_type(), None)
-            }
-            PlannedSourceImportValueTarget::ConstEnum { .. }
-            | PlannedSourceImportValueTarget::RegularEnum { .. } => (
-                enums::get_enum_semantics(store, host, member.value_symbol)
-                    .map_err(DeclaredTypeError::from)?
-                    .value_type,
-                None,
-            ),
-            PlannedSourceImportValueTarget::ExportedObject { type_, .. }
-            | PlannedSourceImportValueTarget::PublishedObjectConst { type_, .. }
-            | PlannedSourceImportValueTarget::PublishedNamespaceConst { type_, .. }
-            | PlannedSourceImportValueTarget::PublishedSpreadObject { type_, .. }
-            | PlannedSourceImportValueTarget::PublishedConstAssertedObject { type_, .. } => {
-                (type_, None)
-            }
-            PlannedSourceImportValueTarget::DeclarationNumericConst { literal, .. } => (
-                declaration_numeric_literal_type(store, member.value_symbol, &literal)?,
-                None,
-            ),
-            PlannedSourceImportValueTarget::DeclarationBooleanConst { value, .. } => (
-                declaration_boolean_literal_type(store, member.value_symbol, value)?,
-                None,
-            ),
-            PlannedSourceImportValueTarget::JavaScriptAnnotatedConst {
-                declaration,
-                annotation,
-                cached_type,
-            } => {
-                let type_ = if let Some(annotation) = annotation {
-                    resolve_planned_jsdoc_type(store, global_types, options, &annotation).map_err(
-                        |_| unsupported(SourceImportUnsupported::TargetDeclaration(declaration)),
-                    )?
-                } else {
-                    cached_type.ok_or_else(|| {
-                        unsupported(SourceImportUnsupported::MissingTargetAnnotation(
-                            declaration,
-                        ))
-                    })?
-                };
-                (type_, None)
-            }
-            PlannedSourceImportValueTarget::CommonJsNamedExport { cached_type, .. } => {
-                (cached_type, None)
-            }
-            PlannedSourceImportValueTarget::ModuleNamespace {
-                declaration,
-                members,
-            } => {
-                let (type_, properties) = materialize_imported_module_namespace(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                    declaration,
-                    member.value_symbol,
-                    members,
-                    None,
-                )?;
-                let links = prepare_value_links(store, member.value_symbol, type_, false)?;
-                (
-                    type_,
-                    Some(Box::new(PreparedSourceImportNestedNamespace {
-                        declaration,
-                        properties,
-                        links,
-                    })),
-                )
-            }
-            PlannedSourceImportValueTarget::RecursiveNamespaceConst { .. } => {
-                unreachable!("recursive namespace exports are staged before member queries")
-            }
-        };
+        let (type_, namespace) = materialize_imported_module_member(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            member.value_symbol,
+            member.target,
+            None,
+        )?;
         if let Some(links) = store.value_symbol_links(member.value_symbol)
             && links.resolved_type.is_some_and(|cached| cached != type_)
         {
@@ -6262,6 +6226,159 @@ fn materialize_imported_module_namespace(
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
     }
     Ok((namespace_type, properties))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_imported_module_member(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    value_symbol: SemanticSymbolId,
+    target: PlannedSourceImportValueTarget,
+    expected_type: Option<TypeId>,
+) -> Result<(TypeId, Option<Box<PreparedSourceImportNestedNamespace>>), SourceImportError> {
+    let resolved = match target {
+        PlannedSourceImportValueTarget::AnnotatedConst { type_node, .. } => (
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .get_type_from_type_node(type_node)?,
+            None,
+        ),
+        PlannedSourceImportValueTarget::AnnotatedFunction(callable) => {
+            let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .get_type_of_source_callable(callable.declaration, callable.owner_symbol)?;
+            let signature = store
+                .source_callable_provenance(type_)
+                .map(|provenance| provenance.signature)
+                .ok_or_else(|| {
+                    invariant(SourceImportInvariant::InvalidTargetLinks(
+                        callable.owner_symbol,
+                    ))
+                })?;
+            if callable.return_type.is_inferred()
+                && store
+                    .signature(signature)
+                    .and_then(super::signatures::Signature::resolved_return_type)
+                    .is_none()
+            {
+                let void = store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.void_type)
+                    .ok_or_else(|| {
+                        invariant(SourceImportInvariant::InvalidTargetLinks(
+                            callable.owner_symbol,
+                        ))
+                    })?;
+                publish_inferred_source_callable_return(store, &callable, signature, void)?;
+            }
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .get_return_type_of_signature(signature)?;
+            (type_, None)
+        }
+        PlannedSourceImportValueTarget::AmbientClass(class) => {
+            let members =
+                execute_nongeneric_class_member_query(store, host, &class).map_err(|error| {
+                    imported_ambient_class_error(value_symbol, class.declaration(), error)
+                })?;
+            (members.shells().value_type(), None)
+        }
+        PlannedSourceImportValueTarget::ConstEnum { .. }
+        | PlannedSourceImportValueTarget::RegularEnum { .. } => (
+            enums::get_enum_semantics(store, host, value_symbol)
+                .map_err(DeclaredTypeError::from)?
+                .value_type,
+            None,
+        ),
+        PlannedSourceImportValueTarget::ExportedObject { type_, .. }
+        | PlannedSourceImportValueTarget::PublishedObjectConst { type_, .. }
+        | PlannedSourceImportValueTarget::PublishedNamespaceConst { type_, .. }
+        | PlannedSourceImportValueTarget::PublishedSpreadObject { type_, .. }
+        | PlannedSourceImportValueTarget::PublishedConstAssertedObject { type_, .. } => {
+            (type_, None)
+        }
+        PlannedSourceImportValueTarget::DeclarationNumericConst { literal, .. } => (
+            declaration_numeric_literal_type(store, value_symbol, &literal)?,
+            None,
+        ),
+        PlannedSourceImportValueTarget::DeclarationBooleanConst { value, .. } => (
+            declaration_boolean_literal_type(store, value_symbol, value)?,
+            None,
+        ),
+        PlannedSourceImportValueTarget::JavaScriptAnnotatedConst {
+            declaration,
+            annotation,
+            cached_type,
+        } => {
+            let type_ = if let Some(annotation) = annotation {
+                resolve_planned_jsdoc_type(store, global_types, options, &annotation).map_err(
+                    |_| unsupported(SourceImportUnsupported::TargetDeclaration(declaration)),
+                )?
+            } else {
+                cached_type.ok_or_else(|| {
+                    unsupported(SourceImportUnsupported::MissingTargetAnnotation(
+                        declaration,
+                    ))
+                })?
+            };
+            (type_, None)
+        }
+        PlannedSourceImportValueTarget::CommonJsNamedExport { cached_type, .. } => {
+            (cached_type, None)
+        }
+        PlannedSourceImportValueTarget::ModuleNamespace {
+            declaration,
+            members,
+        } => {
+            let (type_, properties) = materialize_imported_module_namespace(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                declaration,
+                value_symbol,
+                members,
+                expected_type,
+            )?;
+            let links = prepare_value_links(store, value_symbol, type_, false)?;
+            (
+                type_,
+                Some(Box::new(PreparedSourceImportNestedNamespace {
+                    declaration,
+                    properties,
+                    links,
+                })),
+            )
+        }
+        PlannedSourceImportValueTarget::RecursiveNamespaceConst { .. } => {
+            unreachable!("recursive namespace exports are staged before member queries")
+        }
+    };
+    Ok(resolved)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7234,6 +7351,7 @@ fn plan_direct_typescript_const_target(
     alias: SemanticSymbolId,
     target: SemanticSymbolId,
     namespace_module: Option<SemanticSymbolId>,
+    namespace_aliases: &[StagedSourceImportNamespaceAlias],
 ) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
     let target_record = store
         .symbol(target)
@@ -7502,6 +7620,7 @@ fn plan_direct_typescript_const_target(
                 target,
                 expression,
                 namespace_module,
+                namespace_aliases,
             );
         }
         if matches!(
@@ -7730,6 +7849,7 @@ fn declaration_default_const_export_is_exact(
         && default_links.type_only_declaration.is_none())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_published_namespace_const_target(
     store: &CanonicalTypeMapperStore,
     arena: &NodeArena,
@@ -7738,6 +7858,7 @@ fn plan_published_namespace_const_target(
     target: SemanticSymbolId,
     initializer: NodeRef,
     namespace_module: Option<SemanticSymbolId>,
+    namespace_aliases: &[StagedSourceImportNamespaceAlias],
 ) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
     let unsupported_target = || {
         unsupported(SourceImportUnsupported::MissingTargetAnnotation(
@@ -7785,10 +7906,19 @@ fn plan_published_namespace_const_target(
     {
         return Err(invalid());
     }
-    let namespace_links = store
-        .alias_symbol_links(namespace_alias)
-        .ok_or_else(unsupported_target)?;
-    let module = namespace_links.alias_target.symbol().ok_or_else(invalid)?;
+    let staged_alias = namespace_aliases
+        .iter()
+        .copied()
+        .find(|staged| staged.alias == namespace_alias);
+    let module = if let Some(staged) = staged_alias {
+        preflight_staged_namespace_alias(store, staged)?;
+        staged.target
+    } else {
+        let namespace_links = store
+            .alias_symbol_links(namespace_alias)
+            .ok_or_else(unsupported_target)?;
+        namespace_links.alias_target.symbol().ok_or_else(invalid)?
+    };
     let Some(type_) = store
         .value_symbol_links(target)
         .and_then(|links| links.resolved_type)
@@ -7804,6 +7934,7 @@ fn plan_published_namespace_const_target(
             namespace_alias,
             module,
             None,
+            staged_alias,
         ) {
             return Err(invalid());
         }
@@ -7812,6 +7943,7 @@ fn plan_published_namespace_const_target(
             initializer,
             namespace_alias,
             module,
+            staged_alias,
         });
     };
     let namespace = store
@@ -7871,6 +8003,7 @@ fn plan_published_namespace_const_target(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recursive_namespace_const_is_exact(
     store: &CanonicalTypeMapperStore,
     target: SemanticSymbolId,
@@ -7879,6 +8012,7 @@ fn recursive_namespace_const_is_exact(
     namespace_alias: SemanticSymbolId,
     module: SemanticSymbolId,
     expected_type: Option<TypeId>,
+    staged_alias: Option<StagedSourceImportNamespaceAlias>,
 ) -> bool {
     let Some(target_record) = store.symbol(target) else {
         return false;
@@ -7905,7 +8039,13 @@ fn recursive_namespace_const_is_exact(
     let module_type = store
         .value_symbol_links(module)
         .and_then(|links| links.resolved_type);
-    let namespace_type = expected_type.or(module_type);
+    let namespace_type = expected_type.or(module_type).or_else(|| {
+        store.types().find_map(|(type_, record)| {
+            (record.symbol() == Some(module)
+                && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+                .then_some(type_)
+        })
+    });
     if namespace_type.is_some_and(|type_| {
         store.type_payload(type_).is_none_or(|record| {
             record.symbol() != Some(module)
@@ -7936,7 +8076,15 @@ fn recursive_namespace_const_is_exact(
         && store
             .symbol_node_links(initializer)
             .is_none_or(|links| links.resolved_symbol == Some(namespace_alias))
-        && store.type_node_links(initializer).is_none()
+        && store.type_node_links(initializer).is_none_or(|links| {
+            namespace_type.is_some_and(|type_| {
+                links
+                    == &TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    }
+            })
+        })
         && store.value_symbol_links(target).is_none()
         && alias_record.flags() == SymbolFlags::ALIAS
         && alias_record.check_flags() == CheckFlags::NONE
@@ -7951,13 +8099,19 @@ fn recursive_namespace_const_is_exact(
         && store.source_node_kind(import) == Some(SyntaxKind::ImportDeclaration)
         && store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
         && source.file == declaration.file
-        && store
+        && (store
             .alias_symbol_links(namespace_alias)
             .is_some_and(|links| {
                 links.immediate_target == Some(module)
                     && links.alias_target == AliasTargetState::Resolved(module)
                     && links.type_only_declaration.is_none()
             })
+            || staged_alias.is_some_and(|staged| {
+                staged.alias == namespace_alias
+                    && staged.declaration == binding
+                    && staged.target == module
+                    && preflight_staged_namespace_alias(store, staged).is_ok()
+            }))
         && store.value_symbol_links(namespace_alias).is_none()
         && module_record.flags() == SymbolFlags::VALUE_MODULE
         && module_record.check_flags() == CheckFlags::NONE
@@ -8962,6 +9116,7 @@ fn valid_prepared_imported_namespace(
                             recursive.namespace_alias,
                             module,
                             Some(type_),
+                            None,
                         )
                 })
                 && match &property.namespace {
@@ -11410,20 +11565,11 @@ mod tests {
             "import * as provider from './provider'; export const copied = provider;",
             "import { forwarded } from './provider'; export const copied = forwarded;",
         ] {
-            let consumer = parsed(consumer);
-            let provider = parsed(concat!(
-                "import * as namespace from './dependency'; ",
-                "export const forwarded = namespace;",
-            ));
-            let dependency = parsed("export const value: number = 1;");
-            let consumer_file = FileId::new(10_712);
-            let provider_file = FileId::new(10_713);
-            let dependency_file = FileId::new(10_714);
-            let mut context = context_with_routes(
+            let mut fixture = fixture(
                 &[
-                    (consumer_file, &consumer),
-                    (provider_file, &provider),
-                    (dependency_file, &dependency),
+                    consumer,
+                    "import * as namespace from './dependency'; export const forwarded = namespace;",
+                    "export const value: number = 1;",
                 ],
                 &[
                     Route {
@@ -11438,12 +11584,41 @@ mod tests {
                     },
                 ],
             );
+            let import = fixture.plan_import(0, 0);
+            let provider_import = fixture.plan_import(1, 0);
+            let provider_alias = provider_import.bindings[0].alias_symbol;
+            let binding = &import.bindings[0];
+            let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+            let read = plan_source_import_identifier_read(
+                &fixture.files[0].parsed.arena,
+                bound,
+                &fixture.store,
+                binding,
+                identifier_initializer(&fixture, 0, &binding.local_text),
+                &binding.local_text,
+                binding.alias_symbol,
+            )
+            .unwrap();
+            let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+            let before = (store_state(&fixture.store), fixture.store.symbol_len());
+            let alias_before = fixture.store.alias_symbol_links(provider_alias).cloned();
+
+            resolve_namespace_exports(&mut fixture, &resolved[0]).unwrap();
 
             assert!(matches!(
-                context.check_source_file(consumer_file),
-                Err(crate::semantic::SourceCheckError::Unsupported(_)),
+                prepare_one(&mut fixture, &resolved[0], &read),
+                Err(SourceImportError::Unsupported(
+                    SourceImportUnsupported::MissingTargetAnnotation(_)
+                )),
             ));
-            assert!(context.diagnostics().is_empty());
+            assert_eq!(
+                fixture.store.alias_symbol_links(provider_alias),
+                alias_before.as_ref()
+            );
+            assert_eq!(
+                (store_state(&fixture.store), fixture.store.symbol_len()),
+                before
+            );
         }
     }
 
@@ -11496,64 +11671,80 @@ mod tests {
 
     #[test]
     fn recursive_namespace_preparation_rejects_changed_staged_property_types() {
-        let mut fixture = fixture(
-            &["import * as namespace from './self'; export const forwarded = namespace;"],
-            &[Route {
-                source: 0,
-                specifier: 0,
-                target: Some(0),
-            }],
-        );
-        let import = fixture.plan_import(0, 0);
-        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
-        let read = plan_source_import_identifier_read(
-            &fixture.files[0].parsed.arena,
-            bound,
-            &fixture.store,
-            &import.bindings[0],
-            identifier_initializer(&fixture, 0, "namespace"),
-            "namespace",
-            import.bindings[0].alias_symbol,
-        )
-        .unwrap();
-        let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
-        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
-        let PreparedSourceImportTarget::ModuleNamespace { properties } = &prepared.target else {
-            panic!("expected a recursive namespace")
-        };
-        let property = &properties[0];
-        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
-        let mut links = fixture
-            .store
-            .value_symbol_links(property.symbol)
-            .unwrap()
-            .clone();
-        links.resolved_type = Some(number);
-        assert!(fixture.store.set_value_symbol_links(property.symbol, links));
-        let before = (store_state(&fixture.store), fixture.store.symbol_len());
+        for property_name in ["forwarded", "value"] {
+            let mut fixture = fixture(
+                &[concat!(
+                    "import * as namespace from './self'; ",
+                    "export const value: string = 'ok'; ",
+                    "export const forwarded = namespace;",
+                )],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(0),
+                }],
+            );
+            let import = fixture.plan_import(0, 0);
+            let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+            let read = plan_source_import_identifier_read(
+                &fixture.files[0].parsed.arena,
+                bound,
+                &fixture.store,
+                &import.bindings[0],
+                identifier_initializer(&fixture, 0, "namespace"),
+                "namespace",
+                import.bindings[0].alias_symbol,
+            )
+            .unwrap();
+            let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+            let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+            let PreparedSourceImportTarget::ModuleNamespace { properties } = &prepared.target
+            else {
+                panic!("expected a recursive namespace")
+            };
+            let property = properties
+                .iter()
+                .find(|property| property.name.as_utf8() == Some(property_name))
+                .unwrap();
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(property.value_symbol)
+                    .is_none()
+            );
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            let mut links = fixture
+                .store
+                .value_symbol_links(property.symbol)
+                .unwrap()
+                .clone();
+            links.resolved_type = Some(number);
+            assert!(fixture.store.set_value_symbol_links(property.symbol, links));
+            let before = (store_state(&fixture.store), fixture.store.symbol_len());
 
-        assert_eq!(
-            prepare_one(&mut fixture, &resolved[0], &read),
-            Err(SourceImportError::Invariant(
-                SourceImportInvariant::InvalidTargetLinks(resolved[0].target_symbol,)
-            )),
-        );
-        assert_eq!(
-            (store_state(&fixture.store), fixture.store.symbol_len()),
-            before
-        );
-        assert!(
-            fixture
-                .store
-                .value_symbol_links(resolved[0].target_symbol)
-                .is_none()
-        );
-        assert!(
-            fixture
-                .store
-                .value_symbol_links(import.bindings[0].alias_symbol)
-                .is_none()
-        );
+            assert_eq!(
+                prepare_one(&mut fixture, &resolved[0], &read),
+                Err(SourceImportError::Invariant(
+                    SourceImportInvariant::InvalidTargetLinks(resolved[0].target_symbol,)
+                )),
+            );
+            assert_eq!(
+                (store_state(&fixture.store), fixture.store.symbol_len()),
+                before
+            );
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(resolved[0].target_symbol)
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(import.bindings[0].alias_symbol)
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -11688,11 +11879,11 @@ mod tests {
                         Some(declaration),
                     ));
                 }
-                3 => assert!(fixture.store.set_symbol_flags(
-                    property_symbol,
-                    SymbolFlags::PROPERTY,
-                    CheckFlags::READONLY,
-                )),
+                3 => assert!(
+                    fixture
+                        .store
+                        .set_source_property_readonly(property_symbol, true)
+                ),
                 _ => unreachable!("all recursive namespace property forgeries are covered"),
             }
             let before = (store_state(&fixture.store), fixture.store.symbol_len());
