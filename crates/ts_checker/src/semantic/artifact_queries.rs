@@ -11,10 +11,13 @@ use ts_binder::{
     BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, InternalSymbolName,
     SemanticSymbolId, SymbolFlags,
 };
+use ts_jsnum::PseudoBigInt;
 
 use super::{
     AliasTargetState, CanonicalAliasQueryError, CanonicalCheckerContext, DeclaredTypeError,
-    SourceCheckError, TypeData, TypeId, type_records::TypeRecord,
+    SourceCheckError, TypeData, TypeId,
+    type_nodes::{normalize_bigint_literal, normalize_numeric_separators},
+    type_records::TypeRecord,
 };
 
 /// A location query could not prove an exact result from this checker program.
@@ -188,6 +191,10 @@ impl CanonicalCheckerContext<'_> {
         self.prepare_artifact_location(node)?;
 
         if let Some(type_) = self.class_declaration_artifact_type(node)? {
+            return Ok(type_);
+        }
+
+        if let Some(type_) = self.literal_annotation_artifact_type(node)? {
             return Ok(type_);
         }
 
@@ -700,6 +707,106 @@ impl CanonicalCheckerContext<'_> {
             });
         }
         self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    fn literal_annotation_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let annotation = {
+            let (_, _, record) = self.validated_artifact_node(node)?;
+            let Some(parent) = record.parent else {
+                return Ok(None);
+            };
+            let parent = NodeRef::new(node.arena, node.file, parent);
+            let (_, _, parent_record) = self.validated_artifact_node(parent)?;
+            let NodeData::LiteralTypeNode(literal) = &parent_record.data else {
+                return Ok(None);
+            };
+            if literal.literal != node.node {
+                return Err(CanonicalArtifactQueryError::ForeignNode(node));
+            }
+            parent
+        };
+
+        // Type-node queries cache the annotation, not its literal child.
+        // Check both against the literal table before resolving a cold query.
+        for location in [node, annotation] {
+            let cached = self.cached_artifact_type(location)?;
+            if self
+                .store()
+                .type_node_links(location)
+                .is_some_and(|links| links.outer_type_parameters.is_some())
+            {
+                return Err(CanonicalArtifactQueryError::MissingType {
+                    node: location,
+                    kind: self.validated_artifact_node(location)?.2.kind,
+                });
+            }
+            if let Some(cached) = cached
+                && (self.cached_literal_annotation_identity(node)? != Some(cached)
+                    || self.store().validate_union_constituent(cached).is_err())
+            {
+                return Err(CanonicalArtifactQueryError::InvalidType {
+                    node: location,
+                    type_: cached,
+                });
+            }
+        }
+        let type_ = self.get_type_from_type_node(annotation)?;
+        self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    fn cached_literal_annotation_identity(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (_, _, record) = self.validated_artifact_node(node)?;
+        let Some(bootstrap) = self.store().intrinsic_bootstrap() else {
+            return Ok(None);
+        };
+        let (record, negative) = if let NodeData::PrefixUnaryExpression(prefix) = &record.data {
+            if prefix.operator != SyntaxKind::MinusToken {
+                return Ok(None);
+            }
+            let operand = NodeRef::new(node.arena, node.file, prefix.operand);
+            let (_, _, operand_record) = self.validated_artifact_node(operand)?;
+            if operand_record.parent != Some(node.node) {
+                return Err(CanonicalArtifactQueryError::ForeignNode(operand));
+            }
+            (operand_record, true)
+        } else {
+            (record, false)
+        };
+        Ok(match &record.data {
+            NodeData::KeywordExpression(_) if !negative => match record.kind {
+                SyntaxKind::TrueKeyword => Some(bootstrap.regular_true_type),
+                SyntaxKind::FalseKeyword => Some(bootstrap.regular_false_type),
+                SyntaxKind::NullKeyword => Some(bootstrap.null_type),
+                _ => None,
+            },
+            NodeData::StringLiteral(literal) if !negative => {
+                bootstrap.cached_string_literal_type(&literal.text)
+            }
+            NodeData::NoSubstitutionTemplateLiteral(literal) if !negative => {
+                bootstrap.cached_string_literal_type(&literal.text)
+            }
+            NodeData::NumericLiteral(literal) => normalize_numeric_separators(&literal.text)
+                .map(|text| ts_jsnum::from_string(&text))
+                .filter(|value| !value.is_nan())
+                .and_then(|value| {
+                    bootstrap.cached_number_literal_type(if negative { -value } else { value })
+                }),
+            NodeData::BigIntLiteral(literal) => normalize_bigint_literal(&literal.text)
+                .map(|text| PseudoBigInt::parse_valid(&text))
+                .and_then(|value| {
+                    bootstrap.cached_bigint_literal_type(&PseudoBigInt::new(
+                        &value.base10_value,
+                        negative,
+                    ))
+                }),
+            _ => None,
+        })
     }
 
     fn validate_artifact_type(
@@ -1891,6 +1998,80 @@ mod tests {
             }),
         );
         assert_eq!(context.get_type_at_location(declaration), Ok(instance));
+    }
+
+    #[test]
+    fn literal_annotation_queries_reject_conflicting_caches_without_writes() {
+        for source in [
+            "interface Shape { value: true; }",
+            "interface Shape { value: 'ready'; }",
+            "interface Shape { value: 42; }",
+            "interface Shape { value: -2; }",
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(6_029);
+            let (annotation, literal) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::LiteralTypeNode(literal) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, literal.literal),
+                    ))
+                })
+                .unwrap();
+
+            for poisoned in [literal, annotation] {
+                let mut context = declaration_context(&parsed, file);
+                let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+                let links = TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..TypeNodeLinks::default()
+                };
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(poisoned, links.clone()),
+                );
+                let before = (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                );
+                assert_eq!(
+                    context.get_type_at_location(literal),
+                    Err(CanonicalArtifactQueryError::InvalidType {
+                        node: poisoned,
+                        type_: wrong,
+                    }),
+                );
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().signature_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.diagnostics().len(),
+                    ),
+                    before,
+                );
+                assert_eq!(context.store().type_node_links(poisoned), Some(&links));
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(poisoned, TypeNodeLinks::default()),
+                );
+                let resolved = context.get_type_at_location(literal).unwrap();
+                assert_ne!(resolved, wrong);
+                assert_eq!(context.get_type_from_type_node(annotation), Ok(resolved));
+            }
+        }
     }
 
     #[test]
