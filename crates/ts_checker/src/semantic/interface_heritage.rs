@@ -438,10 +438,48 @@ fn plan_interface_type_arguments(
     let owner_symbol = store
         .symbol(owner)
         .ok_or(DirectInterfaceHeritageError::Invalid)?;
+    let merged_nongeneric_class = owner_symbol.flags()
+        == SymbolFlags::CLASS | SymbolFlags::INTERFACE
+        && parameters.is_none()
+        && arguments.is_none()
+        && owner_symbol
+            .value_declaration()
+            .is_some_and(|class_declaration| {
+                class_declaration.is_for(declaration.arena, declaration.file)
+                    && owner_symbol.declarations().is_some_and(|declarations| {
+                        declarations.len() == 2
+                            && declarations.contains(&class_declaration)
+                            && declarations.contains(&declaration)
+                    })
+                    && host.symbol_matches(store, class_declaration, owner)
+                    && preflight_node(store, host, class_declaration).is_ok_and(|record| {
+                        record.kind == SyntaxKind::ClassDeclaration
+                            && record.parent == owner_record.parent
+                            && matches!(&record.data, NodeData::ClassDeclaration(class)
+                            if class.type_parameters.is_none())
+                    })
+            });
+    let merged_nongeneric_value = parameters.is_none()
+        && arguments.is_none()
+        && owner_symbol.flags().without(SymbolFlags::TRANSIENT)
+            == SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        && owner_symbol
+            .declarations()
+            .is_some_and(|declarations| declarations.contains(&declaration))
+        && authenticate_default_library_interface_base(
+            store,
+            host,
+            owner,
+            owner_symbol
+                .declarations()
+                .ok_or(DirectInterfaceHeritageError::Invalid)?,
+        )?;
     if owner_record.kind != SyntaxKind::InterfaceDeclaration
         || owner_record.flags.0 != 0
         || !host.symbol_matches(store, declaration, owner)
         || owner_symbol.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            && !merged_nongeneric_class
+            && !merged_nongeneric_value
         || owner_symbol.check_flags() != CheckFlags::NONE
         || parameters
             .is_some_and(|parameters| parameters.nodes.is_empty() || parameters.has_trailing_comma)
@@ -682,11 +720,9 @@ pub(super) fn validate_heritage_default_cache(
         super::object_members::cached_planned_type_identity(store, default.node)
     };
     if require_resolved
-        && (expected.is_none()
-            || store
-                .type_node_links(default.node)
-                .and_then(|links| links.resolved_type)
-                != expected)
+        && expected.is_none_or(|expected| {
+            !store.source_direct_type_annotation_is_exact(default.node, expected)
+        })
         || store.type_node_links(default.node).is_some_and(|links| {
             links
                 != &super::TypeNodeLinks {
@@ -3847,6 +3883,166 @@ mod tests {
         ));
         assert_eq!(context.get_declared_type_of_symbol(array), Ok(target));
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn merged_nongeneric_class_heritage_keeps_base_argument_checks() {
+        for (base, extension, expected_arguments) in [
+            ("Base", "Base", Some(0)),
+            ("Base<T>", "Base", None),
+            ("Base<T = number>", "Base", Some(1)),
+            ("Base<T = number>", "Base<number>", None),
+        ] {
+            let parsed = parse_source_file(&format!(
+                "interface {base} {{}} \
+                 class C extends null {{ constructor() {{ super(); }} }} \
+                 interface C extends {extension} {{}}"
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(8_602);
+            let context = checker_context(&parsed, file);
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let result = heritage_plan(&parsed, file, &context, "C");
+            if let Some(expected) = expected_arguments {
+                let plan = result.unwrap();
+                assert_eq!(plan.bases.len(), 1);
+                assert_eq!(plan.bases[0].type_arguments.len(), expected);
+                assert_eq!(plan.bases[0].defaults.len(), expected);
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(DirectInterfaceHeritageError::Unsupported { .. })
+                    ),
+                    "{base} / {extension}: {result:?}",
+                );
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn default_library_interface_value_owners_keep_no_argument_heritage() {
+        let library = parse_source_file(concat!(
+            "interface ElementBase {} ",
+            "interface HTMLAnchorElement extends ElementBase {} ",
+            "declare var HTMLAnchorElement: unknown;",
+        ));
+        let source = parse_source_file("");
+        for default_library in [false, true] {
+            let (context, file, _) =
+                default_library_heritage_context(&library, &source, default_library);
+            let owner = interface_symbol(&library, file, &context, "HTMLAnchorElement");
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let result = heritage_plan(&library, file, &context, "HTMLAnchorElement");
+            if default_library {
+                let plan = result.unwrap();
+                assert_eq!(plan.bases.len(), 1);
+                assert!(plan.bases[0].type_arguments.is_empty());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(DirectInterfaceHeritageError::Unsupported { .. })
+                ));
+            }
+            assert!(context.store().declared_type_links(owner).is_none());
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn heritage_primitive_defaults_validate_uncached_annotations() {
+        for keyword in ["any", "unknown", "string"] {
+            let parsed = parse_source_file(&format!(
+                "interface Base<Value = {keyword}> {{ value: Value }} \
+                 interface Derived extends Base {{}}"
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(8_603);
+            let mut context = checker_context(&parsed, file);
+            let owner = interface_symbol(&parsed, file, &context, "Derived");
+            let target = context.get_declared_type_of_symbol(owner).unwrap();
+            let plan = heritage_plan(&parsed, file, &context, "Derived").unwrap();
+            let default = &plan.bases[0].defaults[0];
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let wrong = bootstrap.number_type;
+            let expected = match keyword {
+                "any" => bootstrap.any_type,
+                "unknown" => bootstrap.unknown_type,
+                "string" => bootstrap.string_type,
+                _ => unreachable!(),
+            };
+            let parameter = context
+                .get_declared_type_of_symbol(default.parameter)
+                .unwrap();
+            let TypeData::TypeParameter(data) =
+                context.store().type_payload(parameter).unwrap().data()
+            else {
+                panic!("the default must retain its declared parameter")
+            };
+            assert_eq!(data.resolved_default_type, Some(expected));
+            assert!(
+                context
+                    .store()
+                    .source_direct_type_annotation_is_exact(default.node, expected)
+            );
+            assert!(context.store().type_node_links(default.node).is_none());
+            let original = context
+                .store()
+                .type_node_links(default.node)
+                .cloned()
+                .unwrap_or_default();
+            assert!(context.store_mut_for_test().set_type_node_links(
+                default.node,
+                super::super::TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..super::super::TypeNodeLinks::default()
+                },
+            ));
+            let before = (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert!(context.get_declared_type_of_symbol(owner).is_err());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(default.node, original)
+            );
+            assert_eq!(context.get_declared_type_of_symbol(owner), Ok(target));
+        }
     }
 
     #[test]

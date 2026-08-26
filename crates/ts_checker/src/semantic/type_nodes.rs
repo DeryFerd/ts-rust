@@ -21894,15 +21894,33 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let invalid =
             || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(base.node));
         let target = self.execute_declared_type(base.symbol, plan, prepared)?;
+        // Resolve omitted defaults in their declaration scope, not as explicit arguments.
+        let supplied_count = base
+            .defaults
+            .first()
+            .map_or(base.type_arguments.len(), |default| default.index);
+        let supplied = base
+            .type_arguments
+            .get(..supplied_count)
+            .ok_or_else(invalid)?;
+        if base.defaults.len() != base.type_arguments.len() - supplied_count
+            || base
+                .defaults
+                .iter()
+                .enumerate()
+                .any(|(offset, default)| default.index != supplied_count + offset)
+        {
+            return Err(invalid());
+        }
         let mut arguments = Vec::with_capacity(base.type_arguments.len());
-        for argument in &base.type_arguments {
+        for argument in supplied {
             arguments.push(self.execute_type_node(*argument, plan, prepared)?);
         }
         if !base.defaults.is_empty() {
             let reference = PlannedTypeReference {
                 symbol: base.symbol,
                 import_alias: None,
-                type_arguments: base.type_arguments.clone(),
+                type_arguments: supplied.to_vec(),
                 alias_owner: None,
                 arity: PlannedTypeReferenceArity::Valid,
                 global_array_target: None,

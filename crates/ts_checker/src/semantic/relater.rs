@@ -6195,6 +6195,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_id: TypeId,
         name: &str,
     ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+        if self.direct_interface_heritage_provenance(type_id).is_some() {
+            return self.resolved_own_property_by_key(type_id, EscapedNameRef::source(name));
+        }
         let mut session = super::instantiate::InstantiationSession::new(
             super::instantiate::InstantiationLimits::default(),
         );
