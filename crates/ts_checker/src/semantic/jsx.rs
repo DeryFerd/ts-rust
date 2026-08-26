@@ -3445,8 +3445,20 @@ fn execute_jsx_element(
         }
     }
 
-    publish_type_links(store, plan.expression, namespace.element_type)?;
-    Ok(namespace.element_type)
+    // Upstream checkJsxFragment recovers error types without changing nested elements.
+    let element_type = if matches!(&plan.kind, JsxElementPlanKind::Fragment)
+        && (namespace.element_type == namespace.error_type
+            || store
+                .type_payload(namespace.element_type)
+                .is_some_and(|record| {
+                    record.flags().intersects(TypeFlags::ANY) && record.alias().is_some()
+                })) {
+        namespace.any_type
+    } else {
+        namespace.element_type
+    };
+    publish_type_links(store, plan.expression, element_type)?;
+    Ok(element_type)
 }
 
 fn check_jsx_element_type_constraint(
@@ -10520,6 +10532,139 @@ mod runtime_tests {
             before,
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn missing_jsx_element_fragments_recover_any_and_preserve_nested_element_errors() {
+        for runtime in [
+            CanonicalJsxRuntime::Preserve,
+            CanonicalJsxRuntime::Classic,
+            CanonicalJsxRuntime::Automatic,
+        ] {
+            for no_implicit_any in [false, true] {
+                let mut fixture =
+                    RuntimeFixture::new("const view = <><div /><></></>;\n", FileId::new(8_220));
+                let expression = fixture.expression("view");
+                let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+                let error = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+                let host =
+                    DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
+                let options = CanonicalCheckerOptions {
+                    no_implicit_any,
+                    jsx_runtime: runtime,
+                    ..CanonicalCheckerOptions::default()
+                };
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+                assert_eq!(
+                    fixture
+                        .store
+                        .check_jsx_element(&host, expression, options, &mut diagnostics)
+                        .unwrap(),
+                    any,
+                );
+                assert_eq!(diagnostics.len(), usize::from(no_implicit_any));
+                for diagnostic in diagnostics.as_slice() {
+                    assert_eq!(diagnostic.diagnostic.code(), 7026);
+                }
+                for (node, record) in fixture.parsed.arena.iter() {
+                    let expected = match record.kind {
+                        SyntaxKind::JsxFragment => any,
+                        SyntaxKind::JsxSelfClosingElement => error,
+                        _ => continue,
+                    };
+                    let node = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+                    assert_eq!(
+                        fixture.store.type_node_links(node),
+                        Some(&TypeNodeLinks {
+                            resolved_type: Some(expected),
+                            ..TypeNodeLinks::default()
+                        }),
+                    );
+                }
+                let cold = (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                    diagnostics.as_slice().to_vec(),
+                );
+
+                assert_eq!(
+                    fixture
+                        .store
+                        .check_jsx_element(&host, expression, options, &mut diagnostics)
+                        .unwrap(),
+                    any,
+                );
+                assert_eq!(
+                    (
+                        fixture.store.type_len(),
+                        fixture.store.symbol_len(),
+                        fixture.store.signature_len(),
+                        fixture.store.checker_link_allocated_lengths(),
+                        diagnostics.as_slice().to_vec(),
+                    ),
+                    cold,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jsx_recovery_rejects_wrong_and_malformed_cached_types() {
+        for source in ["const view = <></>;\n", "const view = <div />;\n"] {
+            for malformed in [false, true] {
+                let mut fixture = RuntimeFixture::new(source, FileId::new(8_221));
+                let expression = fixture.expression("view");
+                let host =
+                    DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
+                let options = CanonicalCheckerOptions::default();
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let result = fixture
+                    .store
+                    .check_jsx_element(&host, expression, options, &mut diagnostics)
+                    .unwrap();
+                let poison = TypeNodeLinks {
+                    resolved_type: Some(if malformed {
+                        result
+                    } else {
+                        fixture.store.intrinsic_bootstrap().unwrap().number_type
+                    }),
+                    outer_type_parameters: malformed.then(Vec::new),
+                };
+                assert!(
+                    fixture
+                        .store
+                        .set_type_node_links(expression, poison.clone())
+                );
+                let cold = (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                    diagnostics.as_slice().to_vec(),
+                );
+
+                assert_eq!(
+                    fixture
+                        .store
+                        .check_jsx_element(&host, expression, options, &mut diagnostics),
+                    Err(SourceCheckError::Property(expression)),
+                );
+                assert_eq!(fixture.store.type_node_links(expression), Some(&poison));
+                assert_eq!(
+                    (
+                        fixture.store.type_len(),
+                        fixture.store.symbol_len(),
+                        fixture.store.signature_len(),
+                        fixture.store.checker_link_allocated_lengths(),
+                        diagnostics.as_slice().to_vec(),
+                    ),
+                    cold,
+                );
+            }
+        }
     }
 
     #[test]
