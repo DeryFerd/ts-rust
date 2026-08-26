@@ -3487,7 +3487,17 @@ fn display_array_type(
             .intersects(TypeFlags::UNION_OR_INTERSECTION)
             && element_record.alias().is_none();
         let function_parentheses = is_unaliased_single_callable_type(store, element_type);
-        if composite_parentheses || function_parentheses {
+        let type_query_parentheses = element_record.alias().is_none()
+            && matches!(element_record.data(), TypeData::Object(_))
+            && element_record
+                .symbol()
+                .and_then(|symbol| store.symbol(symbol))
+                .is_some_and(|symbol| {
+                    symbol
+                        .flags()
+                        .intersects(SymbolFlags::CLASS | SymbolFlags::ENUM | SymbolFlags::MODULE)
+                });
+        if composite_parentheses || function_parentheses || type_query_parentheses {
             element = format!("({element})");
         }
         if readonly {
@@ -6306,6 +6316,52 @@ mod tests {
                     .unwrap(),
                 format!("typeof {name}")
             );
+        }
+    }
+
+    #[test]
+    fn array_display_parenthesizes_type_queries_without_changing_instance_arrays() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "class Model {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(219);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let instance = context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let constructor = context
+            .store()
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let globals = context.global_types().clone();
+        for (element, readonly, expected) in [
+            (instance, false, "Model[]"),
+            (constructor, false, "(typeof Model)[]"),
+            (constructor, true, "readonly (typeof Model)[]"),
+        ] {
+            let array = context
+                .store_mut_for_test()
+                .create_canonical_array_type(&globals, element, readonly)
+                .unwrap();
+            assert_eq!(context.type_to_string(array).unwrap(), expected);
         }
     }
 
