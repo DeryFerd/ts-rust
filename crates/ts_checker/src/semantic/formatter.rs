@@ -54,6 +54,7 @@ use super::{
         validate_stored_source_callable,
     },
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
+    store::SourceNodeParent,
     structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
     symbol_display::{self, SymbolDisplayContext, SymbolDisplayError},
     tuple_types::TupleShape,
@@ -3792,16 +3793,24 @@ fn interface_display_declarations_match(
             if store.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
                 return false;
             }
+            let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(declaration)
+            else {
+                return false;
+            };
+            if store.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+                || store.source_node_parent(source) != Some(SourceNodeParent::Root)
+            {
+                return false;
+            }
             let mut names = (0..declaration.node.index()).filter_map(|index| {
                 let node = NodeRef::new(
                     declaration.arena,
                     declaration.file,
                     ts_ast::NodeId::new(u32::try_from(index).ok()?),
                 );
-                (store.source_node_parent(node)
-                    == Some(super::store::SourceNodeParent::Parent(declaration)))
-                .then(|| store.source_identifier_text(node))
-                .flatten()
+                (store.source_node_parent(node) == Some(SourceNodeParent::Parent(declaration)))
+                    .then(|| store.source_identifier_text(node))
+                    .flatten()
             });
             names.next() == Some(name) && names.next().is_none()
         })
@@ -4092,7 +4101,9 @@ fn validate_resolved_named_interface(
                     .value_symbol_links(property.symbol)
                     .and_then(|links| links.resolved_type)
                     .is_some_and(|property_type| {
-                        store.source_direct_type_annotation_is_exact(
+                        interface_property_annotation_matches(
+                            store,
+                            host,
                             property.type_node,
                             property_type,
                         )
@@ -4178,6 +4189,37 @@ fn validate_resolved_named_interface(
         }
     }
     Ok(())
+}
+
+fn interface_property_annotation_matches(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    mut annotation: NodeRef,
+    type_: TypeId,
+) -> bool {
+    loop {
+        let Some(record) = host.node(annotation) else {
+            return false;
+        };
+        let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
+            return store.source_direct_type_annotation_is_exact(annotation, type_);
+        };
+        let inner = NodeRef::new(annotation.arena, annotation.file, parenthesized.type_);
+        if record.kind != SyntaxKind::ParenthesizedType
+            || inner.node.index() >= annotation.node.index()
+            || store.source_node_parent(inner) != Some(SourceNodeParent::Parent(annotation))
+            || store.type_node_links(annotation).is_some_and(|links| {
+                links.outer_type_parameters.is_some()
+                    || links.resolved_type.is_some_and(|cached| cached != type_)
+            })
+            || store
+                .symbol_node_links(annotation)
+                .is_some_and(|links| links.resolved_symbol.is_some())
+        {
+            return false;
+        }
+        annotation = inner;
+    }
 }
 
 fn validate_property_object_alias(
@@ -6543,6 +6585,35 @@ mod tests {
         );
     }
 
+    fn assert_hostless_malformed_display_without_writes(
+        context: &CanonicalCheckerContext<'_>,
+        type_: TypeId,
+    ) {
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().len(),
+        );
+        assert_eq!(
+            type_to_string(context.store(), type_),
+            Err(TypeDisplayUnavailable::MalformedType(type_))
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            ),
+            before
+        );
+    }
+
     fn external_parsed_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
         let mut binder = CanonicalBinder::new();
         binder
@@ -7040,12 +7111,101 @@ mod tests {
     }
 
     #[test]
+    fn merged_interface_display_rejects_paired_parenthesized_property_cache_changes() {
+        for (index, annotation) in ["(string)", "((string))"].into_iter().enumerate() {
+            let parsed = parse_source_file(&format!(
+                "interface Clock {{ value: {annotation}; }} declare var Clock: number;"
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(1_914 + u32::try_from(index).unwrap());
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            let owner = merged_interface_display_global(&context, "Clock");
+            let interface = context.get_declared_type_of_symbol(owner).unwrap();
+            assert_eq!(
+                context.type_to_string(interface),
+                Ok("Clock".to_owned()),
+                "{annotation}"
+            );
+            let store = context.store();
+            let property = store
+                .symbol(owner)
+                .and_then(|symbol| symbol.members())
+                .and_then(|table| store.symbol_table(table))
+                .and_then(|table| table.get_source("value"))
+                .unwrap();
+            let declaration = store.symbol(property).unwrap().value_declaration().unwrap();
+            let type_node = store.source_direct_type_annotation(declaration).unwrap();
+            assert_eq!(
+                store.source_node_kind(type_node),
+                Some(SyntaxKind::ParenthesizedType)
+            );
+            let property_links = store.value_symbol_links(property).unwrap().clone();
+            let annotation_links = store
+                .type_node_links(type_node)
+                .cloned()
+                .unwrap_or_default();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            assert_eq!(property_links.resolved_type, Some(bootstrap.string_type));
+            assert!(
+                annotation_links
+                    .resolved_type
+                    .is_none_or(|type_| type_ == bootstrap.string_type)
+            );
+            let number = bootstrap.number_type;
+            let mut changed_property = property_links.clone();
+            changed_property.resolved_type = Some(number);
+            let mut changed_annotation = annotation_links.clone();
+            changed_annotation.resolved_type = Some(number);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, changed_property.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(type_node, changed_annotation.clone())
+            );
+            assert_malformed_display_without_writes(&context, interface);
+            assert_hostless_malformed_display_without_writes(&context, interface);
+            assert_eq!(
+                context.store().value_symbol_links(property),
+                Some(&changed_property)
+            );
+            assert_eq!(
+                context.store().type_node_links(type_node),
+                Some(&changed_annotation)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .declared_type_links(owner)
+                    .unwrap()
+                    .declared_type,
+                Some(interface)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, property_links)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(type_node, annotation_links)
+            );
+            assert_eq!(context.type_to_string(interface).unwrap(), "Clock");
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Check declaration ownership and the interface's own type cache.
     fn merged_interface_display_rejects_owner_and_declared_type_cache_changes() {
         let first = parse_source_file(concat!(
             "interface Clock { value: string; } ",
             "interface ClockConstructor { new(): Clock; } ",
             "declare var Clock: ClockConstructor; interface Other { value: string; extra: boolean; }",
+            "namespace Inner { interface Clock { value: string; extra: boolean; } }",
         ));
         let second = parse_source_file("interface Clock { extra: boolean; }");
         let files = [
@@ -7082,7 +7242,16 @@ mod tests {
                 context.store().source_node_kind(*node) == Some(SyntaxKind::InterfaceDeclaration)
             })
             .unwrap();
-        for poison in 0..6 {
+        let inner_declaration = first
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration
+                    && record.parent != Some(first.source_file))
+                .then_some(NodeRef::new(first.arena.id(), files[0].0, node))
+            })
+            .unwrap();
+        for poison in 0..7 {
             match poison {
                 0 => assert!(context.store_mut_for_test().set_symbol_flags(
                     owner,
@@ -7117,10 +7286,15 @@ mod tests {
                         ..declared_links.clone()
                     }
                 )),
-                5 => {
+                5 | 6 => {
+                    let borrowed = if poison == 5 {
+                        other_declaration
+                    } else {
+                        inner_declaration
+                    };
                     assert!(context.store_mut_for_test().set_symbol_declarations(
                         owner,
-                        Some(vec![other_declaration]),
+                        Some(vec![borrowed]),
                         None
                     ));
                     assert!(context.store_mut_for_test().set_symbol_flags(
@@ -7132,8 +7306,19 @@ mod tests {
                 _ => unreachable!(),
             }
             assert_malformed_display_without_writes(&context, instance);
-            if poison == 5 {
-                assert!(type_to_string(context.store(), instance).is_err());
+            if poison >= 5 {
+                assert_hostless_malformed_display_without_writes(&context, instance);
+            }
+            if poison == 6 {
+                let symbol = context.store().symbol(owner).unwrap();
+                assert_eq!(symbol.declarations(), Some([inner_declaration].as_slice()));
+                assert_eq!(symbol.flags(), SymbolFlags::INTERFACE);
+                assert_eq!(symbol.value_declaration(), None);
+                assert_eq!(
+                    context.store().declared_type_links(owner),
+                    Some(&declared_links)
+                );
+                assert_eq!(merged_interface_display_global(&context, "Clock"), owner);
             }
             assert!(
                 context
