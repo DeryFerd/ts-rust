@@ -701,6 +701,33 @@ fn validate_source_member_name_cache(
         return Err(invalid().into());
     }
     let table = resolved.and_then(|table| store.symbol_table(table));
+    // Symbol parents can change, so extra entries need their original source member.
+    if let Some(table) = table {
+        let binder = raw.and_then(|raw| store.symbol_table(raw));
+        for (name, late) in table.iter() {
+            if binder.and_then(|binder| binder.get(name)) == Some(late) {
+                continue;
+            }
+            let record = store.symbol(late).ok_or_else(invalid)?;
+            let declarations = record.declarations().ok_or_else(invalid)?;
+            if !names.iter().any(|member| {
+                member.computed.is_some()
+                    && declarations.contains(&member.declaration)
+                    && store
+                        .symbol(member.symbol)
+                        .and_then(|source| source.declarations())
+                        == Some(declarations)
+                    && store
+                        .late_bound_links(member.symbol)
+                        .and_then(|links| links.late_symbol)
+                        == Some(late)
+                    && (!record.flags().contains(SymbolFlags::METHOD)
+                        || store.late_bound_method_source(late) == Some(member.symbol))
+            }) {
+                return Err(invalid().into());
+            }
+        }
+    }
     for member in names.iter().filter(|member| member.computed.is_some()) {
         let late = store
             .late_bound_links(member.symbol)
@@ -19459,6 +19486,99 @@ mod selected_source_member_tests {
                 assert_eq!(state(store), before, "{poison:?}");
                 assert!(diagnostics.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn selected_source_member_rejects_computed_members_from_a_different_source_owner() {
+        use crate::semantic::links::MembersOrExportsResolutionKind;
+
+        for receiver_members in ["value: T;", "[key](): T; value: T;"] {
+            let library = parsed(BASE);
+            let source = parsed(&format!(
+                "declare const key: unique symbol; \
+                 interface Donor<T> {{ [key](): T; }} \
+                 interface Receiver<T> {{ {receiver_members} }} \
+                 declare var donor: Donor<number>; \
+                 declare var receiver: Receiver<number>;"
+            ));
+            let file = FileId::new(28_576);
+            let files = [(FileId::new(28_575), &library), (file, &source)];
+            let mut context = context(&files, 1);
+            let donor = context
+                .get_type_from_type_node(annotation(&source, file, "donor"))
+                .unwrap();
+            let receiver = context
+                .get_type_from_type_node(annotation(&source, file, "receiver"))
+                .unwrap();
+            let key_type = context
+                .get_type_from_type_node(annotation(&source, file, "key"))
+                .unwrap();
+            let globals = context.global_types().clone();
+            let bound = files
+                .iter()
+                .map(|(file, _)| context.file(*file).unwrap().1.clone())
+                .collect::<Vec<_>>();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                files
+                    .iter()
+                    .zip(&bound)
+                    .map(|((_, file), bound)| (&file.arena, bound)),
+                GlobalMergeCompletion::for_test(options().name_resolution),
+            )
+            .unwrap();
+            let store = context.store_mut_for_test();
+            let TypeData::UniqueEsSymbol(key) = store.type_payload(key_type).unwrap().data() else {
+                panic!("key must be unique")
+            };
+            let key = key.name.clone();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let selected = resolve_object_property_by_key_with_source(
+                store,
+                &host,
+                &globals,
+                options(),
+                donor,
+                key.as_ref(),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .unwrap();
+            let late = selected.symbol;
+            let early = store.late_bound_method_source(late).unwrap();
+            let owner = store.type_payload(receiver).unwrap().symbol().unwrap();
+            let raw = store.symbol(owner).unwrap().members().unwrap();
+            let resolved = store.clone_symbol_table(raw).unwrap();
+            assert!(store.set_symbol_relationships(early, None, None, Some(owner), None));
+            assert!(store.set_symbol_relationships(late, None, None, Some(owner), None));
+            assert_eq!(store.insert_symbol(resolved, key.clone(), late), Some(None));
+            let mut tables = store
+                .members_and_exports_links(owner)
+                .cloned()
+                .unwrap_or_default();
+            tables.tables[MembersOrExportsResolutionKind::ResolvedMembers as usize] =
+                Some(resolved);
+            assert!(store.set_members_and_exports_links(owner, tables.clone()));
+
+            let before = state(store);
+            let instantiations = session.total_count();
+            let result = resolve_object_property_by_key_with_source(
+                store,
+                &host,
+                &globals,
+                options(),
+                receiver,
+                EscapedNameRef::source("absent"),
+                &mut session,
+                &mut diagnostics,
+            );
+            assert!(result.is_err(), "{receiver_members}: {result:?}");
+            assert_eq!(state(store), before, "{receiver_members}");
+            assert_eq!(session.total_count(), instantiations);
+            assert_eq!(store.members_and_exports_links(owner), Some(&tables));
+            assert!(diagnostics.is_empty());
         }
     }
 
