@@ -287,6 +287,8 @@ fn graph_snapshot_records_type_directives_runtime_and_reference_targets() {
         ],
     );
     let options = CompilerOptions {
+        no_lib: false,
+        lib: Some(Vec::new()),
         no_check: false,
         jsx: JsxEmit::ReactJsx,
         types: Some(vec!["present".to_owned(), "missing-automatic".to_owned()]),
@@ -345,6 +347,26 @@ fn graph_snapshot_records_type_directives_runtime_and_reference_targets() {
         graph
             .missing_evidence
             .contains(&ProgramGraphMissingEvidence::ResolutionDefaultModes)
+    );
+
+    let no_lib = Program::new_with_options(
+        &file_system,
+        "/project",
+        &["main.tsx".to_owned()],
+        CompilerOptions {
+            no_lib: true,
+            lib: None,
+            ..program.options().clone()
+        },
+    )
+    .project_graph_snapshot();
+    assert_eq!(no_lib.resolutions, graph.resolutions);
+    assert_eq!(no_lib.references, vec![path.clone()]);
+    assert!(
+        no_lib
+            .sources
+            .iter()
+            .all(|source| !source.is_default_library)
     );
 }
 
