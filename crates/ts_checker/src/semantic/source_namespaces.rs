@@ -19970,44 +19970,90 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Keep cold, warm, and producer-first array queries together.
     fn ambient_imported_variable_queries_preserve_parenthesized_and_array_types() {
-        for (type_syntax, producer_first, invalid_arity) in [
-            ("(string)", true, false),
-            ("((string))", true, false),
-            ("string[]", true, false),
-            ("(string[])", true, false),
-            ("Array<string>", false, false),
-            ("Array<string>", true, false),
-            ("ReadonlyArray<string>", false, false),
-            ("ReadonlyArray<string>", true, false),
-            ("Array", false, true),
-            ("Array", true, true),
-            ("Array<string, number>", false, true),
-            ("Array<string, number>", true, true),
-            ("ReadonlyArray", false, true),
-            ("ReadonlyArray", true, true),
-            ("ReadonlyArray<string, number>", false, true),
-            ("ReadonlyArray<string, number>", true, true),
-        ] {
-            let source = format!(
-                "declare module 'models' {{ export const value: {type_syntax}; }} \
-                 declare module 'consumer' {{ \
-                 import * as Models from 'models'; \
-                 interface View {{ value: typeof Models.value; }} \
-                 }}"
-            );
-            let mut fixture = declaration_fixture_with_array_library(&source);
-            let producer = plan(&fixture, 0);
-            let consumer = plan(&fixture, 1);
-            let [
-                SourceNamespaceMemberPlan::AmbientVariable {
-                    symbol, annotation, ..
-                },
-            ] = producer.members.as_slice()
-            else {
-                panic!("the producer must retain one annotated variable")
-            };
-            if producer_first {
-                let diagnostics = execute(&mut fixture, &producer)
+        for consumer_first_source in [false, true] {
+            for (type_syntax, producer_first, invalid_arity) in [
+                ("(string)", true, false),
+                ("((string))", true, false),
+                ("string[]", true, false),
+                ("(string[])", true, false),
+                ("Array<string>", false, false),
+                ("Array<string>", true, false),
+                ("ReadonlyArray<string>", false, false),
+                ("ReadonlyArray<string>", true, false),
+                ("Array", false, true),
+                ("Array", true, true),
+                ("Array<string, number>", false, true),
+                ("Array<string, number>", true, true),
+                ("ReadonlyArray", false, true),
+                ("ReadonlyArray", true, true),
+                ("ReadonlyArray<string, number>", false, true),
+                ("ReadonlyArray<string, number>", true, true),
+            ] {
+                let producer_source =
+                    format!("declare module 'models' {{ export const value: {type_syntax}; }}");
+                let consumer_source = concat!(
+                    "declare module 'consumer' { ",
+                    "import * as Models from 'models'; ",
+                    "interface View { value: typeof Models.value; } ",
+                    "}",
+                );
+                let source = if consumer_first_source {
+                    format!("{consumer_source} {producer_source}")
+                } else {
+                    format!("{producer_source} {consumer_source}")
+                };
+                let mut fixture = declaration_fixture_with_array_library(&source);
+                let producer = plan(&fixture, usize::from(consumer_first_source));
+                let consumer = plan(&fixture, usize::from(!consumer_first_source));
+                let [
+                    SourceNamespaceMemberPlan::AmbientVariable {
+                        symbol, annotation, ..
+                    },
+                ] = producer.members.as_slice()
+                else {
+                    panic!("the producer must retain one annotated variable")
+                };
+                if producer_first {
+                    let diagnostics = execute(&mut fixture, &producer)
+                        .unwrap_or_else(|error| panic!("{type_syntax}: {error:?}"));
+                    assert_eq!(
+                        diagnostics
+                            .as_slice()
+                            .iter()
+                            .map(|diagnostic| diagnostic.diagnostic.code())
+                            .collect::<Vec<_>>(),
+                        if invalid_arity {
+                            vec![2_314]
+                        } else {
+                            Vec::new()
+                        },
+                        "{type_syntax}",
+                    );
+                }
+                if fixture.context.store().source_node_kind(*annotation)
+                    == Some(SyntaxKind::ParenthesizedType)
+                {
+                    assert!(
+                        fixture
+                            .context
+                            .store()
+                            .type_node_links(*annotation)
+                            .is_none()
+                    );
+                }
+                let query = fixture
+                    .parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::TypeQuery).then_some(NodeRef::new(
+                            fixture.parsed.arena.id(),
+                            fixture.file,
+                            node,
+                        ))
+                    })
+                    .unwrap();
+                let diagnostics = execute(&mut fixture, &consumer)
                     .unwrap_or_else(|error| panic!("{type_syntax}: {error:?}"));
                 assert_eq!(
                     diagnostics
@@ -20015,199 +20061,171 @@ mod tests {
                         .iter()
                         .map(|diagnostic| diagnostic.diagnostic.code())
                         .collect::<Vec<_>>(),
-                    if invalid_arity {
+                    if invalid_arity && !producer_first {
                         vec![2_314]
                     } else {
                         Vec::new()
                     },
                     "{type_syntax}",
                 );
-            }
-            if fixture.context.store().source_node_kind(*annotation)
-                == Some(SyntaxKind::ParenthesizedType)
-            {
-                assert!(
-                    fixture
-                        .context
-                        .store()
-                        .type_node_links(*annotation)
-                        .is_none()
-                );
-            }
-            let query = fixture
-                .parsed
-                .arena
-                .iter()
-                .find_map(|(node, record)| {
-                    (record.kind == SyntaxKind::TypeQuery).then_some(NodeRef::new(
-                        fixture.parsed.arena.id(),
-                        fixture.file,
-                        node,
-                    ))
-                })
-                .unwrap();
-            let diagnostics = execute(&mut fixture, &consumer)
-                .unwrap_or_else(|error| panic!("{type_syntax}: {error:?}"));
-            assert_eq!(
-                diagnostics
-                    .as_slice()
-                    .iter()
-                    .map(|diagnostic| diagnostic.diagnostic.code())
-                    .collect::<Vec<_>>(),
-                if invalid_arity && !producer_first {
-                    vec![2_314]
-                } else {
-                    Vec::new()
-                },
-                "{type_syntax}",
-            );
-            if !producer_first {
-                assert!(
-                    fixture
-                        .context
-                        .store()
-                        .value_symbol_links(*symbol)
-                        .is_none()
-                );
-                assert!(execute(&mut fixture, &producer).unwrap().is_empty());
-            }
-            let expected = fixture
-                .context
-                .store()
-                .value_symbol_links(*symbol)
-                .and_then(|links| links.resolved_type)
-                .unwrap();
-            if invalid_arity {
-                assert_eq!(
-                    expected,
-                    fixture
-                        .context
-                        .store()
-                        .intrinsic_bootstrap()
-                        .unwrap()
-                        .error_type,
-                    "{type_syntax}",
-                );
-            }
-            assert_eq!(
-                fixture
+                if !producer_first {
+                    assert!(
+                        fixture
+                            .context
+                            .store()
+                            .value_symbol_links(*symbol)
+                            .is_none()
+                    );
+                    assert!(execute(&mut fixture, &producer).unwrap().is_empty());
+                }
+                let expected = fixture
                     .context
                     .store()
-                    .type_node_links(query)
-                    .and_then(|links| links.resolved_type),
-                Some(expected),
-                "{type_syntax}",
-            );
-            let warm = (
-                fixture.context.store().type_len(),
-                fixture.context.store().mapper_len(),
-                fixture.context.store().checker_link_allocated_lengths(),
-            );
-            assert!(execute(&mut fixture, &consumer).unwrap().is_empty());
-            assert_eq!(
-                (
+                    .value_symbol_links(*symbol)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                if invalid_arity {
+                    assert_eq!(
+                        expected,
+                        fixture
+                            .context
+                            .store()
+                            .intrinsic_bootstrap()
+                            .unwrap()
+                            .error_type,
+                        "{type_syntax}",
+                    );
+                }
+                assert_eq!(
+                    fixture
+                        .context
+                        .store()
+                        .type_node_links(query)
+                        .and_then(|links| links.resolved_type),
+                    Some(expected),
+                    "{type_syntax}",
+                );
+                let warm = (
                     fixture.context.store().type_len(),
                     fixture.context.store().mapper_len(),
                     fixture.context.store().checker_link_allocated_lengths(),
-                ),
-                warm,
-                "{type_syntax}",
-            );
+                );
+                assert!(execute(&mut fixture, &consumer).unwrap().is_empty());
+                assert_eq!(
+                    (
+                        fixture.context.store().type_len(),
+                        fixture.context.store().mapper_len(),
+                        fixture.context.store().checker_link_allocated_lengths(),
+                    ),
+                    warm,
+                    "{type_syntax}",
+                );
+            }
         }
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep both declaration orders and poisoned cache snapshots together.
     fn ambient_imported_variable_queries_reject_paired_cache_forgery() {
-        for type_syntax in [
-            "string",
-            "(string)",
-            "((string))",
-            "Box<string>",
-            "string[]",
-            "(string[])",
-            "Array<string>",
-            "ReadonlyArray<string>",
-            "Array",
-            "Array<string, number>",
-            "ReadonlyArray",
-            "ReadonlyArray<string, number>",
-        ] {
-            let source = format!(
-                "declare module 'models' {{ \
+        for consumer_first_source in [false, true] {
+            for type_syntax in [
+                "string",
+                "(string)",
+                "((string))",
+                "Box<string>",
+                "string[]",
+                "(string[])",
+                "Array<string>",
+                "ReadonlyArray<string>",
+                "Array",
+                "Array<string, number>",
+                "ReadonlyArray",
+                "ReadonlyArray<string, number>",
+            ] {
+                let producer_source = format!(
+                    "declare module 'models' {{ \
                  export interface Box<Element> {{ value: Element; }} \
                  export const value: {type_syntax}; \
-                 }} \
-                 declare module 'consumer' {{ \
-                 import * as Models from 'models'; \
-                 interface View {{ value: typeof Models.value; }} \
                  }}"
-            );
-            let mut fixture = declaration_fixture_with_array_library(&source);
-            let namespace = plan(&fixture, 1);
-            let imported_module = namespace.imports[0].ambient_target.unwrap();
-            let imported = fixture
-                .context
-                .store()
-                .symbol(imported_module)
-                .and_then(ts_binder::semantic::Symbol::exports)
-                .and_then(|exports| fixture.context.store().symbol_table(exports))
-                .and_then(|exports| exports.get_source("value"))
-                .unwrap();
-            let declaration = fixture
-                .context
-                .store()
-                .symbol(imported)
-                .and_then(ts_binder::semantic::Symbol::value_declaration)
-                .unwrap();
-            let NodeData::VariableDeclaration(variable) =
-                &fixture.parsed.arena.get(declaration.node).unwrap().data
-            else {
-                panic!("the imported value must retain its variable declaration")
-            };
-            let annotation = child(declaration, variable.type_.unwrap());
-            let store = fixture.context.store_mut_for_test();
-            let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
-            assert!(store.set_type_node_links(
-                annotation,
-                TypeNodeLinks {
-                    resolved_type: Some(boolean),
-                    ..TypeNodeLinks::default()
-                },
-            ));
-            assert!(store.set_value_symbol_links(
-                imported,
-                ValueSymbolLinks {
-                    resolved_type: Some(boolean),
-                    ..ValueSymbolLinks::default()
-                },
-            ));
-            let before = (
-                store.type_len(),
-                store.mapper_len(),
-                store.symbol_len(),
-                store.checker_link_allocated_lengths(),
-            );
-            let annotation_links = store.type_node_links(annotation).cloned();
-            let value_links = store.value_symbol_links(imported).cloned();
-            assert!(execute(&mut fixture, &namespace).is_err(), "{type_syntax}");
-            let store = fixture.context.store();
-            assert_eq!(
-                (
+                );
+                let consumer_source = concat!(
+                    "declare module 'consumer' { ",
+                    "import * as Models from 'models'; ",
+                    "interface View { value: typeof Models.value; } ",
+                    "}",
+                );
+                let source = if consumer_first_source {
+                    format!("{consumer_source} {producer_source}")
+                } else {
+                    format!("{producer_source} {consumer_source}")
+                };
+                let mut fixture = declaration_fixture_with_array_library(&source);
+                let namespace = plan(&fixture, usize::from(!consumer_first_source));
+                let imported_module = namespace.imports[0].ambient_target.unwrap();
+                let imported = fixture
+                    .context
+                    .store()
+                    .symbol(imported_module)
+                    .and_then(ts_binder::semantic::Symbol::exports)
+                    .and_then(|exports| fixture.context.store().symbol_table(exports))
+                    .and_then(|exports| exports.get_source("value"))
+                    .unwrap();
+                let declaration = fixture
+                    .context
+                    .store()
+                    .symbol(imported)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    .unwrap();
+                let NodeData::VariableDeclaration(variable) =
+                    &fixture.parsed.arena.get(declaration.node).unwrap().data
+                else {
+                    panic!("the imported value must retain its variable declaration")
+                };
+                let annotation = child(declaration, variable.type_.unwrap());
+                let store = fixture.context.store_mut_for_test();
+                let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
+                assert!(store.set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(boolean),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+                assert!(store.set_value_symbol_links(
+                    imported,
+                    ValueSymbolLinks {
+                        resolved_type: Some(boolean),
+                        ..ValueSymbolLinks::default()
+                    },
+                ));
+                let before = (
                     store.type_len(),
                     store.mapper_len(),
                     store.symbol_len(),
                     store.checker_link_allocated_lengths(),
-                ),
-                before,
-                "{type_syntax}",
-            );
-            assert_eq!(store.type_node_links(annotation), annotation_links.as_ref());
-            assert_eq!(store.value_symbol_links(imported), value_links.as_ref());
-            assert!(
-                store
-                    .alias_symbol_links(namespace.imports[0].symbol)
-                    .is_none()
-            );
+                );
+                let annotation_links = store.type_node_links(annotation).cloned();
+                let value_links = store.value_symbol_links(imported).cloned();
+                assert!(execute(&mut fixture, &namespace).is_err(), "{type_syntax}");
+                let store = fixture.context.store();
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.mapper_len(),
+                        store.symbol_len(),
+                        store.checker_link_allocated_lengths(),
+                    ),
+                    before,
+                    "{type_syntax}",
+                );
+                assert_eq!(store.type_node_links(annotation), annotation_links.as_ref());
+                assert_eq!(store.value_symbol_links(imported), value_links.as_ref());
+                assert!(
+                    store
+                        .alias_symbol_links(namespace.imports[0].symbol)
+                        .is_none()
+                );
+            }
         }
     }
 

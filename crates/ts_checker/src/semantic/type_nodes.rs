@@ -9870,7 +9870,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::ImportAliasTypeReference { node, alias })
             })?;
-        let record = preflight_node(self.store, self.host, node)?;
+        preflight_node(self.store, self.host, node)?;
         let name_record = preflight_node(self.store, self.host, name)?;
         let NodeData::QualifiedName(qualified) = &name_record.data else {
             return Err(invalid());
@@ -9965,7 +9965,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let annotation_record = preflight_node(self.store, self.host, annotation)?;
         if declaration_record.kind != SyntaxKind::VariableDeclaration
             || declaration_record.flags.0 != 0
-            || declaration_record.range.end > record.range.start
             || variable.initializer.is_some()
             || variable.exclamation_token.is_some()
             || variable.local_symbol.is_some()
