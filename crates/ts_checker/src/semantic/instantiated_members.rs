@@ -5375,6 +5375,45 @@ mod tests {
             context.diagnostics()
         );
         let globals = context.global_types().clone();
+        let declarations = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let instances = declarations
+            .into_iter()
+            .map(|declaration| context.get_type_at_location(declaration).unwrap())
+            .collect::<Vec<_>>();
+        let instances = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(&globals, &instances, UnionReduction::Literal)
+            .unwrap();
+        let TypeData::Union(instances) = context.store().type_payload(instances).unwrap().data()
+        else {
+            panic!("the named instance union must retain its members")
+        };
+        assert_eq!(
+            instances
+                .union
+                .types
+                .iter()
+                .map(|type_| {
+                    context
+                        .store()
+                        .type_payload(*type_)
+                        .and_then(|record| record.symbol())
+                        .and_then(|symbol| context.store().symbol(symbol))
+                        .and_then(|symbol| symbol.name().as_utf8())
+                })
+                .collect::<Vec<_>>(),
+            [Some("Alpha"), Some("Middle"), Some("Zebra")],
+        );
         let accesses = source
             .arena
             .iter()
@@ -5416,10 +5455,12 @@ mod tests {
             else {
                 panic!("map must retain one specialized signature")
             };
+            let parameter = context.store().signature(*signature).unwrap().parameters()[0];
             let callback = context
                 .store()
-                .callable_signature_parameter_types(*signature)
-                .unwrap()[0];
+                .value_symbol_links(parameter)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
             let [signature] = context
                 .store()
                 .type_payload(callback)
@@ -5435,8 +5476,18 @@ mod tests {
             };
             let parameters = context
                 .store()
-                .callable_signature_parameter_types(*signature)
-                .unwrap();
+                .signature(*signature)
+                .unwrap()
+                .parameters()
+                .iter()
+                .map(|parameter| {
+                    context
+                        .store()
+                        .value_symbol_links(*parameter)
+                        .and_then(|links| links.resolved_type)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
             assert_eq!(parameters[0], element);
             assert_eq!(
                 context

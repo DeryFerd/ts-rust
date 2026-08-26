@@ -79,6 +79,7 @@ impl PreparedEntityName {
 struct SourceNodeFacts {
     kind: SyntaxKind,
     parent: Option<NodeId>,
+    start: u32,
     identifier_text: Option<Box<str>>,
     prefix_unary_operator: Option<SyntaxKind>,
     type_operator: Option<SyntaxKind>,
@@ -6578,6 +6579,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_node_fact(node).map(|facts| facts.kind)
     }
 
+    /// Returns the registered source offset used to order declarations.
+    #[must_use]
+    pub(super) fn source_node_start(&self, node: NodeRef) -> Option<u32> {
+        self.source_node_fact(node).map(|facts| facts.start)
+    }
+
     /// Returns identifier text from the registered source, not checker caches.
     #[must_use]
     pub(super) fn source_identifier_text(&self, node: NodeRef) -> Option<&str> {
@@ -6725,6 +6732,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             *slot = Some(SourceNodeFacts {
                 kind: node.kind,
                 parent: node.parent,
+                start: node.range.start.get(),
                 identifier_text: match &node.data {
                     NodeData::Identifier(identifier) if node.kind == SyntaxKind::Identifier => {
                         Some(identifier.text.clone().into_boxed_str())

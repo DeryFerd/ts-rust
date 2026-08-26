@@ -3566,7 +3566,73 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 alias.type_arguments().unwrap_or_default().to_vec(),
             )));
         }
-        Ok(record.symbol().map(|symbol| (symbol, Vec::new())))
+        if record
+            .flags()
+            .intersects(TypeFlags::TYPE_PARAMETER | TypeFlags::STRING_MAPPING)
+            || record
+                .object_flags()
+                .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
+        {
+            Ok(record.symbol().map(|symbol| (symbol, Vec::new())))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn compare_union_object_symbols(
+        &self,
+        left: TypeId,
+        right: TypeId,
+    ) -> Result<Ordering, LiteralTypeCacheError> {
+        let left_symbol = self
+            .type_payload(left)
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(left))?
+            .symbol();
+        let right_symbol = self
+            .type_payload(right)
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(right))?
+            .symbol();
+        let (left_symbol, right_symbol) = match (left_symbol, right_symbol) {
+            (left, right) if left == right => return Ok(Ordering::Equal),
+            (Some(left), Some(right)) => (left, right),
+            (Some(_), None) => return Ok(Ordering::Less),
+            (None, Some(_)) => return Ok(Ordering::Greater),
+            (None, None) => return Ok(Ordering::Equal),
+        };
+        let left_record = self
+            .symbol(left_symbol)
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(left))?;
+        let right_record = self
+            .symbol(right_symbol)
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(right))?;
+        let declarations = match (
+            left_record.declarations().and_then(|nodes| nodes.first()),
+            right_record.declarations().and_then(|nodes| nodes.first()),
+        ) {
+            (Some(left_node), Some(right_node)) => {
+                let left_start = self
+                    .source_node_start(*left_node)
+                    .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(left))?;
+                let right_start = self
+                    .source_node_start(*right_node)
+                    .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(right))?;
+                left_node
+                    .file
+                    .cmp(&right_node.file)
+                    .then_with(|| left_start.cmp(&right_start))
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        Ok(declarations
+            .then_with(|| {
+                left_record
+                    .name()
+                    .as_bytes()
+                    .cmp(right_record.name().as_bytes())
+            })
+            .then_with(|| left_symbol.cmp(&right_symbol)))
     }
 
     fn compare_union_type_lists_worker(
@@ -3596,6 +3662,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.compare_union_types_worker(left, right, &mut HashSet::new())
     }
 
+    #[allow(clippy::too_many_lines)] // Keep flags, names, source symbols, and payloads in upstream order.
     fn compare_union_types_worker(
         &self,
         left: TypeId,
@@ -3655,6 +3722,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
 
             match (left_record.data(), right_record.data()) {
+                (TypeData::Object(_), TypeData::Object(_)) => {
+                    let symbols = self.compare_union_object_symbols(left, right)?;
+                    if symbols != Ordering::Equal {
+                        return Ok(symbols);
+                    }
+                }
                 (TypeData::Literal(left_data), TypeData::Literal(right_data)) => {
                     let values = match (&left_data.value, &right_data.value) {
                         (LiteralValue::String(left), LiteralValue::String(right)) => {
