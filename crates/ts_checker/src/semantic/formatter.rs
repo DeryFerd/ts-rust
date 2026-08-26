@@ -6867,6 +6867,90 @@ mod tests {
     }
 
     #[test]
+    fn cold_class_computed_members_keep_their_class_parent() {
+        let parsed = parse_source_file(concat!(
+            "declare const key: unique symbol; ",
+            "declare class Model { [key]: string; } declare class Other {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(233);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declarations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [model_declaration, other_declaration] = declarations.as_slice() else {
+            panic!("the source must retain both class declarations")
+        };
+        let computed_declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let bound = context.file(file).unwrap().1;
+        let model = bound.symbol(*model_declaration).unwrap();
+        let other = bound.symbol(*other_declaration).unwrap();
+        let computed = bound.symbol(computed_declaration).unwrap();
+        let instance = context.get_declared_type_of_symbol(model).unwrap();
+        assert_eq!(
+            context.store().symbol(computed).unwrap().name(),
+            InternalSymbolName::Computed.as_ref()
+        );
+        assert_eq!(
+            context.store().symbol(computed).unwrap().parent(),
+            Some(model)
+        );
+        assert!(context.store().symbol(model).unwrap().members().is_none());
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before
+        );
+        for incorrect_parent in [None, Some(other)] {
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                computed,
+                None,
+                None,
+                incorrect_parent,
+                None,
+            ));
+            assert_malformed_display_without_writes(&context, instance);
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                computed,
+                None,
+                None,
+                Some(model),
+                None,
+            ));
+            assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+        }
+    }
+
+    #[test]
     fn source_class_instances_and_values_keep_distinct_type_names() {
         let parsed = parse_source_file(concat!(
             "class Base {} ",

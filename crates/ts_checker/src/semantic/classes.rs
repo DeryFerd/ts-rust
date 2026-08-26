@@ -16200,7 +16200,7 @@ fn validate_cold_class_binding_tables(
             || record.check_flags().bits() & !allowed_checks.bits() != 0
             || record.declarations() != Some(binding.declarations.as_slice())
             || record.value_declaration() != binding.value_declaration
-            || record.parent() != (!binding.anonymous).then_some(symbol)
+            || record.parent() != Some(symbol)
             || record.members().is_some()
             || record.exports().is_some()
             || record.export_symbol().is_some()
