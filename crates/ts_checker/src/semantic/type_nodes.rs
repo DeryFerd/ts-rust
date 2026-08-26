@@ -3163,7 +3163,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 cached,
                 expected_alias,
                 &self.plan.pending_function_proofs,
-            )
+            )?;
+        if let Some(alias) = expected_alias {
+            let arguments = self
+                .store
+                .type_alias_links(alias)
+                .and_then(|links| links.type_parameters.as_deref())
+                .unwrap_or_default();
+            self.store
+                .validate_union_alias_identity(cached, alias, arguments)?;
+        }
+        Ok(())
     }
 
     fn validate_cached_array_capability(
@@ -23657,18 +23667,28 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         for constituent in union.types {
             types.push(self.execute_type_node(constituent, plan, prepared)?);
         }
-        let resolved_type = match self.global_types.as_ref() {
-            Some(global_types) => self.store.literal_union_type_prepared_with_global_types(
-                global_types,
+        let alias_arguments = union
+            .alias_symbol
+            .and_then(|symbol| plan.aliases.get(&symbol))
+            .map(|alias| {
+                alias
+                    .type_parameters
+                    .iter()
+                    .map(|parameter| execute_type_parameter(self.store, parameter.symbol))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let resolved_type = self
+            .store
+            .literal_union_type_with_alias_prepared(
                 &types,
-                union.alias_symbol,
+                union
+                    .alias_symbol
+                    .map(|symbol| (symbol, alias_arguments.as_slice())),
                 prepared,
-            ),
-            None => self
-                .store
-                .literal_union_type_prepared(&types, union.alias_symbol, prepared),
-        }
-        .map_err(Self::literal_cache_error)?;
+                self.global_types.as_ref(),
+            )
+            .map_err(Self::literal_cache_error)?;
         let mut links = self
             .store
             .type_node_links(node)
@@ -25216,6 +25236,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 cached,
                 &type_parameters,
                 &type_arguments,
+                alias_identity.as_ref(),
             );
         }
         if matches!(
@@ -25372,6 +25393,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 &type_parameters,
                 &type_arguments,
                 plan,
+                alias_identity.as_ref(),
             )? {
             filtered
         } else if matches!(
@@ -25531,6 +25553,35 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )?
         };
 
+        let instantiation = if let Some((owner, arguments)) = alias_identity.as_ref()
+            && self
+                .store
+                .type_payload(declared_type)
+                .is_some_and(|record| {
+                    matches!(record.data(), TypeData::Union(_))
+                        && record
+                            .alias()
+                            .and_then(|identity| self.store.type_alias(identity))
+                            .and_then(super::type_records::TypeAlias::type_arguments)
+                            .is_some_and(|arguments| !arguments.is_empty())
+                })
+            && let Some(TypeData::Union(union)) =
+                self.store.type_payload(instantiation).map(TypeRecord::data)
+        {
+            let types = union
+                .origin
+                .and_then(|origin| self.store.type_payload(origin))
+                .and_then(|record| match record.data() {
+                    TypeData::Union(origin) => Some(origin.union.types.as_slice()),
+                    _ => None,
+                })
+                .unwrap_or(&union.union.types)
+                .to_vec();
+            self.construct_alias_union(&types, Some((*owner, arguments)))?
+        } else {
+            instantiation
+        };
+
         if let Some(cached) = links
             .instantiations
             .as_ref()
@@ -25575,7 +25626,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     }
 
     /// Filters exact generic interface references without demanding inherited members.
-    #[allow(clippy::too_many_lines)] // Authenticate the conditional, union, and each discriminator before publication.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Authenticate the conditional, union, and each discriminator before publication.
     fn try_exclude_discriminated_generic_interface_union(
         &mut self,
         alias: SemanticSymbolId,
@@ -25584,6 +25635,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         parameters: &[TypeId],
         arguments: &[TypeId],
         plan: &TypeQueryPlan,
+        identity: Option<&(SemanticSymbolId, Vec<TypeId>)>,
     ) -> Result<Option<TypeId>, DeclaredTypeError> {
         let [check_parameter, excluded_parameter] = parameters else {
             return Ok(None);
@@ -25700,21 +25752,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 )),
             [remaining] => Ok(Some(*remaining)),
             _ => {
-                let result = if let Some(global_types) = self.global_types.as_ref() {
-                    self.store.expression_union_type_with_global_types(
-                        global_types,
-                        &remaining,
-                        UnionReduction::Literal,
-                    )
-                } else {
-                    let mut prepared = self
-                        .store
-                        .prepare_type_query_types(&[], &[], &[], 1, 0)
-                        .map_err(Self::literal_cache_error)?;
-                    self.store
-                        .literal_union_type_prepared(&remaining, None, &mut prepared)
-                };
-                result.map(Some).map_err(Self::literal_cache_error)
+                let identity = identity.map(|(symbol, arguments)| (*symbol, arguments.as_slice()));
+                self.construct_alias_union(&remaining, identity).map(Some)
             }
         }
     }
@@ -26647,6 +26686,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 &[],
             )
             .map_err(Self::literal_cache_error)?;
+        self.store
+            .validate_union_alias_identity(type_, alias, parameters)
+            .map_err(Self::literal_cache_error)?;
         Ok(union.union.types.iter().any(|constituent| {
             parameters.contains(constituent)
                 || validate_direct_generic_reference(self.store, *constituent).is_ok_and(
@@ -26676,7 +26718,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(alias),
             ));
         };
-        let constituents = union.union.types.clone();
+        let constituents = union
+            .origin
+            .and_then(|origin| self.store.type_payload(origin))
+            .and_then(|record| match record.data() {
+                TypeData::Union(origin) => Some(origin.union.types.as_slice()),
+                _ => None,
+            })
+            .unwrap_or(&union.union.types)
+            .to_vec();
         let mut instantiated = Vec::with_capacity(constituents.len());
         for constituent in constituents {
             instantiated.push(self.instantiate_dependent_alias_type(
@@ -26686,21 +26736,35 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 arguments,
             )?);
         }
-        if let Some(global_types) = self.global_types.as_ref() {
-            self.store.expression_union_type_with_global_types(
-                global_types,
-                &instantiated,
-                UnionReduction::Literal,
-            )
-        } else {
-            let mut prepared = self
-                .store
-                .prepare_type_query_types(&[], &[], &[], 1, 0)
-                .map_err(Self::literal_cache_error)?;
-            self.store
-                .literal_union_type_prepared(&instantiated, None, &mut prepared)
+        self.construct_alias_union(&instantiated, Some((alias, arguments)))
+    }
+
+    fn construct_alias_union(
+        &mut self,
+        types: &[TypeId],
+        identity: Option<(SemanticSymbolId, &[TypeId])>,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let named = usize::from(identity.is_some());
+        let mut prepared = match self.global_types.as_ref() {
+            Some(globals) => self.store.prepare_type_query_types_with_global_types(
+                &[],
+                &[],
+                &[],
+                1,
+                named,
+                globals,
+            ),
+            None => self.store.prepare_type_query_types(&[], &[], &[], 1, named),
         }
-        .map_err(Self::literal_cache_error)
+        .map_err(Self::literal_cache_error)?;
+        self.store
+            .literal_union_type_with_alias_prepared(
+                types,
+                identity,
+                &mut prepared,
+                self.global_types.as_ref(),
+            )
+            .map_err(Self::literal_cache_error)
     }
 
     fn is_literal_method_callable(&self, type_: TypeId) -> bool {
@@ -26738,12 +26802,20 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         cached: TypeId,
         parameters: &[TypeId],
         arguments: &[TypeId],
+        identity: Option<&(SemanticSymbolId, Vec<TypeId>)>,
     ) -> Result<TypeId, DeclaredTypeError> {
         let invalid = || {
             type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
                 alias,
             ))
         };
+        let (owner, identity_arguments) = identity
+            .map_or((alias, arguments), |(owner, arguments)| {
+                (*owner, arguments.as_slice())
+            });
+        self.store
+            .validate_union_alias_identity(cached, owner, identity_arguments)
+            .map_err(|_| invalid())?;
         if parameters == arguments && cached == source {
             return Ok(cached);
         }
@@ -26854,21 +26926,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             };
             instantiated.push(mapped);
         }
-        let result = if let Some(global_types) = self.global_types.as_ref() {
-            self.store.expression_union_type_with_global_types(
-                global_types,
-                &instantiated,
-                UnionReduction::Literal,
-            )
-        } else {
-            let mut prepared = self
-                .store
-                .prepare_type_query_types(&[], &[], &[], 1, 0)
-                .map_err(Self::literal_cache_error)?;
-            self.store
-                .literal_union_type_prepared(&instantiated, None, &mut prepared)
-        };
-        result.map_err(Self::literal_cache_error)
+        self.construct_alias_union(&instantiated, Some((alias, arguments)))
     }
 
     fn instantiate_literal_method_alias_type(
@@ -29362,6 +29420,12 @@ mod tests {
             .and_then(|links| links.declared_type)
             .unwrap();
         assert_eq!(union_alias_symbol(&fixture.store, declared), Some(alias));
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_alias_identity(declared, alias, &[parameter_type]),
+            Ok(()),
+        );
         assert!(union_types(&fixture.store, declared).contains(&parameter_type));
         assert!(union_types(&fixture.store, declared).contains(&null_type));
 
@@ -29370,6 +29434,18 @@ mod tests {
         let number_result = query_node(&mut fixture, number, &mut diagnostics).unwrap();
         assert_eq!(first_type, second_type);
         assert_ne!(first_type, number_result);
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_alias_identity(first_type, alias, &[string_type]),
+            Ok(())
+        );
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_alias_identity(number_result, alias, &[number_type]),
+            Ok(())
+        );
         assert!(union_types(&fixture.store, first_type).contains(&string_type));
         assert!(union_types(&fixture.store, first_type).contains(&null_type));
         assert!(union_types(&fixture.store, number_result).contains(&number_type));
@@ -29397,6 +29473,245 @@ mod tests {
         }
         assert_eq!(union_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_union_alias_identity_keeps_argument_order_and_reduced_results() {
+        for reference_first in [false, true] {
+            let mut fixture = fixture(concat!(
+                "type Choice<Left, Right> = Left | Right; ",
+                "let forward: Choice<string, number>; ",
+                "let reverse: Choice<number, string>; ",
+                "let reduced: Choice<string, string>;",
+            ));
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Choice");
+            let forward_node = variable_type_node(&fixture, "forward");
+            let reverse_node = variable_type_node(&fixture, "reverse");
+            let reduced_node = variable_type_node(&fixture, "reduced");
+            let (string, number) = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                (bootstrap.string_type, bootstrap.number_type)
+            };
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            if !reference_first {
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap();
+            }
+            let forward = query_node(&mut fixture, forward_node, &mut diagnostics).unwrap();
+            let reverse = query_node(&mut fixture, reverse_node, &mut diagnostics).unwrap();
+            let reduced = query_node(&mut fixture, reduced_node, &mut diagnostics).unwrap();
+            assert_ne!(forward, reverse);
+            assert_eq!(
+                union_types(&fixture.store, forward),
+                union_types(&fixture.store, reverse)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .validate_union_alias_identity(forward, alias, &[string, number]),
+                Ok(())
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .validate_union_alias_identity(reverse, alias, &[number, string]),
+                Ok(())
+            );
+            assert_eq!(reduced, string);
+            assert!(
+                fixture
+                    .store
+                    .type_payload(reduced)
+                    .unwrap()
+                    .alias()
+                    .is_none()
+            );
+            let declared = query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let parameters = fixture
+                .store
+                .type_alias_links(alias)
+                .unwrap()
+                .type_parameters
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .validate_union_alias_identity(declared, alias, parameters),
+                Ok(())
+            );
+            let before = union_state(&fixture.store);
+            for (node, expected) in [
+                (forward_node, forward),
+                (reverse_node, reverse),
+                (reduced_node, reduced),
+            ] {
+                assert_eq!(
+                    query_node(&mut fixture, node, &mut diagnostics),
+                    Ok(expected)
+                );
+            }
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics
+                ),
+                Ok(declared)
+            );
+            assert_eq!(union_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn forwarded_generic_union_aliases_keep_the_outer_owner() {
+        let mut fixture = fixture(concat!(
+            "type Choice<Left, Right> = Left | Right; ",
+            "type Forward<Value> = Choice<Value, number>; ",
+            "type Fixed<Value> = boolean; ",
+            "type ForwardFixed<Value> = Fixed<Value>; ",
+            "let first: Forward<string>; ",
+            "let second: Forward<string>; ",
+            "let fixed: ForwardFixed<string>;",
+        ));
+        let owner = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Forward");
+        let first = variable_type_node(&fixture, "first");
+        let second = variable_type_node(&fixture, "second");
+        let fixed = variable_type_node(&fixture, "fixed");
+        let (string, boolean) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.boolean_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let concrete = query_node(&mut fixture, first, &mut diagnostics).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_alias_identity(concrete, owner, &[string]),
+            Ok(())
+        );
+        assert_eq!(
+            query_node(&mut fixture, second, &mut diagnostics),
+            Ok(concrete)
+        );
+        assert_eq!(
+            query_node(&mut fixture, fixed, &mut diagnostics),
+            Ok(boolean)
+        );
+        let declared = query_declared(
+            &mut fixture,
+            owner,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let parameters = fixture
+            .store
+            .type_alias_links(owner)
+            .unwrap()
+            .type_parameters
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_alias_identity(declared, owner, parameters),
+            Ok(())
+        );
+        let before = union_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, first, &mut diagnostics),
+            Ok(concrete)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                owner,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics
+            ),
+            Ok(declared)
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_union_alias_queries_reject_forged_arguments_and_owner_before_writes() {
+        for declared_result in [false, true] {
+            for corruption in 0..3 {
+                let mut fixture = fixture(concat!(
+                    "type Choice<Left, Right> = Left | Right; ",
+                    "type Other<First, Second> = First | Second; ",
+                    "let value: Choice<string, number>;",
+                ));
+                let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Choice");
+                let other = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Other");
+                let node = variable_type_node(&fixture, "value");
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let concrete = query_node(&mut fixture, node, &mut diagnostics).unwrap();
+                let declared = query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap();
+                let target = if declared_result { declared } else { concrete };
+                let identity = fixture.store.type_payload(target).unwrap().alias().unwrap();
+                let arguments = fixture
+                    .store
+                    .type_alias(identity)
+                    .unwrap()
+                    .type_arguments()
+                    .unwrap()
+                    .to_vec();
+                match corruption {
+                    0 => assert!(fixture.store.set_type_alias_arguments(
+                        identity,
+                        Some(vec![arguments[1], arguments[0]])
+                    )),
+                    1 => assert!(fixture.store.set_type_alias_arguments(identity, None)),
+                    2 => {
+                        let forged = fixture.store.alloc_type_alias(Some(other)).unwrap();
+                        assert!(
+                            fixture
+                                .store
+                                .set_type_alias_arguments(forged, Some(arguments.clone()))
+                        );
+                        assert!(fixture.store.set_type_alias(target, Some(forged)));
+                    }
+                    _ => unreachable!(),
+                }
+                let before = union_state(&fixture.store);
+                assert!(query_node(&mut fixture, node, &mut diagnostics).is_err());
+                assert_eq!(union_state(&fixture.store), before);
+                assert!(
+                    fixture
+                        .store
+                        .set_type_alias_arguments(identity, Some(arguments))
+                );
+                assert!(fixture.store.set_type_alias(target, Some(identity)));
+                assert_eq!(
+                    query_node(&mut fixture, node, &mut diagnostics),
+                    Ok(concrete)
+                );
+                assert!(diagnostics.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -29548,7 +29863,8 @@ mod tests {
             "interface Virtual<Value> extends NodeBase<Value> { type: 'virtual'; } ",
             "interface Line<Value> extends NodeBase<Value> { type: 'line'; } ",
             "interface Blank<Value> extends NodeBase<Value> { type: 'blank'; } ",
-            "let value: SubTree<string>;",
+            "let value: SubTree<string>; ",
+            "let numeric: SubTree<number>;",
         ));
         let globals = initialize_fixture_global_types(&mut fixture);
         let subtree = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "SubTree");
@@ -29559,7 +29875,9 @@ mod tests {
             named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Blank"),
         ];
         let concrete = variable_type_node(&fixture, "value");
+        let numeric = variable_type_node(&fixture, "numeric");
         let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
 
         let declared =
@@ -29574,6 +29892,12 @@ mod tests {
         };
         let parameter = *parameter;
         assert_eq!(union_types(&fixture.store, declared).len(), retained.len());
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_alias_identity(declared, subtree, &[parameter]),
+            Ok(())
+        );
         for constituent in union_types(&fixture.store, declared) {
             let reference = validate_direct_generic_reference(&fixture.store, *constituent)
                 .expect("filtered union constituents must remain canonical interface references");
@@ -29595,6 +29919,21 @@ mod tests {
 
         let resolved = query_global_node(&mut fixture, &globals, concrete, &mut diagnostics)
             .expect("concrete filtered unions must substitute each retained interface argument");
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_alias_identity(resolved, subtree, &[string]),
+            Ok(())
+        );
+        let numeric_type =
+            query_global_node(&mut fixture, &globals, numeric, &mut diagnostics).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_alias_identity(numeric_type, subtree, &[number]),
+            Ok(())
+        );
+        assert_ne!(resolved, numeric_type);
         for constituent in union_types(&fixture.store, resolved) {
             let reference = validate_direct_generic_reference(&fixture.store, *constituent)
                 .expect("concrete filtered unions must retain canonical interface references");
@@ -29609,6 +29948,10 @@ mod tests {
         assert_eq!(
             query_global_node(&mut fixture, &globals, concrete, &mut diagnostics),
             Ok(resolved),
+        );
+        assert_eq!(
+            query_global_node(&mut fixture, &globals, numeric, &mut diagnostics),
+            Ok(numeric_type)
         );
         assert_eq!(union_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
@@ -29653,8 +29996,48 @@ mod tests {
         assert!(readonly.readonly);
         assert_eq!(readonly.element_type, parameter);
 
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let mapper = fixture
+            .store
+            .new_simple_type_mapper(parameter, string)
+            .unwrap();
+        assert_eq!(
+            crate::semantic::instantiate::validate_instantiable_member_type(
+                &fixture.store,
+                declared,
+                &[parameter],
+                targets,
+            ),
+            Ok(()),
+        );
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mapped = crate::semantic::instantiate::instantiate_type_with_session(
+            &mut fixture.store,
+            declared,
+            mapper,
+            targets,
+            &mut session,
+        )
+        .unwrap();
         let instantiated = query_global_node(&mut fixture, &globals, node, &mut diagnostics)
             .expect("Many<string> substitutes both union constituents");
+        assert_eq!(mapped, instantiated);
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_alias_identity(instantiated, alias, &[string]),
+            Ok(())
+        );
+        assert_eq!(
+            crate::semantic::instantiate::instantiated_member_type_matches(
+                &fixture.store,
+                declared,
+                instantiated,
+                mapper,
+                targets,
+            ),
+            Ok(true),
+        );
         let constituents = union_types(&fixture.store, instantiated);
         assert!(constituents.contains(&string));
         let readonly = constituents

@@ -311,9 +311,19 @@ pub(super) enum UnionReduction {
     Subtype,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct UnionAliasCacheKey {
     symbol: SemanticSymbolId,
+    type_arguments: Vec<TypeId>,
+}
+
+impl UnionAliasCacheKey {
+    fn new(symbol: SemanticSymbolId, type_arguments: &[TypeId]) -> Self {
+        Self {
+            symbol,
+            type_arguments: type_arguments.to_vec(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -353,7 +363,7 @@ impl UnionTypeCacheKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct UnionOfUnionCacheKey {
     first: TypeId,
     second: TypeId,
@@ -367,7 +377,7 @@ enum UnionPlan {
     Union {
         types: Vec<TypeId>,
         object_flags: ObjectFlags,
-        alias_symbol: Option<SemanticSymbolId>,
+        alias: Option<UnionAliasCacheKey>,
         origin: Option<UnionOriginPlan>,
     },
 }
@@ -384,6 +394,21 @@ impl<'globals> UnionArrayValidation<'globals> {
         match global_types {
             Some(global_types) => Self::GlobalTypes(global_types),
             None => Self::None,
+        }
+    }
+
+    const fn targets(self) -> Option<CanonicalArrayTargets> {
+        match self {
+            Self::None => None,
+            Self::GlobalTypes(globals) => Some(CanonicalArrayTargets::from_global_types(globals)),
+            Self::Targets(targets) => Some(targets),
+        }
+    }
+
+    const fn global_types(self) -> Option<&'globals CanonicalGlobalTypes> {
+        match self {
+            Self::GlobalTypes(globals) => Some(globals),
+            Self::None | Self::Targets(_) => None,
         }
     }
 }
@@ -624,7 +649,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             bigints,
             union_operations,
             named_union_operations,
-            None,
+            UnionArrayValidation::None,
             &[],
             0,
             0,
@@ -646,7 +671,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             bigints,
             union_operations,
             named_union_operations,
-            Some(global_types),
+            UnionArrayValidation::GlobalTypes(global_types),
             &[],
             0,
             0,
@@ -672,7 +697,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             bigints,
             union_operations,
             named_union_operations,
-            global_types,
+            UnionArrayValidation::from_global_types(global_types),
             pending_function_types,
             pending_function_capacity,
             additional_type_aliases,
@@ -687,7 +712,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         bigints: &[PseudoBigInt],
         union_operations: usize,
         named_union_operations: usize,
-        global_types: Option<&CanonicalGlobalTypes>,
+        array_validation: UnionArrayValidation<'_>,
         pending_function_types: &[PendingFunctionTypeProof],
         pending_function_capacity: usize,
         additional_type_aliases: usize,
@@ -705,12 +730,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         {
             return Err(LiteralTypeCacheError::InvalidValue);
         }
-        let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
+        let array_targets = array_validation.targets();
         let pending_ids =
             self.proven_pending_function_types(array_targets, pending_function_types)?;
         if union_operations != 0 && self.union_cache_needs_validation {
             self.validate_union_cache(
-                global_types,
+                array_validation,
                 &pending_ids.iter().copied().collect::<Vec<_>>(),
             )?;
             if pending_function_types.is_empty() {
@@ -839,7 +864,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
         Ok(PreparedTypeQueryTypes {
             store: self.id(),
-            array_targets: global_types.map(CanonicalArrayTargets::from_global_types),
+            array_targets,
             union_operations_remaining: union_operations,
             named_union_operations_remaining: named_union_operations,
             pending_function_types: pending,
@@ -1038,7 +1063,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
     fn validate_union_cache(
         &mut self,
-        global_types: Option<&CanonicalGlobalTypes>,
+        array_validation: UnionArrayValidation<'_>,
         pending_function_types: &[TypeId],
     ) -> Result<(), LiteralTypeCacheError> {
         #[cfg(test)]
@@ -1062,7 +1087,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 bootstrap
                     .union_of_union_types
                     .iter()
-                    .map(|(key, result)| (*key, *result))
+                    .map(|(key, result)| (key.clone(), *result))
                     .collect::<Vec<_>>(),
             )
         };
@@ -1071,15 +1096,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .copied()
             .collect::<HashSet<_>>();
         for (key, union) in unions {
-            self.validate_union_cache_entry(
-                &key,
-                union,
-                UnionArrayValidation::from_global_types(global_types),
-                &allowed_pending,
-            )?;
+            self.validate_union_cache_entry(&key, union, array_validation, &allowed_pending)?;
         }
         for (key, result) in unions_of_unions {
-            self.validate_union_of_union_cache_entry(key, result, global_types, &allowed_pending)?;
+            self.validate_union_of_union_cache_entry(
+                key,
+                result,
+                array_validation,
+                &allowed_pending,
+            )?;
         }
         Ok(())
     }
@@ -1099,8 +1124,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         };
         if data.union.types != key.types
-            || self.checked_union_alias_symbol(union, record.alias())?
-                != key.alias.map(|alias| alias.symbol)
+            || self.checked_union_alias(union, record.alias())? != key.alias
             || !self.union_origin_matches(union, data.origin, key.origin.as_ref())
         {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
@@ -1114,6 +1138,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 allowed_pending,
             )?;
         }
+        if let Some(alias) = key.alias.as_ref() {
+            let mut visited = HashSet::new();
+            for argument in &alias.type_arguments {
+                self.validate_cached_array_capability_worker(
+                    *argument,
+                    array_validation,
+                    &mut visited,
+                    allowed_pending,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1121,33 +1156,32 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &mut self,
         key: UnionOfUnionCacheKey,
         result: TypeId,
-        global_types: Option<&CanonicalGlobalTypes>,
+        array_validation: UnionArrayValidation<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
-        if !self.valid_union_alias_key(key.alias) {
+        if !self.valid_union_alias_key(key.alias.as_ref()) {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(result));
         }
         for candidate in [key.first, key.second, result] {
             self.validate_union_constituent_worker(
                 candidate,
-                UnionArrayValidation::from_global_types(global_types),
+                array_validation,
                 &mut HashSet::new(),
                 allowed_pending,
             )?;
         }
-        let alias_symbol = key.alias.map(|alias| alias.symbol);
         let expected = match self.plan_union_type(
             &[key.first, key.second],
             key.reduction,
-            alias_symbol,
-            global_types,
+            key.alias,
+            array_validation.global_types(),
             true,
         )? {
             UnionPlan::Existing(expected) => expected,
             UnionPlan::Union {
                 types,
                 object_flags: _,
-                alias_symbol,
+                alias,
                 origin,
             } => {
                 let expected_key = UnionTypeCacheKey {
@@ -1158,7 +1192,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         }
                         UnionOriginPlan::ExistingIndex(index) => UnionOriginCacheKey::Index(index),
                     }),
-                    alias: alias_symbol.map(|symbol| UnionAliasCacheKey { symbol }),
+                    alias,
                 };
                 let expected = self
                     .intrinsic_bootstrap
@@ -1169,7 +1203,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 self.validate_union_cache_entry(
                     &expected_key,
                     expected,
-                    UnionArrayValidation::from_global_types(global_types),
+                    array_validation,
                     allowed_pending,
                 )?;
                 expected
@@ -1181,8 +1215,18 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(())
     }
 
-    fn valid_union_alias_key(&self, alias: Option<UnionAliasCacheKey>) -> bool {
-        alias.is_none_or(|alias| self.valid_union_alias_symbol(alias.symbol))
+    fn valid_union_alias_key(&self, alias: Option<&UnionAliasCacheKey>) -> bool {
+        alias.is_none_or(|alias| {
+            self.valid_union_alias_symbol(alias.symbol)
+                && self
+                    .type_alias_links(alias.symbol)
+                    .and_then(|links| links.type_parameters.as_deref())
+                    .is_none_or(|parameters| parameters.len() == alias.type_arguments.len())
+                && alias
+                    .type_arguments
+                    .iter()
+                    .all(|argument| self.type_payload(*argument).is_some())
+        })
     }
 
     fn valid_union_alias_symbol(&self, symbol: SemanticSymbolId) -> bool {
@@ -1195,11 +1239,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             })
     }
 
-    fn checked_union_alias_symbol(
+    fn checked_union_alias(
         &self,
         union: TypeId,
         alias: Option<TypeAliasId>,
-    ) -> Result<Option<SemanticSymbolId>, LiteralTypeCacheError> {
+    ) -> Result<Option<UnionAliasCacheKey>, LiteralTypeCacheError> {
         let Some(alias) = alias else {
             return Ok(None);
         };
@@ -1210,10 +1254,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .symbol()
             .filter(|symbol| self.valid_union_alias_symbol(*symbol))
             .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
-        if alias.type_arguments().is_some() {
+        let key = UnionAliasCacheKey::new(symbol, alias.type_arguments().unwrap_or_default());
+        if !self.valid_union_alias_key(Some(&key)) {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
-        Ok(Some(symbol))
+        Ok(Some(key))
     }
 
     fn union_origin_matches(
@@ -1401,7 +1446,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
-        self.checked_union_alias_symbol(union, record.alias())?;
+        self.checked_union_alias(union, record.alias())?;
         if let Some(origin) = data.origin {
             self.validate_union_origin_structure(union, origin)?;
         }
@@ -1457,6 +1502,25 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             UnionArrayValidation::None,
             &HashSet::new(),
         )
+    }
+
+    pub(super) fn validate_union_alias_identity(
+        &self,
+        type_: TypeId,
+        symbol: SemanticSymbolId,
+        arguments: &[TypeId],
+    ) -> Result<(), LiteralTypeCacheError> {
+        let record = self
+            .type_payload(type_)
+            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+        // Union reduction returns the remaining type without a new alias.
+        if matches!(record.data(), TypeData::Union(_))
+            && self.checked_union_alias(type_, record.alias())?
+                != Some(UnionAliasCacheKey::new(symbol, arguments))
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+        }
+        Ok(())
     }
 
     pub(super) fn validate_cached_union_result_with_array_targets(
@@ -1637,7 +1701,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if let Some(expected_alias) = expected_alias
             && let Some(record) = self.type_payload(type_)
             && matches!(record.data(), TypeData::Union(_))
-            && self.checked_union_alias_symbol(type_, record.alias())? != Some(expected_alias)
+            && self
+                .checked_union_alias(type_, record.alias())?
+                .map(|alias| alias.symbol)
+                != Some(expected_alias)
         {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
         }
@@ -1815,9 +1882,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         array_validation: UnionArrayValidation<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
-        let alias = self
-            .checked_union_alias_symbol(union, record.alias())?
-            .map(|symbol| UnionAliasCacheKey { symbol });
+        let alias = self.checked_union_alias(union, record.alias())?;
         let origin = data.origin.map(|origin| {
             let Some(record) = self.type_payload(origin) else {
                 return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
@@ -2164,6 +2229,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         visited,
                         allowed_pending,
                     )?;
+                }
+                if let Some(alias) = record.alias().and_then(|alias| self.type_alias(alias)) {
+                    for argument in alias.type_arguments().unwrap_or_default() {
+                        self.validate_cached_array_capability_worker(
+                            *argument,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
+                    }
                 }
                 Ok(())
             }
@@ -3914,7 +3989,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         reduction: UnionReduction,
     ) -> Result<TypeId, LiteralTypeCacheError> {
         let mut prepared = self.prepare_type_query_types(&[], &[], &[], 1, 0)?;
-        self.union_type_prepared(types, reduction, None, &mut prepared, None)
+        self.union_type_prepared(
+            types,
+            reduction,
+            None,
+            &mut prepared,
+            UnionArrayValidation::None,
+        )
     }
 
     /// Constructs an expression union with authoritative global-array
@@ -3927,7 +4008,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     ) -> Result<TypeId, LiteralTypeCacheError> {
         let mut prepared =
             self.prepare_type_query_types_with_global_types(&[], &[], &[], 1, 0, global_types)?;
-        self.union_type_prepared(types, reduction, None, &mut prepared, Some(global_types))
+        self.union_type_prepared(
+            types,
+            reduction,
+            None,
+            &mut prepared,
+            UnionArrayValidation::GlobalTypes(global_types),
+        )
     }
 
     #[cfg(test)]
@@ -3947,7 +4034,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         alias_symbol: Option<SemanticSymbolId>,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, LiteralTypeCacheError> {
-        self.union_type_prepared(types, UnionReduction::Literal, alias_symbol, prepared, None)
+        self.literal_union_type_with_alias_prepared(
+            types,
+            alias_symbol.map(|symbol| (symbol, &[][..])),
+            prepared,
+            None,
+        )
     }
 
     pub(super) fn literal_union_type_prepared_with_global_types(
@@ -3957,12 +4049,54 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         alias_symbol: Option<SemanticSymbolId>,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, LiteralTypeCacheError> {
+        self.literal_union_type_with_alias_prepared(
+            types,
+            alias_symbol.map(|symbol| (symbol, &[][..])),
+            prepared,
+            Some(global_types),
+        )
+    }
+
+    /// Keeps the alias symbol and ordered arguments in the canonical union key.
+    pub(super) fn literal_union_type_with_alias_prepared(
+        &mut self,
+        types: &[TypeId],
+        alias: Option<(SemanticSymbolId, &[TypeId])>,
+        prepared: &mut PreparedTypeQueryTypes,
+        global_types: Option<&CanonicalGlobalTypes>,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
         self.union_type_prepared(
             types,
             UnionReduction::Literal,
-            alias_symbol,
+            alias.map(|(symbol, arguments)| UnionAliasCacheKey::new(symbol, arguments)),
             prepared,
-            Some(global_types),
+            UnionArrayValidation::from_global_types(global_types),
+        )
+    }
+
+    pub(super) fn literal_union_type_with_alias_and_array_targets(
+        &mut self,
+        types: &[TypeId],
+        alias: Option<(SemanticSymbolId, &[TypeId])>,
+        targets: Option<CanonicalArrayTargets>,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        let mut prepared = self.prepare_type_query_types_worker(
+            &[],
+            &[],
+            &[],
+            1,
+            usize::from(alias.is_some()),
+            targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets),
+            &[],
+            0,
+            0,
+        )?;
+        self.union_type_prepared(
+            types,
+            UnionReduction::Literal,
+            alias.map(|(symbol, arguments)| UnionAliasCacheKey::new(symbol, arguments)),
+            &mut prepared,
+            targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets),
         )
     }
 
@@ -4010,20 +4144,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             UnionPlan::Union {
                 types,
                 object_flags,
-                alias_symbol: None,
+                alias: None,
                 ..
             } => self.union_type_from_sorted_list(
                 types,
                 object_flags,
                 None,
                 Some(UnionOriginPlan::ExistingIndex(origin)),
-                None,
+                UnionArrayValidation::None,
                 &prepared.pending_function_types,
             ),
-            UnionPlan::Union {
-                alias_symbol: Some(_),
-                ..
-            } => Err(LiteralTypeCacheError::InvalidValue),
+            UnionPlan::Union { alias: Some(_), .. } => Err(LiteralTypeCacheError::InvalidValue),
         }
     }
 
@@ -4031,28 +4162,38 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &mut self,
         types: &[TypeId],
         reduction: UnionReduction,
-        alias_symbol: Option<SemanticSymbolId>,
+        alias: Option<UnionAliasCacheKey>,
         prepared: &mut PreparedTypeQueryTypes,
-        global_types: Option<&CanonicalGlobalTypes>,
+        array_validation: UnionArrayValidation<'_>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
-        let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
-        prepared.consume_union(self.id(), alias_symbol.is_some(), array_targets)?;
+        let array_targets = array_validation.targets();
+        prepared.consume_union(self.id(), alias.is_some(), array_targets)?;
         if !prepared.pending_function_types.is_empty() {
             self.mark_union_cache_validation_dirty();
         }
         for type_ in types {
             self.validate_union_constituent_worker(
                 *type_,
-                UnionArrayValidation::from_global_types(global_types),
+                array_validation,
                 &mut HashSet::new(),
                 &prepared.pending_function_types,
             )?;
         }
-        if !self.valid_union_alias_key(alias_symbol.map(|symbol| UnionAliasCacheKey { symbol })) {
-            return Err(alias_symbol.map_or(
-                LiteralTypeCacheError::InvalidValue,
-                LiteralTypeCacheError::InvalidUnionAlias,
-            ));
+        if !self.valid_union_alias_key(alias.as_ref()) {
+            return Err(alias.map_or(LiteralTypeCacheError::InvalidValue, |alias| {
+                LiteralTypeCacheError::InvalidUnionAlias(alias.symbol)
+            }));
+        }
+        if let Some(alias) = alias.as_ref() {
+            let mut visited = HashSet::new();
+            for argument in &alias.type_arguments {
+                self.validate_cached_array_capability_worker(
+                    *argument,
+                    array_validation,
+                    &mut visited,
+                    &prepared.pending_function_types,
+                )?;
+            }
         }
         if types.is_empty() {
             return self
@@ -4065,7 +4206,6 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Ok(types[0]);
         }
 
-        let alias = alias_symbol.map(|symbol| UnionAliasCacheKey { symbol });
         let first_is_union = self
             .type_payload(types[0])
             .is_some_and(|record| record.flags().intersects(TypeFlags::UNION));
@@ -4083,20 +4223,20 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     first,
                     second,
                     reduction,
-                    alias,
+                    alias: alias.clone(),
                 }
             });
-        if let Some(key) = union_of_union_key
+        if let Some(key) = union_of_union_key.as_ref()
             && let Some(cached) = self
                 .intrinsic_bootstrap
                 .as_ref()
-                .and_then(|bootstrap| bootstrap.union_of_union_types.get(&key))
+                .and_then(|bootstrap| bootstrap.union_of_union_types.get(key))
                 .copied()
         {
             self.validate_union_of_union_cache_entry(
-                key,
+                key.clone(),
                 cached,
-                global_types,
+                array_validation,
                 &prepared.pending_function_types,
             )?;
             return Ok(cached);
@@ -4105,8 +4245,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let result = self.union_type_worker(
             types,
             reduction,
-            alias_symbol,
-            global_types,
+            alias,
+            array_validation,
             &prepared.pending_function_types,
         )?;
         if let Some(key) = union_of_union_key {
@@ -4123,23 +4263,29 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &mut self,
         types: &[TypeId],
         reduction: UnionReduction,
-        alias_symbol: Option<SemanticSymbolId>,
-        global_types: Option<&CanonicalGlobalTypes>,
+        alias: Option<UnionAliasCacheKey>,
+        array_validation: UnionArrayValidation<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
-        match self.plan_union_type(types, reduction, alias_symbol, global_types, true)? {
+        match self.plan_union_type(
+            types,
+            reduction,
+            alias,
+            array_validation.global_types(),
+            true,
+        )? {
             UnionPlan::Existing(existing) => Ok(existing),
             UnionPlan::Union {
                 types,
                 object_flags,
-                alias_symbol,
+                alias,
                 origin,
             } => self.union_type_from_sorted_list(
                 types,
                 object_flags,
-                alias_symbol,
+                alias,
                 origin,
-                global_types,
+                array_validation,
                 allowed_pending,
             ),
         }
@@ -4149,7 +4295,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &mut self,
         types: &[TypeId],
         reduction: UnionReduction,
-        alias_symbol: Option<SemanticSymbolId>,
+        alias: Option<UnionAliasCacheKey>,
         global_types: Option<&CanonicalGlobalTypes>,
         synthesize_origin: bool,
     ) -> Result<UnionPlan, LiteralTypeCacheError> {
@@ -4263,7 +4409,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     reduced.push(*type_);
                 }
             }
-            if alias_symbol.is_none() && named.len() == 1 && reduced.is_empty() {
+            if alias.is_none() && named.len() == 1 && reduced.is_empty() {
                 return Ok(UnionPlan::Existing(named[0]));
             }
             let named_type_count = named.iter().try_fold(0usize, |count, union| {
@@ -4302,7 +4448,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(UnionPlan::Union {
             types: type_set,
             object_flags,
-            alias_symbol,
+            alias,
             origin,
         })
     }
@@ -4311,9 +4457,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &mut self,
         types: Vec<TypeId>,
         object_flags: ObjectFlags,
-        alias_symbol: Option<SemanticSymbolId>,
+        alias: Option<UnionAliasCacheKey>,
         origin: Option<UnionOriginPlan>,
-        global_types: Option<&CanonicalGlobalTypes>,
+        array_validation: UnionArrayValidation<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
         let bootstrap = self
@@ -4334,7 +4480,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
                 UnionOriginPlan::ExistingIndex(index) => UnionOriginCacheKey::Index(*index),
             }),
-            alias: alias_symbol.map(|symbol| UnionAliasCacheKey { symbol }),
+            alias: alias.clone(),
         };
         if let Some(cached) = self
             .intrinsic_bootstrap
@@ -4342,12 +4488,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .and_then(|bootstrap| bootstrap.union_types.get(&key))
             .copied()
         {
-            self.validate_union_cache_entry(
-                &key,
-                cached,
-                UnionArrayValidation::from_global_types(global_types),
-                allowed_pending,
-            )?;
+            self.validate_union_cache_entry(&key, cached, array_validation, allowed_pending)?;
             return Ok(cached);
         }
 
@@ -4381,11 +4522,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 ConstituentMapState::Unallocated,
             ));
         }
-        if let Some(symbol) = alias_symbol {
-            let alias = self
-                .alloc_type_alias(Some(symbol))
+        if let Some(alias) = alias {
+            let identity = self
+                .alloc_type_alias(Some(alias.symbol))
                 .expect("preflighted union alias symbol belongs to this store");
-            assert!(self.set_type_alias(union, Some(alias)));
+            if !alias.type_arguments.is_empty() {
+                assert!(self.set_type_alias_arguments(identity, Some(alias.type_arguments)));
+            }
+            assert!(self.set_type_alias(union, Some(identity)));
         }
         let bootstrap = self
             .intrinsic_bootstrap
@@ -6857,7 +7001,7 @@ mod tests {
         let malformed_key = UnionTypeCacheKey {
             types: types.clone(),
             origin: None,
-            alias: Some(UnionAliasCacheKey { symbol: raw }),
+            alias: Some(UnionAliasCacheKey::new(raw, &[])),
         };
         store
             .intrinsic_bootstrap
@@ -6881,12 +7025,155 @@ mod tests {
         let repaired_key = UnionTypeCacheKey {
             types,
             origin: None,
-            alias: Some(UnionAliasCacheKey { symbol: canonical }),
+            alias: Some(UnionAliasCacheKey::new(canonical, &[])),
         };
         let cache = &mut store.intrinsic_bootstrap.as_mut().unwrap().union_types;
         cache.remove(&malformed_key);
         cache.insert(repaired_key, repaired);
         assert!(store.prepare_type_query_types(&[], &[], &[], 1, 1).is_ok());
+    }
+
+    #[test]
+    fn union_alias_keys_keep_ordered_arguments_in_both_union_caches() {
+        let mut store = initialized(IntrinsicBootstrapOptions::default());
+        let (string, number, boolean, string_or_number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
+                bootstrap.string_or_number_type,
+            )
+        };
+        let symbol = store.alloc_transient_symbol(
+            SymbolFlags::TYPE_ALIAS,
+            EscapedName::source("Choice"),
+            CheckFlags::NONE,
+        );
+        for types in [vec![string, number], vec![string_or_number, boolean]] {
+            let forward = store
+                .literal_union_type_with_alias_and_array_targets(
+                    &types,
+                    Some((symbol, &[string, number])),
+                    None,
+                )
+                .unwrap();
+            let reverse = store
+                .literal_union_type_with_alias_and_array_targets(
+                    &types,
+                    Some((symbol, &[number, string])),
+                    None,
+                )
+                .unwrap();
+            assert_ne!(forward, reverse);
+            assert_eq!(union_types(&store, forward), union_types(&store, reverse));
+            assert_eq!(
+                store.validate_union_alias_identity(forward, symbol, &[string, number]),
+                Ok(())
+            );
+            assert_eq!(
+                store.validate_union_alias_identity(reverse, symbol, &[number, string]),
+                Ok(())
+            );
+            let before = (store.type_len(), store.type_alias_len());
+            for (arguments, expected) in [([string, number], forward), ([number, string], reverse)]
+            {
+                assert_eq!(
+                    store.literal_union_type_with_alias_and_array_targets(
+                        &types,
+                        Some((symbol, &arguments)),
+                        None,
+                    ),
+                    Ok(expected),
+                );
+            }
+            assert_eq!((store.type_len(), store.type_alias_len()), before);
+        }
+    }
+
+    #[test]
+    fn union_alias_argument_and_owner_forgery_fail_before_query_writes() {
+        for corruption in 0..3 {
+            let mut store = initialized(IntrinsicBootstrapOptions::default());
+            let (string, number) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (bootstrap.string_type, bootstrap.number_type)
+            };
+            let symbol = store.alloc_transient_symbol(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source("Choice"),
+                CheckFlags::NONE,
+            );
+            let other = store.alloc_transient_symbol(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source("Other"),
+                CheckFlags::NONE,
+            );
+            let union = store
+                .literal_union_type_with_alias_and_array_targets(
+                    &[string, number],
+                    Some((symbol, &[string, number])),
+                    None,
+                )
+                .unwrap();
+            let alias = store.type_payload(union).unwrap().alias().unwrap();
+            match corruption {
+                0 => assert!(store.set_type_alias_arguments(alias, Some(vec![number, string]))),
+                1 => assert!(store.set_type_alias_arguments(alias, None)),
+                2 => {
+                    let forged = store.alloc_type_alias(Some(other)).unwrap();
+                    assert!(store.set_type_alias_arguments(forged, Some(vec![string, number])));
+                    assert!(store.set_type_alias(union, Some(forged)));
+                }
+                _ => unreachable!(),
+            }
+            let before = (store.type_len(), store.type_alias_len());
+            assert_eq!(
+                store.literal_union_type_with_alias_and_array_targets(
+                    &[string, number],
+                    Some((symbol, &[string, number])),
+                    None,
+                ),
+                Err(LiteralTypeCacheError::InvalidCachedUnion(union)),
+            );
+            assert_eq!((store.type_len(), store.type_alias_len()), before);
+            assert!(store.set_type_alias_arguments(alias, Some(vec![string, number])));
+            assert!(store.set_type_alias(union, Some(alias)));
+            assert_eq!(
+                store.literal_union_type_with_alias_and_array_targets(
+                    &[string, number],
+                    Some((symbol, &[string, number])),
+                    None,
+                ),
+                Ok(union),
+            );
+        }
+    }
+
+    #[test]
+    fn union_alias_foreign_arguments_are_rejected_without_publication() {
+        let mut store = initialized(IntrinsicBootstrapOptions::default());
+        let foreign = initialized(IntrinsicBootstrapOptions::default());
+        let foreign_type = foreign.intrinsic_bootstrap().unwrap().string_type;
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let symbol = store.alloc_transient_symbol(
+            SymbolFlags::TYPE_ALIAS,
+            EscapedName::source("Choice"),
+            CheckFlags::NONE,
+        );
+        let before = (store.type_len(), store.type_alias_len());
+        assert_eq!(
+            store.literal_union_type_with_alias_and_array_targets(
+                &[string, number],
+                Some((symbol, &[foreign_type])),
+                None,
+            ),
+            Err(LiteralTypeCacheError::InvalidUnionAlias(symbol)),
+        );
+        assert_eq!((store.type_len(), store.type_alias_len()), before);
     }
 
     #[test]
