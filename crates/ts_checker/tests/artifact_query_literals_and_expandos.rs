@@ -274,3 +274,47 @@ fn annotated_expando_accesses_keep_declared_property_symbols() {
         Ok(&[expression][..]),
     );
 }
+
+#[test]
+fn cold_class_declaration_and_name_queries_share_the_instance_type() {
+    let parsed = parse_source_file("declare class Model {}");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(4_104);
+    let mut context = context(&parsed, file, true, CanonicalModuleState::Script);
+    let (declaration, name) = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::ClassDeclaration(class) = &record.data else {
+                return None;
+            };
+            Some((
+                NodeRef::new(parsed.arena.id(), file, node),
+                NodeRef::new(parsed.arena.id(), file, class.name.unwrap()),
+            ))
+        })
+        .unwrap();
+    let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+    assert!(
+        context
+            .store()
+            .declared_type_links(owner)
+            .is_none_or(|links| links.declared_type.is_none()),
+    );
+    let instance = context.get_type_at_location(name).unwrap();
+    assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+    assert_eq!(context.get_type_at_location(declaration), Ok(instance));
+    assert_eq!(
+        context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type),
+        Some(instance),
+    );
+    assert!(
+        context
+            .store()
+            .source_file_links(context.source_file(file).unwrap())
+            .is_none_or(|links| !links.type_checked),
+    );
+}

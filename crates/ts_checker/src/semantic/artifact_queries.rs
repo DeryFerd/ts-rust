@@ -188,10 +188,20 @@ impl CanonicalCheckerContext<'_> {
         &mut self,
         node: NodeRef,
     ) -> Result<TypeId, CanonicalArtifactQueryError> {
+        let class = self.class_declaration_artifact_symbol(node)?;
         self.prepare_artifact_location(node)?;
 
-        if let Some(type_) = self.class_declaration_artifact_type(node)? {
-            return Ok(type_);
+        if let Some(symbol) = class {
+            let type_ = self.get_declared_type_of_symbol(symbol)?;
+            if let Some(cached) = self.cached_artifact_type(node)?
+                && cached != type_
+            {
+                return Err(CanonicalArtifactQueryError::InvalidType {
+                    node,
+                    type_: cached,
+                });
+            }
+            return self.validate_artifact_type(node, type_);
         }
 
         if let Some(type_) = self.literal_annotation_artifact_type(node)? {
@@ -674,11 +684,11 @@ impl CanonicalCheckerContext<'_> {
         self.validate_artifact_type(node, type_).map(Some)
     }
 
-    fn class_declaration_artifact_type(
-        &mut self,
+    fn class_declaration_artifact_symbol(
+        &self,
         node: NodeRef,
-    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
-        let symbol = {
+    ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
+        let (declaration, symbol) = {
             let (arena, bound, record) = self.validated_artifact_node(node)?;
             let declaration = if matches!(record.data, NodeData::ClassDeclaration(_)) {
                 node
@@ -702,18 +712,35 @@ impl CanonicalCheckerContext<'_> {
                         node,
                         kind: record.kind,
                     })?;
-            self.merged_artifact_symbol(node, symbol)?
+            (declaration, self.merged_artifact_symbol(node, symbol)?)
         };
-        let type_ = self.get_declared_type_of_symbol(symbol)?;
-        if let Some(cached) = self.cached_artifact_type(node)?
-            && cached != type_
-        {
-            return Err(CanonicalArtifactQueryError::InvalidType {
-                node,
-                type_: cached,
-            });
+        let name = declaration_name(&self.validated_artifact_node(declaration)?.2.data)
+            .map(|name| NodeRef::new(declaration.arena, declaration.file, name));
+        for location in [declaration].into_iter().chain(name) {
+            if location != declaration
+                && self.validated_artifact_node(location)?.2.parent != Some(declaration.node)
+            {
+                return Err(CanonicalArtifactQueryError::ForeignNode(location));
+            }
+            if let Some(cached) = self.cached_artifact_type(location)? {
+                let declared = self
+                    .store()
+                    .declared_type_links(symbol)
+                    .and_then(|links| links.declared_type);
+                if declared != Some(cached)
+                    || self.store().type_payload(cached).is_none_or(|record| {
+                        record.symbol() != Some(symbol)
+                            || !matches!(record.data(), TypeData::Interface(_))
+                    })
+                {
+                    return Err(CanonicalArtifactQueryError::InvalidType {
+                        node: location,
+                        type_: cached,
+                    });
+                }
+            }
         }
-        self.validate_artifact_type(node, type_).map(Some)
+        Ok(Some(symbol))
     }
 
     fn literal_annotation_artifact_type(
@@ -2207,6 +2234,82 @@ mod tests {
             }),
         );
         assert_eq!(context.get_type_at_location(declaration), Ok(instance));
+    }
+
+    #[test]
+    fn cold_class_query_cache_failures_do_not_check_sources_or_allocate_types() {
+        let parsed = parse_source_file("class Model {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_034);
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ClassDeclaration(class) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, class.name.unwrap()),
+                ))
+            })
+            .unwrap();
+        for declaration_file in [false, true] {
+            for poisoned in [declaration, name] {
+                let mut context = context_with_source_kind(
+                    &parsed,
+                    file,
+                    CanonicalCheckerOptions::default(),
+                    declaration_file,
+                );
+                let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+                let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    poisoned,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+                let source = context.source_file(file).unwrap();
+                let before = (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().source_file_links(source).cloned(),
+                    context.store().declared_type_links(owner).cloned(),
+                    context.diagnostics().len(),
+                );
+                assert_eq!(
+                    context.get_type_at_location(name),
+                    Err(CanonicalArtifactQueryError::InvalidType {
+                        node: poisoned,
+                        type_: wrong,
+                    }),
+                );
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().signature_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.store().source_file_links(source).cloned(),
+                        context.store().declared_type_links(owner).cloned(),
+                        context.diagnostics().len(),
+                    ),
+                    before,
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(poisoned, TypeNodeLinks::default()),
+                );
+                let instance = context.get_type_at_location(name).unwrap();
+                assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+                assert_eq!(context.get_type_at_location(declaration), Ok(instance));
+            }
+        }
     }
 
     #[test]
