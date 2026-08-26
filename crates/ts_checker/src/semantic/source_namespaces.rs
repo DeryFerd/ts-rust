@@ -5723,6 +5723,309 @@ fn authenticated_deferred_react_instance_alias(
         && element_owner.parent().is_none()
 }
 
+/// Keeps React's exact `PropTypes.Name<T>` forwarding aliases cold.
+#[allow(clippy::too_many_lines)] // Alias, imported target, forwarded parameter, and caches share one proof.
+fn authenticated_deferred_react_prop_types_alias(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    alias: SemanticSymbolId,
+    declaration: NodeRef,
+    annotation: NodeRef,
+) -> bool {
+    let Some(owner) = store.symbol(alias) else {
+        return false;
+    };
+    let Some(name) = owner.name().as_utf8() else {
+        return false;
+    };
+    let expected_flags = match name {
+        "Validator" | "Requireable" => SymbolFlags::INTERFACE,
+        "ValidationMap" => SymbolFlags::TYPE_ALIAS,
+        _ => return false,
+    };
+    if store
+        .symbol(namespace)
+        .and_then(|namespace| namespace.name().as_utf8())
+        != Some("React")
+    {
+        return false;
+    }
+
+    let authenticated = || -> Option<()> {
+        let exports = store
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))?;
+        let prop_types = exports
+            .get_source("ReactPropTypes")
+            .and_then(|symbol| store.get_merged_symbol(symbol))?;
+        let [prop_types_declaration] = store.symbol(prop_types)?.declarations()? else {
+            return None;
+        };
+        let prop_types_declaration = *prop_types_declaration;
+        if !authenticated_deferred_react_prop_types_interface(
+            arena,
+            bound,
+            store,
+            namespace,
+            prop_types,
+            prop_types_declaration,
+        ) {
+            return None;
+        }
+
+        let record = arena.get(declaration.node)?;
+        let NodeData::TypeAliasDeclaration(alias_data) = &record.data else {
+            return None;
+        };
+        let parameters = alias_data.type_parameters.as_ref()?;
+        let [parameter] = parameters.nodes.as_slice() else {
+            return None;
+        };
+        let parameter = child(declaration, *parameter);
+        let parameter_record = arena.get(parameter.node)?;
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return None;
+        };
+        let parameter_name = child(parameter, parameter_data.name);
+        let parameter_name_record = arena.get(parameter_name.node)?;
+        let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+            return None;
+        };
+        let parameter_symbol = bound
+            .symbol(parameter)
+            .and_then(|parameter| store.get_merged_symbol(parameter))?;
+        let parameter_owner = store.symbol(parameter_symbol)?;
+        let annotation_record = arena.get(annotation.node)?;
+        let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+            return None;
+        };
+        let arguments = reference.type_arguments.as_ref()?;
+        let [argument] = arguments.nodes.as_slice() else {
+            return None;
+        };
+        let argument = child(annotation, *argument);
+        let argument_record = arena.get(argument.node)?;
+        let NodeData::TypeReferenceNode(argument_data) = &argument_record.data else {
+            return None;
+        };
+        let argument_name = child(argument, argument_data.type_name);
+        let argument_name_record = arena.get(argument_name.node)?;
+        let NodeData::Identifier(argument_identifier) = &argument_name_record.data else {
+            return None;
+        };
+        let qualified = child(annotation, reference.type_name);
+        let qualified_record = arena.get(qualified.node)?;
+        let NodeData::QualifiedName(qualified_name) = &qualified_record.data else {
+            return None;
+        };
+        let root = child(qualified, qualified_name.left);
+        let root_record = arena.get(root.node)?;
+        let NodeData::Identifier(root_identifier) = &root_record.data else {
+            return None;
+        };
+        let imported_name = child(qualified, qualified_name.right);
+        let imported_name_record = arena.get(imported_name.node)?;
+        let NodeData::Identifier(imported_identifier) = &imported_name_record.data else {
+            return None;
+        };
+
+        let interface_record = arena.get(prop_types_declaration.node)?;
+        let react_block = child(prop_types_declaration, interface_record.parent?);
+        let react_namespace = child(react_block, arena.get(react_block.node)?.parent?);
+        let module_body = child(react_namespace, arena.get(react_namespace.node)?.parent?);
+        let module = child(module_body, arena.get(module_body.node)?.parent?);
+        let import_alias = bound
+            .locals(module)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("PropTypes"))
+            .and_then(|alias| store.get_merged_symbol(alias))?;
+        let imported_module = bound
+            .locals(bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get(EscapedName::source("\"prop-types\"").as_ref()))
+            .and_then(|module| store.get_merged_symbol(module))?;
+        let target = store
+            .symbol(imported_module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(name))
+            .and_then(|target| store.get_merged_symbol(target))?;
+        let target_owner = store.symbol(target)?;
+        let [target_declaration] = target_owner.declarations()? else {
+            return None;
+        };
+        let target_declaration = *target_declaration;
+        let target_record = arena.get(target_declaration.node)?;
+        let target_parameters = match &target_record.data {
+            NodeData::InterfaceDeclaration(interface)
+                if expected_flags == SymbolFlags::INTERFACE =>
+            {
+                interface.type_parameters.as_ref()
+            }
+            NodeData::TypeAliasDeclaration(alias) if expected_flags == SymbolFlags::TYPE_ALIAS => {
+                alias.type_parameters.as_ref()
+            }
+            _ => return None,
+        }?;
+
+        if owner.flags() != SymbolFlags::TYPE_ALIAS
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration().is_some()
+            || owner.members().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || store.get_merged_symbol(alias) != Some(alias)
+            || store.get_parent_of_symbol(alias) != Some(namespace)
+            || exports
+                .get_source(name)
+                .and_then(|candidate| store.get_merged_symbol(candidate))
+                != Some(alias)
+            || record.kind != SyntaxKind::TypeAliasDeclaration
+            || record.flags.0 != 0
+            || record.parent != interface_record.parent
+            || alias_data.type_ != annotation.node
+            || parameters.has_trailing_comma
+            || parameter_record.kind != SyntaxKind::TypeParameter
+            || parameter_record.flags.0 != 0
+            || parameter_record.parent != Some(declaration.node)
+            || parameter_data.constraint.is_some()
+            || parameter_data.default_type.is_some()
+            || parameter_data.expression.is_some()
+            || parameter_data.modifiers.is_some()
+            || parameter_data.symbol.is_some()
+            || parameter_name_record.kind != SyntaxKind::Identifier
+            || parameter_name_record.flags.0 != 0
+            || parameter_name_record.parent != Some(parameter.node)
+            || parameter_identifier.flow_node.is_some()
+            || parameter_identifier.text != "T"
+            || parameter_owner.flags() != SymbolFlags::TYPE_PARAMETER
+            || parameter_owner.check_flags() != CheckFlags::NONE
+            || parameter_owner.name().as_utf8() != Some("T")
+            || parameter_owner.declarations() != Some(&[parameter])
+            || bound
+                .locals(declaration)
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source("T"))
+                != Some(parameter_symbol)
+            || annotation_record.kind != SyntaxKind::TypeReference
+            || annotation_record.flags.0 != 0
+            || annotation_record.parent != Some(declaration.node)
+            || arguments.has_trailing_comma
+            || qualified_record.kind != SyntaxKind::QualifiedName
+            || qualified_record.flags.0 != 0
+            || qualified_record.parent != Some(annotation.node)
+            || qualified_name.flow_node.is_some()
+            || qualified_name.facts != 0
+            || root_record.kind != SyntaxKind::Identifier
+            || root_record.flags.0 != 0
+            || root_record.parent != Some(qualified.node)
+            || root_identifier.flow_node.is_some()
+            || root_identifier.text != "PropTypes"
+            || imported_name_record.kind != SyntaxKind::Identifier
+            || imported_name_record.flags.0 != 0
+            || imported_name_record.parent != Some(qualified.node)
+            || imported_identifier.flow_node.is_some()
+            || imported_identifier.text != name
+            || argument_record.kind != SyntaxKind::TypeReference
+            || argument_record.flags.0 != 0
+            || argument_record.parent != Some(annotation.node)
+            || argument_data.type_arguments.is_some()
+            || argument_name_record.kind != SyntaxKind::Identifier
+            || argument_name_record.flags.0 != 0
+            || argument_name_record.parent != Some(argument.node)
+            || argument_identifier.flow_node.is_some()
+            || argument_identifier.text != "T"
+            || target_owner.name().as_utf8() != Some(name)
+            || target_owner.flags().without(SymbolFlags::TRANSIENT) != expected_flags
+            || target_owner.check_flags() != CheckFlags::NONE
+            || target_owner.value_declaration().is_some()
+            || store.get_parent_of_symbol(target) != Some(imported_module)
+            || target_parameters.nodes.len() != 1
+            || bound
+                .symbol(target_declaration)
+                .and_then(|candidate| store.get_merged_symbol(candidate))
+                != Some(target)
+        {
+            return None;
+        }
+
+        let parameter_type = store
+            .declared_type_links(parameter_symbol)
+            .and_then(|links| links.declared_type);
+        if parameter_type.is_some_and(|cached| {
+            cached_ordinary_type_parameter_owner(store, cached) != Some(parameter_symbol)
+        }) || store.type_node_links(argument).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links
+                    .resolved_type
+                    .is_some_and(|cached| Some(cached) != parameter_type)
+        }) || store
+            .symbol_node_links(argument)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|cached| store.get_merged_symbol(cached) != Some(parameter_symbol))
+            || store
+                .symbol_node_links(argument_name)
+                .and_then(|links| links.resolved_symbol)
+                .is_some_and(|cached| store.get_merged_symbol(cached) != Some(parameter_symbol))
+            || store
+                .symbol_node_links(annotation)
+                .and_then(|links| links.resolved_symbol)
+                .is_some_and(|cached| store.get_merged_symbol(cached) != Some(target))
+            || store
+                .symbol_node_links(qualified)
+                .and_then(|links| links.resolved_symbol)
+                .is_some_and(|cached| store.get_merged_symbol(cached) != Some(target))
+            || store
+                .symbol_node_links(root)
+                .and_then(|links| links.resolved_symbol)
+                .is_some_and(|cached| store.get_merged_symbol(cached) != Some(import_alias))
+            || store
+                .symbol_node_links(imported_name)
+                .and_then(|links| links.resolved_symbol)
+                .is_some_and(|cached| store.get_merged_symbol(cached) != Some(target))
+        {
+            return None;
+        }
+
+        let cached_annotation = match store.type_node_links(annotation) {
+            None => None,
+            Some(links) if links.outer_type_parameters.is_some() => return None,
+            Some(links) => {
+                if links
+                    .resolved_type
+                    .is_some_and(|cached| store.type_payload(cached).is_none())
+                {
+                    return None;
+                }
+                links.resolved_type
+            }
+        };
+        if store.type_alias_links(alias).is_some_and(|links| {
+            links.declared_type.is_some_and(|cached| {
+                Some(cached) != cached_annotation
+                    || store.type_payload(cached).is_none()
+                    || links.type_parameters.as_deref().is_none_or(|parameters| {
+                        parameters.len() != 1 || Some(parameters[0]) != parameter_type
+                    })
+            }) || links.instantiations.as_ref().is_some_and(|instances| {
+                instances
+                    .values()
+                    .any(|cached| store.type_payload(*cached).is_none())
+            })
+        }) {
+            return None;
+        }
+
+        Some(())
+    };
+
+    authenticated().is_some()
+}
+
 fn plan_type_alias_member(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -5796,6 +6099,15 @@ fn plan_type_alias_member(
                     }
                 }
                 references_are_bound
+                    || authenticated_deferred_react_prop_types_alias(
+                        arena,
+                        bound,
+                        store,
+                        owner,
+                        symbol,
+                        declaration,
+                        annotation,
+                    )
             }
             Err(SourceCheckError::Unsupported(_)) => false,
             Err(error) => return Err(error),
@@ -13401,6 +13713,9 @@ mod tests {
         declaration_fixture(
             concat!(
                 "declare module 'prop-types' { ",
+                "export interface Validator<T> {} ",
+                "export interface Requireable<T> {} ",
+                "export type ValidationMap<T> = T; ",
                 "export const any: string; ",
                 "export const array: string; ",
                 "export const bool: string; ",
@@ -13439,7 +13754,11 @@ mod tests {
                 "objectOf: typeof PropTypes.objectOf; ",
                 "shape: typeof PropTypes.shape; ",
                 "exact: typeof PropTypes.exact; ",
-                "} } }",
+                "} ",
+                "type Validator<T> = PropTypes.Validator<T>; ",
+                "type Requireable<T> = PropTypes.Requireable<T>; ",
+                "type ValidationMap<T> = PropTypes.ValidationMap<T>; ",
+                "} }",
             ),
             CanonicalModuleState::Script,
         )
@@ -16690,6 +17009,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep imported values, forwarding aliases, and warm state together.
     fn ambient_react_prop_type_value_map_remains_authenticated_and_lazy() {
         let mut fixture = react_prop_types_fixture();
         let namespace = plan(&fixture, 1);
@@ -16710,21 +17030,40 @@ mod tests {
                 _ => None,
             })
             .expect("the ambient module must retain its React namespace");
-        let [
-            SourceNamespaceMemberPlan::Interface {
-                declaration,
-                symbol,
-                annotations,
-                generic,
-            },
-        ] = react.members.as_slice()
-        else {
-            panic!("React must retain its complete imported prop-type interface")
-        };
-        let declaration = *declaration;
-        let symbol = *symbol;
-        assert!(annotations.is_empty());
-        assert!(generic.is_none());
+        let (declaration, symbol) = react
+            .members
+            .iter()
+            .find_map(|member| match member {
+                SourceNamespaceMemberPlan::Interface {
+                    declaration,
+                    symbol,
+                    annotations,
+                    generic,
+                } => {
+                    assert!(annotations.is_empty());
+                    assert!(generic.is_none());
+                    Some((*declaration, *symbol))
+                }
+                _ => None,
+            })
+            .expect("React must retain its complete imported prop-type interface");
+        let aliases = react
+            .members
+            .iter()
+            .filter_map(|member| match member {
+                SourceNamespaceMemberPlan::TypeAlias {
+                    symbol,
+                    annotation,
+                    deferred,
+                    ..
+                } => {
+                    assert!(*deferred);
+                    Some((*symbol, *annotation))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 3);
 
         let NodeData::InterfaceDeclaration(interface) =
             &fixture.parsed.arena.get(declaration.node).unwrap().data
@@ -16799,6 +17138,14 @@ mod tests {
                 .type_node_links(*annotation)
                 .is_none()
         }));
+        assert!(aliases.iter().all(|(alias, annotation)| {
+            fixture.context.store().type_alias_links(*alias).is_none()
+                && fixture
+                    .context
+                    .store()
+                    .type_node_links(*annotation)
+                    .is_none()
+        }));
         assert!(
             fixture
                 .context
@@ -16838,18 +17185,18 @@ mod tests {
                 })
                 .unwrap();
             let react_symbol = react.symbol;
-            let [
-                SourceNamespaceMemberPlan::Interface {
-                    declaration,
-                    symbol,
-                    ..
-                },
-            ] = react.members.as_slice()
-            else {
-                panic!("React must retain its complete imported prop-type interface")
-            };
-            let interface_declaration = *declaration;
-            let interface_symbol = *symbol;
+            let (interface_declaration, interface_symbol) = react
+                .members
+                .iter()
+                .find_map(|member| match member {
+                    SourceNamespaceMemberPlan::Interface {
+                        declaration,
+                        symbol,
+                        ..
+                    } => Some((*declaration, *symbol)),
+                    _ => None,
+                })
+                .expect("React must retain its complete imported prop-type interface");
             let import = namespace
                 .imports
                 .iter()
