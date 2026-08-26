@@ -85032,17 +85032,20 @@ class Foo2 {
     }
 
     #[test]
-    fn computed_binding_any_indices_reject_changed_source_annotations() {
-        for (index, (annotation, change_key, change_annotation_cache)) in [
-            ("number", false, false),
-            ("number", true, false),
-            ("Value", false, true),
+    fn computed_binding_index_results_reject_changed_source_annotations() {
+        for (index, (key_annotation, annotation, change_key, change_annotation_cache)) in [
+            ("any", "number", false, false),
+            ("any", "number", true, false),
+            ("any", "Value", false, true),
+            ("never", "number", false, false),
+            ("never", "number", true, false),
+            ("never", "Value", false, true),
         ]
         .into_iter()
         .enumerate()
         {
             let source = parsed(&format!(
-                "type Value = number; declare const key: any; \
+                "type Value = number; declare const key: {key_annotation}; \
                  declare const input: {{ [name: string]: {annotation} }}; \
                  const {{ [key]: first, [key]: second }} = input;",
             ));
@@ -85050,6 +85053,7 @@ class Foo2 {
             let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
             context.check_source_file(file).unwrap();
             let receiver = variable_value_type(&context, &source, file, "input");
+            let index_type = variable_value_type(&context, &source, file, "key");
             let binding = source
                 .arena
                 .iter()
@@ -85078,13 +85082,9 @@ class Foo2 {
                     context.store().index_info(*index).unwrap().declaration(),
                 )
             };
-            let (any, string, number) = {
+            let (string, number) = {
                 let bootstrap = context.store().intrinsic_bootstrap().unwrap();
-                (
-                    bootstrap.any_type,
-                    bootstrap.string_type,
-                    bootstrap.number_type,
-                )
+                (bootstrap.string_type, bootstrap.number_type)
             };
             let replacement = context
                 .store_mut_for_test()
@@ -85133,7 +85133,7 @@ class Foo2 {
                     CanonicalCheckerOptions::default(),
                     binding,
                     receiver,
-                    any,
+                    index_type,
                 )
                 .is_err()
             );

@@ -847,15 +847,6 @@ fn check_computed_binding_element_worker(
     }
 
     if let Some(signatures) = resolved_index_signature_surface(store, receiver_type)? {
-        if matches!(index.shape, IndexShape::Any) {
-            validate_computed_binding_index_annotations(
-                store,
-                host,
-                global_types,
-                options,
-                receiver_type,
-            )?;
-        }
         let value = match index.shape {
             IndexShape::String => signatures.string,
             IndexShape::Number | IndexShape::Any => signatures.number.or(signatures.string),
@@ -864,6 +855,13 @@ fn check_computed_binding_element_worker(
             IndexShape::Literal { .. } => unreachable!("literal keys use property lookup"),
         };
         if let Some(value) = value {
+            validate_computed_binding_index_annotations(
+                store,
+                host,
+                global_types,
+                options,
+                receiver_type,
+            )?;
             return Ok(CheckedSourceElement {
                 type_: unchecked_index_read_type(store, global_types, options, binding, value)?,
                 diagnostic: None,
