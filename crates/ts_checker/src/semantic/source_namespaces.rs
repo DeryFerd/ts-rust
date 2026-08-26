@@ -19968,16 +19968,25 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold, warm, and producer-first array queries together.
     fn ambient_imported_variable_queries_preserve_parenthesized_and_array_types() {
-        for (type_syntax, producer_first) in [
-            ("(string)", true),
-            ("((string))", true),
-            ("string[]", true),
-            ("(string[])", true),
-            ("Array<string>", false),
-            ("Array<string>", true),
-            ("ReadonlyArray<string>", false),
-            ("ReadonlyArray<string>", true),
+        for (type_syntax, producer_first, invalid_arity) in [
+            ("(string)", true, false),
+            ("((string))", true, false),
+            ("string[]", true, false),
+            ("(string[])", true, false),
+            ("Array<string>", false, false),
+            ("Array<string>", true, false),
+            ("ReadonlyArray<string>", false, false),
+            ("ReadonlyArray<string>", true, false),
+            ("Array", false, true),
+            ("Array", true, true),
+            ("Array<string, number>", false, true),
+            ("Array<string, number>", true, true),
+            ("ReadonlyArray", false, true),
+            ("ReadonlyArray", true, true),
+            ("ReadonlyArray<string, number>", false, true),
+            ("ReadonlyArray<string, number>", true, true),
         ] {
             let source = format!(
                 "declare module 'models' {{ export const value: {type_syntax}; }} \
@@ -19998,7 +20007,21 @@ mod tests {
                 panic!("the producer must retain one annotated variable")
             };
             if producer_first {
-                assert!(execute(&mut fixture, &producer).unwrap().is_empty());
+                let diagnostics = execute(&mut fixture, &producer)
+                    .unwrap_or_else(|error| panic!("{type_syntax}: {error:?}"));
+                assert_eq!(
+                    diagnostics
+                        .as_slice()
+                        .iter()
+                        .map(|diagnostic| diagnostic.diagnostic.code())
+                        .collect::<Vec<_>>(),
+                    if invalid_arity {
+                        vec![2_314]
+                    } else {
+                        Vec::new()
+                    },
+                    "{type_syntax}",
+                );
             }
             if fixture.context.store().source_node_kind(*annotation)
                 == Some(SyntaxKind::ParenthesizedType)
@@ -20023,7 +20046,21 @@ mod tests {
                     ))
                 })
                 .unwrap();
-            assert!(execute(&mut fixture, &consumer).unwrap().is_empty());
+            let diagnostics = execute(&mut fixture, &consumer)
+                .unwrap_or_else(|error| panic!("{type_syntax}: {error:?}"));
+            assert_eq!(
+                diagnostics
+                    .as_slice()
+                    .iter()
+                    .map(|diagnostic| diagnostic.diagnostic.code())
+                    .collect::<Vec<_>>(),
+                if invalid_arity && !producer_first {
+                    vec![2_314]
+                } else {
+                    Vec::new()
+                },
+                "{type_syntax}",
+            );
             if !producer_first {
                 assert!(
                     fixture
@@ -20040,6 +20077,18 @@ mod tests {
                 .value_symbol_links(*symbol)
                 .and_then(|links| links.resolved_type)
                 .unwrap();
+            if invalid_arity {
+                assert_eq!(
+                    expected,
+                    fixture
+                        .context
+                        .store()
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .error_type,
+                    "{type_syntax}",
+                );
+            }
             assert_eq!(
                 fixture
                     .context
@@ -20078,6 +20127,10 @@ mod tests {
             "(string[])",
             "Array<string>",
             "ReadonlyArray<string>",
+            "Array",
+            "Array<string, number>",
+            "ReadonlyArray",
+            "ReadonlyArray<string, number>",
         ] {
             let source = format!(
                 "declare module 'models' {{ \

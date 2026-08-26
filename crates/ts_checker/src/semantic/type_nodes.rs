@@ -10062,8 +10062,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         {
             let target = self.resolve_uncached_type_reference_symbol(identity_node)?;
             if let Some(array) = self.authoritative_global_array_target(target, identity_node)? {
-                validate_generic_global_type_instantiation(self.store, array, cached)
-                    .map_err(|_| invalid())?;
+                let reference = self
+                    .plan
+                    .references
+                    .get(&identity_node)
+                    .ok_or_else(&invalid)?;
+                if reference.arity == PlannedTypeReferenceArity::Valid {
+                    validate_generic_global_type_instantiation(self.store, array, cached)
+                        .map_err(|_| invalid())?;
+                } else if self
+                    .store
+                    .intrinsic_bootstrap()
+                    .is_none_or(|bootstrap| cached != bootstrap.error_type)
+                {
+                    return Err(invalid());
+                }
             } else if self.store.symbol(target).is_some_and(|target| {
                 target
                     .flags()
