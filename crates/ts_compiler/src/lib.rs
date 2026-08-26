@@ -2005,7 +2005,7 @@ impl Program {
             self.options.no_lib = true;
         }
         let resolution_options = self.options.module_resolution_options();
-        if !self.options.no_check {
+        if !self.options.no_check && !self.root_file_names.is_empty() {
             self.load_default_libraries();
             self.load_automatic_type_directives(file_system, &resolution_options);
         }

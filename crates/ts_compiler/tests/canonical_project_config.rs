@@ -522,12 +522,76 @@ fn canonical_config_inherited_empty_files_preserves_presence() {
         assert_eq!(queried, Some(false));
         assert!(program.diagnostics().is_empty());
         assert!(program.source_file("/project/main.ts").is_none());
-        assert!(
-            program
-                .source_files()
-                .iter()
-                .all(|source| source.is_default_library)
-        );
+        assert!(program.source_files().is_empty());
+    }
+}
+
+#[test]
+fn canonical_config_empty_inherited_project_skips_libraries_and_type_directives() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/base.json",
+            r#"{"files":[],"compilerOptions":{"types":["missing"]}}"#,
+        )
+        .unwrap();
+    filesystem
+        .write_file("/project/tsconfig.json", r#"{"extends":"./base.json"}"#)
+        .unwrap();
+
+    let (program, queried) = Program::try_from_config_with_canonical_checker_and_queries(
+        &filesystem,
+        "/project/tsconfig.json",
+        |program, queries| {
+            assert!(program.source_files().is_empty());
+            queries.has_diagnostics()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(queried, Some(false));
+    let legacy = Program::from_config(&filesystem, "/project/tsconfig.json");
+    for program in [&program, &legacy] {
+        assert!(program.source_files().is_empty());
+        assert!(program.diagnostics().is_empty());
+        assert_eq!(program.options().types, Some(vec!["missing".to_owned()]));
+    }
+}
+
+#[test]
+fn canonical_config_missing_requested_root_still_loads_libraries_and_types() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files":["missing.ts"],
+                "compilerOptions":{"lib":["es5"],"types":["missing"],"noEmit":true}
+            }"#,
+        )
+        .unwrap();
+
+    let (program, queried) = Program::try_from_config_with_canonical_checker_and_queries(
+        &filesystem,
+        "/project/tsconfig.json",
+        |_, queries| queries.has_diagnostics(),
+    )
+    .unwrap();
+
+    assert_eq!(queried, Some(true));
+    let legacy = Program::from_config(&filesystem, "/project/tsconfig.json");
+    for program in [&program, &legacy] {
+        assert!(program.source_file("/project/missing.ts").is_none());
+        assert!(program.source_files().iter().any(|source| {
+            source.is_default_library && source.file_name.ends_with("/lib.es5.d.ts")
+        }));
+        let mut codes = program
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.code.unwrap())
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        assert_eq!(codes, [2688, 6053]);
     }
 }
 
