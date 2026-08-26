@@ -649,6 +649,25 @@ struct PlannedTypeParameter {
     default_type: Option<NodeRef>,
 }
 
+/// Saved only when source execution publishes a generic union alias cache entry.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct UnionAliasInstantiationProof {
+    symbol: SemanticSymbolId,
+    key: CacheHashKey,
+    declared_type: TypeId,
+    instantiation: TypeId,
+}
+
+impl UnionAliasInstantiationProof {
+    pub(super) const fn cache_key(&self) -> (SemanticSymbolId, CacheHashKey) {
+        (self.symbol, self.key)
+    }
+
+    pub(super) const fn types(&self) -> [TypeId; 2] {
+        [self.declared_type, self.instantiation]
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PlannedTypeReference {
     symbol: SemanticSymbolId,
@@ -1613,6 +1632,35 @@ fn cached_type_alias(
             ));
         }
     };
+    if matches!(
+        store.type_payload(declared_type).map(TypeRecord::data),
+        Some(TypeData::Union(_))
+    ) && let (Some(parameters), Some(instantiations)) = (
+        links.type_parameters.as_deref(),
+        links.instantiations.as_ref(),
+    ) {
+        let identity = type_list_key(parameters);
+        if instantiations.len() != store.union_alias_instantiation_count(symbol) + 1 {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+            ));
+        }
+        for (key, instantiation) in instantiations {
+            if *key == identity {
+                continue;
+            }
+            if store
+                .union_alias_instantiation(symbol, *key)
+                .is_none_or(|proof| {
+                    proof.declared_type != declared_type || proof.instantiation != *instantiation
+                })
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+                ));
+            }
+        }
+    }
     Ok(Some(CachedTypeAlias {
         declared_type,
         type_parameter_count,
@@ -25480,6 +25528,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
             ));
         }
+        let union_alias = matches!(
+            self.store.type_payload(declared_type).map(TypeRecord::data),
+            Some(TypeData::Union(_))
+        );
+        if union_alias && !self.store.try_reserve_union_alias_instantiations(symbol, 1) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::LiteralTypeCapacity,
+            ));
+        }
 
         let alias_identity = if let Some(owner) = reference.alias_owner {
             let owner_plan = plan.aliases.get(&owner).ok_or_else(|| {
@@ -25981,6 +26038,20 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         })?;
         if let Some(previous) = instantiations.insert(key, instantiation)
             && previous != instantiation
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+            ));
+        }
+        if union_alias
+            && !self
+                .store
+                .record_union_alias_instantiation(UnionAliasInstantiationProof {
+                    symbol,
+                    key,
+                    declared_type,
+                    instantiation,
+                })
         {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
@@ -30236,6 +30307,89 @@ mod tests {
         assert_eq!(
             query_node(&mut fixture, later, &mut diagnostics),
             Ok(later_type)
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn composite_union_alias_argument_cache_checks_do_not_publish_node_links() {
+        let mut fixture = fixture(concat!(
+            "type Choice<Left, Right> = Left | Right; ",
+            "let seed: Choice<string, boolean>; let later: Choice<string | number, boolean>;",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Choice");
+        let seed = variable_type_node(&fixture, "seed");
+        let later = variable_type_node(&fixture, "later");
+        let NodeData::TypeReferenceNode(reference) =
+            &fixture.parsed.arena.get(later.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let argument = NodeRef::new(
+            later.arena,
+            later.file,
+            reference.type_arguments.as_ref().unwrap().nodes[0],
+        );
+        let (string, string_or_number, boolean) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.string_or_number_type,
+                bootstrap.boolean_type,
+            )
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let seed_type = query_node(&mut fixture, seed, &mut diagnostics).unwrap();
+        let original = fixture.store.type_alias_links(alias).unwrap().clone();
+        let argument_links = fixture.store.type_node_links(argument).cloned();
+        assert!(argument_links.is_none());
+        let before = union_state(&fixture.store);
+        for replace_existing in [false, true] {
+            let mut forged = original.clone();
+            let entries = forged.instantiations.as_mut().unwrap();
+            if replace_existing {
+                assert_eq!(
+                    entries.remove(&type_alias_instantiation_cache_key(
+                        &[string, boolean],
+                        None
+                    )),
+                    Some(seed_type)
+                );
+            }
+            entries.insert(
+                type_alias_instantiation_cache_key(&[string_or_number, boolean], None),
+                seed_type,
+            );
+            assert!(fixture.store.set_type_alias_links(alias, forged.clone()));
+            for _ in 0..2 {
+                assert!(query_node(&mut fixture, later, &mut diagnostics).is_err());
+                assert_eq!(
+                    fixture.store.type_node_links(argument).cloned(),
+                    argument_links
+                );
+                assert_eq!(fixture.store.type_alias_links(alias), Some(&forged));
+                assert_eq!(union_state(&fixture.store), before);
+            }
+        }
+        assert!(fixture.store.set_type_alias_links(alias, original));
+        let result = query_node(&mut fixture, later, &mut diagnostics).unwrap();
+        assert_ne!(result, seed_type);
+        let argument_links = fixture.store.type_node_links(argument).cloned();
+        assert_eq!(
+            argument_links
+                .as_ref()
+                .and_then(|links| links.resolved_type),
+            Some(string_or_number)
+        );
+        let before = union_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, later, &mut diagnostics),
+            Ok(result)
+        );
+        assert_eq!(
+            fixture.store.type_node_links(argument).cloned(),
+            argument_links
         );
         assert_eq!(union_state(&fixture.store), before);
         assert!(diagnostics.is_empty());

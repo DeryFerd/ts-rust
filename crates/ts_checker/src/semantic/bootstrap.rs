@@ -363,13 +363,13 @@ struct UnionAliasSourceOwner {
 
 /// Created only by canonical union construction and kept outside mutable caches.
 #[derive(Debug, Eq, PartialEq)]
-pub(super) struct CanonicalUnionAliasCreationProof {
+pub(super) struct CanonicalUnionCreationProof {
     union: TypeId,
     key: UnionTypeCacheKey,
     owners: Vec<UnionAliasSourceOwner>,
 }
 
-impl CanonicalUnionAliasCreationProof {
+impl CanonicalUnionCreationProof {
     pub(super) const fn type_id(&self) -> TypeId {
         self.union
     }
@@ -855,7 +855,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .ok_or(LiteralTypeCacheError::Capacity)?;
         if !self.try_reserve_types(additional_types)
             || !self.try_reserve_type_aliases(type_aliases)
-            || !self.try_reserve_canonical_union_alias_creations(named_union_operations)
+            || !self.try_reserve_canonical_union_creations(union_operations)
         {
             return Err(LiteralTypeCacheError::Capacity);
         }
@@ -1322,15 +1322,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .collect()
     }
 
-    fn validate_union_alias_creation(
+    fn validate_union_creation(
         &self,
         union: TypeId,
         record: &TypeRecord,
         data: &super::type_records::UnionTypeData,
     ) -> Result<(), LiteralTypeCacheError> {
         let alias = self.checked_union_alias(union, record.alias())?;
-        let Some(proof) = self.canonical_union_alias_creation(union) else {
-            return if alias.is_none() {
+        let Some(proof) = self.canonical_union_creation(union) else {
+            return if alias.is_none() && data.origin.is_none() {
                 Ok(())
             } else {
                 Err(LiteralTypeCacheError::InvalidCachedUnion(union))
@@ -1538,7 +1538,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
-        self.validate_union_alias_creation(union, record, data)?;
+        self.validate_union_creation(union, record, data)?;
         if let Some(origin) = data.origin {
             self.validate_union_origin_structure(union, origin)?;
         }
@@ -4692,10 +4692,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Ok(cached);
         }
 
+        let needs_creation_proof = alias.is_some() || origin.is_some();
         let owners = alias
             .as_ref()
             .map(|alias| self.union_alias_source_owners(alias))
-            .transpose()?;
+            .transpose()?
+            .unwrap_or_default();
         let cache_was_dirty = self.union_cache_needs_validation;
         let origin = match origin {
             Some(UnionOriginPlan::DenormalizedUnion(types)) => Some(
@@ -4735,9 +4737,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             assert!(self.set_type_alias(union, Some(identity)));
         }
-        if let Some(owners) = owners {
+        if needs_creation_proof {
             assert!(
-                self.record_canonical_union_alias_creation(CanonicalUnionAliasCreationProof {
+                self.record_canonical_union_creation(CanonicalUnionCreationProof {
                     union,
                     key: key.clone(),
                     owners
@@ -7351,6 +7353,153 @@ mod tests {
                 Ok(union),
             );
         }
+    }
+
+    #[test]
+    fn anonymous_union_origin_creation_rejects_origin_and_cache_key_forgery() {
+        let parsed = parse_source_file(concat!(
+            "type Named<T> = T | string; ",
+            "interface Holder<T> { value: Named<T> | boolean }",
+        ));
+        let file = FileId::new(157);
+        let mut context = checker_context(file, &parsed);
+        let property_type = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::PropertyDeclaration(property) = &record.data else {
+                    return None;
+                };
+                property
+                    .type_
+                    .map(|type_| NodeRef::new(parsed.arena.id(), file, type_))
+            })
+            .unwrap();
+        let union = context.get_type_from_type_node(property_type).unwrap();
+        let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        let store = context.store_mut_for_test();
+        let record = store.type_payload(union).unwrap();
+        let TypeData::Union(data) = record.data() else {
+            panic!("the property must retain its union")
+        };
+        assert!(record.alias().is_none());
+        let origin = data
+            .origin
+            .expect("the named constituent must retain its origin");
+        let parameter = data
+            .union
+            .types
+            .iter()
+            .copied()
+            .find(|type_| {
+                matches!(
+                    store.type_payload(*type_).map(TypeRecord::data),
+                    Some(TypeData::TypeParameter(_))
+                )
+            })
+            .unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, parameter).unwrap();
+        assert_eq!(
+            crate::semantic::instantiate::instantiated_member_type_matches(
+                store,
+                union,
+                union,
+                mapper,
+                Some(targets)
+            ),
+            Ok(true)
+        );
+        let original_key = store
+            .intrinsic_bootstrap
+            .as_ref()
+            .unwrap()
+            .union_types
+            .iter()
+            .find_map(|(key, type_)| (*type_ == union).then(|| key.clone()))
+            .unwrap();
+        assert!(original_key.alias.is_none());
+        assert!(original_key.origin.is_some());
+        let mut forged_key = original_key.clone();
+        forged_key.origin = None;
+        assert!(store.set_union_caches(
+            union,
+            None,
+            None,
+            None,
+            EscapedName::default(),
+            ConstituentMapState::Unallocated
+        ));
+        let cache = &mut store.intrinsic_bootstrap.as_mut().unwrap().union_types;
+        cache.remove(&original_key);
+        cache.insert(forged_key.clone(), union);
+        store.mark_union_cache_validation_dirty();
+        let before = (
+            store.type_len(),
+            store.type_alias_len(),
+            store.mapper_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            store.validate_cached_union_result_with_array_targets(targets, union, None),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(union))
+        );
+        assert!(
+            crate::semantic::instantiate::instantiated_member_type_matches(
+                store,
+                union,
+                union,
+                mapper,
+                Some(targets)
+            )
+            .is_err()
+        );
+        let mut session = crate::semantic::instantiate::InstantiationSession::new(
+            crate::semantic::instantiate::InstantiationLimits::default(),
+        );
+        assert!(
+            crate::semantic::instantiate::instantiate_type_with_session(
+                store,
+                union,
+                mapper,
+                Some(targets),
+                &mut session
+            )
+            .is_err()
+        );
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 0);
+        assert_eq!(
+            (
+                store.type_len(),
+                store.type_alias_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert!(context.get_type_from_type_node(property_type).is_err());
+        let store = context.store_mut_for_test();
+        assert_eq!(
+            (
+                store.type_len(),
+                store.type_alias_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert!(store.set_union_caches(
+            union,
+            None,
+            None,
+            Some(origin),
+            EscapedName::default(),
+            ConstituentMapState::Unallocated
+        ));
+        let cache = &mut store.intrinsic_bootstrap.as_mut().unwrap().union_types;
+        cache.remove(&forged_key);
+        cache.insert(original_key, union);
+        assert_eq!(context.get_type_from_type_node(property_type), Ok(union));
     }
 
     #[test]

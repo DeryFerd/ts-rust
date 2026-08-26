@@ -19,7 +19,7 @@ use ts_parser::{IsolatedEntityName, parse_isolated_entity_name};
 
 use super::{
     array_types::CanonicalArrayTargets,
-    bootstrap::{CanonicalUnionAliasCreationProof, IntrinsicBootstrap},
+    bootstrap::{CanonicalUnionCreationProof, IntrinsicBootstrap},
     conditional_types::{
         ConditionalQueryKey, ConditionalQueryProduction, ConditionalTypeProduction,
     },
@@ -50,6 +50,7 @@ use super::{
     source_callables::{
         SourceCallableTypeParameterSyntaxProof, source_type_parameter_default_is_assignable,
     },
+    type_nodes::UnionAliasInstantiationProof,
     type_records::{
         CacheHashKey, ConditionalRoot, ConstrainedTypeData, LiteralValue, TypeAlias,
         TypeCacheState, TypeData, TypeRecord, type_list_key,
@@ -541,7 +542,9 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     next_relation_observation_token: u64,
     pub(super) derived_types: DerivedTypeCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
-    canonical_union_alias_creations: HashMap<TypeId, CanonicalUnionAliasCreationProof>,
+    canonical_union_creations: HashMap<TypeId, CanonicalUnionCreationProof>,
+    union_alias_instantiations:
+        HashMap<SemanticSymbolId, HashMap<CacheHashKey, UnionAliasInstantiationProof>>,
     claimed_strict_builtin_iterator_return: Option<bool>,
     claimed_strict_function_types: Option<bool>,
     pub(super) union_cache_needs_validation: bool,
@@ -637,7 +640,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             next_relation_observation_token: 0,
             derived_types: DerivedTypeCaches::default(),
             intrinsic_bootstrap: None,
-            canonical_union_alias_creations: HashMap::new(),
+            canonical_union_creations: HashMap::new(),
+            union_alias_instantiations: HashMap::new(),
             claimed_strict_builtin_iterator_return: None,
             claimed_strict_function_types: None,
             union_cache_needs_validation: false,
@@ -2594,27 +2598,81 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
     }
 
-    pub(super) fn try_reserve_canonical_union_alias_creations(&mut self, count: usize) -> bool {
-        self.canonical_union_alias_creations
-            .try_reserve(count)
-            .is_ok()
+    pub(super) fn try_reserve_canonical_union_creations(&mut self, count: usize) -> bool {
+        self.canonical_union_creations.try_reserve(count).is_ok()
     }
 
-    pub(super) fn canonical_union_alias_creation(
+    pub(super) fn canonical_union_creation(
         &self,
         type_: TypeId,
-    ) -> Option<&CanonicalUnionAliasCreationProof> {
-        self.canonical_union_alias_creations.get(&type_)
+    ) -> Option<&CanonicalUnionCreationProof> {
+        self.canonical_union_creations.get(&type_)
     }
 
-    pub(super) fn record_canonical_union_alias_creation(
+    pub(super) fn record_canonical_union_creation(
         &mut self,
-        proof: CanonicalUnionAliasCreationProof,
+        proof: CanonicalUnionCreationProof,
     ) -> bool {
         if self.type_payload(proof.type_id()).is_none() {
             return false;
         }
-        match self.canonical_union_alias_creations.entry(proof.type_id()) {
+        match self.canonical_union_creations.entry(proof.type_id()) {
+            std::collections::hash_map::Entry::Occupied(existing) => existing.get() == &proof,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(proof);
+                true
+            }
+        }
+    }
+
+    pub(super) fn try_reserve_union_alias_instantiations(
+        &mut self,
+        symbol: SemanticSymbolId,
+        count: usize,
+    ) -> bool {
+        if self.union_alias_instantiations.try_reserve(1).is_err() {
+            return false;
+        }
+        self.union_alias_instantiations
+            .entry(symbol)
+            .or_default()
+            .try_reserve(count)
+            .is_ok()
+    }
+
+    pub(super) fn union_alias_instantiation(
+        &self,
+        symbol: SemanticSymbolId,
+        key: CacheHashKey,
+    ) -> Option<&UnionAliasInstantiationProof> {
+        self.union_alias_instantiations
+            .get(&symbol)
+            .and_then(|entries| entries.get(&key))
+    }
+
+    pub(super) fn union_alias_instantiation_count(&self, symbol: SemanticSymbolId) -> usize {
+        self.union_alias_instantiations
+            .get(&symbol)
+            .map_or(0, HashMap::len)
+    }
+
+    pub(super) fn record_union_alias_instantiation(
+        &mut self,
+        proof: UnionAliasInstantiationProof,
+    ) -> bool {
+        if self.symbol(proof.cache_key().0).is_none()
+            || proof
+                .types()
+                .iter()
+                .any(|type_| self.type_payload(*type_).is_none())
+        {
+            return false;
+        }
+        let (symbol, key) = proof.cache_key();
+        let Some(entries) = self.union_alias_instantiations.get_mut(&symbol) else {
+            return false;
+        };
+        match entries.entry(key) {
             std::collections::hash_map::Entry::Occupied(existing) => existing.get() == &proof,
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(proof);

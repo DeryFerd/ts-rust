@@ -2013,7 +2013,7 @@ fn instantiable_union_source_types(
     };
     if record.alias().is_some()
         || union.origin.is_some()
-        || store.canonical_union_alias_creation(source).is_some()
+        || store.canonical_union_creation(source).is_some()
     {
         let validation = match array_targets {
             Some(targets) => {
