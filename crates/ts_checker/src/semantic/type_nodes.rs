@@ -30613,6 +30613,45 @@ mod tests {
     }
 
     #[test]
+    fn partial_class_member_publication_rejects_union_creation_before_writes() {
+        let mut fixture = fixture("class C {}");
+        let class = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "C");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let class_type = query_declared(
+            &mut fixture,
+            class,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.store.validate_union_constituent(class_type),
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                class_type
+            )),
+        );
+        assert!(
+            fixture
+                .store
+                .set_interface_declared_members(class_type, true, None, None, None, None,)
+        );
+        let before = union_state(&fixture.store);
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            fixture.store.validate_union_constituent(class_type),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(class_type)),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .literal_union_type(&[class_type, number], None),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(class_type)),
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn recursive_union_aliases_cache_error_and_issue_cycle_diagnostics_once() {
         let mut fixture = fixture("type Recursive = Recursive | string;");
         let recursive = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Recursive");

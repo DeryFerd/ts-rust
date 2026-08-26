@@ -41,7 +41,7 @@ use super::{
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::CallableFamily,
     classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
-    declared::cached_ordinary_type_parameter_owner,
+    declared::{cached_class_type, cached_ordinary_type_parameter_owner},
     derived_types::DerivedObjectLiteralValidation,
     functions::{self, PendingFunctionTypeProof},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
@@ -55,8 +55,8 @@ use super::{
     structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
     tuple_types::PreparedCanonicalTupleType,
     type_records::{
-        ConstituentMapState, ConstrainedTypeData, LiteralValue, ObjectTypeData, RegularLiteralLink,
-        TypeCacheState, TypeData, TypeRecord,
+        ConstituentMapState, ConstrainedTypeData, InterfaceTypeData, LiteralValue, ObjectTypeData,
+        RegularLiteralLink, StructuredTypeData, TypeCacheState, TypeData, TypeRecord,
     },
     types::{ObjectFlags, TypeFlags},
 };
@@ -3100,7 +3100,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         );
                     }
                     ClassHeritageMembersValidation::Malformed => {
-                        return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                        return Err(
+                            if self.is_cold_class_union_constituent(type_, record, interface) {
+                                LiteralTypeCacheError::UnsupportedUnionConstituent(type_)
+                            } else {
+                                LiteralTypeCacheError::InvalidCachedUnion(type_)
+                            },
+                        );
                     }
                     ClassHeritageMembersValidation::NotClass => {}
                 }
@@ -3253,6 +3259,47 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             _ => Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_)),
         }
+    }
+
+    fn is_cold_class_union_constituent(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        interface: &InterfaceTypeData,
+    ) -> bool {
+        let Some(symbol) = record.symbol() else {
+            return false;
+        };
+        // A declared instance can exist before either side has class members.
+        // Published members must still pass the complete class graph check.
+        record.object_flags() == (ObjectFlags::CLASS | ObjectFlags::REFERENCE)
+            && cached_class_type(self, symbol) == Ok(Some(type_))
+            && self.symbol(symbol).is_some_and(|owner| {
+                owner.flags().contains(SymbolFlags::CLASS)
+                    && owner.check_flags() == CheckFlags::NONE
+                    && owner.value_declaration().is_some_and(|declaration| {
+                        matches!(
+                            self.source_node_kind(declaration),
+                            Some(SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression)
+                        ) && owner
+                            .declarations()
+                            .is_some_and(|declarations| declarations.contains(&declaration))
+                    })
+            })
+            && self.get_merged_symbol(symbol) == Some(symbol)
+            && self.direct_class_heritage_provenance(type_).is_none()
+            && !interface.base_types_resolved
+            && interface.resolved_base_constructor_type.is_none()
+            && interface.resolved_base_types.is_none()
+            && !interface.declared_members_resolved
+            && interface.declared_members.is_none()
+            && interface.declared_call_signatures.is_none()
+            && interface.declared_construct_signatures.is_none()
+            && interface.declared_index_infos.is_none()
+            && interface.reference.object.structured == StructuredTypeData::default()
+            && self
+                .value_symbol_links(symbol)
+                .is_none_or(|links| links == &ValueSymbolLinks::default())
     }
 
     fn validate_supported_union_origin(

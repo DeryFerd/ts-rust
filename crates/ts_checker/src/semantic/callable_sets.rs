@@ -1962,7 +1962,7 @@ mod tests {
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks,
         IntrinsicBootstrapOptions, SemanticStore, TypeRecord,
-        bootstrap::UnionReduction,
+        bootstrap::{LiteralTypeCacheError, UnionReduction},
         callables::validate_stored_single_callable,
         calls::{DirectCallApplicability, DirectCallForm, DirectCallRequest, resolve_direct_call},
         mapper::TypeMapper,
@@ -2614,7 +2614,7 @@ mod tests {
 
     #[test]
     fn forged_class_constructor_providers_are_rejected_before_union_creation() {
-        for poison in 0..2 {
+        for poison in 0..3 {
             let parsed = parse_source_file("abstract class Model { value!: string; }");
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
             let file = FileId::new(4_498 + poison);
@@ -2651,7 +2651,13 @@ mod tests {
                             .set_signature_resolved_return_type(signature, Some(wrong))
                     );
                 }
-                _ => unreachable!("only class constructor flags and return identity are poisoned"),
+                2 => {
+                    assert!(context.store_mut_for_test().set_type_object_flags(
+                        instance,
+                        ObjectFlags::CLASS | ObjectFlags::REFERENCE,
+                    ));
+                }
+                _ => unreachable!("unexpected class cache corruption"),
             }
             let state = (
                 context.store().type_len(),
@@ -2665,8 +2671,14 @@ mod tests {
                     family: CallableFamily::DeclaredCallSignatures,
                 }
             ));
-            assert!(context.store().validate_union_constituent(value).is_err());
-            assert!(context.store().validate_union_constituent(instance).is_err());
+            assert_eq!(
+                context.store().validate_union_constituent(value),
+                Err(LiteralTypeCacheError::InvalidCachedUnion(value)),
+            );
+            assert_eq!(
+                context.store().validate_union_constituent(instance),
+                Err(LiteralTypeCacheError::InvalidCachedUnion(instance)),
+            );
             assert_eq!(
                 (
                     context.store().type_len(),
