@@ -1,0 +1,25 @@
+package tsbaseline
+
+import (
+	"github.com/microsoft/typescript-go/internal/ast"
+	"github.com/microsoft/typescript-go/internal/checker"
+)
+
+type phaseOracleQueryObserver struct {
+	typ    func(*checker.Checker, *ast.Node, *ast.Node)
+	symbol func(*checker.Checker, *ast.Node)
+}
+
+var phaseOracleActiveQueryObserver *phaseOracleQueryObserver
+
+func phaseOracleObserveTypeQuery(c *checker.Checker, rendered, queried *ast.Node) {
+	if observer := phaseOracleActiveQueryObserver; observer != nil {
+		observer.typ(c, rendered, queried)
+	}
+}
+
+func phaseOracleObserveSymbolQuery(c *checker.Checker, node *ast.Node) {
+	if observer := phaseOracleActiveQueryObserver; observer != nil {
+		observer.symbol(c, node)
+	}
+}

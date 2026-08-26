@@ -1,0 +1,552 @@
+package tsbaseline
+
+import (
+	"bufio"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"hash"
+	"io"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/microsoft/typescript-go/internal/ast"
+	"github.com/microsoft/typescript-go/internal/bundled"
+	"github.com/microsoft/typescript-go/internal/checker"
+	"github.com/microsoft/typescript-go/internal/compiler"
+	"github.com/microsoft/typescript-go/internal/core"
+	"github.com/microsoft/typescript-go/internal/testutil/harnessutil"
+	"github.com/microsoft/typescript-go/internal/tsoptions"
+	"github.com/microsoft/typescript-go/internal/vfs/osvfs"
+)
+
+type phaseOracleNode struct {
+	File  string `json:"file"`
+	Kind  string `json:"kind"`
+	Start int    `json:"start_byte"`
+	End   int    `json:"end_byte"`
+}
+
+type phaseOracleEvent struct {
+	Sequence  uint64           `json:"sequence"`
+	Token     string           `json:"operation_token"`
+	Program   string           `json:"program_token"`
+	Checker   string           `json:"checker_token,omitempty"`
+	Phase     string           `json:"phase"`
+	Operation string           `json:"operation"`
+	Query     string           `json:"query_token,omitempty"`
+	Rendered  *phaseOracleNode `json:"rendered_node,omitempty"`
+	Queried   *phaseOracleNode `json:"queried_node,omitempty"`
+	File      string           `json:"file,omitempty"`
+}
+
+type phaseOracleCheckerBinding struct {
+	Token   string `json:"checker_token"`
+	Program string `json:"program_token"`
+}
+
+type phaseOracleTrace struct {
+	Path       string `json:"path"`
+	SHA256     string `json:"sha256"`
+	Bytes      int    `json:"bytes"`
+	Events     uint64 `json:"events"`
+	Queries    uint64 `json:"queries"`
+	TokenScope string `json:"token_scope"`
+}
+
+type phaseOracleRecorder struct {
+	file      *os.File
+	writer    *bufio.Writer
+	hasher    hash.Hash
+	sequence  uint64
+	queries   uint64
+	bytes     int
+	snapshots uint64
+	programs  map[*compiler.Program]string
+	checkers  map[*checker.Checker]phaseOracleCheckerBinding
+	bindings  []phaseOracleCheckerBinding
+	byProgram map[string]uint64
+}
+
+type phaseOracleDelta struct {
+	Kind    string                    `json:"kind"`
+	Added   []projectOracleDiagnostic `json:"added"`
+	Removed []projectOracleDiagnostic `json:"removed"`
+}
+
+type phaseOracleSnapshot struct {
+	Token            string                    `json:"snapshot_token"`
+	Program          string                    `json:"program_token"`
+	Checker          string                    `json:"checker_token"`
+	Phase            string                    `json:"phase"`
+	Evidence         string                    `json:"evidence"`
+	QueriesBefore    uint64                    `json:"queries_before"`
+	QueriesAfter     uint64                    `json:"queries_after"`
+	StartOperation   string                    `json:"start_operation"`
+	EndOperation     string                    `json:"end_operation"`
+	Diagnostics      []projectOracleDiagnostic `json:"diagnostics"`
+	Errors           projectOracleArtifact     `json:"errors"`
+	ErrorsFileOrder  []string                  `json:"errors_file_order"`
+	DeltaFromInitial phaseOracleDelta          `json:"delta_from_initial_source_snapshot"`
+}
+
+type phaseOracleReset struct {
+	Operation string `json:"operation_token"`
+	Program   string `json:"program_token"`
+	Checker   string `json:"checker_token"`
+	File      string `json:"file"`
+	Checked   bool   `json:"previously_type_checked"`
+	Unused    bool   `json:"previously_unused_checked"`
+}
+
+type phaseOracleWalk struct {
+	Name              string                `json:"name"`
+	Program           string                `json:"program_token"`
+	SourceSnapshot    string                `json:"initial_source_snapshot_token"`
+	HadErrorBaseline  bool                  `json:"frozen_had_error_baseline"`
+	BeforeTypes       string                `json:"before_types_snapshot"`
+	AfterTypes        string                `json:"after_types_snapshot"`
+	AfterSymbols      string                `json:"after_symbols_snapshot"`
+	Types             projectOracleArtifact `json:"types"`
+	Symbols           projectOracleArtifact `json:"symbols"`
+	Counts            projectOracleWalk     `json:"counts"`
+	FirstQueryOrdinal uint64                `json:"first_query_ordinal"`
+	LastQueryOrdinal  uint64                `json:"last_query_ordinal"`
+	observation       *projectOracleObservation
+}
+
+type phaseOracleProgramReport struct {
+	Token                  string                `json:"program_token"`
+	Role                   string                `json:"role"`
+	Checker                string                `json:"checker_token"`
+	State                  string                `json:"state"`
+	InitialSourceSnapshot  string                `json:"initial_source_snapshot_token"`
+	FrozenHadErrorBaseline bool                  `json:"frozen_had_error_baseline"`
+	EligibleProjectSources int                   `json:"eligible_project_sources"`
+	Snapshots              []phaseOracleSnapshot `json:"snapshots"`
+	SourceResets           []phaseOracleReset    `json:"source_resets"`
+	ArtifactWalks          []*phaseOracleWalk    `json:"artifact_walks"`
+	ArtifactQueries        uint64                `json:"artifact_queries"`
+	RetainedReentryEqual   *bool                 `json:"retained_reentry_diagnostics_equal"`
+	Graph                  *projectOracleGraph   `json:"graph"`
+	GraphSHA256            *string               `json:"graph_sha256"`
+}
+
+type phaseOraclePointerChecks struct {
+	State                string `json:"state"`
+	TypesEqual           bool   `json:"type_artifact_bytes_equal"`
+	SymbolsEqual         bool   `json:"symbol_artifact_bytes_equal"`
+	VisitsEqual          bool   `json:"node_visits_equal"`
+	TypeQueriesEqual     bool   `json:"type_query_pointer_identities_equal"`
+	RenderedTypesEqual   bool   `json:"rendered_type_pointer_identities_equal"`
+	SymbolsIdentical     bool   `json:"symbol_pointer_identities_equal"`
+	ChangedTypeQueries   int    `json:"changed_type_query_identities"`
+	ChangedRenderedTypes int    `json:"changed_rendered_type_identities"`
+	ChangedSymbols       int    `json:"changed_symbol_identities"`
+}
+
+type phaseOracleReport struct {
+	SchemaVersion      int                                   `json:"schema_version"`
+	Implementation     string                                `json:"implementation"`
+	UpstreamSHA        string                                `json:"upstream_sha"`
+	RunID              string                                `json:"run_id"`
+	Config             string                                `json:"config"`
+	Outcome            string                                `json:"outcome"`
+	Failure            *string                               `json:"failure"`
+	Programs           []*phaseOracleProgramReport           `json:"programs"`
+	CheckerBindings    []phaseOracleCheckerBinding           `json:"checker_bindings"`
+	Trace              *phaseOracleTrace                     `json:"trace"`
+	InitialSourceEqual *bool                                 `json:"independent_initial_source_diagnostics_equal"`
+	PointerChecks      phaseOraclePointerChecks              `json:"strict_pointer_checks"`
+	FreshDiagnostics   projectOracleDiagnosticReplayEvidence `json:"fresh_diagnostics"`
+	ParityClaimed      bool                                  `json:"parity_claimed"`
+	Provenance         json.RawMessage                       `json:"provenance"`
+	Runtime            projectOracleRuntime                  `json:"runtime"`
+}
+
+type phaseOracleProgram struct {
+	program *compiler.Program
+	fs      *projectOracleFS
+	files   []*harnessutil.TestFile
+	initial []projectOracleDiagnostic
+	checker *checker.Checker
+	report  *phaseOracleProgramReport
+}
+
+func newPhaseOracleRecorder(output string) *phaseOracleRecorder {
+	file, err := os.OpenFile(filepath.Join(output, "sequence.jsonl"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		panic(err)
+	}
+	hasher := sha256.New()
+	return &phaseOracleRecorder{
+		file: file, hasher: hasher, writer: bufio.NewWriterSize(io.MultiWriter(file, hasher), 1<<20),
+		programs: map[*compiler.Program]string{}, checkers: map[*checker.Checker]phaseOracleCheckerBinding{},
+		bindings: []phaseOracleCheckerBinding{}, byProgram: map[string]uint64{},
+	}
+}
+
+func (r *phaseOracleRecorder) event(event phaseOracleEvent) string {
+	r.sequence++
+	event.Sequence = r.sequence
+	event.Token = fmt.Sprintf("operation-%08d", r.sequence)
+	data, err := json.Marshal(event)
+	if err != nil {
+		panic(err)
+	}
+	data = append(data, '\n')
+	if _, err := r.writer.Write(data); err != nil {
+		panic(err)
+	}
+	r.bytes += len(data)
+	return event.Token
+}
+
+func (r *phaseOracleRecorder) bindProgram(program *compiler.Program, role string) string {
+	if token := r.programs[program]; token != "" {
+		return token
+	}
+	token := fmt.Sprintf("program-%d", len(r.programs)+1)
+	r.programs[program] = token
+	r.event(phaseOracleEvent{Program: token, Phase: role, Operation: "program_created"})
+	return token
+}
+
+func (r *phaseOracleRecorder) bindChecker(program string, c *checker.Checker, phase string) string {
+	if binding, ok := r.checkers[c]; ok {
+		if binding.Program != program {
+			panic("checker reused across independent Programs")
+		}
+		return binding.Token
+	}
+	binding := phaseOracleCheckerBinding{Token: fmt.Sprintf("checker-%d", len(r.checkers)+1), Program: program}
+	r.checkers[c] = binding
+	r.bindings = append(r.bindings, binding)
+	r.event(phaseOracleEvent{Program: program, Checker: binding.Token, Phase: phase, Operation: "checker_bound"})
+	return binding.Token
+}
+
+func phaseOracleDescribe(node *ast.Node) *phaseOracleNode {
+	return &phaseOracleNode{File: ast.GetSourceFileOfNode(node).FileName(), Kind: node.Kind.String(), Start: node.Pos(), End: node.End()}
+}
+
+func (r *phaseOracleRecorder) query(p *phaseOracleProgram, phase, kind string, c *checker.Checker, rendered, queried *ast.Node) {
+	checkerToken := r.bindChecker(p.report.Token, c, phase)
+	if p.checker != c {
+		panic("artifact query used a different checker")
+	}
+	r.queries++
+	r.byProgram[p.report.Token]++
+	r.event(phaseOracleEvent{
+		Program: p.report.Token, Checker: checkerToken, Phase: phase, Operation: kind,
+		Query: fmt.Sprintf("query-%08d", r.queries), Rendered: phaseOracleDescribe(rendered), Queried: phaseOracleDescribe(queried),
+	})
+}
+
+func (r *phaseOracleRecorder) close() *phaseOracleTrace {
+	if err := r.writer.Flush(); err != nil {
+		panic(err)
+	}
+	if err := r.file.Close(); err != nil {
+		panic(err)
+	}
+	return &phaseOracleTrace{Path: "sequence.jsonl", SHA256: hex.EncodeToString(r.hasher.Sum(nil)), Bytes: r.bytes, Events: r.sequence, Queries: r.queries, TokenScope: "process_local_object_bindings_and_ordered_direct_artifact_queries"}
+}
+
+func phaseOracleLoad(configPath, role string, recorder *phaseOracleRecorder) *phaseOracleProgram {
+	fs := newProjectOracleFS(bundled.WrapFS(osvfs.FS()))
+	host := compiler.NewCompilerHost(filepath.Dir(configPath), fs, bundled.LibPath(), nil, nil)
+	config, errors := tsoptions.GetParsedCommandLineOfConfigFile(configPath, nil, nil, host, nil)
+	if config == nil || len(errors) != 0 {
+		panic(fmt.Sprintf("config load failed: %v", errors))
+	}
+	program := compiler.NewProgram(compiler.ProgramOptions{Host: host, Config: config, SingleThreaded: core.TSTrue})
+	token := recorder.bindProgram(program, role)
+	report := &phaseOracleProgramReport{Token: token, Role: role, State: "loaded", Snapshots: []phaseOracleSnapshot{}, SourceResets: []phaseOracleReset{}, ArtifactWalks: []*phaseOracleWalk{}}
+	for _, file := range program.SourceFiles() {
+		if !program.SkipTypeChecking(file, false) && !program.IsSourceFileDefaultLibrary(file.Path()) {
+			report.EligibleProjectSources++
+		}
+	}
+	return &phaseOracleProgram{program: program, fs: fs, files: projectOracleArtifactFiles(program), report: report}
+}
+
+// These are retained Program snapshots. Reading them does not prove fresh production.
+func capturePhaseOracleSnapshot(t *testing.T, p *phaseOracleProgram, recorder *phaseOracleRecorder, output, phase, evidence string) phaseOracleSnapshot {
+	p.fs.setPhase(phase)
+	start := recorder.event(phaseOracleEvent{Program: p.report.Token, Checker: p.report.Checker, Phase: phase, Operation: "program_diagnostics_begin"})
+	before := recorder.queries
+	diagnostics := projectOracleCollectDiagnostics(p.program, nil)
+	if len(p.program.SourceFiles()) != 0 {
+		c, done := p.program.GetTypeCheckerForFileExclusive(context.Background(), p.program.SourceFiles()[0])
+		if p.checker != nil && p.checker != c {
+			done()
+			panic("diagnostic snapshot changed checker identity")
+		}
+		p.checker = c
+		p.report.Checker = recorder.bindChecker(p.report.Token, c, phase)
+		done()
+	}
+	end := recorder.event(phaseOracleEvent{Program: p.report.Token, Checker: p.report.Checker, Phase: phase, Operation: "program_diagnostics_end"})
+	if before != recorder.queries {
+		panic("diagnostic collection unexpectedly made an artifact query")
+	}
+	recorder.snapshots++
+	pass := projectOracleUnavailablePass("diagnostic snapshot only")
+	text := projectOracleErrorBaseline(t, p.files, diagnostics, &pass)
+	snapshot := phaseOracleSnapshot{
+		Token: fmt.Sprintf("snapshot-%04d", recorder.snapshots), Program: p.report.Token, Checker: p.report.Checker, Phase: phase, Evidence: evidence,
+		QueriesBefore: before, QueriesAfter: recorder.queries, StartOperation: start, EndOperation: end,
+		Diagnostics: projectOracleDiagnostics(diagnostics), ErrorsFileOrder: pass.ErrorsFileOrder,
+		Errors: projectOracleWriteArtifact(output, p.report.Token+"-"+phase+".errors.txt", text),
+	}
+	if p.report.InitialSourceSnapshot == "" {
+		p.initial = slices.Clone(snapshot.Diagnostics)
+		p.report.InitialSourceSnapshot = snapshot.Token
+		p.report.FrozenHadErrorBaseline = len(snapshot.Diagnostics) != 0
+	}
+	snapshot.DeltaFromInitial = phaseOracleDifference(p.initial, snapshot.Diagnostics)
+	p.report.Snapshots = append(p.report.Snapshots, snapshot)
+	return snapshot
+}
+
+func phaseOracleDifference(before, after []projectOracleDiagnostic) phaseOracleDelta {
+	result := phaseOracleDelta{Kind: "retained_snapshot_difference_not_fresh_diagnostic_production", Added: []projectOracleDiagnostic{}, Removed: []projectOracleDiagnostic{}}
+	key := func(d projectOracleDiagnostic) string {
+		data, err := json.Marshal(d)
+		if err != nil {
+			panic(err)
+		}
+		return string(data)
+	}
+	old, next := map[string]bool{}, map[string]bool{}
+	for _, d := range before {
+		old[key(d)] = true
+	}
+	for _, d := range after {
+		next[key(d)] = true
+		if !old[key(d)] {
+			result.Added = append(result.Added, d)
+		}
+	}
+	for _, d := range before {
+		if !next[key(d)] {
+			result.Removed = append(result.Removed, d)
+		}
+	}
+	return result
+}
+
+func phaseOracleResetSources(p *phaseOracleProgram, recorder *phaseOracleRecorder) {
+	if p.report.EligibleProjectSources == 0 {
+		p.report.State = "no_eligible_project_sources"
+		return
+	}
+	p.fs.setPhase("source_reset")
+	for _, file := range p.program.SourceFiles() {
+		if p.program.SkipTypeChecking(file, false) {
+			continue
+		}
+		c, done := p.program.GetTypeCheckerForFileExclusive(context.Background(), file)
+		checkerToken := recorder.bindChecker(p.report.Token, c, "source_reset")
+		if p.checker != c {
+			done()
+			panic("source reset used a different checker")
+		}
+		checked, unused := c.ProjectOracleResetSource(file)
+		done()
+		operation := recorder.event(phaseOracleEvent{Program: p.report.Token, Checker: checkerToken, Phase: "source_reset", Operation: "source_completion_flags_reset", File: file.FileName()})
+		p.report.SourceResets = append(p.report.SourceResets, phaseOracleReset{Operation: operation, Program: p.report.Token, Checker: checkerToken, File: file.FileName(), Checked: checked, Unused: unused})
+		if !checked {
+			panic("an eligible source was not checked before reset: " + file.FileName())
+		}
+	}
+}
+
+func phaseOracleArtifacts(t *testing.T, p *phaseOracleProgram, recorder *phaseOracleRecorder, output, name string) *phaseOracleWalk {
+	before := capturePhaseOracleSnapshot(t, p, recorder, output, name+"_before_types", "retained_program_snapshot_at_query_boundary")
+	walk := &phaseOracleWalk{Name: name, Program: p.report.Token, SourceSnapshot: p.report.InitialSourceSnapshot, HadErrorBaseline: p.report.FrozenHadErrorBaseline, BeforeTypes: before.Token, FirstQueryOrdinal: recorder.queries + 1, observation: &projectOracleObservation{}}
+	projectOracleActiveObserver = walk.observation.observer()
+	defer func() { projectOracleActiveObserver = nil; phaseOracleActiveQueryObserver = nil }()
+	phase := name + "_types"
+	phaseOracleActiveQueryObserver = &phaseOracleQueryObserver{
+		typ: func(c *checker.Checker, rendered, queried *ast.Node) {
+			recorder.query(p, phase, "get_type_at_location", c, rendered, queried)
+		},
+		symbol: func(c *checker.Checker, node *ast.Node) {
+			recorder.query(p, phase, "get_symbol_at_location", c, node, node)
+		},
+	}
+	p.fs.setPhase(phase)
+	recorder.event(phaseOracleEvent{Program: p.report.Token, Checker: p.report.Checker, Phase: phase, Operation: "type_artifact_begin"})
+	walker := newTypeWriterWalker(p.program, p.report.FrozenHadErrorBaseline)
+	walk.observation.texts[1] = generateBaseline(p.files, walker, "project", false)
+	walk.Types = projectOracleWriteArtifact(output, p.report.Token+"-"+name+".types", walk.observation.texts[1])
+	recorder.event(phaseOracleEvent{Program: p.report.Token, Checker: p.report.Checker, Phase: phase, Operation: "type_artifact_end"})
+	phaseOracleActiveQueryObserver = nil
+	afterTypes := capturePhaseOracleSnapshot(t, p, recorder, output, name+"_after_types", "retained_program_snapshot_after_type_queries")
+	walk.AfterTypes = afterTypes.Token
+	phase = name + "_symbols"
+	phaseOracleActiveQueryObserver = &phaseOracleQueryObserver{
+		typ: func(c *checker.Checker, rendered, queried *ast.Node) {
+			recorder.query(p, phase, "get_type_at_location", c, rendered, queried)
+		},
+		symbol: func(c *checker.Checker, node *ast.Node) {
+			recorder.query(p, phase, "get_symbol_at_location", c, node, node)
+		},
+	}
+	p.fs.setPhase(phase)
+	recorder.event(phaseOracleEvent{Program: p.report.Token, Checker: p.report.Checker, Phase: phase, Operation: "symbol_artifact_begin"})
+	walk.observation.texts[2] = generateBaseline(p.files, walker, "project", true)
+	walk.Symbols = projectOracleWriteArtifact(output, p.report.Token+"-"+name+".symbols", walk.observation.texts[2])
+	recorder.event(phaseOracleEvent{Program: p.report.Token, Checker: p.report.Checker, Phase: phase, Operation: "symbol_artifact_end"})
+	phaseOracleActiveQueryObserver = nil
+	afterSymbols := capturePhaseOracleSnapshot(t, p, recorder, output, name+"_after_symbols", "retained_program_snapshot_after_symbol_queries")
+	walk.AfterSymbols = afterSymbols.Token
+	walk.LastQueryOrdinal = recorder.queries
+	walk.Counts = walk.observation.walk
+	if uint64(walk.Counts.TypeQueries+walk.Counts.SymbolQueries) != walk.LastQueryOrdinal-walk.FirstQueryOrdinal+1 {
+		panic("query trace and baseline counts disagree")
+	}
+	p.report.ArtifactWalks = append(p.report.ArtifactWalks, walk)
+	return walk
+}
+
+func phaseOracleCompare(first, second *phaseOracleWalk) phaseOraclePointerChecks {
+	a, b := first.observation, second.observation
+	result := phaseOraclePointerChecks{State: "compared_strictly", TypesEqual: a.texts[1] == b.texts[1], SymbolsEqual: a.texts[2] == b.texts[2],
+		VisitsEqual:      first.Counts == second.Counts && slices.Equal(a.typeVisits, b.typeVisits) && slices.Equal(a.symbolVisits, b.symbolVisits),
+		TypeQueriesEqual: slices.Equal(a.typeQueries, b.typeQueries), RenderedTypesEqual: slices.Equal(a.renderedTypes, b.renderedTypes), SymbolsIdentical: slices.Equal(a.symbols, b.symbols)}
+	for i := range min(len(a.typeQueries), len(b.typeQueries)) {
+		if a.typeQueries[i] != b.typeQueries[i] {
+			result.ChangedTypeQueries++
+		}
+	}
+	for i := range min(len(a.renderedTypes), len(b.renderedTypes)) {
+		if a.renderedTypes[i] != b.renderedTypes[i] {
+			result.ChangedRenderedTypes++
+		}
+	}
+	for i := range min(len(a.symbols), len(b.symbols)) {
+		if a.symbols[i] != b.symbols[i] {
+			result.ChangedSymbols++
+		}
+	}
+	return result
+}
+
+func phaseOracleRun(t *testing.T, configPath, output string, report *phaseOracleReport, recorder *phaseOracleRecorder) {
+	sourceOnly := phaseOracleLoad(configPath, "source_only_no_artifact_queries", recorder)
+	report.Programs = append(report.Programs, sourceOnly.report)
+	initial := capturePhaseOracleSnapshot(t, sourceOnly, recorder, output, "initial_source", "source_check_initial_retained_snapshot")
+	capturePhaseOracleSnapshot(t, sourceOnly, recorder, output, "before_reset", "source_only_retained_snapshot_before_reset")
+	phaseOracleResetSources(sourceOnly, recorder)
+	after := capturePhaseOracleSnapshot(t, sourceOnly, recorder, output, "after_reentry", "source_only_reentry_retained_snapshot_not_fresh_production")
+	sourceEqual := reflect.DeepEqual(initial.Diagnostics, after.Diagnostics)
+	sourceOnly.report.RetainedReentryEqual = &sourceEqual
+	sourceOnly.report.ArtifactQueries = recorder.byProgram[sourceOnly.report.Token]
+	if sourceOnly.report.ArtifactQueries != 0 {
+		panic("source-only Program had artifact queries")
+	}
+	if sourceOnly.report.EligibleProjectSources != 0 {
+		sourceOnly.report.State = "retained_source_reentry_observed"
+	}
+	sourceOnly.report.Graph = projectOracleSnapshotGraph(sourceOnly.program, sourceOnly.fs, sourceOnly.files)
+	sourceGraphBytes, err := json.Marshal(sourceOnly.report.Graph)
+	if err != nil {
+		panic(err)
+	}
+	sourceOnly.report.GraphSHA256 = projectOracleString(projectOracleHash(sourceGraphBytes))
+
+	queries := phaseOracleLoad(configPath, "artifact_queries_with_frozen_renderer_input", recorder)
+	report.Programs = append(report.Programs, queries.report)
+	queryInitial := capturePhaseOracleSnapshot(t, queries, recorder, output, "initial_source", "source_check_initial_retained_snapshot")
+	initialEqual := reflect.DeepEqual(initial.Diagnostics, queryInitial.Diagnostics)
+	report.InitialSourceEqual = &initialEqual
+	if queries.report.EligibleProjectSources == 0 {
+		queries.report.State = "no_eligible_project_sources"
+		report.Outcome = "missing_replay_evidence"
+		report.Failure = projectOracleString("no project source is eligible for replay")
+		return
+	}
+	first := phaseOracleArtifacts(t, queries, recorder, output, "first")
+	beforeReset := capturePhaseOracleSnapshot(t, queries, recorder, output, "before_reset", "retained_query_program_snapshot_before_reset")
+	phaseOracleResetSources(queries, recorder)
+	afterReset := capturePhaseOracleSnapshot(t, queries, recorder, output, "after_reentry", "retained_query_program_snapshot_after_reentry_not_fresh_production")
+	retainedEqual := reflect.DeepEqual(beforeReset.Diagnostics, afterReset.Diagnostics)
+	queries.report.RetainedReentryEqual = &retainedEqual
+	second := phaseOracleArtifacts(t, queries, recorder, output, "second")
+	queries.report.State = "phase_observations_complete_fresh_production_unknown"
+	queries.report.ArtifactQueries = recorder.byProgram[queries.report.Token]
+	queries.report.Graph = projectOracleSnapshotGraph(queries.program, queries.fs, queries.files)
+	queryGraphBytes, err := json.Marshal(queries.report.Graph)
+	if err != nil {
+		panic(err)
+	}
+	queries.report.GraphSHA256 = projectOracleString(projectOracleHash(queryGraphBytes))
+	report.PointerChecks = phaseOracleCompare(first, second)
+	checks := report.PointerChecks
+	if !initialEqual || !sourceEqual || !retainedEqual || !checks.TypesEqual || !checks.SymbolsEqual || !checks.VisitsEqual || !checks.TypeQueriesEqual || !checks.RenderedTypesEqual || !checks.SymbolsIdentical {
+		report.Outcome = "invariant_error"
+		report.Failure = projectOracleString("strict phase-controlled source or artifact checks differ; no gate was relaxed")
+		return
+	}
+	report.Outcome = "incomplete_evidence"
+	report.Failure = projectOracleString("fresh diagnostic production has no reviewed verifier")
+}
+
+func newPhaseOracleReport(config string) *phaseOracleReport {
+	return &phaseOracleReport{SchemaVersion: 3, Implementation: "typescript-go", UpstreamSHA: projectOracleUpstreamSHA, Config: config, Outcome: "oracle_error",
+		Programs: []*phaseOracleProgramReport{}, CheckerBindings: []phaseOracleCheckerBinding{}, Provenance: json.RawMessage("null"),
+		PointerChecks: phaseOraclePointerChecks{State: "unavailable"}, FreshDiagnostics: projectOracleDiagnosticReplayEvidence{State: "unavailable", Reason: "retained phase snapshots are not fresh diagnostic production; no reviewed producer verifier exists"}}
+}
+
+func TestPhaseCorrectOracle(t *testing.T) {
+	config := os.Getenv("TS_RUST_PHASE_PROJECT")
+	output := os.Getenv("TS_RUST_PHASE_OUTPUT")
+	if config == "" && output == "" {
+		t.Skip("phase oracle environment is not set")
+	}
+	if !filepath.IsAbs(config) || !filepath.IsAbs(output) {
+		t.Fatal("phase oracle paths must be absolute")
+	}
+	if err := os.Mkdir(output, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	report := newPhaseOracleReport(config)
+	report.RunID = os.Getenv("TS_RUST_PHASE_RUN_ID")
+	recorder := newPhaseOracleRecorder(output)
+	defer func() {
+		if value := recover(); value != nil {
+			report.Outcome = "oracle_error"
+			report.Failure = projectOracleString(fmt.Sprintf("panic: %v", value))
+		}
+		projectOracleActiveObserver = nil
+		phaseOracleActiveQueryObserver = nil
+		report.Trace = recorder.close()
+		report.CheckerBindings = recorder.bindings
+		report.Runtime = projectOracleRuntimeSnapshot(started)
+		if err := projectOracleWriteJSON(filepath.Join(output, "report.json"), report); err != nil {
+			t.Error(err)
+		}
+		if report.Outcome != "complete" {
+			t.Errorf("phase oracle outcome: %s", report.Outcome)
+		}
+	}()
+	provenance, err := os.ReadFile(os.Getenv("TS_RUST_PHASE_PROVENANCE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := projectOracleValidateProvenance(provenance); err != nil {
+		t.Fatal(err)
+	}
+	report.Provenance = provenance
+	phaseOracleRun(t, config, output, report, recorder)
+}
