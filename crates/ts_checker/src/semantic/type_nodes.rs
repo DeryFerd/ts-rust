@@ -10056,6 +10056,24 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         {
             return Err(invalid());
         }
+        if let Some(cached) = annotation_identity
+            && preflight_node(self.store, self.host, identity_node)?.kind
+                == SyntaxKind::TypeReference
+        {
+            let target = self.resolve_uncached_type_reference_symbol(identity_node)?;
+            if self.store.symbol(target).is_some_and(|target| {
+                target
+                    .flags()
+                    .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+            }) {
+                self.validate_cached_class_or_interface_reference(
+                    target,
+                    identity_node,
+                    target,
+                    cached,
+                )?;
+            }
+        }
 
         let cached_type = self
             .store
@@ -15276,6 +15294,23 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     {
                         return Err(unsupported());
                     }
+                } else if constraint_record.kind.is_keyword_type()
+                    && constraint_record.kind != SyntaxKind::IntrinsicKeyword
+                {
+                    if constraint_record.parent != Some(parameter.node)
+                        || constraint_record.flags.0 != 0
+                        || constraint_record.range.start < parameter_node.range.start
+                        || constraint_record.range.end > parameter_node.range.end
+                        || self
+                            .cached_array_element_identity(constraint)?
+                            .is_none_or(|type_| {
+                                !self
+                                    .store
+                                    .source_direct_type_annotation_is_exact(constraint, type_)
+                            })
+                    {
+                        return Err(unsupported());
+                    }
                 } else {
                     let NodeData::TypeReferenceNode(reference) = &constraint_record.data else {
                         return Err(unsupported());
@@ -15397,12 +15432,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             TypeNodeUnavailable::InvalidTypeReference(node),
                         ));
                     };
-                    if parameter_data.constraint.is_some_and(|existing| {
-                        self.store
-                            .type_node_links(constraint)
-                            .and_then(|links| links.resolved_type)
-                            != Some(existing)
-                    }) {
+                    if let Some(existing) = parameter_data.constraint
+                        && self.cached_array_element_identity(constraint)? != Some(existing)
+                    {
                         return Err(type_node_unavailable(
                             TypeNodeUnavailable::InvalidTypeReference(node),
                         ));
@@ -24365,13 +24397,27 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         };
         for &(index, constraint) in constraints {
             let argument = type_arguments.get(index).copied().ok_or_else(&invalid)?;
+            let comparison_argument = match self.store.type_payload(argument).map(TypeRecord::data)
+            {
+                Some(TypeData::TypeParameter(parameter)) if argument != constraint => {
+                    let bootstrap = self.store.intrinsic_bootstrap().ok_or_else(&unsupported)?;
+                    // Upstream relates an unconstrained type variable through unknown.
+                    parameter
+                        .constraint
+                        .filter(|candidate| *candidate != bootstrap.no_constraint_type)
+                        .unwrap_or(bootstrap.unknown_type)
+                }
+                _ => argument,
+            };
             let assignable = match self.global_types.as_ref() {
                 Some(global_types) => self.store.is_type_assignable_to_with_global_types(
-                    argument,
+                    comparison_argument,
                     constraint,
                     global_types,
                 ),
-                None => self.store.is_type_assignable_to(argument, constraint),
+                None => self
+                    .store
+                    .is_type_assignable_to(comparison_argument, constraint),
             }
             .map_err(|_| unsupported())?;
             if assignable {
@@ -24392,10 +24438,29 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 argument_node,
                 CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
             )
-            .map_err(|_| unsupported())?
-            .ok_or_else(&unsupported)?;
-            let issued = self.diagnostics.add(diagnostic.node, diagnostic.diagnostic);
-            issued.related_information = diagnostic.related_information;
+            .map_err(|_| unsupported())?;
+            if let Some(diagnostic) = diagnostic {
+                let issued = self.diagnostics.add(diagnostic.node, diagnostic.diagnostic);
+                issued.related_information = diagnostic.related_information;
+            } else {
+                let display =
+                    get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                        self.store,
+                        self.host,
+                        &global_types,
+                        argument,
+                        constraint,
+                        CanonicalTypeFormatFlags::NONE,
+                    )
+                    .map_err(|_| unsupported())?;
+                self.diagnostics.add(
+                    Some(argument_node),
+                    Diagnostic::with_arguments(
+                        message_by_code(2344).expect("TS2344 is in the diagnostic catalog"),
+                        [display.source, display.target],
+                    ),
+                );
+            }
         }
         Ok(())
     }
