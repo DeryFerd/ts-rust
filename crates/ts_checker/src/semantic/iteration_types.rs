@@ -1126,12 +1126,15 @@ mod tests {
             ("optionalRest", true),
         ]
         .map(|(name, accepted)| {
-            (
-                context
-                    .get_type_from_type_node(annotation(&source, source_file, name))
-                    .unwrap(),
-                accepted,
-            )
+            let annotation = annotation(&source, source_file, name);
+            let type_ = context.get_type_from_type_node(annotation).unwrap();
+            let signature = context
+                .store()
+                .signature_links(annotation)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            context.get_return_type_of_signature(signature).unwrap();
+            (type_, accepted)
         });
         let global_types = context.global_types().clone();
         let bound = files
