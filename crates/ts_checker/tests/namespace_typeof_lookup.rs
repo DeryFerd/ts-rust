@@ -14,6 +14,7 @@ struct TestSource<'arena> {
     parsed: &'arena ParseResult,
     file: FileId,
     path: &'static str,
+    declaration_file: bool,
     module_state: CanonicalModuleState,
 }
 
@@ -36,7 +37,7 @@ fn context<'arena>(
                 CanonicalSourceFileFacts::new(
                     EscapedName::source(source.path),
                     CanonicalSourceLanguage::TypeScript,
-                    false,
+                    source.declaration_file,
                     source.module_state,
                 ),
             )
@@ -144,6 +145,7 @@ fn outer_value_typeof_query_is_cold_and_warm_stable() {
                     parsed: &parsed,
                     file,
                     path: "\"/outer-value.ts\"",
+                    declaration_file: false,
                     module_state: CanonicalModuleState::Script,
                 }],
                 [],
@@ -171,6 +173,7 @@ fn resolved_interface_alias_does_not_hide_outer_typeof_value() {
                 parsed: &parsed,
                 file,
                 path: "\"/alias-shadow.ts\"",
+                declaration_file: false,
                 module_state: CanonicalModuleState::Script,
             }],
             [],
@@ -200,18 +203,20 @@ fn resolved_interface_alias_does_not_hide_outer_typeof_value() {
 }
 
 #[test]
-fn qualified_ambient_typeof_reuses_uncached_scalar_annotations() {
+fn qualified_ambient_import_typeof_reuses_uncached_scalar_annotations() {
     for (annotation, expected) in [("number", "number"), ("(null)", "null")] {
         let parsed = parse_source_file(&format!(
-            "declare namespace Values {{ export const chosen: {annotation}; }} \
-             type Q = typeof Values.chosen;"
+            "declare module 'values' {{ export const chosen: {annotation}; }} \
+             declare module 'consumer' {{ \
+             import * as Values from 'values'; type Q = typeof Values.chosen; }}"
         ));
         let file = FileId::new(13_604);
         let mut checker = context(
             &[TestSource {
                 parsed: &parsed,
                 file,
-                path: "\"/qualified-value.ts\"",
+                path: "\"/qualified-value.d.ts\"",
+                declaration_file: true,
                 module_state: CanonicalModuleState::Script,
             }],
             [],
@@ -263,12 +268,14 @@ fn cold_namespace_typeof_keeps_its_identity_after_value_publication() {
                 parsed: &importer,
                 file: importer_file,
                 path: "\"/namespace-importer.ts\"",
+                declaration_file: false,
                 module_state: CanonicalModuleState::External,
             },
             TestSource {
                 parsed: &target,
                 file: target_file,
                 path: "\"/target.ts\"",
+                declaration_file: false,
                 module_state: CanonicalModuleState::External,
             },
         ],

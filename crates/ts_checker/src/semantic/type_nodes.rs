@@ -48747,6 +48747,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Each rejection and retry uses the same saved cache state.
     fn value_type_query_scalar_annotations_reject_changed_caches_before_writes() {
         for annotation_text in ["number", "(number)", "null", "(null)"] {
             for warm in [false, true] {
