@@ -1182,6 +1182,82 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         }
     }
 
+    /// Reads the manifest target of a direct namespace import without publishing alias links.
+    pub(super) fn namespace_type_query_target<MapperPayload>(
+        &self,
+        store: &CanonicalSemanticStore<MapperPayload>,
+        alias: SemanticSymbolId,
+    ) -> Result<SemanticSymbolId, CanonicalAliasTargetUnavailable> {
+        if store.id() != self.store {
+            return Err(CanonicalAliasTargetUnavailable::ForeignStore {
+                expected: self.store,
+                actual: store.id(),
+            });
+        }
+        let declaration = self.alias_declaration(store, alias)?;
+        let record = store
+            .symbol(alias)
+            .ok_or(CanonicalAliasTargetUnavailable::InvalidAliasLinks(alias))?;
+        if record.flags() != SymbolFlags::ALIAS
+            || record.check_flags() != CheckFlags::NONE
+            || store.get_merged_symbol(alias) != Some(alias)
+        {
+            return Err(CanonicalAliasTargetUnavailable::InvalidAliasLinks(alias));
+        }
+        let SupportedAliasDeclaration::NamespaceImport {
+            specifier,
+            type_only: false,
+        } = self.supported_declaration(store, declaration)?
+        else {
+            return Err(CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(declaration));
+        };
+        let resolved = self.resolved_module(declaration, specifier, store)?;
+        let module = self.direct_source_module(store, declaration, resolved, true)?;
+        if self
+            .sources
+            .get(resolved.target_file())
+            .and_then(|target| target.bound.source_facts())
+            .is_some_and(|facts| facts.is_javascript_file())
+        {
+            return Err(
+                CanonicalAliasTargetUnavailable::JavaScriptModuleUnsupported {
+                    declaration,
+                    file: resolved.target_file(),
+                },
+            );
+        }
+        if resolved.is_ambient_module() {
+            return Err(
+                CanonicalAliasTargetUnavailable::SyntheticModuleResolutionUnsupported {
+                    declaration,
+                    module,
+                },
+            );
+        }
+        if Self::export_equals_target(store, declaration, module)?.is_some() {
+            return Err(
+                CanonicalAliasTargetUnavailable::ExportEqualsResolutionUnsupported {
+                    declaration,
+                    module,
+                },
+            );
+        }
+        if store.alias_symbol_links(alias).is_some_and(|links| {
+            links
+                .immediate_target
+                .is_some_and(|target| target != module)
+                || match links.alias_target {
+                    AliasTargetState::Unresolved => false,
+                    AliasTargetState::Resolved(target) => target != module,
+                    AliasTargetState::Unknown => true,
+                }
+                || links.type_only_declaration.is_some()
+        }) {
+            return Err(CanonicalAliasTargetUnavailable::InvalidAliasLinks(alias));
+        }
+        Self::direct_namespace_target(store, declaration, module)
+    }
+
     /// Resolves the exact string argument of a source-owned `JSDoc` import type.
     pub(super) fn resolve_jsdoc_import_type_module<MapperPayload>(
         &self,

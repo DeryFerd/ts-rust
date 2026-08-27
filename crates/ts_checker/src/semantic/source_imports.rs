@@ -202,6 +202,190 @@ pub(super) struct ResolvedSourceImportBinding {
     namespace_aliases: RefCell<Vec<StagedSourceImportNamespaceAlias>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceFileNamespacePlan {
+    module: SemanticSymbolId,
+    declaration: NodeRef,
+    exports: Option<super::SymbolTableId>,
+    entries: Vec<(EscapedName, SemanticSymbolId)>,
+}
+
+/// One source-file namespace identity, shared by typeof and later value reads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceFileNamespaceIdentity {
+    plan: SourceFileNamespacePlan,
+    type_: TypeId,
+    properties: Option<Vec<PreparedSourceImportModuleProperty>>,
+}
+
+impl SourceFileNamespaceIdentity {
+    pub(super) const fn module(&self) -> SemanticSymbolId {
+        self.plan.module
+    }
+    pub(super) const fn type_(&self) -> TypeId {
+        self.type_
+    }
+    pub(super) fn accepts_completion(&self, next: &Self) -> bool {
+        self.plan == next.plan
+            && self.type_ == next.type_
+            && (self.properties.is_none() || self.properties == next.properties)
+    }
+}
+
+fn plan_source_file_namespace(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    module: SemanticSymbolId,
+) -> Result<SourceFileNamespacePlan, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(module));
+    let record = store.symbol(module).ok_or_else(invalid)?;
+    let Some([declaration]) = record.declarations() else {
+        return Err(invalid());
+    };
+    let declaration = *declaration;
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let source = checked_node(arena, bound, store, declaration)?;
+    let facts = bound.source_facts().ok_or_else(invalid)?;
+    if source.kind != SyntaxKind::SourceFile
+        || source.parent.is_some()
+        || declaration != bound.source_file()
+        || bound.symbol(declaration) != Some(module)
+        || !facts.is_external_module()
+        || facts.is_javascript_file()
+        || facts.is_common_js_module()
+        || record.flags() != SymbolFlags::VALUE_MODULE
+        || record.check_flags() != CheckFlags::NONE
+        || record.name() != facts.source_file_symbol_name()
+        || record.value_declaration() != Some(declaration)
+        || record.parent().is_some()
+        || record.members().is_some()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(module) != Some(module)
+        || !store.source_symbol_declarations_match(module)
+    {
+        return Err(invalid());
+    }
+    let entries = match record.exports() {
+        Some(table) => store
+            .symbol_table(table)
+            .ok_or_else(invalid)?
+            .iter()
+            .map(|(name, symbol)| (name.to_owned(), symbol))
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(SourceFileNamespacePlan {
+        module,
+        declaration,
+        exports: record.exports(),
+        entries,
+    })
+}
+
+fn source_file_namespace_identity<'store>(
+    store: &'store CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    module: SemanticSymbolId,
+) -> Result<Option<&'store SourceFileNamespaceIdentity>, SourceImportError> {
+    let plan = plan_source_file_namespace(store, host, module)?;
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(module));
+    let Some(identity) = store.source_file_namespace_identity(module) else {
+        if store
+            .value_symbol_links(module)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        {
+            return Err(invalid());
+        }
+        return Ok(None);
+    };
+    let record = store.type_payload(identity.type_).ok_or_else(invalid)?;
+    let TypeData::Object(object) = record.data() else {
+        return Err(invalid());
+    };
+    if identity.plan != plan
+        || record.flags() != TypeFlags::OBJECT
+        || record.symbol() != Some(module)
+        || record.alias().is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != super::type_records::TypeCacheState::Unallocated
+        || object.structured.constrained != super::type_records::ConstrainedTypeData::default()
+        || object.structured.index_infos.is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || store.value_symbol_links(module).is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && links
+                    != &ValueSymbolLinks {
+                        resolved_type: Some(identity.type_),
+                        ..ValueSymbolLinks::default()
+                    }
+        })
+    {
+        return Err(invalid());
+    }
+    match &identity.properties {
+        None if record.object_flags() == ObjectFlags::ANONYMOUS
+            && object == &super::type_records::ObjectTypeData::default() => {}
+        Some(_)
+            if record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED => {}
+        _ => return Err(invalid()),
+    }
+    Ok(Some(identity))
+}
+
+/// Validates the deferred or completed namespace without demanding export types.
+pub(super) fn source_file_namespace_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    module: SemanticSymbolId,
+) -> Result<Option<TypeId>, SourceImportError> {
+    let Some(identity) = source_file_namespace_identity(store, host, module)? else {
+        return Ok(None);
+    };
+    if identity.properties.as_ref().is_some_and(|properties| {
+        !valid_prepared_imported_namespace(
+            store,
+            None,
+            module,
+            identity.plan.declaration,
+            identity.type_,
+            properties,
+        )
+    }) {
+        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
+    }
+    Ok(Some(identity.type_))
+}
+
+pub(super) fn prepare_source_file_namespace_identity(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    module: SemanticSymbolId,
+) -> Result<TypeId, SourceImportError> {
+    if let Some(type_) = source_file_namespace_type(store, host, module)? {
+        return Ok(type_);
+    }
+    let plan = plan_source_file_namespace(store, host, module)?;
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(module));
+    if !store.try_reserve_types(1) || !store.try_reserve_source_file_namespace_identities(1) {
+        return Err(invalid());
+    }
+    let type_ = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(module))
+        .ok_or_else(invalid)?;
+    assert!(
+        store.record_source_file_namespace_identity(SourceFileNamespaceIdentity {
+            plan,
+            type_,
+            properties: None
+        })
+    );
+    Ok(type_)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StagedSourceImportNamespaceAlias {
     declaration: NodeRef,
@@ -6114,14 +6298,35 @@ fn materialize_imported_module_namespace(
 ) -> Result<(TypeId, Vec<PreparedSourceImportModuleProperty>), SourceImportError> {
     let owner =
         (store.source_node_kind(declaration) == Some(SyntaxKind::SourceFile)).then_some(module);
+    let shared_owner = owner.filter(|owner| {
+        store
+            .symbol(*owner)
+            .is_some_and(|symbol| symbol.flags() == SymbolFlags::VALUE_MODULE)
+            && host
+                .bound_file(declaration)
+                .and_then(BoundFile::source_facts)
+                .is_some_and(|facts| {
+                    facts.is_external_module()
+                        && !facts.is_javascript_file()
+                        && !facts.is_common_js_module()
+                })
+    });
+    // Keep member-link checks in the existing import and expression planning order.
+    let retained_identity = shared_owner
+        .map(|owner| {
+            source_file_namespace_identity(store, host, owner)
+                .map(|identity| identity.map(SourceFileNamespaceIdentity::type_))
+        })
+        .transpose()?
+        .flatten();
     let cached = store
         .value_symbol_links(module)
         .and_then(|links| links.resolved_type);
     if expected_type.is_some() && cached.is_some() && expected_type != cached {
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
     }
-    let existing = expected_type.or(cached).or_else(|| {
-        owner.and_then(|owner| {
+    let existing = expected_type.or(cached).or(retained_identity).or_else(|| {
+        owner.filter(|_| shared_owner.is_none()).and_then(|owner| {
             store.types().find_map(|(type_, record)| {
                 (record.symbol() == Some(owner)
                     && record.object_flags()
@@ -6130,7 +6335,15 @@ fn materialize_imported_module_namespace(
             })
         })
     });
-    if let Some(existing) = existing {
+    if shared_owner.is_some() && existing.is_some() && existing != retained_identity {
+        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
+    }
+    let deferred_identity = retained_identity.filter(|type_| {
+        store
+            .type_payload(*type_)
+            .is_some_and(|record| record.object_flags() == ObjectFlags::ANONYMOUS)
+    });
+    if let Some(existing) = existing.filter(|type_| Some(*type_) != deferred_identity) {
         let structured = store
             .type_payload(existing)
             .filter(|record| {
@@ -6233,6 +6446,10 @@ fn materialize_imported_module_namespace(
         &members,
     )?;
 
+    let namespace_identity = shared_owner
+        .map(|owner| prepare_source_file_namespace_identity(store, host, owner))
+        .transpose()?;
+
     let mut resolved_members = Vec::with_capacity(members.len());
     for member in members {
         if let PlannedSourceImportValueTarget::RecursiveNamespaceConst {
@@ -6306,10 +6523,13 @@ fn materialize_imported_module_namespace(
     {
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
     }
-    // Allocate the module identity before connecting its recursive properties.
-    let namespace_type = store
-        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, owner)
-        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
+    // Reuse the source-file identity before connecting its recursive properties.
+    let namespace_type = match namespace_identity {
+        Some(type_) => type_,
+        None => store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, owner)
+            .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?,
+    };
     let table = if count == 0 {
         None
     } else {
@@ -6348,6 +6568,14 @@ fn materialize_imported_module_namespace(
     if !store.set_structured_type_members(namespace_type, table, property_symbols, None, None, None)
     {
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
+    }
+    if shared_owner.is_some() {
+        let mut identity = store
+            .source_file_namespace_identity(module)
+            .cloned()
+            .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
+        identity.properties = Some(properties.clone());
+        assert!(store.record_source_file_namespace_identity(identity));
     }
     Ok((namespace_type, properties))
 }
@@ -8216,6 +8444,31 @@ fn recursive_namespace_const_is_exact(
         return false;
     }
 
+    let values_match = match (
+        store.value_symbol_links(target),
+        store.value_symbol_links(namespace_alias),
+    ) {
+        (None, None) => true,
+        (Some(target_links), Some(alias_links)) => namespace_type.is_some_and(|type_| {
+            let expected = ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            };
+            target_links == &expected
+                && alias_links == &expected
+                && module_type == Some(type_)
+                && store.type_node_links(initializer)
+                    == Some(&TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    })
+                && store
+                    .symbol_node_links(initializer)
+                    .is_some_and(|links| links.resolved_symbol == Some(namespace_alias))
+        }),
+        _ => false,
+    };
+
     target_record.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
         && target_record.check_flags() == CheckFlags::NONE
         && target_record.declarations() == Some(&[declaration])
@@ -8237,7 +8490,7 @@ fn recursive_namespace_const_is_exact(
                     }
             })
         })
-        && store.value_symbol_links(target).is_none()
+        && values_match
         && alias_record.flags() == SymbolFlags::ALIAS
         && alias_record.check_flags() == CheckFlags::NONE
         && alias_record.value_declaration().is_none()
@@ -8264,7 +8517,6 @@ fn recursive_namespace_const_is_exact(
                     && staged.target == module
                     && preflight_staged_namespace_alias(store, staged).is_ok()
             }))
-        && store.value_symbol_links(namespace_alias).is_none()
         && module_record.flags() == SymbolFlags::VALUE_MODULE
         && module_record.check_flags() == CheckFlags::NONE
         && module_record.declarations() == Some(&[source])
@@ -9568,6 +9820,617 @@ mod tests {
             .value_symbol_links(exported)
             .and_then(|links| links.resolved_type)
             .unwrap_or_else(|| panic!("missing type for exported value {name}"))
+    }
+
+    fn namespace_type_query_context<'arena>(
+        files: &[(FileId, &'arena ParseResult)],
+        modes: &[CanonicalModuleResolutionMode],
+        routes: Option<&[Route]>,
+        declaration_files: &[usize],
+    ) -> CanonicalCheckerContext<'arena> {
+        assert_eq!(files.len(), modes.len());
+        let mut binder = CanonicalBinder::new();
+        for (index, &(file, parsed)) in files.iter().enumerate() {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    facts_with_declaration_flag(
+                        file,
+                        CanonicalModuleState::External,
+                        declaration_files.contains(&index),
+                    ),
+                )
+                .unwrap();
+        }
+        for &(file, parsed) in files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let sources = files
+            .iter()
+            .map(|(file, parsed)| (*file, &parsed.arena))
+            .collect();
+        let Some(routes) = routes else {
+            return CanonicalCheckerContext::new(
+                binder.finish(),
+                sources,
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+        };
+        let entries = routes.iter().map(|route| {
+            let (file, source) = files[route.source];
+            let specifier = NodeRef::new(
+                source.arena.id(),
+                file,
+                module_specifiers(source)[route.specifier],
+            );
+            match route.target {
+                Some(target) => CanonicalModuleResolutionEntry::resolved(
+                    specifier,
+                    CanonicalResolvedModuleInput::new(
+                        files[target].0,
+                        modes[route.source],
+                        modes[target],
+                    ),
+                ),
+                None => CanonicalModuleResolutionEntry::unresolved(specifier),
+            }
+        });
+        CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            sources,
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new(entries),
+        )
+        .unwrap()
+    }
+
+    fn namespace_type_query_node(source: &ParseResult, file: FileId, name: &str) -> NodeRef {
+        source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeQueryNode(query) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &source.arena.get(query.expr_name)?.data
+                else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .expect("the source contains its namespace type query")
+    }
+
+    #[test]
+    fn namespace_type_queries_share_value_identity_without_changing_declared_types() {
+        use crate::semantic::type_nodes::TypeNodeUnavailable;
+        use CanonicalModuleResolutionMode::{CommonJs, Esm};
+        let importer = parsed(concat!(
+            "import * as ns from './target'; export type ns = string; ",
+            "export type Copy = typeof ns; export type Wrapped = (typeof ns); ",
+            "export const copied = ns;",
+        ));
+        let target = parsed("export const value: number;");
+        let files = [
+            (FileId::new(10_801), &importer),
+            (FileId::new(10_802), &target),
+        ];
+        let routes = [Route {
+            source: 0,
+            specifier: 0,
+            target: Some(1),
+        }];
+        for usage_mode in [CommonJs, Esm] {
+            for target_mode in [CommonJs, Esm] {
+                let mut context = namespace_type_query_context(
+                    &files,
+                    &[usage_mode, target_mode],
+                    Some(&routes),
+                    &[1],
+                );
+                let query = namespace_type_query_node(&importer, files[0].0, "ns");
+                let NodeData::TypeQueryNode(data) = &importer.arena.get(query.node).unwrap().data
+                else {
+                    unreachable!()
+                };
+                let name = NodeRef::new(query.arena, query.file, data.expr_name);
+                let alias_declaration = importer
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::NamespaceImport).then_some(NodeRef::new(
+                            importer.arena.id(),
+                            files[0].0,
+                            node,
+                        ))
+                    })
+                    .unwrap();
+                let alias = context
+                    .file(files[0].0)
+                    .unwrap()
+                    .1
+                    .symbol(alias_declaration)
+                    .unwrap();
+                let (_, bound) = context.file(files[1].0).unwrap();
+                let module = bound.symbol(bound.source_file()).unwrap();
+                let type_ = context.get_type_from_type_node(query).unwrap();
+                assert_eq!(
+                    context.store().type_payload(type_).unwrap().symbol(),
+                    Some(module)
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .symbol_node_links(name)
+                        .unwrap()
+                        .resolved_symbol,
+                    Some(alias)
+                );
+                assert!(context.store().value_symbol_links(alias).is_none());
+                assert!(context.store().value_symbol_links(module).is_none());
+                assert_eq!(
+                    context.get_declared_type_of_symbol(module).unwrap(),
+                    context.store().intrinsic_bootstrap().unwrap().error_type
+                );
+                let exported_type = context
+                    .store()
+                    .symbol(alias)
+                    .unwrap()
+                    .export_symbol()
+                    .unwrap();
+                assert_eq!(
+                    context.get_declared_type_of_symbol(exported_type).unwrap(),
+                    context.store().intrinsic_bootstrap().unwrap().string_type
+                );
+                let before = (
+                    store_state(context.store()),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                );
+                assert_eq!(context.get_type_from_type_node(query), Ok(type_));
+                assert_eq!(
+                    (
+                        store_state(context.store()),
+                        context.store().symbol_len(),
+                        context.store().signature_len()
+                    ),
+                    before
+                );
+
+                context.check_source_file(files[0].0).unwrap();
+                assert_eq!(context_exported_type(&context, files[0].0, "copied"), type_);
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(module)
+                        .unwrap()
+                        .resolved_type,
+                    Some(type_)
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(alias)
+                        .unwrap()
+                        .resolved_type,
+                    Some(type_)
+                );
+                let before = (
+                    store_state(context.store()),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                );
+                context.recheck_source_file(files[0].0).unwrap();
+                for (node, record) in importer.arena.iter() {
+                    if record.kind == SyntaxKind::TypeQuery {
+                        let node = NodeRef::new(importer.arena.id(), files[0].0, node);
+                        assert_eq!(
+                            context.get_type_from_type_node(node),
+                            Ok(type_),
+                            "{usage_mode:?} -> {target_mode:?}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    (
+                        store_state(context.store()),
+                        context.store().symbol_len(),
+                        context.store().signature_len()
+                    ),
+                    before
+                );
+                assert!(context.diagnostics().is_empty());
+
+                let property = context
+                    .store()
+                    .type_payload(type_)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .properties
+                    .as_deref()
+                    .unwrap()[0];
+                let original = context
+                    .store()
+                    .value_symbol_links(property)
+                    .cloned()
+                    .unwrap();
+                let mut poisoned = original.clone();
+                poisoned.write_type =
+                    Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(property, poisoned)
+                );
+                let before = store_state(context.store());
+                assert_eq!(
+                    context.get_type_from_type_node(query),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(query)
+                    ))
+                );
+                assert_eq!(store_state(context.store()), before);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(property, original)
+                );
+                assert_eq!(context.get_type_from_type_node(query), Ok(type_));
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_type_queries_reject_missing_manifest_entries_without_writes() {
+        use crate::semantic::type_nodes::TypeNodeUnavailable;
+        let source = parsed("import * as ns from './target'; type T = typeof ns;");
+        let target = parsed("export const value: number;");
+        let files = [
+            (FileId::new(10_803), &source),
+            (FileId::new(10_804), &target),
+        ];
+        let query = namespace_type_query_node(&source, files[0].0, "ns");
+        let specifier = NodeRef::new(source.arena.id(), files[0].0, module_specifiers(&source)[0]);
+        let unresolved = [Route {
+            source: 0,
+            specifier: 0,
+            target: None,
+        }];
+        for (routes, reason) in [
+            (
+                None,
+                CanonicalAliasTargetUnavailable::ModuleResolutionCapabilityUnavailable(specifier),
+            ),
+            (
+                Some([].as_slice()),
+                CanonicalAliasTargetUnavailable::ModuleResolutionEntryAbsent(specifier),
+            ),
+            (
+                Some(unresolved.as_slice()),
+                CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(specifier),
+            ),
+        ] {
+            let mut context = namespace_type_query_context(
+                &files,
+                &[CanonicalModuleResolutionMode::CommonJs; 2],
+                routes,
+                &[1],
+            );
+            let before = (
+                store_state(context.store()),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+            );
+            let error = context.get_type_from_type_node(query).unwrap_err();
+            assert!(
+                matches!(error, DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::NamespaceAlias {
+                node, error: CanonicalAliasResolutionError::TargetUnavailable { reason: actual, .. },
+            }) if node == query && actual == reason),
+                "{error:?}"
+            );
+            assert_eq!(
+                (
+                    store_state(context.store()),
+                    context.store().symbol_len(),
+                    context.store().signature_len()
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_type_queries_keep_type_only_imports_unsupported_without_writes() {
+        use crate::semantic::type_nodes::TypeNodeUnavailable;
+        let source = parsed("import type * as ns from './target'; type T = typeof ns;");
+        let target = parsed("export const value: number;");
+        let files = [
+            (FileId::new(10_811), &source),
+            (FileId::new(10_812), &target),
+        ];
+        let routes = [Route {
+            source: 0,
+            specifier: 0,
+            target: Some(1),
+        }];
+        let mut context = namespace_type_query_context(
+            &files,
+            &[CanonicalModuleResolutionMode::Esm; 2],
+            Some(&routes),
+            &[1],
+        );
+        let query = namespace_type_query_node(&source, files[0].0, "ns");
+        let before = store_state(context.store());
+        assert_eq!(
+            context.get_type_from_type_node(query),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node: query,
+                    kind: SyntaxKind::TypeQuery,
+                }
+            ))
+        );
+        assert_eq!(store_state(context.store()), before);
+    }
+
+    #[test]
+    fn namespace_type_queries_keep_javascript_targets_unsupported_without_writes() {
+        use crate::semantic::type_nodes::TypeNodeUnavailable;
+        let mut fixture = javascript_commonjs_fixture(
+            "import * as ns from './target'; type T = typeof ns;",
+            "exports.value = 1;",
+            None,
+        );
+        let source = &fixture.files[0];
+        let query = namespace_type_query_node(&source.parsed, source.file, "ns");
+        let host = DeclaredTypeHost::new_after_global_merge(
+            fixture
+                .files
+                .iter()
+                .map(|file| (&file.parsed.arena, fixture.bound.get(&file.file).unwrap())),
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap()
+        .with_module_resolutions(&fixture.manifest);
+        let before = store_state(&fixture.store);
+        let error = CanonicalTypeQuery::new_with_global_types(
+            &mut fixture.store,
+            &host,
+            &fixture.global_types,
+            CanonicalCheckerOptions::default(),
+            &mut CanonicalCheckerDiagnostics::default(),
+        )
+        .unwrap()
+        .get_type_from_type_node(query)
+        .unwrap_err();
+        assert!(
+            matches!(error, DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::NamespaceAlias {
+                node,
+                error: CanonicalAliasResolutionError::TargetUnavailable {
+                    reason: CanonicalAliasTargetUnavailable::JavaScriptModuleUnsupported { file, .. },
+                    ..
+                },
+            }) if node == query && file == fixture.files[1].file),
+            "{error:?}"
+        );
+        assert_eq!(store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn namespace_type_queries_reject_wrong_targets_and_poisoned_warm_caches() {
+        use crate::semantic::type_nodes::TypeNodeUnavailable;
+        let source = parsed("import * as ns from './target'; type T = typeof ns;");
+        let target = parsed("export const value: number;");
+        let other = parsed("export const value: string;");
+        let files = [
+            (FileId::new(10_805), &source),
+            (FileId::new(10_806), &target),
+            (FileId::new(10_807), &other),
+        ];
+        let routes = [Route {
+            source: 0,
+            specifier: 0,
+            target: Some(1),
+        }];
+        let mut context = namespace_type_query_context(
+            &files,
+            &[CanonicalModuleResolutionMode::Esm; 3],
+            Some(&routes),
+            &[1, 2],
+        );
+        let query = namespace_type_query_node(&source, files[0].0, "ns");
+        let NodeData::TypeQueryNode(data) = &source.arena.get(query.node).unwrap().data else {
+            unreachable!()
+        };
+        let name = NodeRef::new(query.arena, query.file, data.expr_name);
+        let type_ = context.get_type_from_type_node(query).unwrap();
+        let alias = context
+            .store()
+            .symbol_node_links(name)
+            .unwrap()
+            .resolved_symbol
+            .unwrap();
+        let module = context
+            .store()
+            .type_payload(type_)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let (_, bound) = context.file(files[2].0).unwrap();
+        let foreign_module = bound.symbol(bound.source_file()).unwrap();
+        let original = context.store().alias_symbol_links(alias).cloned().unwrap();
+        for immediate in [false, true] {
+            let mut poisoned = original.clone();
+            if immediate {
+                poisoned.immediate_target = Some(foreign_module);
+            } else {
+                poisoned.alias_target = AliasTargetState::Resolved(foreign_module);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_alias_symbol_links(alias, poisoned)
+            );
+            let before = store_state(context.store());
+            let error = context.get_type_from_type_node(query).unwrap_err();
+            assert!(
+                matches!(error, DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::NamespaceAlias {
+                error: CanonicalAliasResolutionError::TargetUnavailable { reason: CanonicalAliasTargetUnavailable::InvalidAliasLinks(invalid), .. }, ..
+            }) if invalid == alias),
+                "{error:?}"
+            );
+            assert_eq!(store_state(context.store()), before);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_alias_symbol_links(alias, original.clone())
+            );
+            assert_eq!(context.get_type_from_type_node(query), Ok(type_));
+        }
+        let node_links = context.store().type_node_links(query).cloned().unwrap();
+        let name_links = context.store().symbol_node_links(name).cloned().unwrap();
+        for attack in 0..4 {
+            let store = context.store_mut_for_test();
+            match attack {
+                0 => assert!(store.set_type_node_links(
+                    query,
+                    TypeNodeLinks {
+                        resolved_type: Some(store.intrinsic_bootstrap().unwrap().number_type),
+                        ..TypeNodeLinks::default()
+                    }
+                )),
+                1 => assert!(store.set_symbol_node_links(
+                    name,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(module)
+                    }
+                )),
+                2 => assert!(store.set_type_symbol(type_, Some(foreign_module))),
+                3 => assert!(store.set_alias_symbol_links(alias, AliasSymbolLinks::default())),
+                _ => unreachable!(),
+            }
+            let before = store_state(context.store());
+            assert_eq!(
+                context.get_type_from_type_node(query),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(query)
+                ))
+            );
+            assert_eq!(store_state(context.store()), before);
+            let store = context.store_mut_for_test();
+            assert!(store.set_type_node_links(query, node_links.clone()));
+            assert!(store.set_symbol_node_links(name, name_links.clone()));
+            assert!(store.set_type_symbol(type_, Some(module)));
+            assert!(store.set_alias_symbol_links(alias, original.clone()));
+            assert_eq!(context.get_type_from_type_node(query), Ok(type_));
+        }
+        let unrelated = parsed("import * as ns from './target'; type T = typeof ns;");
+        let foreign = namespace_type_query_node(&unrelated, files[0].0, "ns");
+        let before = store_state(context.store());
+        assert!(context.get_type_from_type_node(foreign).is_err());
+        assert_eq!(store_state(context.store()), before);
+    }
+
+    #[test]
+    fn namespace_type_queries_preserve_recursive_declaration_targets_in_each_mode() {
+        use CanonicalModuleResolutionMode::{CommonJs, Esm};
+        let text = concat!(
+            "import * as cjs from 'inner/cjs'; import * as mjs from 'inner/mjs'; import * as type from 'inner'; ",
+            "export const t: { cjs: typeof cjs; mjs: typeof mjs; type: typeof type }; ",
+            "export const marker: boolean;",
+        );
+        let first = parsed(text);
+        let second = parsed(text);
+        let third = parsed(text);
+        let files = [
+            (FileId::new(10_808), &first),
+            (FileId::new(10_809), &second),
+            (FileId::new(10_810), &third),
+        ];
+        let modes = [CommonJs, Esm, CommonJs];
+        let routes = (0..3)
+            .flat_map(|source| {
+                [2, 1, 0]
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(specifier, target)| Route {
+                        source,
+                        specifier,
+                        target: Some(target),
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut context = namespace_type_query_context(&files, &modes, Some(&routes), &[0, 1, 2]);
+        let modules = files.map(|(file, _)| {
+            let (_, bound) = context.file(file).unwrap();
+            bound.symbol(bound.source_file()).unwrap()
+        });
+        let mut identities = HashMap::new();
+        for &(file, source) in &files {
+            for (name, target) in [("cjs", 2), ("mjs", 1), ("type", 0)] {
+                let query = namespace_type_query_node(source, file, name);
+                let type_ = context.get_type_from_type_node(query).unwrap();
+                assert_eq!(
+                    context.store().type_payload(type_).unwrap().symbol(),
+                    Some(modules[target])
+                );
+                if let Some(previous) = identities.insert(modules[target], type_) {
+                    assert_eq!(previous, type_);
+                }
+            }
+        }
+        assert_eq!(identities.len(), 3);
+        for &(file, _) in &files {
+            context.check_source_file(file).unwrap();
+        }
+        for &(file, _) in &files {
+            let type_ = context_exported_type(&context, file, "t");
+            let properties = context
+                .store()
+                .type_payload(type_)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .properties
+                .as_deref()
+                .unwrap();
+            assert_eq!(properties.len(), 3);
+            for (&property, target) in properties.iter().zip([2, 1, 0]) {
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(property)
+                        .unwrap()
+                        .resolved_type,
+                    Some(identities[&modules[target]])
+                );
+            }
+        }
+        let before = (
+            store_state(context.store()),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+        );
+        for &(file, _) in &files {
+            context.recheck_source_file(file).unwrap();
+        }
+        assert_eq!(
+            (
+                store_state(context.store()),
+                context.store().symbol_len(),
+                context.store().signature_len()
+            ),
+            before
+        );
+        assert!(context.diagnostics().is_empty());
     }
 
     fn fixture(sources: &[&str], routes: &[Route]) -> Fixture {

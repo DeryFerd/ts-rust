@@ -1134,6 +1134,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             instantiation_session,
             diagnostics,
             global_types,
+            module_resolutions,
             ..
         } = self;
         instantiation_session.reset_query();
@@ -1142,7 +1143,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )
-        .map_err(DeclaredTypeError::from)?;
+        .map_err(DeclaredTypeError::from)?
+        .with_module_resolutions(module_resolutions);
         CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             &host,
@@ -1318,6 +1320,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             instantiation_session,
             diagnostics,
             global_types,
+            module_resolutions,
             ..
         } = self;
         instantiation_session.reset_query();
@@ -1325,7 +1328,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             store,
             files,
             GlobalMergeCompletion::new(options.name_resolution),
-        )?;
+        )?
+        .with_module_resolutions(module_resolutions);
         CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             &host,
@@ -1355,6 +1359,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             instantiation_session,
             diagnostics,
             global_types,
+            module_resolutions,
             ..
         } = self;
         instantiation_session.reset_query();
@@ -1362,7 +1367,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             store,
             files,
             GlobalMergeCompletion::new(options.name_resolution),
-        )?;
+        )?
+        .with_module_resolutions(module_resolutions);
         CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             &host,
@@ -1421,7 +1427,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )
-        .map_err(DeclaredTypeError::from)?;
+        .map_err(DeclaredTypeError::from)?
+        .with_module_resolutions(module_resolutions);
         let mut alias_host =
             ProductionAliasTargetHost::from_registry(store, files, module_resolutions)
                 .map_err(|_| SourceCheckError::Import(source_file.node_ref()))?;

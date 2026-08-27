@@ -19,10 +19,13 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::{
     TypeResolutionTargetError,
-    alias_provider::ProductionAliasSourceRegistry,
+    alias_provider::{
+        ProductionAliasSourceRegistry, ProductionAliasTargetHost, ProductionAliasTargetHostError,
+    },
     enums::{self, EnumTypeError},
     ids::TypeId,
     mapper::TypeMapper,
+    module_resolution::CanonicalModuleResolutionManifest,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
     production::GlobalMergeCompletion,
     store::SemanticStore,
@@ -87,6 +90,7 @@ enum DeclaredNameResolution {
 pub struct DeclaredTypeHost<'a> {
     sources: DeclaredTypeSources<'a>,
     name_resolution: DeclaredNameResolution,
+    module_resolutions: Option<&'a CanonicalModuleResolutionManifest>,
 }
 
 /// A source rejected while constructing a [`DeclaredTypeHost`].
@@ -194,6 +198,7 @@ impl<'a> DeclaredTypeHost<'a> {
         Ok(Self {
             sources: DeclaredTypeSources::Registry(sources),
             name_resolution: DeclaredNameResolution::GlobalsMerged(completion.name_resolution()),
+            module_resolutions: None,
         })
     }
 
@@ -246,7 +251,37 @@ impl<'a> DeclaredTypeHost<'a> {
         Ok(Self {
             sources: DeclaredTypeSources::Retained(retained),
             name_resolution,
+            module_resolutions: None,
         })
+    }
+
+    pub(super) fn with_module_resolutions(
+        mut self,
+        manifest: &'a CanonicalModuleResolutionManifest,
+    ) -> Self {
+        self.module_resolutions = Some(manifest);
+        self
+    }
+
+    pub(super) const fn module_resolutions(&self) -> Option<&'a CanonicalModuleResolutionManifest> {
+        self.module_resolutions
+    }
+
+    pub(super) fn alias_target_host<'host>(
+        &'host self,
+        store: &SemanticStore<TypeRecord, TypeMapper>,
+        manifest: &'host CanonicalModuleResolutionManifest,
+    ) -> Result<ProductionAliasTargetHost<'host, 'a, 'host>, ProductionAliasTargetHostError> {
+        match &self.sources {
+            DeclaredTypeSources::Retained(sources) => ProductionAliasTargetHost::new(
+                store,
+                sources.values().map(|source| (source.arena, source.bound)),
+                manifest,
+            ),
+            DeclaredTypeSources::Registry(sources) => {
+                ProductionAliasTargetHost::from_registry(store, sources, manifest)
+            }
+        }
     }
 
     pub(super) fn node(&self, reference: NodeRef) -> Option<&Node> {

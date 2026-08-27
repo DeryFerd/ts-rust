@@ -736,6 +736,7 @@ fn declared_type_unavailable_is_unsupported(error: &DeclaredTypeUnavailable) -> 
 
 fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
     match error {
+        TypeNodeUnavailable::NamespaceAlias { error, .. } => alias_error_is_unsupported(*error),
         TypeNodeUnavailable::UnsupportedSyntax { .. }
         | TypeNodeUnavailable::JsDoc(_)
         | TypeNodeUnavailable::QualifiedTypeReference(_)
@@ -761,6 +762,7 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::UnsupportedTupleElementOrder { .. }
         | TypeNodeUnavailable::RecursiveTupleAliasUnsupported { .. } => true,
         TypeNodeUnavailable::InvalidParenthesizedType(_)
+        | TypeNodeUnavailable::NamespaceAliasHost { .. }
         | TypeNodeUnavailable::InvalidTypeReference(_)
         | TypeNodeUnavailable::InvalidImportAliasTarget { .. }
         | TypeNodeUnavailable::InvalidJsDocImportTypeTarget { .. }
@@ -896,18 +898,31 @@ fn display_error_is_unsupported(error: &TypeDisplayUnavailable) -> bool {
 }
 
 fn symbol_display_error_is_unsupported(error: ts_checker::semantic::SymbolDisplayError) -> bool {
-    use ts_checker::semantic::{
-        SymbolDisplayError,
-        alias::{CanonicalAliasResolutionError, CanonicalAliasTargetUnavailable},
-    };
+    use ts_checker::semantic::SymbolDisplayError;
     match error {
         SymbolDisplayError::MissingModuleSpecifier(_)
         | SymbolDisplayError::CyclicAlias(_)
         | SymbolDisplayError::UnnameableSymbol(_) => true,
-        SymbolDisplayError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
-            reason,
-            ..
-        }) => matches!(
+        SymbolDisplayError::Alias(error) => alias_error_is_unsupported(error),
+        SymbolDisplayError::SourceHost(_)
+        | SymbolDisplayError::AliasHost(_)
+        | SymbolDisplayError::InvalidLocation(_)
+        | SymbolDisplayError::InvalidModuleSpecifier(_)
+        | SymbolDisplayError::InvalidSymbol(_)
+        | SymbolDisplayError::InvalidTable(_)
+        | SymbolDisplayError::InvalidAliasCache(_)
+        | SymbolDisplayError::CyclicContainer(_) => false,
+    }
+}
+
+fn alias_error_is_unsupported(
+    error: ts_checker::semantic::alias::CanonicalAliasResolutionError,
+) -> bool {
+    use ts_checker::semantic::alias::{
+        CanonicalAliasResolutionError, CanonicalAliasTargetUnavailable,
+    };
+    match error {
+        CanonicalAliasResolutionError::TargetUnavailable { reason, .. } => matches!(
             reason,
             CanonicalAliasTargetUnavailable::UnsupportedDeclarationFamily
                 | CanonicalAliasTargetUnavailable::TargetProviderUnavailable
@@ -923,15 +938,7 @@ fn symbol_display_error_is_unsupported(error: ts_checker::semantic::SymbolDispla
                 | CanonicalAliasTargetUnavailable::JavaScriptModuleUnsupported { .. }
                 | CanonicalAliasTargetUnavailable::SyntheticModuleResolutionUnsupported { .. }
         ),
-        SymbolDisplayError::SourceHost(_)
-        | SymbolDisplayError::AliasHost(_)
-        | SymbolDisplayError::InvalidLocation(_)
-        | SymbolDisplayError::InvalidModuleSpecifier(_)
-        | SymbolDisplayError::InvalidSymbol(_)
-        | SymbolDisplayError::InvalidTable(_)
-        | SymbolDisplayError::InvalidAliasCache(_)
-        | SymbolDisplayError::Alias(_)
-        | SymbolDisplayError::CyclicContainer(_) => false,
+        _ => false,
     }
 }
 

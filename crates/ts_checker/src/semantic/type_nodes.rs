@@ -879,6 +879,14 @@ pub enum TypeNodeUnavailable {
         node: NodeRef,
         alias: SemanticSymbolId,
     },
+    NamespaceAlias {
+        node: NodeRef,
+        error: super::alias::CanonicalAliasResolutionError,
+    },
+    NamespaceAliasHost {
+        node: NodeRef,
+        error: super::alias_provider::ProductionAliasTargetHostError,
+    },
     InvalidImportAliasTarget {
         node: NodeRef,
         alias: SemanticSymbolId,
@@ -1223,6 +1231,7 @@ struct TypeQueryPlan {
     recovered_missing_reference_diagnostics:
         BTreeMap<NodeRef, PlannedMissingTypeReferenceDiagnostic>,
     type_queries: BTreeMap<NodeRef, PlannedValueTypeQuery>,
+    namespace_type_queries: BTreeMap<NodeRef, SemanticSymbolId>,
     class_type_queries: BTreeMap<SemanticSymbolId, ClassMemberQueryPlan>,
     imported_callable_type_queries:
         BTreeMap<SemanticSymbolId, source_callables::SourceCallablePlan>,
@@ -10216,19 +10225,25 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         .resolve(
             Some(CanonicalResolutionLocation::Bound(name)),
             &identifier.text,
-            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE | SymbolFlags::ALIAS,
             None,
             false,
             false,
         );
         let symbol = match resolved {
-            Ok(Some(symbol)) => self.store.get_merged_symbol(symbol).ok_or_else(invalid)?,
-            Ok(None) | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => {
+            Ok(Some(symbol))
+            | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(symbol)) => {
+                self.store.get_merged_symbol(symbol).ok_or_else(invalid)?
+            }
+            Ok(None) => {
                 return Err(unsupported());
             }
             Err(error) => return Err(error.into()),
         };
         let symbol_record = self.store.symbol(symbol).ok_or_else(invalid)?;
+        if symbol_record.flags().intersects(SymbolFlags::ALIAS) {
+            return self.plan_namespace_alias_type_query(node, name, symbol);
+        }
         let Some([declaration]) = symbol_record.declarations() else {
             return Err(unsupported());
         };
@@ -10550,6 +10565,181 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
         if let Some(previous) = self.plan.type_queries.insert(node, planned)
             && previous != planned
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    fn plan_namespace_alias_type_query(
+        &mut self,
+        node: NodeRef,
+        name: NodeRef,
+        alias: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let alias_record = self.store.symbol(alias).ok_or_else(invalid)?;
+        let mut declarations = alias_record
+            .declarations()
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .filter(|declaration| {
+                self.store.source_node_kind(*declaration) == Some(SyntaxKind::NamespaceImport)
+            });
+        let Some(declaration) = declarations.next() else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
+                    kind: SyntaxKind::TypeQuery,
+                },
+            ));
+        };
+        if declarations.next().is_some() {
+            return Err(invalid());
+        }
+        let declaration_record = preflight_node(self.store, self.host, declaration)?;
+        let NodeData::NamespaceImport(binding) = &declaration_record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
+                    kind: SyntaxKind::TypeQuery,
+                },
+            ));
+        };
+        let binding_name = NodeRef::new(declaration.arena, declaration.file, binding.name);
+        let NodeData::Identifier(binding_identifier) =
+            &preflight_node(self.store, self.host, binding_name)?.data
+        else {
+            return Err(invalid());
+        };
+        let NodeData::Identifier(identifier) = &preflight_node(self.store, self.host, name)?.data
+        else {
+            return Err(invalid());
+        };
+        if !declaration.is_for(node.arena, node.file)
+            || declaration_record.kind != SyntaxKind::NamespaceImport
+            || alias_record.name().as_utf8() != Some(identifier.text.as_str())
+            || binding_identifier.text != identifier.text
+            || !self.host.symbol_matches(self.store, declaration, alias)
+        {
+            return Err(invalid());
+        }
+        let clause = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            declaration_record.parent.ok_or_else(invalid)?,
+        );
+        let clause_record = preflight_node(self.store, self.host, clause)?;
+        if clause_record.kind != SyntaxKind::ImportClause {
+            return Err(invalid());
+        }
+        let import = NodeRef::new(
+            clause.arena,
+            clause.file,
+            clause_record.parent.ok_or_else(invalid)?,
+        );
+        let (arena, bound) = self.host.source(declaration).ok_or_else(invalid)?;
+        let import_plan = super::source_imports::plan_top_level_named_value_import(
+            arena, bound, self.store, import,
+        )
+        .map_err(|error| match error {
+            super::source_imports::SourceImportError::Unsupported(
+                super::source_imports::SourceImportUnsupported::TypeOnly(_),
+            ) => type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: SyntaxKind::TypeQuery,
+            }),
+            _ => invalid(),
+        })?;
+        if !import_plan.bindings.iter().any(|binding| {
+            binding.declaration == declaration
+                && binding.alias_symbol == alias
+                && binding.local_text == identifier.text
+                && binding.imported_text == "*"
+        }) {
+            return Err(invalid());
+        }
+        let unavailable =
+            super::module_resolution::CanonicalModuleResolutionManifest::unavailable();
+        let manifest = self.host.module_resolutions().unwrap_or(&unavailable);
+        let provider = self
+            .host
+            .alias_target_host(self.store, manifest)
+            .map_err(|error| {
+                type_node_unavailable(TypeNodeUnavailable::NamespaceAliasHost { node, error })
+            })?;
+        let module = provider
+            .namespace_type_query_target(self.store, alias)
+            .map_err(|reason| {
+                type_node_unavailable(TypeNodeUnavailable::NamespaceAlias {
+                    node,
+                    error: super::alias::CanonicalAliasResolutionError::TargetUnavailable {
+                        alias,
+                        reason,
+                    },
+                })
+            })?;
+        let type_ =
+            super::source_imports::source_file_namespace_type(self.store, self.host, module)
+                .map_err(|_| invalid())?;
+        let cached_type = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type);
+        let cached_symbol = self
+            .store
+            .symbol_node_links(name)
+            .and_then(|links| links.resolved_symbol);
+        if self
+            .store
+            .type_node_links(node)
+            .is_some_and(|links| links.outer_type_parameters.is_some())
+            || self
+                .store
+                .symbol_node_links(node)
+                .is_some_and(|links| links.resolved_symbol.is_some())
+            || cached_type.is_some_and(|cached| Some(cached) != type_)
+            || cached_symbol.is_some_and(|cached| cached != alias)
+            || cached_type.is_some() != cached_symbol.is_some()
+            || cached_type.is_some()
+                && self.store.alias_symbol_links(alias).is_none_or(|links| {
+                    links.alias_target != super::AliasTargetState::Resolved(module)
+                })
+            || self.store.value_symbol_links(alias).is_some_and(|links| {
+                links != &super::ValueSymbolLinks::default()
+                    && (links.resolved_type != type_
+                        || type_.is_none()
+                        || self
+                            .store
+                            .value_symbol_links(module)
+                            .and_then(|links| links.resolved_type)
+                            != type_
+                        || links
+                            != &super::ValueSymbolLinks {
+                                resolved_type: type_,
+                                ..super::ValueSymbolLinks::default()
+                            })
+            })
+        {
+            return Err(invalid());
+        }
+        let query = PlannedValueTypeQuery {
+            name,
+            symbol: alias,
+            source_node: None,
+            type_,
+        };
+        if self
+            .plan
+            .type_queries
+            .insert(node, query)
+            .is_some_and(|previous| previous != query)
+            || self
+                .plan
+                .namespace_type_queries
+                .insert(node, module)
+                .is_some_and(|previous| previous != module)
         {
             return Err(invalid());
         }
@@ -19197,6 +19387,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || self.direct_intersection_rhs(type_node)?
             || self.direct_type_literal_rhs(type_node)?
             || self.direct_callable_type_rhs(type_node)?
+            || self.direct_value_type_query_rhs(type_node)?
             || self.direct_indexed_access_rhs(type_node)?
             || self.is_authenticated_supported_generic_union_alias(type_node, symbol)?
             || self.direct_keyof_rhs(type_node)?
@@ -19571,6 +19762,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 record.kind,
                 SyntaxKind::FunctionType | SyntaxKind::ConstructorType
             ) {
+                return Ok(true);
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
+                return Ok(false);
+            };
+            node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
+    }
+
+    fn direct_value_type_query_rhs(&self, mut node: NodeRef) -> Result<bool, DeclaredTypeError> {
+        loop {
+            let record = preflight_node(self.store, self.host, node)?;
+            if record.kind == SyntaxKind::TypeQuery {
                 return Ok(true);
             }
             let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
@@ -25990,6 +26194,39 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Result<TypeId, DeclaredTypeError> {
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
         let query = plan.type_queries.get(&node).copied().ok_or_else(invalid)?;
+        let namespace_value = if let Some(module) = plan.namespace_type_queries.get(&node).copied()
+        {
+            let unavailable =
+                super::module_resolution::CanonicalModuleResolutionManifest::unavailable();
+            let manifest = self.host.module_resolutions().unwrap_or(&unavailable);
+            let mut provider =
+                self.host
+                    .alias_target_host(self.store, manifest)
+                    .map_err(|error| {
+                        type_node_unavailable(TypeNodeUnavailable::NamespaceAliasHost {
+                            node,
+                            error,
+                        })
+                    })?;
+            let resolved = super::alias::CanonicalAliasResolver::new(self.store, &mut provider)
+                .resolve_alias(query.symbol)
+                .map_err(|error| {
+                    type_node_unavailable(TypeNodeUnavailable::NamespaceAlias { node, error })
+                })?;
+            if resolved.target != super::AliasTargetState::Resolved(module)
+                || !resolved.events.is_empty()
+            {
+                return Err(invalid());
+            }
+            Some(
+                super::source_imports::prepare_source_file_namespace_identity(
+                    self.store, self.host, module,
+                )
+                .map_err(|_| invalid())?,
+            )
+        } else {
+            None
+        };
         let class_value = if let Some(class) = plan.class_type_queries.get(&query.symbol) {
             let members = execute_nongeneric_class_member_query(self.store, self.host, class)
                 .map_err(|_| invalid())?;
@@ -26050,6 +26287,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .or(source_type)
             .or(class_value)
             .or(callable_value)
+            .or(namespace_value)
             .ok_or_else(invalid)?;
         let value_type = self
             .store
@@ -26059,7 +26297,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             || source_type.is_some_and(|type_| type_ != expected)
             || class_value.is_some_and(|type_| type_ != expected)
             || callable_value.is_some_and(|type_| type_ != expected)
-            || value_type.is_none() && source_type != Some(expected)
+            || namespace_value.is_some_and(|type_| type_ != expected)
+            || value_type.is_none()
+                && source_type != Some(expected)
+                && namespace_value != Some(expected)
             || self.store.type_payload(expected).is_none()
         {
             return Err(invalid());

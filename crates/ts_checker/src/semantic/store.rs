@@ -55,6 +55,7 @@ use super::{
         SourceCallableAliasAnnotation, SourceCallableAliasSnapshot,
         SourceCallableTypeParameterSyntaxProof, source_type_parameter_default_is_assignable,
     },
+    source_imports::SourceFileNamespaceIdentity,
     source_namespaces::ModuleValueIdentity,
     type_nodes::{
         ConstructorAnnotationProof, SourceCallableAliasResolution, UnionAliasInstantiationProof,
@@ -540,6 +541,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     module_value_identities: HashMap<SemanticSymbolId, ModuleValueIdentity>,
     object_literal_property_clone_origins:
         HashMap<SemanticSymbolId, ObjectLiteralPropertyCloneOrigin>,
+    source_file_namespace_identities: HashMap<SemanticSymbolId, SourceFileNamespaceIdentity>,
     source_overload_provenance: HashMap<TypeId, SourceOverloadProvenance>,
     source_overload_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_overload_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
@@ -675,6 +677,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_type_parameters: HashMap::new(),
             module_value_identities: HashMap::new(),
             object_literal_property_clone_origins: HashMap::new(),
+            source_file_namespace_identities: HashMap::new(),
             source_overload_provenance: HashMap::new(),
             source_overload_types_by_declaration: HashMap::new(),
             source_overload_types_by_owner: HashMap::new(),
@@ -2974,6 +2977,47 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         symbol: SemanticSymbolId,
     ) -> Option<&ModuleValueIdentity> {
         self.module_value_identities.get(&symbol)
+    }
+
+    pub(super) fn source_file_namespace_identity(
+        &self,
+        module: SemanticSymbolId,
+    ) -> Option<&SourceFileNamespaceIdentity> {
+        self.source_file_namespace_identities.get(&module)
+    }
+
+    pub(super) fn try_reserve_source_file_namespace_identities(&mut self, count: usize) -> bool {
+        self.source_file_namespace_identities
+            .try_reserve(count)
+            .is_ok()
+    }
+
+    pub(super) fn record_source_file_namespace_identity(
+        &mut self,
+        identity: SourceFileNamespaceIdentity,
+    ) -> bool {
+        if self.symbol(identity.module()).is_none() || self.type_payload(identity.type_()).is_none()
+        {
+            return false;
+        }
+        match self
+            .source_file_namespace_identities
+            .entry(identity.module())
+        {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if !entry.get().accepts_completion(&identity) {
+                    return false;
+                }
+                if entry.get() != &identity {
+                    entry.insert(identity);
+                }
+                true
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(identity);
+                true
+            }
+        }
     }
 
     pub(super) fn try_reserve_module_value_identities(&mut self, additional: usize) -> bool {
