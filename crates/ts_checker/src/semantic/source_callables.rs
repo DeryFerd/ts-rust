@@ -8135,6 +8135,17 @@ pub(super) fn authenticated_jsdoc_contextual_source_signature(
     {
         return Ok(None);
     }
+    let comments = plan_javascript_source_jsdoc(arena, bound.source_file())
+        .map_err(|_| invariant(SourceCallableInvariant::InvalidSyntax(plan.declaration)))?;
+    let Some(declaration) = comments.callable_declaration(arena, plan.declaration) else {
+        return Ok(None);
+    };
+    let Some(annotation) = declaration.type_() else {
+        return Ok(None);
+    };
+    let Some(callback) = annotation.resolved_callback() else {
+        return Ok(None);
+    };
     let Some(SourceNodeParent::Parent(variable)) = store.source_node_parent(plan.declaration)
     else {
         return Err(invalid());
@@ -8149,18 +8160,6 @@ pub(super) fn authenticated_jsdoc_contextual_source_signature(
     ) {
         return Err(invalid());
     }
-
-    let comments = plan_javascript_source_jsdoc(arena, bound.source_file())
-        .map_err(|_| invariant(SourceCallableInvariant::InvalidSyntax(plan.declaration)))?;
-    let Some(declaration) = comments.callable_declaration(arena, plan.declaration) else {
-        return Ok(None);
-    };
-    let Some(annotation) = declaration.type_() else {
-        return Ok(None);
-    };
-    let Some(callback) = annotation.resolved_callback() else {
-        return Ok(None);
-    };
     if !matches!(annotation.type_(), JsDocType::Named(name) if name == callback.name())
         || declaration
             .callbacks()
@@ -16778,6 +16777,79 @@ mod tests {
                 ))
             ));
             assert_eq!(publication_state(&fixture.store), cold);
+        }
+    }
+
+    #[test]
+    fn javascript_callback_anchors_are_required_only_for_callback_annotations() {
+        for (index, (source, kind, has_callback)) in [
+            ("var callback = () => {};", SyntaxKind::ArrowFunction, false),
+            (
+                "const callback = () => {}; callback.value = 1;",
+                SyntaxKind::ArrowFunction,
+                false,
+            ),
+            (
+                "const callback = function () {};",
+                SyntaxKind::FunctionExpression,
+                false,
+            ),
+            (
+                concat!(
+                    "/** @callback Callback\n * @returns {void}\n */\n",
+                    "/** @type {Callback} */ var callback = () => {};",
+                ),
+                SyntaxKind::ArrowFunction,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = QueryFixture::javascript(
+                source,
+                FileId::new(1_332 + u32::try_from(index).unwrap()),
+            );
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let plan =
+                plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+            let Some(SourceNodeParent::Parent(variable)) =
+                fixture.store.source_node_parent(declaration)
+            else {
+                panic!("expected a variable-owned callable")
+            };
+            let variable = fixture.bound.symbol(variable).unwrap();
+            assert!(!fixture.store.source_contextual_callable_anchor_is_exact(
+                declaration,
+                owner,
+                variable,
+            ));
+            let before = generic_transaction_state(&fixture.store);
+            let context =
+                authenticated_jsdoc_contextual_source_signature(&fixture.store, &host, &plan, None);
+            if has_callback {
+                assert!(context.is_err(), "{source}");
+            } else {
+                assert_eq!(context, Ok(None), "{source}");
+            }
+            assert_eq!(generic_transaction_state(&fixture.store), before);
         }
     }
 
