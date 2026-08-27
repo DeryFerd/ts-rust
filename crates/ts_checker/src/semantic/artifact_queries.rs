@@ -59,6 +59,10 @@ pub enum CanonicalArtifactQueryError {
         declaration: NodeRef,
     },
     SourceCheck(SourceCheckError),
+    Class {
+        node: NodeRef,
+        error: super::ClassError,
+    },
     DeclaredType(DeclaredTypeError),
     Alias(CanonicalAliasQueryError),
     SymbolDisplay(super::SymbolDisplayError),
@@ -127,6 +131,10 @@ impl std::fmt::Display for CanonicalArtifactQueryError {
                 )
             }
             Self::SourceCheck(error) => error.fmt(formatter),
+            Self::Class { node, error } => write!(
+                formatter,
+                "artifact class query failed at {node:?}: {error}"
+            ),
             Self::DeclaredType(error) => error.fmt(formatter),
             Self::Alias(error) => error.fmt(formatter),
             Self::SymbolDisplay(error) => error.fmt(formatter),
@@ -138,6 +146,7 @@ impl std::error::Error for CanonicalArtifactQueryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::SourceCheck(error) => Some(error),
+            Self::Class { error, .. } => Some(error),
             Self::DeclaredType(error) => Some(error),
             Self::Alias(error) => Some(error),
             Self::SymbolDisplay(error) => Some(error),
@@ -270,6 +279,13 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        match self.get_class_query_type_at_location(node) {
+            Ok(Some(type_)) => return self.validate_artifact_type(node, type_),
+            Ok(None) | Err(super::ClassError::Unsupported(_)) => {}
+            Err(super::ClassError::DeclaredType(error)) => return Err(error.into()),
+            Err(error) => return Err(CanonicalArtifactQueryError::Class { node, error }),
+        }
+
         if let Some((type_, _)) = self.heritage_artifact_target(node)? {
             return self.validate_artifact_type(node, type_);
         }
@@ -339,6 +355,7 @@ impl CanonicalCheckerContext<'_> {
             &self.validated_artifact_node(node)?.2.data,
             NodeData::ArrowFunction(_)
                 | NodeData::BinaryExpression(_)
+                | NodeData::ClassExpression(_)
                 | NodeData::ObjectLiteralExpression(_)
                 | NodeData::JsxElement(_)
                 | NodeData::JsxOpeningElement(_)
@@ -396,6 +413,29 @@ impl CanonicalCheckerContext<'_> {
             && let Some(symbol) = self.cached_artifact_symbol(node)?
         {
             return Ok(Some(symbol));
+        }
+
+        if bound_symbol.is_none()
+            && !matches!(
+                parent,
+                Some(LocationParent::Declaration(_) | LocationParent::AliasedPropertyName(_))
+            )
+            && !matches!(
+                parent,
+                Some(
+                    LocationParent::TypeReference(_)
+                        | LocationParent::TypeQuery(_)
+                        | LocationParent::QualifiedName(_)
+                )
+            )
+        {
+            let host = self.declared_type_host()?;
+            match super::classes::class_query_reference_symbol(self.store(), &host, node) {
+                Ok(Some(symbol)) => return self.merged_artifact_symbol(node, symbol).map(Some),
+                Ok(None) | Err(super::ClassError::Unsupported(_)) => {}
+                Err(super::ClassError::DeclaredType(error)) => return Err(error.into()),
+                Err(error) => return Err(CanonicalArtifactQueryError::Class { node, error }),
+            }
         }
 
         if let Some(symbol) = self.module_specifier_artifact_symbol(node)? {
@@ -2796,6 +2836,28 @@ impl CanonicalCheckerContext<'_> {
             .map(|record| (record.flags(), record.export_symbol()))
             .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?;
 
+        if flags.intersects(SymbolFlags::PROPERTY | SymbolFlags::METHOD)
+            && self
+                .store()
+                .symbol(symbol)
+                .and_then(ts_binder::semantic::Symbol::parent)
+                .and_then(|owner| self.store().symbol(owner))
+                .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+        {
+            match self.get_class_query_member_type(symbol) {
+                Ok(type_)
+                    if !flags.contains(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+                        || !self.options().intrinsic.strict_null_checks =>
+                {
+                    return self.validate_artifact_type(node, type_).map(Some);
+                }
+                Ok(_) => {}
+                Err(super::ClassError::Unsupported(_)) => {}
+                Err(super::ClassError::DeclaredType(error)) => return Err(error.into()),
+                Err(error) => return Err(CanonicalArtifactQueryError::Class { node, error }),
+            }
+        }
+
         if super::source_namespaces::has_pure_module_flags(flags)
             && let Some(declaration) = self
                 .store()
@@ -3117,11 +3179,31 @@ impl CanonicalCheckerContext<'_> {
             return Ok(None);
         };
         let annotation = {
-            let (_, bound, record) = self.validated_artifact_node(declaration)?;
-            if !bound
+            let (arena, bound, record) = self.validated_artifact_node(declaration)?;
+            let declaration_file = bound
                 .source_facts()
-                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
-            {
+                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file);
+            let mut ancestor = Some(declaration.node);
+            let mut seen = HashSet::new();
+            let mut ambient_variable = false;
+            while let Some(node) = ancestor {
+                if !seen.insert(node) {
+                    break;
+                }
+                let Some(record) = arena.get(node) else {
+                    break;
+                };
+                if record.kind == SyntaxKind::VariableStatement {
+                    ambient_variable = ts_binder::canonical_has_syntactic_modifier(
+                        arena,
+                        node,
+                        SyntaxKind::DeclareKeyword,
+                    );
+                    break;
+                }
+                ancestor = record.parent;
+            }
+            if !declaration_file && !ambient_variable {
                 return Ok(None);
             }
             match &record.data {

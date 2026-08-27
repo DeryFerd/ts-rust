@@ -3,7 +3,7 @@
 use std::{error::Error, fmt, fmt::Write as _};
 
 use ts_ast::{Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
-use ts_checker::semantic::TypeDisplayUnavailable;
+use ts_checker::semantic::{ClassError, TypeDisplayUnavailable};
 use ts_compiler::{
     CanonicalArtifactQueryError, CanonicalProgramCheckError, CanonicalProgramCheckFailureClass,
     CanonicalProgramQueries, CanonicalSymbolId, CanonicalTypeFormatFlags, CanonicalTypeId, Program,
@@ -134,6 +134,19 @@ impl ArtifactRenderError {
                 }
                 .failure_class()
             }
+            CanonicalArtifactQueryError::Class { error, .. } => match error {
+                ClassError::Unsupported(_) => CanonicalProgramCheckFailureClass::Unsupported {
+                    capability_code: "ARTIFACT.UNSUPPORTED_NODE",
+                },
+                ClassError::Invariant(_) => CanonicalProgramCheckFailureClass::Fatal {
+                    invariant_code: "INV.ARTIFACT.QUERY",
+                },
+                ClassError::DeclaredType(error) => CanonicalProgramCheckError::SourceCheck {
+                    file_name: file_name.to_owned(),
+                    error: error.into(),
+                }
+                .failure_class(),
+            },
             CanonicalArtifactQueryError::DeclaredType(error) => {
                 CanonicalProgramCheckError::SourceCheck {
                     file_name: file_name.to_owned(),
@@ -1035,7 +1048,7 @@ pub(super) fn declaration_name(parent: &Node) -> Option<NodeId> {
 #[cfg(test)]
 mod tests {
     use ts_ast::{NodeData, SyntaxKind};
-    use ts_checker::semantic::SymbolDisplayError;
+    use ts_checker::semantic::{ClassError, ClassInvariant, ClassUnsupported, SymbolDisplayError};
     use ts_compiler::{CanonicalArtifactQueryError, CanonicalProgramCheckFailureClass, Program};
     use ts_options::CompilerOptions;
     use ts_vfs::{FileSystem, MemoryFileSystem};
@@ -1046,6 +1059,38 @@ mod tests {
         ArtifactRenderError, SemanticArtifactWalk, declaration_full_start,
         ecma_line_and_utf16_column, render_program, source_files, walk_program,
     };
+
+    #[test]
+    fn class_query_errors_keep_unsupported_and_invariant_outcomes_separate() {
+        let parsed = ts_parser::parse_source_file("class Item {}");
+        let node = ts_ast::NodeRef::new(
+            parsed.arena.id(),
+            ts_ast::FileId::new(1),
+            parsed.source_file,
+        );
+        for (error, expected) in [
+            (
+                ClassError::Unsupported(ClassUnsupported::PropertyInitializer(node)),
+                CanonicalProgramCheckFailureClass::Unsupported {
+                    capability_code: "ARTIFACT.UNSUPPORTED_NODE",
+                },
+            ),
+            (
+                ClassError::Invariant(ClassInvariant::InvalidPropertyTypeCache(node)),
+                CanonicalProgramCheckFailureClass::Fatal {
+                    invariant_code: "INV.ARTIFACT.QUERY",
+                },
+            ),
+        ] {
+            let rendered = ArtifactRenderError::query(
+                "query",
+                "class.ts",
+                CanonicalArtifactQueryError::Class { node, error },
+            );
+            assert_eq!(rendered.class, expected);
+            assert!(rendered.detail.contains(&error.to_string()));
+        }
+    }
 
     fn fixture_filesystem(case: &Case) -> MemoryFileSystem {
         let filesystem = MemoryFileSystem::new(fixture_case_sensitive(case));

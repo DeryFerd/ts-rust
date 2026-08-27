@@ -1298,6 +1298,102 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         execute_nongeneric_class_shells(store, &host, &plan)
     }
 
+    /// Queries canonical class identities without checking or publishing members.
+    ///
+    /// This admits top-level nongeneric TypeScript declarations and named class expressions
+    /// in top-level variable initializers. Heritage remains a separate query.
+    /// It does not mark a source checked or admit it to the class writers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed source, binding, or cache error before query publication.
+    pub fn get_class_query_shells(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<ClassShells, ClassError> {
+        let Self {
+            options,
+            files,
+            store,
+            ..
+        } = self;
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?;
+        let plan = super::classes::plan_class_query(store, &host, symbol)?;
+        super::classes::execute_class_query_shells(store, &host, &plan)
+    }
+
+    /// Resolves one class member without publishing the class member tables.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsupported members and changed source bindings or caches.
+    pub fn get_class_query_member_type(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<TypeId, ClassError> {
+        let Self {
+            options,
+            files,
+            store,
+            global_types,
+            instantiation_session,
+            diagnostics,
+            ..
+        } = self;
+        instantiation_session.reset_query();
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?;
+        super::classes::ClassValueQuery {
+            store,
+            host: &host,
+            global_types,
+            options: *options,
+            session: instantiation_session,
+            diagnostics,
+        }
+        .member_type(symbol)
+    }
+
+    pub(super) fn get_class_query_type_at_location(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, ClassError> {
+        let Self {
+            options,
+            files,
+            store,
+            global_types,
+            instantiation_session,
+            diagnostics,
+            ..
+        } = self;
+        instantiation_session.reset_query();
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?;
+        super::classes::ClassValueQuery {
+            store,
+            host: &host,
+            global_types,
+            options: *options,
+            session: instantiation_session,
+            diagnostics,
+        }
+        .type_at_location(node)
+    }
+
     /// Materializes exact primitive annotated members and the default
     /// construct signature for one local nongeneric class declaration.
     ///

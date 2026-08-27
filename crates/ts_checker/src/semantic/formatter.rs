@@ -807,6 +807,13 @@ fn display_type_worker(
     }
     if type_flags.intersects(TypeFlags::TYPE_PARAMETER) {
         require_data_kind(type_id, record, TypeDataKind::TypeParameter)?;
+        if let Some(host) = host
+            && super::classes::class_query_is_this_type(store, host, type_id)
+                .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+        {
+            state.add(4);
+            return Ok("this".to_owned());
+        }
         let symbol = cached_ordinary_type_parameter_owner(store, type_id)
             .or_else(|| {
                 state
@@ -1343,6 +1350,12 @@ fn validated_class_method_return_type(
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
     if method_record.flags() != SymbolFlags::METHOD {
         return Ok(None);
+    }
+    if let Some(return_type) =
+        super::classes::selected_class_method_return_type(store, host, type_id)
+            .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+    {
+        return Ok(Some(return_type));
     }
     let TypeData::Object(object) = record.data() else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
@@ -2046,6 +2059,18 @@ fn display_validated_class_type(
     };
     if !owner.flags().contains(SymbolFlags::CLASS) {
         return Ok(None);
+    }
+    if let Some(side) = super::classes::class_query_type_side(store, host, type_id)
+        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+    {
+        let name = display_symbol_name(store, Some(host), type_id, symbol, state)?;
+        return Ok(Some(match side {
+            super::classes::ClassQueryTypeSide::Instance => name,
+            super::classes::ClassQueryTypeSide::Value => {
+                state.add(7);
+                format!("typeof {name}")
+            }
+        }));
     }
     let Some(instance) = store
         .declared_type_links(symbol)
