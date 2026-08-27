@@ -988,3 +988,89 @@ fn export_equals_final_invariant_global_class_namespace_merge_keeps_identity() {
         },
     );
 }
+
+#[test]
+fn export_equals_final_invariant_class_flags_cannot_hide_from_value_lookup() {
+    let mut failures = Vec::new();
+    for (source_kind, text, declaration_file) in [
+        ("checked", CLASS_SOURCE, false),
+        (
+            "prepared declaration",
+            "declare class Value { value: number; } export = Value;",
+            true,
+        ),
+    ] {
+        for (flag_name, changed_flags) in [
+            ("type alias", SymbolFlags::TYPE_ALIAS),
+            ("interface", SymbolFlags::INTERFACE),
+            ("none", SymbolFlags::NONE),
+        ] {
+            assert!(
+                !changed_flags.intersects(
+                    SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE | SymbolFlags::ALIAS
+                )
+            );
+            with_source(text, declaration_file, |context, fixture| {
+                let owner = fixture.owner(context, "Value");
+                if declaration_file {
+                    context.get_nongeneric_class_members(owner).unwrap();
+                }
+                let (declared, value) = identities(context, owner);
+                assert_healthy(context, fixture, owner, declared, value);
+                let record = context.store().symbol(owner).unwrap();
+                let flags = record.flags();
+                let check_flags = record.check_flags();
+                assert!(flags.intersects(SymbolFlags::CLASS));
+                let node_links = context
+                    .store()
+                    .type_node_links(fixture.exported)
+                    .cloned()
+                    .unwrap_or_default();
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                assert_ne!(number, declared);
+                assert_ne!(number, value);
+                let store = context.store_mut_for_test();
+                assert!(store.set_symbol_flags(owner, changed_flags, check_flags));
+                assert!(store.set_type_node_links(
+                    fixture.exported,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+                assert_eq!(context.store().source_symbol_flags(owner), Some(flags));
+                assert_eq!(
+                    context
+                        .store()
+                        .symbol_table(fixture.local_table)
+                        .unwrap()
+                        .get_source("Value"),
+                    Some(owner)
+                );
+                let before = snapshot(context, fixture);
+                for attempt in 0..2 {
+                    let route = context.export_equals_declared_artifact_type(fixture.exported);
+                    let actual = context.get_type_at_location(fixture.exported);
+                    eprintln!(
+                        "export flag-filter review: {source_kind}, {flag_name}, attempt {attempt}: route={route:?}, actual={actual:?}, declared={declared:?}, cached={number:?}"
+                    );
+                    if actual.is_ok() {
+                        failures.push(format!(
+                            "{source_kind}, {flag_name}, attempt {attempt}: accepted {actual:?}, route={route:?}"
+                        ));
+                    }
+                    if snapshot(context, fixture) != before {
+                        failures.push(format!(
+                            "{source_kind}, {flag_name}, attempt {attempt}: query changed state"
+                        ));
+                    }
+                }
+                let store = context.store_mut_for_test();
+                assert!(store.set_symbol_flags(owner, flags, check_flags));
+                assert!(store.set_type_node_links(fixture.exported, node_links));
+                assert_healthy(context, fixture, owner, declared, value);
+            });
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
