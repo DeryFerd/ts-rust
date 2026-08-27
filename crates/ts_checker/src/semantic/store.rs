@@ -2998,6 +2998,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_file_namespace_identities.get(&module)
     }
 
+    pub(super) fn source_file_namespace_identity_for_type(
+        &self,
+        type_: TypeId,
+    ) -> Option<&SourceFileNamespaceIdentity> {
+        self.source_file_namespace_identities
+            .values()
+            .find(|identity| identity.type_() == type_)
+    }
+
     pub(super) fn try_reserve_source_file_namespace_identities(&mut self, count: usize) -> bool {
         self.source_file_namespace_identities
             .try_reserve(count)

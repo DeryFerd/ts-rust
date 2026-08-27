@@ -375,6 +375,22 @@ fn source_file_namespace_record_is_exact(
     }
 }
 
+/// Finds the retained owner and rejects changes to a source namespace type record.
+pub(super) fn validated_source_file_namespace_owner(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<SemanticSymbolId>, SourceImportError> {
+    let Some(identity) = store.source_file_namespace_identity_for_type(type_) else {
+        return Ok(None);
+    };
+    if !source_file_namespace_record_is_exact(store, identity) {
+        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(
+            identity.module(),
+        )));
+    }
+    Ok(Some(identity.module()))
+}
+
 /// Validates the deferred or completed namespace without demanding export types.
 pub(super) fn source_file_namespace_type(
     store: &CanonicalTypeMapperStore,
