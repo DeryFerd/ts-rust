@@ -1,20 +1,15 @@
-//! Context-owned helper arity queries without source-body checking.
+//! Helper arity queries over source declarations without source-body checking.
 
-use ts_ast::{FileId, NodeArenaRevision, NodeData, NodeRef};
+use ts_ast::{FileId, NodeArenaRevision, NodeRef, SyntaxKind};
 use ts_binder::{SemanticSymbolId, SymbolFlags};
 
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError, TypeId,
-    bootstrap::LiteralTypeCacheError,
     calls::{DirectCallError, DirectCallUnsupported, call_signature_parameter_counts},
     instantiate::InstantiationSession,
-    object_members::{
-        DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
-    },
     type_nodes::CanonicalTypeQuery,
     type_records::TypeRecord,
-    types::TypeFlags,
 };
 
 /// The helper query could not establish an exact answer for a resolved value.
@@ -121,29 +116,15 @@ impl HelperSignatureQuery<'_, '_> {
         if !record.flags().intersects(SymbolFlags::VALUE) {
             return Err(CanonicalHelperSignatureError::InvalidSymbol(symbol));
         }
-        let declarations = record.declarations().unwrap_or_default().to_vec();
-        let declaration = record
-            .value_declaration()
-            .ok_or(CanonicalHelperSignatureError::MissingDeclaration(symbol))?;
-        if declarations
-            .iter()
-            .filter(|node| **node == declaration)
-            .count()
-            != 1
-        {
-            return Err(CanonicalHelperSignatureError::InvalidDeclaration {
-                symbol,
-                declaration,
-            });
-        }
-        for &node in &declarations {
-            self.validate_declaration(symbol, node)?;
-        }
+        let functions = self.function_declarations(symbol)?;
+        let Some(declaration) = functions.first().copied() else {
+            return Ok(false);
+        };
         let cached = self
             .store
             .value_symbol_links(symbol)
             .and_then(|links| links.resolved_type);
-        let (arena, bound) = self.host.source(declaration).ok_or(
+        let (_, bound) = self.host.source(declaration).ok_or(
             CanonicalHelperSignatureError::InvalidDeclaration {
                 symbol,
                 declaration,
@@ -159,37 +140,74 @@ impl HelperSignatureQuery<'_, '_> {
                 declaration,
             });
         }
-        let node = arena.get(declaration.node).ok_or(
-            CanonicalHelperSignatureError::InvalidDeclaration {
-                symbol,
-                declaration,
-            },
-        )?;
-        let type_ = match &node.data {
-            NodeData::FunctionDeclaration(_) if declarations.len() == 1 => self
-                .type_query()?
-                .get_type_of_source_callable(declaration, symbol)?,
-            NodeData::FunctionDeclaration(_) => {
-                self.existing_overload_type(symbol, declaration, cached)?
-            }
-            NodeData::VariableDeclaration(_)
-            | NodeData::PropertyDeclaration(_)
-            | NodeData::PropertySignatureDeclaration(_) => {
-                self.type_query()?.get_type_of_declared_value(symbol)?
-            }
-            _ => {
-                return Err(CanonicalHelperSignatureError::ProviderUnavailable {
-                    symbol,
-                    declaration,
-                });
-            }
+        let type_ = if functions.len() == 1 {
+            self.type_query()?
+                .get_type_of_source_callable(declaration, symbol)?
+        } else {
+            self.existing_overload_type(symbol, declaration, cached)?
         };
         let counts = call_signature_parameter_counts(self.store, self.global_types, type_)
-            .map_err(|error| Self::arity_error(symbol, type_, error))?;
-        match counts {
-            Some(counts) => Ok(counts.into_iter().any(|count| count > arity)),
-            None => self.proven_non_callable(symbol, type_),
+            .map_err(|error| Self::arity_error(symbol, type_, error))?
+            .ok_or(CanonicalHelperSignatureError::InvalidCallable { symbol, type_ })?;
+        Ok(counts.into_iter().any(|count| count > arity))
+    }
+
+    /// Authenticates the complete declaration set before selecting helper signatures.
+    fn function_declarations(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<Vec<NodeRef>, CanonicalHelperSignatureError> {
+        let record = self
+            .store
+            .symbol(symbol)
+            .ok_or(CanonicalHelperSignatureError::InvalidSymbol(symbol))?;
+        let declarations = record.declarations().unwrap_or_default();
+        let declaration = record
+            .value_declaration()
+            .ok_or(CanonicalHelperSignatureError::MissingDeclaration(symbol))?;
+        if declarations
+            .iter()
+            .filter(|node| **node == declaration)
+            .count()
+            != 1
+            || !self.store.source_merged_symbol_declarations_match(symbol)
+        {
+            return Err(CanonicalHelperSignatureError::InvalidDeclaration {
+                symbol,
+                declaration,
+            });
         }
+        let mut functions = Vec::new();
+        let mut unsupported = None;
+        for &node in declarations {
+            // Match the pinned IsFunctionLike filter before choosing a provider.
+            match self.validate_declaration(symbol, node)? {
+                SyntaxKind::FunctionDeclaration => functions.push(node),
+                SyntaxKind::MethodDeclaration
+                | SyntaxKind::Constructor
+                | SyntaxKind::GetAccessor
+                | SyntaxKind::SetAccessor
+                | SyntaxKind::FunctionExpression
+                | SyntaxKind::ArrowFunction
+                | SyntaxKind::MethodSignature
+                | SyntaxKind::CallSignature
+                | SyntaxKind::JsDocSignature
+                | SyntaxKind::ConstructSignature
+                | SyntaxKind::IndexSignature
+                | SyntaxKind::FunctionType
+                | SyntaxKind::ConstructorType => {
+                    unsupported.get_or_insert(node);
+                }
+                _ => {}
+            }
+        }
+        if let Some(declaration) = unsupported {
+            return Err(CanonicalHelperSignatureError::ProviderUnavailable {
+                symbol,
+                declaration,
+            });
+        }
+        Ok(functions)
     }
 
     fn type_query(&mut self) -> Result<CanonicalTypeQuery<'_, '_, '_, '_>, DeclaredTypeError> {
@@ -207,7 +225,7 @@ impl HelperSignatureQuery<'_, '_> {
         &self,
         symbol: SemanticSymbolId,
         declaration: NodeRef,
-    ) -> Result<(), CanonicalHelperSignatureError> {
+    ) -> Result<SyntaxKind, CanonicalHelperSignatureError> {
         let invalid = || CanonicalHelperSignatureError::InvalidDeclaration {
             symbol,
             declaration,
@@ -220,14 +238,17 @@ impl HelperSignatureQuery<'_, '_> {
                 actual: arena.revision(),
             });
         }
+        let node = arena.get(declaration.node).ok_or_else(invalid)?;
         if !declaration.is_for(arena.id(), bound.file_id())
             || !bound.contains(declaration)
             || !self.store.contains_node_ref(declaration)
             || !self.host.symbol_matches(self.store, declaration, symbol)
+            || self.store.source_node_kind(declaration) != Some(node.kind)
+            || !node.data.matches_syntax_kind(node.kind)
         {
             return Err(invalid());
         }
-        Ok(())
+        Ok(node.kind)
     }
 
     fn existing_overload_type(
@@ -247,37 +268,6 @@ impl HelperSignatureQuery<'_, '_> {
             });
         }
         Ok(type_)
-    }
-
-    fn proven_non_callable(
-        &self,
-        symbol: SemanticSymbolId,
-        type_: TypeId,
-    ) -> Result<bool, CanonicalHelperSignatureError> {
-        let invalid = || CanonicalHelperSignatureError::InvalidCallable { symbol, type_ };
-        let unavailable = || CanonicalHelperSignatureError::ArityUnavailable { symbol, type_ };
-        let record = self.store.type_payload(type_).ok_or_else(invalid)?;
-        let primitive = record.flags().intersects(
-            TypeFlags::PRIMITIVE
-                | TypeFlags::ANY
-                | TypeFlags::UNKNOWN
-                | TypeFlags::NEVER
-                | TypeFlags::NON_PRIMITIVE,
-        );
-        if !primitive {
-            match validate_resolved_declared_property_object(self.store, type_) {
-                DeclaredPropertyObjectValidation::Valid(_) => {}
-                DeclaredPropertyObjectValidation::NotDeclared => return Err(unavailable()),
-                DeclaredPropertyObjectValidation::Malformed => return Err(invalid()),
-            }
-        }
-        self.store
-            .validate_union_constituent_with_global_types(self.global_types, type_)
-            .map_err(|error| match error {
-                LiteralTypeCacheError::UnsupportedUnionConstituent(_) => unavailable(),
-                _ => invalid(),
-            })?;
-        Ok(false)
     }
 
     fn arity_error(
@@ -301,7 +291,7 @@ impl HelperSignatureQuery<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::NodeId;
+    use ts_ast::{NodeData, NodeId};
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         EscapedName,
@@ -312,7 +302,8 @@ mod tests {
     use crate::semantic::{
         AliasTargetState, CanonicalCheckerContext, CanonicalModuleResolutionEntry,
         CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
-        CanonicalResolvedModuleInput, TypeNodeLinks, ValueSymbolLinks, types::ObjectFlags,
+        CanonicalResolvedModuleInput, TypeNodeLinks, ValueSymbolLinks,
+        instantiate::InstantiationLimits, production::GlobalMergeCompletion,
     };
 
     const LIBRARY: FileId = FileId::new(24_000);
@@ -570,62 +561,132 @@ mod tests {
         let source = parsed("export declare const get: number;");
         let mut context = context(&lib, &source, true);
         let symbol = symbol(&context, &source, "get");
+        let before = (
+            counts(&context),
+            context.store().checker_link_allocated_lengths(),
+        );
         assert_eq!(
             context.has_call_signature_with_arity_greater_than(symbol, 3),
             Ok(false)
         );
-        let before = counts(&context);
         assert_eq!(
             context.has_call_signature_with_arity_greater_than(symbol, 0),
             Ok(false)
         );
-        assert_eq!(counts(&context), before);
+        assert_eq!(
+            (
+                counts(&context),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert!(context.store().value_symbol_links(symbol).is_none());
+        assert!(context.store().declared_value_provenance(symbol).is_none());
         assert_unchecked(&context);
     }
 
     #[test]
-    fn non_callable_type_literals_use_the_declared_object_proof() {
+    fn variable_call_and_constructor_annotations_stay_cold() {
         let lib = library();
-        for annotation in ["{}", "{ tag: number }"] {
-            let source = parsed(&format!("declare const get: {annotation};"));
+        for annotation in [
+            "{}",
+            "{ tag: number }",
+            "(a: number, b: number, c: number, d: number) => 'ready'",
+            "{ (a: number, b: number, c: number, d: number): 'ready'; }",
+            "Call",
+            "new () => 'ready'",
+            "Ctor",
+            "Missing",
+        ] {
+            let source = parsed(&format!(
+                "type Call = {{ (a: number, b: number, c: number, d: number): 'ready'; }}; \
+                 type Ctor = new () => 'ready'; declare const get: {annotation};"
+            ));
             let mut context = context(&lib, &source, false);
             let symbol = symbol(&context, &source, "get");
+            let declaration = NodeRef::new(source.arena.id(), SOURCE, declaration(&source, "get"));
+            let annotation_node = context
+                .store()
+                .source_direct_type_annotation(declaration)
+                .unwrap();
+            let before = (
+                counts(&context),
+                context.store().checker_link_allocated_lengths(),
+            );
+            for arity in [0, 3, 4] {
+                assert_eq!(
+                    context.has_call_signature_with_arity_greater_than(symbol, arity),
+                    Ok(false),
+                    "{annotation}"
+                );
+            }
             assert_eq!(
-                context.has_call_signature_with_arity_greater_than(symbol, 0),
-                Ok(false),
-                "{annotation}"
+                (
+                    counts(&context),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
             );
-            let before = counts(&context);
-            let links = context.store().value_symbol_links(symbol).unwrap().clone();
-            let type_ = links.resolved_type.unwrap();
-            let flags = context.store().type_payload(type_).unwrap().object_flags();
+            assert!(context.store().value_symbol_links(symbol).is_none());
+            assert!(context.store().declared_value_provenance(symbol).is_none());
+            assert!(context.store().type_node_links(annotation_node).is_none());
+            assert_unchecked(&context);
+        }
+    }
+
+    #[test]
+    fn callable_get_and_set_variables_have_no_helper_declaration_signatures() {
+        let lib = library();
+        for (declaration_file, source_text) in [
+            (
+                true,
+                concat!(
+                    "export declare const __classPrivateFieldGet: ",
+                    "(receiver: unknown, state: unknown, kind: unknown, f: unknown) => unknown; ",
+                    "export declare const __classPrivateFieldSet: ",
+                    "(receiver: unknown, state: unknown, value: unknown, kind: unknown, f: unknown) => unknown;",
+                ),
+            ),
+            (
+                false,
+                concat!(
+                    "export const __classPrivateFieldGet = ",
+                    "(receiver: unknown, state: unknown, kind: unknown, f: unknown) => missingGet; ",
+                    "export const __classPrivateFieldSet = ",
+                    "(receiver: unknown, state: unknown, value: unknown, kind: unknown, f: unknown) => missingSet;",
+                ),
+            ),
+        ] {
+            let source = parsed(source_text);
+            let mut context = context_with_source_kind(&lib, &source, true, declaration_file);
+            let (_, bound) = context.file(SOURCE).unwrap();
+            let module = bound.symbol(bound.source_file()).unwrap();
+            let before = (
+                counts(&context),
+                context.store().checker_link_allocated_lengths(),
+            );
+            for (name, arity) in [("__classPrivateFieldGet", 3), ("__classPrivateFieldSet", 4)] {
+                let export = context
+                    .get_module_export_by_name(module, name)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(export, symbol(&context, &source, name));
+                for _ in 0..2 {
+                    assert_eq!(
+                        context.has_call_signature_with_arity_greater_than(export, arity),
+                        Ok(false),
+                        "{name}"
+                    );
+                }
+                assert!(context.store().value_symbol_links(export).is_none());
+            }
             assert_eq!(
-                context.has_call_signature_with_arity_greater_than(symbol, 3),
-                Ok(false)
+                (
+                    counts(&context),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
             );
-            assert_eq!(counts(&context), before);
-            assert!(
-                context
-                    .store_mut_for_test()
-                    .set_type_object_flags(type_, flags & !ObjectFlags::MEMBERS_RESOLVED)
-            );
-            assert!(
-                context
-                    .has_call_signature_with_arity_greater_than(symbol, 3)
-                    .is_err()
-            );
-            assert_eq!(counts(&context), before);
-            assert_eq!(context.store().value_symbol_links(symbol), Some(&links));
-            assert!(
-                context
-                    .store_mut_for_test()
-                    .set_type_object_flags(type_, flags)
-            );
-            assert_eq!(
-                context.has_call_signature_with_arity_greater_than(symbol, 3),
-                Ok(false)
-            );
-            assert_eq!(counts(&context), before);
             assert_unchecked(&context);
         }
     }
@@ -653,7 +714,7 @@ mod tests {
                 ("get", true),
                 ("oldGet", false),
                 ("scalar", false),
-                ("variable", true),
+                ("variable", false),
             ] {
                 let export = context
                     .get_module_export_by_name(module, name)
@@ -681,6 +742,13 @@ mod tests {
                     Ok(expected),
                     "{entry_text}: {name}"
                 );
+                if matches!(name, "scalar" | "variable") {
+                    assert!(context.store().value_symbol_links(target).is_none());
+                    let node =
+                        NodeRef::new(helpers.arena.id(), SOURCE, declaration(&helpers, name));
+                    let annotation = context.store().source_direct_type_annotation(node).unwrap();
+                    assert!(context.store().type_node_links(annotation).is_none());
+                }
                 let before = (
                     counts(&context),
                     context.store().checker_link_allocated_lengths(),
@@ -932,38 +1000,142 @@ mod tests {
     }
 
     #[test]
-    fn a_poisoned_callable_variable_does_not_materialize_its_annotation() {
+    fn a_warm_callable_variable_still_has_no_helper_declaration_signatures() {
         let lib = library();
         let source = parsed(
             "export declare const get: (a: number, b: number, c: number, d: number) => void;",
         );
         let mut context = context(&lib, &source, true);
         let symbol = symbol(&context, &source, "get");
-        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
-        assert!(context.store_mut_for_test().set_value_symbol_links(
-            symbol,
-            ValueSymbolLinks {
-                resolved_type: Some(wrong),
-                ..ValueSymbolLinks::default()
-            }
-        ));
-        let before = counts(&context);
-        assert!(
-            context
-                .has_call_signature_with_arity_greater_than(symbol, 3)
-                .is_err()
+        assert_eq!(
+            context.has_call_signature_with_arity_greater_than(symbol, 3),
+            Ok(false)
         );
-        assert_eq!(counts(&context), before);
-        assert!(
-            context
-                .store_mut_for_test()
-                .set_value_symbol_links(symbol, ValueSymbolLinks::default())
+        assert!(context.store().value_symbol_links(symbol).is_none());
+
+        let library_bound = context.file(LIBRARY).unwrap().1.clone();
+        let source_bound = context.file(SOURCE).unwrap().1.clone();
+        let options = CanonicalCheckerOptions::default();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&lib.arena, &library_bound), (&source.arena, &source_bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let value = CanonicalTypeQuery::new_with_global_types_and_session(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_declared_value(symbol)
+        .unwrap();
+        assert_eq!(
+            call_signature_parameter_counts(context.store(), &globals, value),
+            Ok(Some(vec![4]))
+        );
+        let links = context.store().value_symbol_links(symbol).unwrap().clone();
+        let before = (
+            counts(&context),
+            context.store().checker_link_allocated_lengths(),
         );
         assert_eq!(
             context.has_call_signature_with_arity_greater_than(symbol, 3),
-            Ok(true)
+            Ok(false)
         );
+        assert_eq!(context.store().value_symbol_links(symbol), Some(&links));
+        assert_eq!(
+            (
+                counts(&context),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert!(diagnostics.is_empty());
         assert_unchecked(&context);
+    }
+
+    #[test]
+    fn non_function_like_negatives_require_the_retained_declaration_identity() {
+        let lib = library();
+        let source = parsed(concat!(
+            "export declare const get: (a: number, b: number, c: number, d: number) => void; ",
+            "declare function other(a: number, b: number, c: number, d: number): void;",
+        ));
+        for poison in ["flags", "declarations", "missing-value"] {
+            let mut context = context(&lib, &source, true);
+            let symbol = symbol(&context, &source, "get");
+            let original = context.store().symbol(symbol).unwrap().clone();
+            assert_eq!(
+                context.has_call_signature_with_arity_greater_than(symbol, 3),
+                Ok(false)
+            );
+            match poison {
+                "flags" => assert!(context.store_mut_for_test().set_symbol_flags(
+                    symbol,
+                    SymbolFlags::FUNCTION,
+                    original.check_flags(),
+                )),
+                "declarations" => {
+                    let other =
+                        NodeRef::new(source.arena.id(), SOURCE, declaration(&source, "other"));
+                    assert!(context.store_mut_for_test().set_symbol_declarations(
+                        symbol,
+                        Some(vec![other]),
+                        Some(other),
+                    ));
+                }
+                "missing-value" => assert!(context.store_mut_for_test().set_symbol_declarations(
+                    symbol,
+                    original.declarations().map(<[_]>::to_vec),
+                    None,
+                )),
+                _ => unreachable!(),
+            }
+            let before = (
+                counts(&context),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert!(
+                context
+                    .has_call_signature_with_arity_greater_than(symbol, 3)
+                    .is_err()
+            );
+            assert_eq!(
+                (
+                    counts(&context),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+            assert!(context.store_mut_for_test().set_symbol_flags(
+                symbol,
+                original.flags(),
+                original.check_flags(),
+            ));
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                symbol,
+                original.declarations().map(<[_]>::to_vec),
+                original.value_declaration(),
+            ));
+            assert_eq!(
+                context.has_call_signature_with_arity_greater_than(symbol, 3),
+                Ok(false)
+            );
+            assert_eq!(
+                (
+                    counts(&context),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+            assert_unchecked(&context);
+        }
     }
 
     #[test]

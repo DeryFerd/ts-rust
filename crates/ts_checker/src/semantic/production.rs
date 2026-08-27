@@ -1143,10 +1143,12 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             .map_err(Into::into)
     }
 
-    /// Tests the effective call arity of one resolved value symbol.
+    /// Tests the effective call arity of a symbol's own function-like declarations.
     ///
-    /// Cold declaration-file values use the installed callable providers.
-    /// This query does not check a source body or demand a signature return.
+    /// Cold declaration-file functions use the installed callable providers.
+    /// Variables have no helper declaration signatures, even if their types
+    /// are callable. This query does not read their annotations, check a source
+    /// body, or demand a signature return.
     ///
     /// # Errors
     ///
