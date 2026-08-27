@@ -11928,9 +11928,6 @@ fn validate_global_date_interface_type_graph(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> DeclaredPropertyTypeGraphValidation {
-    use super::callable_sets::{
-        StoredCallableSetValidation, validate_stored_declared_method_callable_set,
-    };
     use DeclaredPropertyTypeGraphValidation::{Malformed, Opaque, Traversable};
 
     let Some(record) = store.type_payload(type_) else {
@@ -11982,7 +11979,6 @@ fn validate_global_date_interface_type_graph(
             || store.declared_type_links(symbol)?.declared_type != Some(type_)
             || record.flags() != TypeFlags::OBJECT
             || record.alias().is_some()
-            || !valid_thisless_interface_identity(interface)
         {
             return None;
         }
@@ -11997,7 +11993,7 @@ fn validate_global_date_interface_type_graph(
             }
             match store.source_node_kind(declaration)? {
                 SyntaxKind::InterfaceDeclaration => {
-                    if !default_library_interface_declaration_matches(
+                    if !default_library_interface_declaration_owner_matches(
                         store,
                         symbol,
                         declaration,
@@ -12020,6 +12016,44 @@ fn validate_global_date_interface_type_graph(
             return None;
         }
 
+        let marker = date_interface_marker(store, symbol, type_)?;
+        let mut expected_declarations = HashSet::new();
+        let mut declaration_order = Vec::new();
+        let mut excluded_members = false;
+        for declaration in &interface_declarations {
+            for child in store.source_direct_children(*declaration)? {
+                match store.source_node_kind(child)? {
+                    SyntaxKind::Identifier | SyntaxKind::DeclareKeyword => {}
+                    SyntaxKind::MethodSignature if expected_declarations.insert(child) => {
+                        declaration_order.push(child);
+                    }
+                    SyntaxKind::TypeParameter
+                    | SyntaxKind::HeritageClause
+                    | SyntaxKind::PropertyDeclaration
+                    | SyntaxKind::PropertySignature
+                    | SyntaxKind::GetAccessor
+                    | SyntaxKind::SetAccessor
+                    | SyntaxKind::IndexSignature
+                    | SyntaxKind::CallSignature
+                    | SyntaxKind::ConstructSignature => excluded_members = true,
+                    _ => return None,
+                }
+            }
+        }
+        if excluded_members {
+            super::declared::preflight_class_or_interface_reference(
+                store,
+                &DeclaredTypeHost::default(),
+                symbol,
+                owner.flags(),
+            )
+            .ok()?;
+            return Some(Opaque);
+        }
+        if !valid_thisless_interface_identity(interface) {
+            return None;
+        }
+
         let cold = record.object_flags() == ObjectFlags::INTERFACE
             && valid_unresolved_interface_members(interface);
         let structured = &interface.reference.object.structured;
@@ -12029,7 +12063,11 @@ fn validate_global_date_interface_type_graph(
             && interface.resolved_base_constructor_type.is_none()
             && interface.resolved_base_types.is_none()
             && interface.declared_members_resolved
-            && interface.declared_members == owner.members()
+            && super::structured_members::valid_declared_member_table(
+                store,
+                symbol,
+                interface.declared_members,
+            )
             && interface.declared_members == structured.members
             && interface.declared_call_signatures.is_none()
             && interface.declared_construct_signatures.is_none()
@@ -12039,44 +12077,52 @@ fn validate_global_date_interface_type_graph(
             return None;
         }
         let table = store.symbol_table(owner.members()?)?;
-        let mut expected_declarations = HashSet::new();
-        for declaration in &interface_declarations {
-            for child in store.source_direct_children(*declaration)? {
-                match store.source_node_kind(child)? {
-                    SyntaxKind::Identifier | SyntaxKind::DeclareKeyword => {}
-                    SyntaxKind::MethodSignature if expected_declarations.insert(child) => {}
-                    _ => return None,
-                }
-            }
-        }
         let mut seen_declarations = HashSet::new();
+        let mut seen_sources = HashSet::new();
         let mut methods = Vec::with_capacity(table.len());
         let mut edges = Vec::new();
-        let mut marker = None;
-        for (name, raw_method) in table.iter() {
-            let method = store.get_merged_symbol(raw_method)?;
-            let method_record = store.symbol(method)?;
+        let mut unsupported = false;
+        for declaration in declaration_order {
+            let source = store.source_declaration_symbol(declaration)?;
+            if !seen_sources.insert(source) {
+                continue;
+            }
+            let method_record = store.symbol(source)?;
+            let name = method_record.name();
             let method_declarations = method_record.declarations()?;
             if method_record.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::METHOD
                 || method_record.check_flags() != CheckFlags::NONE
-                || method_record.name() != name
-                || name.as_utf8().is_none()
-                || name.is_reserved_member_name()
-                || name.is_private_identifier()
-                || name.is_late_bound()
-                || store.authenticated_interface_method_owner(method) != Some((symbol, type_))
-                || !store.source_merged_symbol_declarations_match(method)
+                || store.get_parent_of_symbol(source) != Some(symbol)
+                || store.get_merged_symbol(source) != Some(source)
+                || !store.source_merged_symbol_declarations_match(source)
+                || method_declarations.is_empty()
+                || method_record.value_declaration() != method_declarations.first().copied()
+                || method_record.members().is_some()
+                || method_record.exports().is_some()
+                || method_record.export_symbol().is_some()
             {
                 return None;
             }
+            let computed = store
+                .source_child_with_kind(declaration, SyntaxKind::ComputedPropertyName)
+                .is_some();
             for &declaration in method_declarations {
                 if !seen_declarations.insert(declaration)
                     || !expected_declarations.contains(&declaration)
-                    || !store.source_declaration_belongs_to_symbol(declaration, method)
+                    || store.source_declaration_symbol(declaration) != Some(source)
                     || store
-                        .source_child_with_kind(declaration, SyntaxKind::TypeParameter)
+                        .source_child_with_kind(declaration, SyntaxKind::ComputedPropertyName)
                         .is_some()
-                    || store
+                        != computed
+                {
+                    return None;
+                }
+                unsupported |= store
+                    .source_direct_children(declaration)?
+                    .into_iter()
+                    .any(|child| store.source_node_kind(child) == Some(SyntaxKind::TypeParameter));
+                if !computed
+                    && store
                         .source_child_with_kind(declaration, SyntaxKind::Identifier)
                         .and_then(|name| store.source_identifier_text(name))
                         != name.as_utf8()
@@ -12084,64 +12130,188 @@ fn validate_global_date_interface_type_graph(
                     return None;
                 }
             }
-            if name.as_utf8() == Some("toISOString") {
-                let [declaration] = method_declarations else {
+            let method = if computed {
+                unsupported = true;
+                if name != InternalSymbolName::Computed.as_ref() {
                     return None;
-                };
-                if marker.replace(method).is_some()
-                    || method_record.flags() != SymbolFlags::METHOD
-                    || store.source_direct_children(*declaration)?.len() != 2
-                    || store
-                        .source_direct_type_annotation(*declaration)
-                        .and_then(|annotation| store.source_node_kind(annotation))
-                        != Some(SyntaxKind::StringKeyword)
+                }
+                match store
+                    .late_bound_links(source)
+                    .and_then(|links| links.late_symbol)
+                {
+                    Some(late) => {
+                        if store.symbol(late)?.check_flags() != CheckFlags::LATE
+                            || store.late_bound_method_source(late) != Some(source)
+                            || store.authenticated_interface_method_owner(late)
+                                != Some((symbol, type_))
+                            || declared_method_value_links(store, late, None).is_none()
+                        {
+                            return None;
+                        }
+                        Some(late)
+                    }
+                    None => {
+                        if resolved
+                            || store
+                                .value_symbol_links(source)
+                                .is_some_and(|links| links != &ValueSymbolLinks::default())
+                            || method_declarations.iter().any(|declaration| {
+                                store
+                                    .signature_links(*declaration)
+                                    .is_some_and(|links| links != &SignatureLinks::default())
+                                    || store.symbol_node_links(*declaration).is_some_and(|links| {
+                                        links.resolved_symbol.is_some_and(|symbol| {
+                                            store.get_merged_symbol(symbol) != Some(source)
+                                        })
+                                    })
+                            })
+                        {
+                            return None;
+                        }
+                        None
+                    }
+                }
+            } else {
+                if name.as_utf8().is_none()
+                    || name.is_reserved_member_name()
+                    || name.is_private_identifier()
+                    || name.is_late_bound()
+                    || table
+                        .get(name)
+                        .and_then(|symbol| store.get_merged_symbol(symbol))
+                        != Some(source)
+                    || store.authenticated_interface_method_owner(source) != Some((symbol, type_))
                 {
                     return None;
                 }
-            }
-            match store
-                .value_symbol_links(method)
-                .and_then(|links| links.resolved_type)
-            {
-                Some(_) => {
-                    let (callable, value) = declared_method_value_types(store, method)?;
-                    if !matches!(
-                        validate_stored_declared_method_callable_set(store, callable),
-                        Some(StoredCallableSetValidation::Valid { .. })
-                    ) {
-                        return None;
-                    }
+                Some(source)
+            };
+            if let Some(method) = method {
+                if let Some(value) = date_method_cached_value(store, method, resolved)? {
                     edges.push(value);
                 }
-                None => {
-                    if resolved
-                        || store
-                            .value_symbol_links(method)
-                            .is_some_and(|links| links != &ValueSymbolLinks::default())
-                        || method_declarations.iter().any(|declaration| {
-                            store
-                                .signature_links(*declaration)
-                                .is_some_and(|links| links != &SignatureLinks::default())
-                        })
-                    {
-                        return None;
-                    }
-                }
+                methods.push(method);
             }
-            methods.push(method);
         }
-        if marker.is_none()
+        if !seen_sources.contains(&marker)
             || seen_declarations != expected_declarations
+            || table.iter().any(|(name, raw)| {
+                store.get_merged_symbol(raw).is_none_or(|source| {
+                    !seen_sources.contains(&source)
+                        || store
+                            .symbol(source)
+                            .is_none_or(|record| record.name() != name)
+                })
+            })
             || resolved && structured.properties.as_deref() != Some(methods.as_slice())
         {
             return None;
         }
-        Some(edges)
+        Some(if unsupported {
+            Opaque
+        } else {
+            Traversable(edges)
+        })
     })();
-    valid.map_or(Malformed, Traversable)
+    valid.unwrap_or(Malformed)
+}
+
+fn date_interface_marker(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    type_: TypeId,
+) -> Option<SemanticSymbolId> {
+    let marker = store
+        .symbol_table(store.symbol(owner)?.members()?)?
+        .get_source("toISOString")?;
+    let marker = store.get_merged_symbol(marker)?;
+    let method = store.symbol(marker)?;
+    let [declaration] = method.declarations()? else {
+        return None;
+    };
+    if method.flags() != SymbolFlags::METHOD
+        || method.name().as_utf8() != Some("toISOString")
+        || !store.source_merged_symbol_declarations_match(marker)
+        || store.authenticated_interface_method_owner(marker) != Some((owner, type_))
+        || store.source_direct_children(*declaration)?.len() != 2
+        || store
+            .source_child_with_kind(*declaration, SyntaxKind::Identifier)
+            .and_then(|name| store.source_identifier_text(name))
+            != Some("toISOString")
+        || store
+            .source_direct_type_annotation(*declaration)
+            .and_then(|annotation| store.source_node_kind(annotation))
+            != Some(SyntaxKind::StringKeyword)
+    {
+        return None;
+    }
+    date_method_cached_value(
+        store,
+        marker,
+        store
+            .type_payload(type_)?
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED),
+    )?;
+    Some(marker)
+}
+
+fn date_method_cached_value(
+    store: &CanonicalTypeMapperStore,
+    method: SemanticSymbolId,
+    resolved: bool,
+) -> Option<Option<TypeId>> {
+    use super::callable_sets::{
+        StoredCallableSetValidation, validate_stored_declared_method_callable_set,
+    };
+    if store
+        .value_symbol_links(method)
+        .and_then(|links| links.resolved_type)
+        .is_some()
+    {
+        let (callable, value) = declared_method_value_types(store, method)?;
+        return matches!(
+            validate_stored_declared_method_callable_set(store, callable),
+            Some(StoredCallableSetValidation::Valid { .. })
+        )
+        .then_some(Some(value));
+    }
+    let expected = declared_method_value_links(store, method, None)?;
+    if resolved
+        || store
+            .value_symbol_links(method)
+            .is_some_and(|links| links != &expected)
+        || store
+            .symbol(method)?
+            .declarations()?
+            .iter()
+            .any(|declaration| {
+                store
+                    .signature_links(*declaration)
+                    .is_some_and(|links| links != &SignatureLinks::default())
+            })
+    {
+        return None;
+    }
+    Some(None)
 }
 
 fn default_library_interface_declaration_matches(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    name: &str,
+) -> bool {
+    default_library_interface_declaration_owner_matches(store, symbol, declaration, name)
+        && store
+            .source_child_with_kind(declaration, SyntaxKind::TypeParameter)
+            .is_none()
+        && store
+            .source_child_with_kind(declaration, SyntaxKind::HeritageClause)
+            .is_none()
+}
+
+fn default_library_interface_declaration_owner_matches(
     store: &CanonicalTypeMapperStore,
     symbol: SemanticSymbolId,
     declaration: NodeRef,
@@ -12158,12 +12328,6 @@ fn default_library_interface_declaration_matches(
             .source_child_with_kind(declaration, SyntaxKind::Identifier)
             .and_then(|identifier| store.source_identifier_text(identifier))
             == Some(name)
-        && store
-            .source_child_with_kind(declaration, SyntaxKind::TypeParameter)
-            .is_none()
-        && store
-            .source_child_with_kind(declaration, SyntaxKind::HeritageClause)
-            .is_none()
 }
 
 fn global_date_value_binding_matches(
@@ -24492,6 +24656,250 @@ mod generic_publication_tests {
         "declare var Date: DateConstructor;",
     );
     const DATE_UNION_AUGMENTATION: &str = "interface Date { toJSON(key?: any): string; }";
+
+    fn assert_date_union_rejection_without_writes(
+        fixture: &mut DateUnionFixture<'_>,
+        expected: crate::semantic::bootstrap::LiteralTypeCacheError,
+    ) {
+        use crate::semantic::bootstrap::LiteralTypeCacheError;
+
+        let store = fixture.context.store_mut_for_test();
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.index_info_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        let graph = validate_resolved_declared_property_type_graph(store, fixture.type_);
+        match expected {
+            LiteralTypeCacheError::UnsupportedUnionConstituent(_) => {
+                assert!(matches!(graph, DeclaredPropertyTypeGraphValidation::Opaque));
+            }
+            LiteralTypeCacheError::InvalidCachedUnion(_) => {
+                assert!(matches!(
+                    graph,
+                    DeclaredPropertyTypeGraphValidation::Malformed
+                ));
+            }
+            _ => panic!("the Date graph must distinguish excluded shapes from invalid caches"),
+        }
+        assert_eq!(
+            store.expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal),
+            Err(expected),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    fn assert_excluded_date_marker_cache_guard(fixture: &mut DateUnionFixture<'_>) {
+        use crate::semantic::bootstrap::LiteralTypeCacheError;
+
+        let unsupported = LiteralTypeCacheError::UnsupportedUnionConstituent(fixture.type_);
+        let malformed = LiteralTypeCacheError::InvalidCachedUnion(fixture.type_);
+        assert_date_union_rejection_without_writes(fixture, unsupported);
+        let store = fixture.context.store_mut_for_test();
+        let marker_links = store
+            .value_symbol_links(fixture.marker)
+            .cloned()
+            .unwrap_or_default();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(store.set_value_symbol_links(
+            fixture.marker,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_date_union_rejection_without_writes(fixture, malformed);
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_value_symbol_links(fixture.marker, marker_links)
+        );
+        assert_date_union_rejection_without_writes(fixture, unsupported);
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(fixture.sibling)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn date_unions_keep_generic_siblings_opaque_without_hiding_invalid_caches() {
+        use crate::semantic::bootstrap::LiteralTypeCacheError;
+
+        let library = parse_source_file(DATE_UNION_LIBRARY);
+        for method in [
+            "extra<T>(value: T): T;",
+            "extra<T, U>(first: T, second: U): T;",
+        ] {
+            let source = format!(
+                "{DATE_UNION_AUGMENTATION} interface Date {{ {method} }} {}",
+                "interface DateConstructor { new(value: string): Date; }",
+            );
+            let augmentation = parse_source_file(&source);
+            for warm in [false, true] {
+                let mut fixture = date_union_fixture(&library, &augmentation, true);
+                if warm {
+                    publish_date_union_marker(&mut fixture);
+                }
+                assert_excluded_date_marker_cache_guard(&mut fixture);
+                let unsupported = LiteralTypeCacheError::UnsupportedUnionConstituent(fixture.type_);
+                let malformed = LiteralTypeCacheError::InvalidCachedUnion(fixture.type_);
+                let store = fixture.context.store_mut_for_test();
+                let constructor = store
+                    .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                    .and_then(|globals| globals.get_source("DateConstructor"))
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap();
+                let declarations = store
+                    .symbol(constructor)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()
+                    .to_vec();
+                assert_eq!(declarations.len(), 2);
+                assert_ne!(declarations[0], declarations[1]);
+                assert!(store.set_symbol_declarations(
+                    constructor,
+                    Some(vec![declarations[0], declarations[0]]),
+                    None,
+                ));
+                assert_date_union_rejection_without_writes(&mut fixture, malformed);
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_symbol_declarations(constructor, Some(declarations), None,)
+                );
+                assert_date_union_rejection_without_writes(&mut fixture, unsupported);
+            }
+        }
+    }
+
+    #[test]
+    fn date_unions_keep_nonmethod_siblings_opaque_without_hiding_marker_caches() {
+        let library = parse_source_file(DATE_UNION_LIBRARY);
+        for member in [
+            "readonly label: string;",
+            "get value(): number;",
+            "[index: number]: string;",
+            "(): string;",
+            "new(): Date;",
+        ] {
+            let source = format!("{DATE_UNION_AUGMENTATION} interface Date {{ {member} }}");
+            let augmentation = parse_source_file(&source);
+            for warm in [false, true] {
+                let mut fixture = date_union_fixture(&library, &augmentation, true);
+                if warm {
+                    publish_date_union_marker(&mut fixture);
+                }
+                assert_excluded_date_marker_cache_guard(&mut fixture);
+            }
+        }
+    }
+
+    #[test]
+    fn date_unions_keep_es2015_computed_siblings_opaque_without_writes() {
+        let well_known = include_str!("../../../ts_bundled/libs/lib.es2015.symbol.wellknown.d.ts");
+        let parsed = parse_source_file(well_known);
+        assert!(parsed.diagnostics.is_empty());
+        let range = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(interface.name)?.data else {
+                    return None;
+                };
+                (name.text == "Date").then_some(record.range)
+            })
+            .expect("the ES2015 library must contain its real Date declaration");
+        let augmentation_source = format!(
+            "{DATE_UNION_AUGMENTATION}\n{}",
+            &well_known[range.start.get() as usize..range.end.get() as usize],
+        );
+        let library_source = format!(
+            "{DATE_UNION_LIBRARY}\n{}",
+            concat!(
+                "interface SymbolConstructor { readonly toPrimitive: unique symbol; } ",
+                "declare var Symbol: SymbolConstructor;",
+            ),
+        );
+        let library = parse_source_file(&library_source);
+        let augmentation = parse_source_file(&augmentation_source);
+        let computed_declaration = augmentation
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+                    return None;
+                };
+                (augmentation.arena.get(method.name)?.kind == SyntaxKind::ComputedPropertyName)
+                    .then_some(NodeRef::new(
+                        augmentation.arena.id(),
+                        FileId::new(9_951),
+                        node,
+                    ))
+            })
+            .expect("the real Date declaration must retain its computed methods");
+        for warm in [false, true] {
+            let mut fixture = date_union_fixture(&library, &augmentation, true);
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .source_computed_member_count(fixture.date),
+                Some(4)
+            );
+            if warm {
+                publish_date_union_marker(&mut fixture);
+            }
+            assert_excluded_date_marker_cache_guard(&mut fixture);
+            let store = fixture.context.store_mut_for_test();
+            let computed = store
+                .source_declaration_symbol(computed_declaration)
+                .unwrap();
+            assert!(store.set_late_bound_links(
+                computed,
+                crate::semantic::links::LateBoundLinks {
+                    late_symbol: Some(fixture.marker)
+                },
+            ));
+            let malformed = crate::semantic::bootstrap::LiteralTypeCacheError::InvalidCachedUnion(
+                fixture.type_,
+            );
+            assert_date_union_rejection_without_writes(&mut fixture, malformed);
+            assert!(
+                fixture.context.store_mut_for_test().set_late_bound_links(
+                    computed,
+                    crate::semantic::links::LateBoundLinks::default(),
+                )
+            );
+            let unsupported =
+                crate::semantic::bootstrap::LiteralTypeCacheError::UnsupportedUnionConstituent(
+                    fixture.type_,
+                );
+            assert_date_union_rejection_without_writes(&mut fixture, unsupported);
+        }
+    }
 
     #[test]
     fn date_unions_keep_cold_and_warm_identity_without_demanding_sibling_methods() {

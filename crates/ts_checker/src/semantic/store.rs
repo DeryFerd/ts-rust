@@ -858,6 +858,24 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 })
     }
 
+    /// Returns a declaration's unique binder owner after canonical merges.
+    #[must_use]
+    pub(super) fn source_declaration_symbol(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<SemanticSymbolId> {
+        self.source_node_fact(declaration)?;
+        let mut owner = None;
+        for source in self.source_declaration_owners.get(&declaration)? {
+            let symbol = self.get_merged_symbol(*source)?;
+            if owner.is_some_and(|owner| owner != symbol) {
+                return None;
+            }
+            owner = Some(symbol);
+        }
+        owner
+    }
+
     /// Checks declarations against the symbol graph adopted from the binder.
     #[must_use]
     pub(super) fn source_symbol_declarations_match(&self, symbol: SemanticSymbolId) -> bool {
