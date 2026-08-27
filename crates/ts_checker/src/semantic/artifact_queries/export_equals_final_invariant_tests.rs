@@ -445,6 +445,7 @@ fn check_owner_changes(text: &str) {
             let other_declarations = other_record.declarations().unwrap().to_vec();
             let other_value_declaration = other_record.value_declaration();
             let other_members = other_record.members();
+            let other_exports = other_record.exports();
             let declared_links = context.store().declared_type_links(owner).cloned().unwrap();
             let value_links = context.store().value_symbol_links(owner).cloned().unwrap();
             let node_links = context
@@ -486,13 +487,23 @@ fn check_owner_changes(text: &str) {
                         return;
                     }
                 }
-                OwnerChange::Members => assert!(store.set_symbol_relationships(
-                    owner,
-                    other_members,
-                    exports,
-                    parent,
-                    export_symbol
-                )),
+                OwnerChange::Members => {
+                    let (changed_members, changed_exports) = if flags.intersects(SymbolFlags::ENUM)
+                    {
+                        assert_ne!(exports, other_exports);
+                        (members, other_exports)
+                    } else {
+                        assert_ne!(members, other_members);
+                        (other_members, exports)
+                    };
+                    assert!(store.set_symbol_relationships(
+                        owner,
+                        changed_members,
+                        changed_exports,
+                        parent,
+                        export_symbol
+                    ));
+                }
                 OwnerChange::ExportSymbol => assert!(store.set_symbol_relationships(
                     owner,
                     members,
