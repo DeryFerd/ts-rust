@@ -29,6 +29,10 @@ config_directory="$(realpath -m -- "$(dirname -- "$config")")"
 # Keep the requested config for Go. Resolve its file target only for path guards.
 physical_config="$(realpath -m -- "$config")"
 physical_config_directory="$(dirname -- "$physical_config")"
+if [[ ! -d "$config_directory" || ! -d "$physical_config_directory" ]]; then
+  printf 'Config parent directories must exist.\n' >&2
+  exit 2
+fi
 case "$out_real/" in
   "$upstream_real/"*|"$config_directory/"*|"$physical_config_directory/"*)
     printf 'Output must be outside the upstream and config directories.\n' >&2

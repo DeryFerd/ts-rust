@@ -50,14 +50,18 @@ class CachePathTests(unittest.TestCase):
 
     def config_link(
         self, *, requested_git: bool = False, physical_git: bool = False,
+        missing_target_parent: bool = False,
     ) -> tuple[Path, Path, Path, Path]:
         requested_root = self.directory / "requested-project"
         physical_root = self.directory / "physical-project"
         link = requested_root / "configs" / "tsconfig.json"
         target = physical_root / "configs" / "tsconfig.json"
         link.parent.mkdir(parents=True)
-        target.parent.mkdir(parents=True)
-        target.write_text('{"compilerOptions":{"noEmit":true},"files":[]}\n', encoding="utf-8")
+        if missing_target_parent:
+            physical_root.mkdir()
+        else:
+            target.parent.mkdir(parents=True)
+            target.write_text('{"compilerOptions":{"noEmit":true},"files":[]}\n', encoding="utf-8")
         link.symlink_to(os.path.relpath(target, link.parent))
         for root, enabled in [(requested_root, requested_git), (physical_root, physical_git)]:
             if enabled:
@@ -190,6 +194,60 @@ class CachePathTests(unittest.TestCase):
         self.assertIsNone(manifest["project"]["root"])
         self.assertIsNone(manifest["go"]["version"])
         self.assertIsNone(manifest["executable"])
+
+    def test_missing_config_parent_rejects_output_inside_project(self) -> None:
+        link, target, _, physical_root = self.config_link(
+            physical_git=True, missing_target_parent=True,
+        )
+        for index, config in enumerate([target, link]):
+            with self.subTest(config=config):
+                self.assert_rejected(
+                    None, "Config parent directories must exist", config=config,
+                    output=physical_root / f"oracle-output-{index}",
+                )
+
+    def test_missing_config_parent_rejects_cache_inside_project(self) -> None:
+        link, target, _, physical_root = self.config_link(
+            physical_git=True, missing_target_parent=True,
+        )
+        for index, config in enumerate([target, link]):
+            with self.subTest(config=config):
+                self.assert_rejected(
+                    str(physical_root / f"module-cache-{index}"),
+                    "Config parent directories must exist", config=config,
+                    output=self.directory / f"oracle-output-{index}",
+                )
+
+    def test_missing_config_parent_rejects_prepare_with_safe_paths(self) -> None:
+        link, target, _, _ = self.config_link(
+            physical_git=True, missing_target_parent=True,
+        )
+        for index, config in enumerate([target, link]):
+            with self.subTest(config=config):
+                self.assert_rejected(
+                    None, "Config parent directories must exist", config=config,
+                    output=self.directory / f"oracle-output-{index}",
+                )
+
+    def test_missing_config_file_with_existing_parent_remains_preparable(self) -> None:
+        link, target, _, physical_root = self.config_link(physical_git=True)
+        missing = target.parent / "absent.json"
+        missing_link = link.parent / "absent.json"
+        missing_link.symlink_to(os.path.relpath(missing, missing_link.parent))
+        for index, config in enumerate([missing, missing_link]):
+            with self.subTest(config=config):
+                output = self.directory / f"oracle-output-{index}"
+                result = self.run_helper(None, config=config, output=output)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                manifest = json.loads((output / "build.json").read_text())
+                self.assertEqual(manifest["project"]["config_path"], str(config))
+                self.assertEqual(
+                    manifest["project"]["root"], str(physical_root) if config == missing else None,
+                )
+                self.assertEqual(manifest["state"], "prepared")
+                self.assertIsNone(manifest["go"]["version"])
+                self.assertIsNone(manifest["executable"])
+                self.assertFalse(missing.exists())
 
 
 def main() -> int:
