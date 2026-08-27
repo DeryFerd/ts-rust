@@ -19387,7 +19387,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || self.direct_intersection_rhs(type_node)?
             || self.direct_type_literal_rhs(type_node)?
             || self.direct_callable_type_rhs(type_node)?
-            || self.direct_value_type_query_rhs(type_node)?
+            || self.direct_value_type_query_rhs(type_node)?.is_some()
             || self.direct_indexed_access_rhs(type_node)?
             || self.is_authenticated_supported_generic_union_alias(type_node, symbol)?
             || self.direct_keyof_rhs(type_node)?
@@ -19400,6 +19400,27 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || self.type_node_contains_builtin_array_reference(type_node, &mut HashSet::new())?
         {
             self.plan_type_node_in_context(type_node, Some(symbol), union_constituent)?;
+        }
+        // Reject changed or missing typeof body caches before execution can publish links.
+        if let Some(cached) = cached
+            && let Some(query) = self.direct_value_type_query_rhs(type_node)?
+            && self
+                .store
+                .type_node_links(query)
+                .and_then(|links| links.resolved_type)
+                .is_none_or(|resolved| {
+                    !valid_type_alias_identity_seed(
+                        self.store,
+                        symbol,
+                        cached.declared_type,
+                        resolved,
+                        self.strict_builtin_iterator_return,
+                    )
+                })
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
+            ));
         }
         if cached_pending_function && let Some(cached) = cached {
             self.validate_cached_type_alias_identity(symbol, cached, union_constituent)?;
@@ -19771,14 +19792,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
     }
 
-    fn direct_value_type_query_rhs(&self, mut node: NodeRef) -> Result<bool, DeclaredTypeError> {
+    fn direct_value_type_query_rhs(
+        &self,
+        mut node: NodeRef,
+    ) -> Result<Option<NodeRef>, DeclaredTypeError> {
         loop {
             let record = preflight_node(self.store, self.host, node)?;
             if record.kind == SyntaxKind::TypeQuery {
-                return Ok(true);
+                return Ok(Some(node));
             }
             let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
-                return Ok(false);
+                return Ok(None);
             };
             node = NodeRef::new(node.arena, node.file, parenthesized.type_);
         }
@@ -23462,6 +23486,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 && let Some(structural_node) = self
                     .direct_type_literal_plan_node(alias.type_node, plan)
                     .or_else(|| self.direct_callable_type_plan_node(alias.type_node, plan))
+                    .or_else(|| self.direct_value_type_query_plan_node(alias.type_node, plan))
                     .or_else(|| self.direct_indexed_access_plan_node(alias.type_node, plan))
                     .or_else(|| self.direct_keyof_plan_node(alias.type_node, plan))
                     .or_else(|| self.direct_tuple_type_plan_node(alias.type_node, plan))
@@ -25662,6 +25687,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Option<NodeRef> {
         loop {
             if plan.functions.contains_key(&node) || plan.constructors.contains_key(&node) {
+                return Some(node);
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data else {
+                return None;
+            };
+            node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
+    }
+
+    fn direct_value_type_query_plan_node(
+        &self,
+        mut node: NodeRef,
+        plan: &TypeQueryPlan,
+    ) -> Option<NodeRef> {
+        loop {
+            if plan.type_queries.contains_key(&node) {
                 return Some(node);
             }
             let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data else {
@@ -29934,6 +29975,66 @@ mod tests {
         )
         .unwrap();
         (context, library_file, source_file)
+    }
+
+    fn namespace_typeof_alias_context<'arena>(
+        source: &'arena ParseResult,
+        target: &'arena ParseResult,
+    ) -> (CanonicalCheckerContext<'arena>, FileId, FileId) {
+        use crate::semantic::module_resolution::{
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+        };
+
+        let source_file = FileId::new(10_831);
+        let target_file = FileId::new(10_832);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, declaration) in
+            [(source, source_file, false), (target, target_file, true)]
+        {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/namespace-typeof-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        CanonicalModuleState::External,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let specifier = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::ImportDeclaration(import) => Some(import.module_specifier),
+                _ => None,
+            })
+            .unwrap();
+        let context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            vec![(source_file, &source.arena), (target_file, &target.arena)],
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    NodeRef::new(source.arena.id(), source_file, specifier),
+                    CanonicalResolvedModuleInput::new(
+                        target_file,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::Esm,
+                    ),
+                ),
+            ]),
+        )
+        .unwrap();
+        (context, source_file, target_file)
     }
 
     #[allow(clippy::too_many_lines)] // One fixture binds independent DOM, React, and source files.
@@ -49069,6 +49170,210 @@ mod tests {
             );
             assert!(diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    fn namespace_typeof_aliases_keep_cold_and_warm_identity() {
+        let source = parse_source_file(concat!(
+            "import * as ns from './target'; ",
+            "export type Copy = typeof ns; export type Wrapped = (typeof ns); ",
+            "export const copied = ns;",
+        ));
+        let target = parse_source_file("export const value: number;");
+        let (mut context, source_file, target_file) =
+            namespace_typeof_alias_context(&source, &target);
+        let (_, bound) = context.file(source_file).unwrap();
+        let source_module = bound.symbol(bound.source_file()).unwrap();
+        let exports = context
+            .store()
+            .symbol(source_module)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let aliases = ["Copy", "Wrapped"].map(|name| {
+            context
+                .store()
+                .symbol_table(exports)
+                .unwrap()
+                .get_source(name)
+                .unwrap()
+        });
+        let (_, bound) = context.file(target_file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let expected = context.get_declared_type_of_symbol(aliases[0]).unwrap();
+        assert_eq!(
+            context.store().type_payload(expected).unwrap().symbol(),
+            Some(module)
+        );
+        assert_eq!(
+            context.get_declared_type_of_symbol(aliases[1]),
+            Ok(expected)
+        );
+        assert!(context.store().value_symbol_links(module).is_none());
+        for completed in [false, true] {
+            if completed {
+                context.check_source_file(source_file).unwrap();
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(module)
+                        .unwrap()
+                        .resolved_type,
+                    Some(expected),
+                );
+            }
+            let before = (
+                store_state(context.store()),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+            );
+            let identity = context
+                .store()
+                .source_file_namespace_identity(module)
+                .cloned();
+            for alias in aliases {
+                assert_eq!(context.get_declared_type_of_symbol(alias), Ok(expected));
+            }
+            assert_eq!(
+                (
+                    store_state(context.store()),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                ),
+                before,
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .source_file_namespace_identity(module)
+                    .cloned(),
+                identity
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn namespace_typeof_aliases_reject_corrupt_caches_without_repair() {
+        let target = parse_source_file("export const value: number;");
+        let mut failures = Vec::new();
+        for body in ["typeof ns", "(typeof ns)"] {
+            let source = parse_source_file(&format!(
+                "import * as ns from './target'; export type Copy = {body};",
+            ));
+            let (mut context, source_file, _) = namespace_typeof_alias_context(&source, &target);
+            let (declaration, alias_data) = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| match &record.data {
+                    NodeData::TypeAliasDeclaration(alias) => Some((node, alias)),
+                    _ => None,
+                })
+                .unwrap();
+            let declaration = NodeRef::new(source.arena.id(), source_file, declaration);
+            let alias = context
+                .file(source_file)
+                .unwrap()
+                .1
+                .symbol(declaration)
+                .unwrap();
+            let mut query = NodeRef::new(declaration.arena, declaration.file, alias_data.type_);
+            while let NodeData::ParenthesizedTypeNode(parenthesized) =
+                &source.arena.get(query.node).unwrap().data
+            {
+                query = NodeRef::new(query.arena, query.file, parenthesized.type_);
+            }
+            let NodeData::TypeQueryNode(query_data) = &source.arena.get(query.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let name = NodeRef::new(query.arena, query.file, query_data.expr_name);
+            let expected = context.get_declared_type_of_symbol(alias).unwrap();
+            assert_eq!(context.get_declared_type_of_symbol(alias), Ok(expected));
+            let original_alias = context.store().type_alias_links(alias).cloned().unwrap();
+            let original_query = context.store().type_node_links(query).cloned().unwrap();
+            let original_name = context.store().symbol_node_links(name).cloned().unwrap();
+            let module = context
+                .store()
+                .type_payload(expected)
+                .unwrap()
+                .symbol()
+                .unwrap();
+            let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert_ne!(expected, wrong);
+            for corruption in 0..3 {
+                let store = context.store_mut_for_test();
+                match corruption {
+                    0 => {
+                        let mut links = original_alias.clone();
+                        links.declared_type = Some(wrong);
+                        assert!(store.set_type_alias_links(alias, links));
+                    }
+                    1 => {
+                        assert!(store.set_type_node_links(query, TypeNodeLinks::default()));
+                        assert!(store.set_symbol_node_links(name, SymbolNodeLinks::default()));
+                    }
+                    2 => {
+                        let mut links = original_query.clone();
+                        links.resolved_type = Some(wrong);
+                        assert!(store.set_type_node_links(query, links));
+                    }
+                    _ => unreachable!(),
+                }
+                let before = (
+                    store_state(context.store()),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                );
+                let alias_links = context.store().type_alias_links(alias).cloned();
+                let query_links = context.store().type_node_links(query).cloned();
+                let name_links = context.store().symbol_node_links(name).cloned();
+                let identity = context
+                    .store()
+                    .source_file_namespace_identity(module)
+                    .cloned();
+                let actual = context.get_declared_type_of_symbol(alias);
+                let reason = if corruption == 2 {
+                    TypeNodeUnavailable::InvalidTypeReference(query)
+                } else {
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(alias)
+                };
+                if actual != Err(DeclaredTypeError::TypeNodeUnavailable(reason)) {
+                    failures.push((body, corruption, actual));
+                }
+                assert_eq!(
+                    (
+                        store_state(context.store()),
+                        context.store().symbol_len(),
+                        context.store().signature_len(),
+                    ),
+                    before,
+                );
+                assert_eq!(
+                    context.store().type_alias_links(alias).cloned(),
+                    alias_links
+                );
+                assert_eq!(context.store().type_node_links(query).cloned(), query_links);
+                assert_eq!(context.store().symbol_node_links(name).cloned(), name_links);
+                assert_eq!(
+                    context
+                        .store()
+                        .source_file_namespace_identity(module)
+                        .cloned(),
+                    identity
+                );
+                assert!(context.diagnostics().is_empty());
+                let store = context.store_mut_for_test();
+                assert!(store.set_type_alias_links(alias, original_alias.clone()));
+                assert!(store.set_type_node_links(query, original_query.clone()));
+                assert!(store.set_symbol_node_links(name, original_name.clone()));
+                assert_eq!(context.get_declared_type_of_symbol(alias), Ok(expected));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "namespace alias cache mismatches: {failures:?}"
+        );
     }
 
     #[test]
