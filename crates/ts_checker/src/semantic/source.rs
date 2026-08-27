@@ -1066,6 +1066,7 @@ struct PlannedFunctionHeader {
 enum PlannedFunctionModifierMode {
     None,
     Export(NodeRef),
+    ExportDefault(NodeRef),
     ExportAsync(NodeRef),
     Declare,
     ExportDeclare(NodeRef),
@@ -8058,6 +8059,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             self.validate_function_modifiers(declaration, range, name_start, modifiers.as_ref())?;
         match modifier_mode {
             PlannedFunctionModifierMode::Export(export_modifier)
+            | PlannedFunctionModifierMode::ExportDefault(export_modifier)
             | PlannedFunctionModifierMode::ExportAsync(export_modifier)
             | PlannedFunctionModifierMode::ExportDeclare(export_modifier)
                 if !is_external_module =>
@@ -8115,6 +8117,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             matches!(
                 header.modifier_mode,
                 PlannedFunctionModifierMode::Export(_)
+                    | PlannedFunctionModifierMode::ExportDefault(_)
                     | PlannedFunctionModifierMode::ExportAsync(_)
                     | PlannedFunctionModifierMode::ExportDeclare(_)
             ),
@@ -8152,6 +8155,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ) | (
                 PlannedFunctionModifierMode::None
                     | PlannedFunctionModifierMode::Export(_)
+                    | PlannedFunctionModifierMode::ExportDefault(_)
                     | PlannedFunctionModifierMode::ExportAsync(_)
                     | PlannedFunctionModifierMode::Async,
                 SourceCallableBodyMode::Present
@@ -8160,7 +8164,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && matches!(
                 (header.modifier_mode, callable.body_mode),
                 (
-                    PlannedFunctionModifierMode::None | PlannedFunctionModifierMode::Export(_),
+                    PlannedFunctionModifierMode::None
+                        | PlannedFunctionModifierMode::Export(_)
+                        | PlannedFunctionModifierMode::ExportDefault(_),
                     SourceCallableBodyMode::AmbientDeclaration
                 )
             );
@@ -9737,7 +9743,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 || !self.source_spelling_matches(export_modifier, "export")
                 || !matches!(
                     node.kind,
-                    SyntaxKind::DeclareKeyword | SyntaxKind::AsyncKeyword
+                    SyntaxKind::DeclareKeyword
+                        | SyntaxKind::AsyncKeyword
+                        | SyntaxKind::DefaultKeyword
                 )
             {
                 return Err(self.unsupported(
@@ -9751,10 +9759,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || modifiers.list.has_trailing_comma
             || modifiers.list.range.start != declaration_range.start
             || modifiers.list.range.end.get() > name_start
-            || !matches!(
+            || !(matches!(
                 node.kind,
                 SyntaxKind::ExportKeyword | SyntaxKind::DeclareKeyword | SyntaxKind::AsyncKeyword
-            )
+            ) || node.kind == SyntaxKind::DefaultKeyword && export_modifier.is_some())
             || !matches!(node.data, NodeData::Token(_))
             || node.flags.0 != 0
             || node.parent != Some(declaration.node)
@@ -9767,6 +9775,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     SyntaxKind::ExportKeyword => "export",
                     SyntaxKind::DeclareKeyword => "declare",
                     SyntaxKind::AsyncKeyword => "async",
+                    SyntaxKind::DefaultKeyword => "default",
                     _ => unreachable!("the function modifier kind was already validated"),
                 },
             )
@@ -9779,6 +9788,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             (Some(export), SyntaxKind::AsyncKeyword) => {
                 PlannedFunctionModifierMode::ExportAsync(export)
+            }
+            (Some(export), SyntaxKind::DefaultKeyword) => {
+                PlannedFunctionModifierMode::ExportDefault(export)
             }
             (None, SyntaxKind::ExportKeyword) => PlannedFunctionModifierMode::Export(modifier),
             (None, SyntaxKind::DeclareKeyword) => PlannedFunctionModifierMode::Declare,
@@ -71974,6 +71986,336 @@ mod tests {
             "Type 'false' is not assignable to type 'string | number | null'."
         );
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check the local proxy, default owner, and both import forms together.
+    fn named_default_function_preserves_local_export_and_import_types() {
+        let provider = parsed(concat!(
+            "export default function greet(name: string) { return `hello, ${name}`; } ",
+            "const localMessage = greet('local');",
+        ));
+        let direct = parsed(concat!(
+            "import chosen from './provider'; ",
+            "export const message = chosen('world');",
+        ));
+        let grouped = parsed(concat!(
+            "import selected, * as dependency from './provider'; ",
+            "export const message = selected('world'); ",
+            "export const namespaceMessage = dependency.default('namespace');",
+        ));
+        let provider_file = FileId::new(12_100);
+        let direct_file = FileId::new(12_101);
+        let grouped_file = FileId::new(12_102);
+        let files = [
+            (provider_file, &provider),
+            (direct_file, &direct),
+            (grouped_file, &grouped),
+        ];
+        let entries = files[1..].iter().map(|(file, source)| {
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(
+                    source.arena.id(),
+                    *file,
+                    source_module_specifiers(source)[0],
+                ),
+                CanonicalResolvedModuleInput::new(
+                    provider_file,
+                    CanonicalModuleResolutionMode::CommonJs,
+                    CanonicalModuleResolutionMode::CommonJs,
+                ),
+            )
+        });
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            completed_bindings_with_module_state(&files, CanonicalModuleState::External),
+            files
+                .iter()
+                .map(|(file, source)| (*file, &source.arena))
+                .collect(),
+            CanonicalCheckerOptions {
+                emit_common_js: true,
+                ..CanonicalCheckerOptions::default()
+            },
+            CanonicalModuleResolutionManifestInput::new(entries),
+        )
+        .unwrap();
+        let declaration = function_declaration(&provider, provider_file, "greet");
+        let (_, bound) = context.file(provider_file).unwrap();
+        let owner = bound.symbol(declaration).unwrap();
+        let local = bound.local_symbol(declaration).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let exports = context.store().symbol(module).unwrap().exports().unwrap();
+        assert_ne!(local, owner);
+        assert_eq!(
+            context.store().symbol(owner).unwrap().flags(),
+            SymbolFlags::FUNCTION
+        );
+        assert_eq!(
+            context.store().symbol(owner).unwrap().name(),
+            InternalSymbolName::Default.as_ref()
+        );
+        assert_eq!(
+            context.store().symbol(local).unwrap().flags(),
+            SymbolFlags::EXPORT_VALUE
+        );
+        assert_eq!(
+            context.store().symbol(local).unwrap().name().as_utf8(),
+            Some("greet")
+        );
+        assert_eq!(
+            context.store().symbol(local).unwrap().export_symbol(),
+            Some(owner)
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_table(exports)
+                .unwrap()
+                .get(InternalSymbolName::Default.as_ref()),
+            Some(owner)
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_table(exports)
+                .unwrap()
+                .get_source("greet"),
+            None
+        );
+
+        context.check_source_file(provider_file).unwrap();
+        context.check_source_file(direct_file).unwrap();
+        context.check_source_file(grouped_file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        let signature = provenance.signature;
+        assert_eq!(provenance.export_local, Some(local));
+        assert_eq!(provenance.owner_parent, Some(module));
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(string)
+        );
+        assert_eq!(
+            context
+                .store()
+                .callable_signature_parameter_types(signature),
+            Some([string].as_slice())
+        );
+        assert!(context.store().value_symbol_links(local).is_none());
+        assert!(context.store().alias_symbol_links(owner).is_none());
+        for read in identifier_expressions(&provider, provider_file, "greet") {
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(read)
+                    .unwrap()
+                    .resolved_symbol,
+                Some(local)
+            );
+            assert_eq!(resolved_node_type(&context, read), callable);
+        }
+        for (file, source) in &files {
+            for (node, record) in source.arena.iter() {
+                let node = NodeRef::new(source.arena.id(), *file, node);
+                if record.kind == SyntaxKind::CallExpression {
+                    assert_eq!(resolved_node_type(&context, node), string);
+                    assert_eq!(
+                        context
+                            .store()
+                            .signature_links(node)
+                            .unwrap()
+                            .resolved_signature
+                            .signature(),
+                        Some(signature)
+                    );
+                }
+                if let NodeData::ImportClause(clause) = &record.data {
+                    let alias = context.file(*file).unwrap().1.symbol(node).unwrap();
+                    assert_ne!(alias, local);
+                    assert_ne!(alias, owner);
+                    assert_eq!(
+                        context.store().symbol(alias).unwrap().flags(),
+                        SymbolFlags::ALIAS
+                    );
+                    assert_eq!(
+                        context
+                            .store()
+                            .alias_symbol_links(alias)
+                            .unwrap()
+                            .alias_target,
+                        AliasTargetState::Resolved(owner)
+                    );
+                    let name_node = clause.name.unwrap();
+                    let NodeData::Identifier(name) = &source.arena.get(name_node).unwrap().data
+                    else {
+                        panic!("expected the default import name")
+                    };
+                    let reads = identifier_expressions(source, *file, &name.text)
+                        .into_iter()
+                        .filter(|read| read.node != name_node)
+                        .collect::<Vec<_>>();
+                    assert_eq!(reads.len(), 1);
+                    for read in reads {
+                        assert_eq!(
+                            context
+                                .store()
+                                .symbol_node_links(read)
+                                .unwrap()
+                                .resolved_symbol,
+                            Some(alias)
+                        );
+                        assert_eq!(resolved_node_type(&context, read), callable);
+                    }
+                }
+            }
+        }
+        for (file, source, name) in [
+            (provider_file, &provider, "localMessage"),
+            (direct_file, &direct, "message"),
+            (grouped_file, &grouped, "namespaceMessage"),
+        ] {
+            assert_eq!(variable_value_type(&context, source, file, name), string);
+        }
+        let warm = files
+            .iter()
+            .map(|(file, _)| observable_state(&context, *file))
+            .collect::<Vec<_>>();
+        for (file, _) in &files {
+            context.recheck_source_file(*file).unwrap();
+        }
+        assert_eq!(
+            files
+                .iter()
+                .map(|(file, _)| observable_state(&context, *file))
+                .collect::<Vec<_>>(),
+            warm
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(string)
+        );
+    }
+
+    #[test]
+    fn named_default_function_keeps_parameter_and_return_checks() {
+        let source = parsed(concat!(
+            "export default function greet(name: string): number { return name; } ",
+            "export const message = greet(1);",
+        ));
+        let file = FileId::new(12_103);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, (code, text)) in diagnostics
+            .iter()
+            .zip([(2322, "return name;"), (2345, "1")])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), code);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), text);
+        }
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "message"),
+            number
+        );
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn named_default_function_rejects_a_wrong_export_entry() {
+        let source = parsed(concat!(
+            "export default function greet(name: string): string { return name; } ",
+            "function other(name: string): string { return name; }",
+        ));
+        let file = FileId::new(12_104);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+        context.check_source_file(file).unwrap();
+        let owner = function_symbol(&context, &source, file, "greet");
+        let other = function_symbol(&context, &source, file, "other");
+        let (_, bound) = context.file(file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let exports = context.store().symbol(module).unwrap().exports().unwrap();
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        mark_source_unchecked(&mut context, file);
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::internal(InternalSymbolName::Default),
+                other
+            ),
+            Some(Some(owner)),
+        );
+        let poisoned = observable_state(&context, file);
+
+        assert!(matches!(
+            super::super::source_callables::validate_stored_source_callable(
+                context.store(),
+                callable
+            ),
+            super::super::source_callables::StoredSourceCallableValidation::Malformed,
+        ));
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Function(_))
+        ));
+        assert_eq!(observable_state(&context, file), poisoned);
+    }
+
+    #[test]
+    fn named_default_function_does_not_admit_other_modifier_forms() {
+        for (index, text) in [
+            "export default function (name: string) { return name; }",
+            "export default async function greet() { return 1; }",
+            "export default function greet<T>(value: T) { return value; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(12_105 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
+            let cold = observable_state(&context, file);
+
+            assert!(context.check_source_file(file).is_err());
+            assert_eq!(observable_state(&context, file), cold);
+        }
     }
 
     #[test]

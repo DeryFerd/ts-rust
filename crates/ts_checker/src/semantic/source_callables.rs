@@ -1164,6 +1164,63 @@ pub(super) fn valid_source_function_owner_shape(
         )
 }
 
+/// Proves the distinct local name and default export against registered syntax and binder owners.
+pub(super) fn named_default_function_export_is_exact(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    local_symbol: SemanticSymbolId,
+) -> bool {
+    let Some(name) = store.source_default_function_name(declaration) else {
+        return false;
+    };
+    let Some(name_text) = store.source_identifier_text(name) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(owner) = store.symbol(owner_symbol) else {
+        return false;
+    };
+    let Some(local) = store.symbol(local_symbol) else {
+        return false;
+    };
+    let Some(parent) = owner.parent() else {
+        return false;
+    };
+    store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
+        && store.source_node_parent(name) == Some(SourceNodeParent::Parent(declaration))
+        && store.source_declaration_belongs_to_symbol(source, parent)
+        && store.source_symbol_declarations_match(owner_symbol)
+        && store.source_symbol_declarations_match(local_symbol)
+        && store.get_merged_symbol(owner_symbol) == Some(owner_symbol)
+        && store.get_merged_symbol(local_symbol) == Some(local_symbol)
+        && store.get_merged_symbol(parent) == Some(parent)
+        && owner.flags() == SymbolFlags::FUNCTION
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.name() == InternalSymbolName::Default.as_ref()
+        && owner.declarations() == Some(&[declaration])
+        && owner.value_declaration() == Some(declaration)
+        && owner.members().is_none()
+        && owner.export_symbol().is_none()
+        && local.flags() == SymbolFlags::EXPORT_VALUE
+        && local.check_flags() == CheckFlags::NONE
+        && local.name().as_utf8() == Some(name_text)
+        && local.declarations() == Some(&[declaration])
+        && local.value_declaration().is_none()
+        && local.members().is_none()
+        && local.exports().is_none()
+        && local.parent().is_none()
+        && local.export_symbol() == Some(owner_symbol)
+        && store
+            .symbol(parent)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(InternalSymbolName::Default.as_ref()))
+            == Some(owner_symbol)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GlobalWrapperMethodParameter {
     declaration: NodeRef,
@@ -6809,7 +6866,10 @@ fn validate_modifiers(
         let record = preflight_node(store, host, modifier)?;
         if !matches!(
             record.kind,
-            SyntaxKind::ExportKeyword | SyntaxKind::DeclareKeyword | SyntaxKind::AsyncKeyword
+            SyntaxKind::ExportKeyword
+                | SyntaxKind::DeclareKeyword
+                | SyntaxKind::AsyncKeyword
+                | SyntaxKind::DefaultKeyword
         ) || !matches!(record.data, NodeData::Token(_))
             || record.flags.0 != 0
             || record.parent != Some(declaration.node)
@@ -6826,6 +6886,28 @@ fn validate_modifiers(
     }
 
     match modifier_kinds.as_slice() {
+        [SyntaxKind::ExportKeyword, SyntaxKind::DefaultKeyword]
+            if view.family == SourceCallableFamily::FunctionDeclaration
+                && view.type_parameters.is_none()
+                && store.source_default_function_name(declaration)
+                    == view
+                        .name
+                        .map(|name| NodeRef::new(declaration.arena, declaration.file, name))
+                && view.name.is_some()
+                && host.bound_file(declaration).is_some_and(|bound| {
+                    bound
+                        .source_facts()
+                        .is_some_and(CanonicalSourceFileFacts::is_external_module)
+                        && store.source_node_parent(declaration)
+                            == Some(SourceNodeParent::Parent(bound.source_file()))
+                }) =>
+        {
+            Ok(if is_declaration_file && view.body.is_none() {
+                SourceCallableBodyMode::AmbientDeclaration
+            } else {
+                SourceCallableBodyMode::Present
+            })
+        }
         [SyntaxKind::AsyncKeyword]
             if !is_declaration_file
                 && view.family == SourceCallableFamily::ArrowFunction
@@ -7212,9 +7294,18 @@ fn validate_owner_name_and_export_route(
                     declaration,
                 )));
             };
+            let name_matches = if store.source_default_function_name(declaration).is_some() {
+                local_symbol.is_some_and(|local| {
+                    bound.symbol(declaration).is_some_and(|owner| {
+                        named_default_function_export_is_exact(store, declaration, owner, local)
+                    })
+                })
+            } else {
+                owner.name().as_bytes() == identifier.text.as_bytes()
+            };
             if name_record.kind != SyntaxKind::Identifier
                 || name_record.parent != Some(declaration.node)
-                || owner.name().as_bytes() != identifier.text.as_bytes()
+                || !name_matches
             {
                 return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
                     declaration,
@@ -7401,7 +7492,19 @@ fn valid_source_callable_plan_owner(
                             && store.symbol(local).is_some_and(|local_record| {
                                 local_record.flags() == SymbolFlags::EXPORT_VALUE
                                     && local_record.check_flags() == CheckFlags::NONE
-                                    && local_record.name() == owner.name()
+                                    && (if store
+                                        .source_default_function_name(plan.declaration)
+                                        .is_some()
+                                    {
+                                        named_default_function_export_is_exact(
+                                            store,
+                                            plan.declaration,
+                                            plan.owner_symbol,
+                                            local,
+                                        )
+                                    } else {
+                                        local_record.name() == owner.name()
+                                    })
                                     && local_record.declarations() == Some(&[plan.declaration])
                                     && local_record.value_declaration().is_none()
                                     && local_record.members().is_none()
@@ -11473,7 +11576,16 @@ fn valid_stored_function_export_route(
                 store.get_merged_symbol(local) == Some(local)
                     && local_record.flags() == SymbolFlags::EXPORT_VALUE
                     && local_record.check_flags() == CheckFlags::NONE
-                    && local_record.name() == owner.name()
+                    && (if store.source_default_function_name(declaration).is_some() {
+                        named_default_function_export_is_exact(
+                            store,
+                            declaration,
+                            owner_symbol,
+                            local,
+                        )
+                    } else {
+                        local_record.name() == owner.name()
+                    })
                     && local_record.declarations() == Some(&[declaration])
                     && local_record.value_declaration().is_none()
                     && local_record.members().is_none()

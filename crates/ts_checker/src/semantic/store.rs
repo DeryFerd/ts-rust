@@ -83,6 +83,7 @@ struct SourceNodeFacts {
     parent: Option<NodeId>,
     start: u32,
     identifier_text: Option<Box<str>>,
+    default_function_name: Option<NodeId>,
     prefix_unary_operator: Option<SyntaxKind>,
     type_operator: Option<SyntaxKind>,
     exported: bool,
@@ -7141,6 +7142,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .collect()
     }
 
+    /// Returns the registered name of an exact named default-function declaration.
+    pub(super) fn source_default_function_name(&self, declaration: NodeRef) -> Option<NodeRef> {
+        let name = self.source_node_fact(declaration)?.default_function_name?;
+        Some(NodeRef::new(declaration.arena, declaration.file, name))
+    }
+
     /// Returns the registered parent of a source-reachable node. The outer
     /// outer `Option` distinguishes an unknown node from a registered root.
     #[must_use]
@@ -7452,6 +7459,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     }
                     _ => None,
                 },
+                default_function_name: Self::named_default_function_name(arena, node_id, node),
                 prefix_unary_operator: match &node.data {
                     NodeData::PrefixUnaryExpression(prefix) => Some(prefix.operator),
                     _ => None,
@@ -7486,6 +7494,66 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             node.for_each_child(|child| pending.push((child, Some(node_id))));
         }
         Some(facts)
+    }
+
+    fn named_default_function_name(
+        arena: &NodeArena,
+        declaration: NodeId,
+        record: &ts_ast::Node,
+    ) -> Option<NodeId> {
+        let NodeData::FunctionDeclaration(function) = &record.data else {
+            return None;
+        };
+        let modifiers = function.modifiers.as_ref()?;
+        let [export, default] = modifiers.list.nodes.as_slice() else {
+            return None;
+        };
+        let name = function.name?;
+        let name_record = arena.get(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return None;
+        };
+        if record.kind != SyntaxKind::FunctionDeclaration
+            || record.flags.0 != 0
+            || modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifiers.list.range.start != record.range.start
+            || modifiers.list.range.end > name_record.range.start
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration)
+            || identifier.text.is_empty()
+            || identifier.flow_node.is_some()
+        {
+            return None;
+        }
+        let text = arena.source_text()?;
+        let mut previous_end = record.range.start;
+        for (index, (&modifier, kind, spelling)) in [
+            (export, SyntaxKind::ExportKeyword, "export"),
+            (default, SyntaxKind::DefaultKeyword, "default"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let modifier = arena.get(modifier)?;
+            if modifier.kind != kind
+                || modifier.flags.0 != 0
+                || !matches!(modifier.data, NodeData::Token(_))
+                || modifier.parent != Some(declaration)
+                || modifier.range.start < previous_end
+                || index == 0 && modifier.range.start != record.range.start
+                || modifier.range.end > modifiers.list.range.end
+                || text.get(
+                    usize::try_from(modifier.range.start.get()).ok()?
+                        ..usize::try_from(modifier.range.end.get()).ok()?,
+                ) != Some(spelling)
+            {
+                return None;
+            }
+            previous_end = modifier.range.end;
+        }
+        Some(name)
     }
 
     fn is_signature_links_eligible(arena: &NodeArena, node: &ts_ast::Node) -> bool {

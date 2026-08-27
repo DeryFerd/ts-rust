@@ -15,7 +15,8 @@ use ts_binder::{
 
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
-    source_callables::valid_source_function_owner_shape, store::SourceNodeParent,
+    source_callables::{named_default_function_export_is_exact, valid_source_function_owner_shape},
+    store::SourceNodeParent,
 };
 
 /// Binder identities retained for one exact top-level function declaration.
@@ -603,7 +604,17 @@ fn validate_function_target(
         }
         .into());
     }
-    if record.name().as_bytes() != name_text.as_bytes() {
+    let name_matches = if store.source_default_function_name(declaration).is_some() {
+        bound.local_symbol(declaration).is_some_and(|local| {
+            named_default_function_export_is_exact(store, declaration, symbol, local)
+                && store
+                    .symbol(local)
+                    .is_some_and(|local| local.name().as_bytes() == name_text.as_bytes())
+        })
+    } else {
+        record.name().as_bytes() == name_text.as_bytes()
+    };
+    if !name_matches {
         return Err(SourceFunctionInvariant::IdentifierNameMismatch {
             node: name,
             declaration,
