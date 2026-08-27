@@ -1,0 +1,6 @@
+--- a/internal/checker/checker.go
++++ b/internal/checker/checker.go
+@@ -579,0 +580 @@
++	projectOracleObjectWitness *projectOracleObjectWitnessState
+@@ -13160,0 +13162 @@
++		c.projectOracleObjectLiteralProduced(node, result, checkMode, inDestructuringPattern, inConstContext, contextualTypeHasPattern)

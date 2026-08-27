@@ -1,0 +1,40 @@
+package tsbaseline
+
+import (
+	"github.com/microsoft/typescript-go/internal/ast"
+	"github.com/microsoft/typescript-go/internal/checker"
+)
+
+// Only the single-threaded oracle test enables these observation hooks.
+var projectOracleActiveObserver *projectOracleObserver
+
+type projectOracleObserver struct {
+	visit        func(*ast.Node, bool)
+	typeQuery    func(*ast.Node, *ast.Node, *checker.Type)
+	renderedType func(*ast.Node, *checker.Type)
+	symbol       func(*ast.Node, *ast.Symbol)
+}
+
+func projectOracleObserveVisit(node *ast.Node, symbolWalk bool) {
+	if observer := projectOracleActiveObserver; observer != nil {
+		observer.visit(node, symbolWalk)
+	}
+}
+
+func projectOracleObserveTypeQuery(renderedNode, queriedNode *ast.Node, typ *checker.Type) {
+	if observer := projectOracleActiveObserver; observer != nil {
+		observer.typeQuery(renderedNode, queriedNode, typ)
+	}
+}
+
+func projectOracleObserveRenderedType(node *ast.Node, typ *checker.Type) {
+	if observer := projectOracleActiveObserver; observer != nil {
+		observer.renderedType(node, typ)
+	}
+}
+
+func projectOracleObserveSymbol(node *ast.Node, symbol *ast.Symbol) {
+	if observer := projectOracleActiveObserver; observer != nil {
+		observer.symbol(node, symbol)
+	}
+}

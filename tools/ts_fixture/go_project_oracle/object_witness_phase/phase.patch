@@ -1,0 +1,6 @@
+--- a/phase_oracle_test.go
++++ b/phase_oracle_test.go
+@@ -373,0 +374 @@
++	objectPhaseBeginPass(p, recorder, name, before.Token)
+@@ -417,0 +419 @@
++	objectPhaseEndPass(p, recorder, walk)

@@ -1,0 +1,140 @@
+package checker
+
+import (
+	"fmt"
+	"slices"
+
+	"github.com/microsoft/typescript-go/internal/ast"
+)
+
+// These mutation helpers exist only in the added checker test overlay.
+func (c *Checker) ProjectOracleObjectWitnessTestMutate(query *ProjectOracleObjectQueryWitness, change string) error {
+	production := query.productions[query.result]
+	if production == nil {
+		return fmt.Errorf("test query has no root producer")
+	}
+	data := query.result.data.(*ObjectType)
+	var property *ast.Symbol
+	if len(data.properties) != 0 {
+		property = data.properties[0]
+	}
+	switch change {
+	case "owner":
+		original := query.result.symbol
+		query.result.symbol = &ast.Symbol{Flags: original.Flags, Name: original.Name,
+			Declarations: slices.Clone(original.Declarations), ValueDeclaration: original.ValueDeclaration,
+			Members: original.Members, Parent: original.Parent}
+	case "flags":
+		query.result.objectFlags &^= ObjectFlagsFreshLiteral
+	case "members":
+		members := make(ast.SymbolTable, len(data.members)+1)
+		for name, symbol := range data.members {
+			members[name] = symbol
+		}
+		members["unprinted"] = c.newSymbol(ast.SymbolFlagsTypeAlias, "unprinted")
+		data.members = members
+	case "property_flags":
+		property.Flags |= ast.SymbolFlagsAssignment
+	case "parent":
+		property.Parent = &ast.Symbol{Flags: ast.SymbolFlagsObjectLiteral, Name: ast.InternalSymbolNameObject}
+	case "target":
+		target := c.valueSymbolLinks.Get(property).target
+		c.valueSymbolLinks.Get(property).target = &ast.Symbol{Flags: target.Flags, Name: target.Name,
+			Declarations: slices.Clone(target.Declarations), ValueDeclaration: target.ValueDeclaration, Parent: target.Parent}
+	case "declarations":
+		property.Declarations = nil
+	case "signature", "signature_and_cache":
+		function := c.valueSymbolLinks.Get(property).resolvedType.AsObjectType()
+		original := function.signatures[0]
+		copy := *original
+		c.SignatureCount++
+		copy.id = SignatureId(c.SignatureCount)
+		function.signatures = []*Signature{&copy}
+		if change == "signature_and_cache" {
+			c.signatureLinks.Get(copy.declaration).resolvedSignature = &copy
+		}
+	case "signature_cache_missing":
+		function := c.valueSymbolLinks.Get(property).resolvedType.AsObjectType()
+		c.signatureLinks.Get(function.signatures[0].declaration).resolvedSignature = nil
+	case "signature_return_unresolved":
+		c.valueSymbolLinks.Get(property).resolvedType.AsObjectType().signatures[0].resolvedReturnType = nil
+	case "predicate_unresolved":
+		c.valueSymbolLinks.Get(property).resolvedType.AsObjectType().signatures[0].resolvedTypePredicate = nil
+	case "function_base_constraint":
+		c.valueSymbolLinks.Get(property).resolvedType.AsObjectType().resolvedBaseConstraint = c.numberType
+	case "function_instantiations":
+		c.valueSymbolLinks.Get(property).resolvedType.AsObjectType().instantiations = map[CacheHashKey]*Type{{}: c.numberType}
+	case "function_without_abstract":
+		c.valueSymbolLinks.Get(property).resolvedType.AsObjectType().objectTypeWithoutAbstractConstructSignatures = c.numberType
+	case "boolean_regular_value":
+		c.regularTrueType.AsLiteralType().value = false
+	case "boolean_false_value":
+		c.regularFalseType.AsLiteralType().value = true
+	case "boolean_regular_header":
+		c.regularTrueType.objectFlags |= ObjectFlagsNonInferrableType
+	case "boolean_regular_id":
+		c.regularTrueType.id++
+	case "boolean_regular_links":
+		c.regularTrueType.AsLiteralType().regularType = c.regularFalseType
+	case "boolean_fresh_value":
+		c.trueType.AsLiteralType().value = false
+	case "boolean_fresh_owner":
+		c.trueType.checker = nil
+	case "boolean_fresh_links":
+		c.falseType.AsLiteralType().freshType = c.trueType
+	case "boolean_union_constraint":
+		c.booleanType.AsUnionType().resolvedBaseConstraint = c.numberType
+	case "boolean_union_regular":
+		c.booleanType.AsUnionType().regularType = c.numberType
+	case "boolean_union_without_abstract":
+		c.booleanType.AsUnionType().objectTypeWithoutAbstractConstructSignatures = c.numberType
+	case "boolean_union_property_cache":
+		c.booleanType.AsUnionType().propertyCache = ast.SymbolTable{"hidden": c.newProperty("hidden", c.numberType)}
+	case "boolean_union_constituent_map":
+		c.booleanType.AsUnionType().constituentMap = map[*Type]*Type{c.regularTrueType: c.numberType}
+	case "error_intrinsic":
+		c.valueSymbolLinks.Get(property).resolvedType = c.errorType
+	case "query_token":
+		query.token++
+	case "producer_token":
+		production.queryToken++
+	case "cycle":
+		c.valueSymbolLinks.Get(property).resolvedType = query.result
+		for index := range production.birth.properties {
+			if production.birth.properties[index].symbol.ref == property {
+				production.birth.properties[index].links.resolvedType = query.result
+			}
+		}
+	default:
+		return fmt.Errorf("unknown test mutation %q", change)
+	}
+	return nil
+}
+
+func (c *Checker) ProjectOracleObjectWitnessTestCacheEvidence(query *ProjectOracleObjectQueryWitness) (bool, bool) {
+	production := query.productions[query.result]
+	property := query.result.AsObjectType().properties[0]
+	_, birth := production.birth.cacheEdges[property]
+	_, closed := query.closed[query.result].cacheEdges[property]
+	return birth, closed
+}
+
+func (c *Checker) ProjectOracleObjectWitnessTestSeedFlow(node *ast.Node, typ *Type) {
+	if c.flowTypeCache == nil {
+		c.flowTypeCache = map[*ast.Node]*Type{}
+	}
+	c.flowTypeCache[node] = typ
+}
+
+func (c *Checker) ProjectOracleObjectWitnessTestSeedExpando(node *ast.Node) {
+	node.Symbol().Exports = ast.SymbolTable{"value": c.newProperty("value", c.numberType)}
+}
+
+func (c *Checker) ProjectOracleObjectWitnessTestSeedOverflow(left, right *ProjectOracleObjectQueryWitness) {
+	key, _ := getRelationKey(left.result, right.result, IntersectionStateNone, true, false)
+	c.identityRelation.set(key, RelationComparisonResultFailed|RelationComparisonResultStackDepthOverflow)
+}
+
+func (c *Checker) ProjectOracleObjectWitnessTestAnyError() (string, string, bool) {
+	return c.TypeToString(c.anyType), c.TypeToString(c.errorType), c.isTypeIdenticalTo(c.anyType, c.errorType)
+}
