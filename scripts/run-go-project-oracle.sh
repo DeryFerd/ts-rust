@@ -19,12 +19,19 @@ for path in "$go" "$upstream" "$config" "$out"; do
     exit 2
   fi
 done
-if [[ -e "$out" || -L "$out" ]]; then
-  printf 'Output must not already exist: %s\n' "$out" >&2
+# A trailing slash or '.' still names the same final entry.
+out_entry=$out
+while [[ "$(basename -- "$out_entry")" == "." ]]; do
+  out_entry="$(dirname -- "$out_entry")"
+done
+# Resolve only the parent before testing that entry for a symlink.
+out_entry="$(realpath -m -- "$(dirname -- "$out_entry")")/$(basename -- "$out_entry")"
+if [[ -L "$out_entry" || -e "$out_entry" ]]; then
+  printf 'Output must not already exist: %s\n' "$out_entry" >&2
   exit 2
 fi
-out_real="$(realpath -m -- "$out")"
-if [[ -e "$out_real" || -L "$out_real" ]]; then
+out_real="$(realpath -m -- "$out_entry")"
+if [[ -L "$out_real" || -e "$out_real" ]]; then
   printf 'Output must not already exist: %s\n' "$out_real" >&2
   exit 2
 fi

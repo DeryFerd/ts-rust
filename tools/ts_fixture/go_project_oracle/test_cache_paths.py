@@ -24,7 +24,7 @@ class CachePathTests(unittest.TestCase):
         self.output = self.directory / "output"
 
     def run_helper(
-        self, cache: str | None, *, config: Path | None = None, output: Path | None = None,
+        self, cache: str | None, *, config: Path | None = None, output: Path | str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.pop("GOMODCACHE", None)
@@ -212,6 +212,66 @@ class CachePathTests(unittest.TestCase):
                 self.assertEqual(target.exists(), target_exists)
                 if target_exists:
                     self.assertEqual(list(target.iterdir()), [])
+
+    def test_hidden_final_output_symlinks_are_rejected(self) -> None:
+        for index, suffix in enumerate([None, "/", "/.", "//.//./"]):
+            with self.subTest(suffix=suffix):
+                target = self.directory / f"absent-output-target-{index}"
+                link = self.directory / f"final-output-link-{index}"
+                link.symlink_to(target.name, target_is_directory=True)
+                intermediate = self.directory / f"missing-output-parent-{index}"
+                output = (
+                    str(intermediate / ".." / link.name)
+                    if suffix is None else str(link) + suffix
+                )
+                result = self.run_helper(None, output=output)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("Output must not already exist", result.stderr)
+                self.assertFalse(target.exists())
+                self.assertFalse(intermediate.exists())
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(link.readlink(), Path(target.name))
+
+    def test_new_outputs_allow_trailing_separators_and_dots(self) -> None:
+        for index, suffix in enumerate(["/", "/.", "/./", "//.//./"]):
+            with self.subTest(suffix=suffix):
+                destination = self.directory / f"new-output-{index}"
+                result = self.run_helper(None, output=str(destination) + suffix)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assert_canonical_output(destination, self.config)
+
+    def test_output_final_entry_uses_the_physical_parent(self) -> None:
+        physical = self.directory / "physical-output-parent"
+        child = physical / "child"
+        child.mkdir(parents=True)
+        lexical = self.directory / "lexical-output-parent"
+        lexical.mkdir()
+        parent_link = lexical / "parent-link"
+        parent_target = Path(os.path.relpath(child, lexical))
+        parent_link.symlink_to(parent_target, target_is_directory=True)
+
+        decoy = lexical / "new-output"
+        decoy.symlink_to("unused-decoy-target", target_is_directory=True)
+        output = parent_link / ".." / "new-output"
+        result = self.run_helper(None, output=output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_canonical_output(physical / "new-output", self.config)
+        self.assertTrue(decoy.is_symlink())
+        self.assertFalse((lexical / "unused-decoy-target").exists())
+
+        final_link = physical / "final-output-link"
+        final_link.symlink_to("absent-output-target", target_is_directory=True)
+        missing = physical / "missing-output-parent"
+        output = parent_link / ".." / missing.name / ".." / final_link.name
+        result = self.run_helper(None, output=output)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("Output must not already exist", result.stderr)
+        self.assertTrue(final_link.is_symlink())
+        self.assertEqual(final_link.readlink(), Path("absent-output-target"))
+        self.assertFalse((physical / "absent-output-target").exists())
+        self.assertFalse(missing.exists())
+        self.assertTrue(parent_link.is_symlink())
+        self.assertEqual(parent_link.readlink(), parent_target)
 
     def test_config_symlink_protects_both_config_directories_from_output(self) -> None:
         link, target, _, _ = self.config_link()
