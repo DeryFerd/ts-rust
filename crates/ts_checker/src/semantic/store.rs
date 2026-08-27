@@ -237,6 +237,8 @@ pub(super) struct SourceCallableProvenance {
     pub(super) owner_parent: Option<SemanticSymbolId>,
     pub(super) export_local: Option<SemanticSymbolId>,
     pub(super) signature: SignatureId,
+    /// Flags authenticated by source planning before publication.
+    pub(super) flags: SignatureFlags,
     pub(super) return_provenance: SourceCallableReturnProvenance,
     /// Exact global-array targets installed while this callable was planned.
     /// Store-only validation uses this retained capability for inferred
@@ -1665,7 +1667,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || provenance.export_local == Some(provenance.owner_symbol)
             || provenance.return_provenance == SourceCallableReturnProvenance::Inferred
                 && provenance.generic_return_type_parameter.is_some()
-            || self.signatures.get(provenance.signature).is_none()
+            || self
+                .signatures
+                .get(provenance.signature)
+                .is_none_or(|signature| signature.flags() != provenance.flags)
             || self
                 .source_callable_types_by_declaration
                 .contains_key(&provenance.declaration)
@@ -9084,6 +9089,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             owner_parent: prepared.owner_parent,
             export_local: prepared.export_local,
             signature,
+            flags: prepared.flags,
             return_provenance: if prepared.return_annotation.is_some() {
                 SourceCallableReturnProvenance::Annotated
             } else {
