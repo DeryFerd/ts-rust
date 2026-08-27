@@ -22451,6 +22451,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     }
 }
 
+/// Reuses the source proof without publishing the invalid catch binding.
+pub(super) fn catch_object_rest_artifact_binding(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    source: SourceFileRef,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<(NodeRef, SemanticSymbolId), SourceCheckError> {
+    let host = DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
+    let catch = SourcePlanner::new_semantic(arena, bound, source, store, &host)
+        .plan_catch_object_rest(statement)?;
+    Ok((catch.name, catch.symbol))
+}
+
 fn reserved_commonjs_import_equals_diagnostic(
     arena: &NodeArena,
     bound: &BoundFile,

@@ -196,7 +196,12 @@ impl CanonicalCheckerContext<'_> {
         &mut self,
         node: NodeRef,
     ) -> Result<TypeId, CanonicalArtifactQueryError> {
+        let catch_rest = self.catch_rest_artifact_type(node)?;
         let declaration = self.prepare_artifact_type_location(node)?;
+
+        if let Some(type_) = catch_rest {
+            return self.validate_artifact_type(node, type_);
+        }
 
         if let Some(symbol) = declaration {
             let type_ = self.get_declared_type_of_symbol(symbol)?;
@@ -982,6 +987,103 @@ impl CanonicalCheckerContext<'_> {
             });
         }
         self.validate_artifact_type(node, error_type).map(Some)
+    }
+
+    fn catch_rest_artifact_type(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (arena, bound, record) = self.validated_artifact_node(node)?;
+        let element = match &record.data {
+            NodeData::BindingElement(_) => node,
+            NodeData::Identifier(_) => {
+                let Some(LocationParent::Declaration(declaration)) =
+                    location_parent(arena, bound, node, record)?
+                else {
+                    return Ok(None);
+                };
+                if self.validated_artifact_node(declaration)?.2.kind != SyntaxKind::BindingElement {
+                    return Ok(None);
+                }
+                declaration
+            }
+            _ => return Ok(None),
+        };
+        let mut catch = element;
+        for kind in [
+            SyntaxKind::ObjectBindingPattern,
+            SyntaxKind::VariableDeclaration,
+            SyntaxKind::CatchClause,
+        ] {
+            let Some(parent) = self.validated_artifact_node(catch)?.2.parent else {
+                return Ok(None);
+            };
+            catch = NodeRef::new(node.arena, node.file, parent);
+            if self.validated_artifact_node(catch)?.2.kind != kind {
+                return Ok(None);
+            }
+        }
+        let unsupported = || CanonicalArtifactQueryError::UnsupportedNode {
+            node,
+            kind: record.kind,
+        };
+        if bound
+            .source_facts()
+            .is_none_or(|facts| facts.is_declaration_file() || facts.is_default_library())
+        {
+            return Err(unsupported());
+        }
+        let statement = self
+            .validated_artifact_node(catch)?
+            .2
+            .parent
+            .map(|parent| NodeRef::new(node.arena, node.file, parent))
+            .ok_or_else(unsupported)?;
+        let source = self
+            .source_file(node.file)
+            .ok_or(CanonicalArtifactQueryError::MissingFile(node.file))?;
+        let (name, symbol) = super::source::catch_object_rest_artifact_binding(
+            arena,
+            bound,
+            source,
+            self.store(),
+            statement,
+        )?;
+        if bound.symbol(element) != Some(symbol) || node != element && node != name {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
+        let error_type = self
+            .store()
+            .intrinsic_bootstrap()
+            .ok_or_else(unsupported)?
+            .error_type;
+        for location in [element, name] {
+            if let Some(links) = self.store().type_node_links(location)
+                && links != &TypeNodeLinks::default()
+                && links
+                    != &(TypeNodeLinks {
+                        resolved_type: Some(error_type),
+                        ..TypeNodeLinks::default()
+                    })
+            {
+                return Err(CanonicalArtifactQueryError::InvalidType {
+                    node: location,
+                    type_: links.resolved_type.unwrap_or(error_type),
+                });
+            }
+            if let Some(cached) = self
+                .store()
+                .symbol_node_links(location)
+                .and_then(|links| links.resolved_symbol)
+                && cached != symbol
+            {
+                return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                    node: location,
+                    symbol: cached,
+                });
+            }
+        }
+        Ok(Some(error_type))
     }
 
     fn arrow_artifact_type(
@@ -3019,6 +3121,230 @@ mod tests {
         }
     }
 
+    fn catch_rest_nodes(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef) {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::BindingElement(binding) = &record.data else {
+                    return None;
+                };
+                binding.dot_dot_dot_token?;
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, binding.name?),
+                ))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn catch_rest_artifacts_return_error_type_without_publishing_bindings() {
+        let parsed = parse_source_file("try {\n  // ...\n} catch ({ ...rest }) {\n  // ...\n}\n");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_210);
+        let (element, name) = catch_rest_nodes(&parsed, file);
+        for checked_first in [false, true] {
+            let mut context = context(&parsed, file);
+            if checked_first {
+                context.check_source_file(file).unwrap();
+            }
+            let symbol = context.file(file).unwrap().1.symbol(element).unwrap();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let error_type = bootstrap.error_type;
+            assert_ne!(error_type, bootstrap.any_type);
+            assert_eq!(context.get_type_at_location(name), Ok(error_type));
+            assert_eq!(context.type_to_string(error_type).unwrap(), "any");
+            assert_eq!(context.get_symbol_at_location(name), Ok(Some(symbol)));
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected the catch-rest diagnostic")
+            };
+            assert_eq!(diagnostic.node, Some(name));
+            assert_eq!(diagnostic.diagnostic.code(), 2700);
+            let state = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().as_slice().to_vec(),
+                )
+            };
+            let warm = state(&context);
+            for _ in 0..2 {
+                for location in [element, name] {
+                    assert_eq!(context.get_type_at_location(location), Ok(error_type));
+                    assert_eq!(context.get_symbol_at_location(location), Ok(Some(symbol)));
+                    assert!(context.store().type_node_links(location).is_none());
+                    assert!(context.store().symbol_node_links(location).is_none());
+                }
+                assert!(context.store().value_symbol_links(symbol).is_none());
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(state(&context), warm);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check both locations against cold and warm cache failures.
+    fn catch_rest_artifacts_reject_poisoned_caches_before_source_writes() {
+        let parsed = parse_source_file("try {} catch ({ ...rest }) {}");
+        let file = FileId::new(6_211);
+        let (element, name) = catch_rest_nodes(&parsed, file);
+        for checked_first in [false, true] {
+            for location in [element, name] {
+                for poison in ["type", "metadata", "value", "write", "symbol"] {
+                    let mut context = context(&parsed, file);
+                    if checked_first {
+                        context.check_source_file(file).unwrap();
+                    }
+                    let symbol = context.file(file).unwrap().1.symbol(element).unwrap();
+                    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                    let error_type = bootstrap.error_type;
+                    let any = bootstrap.any_type;
+                    let other_symbol = bootstrap.undefined_symbol;
+                    match poison {
+                        "type" | "metadata" => {
+                            assert!(context.store_mut_for_test().set_type_node_links(
+                                location,
+                                TypeNodeLinks {
+                                    resolved_type: (poison == "type").then_some(any),
+                                    outer_type_parameters:
+                                        (poison == "metadata").then(|| vec![error_type]),
+                                },
+                            ));
+                        }
+                        "value" | "write" => {
+                            assert!(context.store_mut_for_test().set_value_symbol_links(
+                                symbol,
+                                ValueSymbolLinks {
+                                    resolved_type: (poison == "value").then_some(error_type),
+                                    write_type: (poison == "write").then_some(error_type),
+                                    ..ValueSymbolLinks::default()
+                                },
+                            ));
+                        }
+                        "symbol" => {
+                            assert!(context.store_mut_for_test().set_symbol_node_links(
+                                location,
+                                SymbolNodeLinks {
+                                    resolved_symbol: Some(other_symbol),
+                                },
+                            ));
+                        }
+                        _ => unreachable!(),
+                    }
+                    let state = |context: &CanonicalCheckerContext<'_>| {
+                        (
+                            context.store().type_len(),
+                            context.store().signature_len(),
+                            context.store().checker_link_allocated_lengths(),
+                            context.store().type_node_links(location).cloned(),
+                            context.store().symbol_node_links(location).cloned(),
+                            context.store().value_symbol_links(symbol).cloned(),
+                            context
+                                .store()
+                                .source_file_links(context.source_file(file).unwrap())
+                                .cloned(),
+                            context.diagnostics().as_slice().to_vec(),
+                        )
+                    };
+                    let poisoned = state(&context);
+                    for target in [element, name] {
+                        let error = context.get_type_at_location(target).unwrap_err();
+                        match poison {
+                            "type" | "metadata" => assert!(matches!(
+                                error,
+                                CanonicalArtifactQueryError::InvalidType { node, .. }
+                                    if node == location
+                            )),
+                            "value" | "write" => assert!(matches!(
+                                error,
+                                CanonicalArtifactQueryError::SourceCheck(_)
+                            )),
+                            "symbol" => assert_eq!(
+                                error,
+                                CanonicalArtifactQueryError::InvalidSymbol {
+                                    node: location,
+                                    symbol: other_symbol,
+                                },
+                            ),
+                            _ => unreachable!(),
+                        }
+                        assert_eq!(state(&context), poisoned, "{poison}");
+                    }
+                    match poison {
+                        "type" | "metadata" => assert!(
+                            context
+                                .store_mut_for_test()
+                                .set_type_node_links(location, TypeNodeLinks::default())
+                        ),
+                        "value" | "write" => assert!(
+                            context
+                                .store_mut_for_test()
+                                .set_value_symbol_links(symbol, ValueSymbolLinks::default())
+                        ),
+                        "symbol" => assert!(
+                            context
+                                .store_mut_for_test()
+                                .set_symbol_node_links(location, SymbolNodeLinks::default())
+                        ),
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(context.get_type_at_location(name), Ok(error_type));
+                    context.recheck_source_file(file).unwrap();
+                    assert_eq!(context.diagnostics().len(), 1);
+                    assert!(
+                        context
+                            .store()
+                            .value_symbol_links(symbol)
+                            .is_none_or(|links| { links == &ValueSymbolLinks::default() })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn catch_rest_artifacts_reject_foreign_nodes_and_changed_owners() {
+        let parsed = parse_source_file("try {} catch ({ ...rest }) {}");
+        let foreign = parse_source_file("try {} catch ({ ...rest }) {}");
+        let file = FileId::new(6_212);
+        let (element, name) = catch_rest_nodes(&parsed, file);
+        let (_, foreign_name) = catch_rest_nodes(&foreign, file);
+        for checked_first in [false, true] {
+            let mut context = context(&parsed, file);
+            if checked_first {
+                context.check_source_file(file).unwrap();
+            }
+            let before = (
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            );
+            assert_eq!(
+                context.get_type_at_location(foreign_name),
+                Err(CanonicalArtifactQueryError::ForeignNode(foreign_name)),
+            );
+            let symbol = context.file(file).unwrap().1.symbol(element).unwrap();
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_flags(symbol, SymbolFlags::FUNCTION_SCOPED_VARIABLE,)
+            );
+            assert!(matches!(
+                context.get_type_at_location(name),
+                Err(CanonicalArtifactQueryError::SourceCheck(_)),
+            ));
+            assert_eq!(
+                (
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().as_slice().to_vec(),
+                ),
+                before,
+            );
+            assert!(context.store().value_symbol_links(symbol).is_none());
+        }
+    }
+
     #[test]
     fn unresolved_namespace_alias_declaration_queries_require_exact_manifest_evidence() {
         let parsed = parse_source_file("import * as s from 'self';\ns;\n");
@@ -3243,6 +3569,41 @@ mod tests {
                 context.store().checker_link_allocated_lengths()
             ),
             before
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn catch_rest_artifacts_require_the_bounded_recovery_context() {
+        for text in [
+            "try { const value = 1; } catch ({ ...rest }) {}",
+            "try {} catch ({ value, ...rest }) {}",
+            "try {} catch ({ ...rest }) { rest; }",
+            "try {} catch ({ ...rest }) {} finally {}",
+        ] {
+            let parsed = parse_source_file(text);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(6_213);
+            let (_, name) = catch_rest_nodes(&parsed, file);
+            let mut context = context(&parsed, file);
+            let before = context.store().checker_link_allocated_lengths();
+            assert!(matches!(
+                context.get_type_at_location(name),
+                Err(CanonicalArtifactQueryError::SourceCheck(_)),
+            ));
+            assert_eq!(context.store().checker_link_allocated_lengths(), before);
+            assert!(context.diagnostics().is_empty());
+        }
+        let parsed = parse_source_file("try {} catch ({ ...rest }) {}");
+        let file = FileId::new(6_214);
+        let (_, name) = catch_rest_nodes(&parsed, file);
+        let mut context = declaration_context(&parsed, file);
+        assert_eq!(
+            context.get_type_at_location(name),
+            Err(CanonicalArtifactQueryError::UnsupportedNode {
+                node: name,
+                kind: SyntaxKind::Identifier,
+            }),
         );
         assert!(context.diagnostics().is_empty());
     }
