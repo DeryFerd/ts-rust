@@ -218,15 +218,23 @@ impl ConstructorAnnotationProof {
         host: &DeclaredTypeHost<'_>,
         global_types: Option<&CanonicalGlobalTypes>,
     ) -> Result<Option<TypeId>, DeclaredTypeError> {
-        self.node_type(store, host, global_types, self.node, &mut HashSet::new())
+        self.plan.cached_annotation_type(
+            store,
+            host,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+            self.node,
+            &mut HashSet::new(),
+        )
     }
+}
 
+impl TypeQueryPlan {
     #[allow(clippy::too_many_lines)] // Checks each admitted source shape against its own provider.
-    fn node_type(
+    fn cached_annotation_type(
         &self,
         store: &CanonicalTypeMapperStore,
         host: &DeclaredTypeHost<'_>,
-        global_types: Option<&CanonicalGlobalTypes>,
+        array_targets: Option<CanonicalArrayTargets>,
         node: NodeRef,
         active: &mut HashSet<NodeRef>,
     ) -> Result<Option<TypeId>, DeclaredTypeError> {
@@ -235,7 +243,7 @@ impl ConstructorAnnotationProof {
             return Err(invalid());
         }
         let bootstrap = store.intrinsic_bootstrap().ok_or_else(&invalid)?;
-        let expected = if let Some(reference) = self.plan.references.get(&node) {
+        let expected = if let Some(reference) = self.references.get(&node) {
             let cached_symbol = store
                 .symbol_node_links(node)
                 .and_then(|links| links.resolved_symbol);
@@ -251,9 +259,14 @@ impl ConstructorAnnotationProof {
             {
                 return Err(invalid());
             }
-            if let Some(alias) = self.plan.aliases.get(&reference.symbol) {
-                let expected =
-                    self.node_type(store, host, global_types, alias.type_node, active)?;
+            if let Some(alias) = self.aliases.get(&reference.symbol) {
+                let expected = self.cached_annotation_type(
+                    store,
+                    host,
+                    array_targets,
+                    alias.type_node,
+                    active,
+                )?;
                 if store
                     .type_alias_links(reference.symbol)
                     .is_some_and(|links| {
@@ -281,11 +294,13 @@ impl ConstructorAnnotationProof {
                     .declared_type_links(reference.symbol)
                     .and_then(|links| links.declared_type)
             }
-        } else if let Some(union) = self.plan.unions.get(&node) {
+        } else if let Some(union) = self.unions.get(&node) {
             let mut constituents = Vec::with_capacity(union.types.len());
             let mut complete = true;
             for child in &union.types {
-                if let Some(type_) = self.node_type(store, host, global_types, *child, active)? {
+                if let Some(type_) =
+                    self.cached_annotation_type(store, host, array_targets, *child, active)?
+                {
                     constituents.push(type_);
                 } else {
                     complete = false;
@@ -301,13 +316,13 @@ impl ConstructorAnnotationProof {
                     .cached_literal_union_type_with_alias(
                         &constituents,
                         union.alias_symbol.map(|symbol| (symbol, &[][..])),
-                        global_types.map(CanonicalArrayTargets::from_global_types),
+                        array_targets,
                     )
                     .map_err(type_construction_error)?
             } else {
                 None
             }
-        } else if let Some(literal) = self.plan.literals.get(&node) {
+        } else if let Some(literal) = self.literals.get(&node) {
             match literal {
                 PlannedLiteralType::Null => Some(bootstrap.null_type),
                 PlannedLiteralType::String(value) => bootstrap.cached_string_literal_type(value),
@@ -326,10 +341,10 @@ impl ConstructorAnnotationProof {
         } else {
             let record = preflight_node(store, host, node)?;
             if let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data {
-                self.node_type(
+                self.cached_annotation_type(
                     store,
                     host,
-                    global_types,
+                    array_targets,
                     NodeRef::new(node.arena, node.file, parenthesized.type_),
                     active,
                 )?
@@ -355,7 +370,7 @@ impl ConstructorAnnotationProof {
                 && (links.outer_type_parameters.is_some()
                     || links.resolved_type.is_none()
                     || links.resolved_type != expected)
-        }) || !self.plan.references.contains_key(&node)
+        }) || !self.references.contains_key(&node)
             && store
                 .symbol_node_links(node)
                 .is_some_and(|links| links != &SymbolNodeLinks::default())
@@ -363,10 +378,9 @@ impl ConstructorAnnotationProof {
             return Err(invalid());
         }
         active.remove(&node);
-        let needs_node_cache = self.plan.references.contains_key(&node)
-            || self.plan.unions.contains_key(&node)
+        let needs_node_cache = self.references.contains_key(&node)
+            || self.unions.contains_key(&node)
             || self
-                .plan
                 .literals
                 .get(&node)
                 .is_some_and(|literal| !matches!(literal, PlannedLiteralType::Null));
@@ -2454,6 +2468,111 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         self.plan
     }
 
+    fn plan_source_callable_inputs(
+        &mut self,
+        callable: &source_callables::SourceCallablePlan,
+    ) -> Result<(), DeclaredTypeError> {
+        let replay_cached_annotations = self.replay_cached_annotations;
+        self.replay_cached_annotations = true;
+        for parameter in &callable.type_parameters {
+            if let Some(constraint) = parameter.constraint {
+                self.plan_type_node(constraint)?;
+            }
+            if let Some(default_type) = parameter.default_type {
+                self.plan_type_node(default_type)?;
+            }
+        }
+        for parameter in &callable.parameters {
+            if let Some(annotation) = parameter.explicit_type_node() {
+                self.plan_type_node(annotation)?;
+            }
+        }
+        self.replay_cached_annotations = replay_cached_annotations;
+        Ok(())
+    }
+
+    fn validate_replayed_annotation_cache(&self, node: NodeRef) -> Result<(), DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let record = preflight_node(self.store, self.host, node)?;
+        let links = self.store.type_node_links(node);
+        if links.is_some_and(|links| links.outer_type_parameters.is_some())
+            || matches!(
+                record.kind,
+                SyntaxKind::ArrayType | SyntaxKind::TupleType | SyntaxKind::ParenthesizedType
+            ) && self
+                .store
+                .symbol_node_links(node)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return Err(invalid());
+        }
+        if let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data
+            && let Some(cached) = links.and_then(|links| links.resolved_type)
+            && self.cached_array_element_identity(NodeRef::new(
+                node.arena,
+                node.file,
+                parenthesized.type_,
+            ))? != Some(cached)
+        {
+            return Err(invalid());
+        }
+        if !planned_constructor_annotation_shape(
+            self.store,
+            self.host,
+            &self.plan,
+            node,
+            &mut HashSet::new(),
+            &mut Vec::new(),
+        ) {
+            if let Some(reference) = self.plan.references.get(&node)
+                && reference.arity == PlannedTypeReferenceArity::Valid
+                && reference.type_arguments.is_empty()
+                && let Some(alias) = self.plan.aliases.get(&reference.symbol)
+                && alias.type_parameters.is_empty()
+            {
+                // The type-specific planner checked the RHS. An alias cache
+                // must retain that result, including array and tuple types.
+                let declared = self
+                    .store
+                    .type_alias_links(reference.symbol)
+                    .and_then(|links| links.declared_type);
+                let rhs = self.cached_array_element_identity(alias.type_node)?;
+                if declared.is_some_and(|declared| {
+                    rhs.is_none_or(|rhs| {
+                        !valid_type_alias_identity_seed(
+                            self.store,
+                            reference.symbol,
+                            declared,
+                            rhs,
+                            self.strict_builtin_iterator_return,
+                        )
+                    })
+                }) || self.store.type_node_links(node).is_some_and(|links| {
+                    links != &TypeNodeLinks::default()
+                        && (links.outer_type_parameters.is_some()
+                            || links.resolved_type.is_none()
+                            || links.resolved_type != declared
+                            || self
+                                .store
+                                .symbol_node_links(node)
+                                .and_then(|links| links.resolved_symbol)
+                                != Some(reference.symbol))
+                }) {
+                    return Err(invalid());
+                }
+            }
+            return Ok(());
+        }
+        self.plan.cached_annotation_type(
+            self.store,
+            self.host,
+            self.array_targets,
+            node,
+            &mut HashSet::new(),
+        )?;
+        Ok(())
+    }
+
     fn plan_type_node(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
         if let Some(alias) = self.direct_type_alias_owner(node)? {
             self.plan_type_alias(alias, false).map(|_| ())
@@ -2579,6 +2698,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     record.kind,
                     SyntaxKind::FunctionType | SyntaxKind::TypeReference
                 )
+                && !alias_owner.is_some_and(|owner| {
+                    self.plan
+                        .aliases
+                        .get(&owner)
+                        .is_some_and(|alias| !alias.type_parameters.is_empty())
+                })
             {
                 match self.validate_cached_union_result(cached, None) {
                     Ok(()) => {}
@@ -2726,6 +2851,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.validate_cached_union_result(cached, None)
                     .map_err(type_construction_error)?;
             }
+        }
+        if self.replay_cached_annotations {
+            self.validate_replayed_annotation_cache(node)?;
         }
         Ok(())
     }
@@ -11349,6 +11477,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             !source_parameter_constraint
                 && !self.lazy_interface_values
                 && !self.source_callable_alias_planning
+                && !self.replay_cached_annotations
         }) {
             self.store.get_merged_symbol(symbol).ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidCachedSymbol { node, symbol })
@@ -18875,9 +19004,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             symbol,
             self.strict_builtin_iterator_return,
         )?;
+        // A generic alias cache stores its template. Its instantiated reference
+        // is checked separately as the union constituent.
+        let cached_union_constituent =
+            union_constituent && cached.is_none_or(|cached| cached.type_parameter_count == 0);
         if let Some(plan) = self.plan.aliases.get(&symbol) {
             if let Some(cached) = cached {
-                self.validate_cached_type_alias_identity(symbol, cached, union_constituent)?;
+                self.validate_cached_type_alias_identity(symbol, cached, cached_union_constituent)?;
             }
             return Ok(cached.map_or(plan.type_parameters.len(), |cached| {
                 cached.type_parameter_count
@@ -18886,7 +19019,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
         let mut cached_pending_function = false;
         if let Some(cached) = cached {
-            match self.validate_cached_type_alias_identity(symbol, cached, union_constituent) {
+            match self.validate_cached_type_alias_identity(symbol, cached, cached_union_constituent)
+            {
                 Ok(()) => {}
                 Err(DeclaredTypeError::TypeNodeUnavailable(
                     TypeNodeUnavailable::InvalidCachedUnionType(type_),
@@ -18923,7 +19057,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .first()
                 .is_some_and(|declaration| self.host.source(*declaration).is_none())
         {
-            self.validate_cached_type_alias_identity(symbol, cached_alias, union_constituent)?;
+            self.validate_cached_type_alias_identity(
+                symbol,
+                cached_alias,
+                cached_union_constituent,
+            )?;
             return Ok(cached_alias.type_parameter_count);
         }
 
@@ -19211,7 +19349,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.plan_type_node_in_context(type_node, Some(symbol), union_constituent)?;
         }
         if cached_pending_function && let Some(cached) = cached {
-            self.validate_cached_type_alias_identity(symbol, cached, union_constituent)?;
+            self.validate_cached_type_alias_identity(symbol, cached, cached_union_constituent)?;
         }
         Ok(type_parameter_count)
     }
@@ -20769,14 +20907,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         .map_err(|error| source_callable_error(error, family))?;
         self.require_source_callable_alias_capabilities(&callable)?;
         self.preflight_source_callable_alias_annotations(&callable)?;
-        match source_callables::source_callable_state(self.store, &callable, true)
-            .map_err(|error| source_callable_error(error, callable.family))?
-        {
-            source_callables::SourceCallableState::AwaitingInferredReturn { .. }
-            | source_callables::SourceCallableState::Resolved { .. } => return Ok(()),
-            _ => {}
-        }
-
         let mut planner = TypeQueryPlanner::new(
             self.store,
             self.host,
@@ -20785,19 +20915,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
         );
-        for type_parameter in &callable.type_parameters {
-            if let Some(constraint) = type_parameter.constraint {
-                planner.plan_type_node(constraint)?;
-            }
-            if let Some(default_type) = type_parameter.default_type {
-                planner.plan_type_node(default_type)?;
-            }
+        planner.plan_source_callable_inputs(&callable)?;
+        match source_callables::source_callable_state(self.store, &callable, true)
+            .map_err(|error| source_callable_error(error, callable.family))?
+        {
+            source_callables::SourceCallableState::AwaitingInferredReturn { .. }
+            | source_callables::SourceCallableState::Resolved { .. } => return Ok(()),
+            _ => {}
         }
-        for parameter in &callable.parameters {
-            if let Some(type_node) = parameter.explicit_type_node() {
-                planner.plan_type_node(type_node)?;
-            }
-        }
+
         if let Some(return_type) = callable.return_type.type_node() {
             planner.plan_type_node(return_type)?;
         }
@@ -20851,14 +20977,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         .map_err(|error| source_callable_error(error, family))?;
         self.require_source_callable_alias_capabilities(&callable)?;
         self.preflight_source_callable_alias_annotations(&callable)?;
-        match source_callables::source_callable_state(self.store, &callable, true)
-            .map_err(|error| source_callable_error(error, callable.family))?
-        {
-            source_callables::SourceCallableState::AwaitingInferredReturn { type_, .. }
-            | source_callables::SourceCallableState::Resolved { type_, .. } => return Ok(type_),
-            _ => {}
-        }
-
         let mut planner = TypeQueryPlanner::new(
             self.store,
             self.host,
@@ -20867,18 +20985,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
         );
-        for type_parameter in &callable.type_parameters {
-            if let Some(constraint) = type_parameter.constraint {
-                planner.plan_type_node(constraint)?;
-            }
-            if let Some(default_type) = type_parameter.default_type {
-                planner.plan_type_node(default_type)?;
-            }
-        }
-        for parameter in &callable.parameters {
-            if let Some(type_node) = parameter.explicit_type_node() {
-                planner.plan_type_node(type_node)?;
-            }
+        planner.plan_source_callable_inputs(&callable)?;
+        match source_callables::source_callable_state(self.store, &callable, true)
+            .map_err(|error| source_callable_error(error, callable.family))?
+        {
+            source_callables::SourceCallableState::AwaitingInferredReturn { type_, .. }
+            | source_callables::SourceCallableState::Resolved { type_, .. } => return Ok(type_),
+            _ => {}
         }
         for proof in callable.alias_annotations().iter().filter(|proof| {
             proof.owner() == callable.owner_symbol
