@@ -16391,7 +16391,8 @@ mod tests {
                 context.store().type_len(),
                 context.store().symbol_len(),
                 context.store().signature_len(),
-                context.store().checker_link_allocated_lengths(),
+                context.store().mapper_len(),
+                context.store().type_resolution_len(),
             );
             let mut repeated = Vec::new();
             program
@@ -16403,7 +16404,8 @@ mod tests {
                     context.store().type_len(),
                     context.store().symbol_len(),
                     context.store().signature_len(),
-                    context.store().checker_link_allocated_lengths()
+                    context.store().mapper_len(),
+                    context.store().type_resolution_len()
                 ),
                 warm
             );
