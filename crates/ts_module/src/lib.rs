@@ -7,7 +7,10 @@ use std::{
 };
 
 use serde_json::Value;
-use ts_path::{FileExtension, is_absolute, is_relative, normalize_path, resolve_path, root_length};
+use ts_path::{
+    FileExtension, is_absolute, is_relative, is_rooted_disk_path, normalize_path, resolve_path,
+    root_length,
+};
 use ts_semver::{Version, VersionRange};
 use ts_vfs::FileSystem;
 
@@ -48,6 +51,7 @@ pub struct ResolutionOptions {
     pub resolve_package_json_exports: bool,
     pub resolve_package_json_imports: bool,
     pub prefer_types: bool,
+    pub preserve_symlinks: bool,
     pub custom_conditions: Vec<String>,
     pub module_suffixes: Vec<String>,
     pub base_url: Option<String>,
@@ -67,6 +71,7 @@ impl Default for ResolutionOptions {
             resolve_package_json_exports: true,
             resolve_package_json_imports: true,
             prefer_types: true,
+            preserve_symlinks: false,
             custom_conditions: Vec::new(),
             module_suffixes: Vec::new(),
             base_url: None,
@@ -94,7 +99,8 @@ pub struct FailedLookup {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedModule {
     pub resolved_file_name: String,
-    /// The exact candidate passed to the file system's `realpath` call.
+    /// The lookup candidate before optional realpath handling.
+    /// This remains present when realpath is skipped or returns an equivalent path.
     pub original_file_name: String,
     pub extension: Option<FileExtension>,
     pub resolved_using_ts_extension: bool,
@@ -438,6 +444,19 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
                 .or_else(|| state.resolve_node_modules(specifier, &containing_directory))
                 .or_else(|| state.resolve_from_type_roots(specifier, &containing_directory))
         };
+        let resolved = resolved.map(|mut resolved| {
+            resolved.is_external_library_import =
+                resolved.resolved_file_name.contains("/node_modules/");
+            if !self.options.preserve_symlinks
+                && resolved.is_external_library_import
+                && resolved.resolved_file_name == resolved.original_file_name
+                && !is_relative(specifier)
+                && !is_rooted_disk_path(specifier)
+            {
+                self.apply_realpath(&mut resolved);
+            }
+            resolved
+        });
         let result = ResolutionResult {
             resolved,
             failed_lookups: state.failed_lookups,
@@ -473,7 +492,15 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         let containing_directory = directory_path(containing_file);
         let resolved = state
             .resolve_type_reference_from_roots(name, &containing_directory)
-            .or_else(|| state.resolve_node_modules(name, &containing_directory));
+            .or_else(|| state.resolve_node_modules(name, &containing_directory))
+            .map(|mut resolved| {
+                resolved.is_external_library_import =
+                    resolved.resolved_file_name.contains("/node_modules/");
+                if !self.options.preserve_symlinks {
+                    self.apply_realpath(&mut resolved);
+                }
+                resolved
+            });
         ResolutionResult {
             resolved,
             failed_lookups: state.failed_lookups,
@@ -492,6 +519,34 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
     }
+
+    fn apply_realpath(&self, resolved: &mut ResolvedModule) {
+        let realpath = normalize_path(&self.file_system.realpath(&resolved.resolved_file_name));
+        let candidate = normalize_path(&resolved.resolved_file_name);
+        let candidate_root = root_length(&candidate);
+        let realpath_root = root_length(&realpath);
+        let case_sensitive = self.file_system.use_case_sensitive_file_names();
+        if !path_text_equal(
+            &candidate[..candidate_root],
+            &realpath[..realpath_root],
+            false,
+        ) || !path_text_equal(
+            &candidate[candidate_root..],
+            &realpath[realpath_root..],
+            case_sensitive,
+        ) {
+            resolved.resolved_file_name = realpath;
+        }
+    }
+}
+
+fn path_text_equal(left: &str, right: &str, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        return left == right;
+    }
+    // Go ComparePaths uses one-character lowercase mappings, not filename keys.
+    let lowercase = |character: char| character.to_lowercase().next().unwrap_or(character);
+    left.chars().map(lowercase).eq(right.chars().map(lowercase))
 }
 
 struct ResolutionState<'a, 'fs, F: FileSystem + ?Sized> {
@@ -1156,10 +1211,9 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         for candidate in self.module_suffix_candidates(path) {
             if self.resolver.file_system.file_exists(&candidate) {
                 let is_external_library_import = external || candidate.contains("/node_modules/");
-                let resolved_file_name = self.resolver.file_system.realpath(&candidate);
                 return Some(ResolvedModule {
-                    extension: ts_path::extension_from_path(&resolved_file_name),
-                    resolved_file_name,
+                    extension: ts_path::extension_from_path(&candidate),
+                    resolved_file_name: candidate.clone(),
                     original_file_name: candidate,
                     resolved_using_ts_extension: self.specifier_uses_ts_extension
                         && !self.candidate_ending_is_from_config,

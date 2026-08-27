@@ -44,8 +44,8 @@ separate. The compiler still performs its later diagnostic read in the same
 place. `ProgramGraphConfig::source_text` and the report's
 `diagnosticSourceTextDigest` describe that later text, which can differ.
 
-Resolved module records now retain the original candidate passed to
-`realpath`. Every resolution attempt retains the effective import or require
+Resolved module records retain the lookup candidate before optional realpath
+handling. Every resolution attempt retains the effective import or require
 mode, including default-mode and failed attempts. Config parse and extends
 gaps remain when observations are incomplete. A missing leaf text remains a
 separate gap.

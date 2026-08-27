@@ -223,7 +223,7 @@ pub struct ProgramGraphTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramGraphResolution {
     pub request: ProgramGraphResolutionRequest,
-    /// Resolved file names are the resolver's terminal realpath results.
+    /// Resolved file names are the resolver's selected source paths.
     pub result: ResolutionResult,
     /// An ambient declaration can satisfy a failed filesystem resolution.
     pub ambient_target: Option<String>,

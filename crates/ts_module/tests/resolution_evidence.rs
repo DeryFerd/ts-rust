@@ -9,18 +9,29 @@ use std::{
 use ts_module::{
     FailedLookupKind, ModuleFormat, ResolutionMode, ResolutionOptions, ResolutionResult, Resolver,
 };
+use ts_path::FileExtension;
 use ts_vfs::{DirectoryEntries, FileSystem, MemoryFileSystem};
+
+enum RealpathReply {
+    FileSystem,
+    Input,
+    Fixed(String),
+}
 
 struct ObservedFileSystem {
     files: MemoryFileSystem,
     calls: AtomicUsize,
     realpaths: Mutex<Vec<(String, String)>>,
-    return_input_from_realpath: bool,
+    realpath_reply: RealpathReply,
 }
 
 impl ObservedFileSystem {
     fn new(entries: &[(&str, &str)]) -> Self {
-        let files = MemoryFileSystem::new(true);
+        Self::with_case_sensitivity(entries, true)
+    }
+
+    fn with_case_sensitivity(entries: &[(&str, &str)], case_sensitive: bool) -> Self {
+        let files = MemoryFileSystem::new(case_sensitive);
         for (path, contents) in entries {
             files.write_file(path, contents).unwrap();
         }
@@ -28,7 +39,7 @@ impl ObservedFileSystem {
             files,
             calls: AtomicUsize::new(0),
             realpaths: Mutex::new(Vec::new()),
-            return_input_from_realpath: false,
+            realpath_reply: RealpathReply::FileSystem,
         }
     }
 }
@@ -51,10 +62,10 @@ impl FileSystem for ObservedFileSystem {
 
     fn realpath(&self, path: &str) -> String {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        let result = if self.return_input_from_realpath {
-            path.to_owned()
-        } else {
-            self.files.realpath(path)
+        let result = match &self.realpath_reply {
+            RealpathReply::FileSystem => self.files.realpath(path),
+            RealpathReply::Input => path.to_owned(),
+            RealpathReply::Fixed(result) => result.clone(),
         };
         self.realpaths
             .lock()
@@ -100,7 +111,7 @@ fn conditional_package() -> ObservedFileSystem {
 }
 
 #[test]
-fn resolution_evidence_records_the_selected_symlink_candidate() {
+fn resolution_evidence_retains_relative_candidates_without_realpath() {
     let filesystem = ObservedFileSystem::new(&[("/real/pkg/entry.ios.d.ts", "")]);
     filesystem
         .files
@@ -119,12 +130,12 @@ fn resolution_evidence_records_the_selected_symlink_candidate() {
         entry.original_file_name,
         "/app/node_modules/pkg/entry.ios.d.ts"
     );
-    assert_eq!(entry.resolved_file_name, "/real/pkg/entry.ios.d.ts");
-    assert!(entry.is_external_library_import);
     assert_eq!(
-        *filesystem.realpaths.lock().unwrap(),
-        [(entry.original_file_name, entry.resolved_file_name)]
+        entry.resolved_file_name,
+        "/app/node_modules/pkg/entry.ios.d.ts"
     );
+    assert!(entry.is_external_library_import);
+    assert!(filesystem.realpaths.lock().unwrap().is_empty());
     assert_eq!(
         result
             .failed_lookups
@@ -156,15 +167,19 @@ fn resolution_evidence_records_the_selected_symlink_candidate() {
 #[test]
 fn resolution_evidence_records_unchanged_realpath_results() {
     for (return_input, specifier, candidate) in [
-        (false, "./direct", "/app/direct.ts"),
-        (true, "./alias", "/app/alias.ts"),
+        (false, "direct", "/app/node_modules/direct/index.d.ts"),
+        (true, "alias", "/app/node_modules/alias/index.d.ts"),
     ] {
-        let mut filesystem =
-            ObservedFileSystem::new(&[("/app/direct.ts", ""), ("/real/entry.ts", "")]);
+        let mut filesystem = ObservedFileSystem::new(&[
+            ("/app/node_modules/direct/index.d.ts", ""),
+            ("/real/entry.d.ts", ""),
+        ]);
         filesystem
             .files
-            .add_file_link("/real/entry.ts", "/app/alias.ts");
-        filesystem.return_input_from_realpath = return_input;
+            .add_file_link("/real/entry.d.ts", "/app/node_modules/alias/index.d.ts");
+        if return_input {
+            filesystem.realpath_reply = RealpathReply::Input;
+        }
         let resolver = Resolver::new(&filesystem, ResolutionOptions::default());
         let entry = resolver
             .resolve(specifier, "/app/main.ts")
@@ -177,6 +192,239 @@ fn resolution_evidence_records_unchanged_realpath_results() {
             [(candidate.to_owned(), candidate.to_owned())]
         );
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep lookup kinds beside their expected realpath policy.
+fn symlink_rules_distinguish_relative_package_and_mapped_modules() {
+    for preserve_symlinks in [false, true] {
+        for (specifier, candidate, realpath, external, eligible) in [
+            ("./local", "/app/local.ts", "/real/local.ts", false, false),
+            (
+                "./node_modules/pkg/index",
+                "/app/node_modules/pkg/index.d.ts",
+                "/real/pkg/index.d.ts",
+                true,
+                false,
+            ),
+            (
+                "/app/node_modules/pkg/index.d.ts",
+                "/app/node_modules/pkg/index.d.ts",
+                "/real/pkg/index.d.ts",
+                true,
+                false,
+            ),
+            (
+                "pkg",
+                "/app/node_modules/pkg/index.d.ts",
+                "/real/pkg/index.d.ts",
+                true,
+                true,
+            ),
+            (
+                "mapped",
+                "/app/node_modules/pkg/index.d.ts",
+                "/real/pkg/index.d.ts",
+                true,
+                true,
+            ),
+            (
+                "asset://pkg",
+                "/app/node_modules/pkg/index.d.ts",
+                "/real/pkg/index.d.ts",
+                true,
+                true,
+            ),
+            (
+                "local-mapped",
+                "/app/local.ts",
+                "/real/local.ts",
+                false,
+                false,
+            ),
+        ] {
+            let filesystem =
+                ObservedFileSystem::new(&[("/real/local.ts", ""), ("/real/pkg/index.d.ts", "")]);
+            filesystem
+                .files
+                .add_file_link("/real/local.ts", "/app/local.ts");
+            filesystem
+                .files
+                .add_directory_link("/real/pkg", "/app/node_modules/pkg");
+            let resolver = Resolver::new(
+                &filesystem,
+                ResolutionOptions {
+                    mode: ResolutionMode::Bundler,
+                    preserve_symlinks,
+                    base_url: Some("/app".to_owned()),
+                    paths: std::collections::BTreeMap::from([
+                        (
+                            "mapped".to_owned(),
+                            vec!["node_modules/pkg/index.d.ts".to_owned()],
+                        ),
+                        (
+                            "asset://pkg".to_owned(),
+                            vec!["node_modules/pkg/index.d.ts".to_owned()],
+                        ),
+                        ("local-mapped".to_owned(), vec!["local.ts".to_owned()]),
+                    ]),
+                    ..ResolutionOptions::default()
+                },
+            );
+            let result = resolver.resolve(specifier, "/app/main.ts");
+            assert_eq!(result.effective_mode, Some(ModuleFormat::Esm));
+            let entry = result.resolved.as_ref().unwrap();
+            let follows = eligible && !preserve_symlinks;
+            assert_eq!(entry.original_file_name, candidate);
+            assert_eq!(
+                entry.resolved_file_name,
+                if follows { realpath } else { candidate }
+            );
+            assert_eq!(entry.is_external_library_import, external);
+            let expected = if follows {
+                vec![(candidate.to_owned(), realpath.to_owned())]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                *filesystem.realpaths.lock().unwrap(),
+                expected,
+                "{specifier}"
+            );
+            let calls = filesystem.calls.load(Ordering::Relaxed);
+            assert_eq!(resolver.resolve(specifier, "/app/main.ts"), result);
+            assert_eq!(filesystem.calls.load(Ordering::Relaxed), calls);
+        }
+    }
+}
+
+#[test]
+fn symlink_rules_keep_type_directives_distinct_outside_node_modules() {
+    for preserve_symlinks in [false, true] {
+        let filesystem = ObservedFileSystem::new(&[("/real/types/index.d.ts", "")]);
+        filesystem
+            .files
+            .add_directory_link("/real/types", "/types/pkg");
+        let resolver = Resolver::new(
+            &filesystem,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                preserve_symlinks,
+                type_roots: Some(vec!["/types".to_owned()]),
+                ..ResolutionOptions::default()
+            },
+        );
+        let module = resolver.resolve("pkg", "/app/main.ts");
+        assert_eq!(module.effective_mode, Some(ModuleFormat::Esm));
+        let module = module.resolved.unwrap();
+        assert_eq!(module.original_file_name, "/types/pkg/index.d.ts");
+        assert_eq!(module.resolved_file_name, "/types/pkg/index.d.ts");
+        assert!(!module.is_external_library_import);
+        assert!(filesystem.realpaths.lock().unwrap().is_empty());
+
+        let directive = resolver.resolve_type_reference("pkg", "/app/main.ts");
+        assert_eq!(directive.effective_mode, Some(ModuleFormat::Esm));
+        let directive = directive.resolved.unwrap();
+        assert_eq!(directive.original_file_name, "/types/pkg/index.d.ts");
+        assert_eq!(
+            directive.resolved_file_name,
+            if preserve_symlinks {
+                "/types/pkg/index.d.ts"
+            } else {
+                "/real/types/index.d.ts"
+            }
+        );
+        assert!(!directive.is_external_library_import);
+        let expected = if preserve_symlinks {
+            Vec::new()
+        } else {
+            vec![(
+                "/types/pkg/index.d.ts".to_owned(),
+                "/real/types/index.d.ts".to_owned(),
+            )]
+        };
+        assert_eq!(*filesystem.realpaths.lock().unwrap(), expected);
+    }
+}
+
+#[test]
+fn symlink_rules_preserve_lookup_spelling_for_case_equivalent_results() {
+    let candidate = "/app/node_modules/pkg/index.d.ts";
+    let returned = "/APP/NODE_MODULES/PKG/index.d.ts";
+    for case_sensitive in [false, true] {
+        let mut filesystem =
+            ObservedFileSystem::with_case_sensitivity(&[(candidate, "")], case_sensitive);
+        filesystem.realpath_reply = RealpathReply::Fixed(returned.to_owned());
+        let resolver = Resolver::new(&filesystem, ResolutionOptions::default());
+        let result = resolver.resolve("pkg", "/app/main.ts").resolved.unwrap();
+        assert_eq!(result.original_file_name, candidate);
+        assert_eq!(
+            result.resolved_file_name,
+            if case_sensitive { returned } else { candidate }
+        );
+        assert_eq!(
+            *filesystem.realpaths.lock().unwrap(),
+            [(candidate.to_owned(), returned.to_owned())]
+        );
+    }
+}
+
+#[test]
+fn symlink_rules_compare_drive_roots_without_case_sensitivity() {
+    let candidate = "c:/app/node_modules/pkg/index.d.ts";
+    let returned = "C:/app/node_modules/pkg/index.d.ts";
+    let mut filesystem = ObservedFileSystem::new(&[(candidate, "")]);
+    filesystem.realpath_reply = RealpathReply::Fixed(returned.to_owned());
+    let resolver = Resolver::new(&filesystem, ResolutionOptions::default());
+    let result = resolver.resolve("pkg", "c:/app/main.ts").resolved.unwrap();
+    assert_eq!(result.original_file_name, candidate);
+    assert_eq!(result.resolved_file_name, candidate);
+    assert_eq!(
+        *filesystem.realpaths.lock().unwrap(),
+        [(candidate.to_owned(), returned.to_owned())]
+    );
+}
+
+#[test]
+fn symlink_rules_use_go_character_case_comparison() {
+    let candidate = "/app/node_modules/pkg/\u{0130}tem.d.ts";
+    let returned = "/app/node_modules/pkg/item.d.ts";
+    let mut filesystem = ObservedFileSystem::with_case_sensitivity(
+        &[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"types":"\u0130tem.d.ts"}"#,
+            ),
+            (candidate, ""),
+        ],
+        false,
+    );
+    filesystem.realpath_reply = RealpathReply::Fixed(returned.to_owned());
+    let resolver = Resolver::new(&filesystem, ResolutionOptions::default());
+    let result = resolver.resolve("pkg", "/app/main.ts").resolved.unwrap();
+    assert_eq!(result.original_file_name, candidate);
+    assert_eq!(result.resolved_file_name, candidate);
+    assert_eq!(
+        *filesystem.realpaths.lock().unwrap(),
+        [(candidate.to_owned(), returned.to_owned())]
+    );
+}
+
+#[test]
+fn symlink_rules_normalize_returned_paths_and_keep_candidate_extension() {
+    let candidate = "/app/node_modules/pkg/index.d.ts";
+    let returned = "/real/./temporary/../entry.js";
+    let mut filesystem = ObservedFileSystem::new(&[(candidate, "")]);
+    filesystem.realpath_reply = RealpathReply::Fixed(returned.to_owned());
+    let resolver = Resolver::new(&filesystem, ResolutionOptions::default());
+    let result = resolver.resolve("pkg", "/app/main.ts").resolved.unwrap();
+    assert_eq!(result.original_file_name, candidate);
+    assert_eq!(result.resolved_file_name, "/real/entry.js");
+    assert_eq!(result.extension, Some(FileExtension::Dts));
+    assert_eq!(
+        *filesystem.realpaths.lock().unwrap(),
+        [(candidate.to_owned(), returned.to_owned())]
+    );
 }
 
 #[test]
