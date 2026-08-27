@@ -825,6 +825,7 @@ impl CanonicalCheckerContext<'_> {
         self.type_reference_qualifier_artifact_type(node)?;
         self.preflight_literal_annotation_nodes(node)?;
         self.preflight_duplicate_property_artifact_nodes(node)?;
+        self.preflight_enum_initializer_artifact_node(node)?;
         self.prepare_artifact_location(node)?;
         Ok(declaration)
     }
@@ -1514,24 +1515,34 @@ impl CanonicalCheckerContext<'_> {
         &mut self,
         node: NodeRef,
     ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        if !self.preflight_enum_initializer_artifact_node(node)? {
+            return Ok(None);
+        }
+        self.primitive_initializer_artifact_type(node).map(Some)
+    }
+
+    fn preflight_enum_initializer_artifact_node(
+        &self,
+        node: NodeRef,
+    ) -> Result<bool, CanonicalArtifactQueryError> {
         let owner = {
             let (arena, bound, record) = self.validated_artifact_node(node)?;
             if !matches!(
                 record.data,
                 NodeData::StringLiteral(_) | NodeData::NumericLiteral(_)
             ) {
-                return Ok(None);
+                return Ok(false);
             }
             let Some(member_id) = record.parent else {
-                return Ok(None);
+                return Ok(false);
             };
             let member = NodeRef::new(node.arena, node.file, member_id);
             let (_, _, member_record) = self.validated_artifact_node(member)?;
             let NodeData::EnumMember(data) = &member_record.data else {
-                return Ok(None);
+                return Ok(false);
             };
             if data.initializer != Some(node.node) {
-                return Ok(None);
+                return Ok(false);
             }
             let declaration = member_record
                 .parent
@@ -1549,7 +1560,8 @@ impl CanonicalCheckerContext<'_> {
             self.merged_artifact_symbol(node, owner)?
         };
         self.preflight_enum_type(owner)?;
-        self.primitive_initializer_artifact_type(node).map(Some)
+        self.preflight_primitive_initializer_artifact_node(node)?;
+        Ok(true)
     }
 
     fn primitive_initializer_artifact_type(
@@ -6057,139 +6069,207 @@ mod tests {
 
     #[test]
     fn enum_initializer_artifacts_use_primitive_literals_without_member_symbols() {
-        let parsed = parse_source_file("enum Choice { First = 'choice', Second = 42 }");
-        let file = FileId::new(6_114);
-        let mut context = context(&parsed, file);
-        context.check_source_file(file).unwrap();
-        let mut results = Vec::new();
-        for (id, record) in parsed.arena.iter() {
-            if !matches!(
-                record.data,
-                NodeData::StringLiteral(_) | NodeData::NumericLiteral(_)
-            ) {
-                continue;
+        for checked_first in [false, true] {
+            let parsed = parse_source_file("enum Choice { First = 'choice', Second = 42 }");
+            let file = FileId::new(6_114);
+            let mut context = context(&parsed, file);
+            if checked_first {
+                context.check_source_file(file).unwrap();
             }
-            let node = NodeRef::new(parsed.arena.id(), file, id);
-            let type_ = context.get_type_at_location(node).unwrap();
-            let payload = context.store().type_payload(type_).unwrap();
-            let TypeData::Literal(literal) = payload.data() else {
-                panic!("an enum initializer must retain its primitive literal type")
-            };
-            assert_eq!(literal.regular_type, type_);
-            assert!(payload.symbol().is_none());
-            assert!(!payload.flags().contains(TypeFlags::ENUM_LITERAL));
-            assert_eq!(context.get_symbol_at_location(node).unwrap(), None);
-            let fresh = context.store().fresh_type_of_literal_type(type_).unwrap();
-            assert!(context.store_mut_for_test().set_type_node_links(
-                node,
-                TypeNodeLinks {
-                    resolved_type: Some(fresh),
-                    outer_type_parameters: None,
+            let mut results = Vec::new();
+            for (id, record) in parsed.arena.iter() {
+                if !matches!(
+                    record.data,
+                    NodeData::StringLiteral(_) | NodeData::NumericLiteral(_)
+                ) {
+                    continue;
                 }
-            ));
-            results.push((node, type_));
-        }
-        assert_eq!(results.len(), 2);
-        assert_eq!(context.type_to_string(results[0].1).unwrap(), "\"choice\"");
-        assert_eq!(context.type_to_string(results[1].1).unwrap(), "42");
-        let before = (
-            context.store().type_len(),
-            context.store().checker_link_allocated_lengths(),
-        );
-        for (node, type_) in results {
-            assert_eq!(context.get_type_at_location(node).unwrap(), type_);
-        }
-        assert_eq!(
-            (
+                let node = NodeRef::new(parsed.arena.id(), file, id);
+                let type_ = context.get_type_at_location(node).unwrap();
+                let payload = context.store().type_payload(type_).unwrap();
+                let TypeData::Literal(literal) = payload.data() else {
+                    panic!("an enum initializer must retain its primitive literal type")
+                };
+                assert_eq!(literal.regular_type, type_);
+                assert!(payload.symbol().is_none());
+                assert!(!payload.flags().contains(TypeFlags::ENUM_LITERAL));
+                assert_eq!(context.get_symbol_at_location(node).unwrap(), None);
+                let fresh = context.store().fresh_type_of_literal_type(type_).unwrap();
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(fresh),
+                        outer_type_parameters: None,
+                    }
+                ));
+                results.push((node, type_));
+            }
+            assert_eq!(results.len(), 2);
+            assert_eq!(context.type_to_string(results[0].1).unwrap(), "\"choice\"");
+            assert_eq!(context.type_to_string(results[1].1).unwrap(), "42");
+            let source_file = context.source_file(file).unwrap();
+            assert!(
+                context
+                    .store()
+                    .source_file_links(source_file)
+                    .unwrap()
+                    .type_checked
+            );
+            let before = (
                 context.store().type_len(),
-                context.store().checker_link_allocated_lengths()
-            ),
-            before
-        );
+                context.store().checker_link_allocated_lengths(),
+                context.store().source_file_links(source_file).cloned(),
+            );
+            for (node, type_) in results {
+                assert_eq!(context.get_type_at_location(node).unwrap(), type_);
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().source_file_links(source_file).cloned(),
+                ),
+                before,
+                "checked_first {checked_first}",
+            );
+        }
     }
 
     #[test]
     fn enum_initializer_artifacts_reject_changed_enum_and_literal_caches() {
-        for poison in 0..4 {
-            let parsed = parse_source_file("enum Choice { First = 'choice' }");
-            let file = FileId::new(6_115);
-            let mut context = context(&parsed, file);
-            context.check_source_file(file).unwrap();
-            let (member, initializer) = parsed
-                .arena
-                .iter()
-                .find_map(|(id, record)| {
-                    let NodeData::EnumMember(member) = &record.data else {
-                        return None;
-                    };
-                    Some((
-                        NodeRef::new(parsed.arena.id(), file, id),
-                        NodeRef::new(parsed.arena.id(), file, member.initializer.unwrap()),
-                    ))
-                })
-                .unwrap();
-            let symbol = context.file(file).unwrap().1.symbol(member).unwrap();
-            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
-            match poison {
-                0 => assert!(context.store_mut_for_test().set_type_node_links(
-                    initializer,
-                    TypeNodeLinks {
-                        resolved_type: Some(number),
-                        outer_type_parameters: None
+        for source in [
+            "enum Choice { First = 'choice' }",
+            "enum Choice { First = 42 }",
+        ] {
+            for checked_first in [false, true] {
+                for poison in 0..5 {
+                    let parsed = parse_source_file(source);
+                    let file = FileId::new(6_115);
+                    let mut context = context(&parsed, file);
+                    if checked_first {
+                        context.check_source_file(file).unwrap();
                     }
-                )),
-                1 => assert!(context.store_mut_for_test().set_value_symbol_links(
-                    symbol,
-                    ValueSymbolLinks {
-                        resolved_type: Some(number),
-                        ..ValueSymbolLinks::default()
-                    }
-                )),
-                2 => assert!(context.store_mut_for_test().set_symbol_node_links(
-                    initializer,
-                    SymbolNodeLinks {
-                        resolved_symbol: Some(symbol)
-                    }
-                )),
-                3 => {
-                    let member_type = context
-                        .store()
-                        .value_symbol_links(symbol)
-                        .unwrap()
-                        .resolved_type
+                    let (member, initializer) = parsed
+                        .arena
+                        .iter()
+                        .find_map(|(id, record)| {
+                            let NodeData::EnumMember(member) = &record.data else {
+                                return None;
+                            };
+                            Some((
+                                NodeRef::new(parsed.arena.id(), file, id),
+                                NodeRef::new(parsed.arena.id(), file, member.initializer.unwrap()),
+                            ))
+                        })
                         .unwrap();
-                    assert!(context.store_mut_for_test().set_type_node_links(
-                        initializer,
-                        TypeNodeLinks {
-                            resolved_type: Some(member_type),
-                            outer_type_parameters: None,
+                    let symbol = context.file(file).unwrap().1.symbol(member).unwrap();
+                    let owner = context.store().get_parent_of_symbol(symbol).unwrap();
+                    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                    match poison {
+                        0 => assert!(context.store_mut_for_test().set_type_node_links(
+                            initializer,
+                            TypeNodeLinks {
+                                resolved_type: Some(number),
+                                outer_type_parameters: None
+                            }
+                        )),
+                        1 => assert!(context.store_mut_for_test().set_value_symbol_links(
+                            symbol,
+                            ValueSymbolLinks {
+                                resolved_type: Some(number),
+                                ..ValueSymbolLinks::default()
+                            }
+                        )),
+                        2 => assert!(context.store_mut_for_test().set_symbol_node_links(
+                            initializer,
+                            SymbolNodeLinks {
+                                resolved_symbol: Some(symbol)
+                            }
+                        )),
+                        3 => {
+                            // Obtain the enum member type without checking its source file.
+                            context.get_declared_type_of_symbol(owner).unwrap();
+                            let member_type = context
+                                .store()
+                                .value_symbol_links(symbol)
+                                .unwrap()
+                                .resolved_type
+                                .unwrap();
+                            assert!(context.store_mut_for_test().set_type_node_links(
+                                initializer,
+                                TypeNodeLinks {
+                                    resolved_type: Some(member_type),
+                                    outer_type_parameters: None,
+                                }
+                            ));
                         }
-                    ));
+                        4 => assert!(context.store_mut_for_test().set_type_node_links(
+                            initializer,
+                            TypeNodeLinks {
+                                resolved_type: None,
+                                outer_type_parameters: Some(vec![number]),
+                            }
+                        )),
+                        _ => unreachable!(),
+                    }
+                    let source_file = context.source_file(file).unwrap();
+                    assert_eq!(
+                        context
+                            .store()
+                            .source_file_links(source_file)
+                            .is_some_and(|links| links.type_checked),
+                        checked_first,
+                    );
+                    let before = (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().signature_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.diagnostics().len(),
+                        context.store().source_file_links(source_file).cloned(),
+                        context.store().declared_type_links(owner).cloned(),
+                        context.store().value_symbol_links(symbol).cloned(),
+                        context.store().enum_member_links(member).cloned(),
+                        context.store().type_node_links(initializer).cloned(),
+                        context.store().symbol_node_links(initializer).cloned(),
+                    );
+                    let result = context.get_type_at_location(initializer);
+                    match poison {
+                        0 => assert_eq!(
+                            result,
+                            Err(CanonicalArtifactQueryError::InvalidType {
+                                node: initializer,
+                                type_: number,
+                            })
+                        ),
+                        2 => assert_eq!(
+                            result,
+                            Err(CanonicalArtifactQueryError::InvalidSymbol {
+                                node: initializer,
+                                symbol,
+                            })
+                        ),
+                        _ => assert!(result.is_err(), "{source}, poison {poison}"),
+                    }
+                    assert_eq!(
+                        (
+                            context.store().type_len(),
+                            context.store().symbol_len(),
+                            context.store().signature_len(),
+                            context.store().checker_link_allocated_lengths(),
+                            context.diagnostics().len(),
+                            context.store().source_file_links(source_file).cloned(),
+                            context.store().declared_type_links(owner).cloned(),
+                            context.store().value_symbol_links(symbol).cloned(),
+                            context.store().enum_member_links(member).cloned(),
+                            context.store().type_node_links(initializer).cloned(),
+                            context.store().symbol_node_links(initializer).cloned(),
+                        ),
+                        before,
+                        "{source}, checked_first {checked_first}, poison {poison}",
+                    );
                 }
-                _ => unreachable!(),
             }
-            let before = (
-                context.store().type_len(),
-                context.store().symbol_len(),
-                context.store().signature_len(),
-                context.store().checker_link_allocated_lengths(),
-                context.diagnostics().len(),
-            );
-            assert!(
-                context.get_type_at_location(initializer).is_err(),
-                "poison {poison}"
-            );
-            assert_eq!(
-                (
-                    context.store().type_len(),
-                    context.store().symbol_len(),
-                    context.store().signature_len(),
-                    context.store().checker_link_allocated_lengths(),
-                    context.diagnostics().len()
-                ),
-                before,
-                "poison {poison}"
-            );
         }
     }
 
