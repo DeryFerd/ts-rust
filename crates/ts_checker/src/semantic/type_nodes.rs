@@ -47715,6 +47715,536 @@ mod tests {
         .get_type_of_declared_value(symbol)
     }
 
+    fn exported_declared_value_fixture(
+        source: &str,
+        declaration_file: bool,
+    ) -> (Fixture, crate::semantic::SourceFileRef) {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(24_035);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(if declaration_file {
+                        "\"/declared-values.d.ts\""
+                    } else {
+                        "\"/declared-values.ts\""
+                    }),
+                    CanonicalSourceLanguage::TypeScript,
+                    declaration_file,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        let source = store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        (
+            Fixture {
+                parsed,
+                file,
+                files,
+                store,
+            },
+            source,
+        )
+    }
+
+    #[test]
+    fn exported_declared_values_keep_scalar_identity_and_leave_siblings_unchecked() {
+        for (declaration_file, prefix) in [
+            (false, "export declare"),
+            (true, "export declare"),
+            (true, "export"),
+            (true, "declare"),
+        ] {
+            for binding in ["const", "let", "var"] {
+                let (mut fixture, source) = exported_declared_value_fixture(
+                    &format!(
+                        "{prefix} {binding} get: number; export declare const ignored: Missing;"
+                    ),
+                    declaration_file,
+                );
+                let declaration = named_node(&fixture, SyntaxKind::VariableDeclaration, "get");
+                let symbol = node_symbol(&fixture, declaration);
+                let bound = fixture.files.get(&fixture.file).unwrap();
+                let local = bound.local_symbol(declaration).unwrap();
+                let annotation = fixture
+                    .store
+                    .source_direct_type_annotation(declaration)
+                    .unwrap();
+                let ignored = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "ignored");
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let before = (
+                    union_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len(),
+                );
+                {
+                    let host = post_global_host(&fixture.parsed.arena, bound);
+                    let query = CanonicalTypeQuery::new(
+                        &mut fixture.store,
+                        &host,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .unwrap();
+                    query.preflight_type_of_declared_value(symbol).unwrap();
+                }
+                assert_eq!(
+                    (
+                        union_state(&fixture.store),
+                        fixture.store.symbol_len(),
+                        fixture.store.signature_len()
+                    ),
+                    before
+                );
+                assert!(fixture.store.value_symbol_links(symbol).is_none());
+                assert!(fixture.store.declared_value_provenance(symbol).is_none());
+                let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                assert_eq!(
+                    query_declared_value(&mut fixture, symbol, &mut diagnostics),
+                    Ok(number)
+                );
+                assert_eq!(
+                    validate_stored_callable_set(&fixture.store, number),
+                    StoredCallableSetValidation::NotCallable
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_direct_type_annotation_is_exact(annotation, number)
+                );
+                assert!(
+                    fixture
+                        .store
+                        .declared_value_provenance(symbol)
+                        .unwrap()
+                        .is_current(&fixture.store, symbol)
+                );
+                assert_ne!(local, symbol);
+                assert_eq!(
+                    fixture.store.symbol(local).unwrap().flags(),
+                    SymbolFlags::EXPORT_VALUE
+                );
+                assert!(fixture.store.value_symbol_links(local).is_none());
+                assert!(fixture.store.value_symbol_links(ignored).is_none());
+                let before = (
+                    union_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len(),
+                );
+                assert_eq!(
+                    query_declared_value(&mut fixture, symbol, &mut diagnostics),
+                    Ok(number)
+                );
+                assert!(query_declared_value(&mut fixture, local, &mut diagnostics).is_err());
+                assert_eq!(
+                    (
+                        union_state(&fixture.store),
+                        fixture.store.symbol_len(),
+                        fixture.store.signature_len()
+                    ),
+                    before
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_file_links(source)
+                        .is_none_or(|links| !links.type_checked)
+                );
+                assert!(diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn exported_declared_values_reject_callable_cache_poison_and_retry() {
+        let (mut fixture, source) = exported_declared_value_fixture(
+            "export declare const get: (a: number, b: number, c: number, d: number) => void; export declare const ignored: Missing;",
+            true,
+        );
+        let declaration = named_node(&fixture, SyntaxKind::VariableDeclaration, "get");
+        let symbol = node_symbol(&fixture, declaration);
+        let annotation = fixture
+            .store
+            .source_direct_type_annotation(declaration)
+            .unwrap();
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(fixture.store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let before = (
+            union_state(&fixture.store),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+        );
+        assert!(query_declared_value(&mut fixture, symbol, &mut diagnostics).is_err());
+        assert_eq!(
+            (
+                union_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len()
+            ),
+            before
+        );
+        assert!(fixture.store.type_node_links(annotation).is_none());
+        assert!(fixture.store.declared_value_provenance(symbol).is_none());
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(symbol, ValueSymbolLinks::default())
+        );
+
+        let type_ = query_declared_value(&mut fixture, symbol, &mut diagnostics).unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, type_)
+        else {
+            panic!("the declared value must retain its validated callable");
+        };
+        let [callable] = projection.call_signatures.as_ref() else {
+            panic!("expected one call signature");
+        };
+        assert_eq!(
+            crate::semantic::calls::get_parameter_count(&fixture.store, None, callable),
+            Ok(4)
+        );
+        assert!(
+            fixture
+                .store
+                .signature(callable.signature)
+                .unwrap()
+                .resolved_return_type()
+                .is_none()
+        );
+        let value_links = fixture.store.value_symbol_links(symbol).cloned().unwrap();
+        let node_links = fixture.store.type_node_links(annotation).cloned().unwrap();
+        let provenance = fixture.store.declared_value_provenance(symbol);
+        let before = (
+            union_state(&fixture.store),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+        );
+        assert_eq!(
+            query_declared_value(&mut fixture, symbol, &mut diagnostics),
+            Ok(type_)
+        );
+        assert_eq!(
+            (
+                union_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len()
+            ),
+            before
+        );
+
+        for paired_annotation in [false, true] {
+            assert!(fixture.store.set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(wrong),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            if paired_annotation {
+                assert!(fixture.store.set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+            }
+            let before = (
+                union_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+            );
+            assert!(query_declared_value(&mut fixture, symbol, &mut diagnostics).is_err());
+            assert_eq!(
+                (
+                    union_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len()
+                ),
+                before
+            );
+            assert_eq!(fixture.store.declared_value_provenance(symbol), provenance);
+            assert!(
+                fixture
+                    .store
+                    .set_type_node_links(annotation, node_links.clone())
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_value_symbol_links(symbol, value_links.clone())
+            );
+            assert_eq!(
+                query_declared_value(&mut fixture, symbol, &mut diagnostics),
+                Ok(type_)
+            );
+        }
+        assert!(
+            fixture
+                .store
+                .source_file_links(source)
+                .is_none_or(|links| !links.type_checked)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn exported_declared_values_validate_local_and_export_edges_cold_and_warm() {
+        #[derive(Clone, Copy, Debug)]
+        enum Corruption {
+            LocalTarget,
+            ValueParent,
+            ExportEntry,
+            LocalEntry,
+            LocalFlags,
+            LocalDeclaration,
+            LocalValueCache,
+        }
+        for warm in [false, true] {
+            for corruption in [
+                Corruption::LocalTarget,
+                Corruption::ValueParent,
+                Corruption::ExportEntry,
+                Corruption::LocalEntry,
+                Corruption::LocalFlags,
+                Corruption::LocalDeclaration,
+                Corruption::LocalValueCache,
+            ] {
+                let (mut fixture, source_handle) = exported_declared_value_fixture(
+                    "export declare const get: number; export declare const other: string;",
+                    true,
+                );
+                let declaration = named_node(&fixture, SyntaxKind::VariableDeclaration, "get");
+                let symbol = node_symbol(&fixture, declaration);
+                let other_declaration =
+                    named_node(&fixture, SyntaxKind::VariableDeclaration, "other");
+                let other = node_symbol(&fixture, other_declaration);
+                let bound = fixture.files.get(&fixture.file).unwrap();
+                let source = bound.source_file();
+                let module = bound.symbol(source).unwrap();
+                let local = bound.local_symbol(declaration).unwrap();
+                let other_local = bound.local_symbol(other_declaration).unwrap();
+                let locals = bound.locals(source).unwrap();
+                let exports = fixture.store.symbol(module).unwrap().exports().unwrap();
+                let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                if warm {
+                    assert_eq!(
+                        query_declared_value(&mut fixture, symbol, &mut diagnostics),
+                        Ok(number)
+                    );
+                }
+                match corruption {
+                    Corruption::LocalTarget => assert!(fixture.store.set_symbol_relationships(
+                        local,
+                        None,
+                        None,
+                        None,
+                        Some(other)
+                    )),
+                    Corruption::ValueParent => assert!(
+                        fixture
+                            .store
+                            .set_symbol_relationships(symbol, None, None, None, None)
+                    ),
+                    Corruption::ExportEntry => assert_eq!(
+                        fixture
+                            .store
+                            .insert_symbol(exports, EscapedName::source("get"), other),
+                        Some(Some(symbol))
+                    ),
+                    Corruption::LocalEntry => assert_eq!(
+                        fixture.store.insert_symbol(
+                            locals,
+                            EscapedName::source("get"),
+                            other_local
+                        ),
+                        Some(Some(local))
+                    ),
+                    Corruption::LocalFlags => assert!(fixture.store.set_symbol_flags(
+                        local,
+                        SymbolFlags::ALIAS,
+                        CheckFlags::NONE
+                    )),
+                    Corruption::LocalDeclaration => assert!(fixture.store.set_symbol_declarations(
+                        local,
+                        Some(vec![declaration]),
+                        Some(declaration)
+                    )),
+                    Corruption::LocalValueCache => assert!(fixture.store.set_value_symbol_links(
+                        local,
+                        ValueSymbolLinks {
+                            resolved_type: Some(number),
+                            ..ValueSymbolLinks::default()
+                        }
+                    )),
+                }
+                let before = (
+                    union_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len(),
+                );
+                let value_links = fixture.store.value_symbol_links(symbol).cloned();
+                let provenance = fixture.store.declared_value_provenance(symbol);
+                assert!(
+                    query_declared_value(&mut fixture, symbol, &mut diagnostics).is_err(),
+                    "{warm:?} {corruption:?}"
+                );
+                assert_eq!(
+                    (
+                        union_state(&fixture.store),
+                        fixture.store.symbol_len(),
+                        fixture.store.signature_len()
+                    ),
+                    before,
+                    "{warm:?} {corruption:?}"
+                );
+                assert_eq!(
+                    fixture.store.value_symbol_links(symbol),
+                    value_links.as_ref()
+                );
+                assert_eq!(fixture.store.declared_value_provenance(symbol), provenance);
+                match corruption {
+                    Corruption::LocalTarget => assert!(fixture.store.set_symbol_relationships(
+                        local,
+                        None,
+                        None,
+                        None,
+                        Some(symbol)
+                    )),
+                    Corruption::ValueParent => assert!(fixture.store.set_symbol_relationships(
+                        symbol,
+                        None,
+                        None,
+                        Some(module),
+                        None
+                    )),
+                    Corruption::ExportEntry => assert_eq!(
+                        fixture
+                            .store
+                            .insert_symbol(exports, EscapedName::source("get"), symbol),
+                        Some(Some(other))
+                    ),
+                    Corruption::LocalEntry => assert_eq!(
+                        fixture
+                            .store
+                            .insert_symbol(locals, EscapedName::source("get"), local),
+                        Some(Some(other_local))
+                    ),
+                    Corruption::LocalFlags => assert!(fixture.store.set_symbol_flags(
+                        local,
+                        SymbolFlags::EXPORT_VALUE,
+                        CheckFlags::NONE
+                    )),
+                    Corruption::LocalDeclaration => assert!(fixture.store.set_symbol_declarations(
+                        local,
+                        Some(vec![declaration]),
+                        None
+                    )),
+                    Corruption::LocalValueCache => assert!(
+                        fixture
+                            .store
+                            .set_value_symbol_links(local, ValueSymbolLinks::default())
+                    ),
+                }
+                assert_eq!(
+                    query_declared_value(&mut fixture, symbol, &mut diagnostics),
+                    Ok(number)
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_file_links(source_handle)
+                        .is_none_or(|links| !links.type_checked)
+                );
+                assert!(diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn exported_declared_values_keep_unsupported_and_foreign_inputs_unpublished() {
+        for (source, declaration_file) in [
+            ("export let get: number;", false),
+            ("export declare const get: number = 1;", true),
+            ("export declare const get;", true),
+            ("export declare namespace N { const get: number; }", true),
+        ] {
+            let (mut fixture, _) = exported_declared_value_fixture(source, declaration_file);
+            let declaration = named_node(&fixture, SyntaxKind::VariableDeclaration, "get");
+            let symbol = node_symbol(&fixture, declaration);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let before = (
+                union_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+            );
+            assert_eq!(
+                query_declared_value(&mut fixture, symbol, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: declaration,
+                        kind: SyntaxKind::VariableDeclaration,
+                    }
+                )),
+                "{source}"
+            );
+            assert_eq!(
+                (
+                    union_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len()
+                ),
+                before
+            );
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+            assert!(diagnostics.is_empty());
+        }
+        let source = "export declare const get: number;";
+        let (mut fixture, _) = exported_declared_value_fixture(source, true);
+        let (foreign, _) = exported_declared_value_fixture(source, true);
+        let symbol = named_symbol(&foreign, SyntaxKind::VariableDeclaration, "get");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = (
+            union_state(&fixture.store),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+        );
+        assert!(query_declared_value(&mut fixture, symbol, &mut diagnostics).is_err());
+        assert_eq!(
+            (
+                union_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len()
+            ),
+            before
+        );
+        assert!(diagnostics.is_empty());
+    }
+
     #[test]
     fn lazy_declared_values_resolve_one_property_without_sibling_types() {
         let mut fixture = fixture(concat!(
