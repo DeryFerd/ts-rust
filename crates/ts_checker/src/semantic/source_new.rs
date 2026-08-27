@@ -1039,6 +1039,11 @@ pub(super) fn plan_direct_default_new(
         if class.constructor_interface_annotation().is_some() {
             return Err(unsupported(SourceNewUnsupported::Arguments(node)));
         }
+        if class.constructor_annotation().is_some()
+            && (argument.is_some() || class.constructor_minimum_argument_count() != 0)
+        {
+            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+        }
         let parameter = constructor_parameter(store, host, &class)?;
         if argument.is_some() && class.direct_plan().is_none() {
             return Err(unsupported(SourceNewUnsupported::Arguments(node)));
@@ -3483,6 +3488,14 @@ fn constructor_parameter(
         .ok_or_else(invalid)?;
     let symbol = store.get_merged_symbol(raw).ok_or_else(invalid)?;
     let symbol_record = store.symbol(symbol).ok_or_else(invalid)?;
+    if class.constructor_annotation() == Some(type_node) {
+        if class.constructor_parameter_symbol() != Some(symbol)
+            || class.type_query_context().is_none()
+        {
+            return Err(invalid());
+        }
+        return Ok(None);
+    }
     let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
     let type_ = match type_record.kind {
         SyntaxKind::AnyKeyword => bootstrap.any_type,
@@ -6703,6 +6716,21 @@ fn validate_selected_default_signature(
         if store.value_symbol_links(parameter.symbol)
             != Some(&ValueSymbolLinks {
                 resolved_type: Some(value_type),
+                ..ValueSymbolLinks::default()
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    if class.constructor_annotation().is_some() {
+        let invalid = || invariant(SourceNewInvariant::InvalidConstructSignature(signature));
+        let symbol = class.constructor_parameter_symbol().ok_or_else(invalid)?;
+        let type_ = class
+            .annotated_constructor_parameter_type(store, host)?
+            .ok_or_else(invalid)?;
+        if store.value_symbol_links(symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(type_),
                 ..ValueSymbolLinks::default()
             })
         {

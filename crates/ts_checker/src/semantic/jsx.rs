@@ -3932,7 +3932,18 @@ fn jsx_child_is_assignable(
         return Err(error.into());
     }
 
-    let Ok(plan) = super::object_members::plan_interface(store, host, owner) else {
+    // Generic bases keep their arguments without resolving the JSX interface shell.
+    let plan = super::object_members::plan_interface(store, host, owner)
+        .ok()
+        .filter(|plan| {
+            plan.heritage.as_ref().is_none_or(|heritage| {
+                heritage
+                    .bases
+                    .iter()
+                    .all(|base| base.type_arguments.is_empty())
+            })
+        });
+    let Some(plan) = plan else {
         let base = resolve_generic_jsx_element_base(
             store,
             host,

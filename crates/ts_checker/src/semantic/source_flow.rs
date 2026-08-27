@@ -150,6 +150,7 @@ pub(super) struct SourceFlowAssignment {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceFlowParameterAssignment {
     pub(super) target: NodeRef,
+    /// The direct parameter or binding element that owns the assigned symbol.
     pub(super) parameter: NodeRef,
     pub(super) symbol: SemanticSymbolId,
 }
@@ -2136,6 +2137,90 @@ fn validate_container(graph: &BoundFlowGraph, container: NodeRef) -> Result<(), 
     }
 }
 
+fn parameter_assignment_declaration_and_name(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    container: NodeRef,
+    declaration: NodeRef,
+) -> Option<(NodeRef, NodeRef)> {
+    let record = arena.get(declaration.node)?;
+    match &record.data {
+        NodeData::ParameterDeclaration(parameter) if record.kind == SyntaxKind::Parameter => {
+            Some((
+                declaration,
+                NodeRef::new(declaration.arena, declaration.file, parameter.name),
+            ))
+        }
+        NodeData::BindingElement(binding) if record.kind == SyntaxKind::BindingElement => {
+            let name = NodeRef::new(declaration.arena, declaration.file, binding.name?);
+            let pattern = NodeRef::new(declaration.arena, declaration.file, record.parent?);
+            let pattern_record = arena.get(pattern.node)?;
+            let NodeData::BindingPattern(elements) = &pattern_record.data else {
+                return None;
+            };
+            let parameter =
+                NodeRef::new(declaration.arena, declaration.file, pattern_record.parent?);
+            let parameter_record = arena.get(parameter.node)?;
+            let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+                return None;
+            };
+            let name_record = arena.get(name.node)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return None;
+            };
+            if record.flags.0 != 0
+                || binding.dot_dot_dot_token.is_some()
+                || binding.flow_node.is_some()
+                || binding.initializer.is_some()
+                || binding.local_symbol.is_some()
+                || binding.property_name.is_some()
+                || binding.symbol.is_some()
+                || binding.facts != 0
+                || pattern_record.kind != SyntaxKind::ArrayBindingPattern
+                || pattern_record.flags.0 != 0
+                || elements.facts != 0
+                || elements.elements.range != pattern_record.range
+                || elements
+                    .elements
+                    .nodes
+                    .iter()
+                    .filter(|element| **element == declaration.node)
+                    .count()
+                    != 1
+                || parameter_record.kind != SyntaxKind::Parameter
+                || parameter_record.parent != Some(container.node)
+                || parameter_data.name != pattern.node
+                || pattern_record.range.start < parameter_record.range.start
+                || pattern_record.range.end > parameter_record.range.end
+                || name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(declaration.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+                || bound.symbol(parameter).is_none()
+                || bound.symbol(pattern).is_some()
+                || bound.local_symbol(pattern).is_some()
+                || bound.local_symbol(declaration).is_some()
+                || record.range.start < pattern_record.range.start
+                || record.range.end > pattern_record.range.end
+                || name_record.range.start < record.range.start
+                || name_record.range.end > record.range.end
+                || [declaration, name, pattern, parameter]
+                    .into_iter()
+                    .any(|node| {
+                        !bound.contains(node)
+                            || bound.container(node) != Some(container)
+                            || bound.block_scope_container(node) != Some(container)
+                    })
+            {
+                return None;
+            }
+            Some((parameter, name))
+        }
+        _ => None,
+    }
+}
+
 fn validate_parameter_assignment(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -2160,11 +2245,11 @@ fn validate_parameter_assignment(
     let NodeData::FunctionDeclaration(function_data) = &function.data else {
         return Err(invalid().into());
     };
-    let parameter = arena.get(assignment.parameter.node).ok_or_else(invalid)?;
-    let NodeData::ParameterDeclaration(parameter_data) = &parameter.data else {
-        return Err(invalid().into());
-    };
-    let parameter_name = arena.get(parameter_data.name).ok_or_else(invalid)?;
+    let (parameter_declaration, parameter_name) =
+        parameter_assignment_declaration_and_name(arena, bound, container, assignment.parameter)
+            .ok_or_else(invalid)?;
+    let parameter = arena.get(parameter_declaration.node).ok_or_else(invalid)?;
+    let parameter_name = arena.get(parameter_name.node).ok_or_else(invalid)?;
     let NodeData::Identifier(parameter_identifier) = &parameter_name.data else {
         return Err(invalid().into());
     };
@@ -2179,7 +2264,7 @@ fn validate_parameter_assignment(
             .parameters
             .nodes
             .iter()
-            .filter(|node| **node == assignment.parameter.node)
+            .filter(|node| **node == parameter_declaration.node)
             .count()
             != 1
         || parameter_name.kind != SyntaxKind::Identifier
@@ -3818,99 +3903,121 @@ mod tests {
 
     #[test]
     fn parameter_assignment_flow_updates_only_its_authenticated_symbol() {
-        let parsed = parse_source_file(concat!(
-            "function effects(value: string | number, other: number): void {\n",
-            "  value = 1;\n",
-            "  value;\n",
-            "}\n",
-        ));
-        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let file = FileId::new(2_403);
-        let mut context = loop_context(&parsed, file);
-        let bound = context.file(file).unwrap().1.clone();
-        let globals = context.global_types().clone();
-        let (function, parameter, statements) = linear_function_nodes(&parsed, file, "effects");
-        let [assignment_statement, after_statement] = statements.as_slice() else {
-            panic!("expected one assignment and one following statement")
-        };
-        let expression = expression_statement_expression(&parsed, file, *assignment_statement);
-        let NodeData::BinaryExpression(binary) = &parsed.arena.get(expression.node).unwrap().data
-        else {
-            panic!("expected an assignment expression")
-        };
-        let target = NodeRef::new(parsed.arena.id(), file, binary.left);
-        let symbol = bound.symbol(parameter).unwrap();
-        let assignment = SourceFlowParameterAssignment {
-            target,
-            parameter,
-            symbol,
-        };
+        for (index, parameters) in [
+            "value: string | number, other: number",
+            "[, value, , other]: (string | number)[]",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(&format!(
+                "function effects({parameters}): void {{ value = 1; value; }}",
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(2_403 + u32::try_from(index).unwrap());
+            let mut context = loop_context(&parsed, file);
+            let bound = context.file(file).unwrap().1.clone();
+            let globals = context.global_types().clone();
+            let (function, first_parameter, statements) =
+                linear_function_nodes(&parsed, file, "effects");
+            let locals = bound.locals(function).unwrap();
+            let [parameter, other] = ["value", "other"].map(|name| {
+                let symbol = context
+                    .store()
+                    .symbol_table(locals)
+                    .unwrap()
+                    .get_source(name)
+                    .unwrap();
+                context
+                    .store()
+                    .symbol(symbol)
+                    .unwrap()
+                    .value_declaration()
+                    .unwrap()
+            });
+            let [assignment_statement, after_statement] = statements.as_slice() else {
+                panic!("expected one assignment and one following statement")
+            };
+            let expression = expression_statement_expression(&parsed, file, *assignment_statement);
+            let NodeData::BinaryExpression(binary) =
+                &parsed.arena.get(expression.node).unwrap().data
+            else {
+                panic!("expected an assignment expression")
+            };
+            let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+            let symbol = bound.symbol(parameter).unwrap();
+            let assignment = SourceFlowParameterAssignment {
+                target,
+                parameter,
+                symbol,
+            };
 
-        let plan = SourceFlowPlan::preflight_linear(
-            &parsed.arena,
-            &bound,
-            function,
-            [*assignment_statement, *after_statement],
-            [],
-            [assignment],
-            [],
-        )
-        .unwrap();
-        let (union, number) = {
-            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
-            (bootstrap.string_or_number_type, bootstrap.number_type)
-        };
-        for _ in 0..2 {
-            let mut frame = plan
-                .frame(&bound, [(symbol, union)].into_iter().collect())
-                .unwrap();
-            let before = frame
-                .snapshot_at(
-                    context.store_mut_for_test(),
-                    &globals,
-                    *assignment_statement,
-                )
-                .unwrap();
-            assert_eq!(before.type_of(symbol), Some(union));
-            assert_eq!(
-                frame.snapshot_at(context.store_mut_for_test(), &globals, *after_statement),
-                Err(SourceFlowInvariant::PendingAssignment(target).into()),
-            );
-            frame.complete_assignment(target, symbol, number).unwrap();
-            let after = frame
-                .snapshot_at(context.store_mut_for_test(), &globals, *after_statement)
-                .unwrap();
-            assert_eq!(after.type_of(symbol), Some(number));
-            assert_eq!(
-                frame.complete_assignment(target, symbol, number),
-                Err(SourceFlowInvariant::AssignmentAlreadyCompleted(target).into()),
-            );
-        }
-
-        let function_node = parsed.arena.get(function.node).unwrap();
-        let NodeData::FunctionDeclaration(function_data) = &function_node.data else {
-            panic!("expected a function declaration")
-        };
-        let other = NodeRef::new(parsed.arena.id(), file, function_data.parameters.nodes[1]);
-        let forged = SourceFlowParameterAssignment {
-            target,
-            parameter: other,
-            symbol: bound.symbol(other).unwrap(),
-        };
-        assert!(matches!(
-            SourceFlowPlan::preflight_linear(
+            let plan = SourceFlowPlan::preflight_linear(
                 &parsed.arena,
                 &bound,
                 function,
                 [*assignment_statement, *after_statement],
                 [],
-                [forged],
+                [assignment],
                 [],
-            ),
-            Err(SourceFlowError::Invariant(
-                SourceFlowInvariant::InvalidParameterAssignment(node)
-            )) if node == target
-        ));
+            )
+            .unwrap();
+            let (union, number) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (bootstrap.string_or_number_type, bootstrap.number_type)
+            };
+            for _ in 0..2 {
+                let mut frame = plan
+                    .frame(&bound, [(symbol, union)].into_iter().collect())
+                    .unwrap();
+                let before = frame
+                    .snapshot_at(
+                        context.store_mut_for_test(),
+                        &globals,
+                        *assignment_statement,
+                    )
+                    .unwrap();
+                assert_eq!(before.type_of(symbol), Some(union));
+                assert_eq!(
+                    frame.snapshot_at(context.store_mut_for_test(), &globals, *after_statement),
+                    Err(SourceFlowInvariant::PendingAssignment(target).into()),
+                );
+                frame.complete_assignment(target, symbol, number).unwrap();
+                let after = frame
+                    .snapshot_at(context.store_mut_for_test(), &globals, *after_statement)
+                    .unwrap();
+                assert_eq!(after.type_of(symbol), Some(number));
+                assert_eq!(
+                    frame.complete_assignment(target, symbol, number),
+                    Err(SourceFlowInvariant::AssignmentAlreadyCompleted(target).into()),
+                );
+            }
+
+            for other in [other, first_parameter] {
+                if other == parameter {
+                    continue;
+                }
+                let forged = SourceFlowParameterAssignment {
+                    target,
+                    parameter: other,
+                    symbol: bound.symbol(other).unwrap(),
+                };
+                assert!(matches!(
+                    SourceFlowPlan::preflight_linear(
+                        &parsed.arena,
+                        &bound,
+                        function,
+                        [*assignment_statement, *after_statement],
+                        [],
+                        [forged],
+                        [],
+                    ),
+                    Err(SourceFlowError::Invariant(
+                        SourceFlowInvariant::InvalidParameterAssignment(node)
+                    )) if node == target
+                ));
+            }
+        }
     }
 
     #[test]

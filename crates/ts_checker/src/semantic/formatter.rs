@@ -3598,6 +3598,9 @@ fn display_single_call_signature(
         if index != 0 {
             result.push_str(", ");
         }
+        if parameter.rest {
+            result.push_str("...");
+        }
         result.push_str(&parameter.name);
         if parameter.optional {
             result.push('?');
@@ -3782,7 +3785,7 @@ fn valid_display_interface_owner(
 ) -> bool {
     match (store.source_node_is_exported(declaration), symbol.parent()) {
         (Some(false), None) => true,
-        (Some(true), Some(_)) => host.is_some_and(|host| {
+        (Some(_), Some(_)) => host.is_some_and(|host| {
             object_members::plan_interface(store, host, symbol_id)
                 .is_ok_and(|plan| plan.node == declaration && plan.symbol == symbol_id)
         }),
@@ -9952,6 +9955,61 @@ mod tests {
             ),
             before
         );
+    }
+
+    #[test]
+    fn implicit_namespace_interface_display_validates_its_export_owner() {
+        let parsed = parse_source_file(concat!(
+            "declare namespace First { interface Item { value: number; } } ",
+            "declare namespace Second { interface Item { value: string; } }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4_129);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let first = namespace_export(&context, file, &["First", "Item"]);
+        let second = namespace_export(&context, file, &["Second", "Item"]);
+        let type_ = context.get_declared_type_of_symbol(first).unwrap();
+        let owner = context.store().symbol(first).unwrap().parent().unwrap();
+        let exports = context.store().symbol(owner).unwrap().exports().unwrap();
+
+        // Go's context-free TypeToString does not add the namespace name.
+        assert_eq!(context.type_to_string(type_).unwrap(), "Item");
+        assert!(type_to_string(context.store(), type_).is_err());
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("Item"),
+                second,
+            ),
+            Some(Some(first))
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.store().relation_state_snapshot(),
+        );
+
+        assert_eq!(
+            context.type_to_string(type_),
+            Err(TypeDisplayUnavailable::MalformedType(type_))
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot(),
+            ),
+            before
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .insert_symbol(exports, EscapedName::source("Item"), first,),
+            Some(Some(second))
+        );
+        assert_eq!(context.type_to_string(type_).unwrap(), "Item");
     }
 
     #[test]

@@ -84,12 +84,13 @@ pub(super) enum StoredSingleCallableValidation {
 
 /// Syntax-neutral display data for one parameter of a validated single-call
 /// signature. The semantic value type includes optional `undefined`; the
-/// syntactic question mark remains an independent display fact.
+/// syntactic question mark and rest marker remain independent display facts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ValidatedSingleCallParameterDisplay {
     pub(super) name: String,
     pub(super) value_type: TypeId,
     pub(super) optional: bool,
+    pub(super) rest: bool,
 }
 
 /// Immutable display projection produced by a callable-family validator.

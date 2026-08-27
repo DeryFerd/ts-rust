@@ -230,6 +230,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some(type_) = self.declaration_method_artifact_type(node)? {
+            return Ok(type_);
+        }
+
         if supports_type_location(&self.validated_artifact_node(node)?.2.data)
             && let Some(type_) = self.cached_artifact_type(node)?
         {
@@ -242,7 +246,7 @@ impl CanonicalCheckerContext<'_> {
 
         if is_type_node {
             return self
-                .get_type_from_type_node(node)
+                .type_node_artifact_type(node)
                 .map_err(CanonicalArtifactQueryError::from)
                 .and_then(|type_| self.validate_artifact_type(node, type_));
         }
@@ -265,7 +269,7 @@ impl CanonicalCheckerContext<'_> {
                     LocationParent::TypeReference(_) | LocationParent::TypeQuery(_)
                 ) {
                     return self
-                        .get_type_from_type_node(parent_node)
+                        .type_node_artifact_type(parent_node)
                         .map_err(CanonicalArtifactQueryError::from)
                         .and_then(|type_| self.validate_artifact_type(node, type_));
                 }
@@ -323,6 +327,10 @@ impl CanonicalCheckerContext<'_> {
         }
 
         if let Some(symbol) = self.literal_computed_artifact_symbol(node)? {
+            return Ok(Some(symbol));
+        }
+
+        if let Some(symbol) = self.declaration_method_artifact_symbol(node)? {
             return Ok(Some(symbol));
         }
 
@@ -410,6 +418,13 @@ impl CanonicalCheckerContext<'_> {
             Some(LocationParent::TypeReference(reference)) => {
                 if let Some(symbol) = self.cached_artifact_symbol(reference)? {
                     return Ok(Some(symbol));
+                }
+                if matches!(
+                    self.validated_artifact_node(node)?.2.data,
+                    NodeData::Identifier(_)
+                ) {
+                    return self
+                        .lexical_artifact_symbol(node, SymbolFlags::TYPE | SymbolFlags::ALIAS);
                 }
                 self.get_type_from_type_node(reference)?;
                 self.cached_artifact_symbol(reference)
@@ -770,6 +785,7 @@ impl CanonicalCheckerContext<'_> {
             && self.store().type_node_links(node).is_some_and(|links| {
                 links.resolved_type.is_some() || links.outer_type_parameters.is_some()
             })
+            && self.declaration_method_artifact_symbol(node)?.is_none()
         {
             return Err(CanonicalArtifactQueryError::UnsupportedNode {
                 node,
@@ -1958,6 +1974,170 @@ impl CanonicalCheckerContext<'_> {
         Ok(None)
     }
 
+    fn type_node_artifact_type(&mut self, node: NodeRef) -> Result<TypeId, DeclaredTypeError> {
+        if self.store().source_node_kind(node) == Some(SyntaxKind::TypeReference) {
+            self.artifact_type_reference_identity(node)
+        } else {
+            self.get_type_from_type_node(node)
+        }
+    }
+
+    fn declaration_method_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let Some(symbol) = self.declaration_method_artifact_symbol(node)? else {
+            return Ok(None);
+        };
+        let selected = self
+            .store()
+            .late_bound_links(symbol)
+            .and_then(|links| links.late_symbol)
+            .unwrap_or(symbol);
+        if let Some(links) = self.store().type_node_links(node)
+            && links != &TypeNodeLinks::default()
+        {
+            let type_ = links
+                .resolved_type
+                .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?;
+            if links.outer_type_parameters.is_some()
+                || self
+                    .store()
+                    .value_symbol_links(selected)
+                    .and_then(|value| value.resolved_type)
+                    != Some(type_)
+            {
+                return Err(CanonicalArtifactQueryError::InvalidType { node, type_ });
+            }
+        }
+        let type_ = self.artifact_interface_method_type(symbol)?;
+        self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    fn declaration_method_artifact_symbol(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
+        let (declaration, symbol) = {
+            let (arena, bound, record) = self.validated_artifact_node(node)?;
+            if !bound
+                .source_facts()
+                .is_some_and(|facts| facts.is_declaration_file() || facts.is_default_library())
+            {
+                return Ok(None);
+            }
+            let declaration = if record.kind == SyntaxKind::MethodSignature {
+                node
+            } else {
+                let Some(parent) = record.parent else {
+                    return Ok(None);
+                };
+                let Some(parent_record) = arena.get(parent) else {
+                    return Err(CanonicalArtifactQueryError::ForeignNode(node));
+                };
+                if !matches!(&parent_record.data,
+                    NodeData::MethodSignatureDeclaration(method) if method.name == node.node)
+                {
+                    return Ok(None);
+                }
+                NodeRef::new(node.arena, node.file, parent)
+            };
+            let symbol =
+                bound
+                    .symbol(declaration)
+                    .ok_or(CanonicalArtifactQueryError::UnsupportedNode {
+                        node: declaration,
+                        kind: SyntaxKind::MethodSignature,
+                    })?;
+            (declaration, symbol)
+        };
+        let symbol = self.declaration_method_artifact_selection(node, declaration, symbol)?;
+        Ok(Some(symbol))
+    }
+
+    fn declaration_method_artifact_selection(
+        &self,
+        node: NodeRef,
+        declaration: NodeRef,
+        raw: SemanticSymbolId,
+    ) -> Result<SemanticSymbolId, CanonicalArtifactQueryError> {
+        let symbol = self.merged_artifact_symbol(node, raw)?;
+        let invalid = || CanonicalArtifactQueryError::InvalidSymbol { node, symbol };
+        if self.store().get_merged_symbol(symbol) != Some(symbol) {
+            return Err(invalid());
+        }
+        let (_, bound, record) = self.validated_artifact_node(declaration)?;
+        let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+            return Err(invalid());
+        };
+        if record.kind != SyntaxKind::MethodSignature
+            || bound.symbol(declaration) != Some(raw)
+            || node != declaration && method.name != node.node
+        {
+            return Err(invalid());
+        }
+        let owner_node = record
+            .parent
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+            .ok_or_else(invalid)?;
+        let (_, owner_bound, owner_record) = self.validated_artifact_node(owner_node)?;
+        if !matches!(
+            owner_record.kind,
+            SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral
+        ) {
+            return Err(invalid());
+        }
+        let raw_owner = owner_bound.symbol(owner_node).ok_or_else(invalid)?;
+        let owner = self
+            .store()
+            .get_merged_symbol(raw_owner)
+            .ok_or_else(invalid)?;
+        let owner_record = self.store().symbol(owner).ok_or_else(invalid)?;
+        let method_record = self.store().symbol(symbol).ok_or_else(invalid)?;
+        if self.store().get_merged_symbol(owner) != Some(owner)
+            || self.store().get_parent_of_symbol(symbol) != Some(owner)
+            || owner_record
+                .declarations()
+                .unwrap_or_default()
+                .iter()
+                .filter(|candidate| **candidate == owner_node)
+                .count()
+                != 1
+            || method_record
+                .declarations()
+                .unwrap_or_default()
+                .iter()
+                .filter(|candidate| **candidate == declaration)
+                .count()
+                != 1
+            || self
+                .store()
+                .symbol(raw)
+                .is_none_or(|raw| raw.name() != method_record.name())
+            || self
+                .store()
+                .symbol(raw_owner)
+                .is_none_or(|raw| raw.name() != owner_record.name())
+        {
+            return Err(invalid());
+        }
+        if let Some(selected) = self
+            .store()
+            .late_bound_links(symbol)
+            .and_then(|links| links.late_symbol)
+        {
+            let selected_record = self.store().symbol(selected).ok_or_else(invalid)?;
+            if self.store().get_merged_symbol(selected) != Some(selected)
+                || self.store().late_bound_method_source(selected) != Some(symbol)
+                || self.store().get_parent_of_symbol(selected) != Some(owner)
+                || selected_record.declarations() != method_record.declarations()
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(symbol)
+    }
+
     fn object_literal_property_type(
         &self,
         node: NodeRef,
@@ -2067,7 +2247,7 @@ impl CanonicalCheckerContext<'_> {
         let Some(annotation) = annotation else {
             return Ok(None);
         };
-        let type_ = self.get_type_from_type_node(annotation)?;
+        let type_ = self.type_node_artifact_type(annotation)?;
         self.validate_artifact_type(node, type_).map(Some)
     }
 
@@ -2386,6 +2566,22 @@ mod tests {
         context_with_source_kind(parsed, file, CanonicalCheckerOptions::default(), true)
     }
 
+    fn declaration_method_nodes(parsed: &ParseResult, file: FileId) -> Vec<(NodeRef, NodeRef)> {
+        parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, method.name),
+                ))
+            })
+            .collect()
+    }
+
     fn context_with_source_kind(
         parsed: &ParseResult,
         file: FileId,
@@ -2410,6 +2606,257 @@ mod tests {
             .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
         CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
+    }
+
+    #[test]
+    fn declaration_method_locations_reject_redirected_source_symbols() {
+        for source in [
+            "interface A { run(): number; } interface B { run(): string; } interface C { run(): boolean; }",
+            "interface A { run(): number; other(): string; last(): boolean; }",
+        ] {
+            for warm in [false, true] {
+                for chained in [false, true] {
+                    let parsed = parse_source_file(source);
+                    let file = FileId::new(6_131);
+                    let mut context = declaration_context(&parsed, file);
+                    let locations = declaration_method_nodes(&parsed, file);
+                    let symbols = locations
+                        .iter()
+                        .map(|(declaration, _)| {
+                            context.file(file).unwrap().1.symbol(*declaration).unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    if warm {
+                        for (_, name) in &locations {
+                            context.get_type_at_location(*name).unwrap();
+                        }
+                    }
+                    context
+                        .store_mut_for_test()
+                        .record_merged_symbol(symbols[1], symbols[0])
+                        .unwrap();
+                    if chained {
+                        context
+                            .store_mut_for_test()
+                            .record_merged_symbol(symbols[2], symbols[1])
+                            .unwrap();
+                    }
+                    let before = (
+                        context.store().type_len(),
+                        context.store().signature_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.store().relation_state_snapshot(),
+                    );
+                    for node in [locations[0].0, locations[0].1] {
+                        let expected = CanonicalArtifactQueryError::InvalidSymbol {
+                            node,
+                            symbol: symbols[1],
+                        };
+                        assert_eq!(context.get_type_at_location(node), Err(expected));
+                        assert_eq!(context.get_symbol_at_location(node), Err(expected));
+                    }
+                    assert_eq!(
+                        (
+                            context.store().type_len(),
+                            context.store().signature_len(),
+                            context.store().checker_link_allocated_lengths(),
+                            context.store().relation_state_snapshot()
+                        ),
+                        before
+                    );
+                    assert!(context.diagnostics().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn declaration_method_locations_require_the_queried_declaration() {
+        let parsed =
+            parse_source_file("interface A { run(): number; } interface B { run(): string; }");
+        let file = FileId::new(6_132);
+        let mut context = declaration_context(&parsed, file);
+        let locations = declaration_method_nodes(&parsed, file);
+        let symbols = locations
+            .iter()
+            .map(|(declaration, _)| context.file(file).unwrap().1.symbol(*declaration).unwrap())
+            .collect::<Vec<_>>();
+        let owner = context.store().symbol(symbols[0]).unwrap().parent();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_relationships(symbols[1], None, None, owner, None)
+        );
+        context
+            .store_mut_for_test()
+            .record_merged_symbol(symbols[1], symbols[0])
+            .unwrap();
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for node in [locations[0].0, locations[0].1] {
+            let expected = CanonicalArtifactQueryError::InvalidSymbol {
+                node,
+                symbol: symbols[1],
+            };
+            assert_eq!(context.get_type_at_location(node), Err(expected));
+            assert_eq!(context.get_symbol_at_location(node), Err(expected));
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn declaration_method_metadata_only_cache_errors_are_invariants() {
+        for source in [
+            "interface Shape { run(): string; }",
+            "declare const key: unique symbol; interface Shape { [key](): string; }",
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(6_133);
+            let (declaration, name) = declaration_method_nodes(&parsed, file)[0];
+            for warm in [false, true] {
+                for node in [declaration, name] {
+                    let mut context = declaration_context(&parsed, file);
+                    let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+                    if warm {
+                        context.get_type_at_location(node).unwrap();
+                    }
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        node,
+                        TypeNodeLinks {
+                            resolved_type: None,
+                            outer_type_parameters: Some(Vec::new()),
+                        }
+                    ));
+                    let before = (
+                        context.store().type_len(),
+                        context.store().signature_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.store().relation_state_snapshot(),
+                    );
+                    assert_eq!(
+                        context.get_type_at_location(node),
+                        Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })
+                    );
+                    assert_eq!(
+                        (
+                            context.store().type_len(),
+                            context.store().signature_len(),
+                            context.store().checker_link_allocated_lengths(),
+                            context.store().relation_state_snapshot()
+                        ),
+                        before
+                    );
+                    assert!(context.diagnostics().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn declaration_method_locations_keep_merged_overload_identity() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { run(value: number): number; } ",
+            "interface Shape { run(value: string): string; }",
+        ));
+        let file = FileId::new(6_134);
+        let mut context = declaration_context(&parsed, file);
+        let locations = declaration_method_nodes(&parsed, file);
+        let expected = context.get_type_at_location(locations[0].1).unwrap();
+        let symbol = context.get_symbol_at_location(locations[0].1).unwrap();
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for (declaration, name) in locations {
+            for node in [declaration, name] {
+                assert_eq!(context.get_type_at_location(node), Ok(expected));
+                assert_eq!(context.get_symbol_at_location(node), Ok(symbol));
+            }
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn declaration_method_location_rejects_cold_and_warm_cache_changes() {
+        for warm in [false, true] {
+            for paired in [false, true] {
+                let parsed = parse_source_file("interface Shape { run(): string; ignored(); }");
+                let file = FileId::new(6_130);
+                let mut context = declaration_context(&parsed, file);
+                let (declaration, name) = parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+                            return None;
+                        };
+                        let NodeData::Identifier(name) = &parsed.arena.get(method.name)?.data
+                        else {
+                            return None;
+                        };
+                        (name.text == "run").then_some((
+                            NodeRef::new(parsed.arena.id(), file, node),
+                            NodeRef::new(parsed.arena.id(), file, method.name),
+                        ))
+                    })
+                    .unwrap();
+                let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+                if warm {
+                    context.get_type_at_location(name).unwrap();
+                }
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    name,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+                if paired {
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(number),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                let before = (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                );
+                assert!(context.get_type_at_location(name).is_err());
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().signature_len(),
+                        context.store().checker_link_allocated_lengths(),
+                    ),
+                    before,
+                );
+                assert!(context.diagnostics().is_empty());
+            }
+        }
     }
 
     #[test]

@@ -530,6 +530,31 @@ impl PreparedTypeQueryTypes {
         self.pending_function_types.insert(proof.type_());
         Ok(())
     }
+
+    pub(super) fn finish_pending_function(
+        &mut self,
+        proof: &PendingFunctionTypeProof,
+    ) -> Result<(), LiteralTypeCacheError> {
+        if proof.store() != self.store || !self.pending_function_types.remove(&proof.type_()) {
+            return Err(LiteralTypeCacheError::InvalidPreparedQuery);
+        }
+        Ok(())
+    }
+
+    pub(super) fn preflight_union_operations(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        targets: Option<CanonicalArrayTargets>,
+        count: usize,
+    ) -> Result<(), LiteralTypeCacheError> {
+        if self.store != store.id()
+            || self.array_targets != targets
+            || self.union_operations_remaining < count
+        {
+            return Err(LiteralTypeCacheError::InvalidPreparedQuery);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1148,19 +1173,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         array_validation: UnionArrayValidation<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
-        self.validate_union_structure(union)?;
-        let record = self
+        self.validate_union_cache_entry_metadata(key, union)?;
+        let TypeData::Union(data) = self
             .type_payload(union)
-            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
-        let TypeData::Union(data) = record.data() else {
+            .expect("validated union metadata")
+            .data()
+        else {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         };
-        if data.union.types != key.types
-            || self.checked_union_alias(union, record.alias())? != key.alias
-            || !self.union_origin_matches(union, data.origin, key.origin.as_ref())
-        {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
-        }
         let mut visiting = HashSet::new();
         for constituent in &data.union.types {
             self.validate_union_constituent_worker(
@@ -1182,6 +1202,50 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
         Ok(())
+    }
+
+    fn validate_union_cache_entry_metadata(
+        &self,
+        key: &UnionTypeCacheKey,
+        union: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_union_structure(union)?;
+        let record = self
+            .type_payload(union)
+            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+        let TypeData::Union(data) = record.data() else {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        };
+        if data.union.types != key.types
+            || self.checked_union_alias(union, record.alias())? != key.alias
+            || !self.union_origin_matches(union, data.origin, key.origin.as_ref())
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        }
+        Ok(())
+    }
+
+    /// Checks a cached union without traversing unused member types.
+    /// Query providers validate each member they consume.
+    pub(super) fn validate_union_query_metadata(
+        &self,
+        union: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        if self
+            .intrinsic_bootstrap
+            .as_ref()
+            .is_some_and(|bootstrap| union == bootstrap.boolean_type)
+        {
+            return self.validate_union_constituent(union);
+        }
+        let record = self
+            .type_payload(union)
+            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+        let TypeData::Union(data) = record.data() else {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        };
+        let key = self.validated_union_cache_key(union, record, data)?;
+        self.validate_union_cache_entry_metadata(&key, union)
     }
 
     fn validate_union_of_union_cache_entry(
@@ -1543,6 +1607,96 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             self.validate_union_origin_structure(union, origin)?;
         }
         Ok(())
+    }
+
+    /// Validates an anonymous union's exact cache identity without following its constituents.
+    /// The caller must validate each constituent independently.
+    pub(super) fn validate_canonical_union_metadata(
+        &self,
+        union: TypeId,
+        expected: &[TypeId],
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_union_structure(union)?;
+        let record = self
+            .type_payload(union)
+            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+        let TypeData::Union(data) = record.data() else {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        };
+        if record.alias().is_some()
+            || data.origin.is_some()
+            || data.union.types != expected
+            || self
+                .intrinsic_bootstrap
+                .as_ref()
+                .and_then(|bootstrap| bootstrap.cached_union_type(expected))
+                != Some(union)
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        }
+        Ok(())
+    }
+
+    /// Validates the optional wrapper while leaving annotation graph validation to its owner.
+    pub(super) fn validate_optional_parameter_type_metadata(
+        &self,
+        base: TypeId,
+        resolved: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let invalid = || LiteralTypeCacheError::InvalidCachedUnion(resolved);
+        let bootstrap = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        if bootstrap.cached_optional_parameter_type(base) != Some(resolved) {
+            return Err(invalid());
+        }
+        let base_record = self.type_payload(base).ok_or_else(invalid)?;
+        let mut expected = match base_record.data() {
+            TypeData::Union(data) => data.union.types.clone(),
+            _ if base_record.flags().intersects(TypeFlags::ANY_OR_UNKNOWN) => {
+                if base != resolved {
+                    return Err(invalid());
+                }
+                return self.validate_union_constituent(base);
+            }
+            _ if base_record.flags().intersects(TypeFlags::NEVER) => Vec::new(),
+            _ => vec![base],
+        };
+        expected.push(bootstrap.undefined_type);
+        expected.retain(|type_| *type_ != bootstrap.missing_type);
+        expected.sort_unstable();
+        expected.dedup();
+        match expected.as_slice() {
+            [single] if *single == resolved => {}
+            _ => {
+                let Some(TypeData::Union(data)) = self.type_payload(resolved).map(TypeRecord::data)
+                else {
+                    return Err(invalid());
+                };
+                if data.union.types != expected {
+                    return Err(invalid());
+                }
+            }
+        }
+        for type_ in [base, resolved] {
+            if matches!(
+                self.type_payload(type_).map(TypeRecord::data),
+                Some(TypeData::Union(_))
+            ) {
+                let mut found = false;
+                for (key, value) in &bootstrap.union_types {
+                    if *value == type_ {
+                        self.validate_union_cache_entry_metadata(key, type_)?;
+                        found = true;
+                    }
+                }
+                if !found {
+                    return Err(invalid());
+                }
+            }
+        }
+        self.validate_union_constituent(bootstrap.undefined_type)
     }
 
     pub(super) fn validate_union_constituent(
@@ -1976,6 +2130,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         array_validation: UnionArrayValidation<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
+        let key = self.validated_union_cache_key(union, record, data)?;
+        self.validate_union_cache_entry(&key, union, array_validation, allowed_pending)
+    }
+
+    fn validated_union_cache_key(
+        &self,
+        union: TypeId,
+        record: &TypeRecord,
+        data: &super::type_records::UnionTypeData,
+    ) -> Result<UnionTypeCacheKey, LiteralTypeCacheError> {
         let alias = self.checked_union_alias(union, record.alias())?;
         let origin = data.origin.map(|origin| {
             let Some(record) = self.type_payload(origin) else {
@@ -2008,7 +2172,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if cached != Some(union) {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
-        self.validate_union_cache_entry(&key, union, array_validation, allowed_pending)
+        Ok(key)
     }
 
     fn validate_supported_fresh_property_object(
@@ -2356,7 +2520,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         return Ok(());
                     }
                     StoredCallableSetValidation::Pending {
-                        family: CallableFamily::FunctionType,
+                        family:
+                            CallableFamily::FunctionType | CallableFamily::DeclaredCallSignatures,
                     } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
@@ -2958,7 +3123,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
         let (projection, edges) = match validate_stored_callable_set(self, *value) {
             StoredCallableSetValidation::Valid {
-                family: CallableFamily::FunctionType,
+                family: CallableFamily::FunctionType | CallableFamily::DeclaredCallSignatures,
                 projection,
                 edges,
             } => (projection, edges),
@@ -3163,7 +3328,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         return Ok(());
                     }
                     StoredCallableSetValidation::Pending {
-                        family: CallableFamily::FunctionType,
+                        family:
+                            CallableFamily::FunctionType | CallableFamily::DeclaredCallSignatures,
                     } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
@@ -3247,7 +3413,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         return Ok(());
                     }
                     StoredCallableSetValidation::Pending {
-                        family: CallableFamily::FunctionType,
+                        family:
+                            CallableFamily::FunctionType | CallableFamily::DeclaredCallSignatures,
                     } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
@@ -4235,6 +4402,25 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    pub(super) fn preflight_prepared_union_constituent(
+        &self,
+        type_: TypeId,
+        prepared: &PreparedTypeQueryTypes,
+        globals: Option<&CanonicalGlobalTypes>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        if prepared.store != self.id()
+            || prepared.array_targets != globals.map(CanonicalArrayTargets::from_global_types)
+        {
+            return Err(LiteralTypeCacheError::InvalidPreparedQuery);
+        }
+        self.validate_union_constituent_worker(
+            type_,
+            UnionArrayValidation::from_global_types(globals),
+            &mut HashSet::new(),
+            &prepared.pending_function_types,
+        )
+    }
+
     pub(super) fn literal_union_type_prepared_with_global_types(
         &mut self,
         global_types: &CanonicalGlobalTypes,
@@ -5040,6 +5226,43 @@ impl IntrinsicBootstrap {
         self.union_types
             .get(&UnionTypeCacheKey::anonymous(normalized_types.to_vec()))
             .copied()
+    }
+
+    /// Reads an existing optional-parameter identity without normalizing or allocating types.
+    pub(super) fn cached_optional_parameter_type(&self, base: TypeId) -> Option<TypeId> {
+        if [
+            self.any_type,
+            self.wildcard_type,
+            self.error_type,
+            self.unknown_type,
+            self.undefined_type,
+        ]
+        .contains(&base)
+        {
+            return Some(base);
+        }
+        if base == self.never_type || base == self.missing_type {
+            return Some(self.undefined_type);
+        }
+        let (first, second) = if base < self.undefined_type {
+            (base, self.undefined_type)
+        } else {
+            (self.undefined_type, base)
+        };
+        self.union_of_union_types
+            .get(&UnionOfUnionCacheKey {
+                first,
+                second,
+                reduction: UnionReduction::Literal,
+                alias: None,
+            })
+            .copied()
+            .or_else(|| self.cached_union_type(&[first, second]))
+            .or_else(|| {
+                self.union_types.iter().find_map(|(key, value)| {
+                    (*value == base && key.types.contains(&self.undefined_type)).then_some(base)
+                })
+            })
     }
 
     /// Looks up an already-normalized bootstrap template-literal key.

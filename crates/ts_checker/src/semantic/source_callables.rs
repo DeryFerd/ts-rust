@@ -61,7 +61,7 @@ pub(super) use super::store::SourceCallableFamily;
 
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
 
-/// One identifier parameter and its explicit or implicit type identity.
+/// One source parameter and its explicit or implicit type identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)] // Preserve the flat upstream parameter state.
 pub(super) struct SourceCallableParameterPlan {
@@ -71,6 +71,7 @@ pub(super) struct SourceCallableParameterPlan {
     identity_node: NodeRef,
     null_literal_identity: bool,
     implicit_any: bool,
+    inferred_initializer: bool,
     jsdoc_function: bool,
     jsdoc_contextual_type: Option<TypeId>,
     pub(super) optional: bool,
@@ -83,7 +84,7 @@ impl SourceCallableParameterPlan {
         (self.identity_node, self.null_literal_identity)
     }
 
-    /// Returns the written type node, or `None` for an implicit `any`.
+    /// Returns the annotation used by this parameter, including its initializer source.
     pub(super) const fn explicit_type_node(self) -> Option<NodeRef> {
         if self.implicit_any {
             None
@@ -110,6 +111,10 @@ impl SourceCallableParameterPlan {
 
     pub(super) const fn is_implicit_any(self) -> bool {
         self.implicit_any && self.jsdoc_contextual_type.is_none()
+    }
+
+    pub(super) const fn has_inferred_initializer_type(self) -> bool {
+        self.inferred_initializer
     }
 
     pub(super) const fn has_jsdoc_function_type(self) -> bool {
@@ -2535,6 +2540,11 @@ fn plan_source_callable_with_owner_shape(
         previous_end = parameter_record.range.end;
         let name = NodeRef::new(declaration.arena, declaration.file, data.name);
         let name_record = preflight_node(store, host, name)?;
+        let initialized_array_binding = name_record.kind == SyntaxKind::ArrayBindingPattern
+            && data.type_.is_none()
+            && data.initializer.is_some()
+            && authenticated_function_array_parameter_bindings(store, host, declaration, parameter)
+                .is_some();
         let parameter_name = match (&name_record.data, name_record.kind) {
             (NodeData::Identifier(identifier), SyntaxKind::Identifier) => identifier.text.clone(),
             (NodeData::BindingPattern(pattern), SyntaxKind::ArrayBindingPattern)
@@ -2543,7 +2553,17 @@ fn plan_source_callable_with_owner_shape(
                         super::source_calls::is_authenticated_sort_tuple_binding(
                             arena, name.node, pattern,
                         )
-                    }) =>
+                    })
+                    || view.family == SourceCallableFamily::FunctionDeclaration
+                        && body_mode == SourceCallableBodyMode::Present
+                        && type_parameters.is_empty()
+                        && authenticated_function_array_parameter_bindings(
+                            store,
+                            host,
+                            declaration,
+                            parameter,
+                        )
+                        .is_some() =>
             {
                 format!("__{}", parameters.len())
             }
@@ -2669,7 +2689,7 @@ fn plan_source_callable_with_owner_shape(
                     || direct_implicit_any_rest_arrow)
                     || body_mode.is_ambient() && !rest
                     || !type_parameters.is_empty()
-                    || initializer.is_some()
+                    || initializer.is_some() && !initialized_array_binding
                     || rest
                         && implicit_any_array_type(store).is_none_or(|array| {
                             array_targets.is_none()
@@ -2682,13 +2702,24 @@ fn plan_source_callable_with_owner_shape(
                         SourceCallableUnsupported::MissingParameterType(parameter),
                     ));
                 }
+                let inferred_annotation = if initialized_array_binding {
+                    Some(
+                        function_array_parameter_type_node(store, host, declaration, parameter)
+                            .ok_or_else(|| {
+                                invariant(SourceCallableInvariant::InvalidParameter(parameter))
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                let identity = inferred_annotation.unwrap_or(name);
                 (
-                    name,
+                    identity,
                     parameter_record.range.end,
                     name_record.range.end,
-                    name,
+                    identity,
                     false,
-                    true,
+                    inferred_annotation.is_none(),
                 )
             };
         let optional = validate_optional_token(
@@ -2801,6 +2832,7 @@ fn plan_source_callable_with_owner_shape(
             identity_node,
             null_literal_identity,
             implicit_any,
+            inferred_initializer: initialized_array_binding,
             jsdoc_function: javascript_jsdoc_function_parameter
                 .as_ref()
                 .is_some_and(|(declaration, _)| *declaration == parameter),
@@ -3576,6 +3608,212 @@ pub(super) fn source_promise_constructor_argument_arrow_is_exact(
                 && symbol.parent().is_none()
                 && symbol.export_symbol().is_none()
         }))
+}
+
+fn function_array_parameter_type_node(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameter: NodeRef,
+) -> Option<NodeRef> {
+    let (_, bound) = host.source(declaration)?;
+    let function_record = host.node(declaration)?;
+    let NodeData::FunctionDeclaration(function) = &function_record.data else {
+        return None;
+    };
+    let parameter_record = host.node(parameter)?;
+    let NodeData::ParameterDeclaration(syntax) = &parameter_record.data else {
+        return None;
+    };
+    let annotation = if let Some(annotation) = syntax.type_ {
+        let annotation = NodeRef::new(parameter.arena, parameter.file, annotation);
+        let record = host.node(annotation)?;
+        if record.parent != Some(parameter.node) {
+            return None;
+        }
+        annotation
+    } else {
+        let initializer = NodeRef::new(parameter.arena, parameter.file, syntax.initializer?);
+        let initializer_record = host.node(initializer)?;
+        let NodeData::Identifier(initializer_name) = &initializer_record.data else {
+            return None;
+        };
+        let source = bound.source_file();
+        let symbol = bound
+            .locals(source)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&initializer_name.text))?;
+        let owner = store.symbol(symbol)?;
+        let source_declaration = owner.value_declaration()?;
+        let source_record = host.node(source_declaration)?;
+        let NodeData::VariableDeclaration(source_variable) = &source_record.data else {
+            return None;
+        };
+        let annotation = NodeRef::new(
+            source_declaration.arena,
+            source_declaration.file,
+            source_variable.type_?,
+        );
+        let annotation_record = host.node(annotation)?;
+        if function_record.parent != Some(source.node)
+            || !function.parameters.nodes.contains(&parameter.node)
+            || initializer_record.kind != SyntaxKind::Identifier
+            || initializer_record.flags.0 != 0
+            || initializer_record.parent != Some(parameter.node)
+            || initializer_name.flow_node.is_some()
+            || initializer_name.text.is_empty()
+            || bound.container(initializer) != Some(declaration)
+            || bound.block_scope_container(initializer) != Some(declaration)
+            || bound
+                .locals(declaration)
+                .and_then(|locals| store.symbol_table(locals))
+                .is_none_or(|locals| locals.get_source(&initializer_name.text).is_some())
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || owner.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some(initializer_name.text.as_str())
+            || owner.declarations() != Some(&[source_declaration])
+            || source_record.kind != SyntaxKind::VariableDeclaration
+            || source_record.flags.0 != 0
+            || source_record.range.end > function_record.range.start
+            || bound.symbol(source_declaration) != Some(symbol)
+            || bound.container(source_declaration) != Some(source)
+            || annotation_record.parent != Some(source_declaration.node)
+        {
+            return None;
+        }
+        annotation
+    };
+    Some(annotation)
+}
+
+/// Authenticates omitted positions in typed or default-inferred function array parameters.
+pub(super) fn authenticated_function_array_parameter_bindings(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameter: NodeRef,
+) -> Option<Vec<(NodeRef, SemanticSymbolId)>> {
+    let (arena, bound) = host.source(declaration)?;
+    let function_record = host.node(declaration)?;
+    let NodeData::FunctionDeclaration(function) = &function_record.data else {
+        return None;
+    };
+    let parameter_record = host.node(parameter)?;
+    let NodeData::ParameterDeclaration(syntax) = &parameter_record.data else {
+        return None;
+    };
+    let annotation = function_array_parameter_type_node(store, host, declaration, parameter)?;
+    let annotation_record = host.node(annotation)?;
+    let pattern = NodeRef::new(parameter.arena, parameter.file, syntax.name);
+    let pattern_record = host.node(pattern)?;
+    let NodeData::BindingPattern(elements) = &pattern_record.data else {
+        return None;
+    };
+    let locals = bound
+        .locals(declaration)
+        .and_then(|locals| store.symbol_table(locals))?;
+
+    if function_record.kind != SyntaxKind::FunctionDeclaration
+        || function.type_parameters.is_some()
+        || function.body.is_none()
+        || !function.parameters.nodes.contains(&parameter.node)
+        || parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.flags.0 != 0
+        || parameter_record.parent != Some(declaration.node)
+        || syntax.dot_dot_dot_token.is_some()
+        || syntax.modifiers.is_some()
+        || syntax.question_token.is_some()
+        || annotation_record.kind != SyntaxKind::ArrayType
+        || annotation_record.flags.0 != 0
+        || pattern_record.kind != SyntaxKind::ArrayBindingPattern
+        || pattern_record.flags.0 != 0
+        || pattern_record.parent != Some(parameter.node)
+        || elements.elements.nodes.is_empty()
+        || elements.elements.range != pattern_record.range
+        || elements.facts != 0
+        || bound.container(parameter) != Some(declaration)
+        || bound.block_scope_container(parameter) != Some(declaration)
+        || bound.container(pattern) != Some(declaration)
+        || bound.block_scope_container(pattern) != Some(declaration)
+        || bound.symbol(pattern).is_some()
+        || bound.local_symbol(pattern).is_some()
+    {
+        return None;
+    }
+
+    let mut bindings = Vec::with_capacity(elements.elements.nodes.len());
+    let mut omitted = false;
+    for element in &elements.elements.nodes {
+        let element = NodeRef::new(pattern.arena, pattern.file, *element);
+        let record = arena.get(element.node)?;
+        if record.flags.0 != 0
+            || record.parent != Some(pattern.node)
+            || record.range.start < pattern_record.range.start
+            || record.range.end > pattern_record.range.end
+            || bound.container(element) != Some(declaration)
+            || bound.block_scope_container(element) != Some(declaration)
+            || bound.local_symbol(element).is_some()
+        {
+            return None;
+        }
+        if matches!(&record.data, NodeData::OmittedExpression(_)) {
+            if record.kind != SyntaxKind::OmittedExpression
+                || record.range.start != record.range.end
+                || bound.symbol(element).is_some()
+            {
+                return None;
+            }
+            omitted = true;
+            continue;
+        }
+
+        let NodeData::BindingElement(binding) = &record.data else {
+            return None;
+        };
+        let name = NodeRef::new(element.arena, element.file, binding.name?);
+        let name_record = arena.get(name.node)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return None;
+        };
+        let symbol = bound.symbol(element)?;
+        let symbol_record = store.symbol(symbol)?;
+        if record.kind != SyntaxKind::BindingElement
+            || binding.dot_dot_dot_token.is_some()
+            || binding.flow_node.is_some()
+            || binding.initializer.is_some()
+            || binding.local_symbol.is_some()
+            || binding.property_name.is_some()
+            || binding.symbol.is_some()
+            || binding.facts != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(element.node)
+            || name_record.range.start < record.range.start
+            || name_record.range.end > record.range.end
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || bound.container(name) != Some(declaration)
+            || bound.block_scope_container(name) != Some(declaration)
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || symbol_record.check_flags() != CheckFlags::NONE
+            || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+            || symbol_record.declarations() != Some(&[element])
+            || symbol_record.value_declaration() != Some(element)
+            || symbol_record.members().is_some()
+            || symbol_record.exports().is_some()
+            || symbol_record.parent().is_some()
+            || symbol_record.export_symbol().is_some()
+            || locals.get_source(&identifier.text) != Some(symbol)
+            || bindings.iter().any(|(_, existing)| *existing == symbol)
+        {
+            return None;
+        }
+        bindings.push((element, symbol));
+    }
+
+    (omitted && !bindings.is_empty()).then_some(bindings)
 }
 
 fn source_array_sort_argument_arrow_is_exact(
@@ -9855,6 +10093,7 @@ pub(super) fn source_callable_display_projection(
                 name: identifier.text.clone(),
                 value_type: *value_type,
                 optional: parameter_data.question_token.is_some(),
+                rest: false,
             });
         }
         return Ok(ValidatedSingleCallSignatureDisplay {
@@ -9895,12 +10134,22 @@ pub(super) fn source_callable_display_projection(
         .signature(signature)
         .ok_or(SourceCallableDisplayError::Malformed)?
         .resolved_return_type();
+    let minimum = usize::try_from(plan.min_argument_count)
+        .map_err(|_| SourceCallableDisplayError::Malformed)?;
     let mut parameters = Vec::with_capacity(plan.parameters.len());
-    for parameter in &plan.parameters {
-        let value_type = store
-            .value_symbol_links(parameter.symbol)
-            .and_then(|links| links.resolved_type)
-            .ok_or(SourceCallableDisplayError::Malformed)?;
+    for (index, parameter) in plan.parameters.iter().enumerate() {
+        let optional = parameter.optional || parameter.initializer.is_some() && index >= minimum;
+        let value_type = if parameter.initializer.is_some() && !optional {
+            store
+                .callable_signature_parameter_types(signature)
+                .and_then(|types| types.get(index))
+                .copied()
+        } else {
+            store
+                .value_symbol_links(parameter.symbol)
+                .and_then(|links| links.resolved_type)
+        }
+        .ok_or(SourceCallableDisplayError::Malformed)?;
         let parameter_node = host
             .node(parameter.declaration)
             .ok_or(SourceCallableDisplayError::Malformed)?;
@@ -9915,13 +10164,54 @@ pub(super) fn source_callable_display_projection(
         let name_node = host
             .node(name)
             .ok_or(SourceCallableDisplayError::Malformed)?;
-        let NodeData::Identifier(identifier) = &name_node.data else {
-            return Err(SourceCallableDisplayError::Malformed);
+        let name = match &name_node.data {
+            NodeData::Identifier(identifier) => identifier.text.clone(),
+            NodeData::BindingPattern(pattern)
+                if authenticated_function_array_parameter_bindings(
+                    store,
+                    host,
+                    plan.declaration,
+                    parameter.declaration,
+                )
+                .is_some() =>
+            {
+                let mut display = String::from("[");
+                for (index, element) in pattern.elements.nodes.iter().enumerate() {
+                    if index != 0 {
+                        display.push_str(", ");
+                    }
+                    let element = NodeRef::new(name.arena, name.file, *element);
+                    let record = host
+                        .node(element)
+                        .ok_or(SourceCallableDisplayError::Malformed)?;
+                    if let NodeData::BindingElement(binding) = &record.data {
+                        let binding_name = NodeRef::new(
+                            name.arena,
+                            name.file,
+                            binding.name.ok_or(SourceCallableDisplayError::Malformed)?,
+                        );
+                        let record = host
+                            .node(binding_name)
+                            .ok_or(SourceCallableDisplayError::Malformed)?;
+                        let NodeData::Identifier(identifier) = &record.data else {
+                            return Err(SourceCallableDisplayError::Malformed);
+                        };
+                        display.push_str(&identifier.text);
+                    }
+                }
+                if pattern.elements.has_trailing_comma {
+                    display.push(',');
+                }
+                display.push(']');
+                display
+            }
+            _ => return Err(SourceCallableDisplayError::Malformed),
         };
         parameters.push(ValidatedSingleCallParameterDisplay {
-            name: identifier.text.clone(),
+            name,
             value_type,
-            optional: parameter.optional || parameter.initializer.is_some(),
+            optional,
+            rest: parameter_data.dot_dot_dot_token.is_some(),
         });
     }
     Ok(ValidatedSingleCallSignatureDisplay {
@@ -15157,6 +15447,274 @@ mod tests {
             StoredSourceCallableValidation::Valid(_)
         ));
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn typed_function_array_parameters_authenticate_omitted_binding_positions() {
+        for (index, (source, expected)) in [
+            (
+                "function select([, second, , fourth, ,]: string[]): void {}",
+                [("second", 1_usize), ("fourth", 3)].as_slice(),
+            ),
+            (
+                "function select([first, , third,]: string[]): void {}",
+                [("first", 0_usize), ("third", 2)].as_slice(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                QueryFixture::new(source, FileId::new(1_251 + u32::try_from(index).unwrap()));
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let cold = generic_transaction_state(&fixture.store);
+
+            let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            let [parameter] = plan.parameters.as_slice() else {
+                panic!("expected one authenticated array parameter")
+            };
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol(parameter.symbol)
+                    .and_then(|symbol| symbol.name().as_utf8()),
+                Some("__0"),
+            );
+            let NodeData::ParameterDeclaration(syntax) = &fixture
+                .parsed
+                .arena
+                .get(parameter.declaration.node)
+                .unwrap()
+                .data
+            else {
+                panic!("expected the owning function parameter")
+            };
+            let NodeData::BindingPattern(pattern) =
+                &fixture.parsed.arena.get(syntax.name).unwrap().data
+            else {
+                panic!("expected an authenticated array binding pattern")
+            };
+            let bindings = authenticated_function_array_parameter_bindings(
+                &fixture.store,
+                &host,
+                declaration,
+                parameter.declaration,
+            )
+            .unwrap();
+            assert_eq!(bindings.len(), expected.len());
+            for ((element, symbol), (name, position)) in bindings.iter().zip(expected) {
+                assert_eq!(pattern.elements.nodes[*position], element.node);
+                assert_eq!(
+                    fixture
+                        .bound
+                        .locals(declaration)
+                        .and_then(|locals| fixture.store.symbol_table(locals))
+                        .and_then(|locals| locals.get_source(name)),
+                    Some(*symbol),
+                );
+            }
+            assert_eq!(
+                plan_source_callable(&fixture.store, &host, declaration, owner, None),
+                Ok(plan),
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), cold);
+        }
+    }
+
+    #[test]
+    fn typed_function_array_parameters_reject_forged_binding_scope_symbols() {
+        let mut fixture = QueryFixture::new(
+            "function select([, first, , second,]: string[]): void {}",
+            FileId::new(1_253),
+        );
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        let parameter = plan.parameters[0].declaration;
+        let bindings = authenticated_function_array_parameter_bindings(
+            &fixture.store,
+            &host,
+            declaration,
+            parameter,
+        )
+        .unwrap();
+        let [(_, first), (_, second)] = bindings.as_slice() else {
+            panic!("expected two authenticated function binding symbols")
+        };
+        let locals = fixture.bound.locals(declaration).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(locals, EscapedName::source("second"), *first),
+            Some(Some(*second)),
+        );
+        let cold = generic_transaction_state(&fixture.store);
+
+        assert_eq!(
+            plan_source_callable(&fixture.store, &host, declaration, owner, None),
+            Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::DestructuredParameter(parameter),
+            )),
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), cold);
+    }
+
+    #[test]
+    fn initialized_array_parameters_preserve_omitted_positions_and_synthetic_symbols() {
+        let fixture = QueryFixture::new(
+            concat!(
+                "var results: string[]; ",
+                "function select([, first, , second, ,] = results) {}",
+            ),
+            FileId::new(1_254),
+        );
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let cold = generic_transaction_state(&fixture.store);
+
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        let [parameter] = plan.parameters.as_slice() else {
+            panic!("expected one initialized array binding parameter")
+        };
+        assert!(!parameter.is_implicit_any());
+        assert!(parameter.has_inferred_initializer_type());
+        let annotation = parameter.explicit_type_node().unwrap();
+        assert_eq!(
+            fixture.parsed.arena.get(annotation.node).unwrap().kind,
+            SyntaxKind::ArrayType,
+        );
+        assert_ne!(
+            fixture.parsed.arena.get(annotation.node).unwrap().parent,
+            Some(parameter.declaration.node),
+        );
+        assert!(parameter.initializer.is_some());
+        assert_eq!(plan.min_argument_count, 0);
+        assert_eq!(
+            fixture
+                .store
+                .symbol(parameter.symbol)
+                .and_then(|symbol| symbol.name().as_utf8()),
+            Some("__0"),
+        );
+        let bindings = authenticated_function_array_parameter_bindings(
+            &fixture.store,
+            &host,
+            declaration,
+            parameter.declaration,
+        )
+        .unwrap();
+        assert_eq!(bindings.len(), 2);
+        for ((_, symbol), name) in bindings.iter().zip(["first", "second"]) {
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol(*symbol)
+                    .and_then(|symbol| symbol.name().as_utf8()),
+                Some(name),
+            );
+        }
+        assert_eq!(
+            plan_source_callable(&fixture.store, &host, declaration, owner, None),
+            Ok(plan),
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), cold);
+    }
+
+    #[test]
+    fn initialized_array_parameters_reject_unproven_source_and_binding_shapes() {
+        for (index, source) in [
+            "var results: any; function select([, first] = results) {}",
+            "var results: string[]; function select([first] = results) {}",
+            "function select([, first] = results) {} var results: string[];",
+            "var results: string[]; function select([, results] = results) {}",
+            "var results: string[]; function select([, first] = results, results: number) {}",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                QueryFixture::new(source, FileId::new(1_255 + u32::try_from(index).unwrap()));
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let cold = generic_transaction_state(&fixture.store);
+
+            assert!(
+                matches!(
+                    plan_source_callable(&fixture.store, &host, declaration, owner, None),
+                    Err(SourceCallableError::Unsupported(
+                        SourceCallableUnsupported::DestructuredParameter(_)
+                    )),
+                ),
+                "{source}",
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), cold);
+        }
     }
 
     #[test]
