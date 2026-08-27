@@ -5,7 +5,7 @@
 //! unsupported namespace member as a successful check.
 //! An exported class can merge with one namespace that exports its constructor.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use ts_ast::{ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
@@ -37,6 +37,7 @@ use super::{
     source_callables::{self, SourceCallableError, SourceCallableUnsupported},
     source_overloads::{self, SourceOverloadError},
     type_nodes::{CanonicalTypeQuery, TypeNodeUnavailable, normalize_numeric_separators},
+    type_records::{ObjectTypeData, TypeCacheState, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -255,6 +256,7 @@ struct SourceNamespaceRecursiveClassState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecursiveNamespaceClassCacheState {
     Cold,
+    NamespaceIdentityOnly(TypeId),
     Warm(SourceNamespaceRecursiveClassState),
 }
 
@@ -281,6 +283,581 @@ pub(super) struct SourceNamespacePlan {
     classes: Vec<SourceNamespaceClassPlan>,
     recursive_class: Option<SourceNamespaceRecursiveClassPlan>,
     diagnostics: Vec<NamespaceDiagnosticPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModuleValuePlan {
+    symbol: SemanticSymbolId,
+    flags: SymbolFlags,
+    declarations: Box<[NodeRef]>,
+    value_declaration: Option<NodeRef>,
+    exports: Option<SymbolTableId>,
+    export_members: Box<[ModuleValueExport]>,
+    parent: Option<SemanticSymbolId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModuleValueExport {
+    name: EscapedName,
+    symbol: SemanticSymbolId,
+    declarations: Box<[NodeRef]>,
+    flags: SymbolFlags,
+    value_declaration: Option<NodeRef>,
+}
+
+struct ModuleExportDeclaration {
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+    flags: SymbolFlags,
+}
+
+/// The declaration proof retained when a module's value identity is created.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ModuleValueIdentity {
+    plan: ModuleValuePlan,
+    type_: TypeId,
+    published: bool,
+}
+
+impl ModuleValueIdentity {
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.plan.symbol
+    }
+
+    pub(super) const fn type_(&self) -> TypeId {
+        self.type_
+    }
+
+    pub(super) const fn mark_published(&mut self) {
+        self.published = true;
+    }
+}
+
+pub(super) fn has_pure_module_flags(flags: SymbolFlags) -> bool {
+    flags.intersects(SymbolFlags::MODULE)
+        && flags.without(
+            SymbolFlags::MODULE | SymbolFlags::CONST_ENUM_ONLY_MODULE | SymbolFlags::TRANSIENT,
+        ) == SymbolFlags::NONE
+}
+
+fn module_value_declaration_is_exported(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    node: NodeRef,
+) -> bool {
+    if bound.local_symbol(node).is_some() {
+        return true;
+    }
+    match arena.get(node.node).map(|record| &record.data) {
+        Some(
+            NodeData::ExportSpecifier(_)
+            | NodeData::NamespaceExport(_)
+            | NodeData::ExportAssignment(_),
+        ) => true,
+        Some(NodeData::ExportDeclaration(export)) => export.export_clause.is_none(),
+        Some(NodeData::ImportEqualsDeclaration(_)) => {
+            canonical_has_syntactic_modifier(arena, node.node, SyntaxKind::ExportKeyword)
+        }
+        Some(NodeData::FunctionDeclaration(function)) if function.name.is_none() => {
+            canonical_has_syntactic_modifier(arena, node.node, SyntaxKind::DefaultKeyword)
+        }
+        Some(NodeData::ClassDeclaration(class)) if class.name.is_none() => {
+            canonical_has_syntactic_modifier(arena, node.node, SyntaxKind::DefaultKeyword)
+        }
+        _ => false,
+    }
+}
+
+fn module_value_declaration_parent(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    node: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+    if !module_value_declaration_is_exported(arena, bound, node) {
+        return Ok(None);
+    }
+    let invalid =
+        || SourceCheckError::Provenance(SourceCheckProvenanceError::MissingDeclarationSymbol(node));
+    let container = bound.container(node).ok_or_else(invalid)?;
+    let record = owned_node(arena, bound, store, container)?;
+    if !matches!(
+        record.data,
+        NodeData::ModuleDeclaration(_) | NodeData::SourceFile(_)
+    ) {
+        return Err(invalid());
+    }
+    bound
+        .symbol(container)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .map(Some)
+        .ok_or_else(invalid)
+}
+
+fn module_value_export_declaration(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    node: NodeRef,
+) -> Result<(EscapedName, ModuleExportDeclaration), SourceCheckError> {
+    let record = owned_node(arena, bound, store, node)?;
+    let unsupported = || unsupported(node, record.kind, SourceSyntaxRole::Statement);
+    let (name, flags) = match &record.data {
+        NodeData::VariableDeclaration(data) => (Some(data.name), SymbolFlags::VARIABLE),
+        NodeData::BindingElement(data) => (data.name, SymbolFlags::VARIABLE),
+        NodeData::FunctionDeclaration(data) => (data.name, SymbolFlags::FUNCTION),
+        NodeData::ClassDeclaration(data) => (data.name, SymbolFlags::CLASS),
+        NodeData::InterfaceDeclaration(data) => (Some(data.name), SymbolFlags::INTERFACE),
+        NodeData::TypeAliasDeclaration(data) => (Some(data.name), SymbolFlags::TYPE_ALIAS),
+        NodeData::EnumDeclaration(data) => (Some(data.name), SymbolFlags::ENUM),
+        NodeData::ModuleDeclaration(data) => (Some(data.name), SymbolFlags::MODULE),
+        NodeData::ImportEqualsDeclaration(data) => (Some(data.name), SymbolFlags::ALIAS),
+        NodeData::ExportSpecifier(data) => (Some(data.name), SymbolFlags::ALIAS),
+        NodeData::NamespaceExport(data) => (Some(data.name), SymbolFlags::ALIAS),
+        NodeData::ExportAssignment(_) => (None, SymbolFlags::ALIAS | SymbolFlags::PROPERTY),
+        NodeData::ExportDeclaration(_) => (None, SymbolFlags::EXPORT_STAR),
+        _ => return Err(unsupported()),
+    };
+    let name = if canonical_has_syntactic_modifier(arena, node.node, SyntaxKind::DefaultKeyword) {
+        EscapedName::internal(InternalSymbolName::Default)
+    } else if let NodeData::ExportAssignment(assignment) = &record.data {
+        EscapedName::internal(if assignment.is_export_equals {
+            InternalSymbolName::ExportEquals
+        } else {
+            InternalSymbolName::Default
+        })
+    } else if matches!(record.data, NodeData::ExportDeclaration(_)) {
+        EscapedName::internal(InternalSymbolName::ExportStar)
+    } else {
+        let name = child(node, name.ok_or_else(unsupported)?);
+        let name_record = owned_node(arena, bound, store, name)?;
+        if name_record.parent != Some(node.node) {
+            return Err(invalid_parent(name, node, name_record.parent));
+        }
+        match &name_record.data {
+            NodeData::Identifier(name) => EscapedName::source(&name.text),
+            NodeData::StringLiteral(name) => EscapedName::source(&name.text),
+            NodeData::NoSubstitutionTemplateLiteral(name) => EscapedName::source(&name.text),
+            NodeData::NumericLiteral(name) => EscapedName::source(&name.text),
+            _ => return Err(unsupported()),
+        }
+    };
+    let symbol = bound.symbol(node).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(node),
+    ))?;
+    Ok((
+        name,
+        ModuleExportDeclaration {
+            node,
+            symbol,
+            flags,
+        },
+    ))
+}
+
+fn module_value_exports(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declarations: &[NodeRef],
+    exports: Option<SymbolTableId>,
+) -> Result<Box<[ModuleValueExport]>, SourceCheckError> {
+    let invalid = || SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(owner));
+    let mut expected = BTreeMap::<EscapedName, Vec<ModuleExportDeclaration>>::new();
+    for &declaration in declarations {
+        let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+        for node in bound.traversal_order() {
+            if bound.container(node) != Some(declaration)
+                || bound.symbol(node).is_none()
+                || !module_value_declaration_is_exported(arena, bound, node)
+            {
+                continue;
+            }
+            let (name, export) = module_value_export_declaration(store, arena, bound, node)?;
+            expected.entry(name).or_default().push(export);
+        }
+    }
+    let Some(exports) = exports else {
+        return if expected.is_empty() {
+            Ok(Box::default())
+        } else {
+            Err(invalid())
+        };
+    };
+    let table = store.symbol_table(exports).ok_or_else(invalid)?;
+    if table.len() != expected.len() {
+        return Err(invalid());
+    }
+    let mut members = Vec::with_capacity(expected.len());
+    for (name, symbol) in table.iter() {
+        let source = expected.get(&name.to_owned()).ok_or_else(invalid)?;
+        let record = store.symbol(symbol).ok_or_else(invalid)?;
+        let Some(actual) = record.declarations() else {
+            return Err(invalid());
+        };
+        let mut allowed_flags = source
+            .iter()
+            .fold(SymbolFlags::TRANSIENT, |flags, export| flags | export.flags);
+        if allowed_flags.intersects(SymbolFlags::MODULE) {
+            allowed_flags |= SymbolFlags::CONST_ENUM_ONLY_MODULE;
+        }
+        if record.name() != name
+            || record.check_flags() != CheckFlags::NONE
+            || record.flags().without(allowed_flags) != SymbolFlags::NONE
+            || record.flags().contains(SymbolFlags::TRANSIENT)
+                && source.iter().all(|export| export.symbol == symbol)
+            || record
+                .parent()
+                .and_then(|parent| store.get_merged_symbol(parent))
+                != Some(owner)
+            || actual.len() != source.len()
+            || actual.iter().collect::<HashSet<_>>().len() != source.len()
+            || source.iter().any(|export| {
+                !actual.contains(&export.node)
+                    || !record.flags().intersects(export.flags)
+                    || store.get_merged_symbol(export.symbol) != store.get_merged_symbol(symbol)
+            })
+            || record
+                .value_declaration()
+                .is_some_and(|node| !actual.contains(&node))
+            || record.flags().intersects(SymbolFlags::VALUE) && record.value_declaration().is_none()
+        {
+            return Err(invalid());
+        }
+        members.push(ModuleValueExport {
+            name: name.to_owned(),
+            symbol,
+            declarations: actual.into(),
+            flags: record.flags(),
+            value_declaration: record.value_declaration(),
+        });
+    }
+    Ok(members.into_boxed_slice())
+}
+
+fn plan_module_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<ModuleValuePlan, SourceCheckError> {
+    let invalid = || SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(symbol));
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    let declarations = owner
+        .declarations()
+        .filter(|nodes| !nodes.is_empty())
+        .ok_or_else(invalid)?;
+    let unsupported = || {
+        unsupported(
+            declarations[0],
+            host.node(declarations[0])
+                .map_or(SyntaxKind::Unknown, |node| node.kind),
+            SourceSyntaxRole::Statement,
+        )
+    };
+    if !has_pure_module_flags(owner.flags()) {
+        return Err(unsupported());
+    }
+    if store.get_merged_symbol(symbol) != Some(symbol)
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.members().is_some()
+        || owner.export_symbol().is_some()
+        || owner.value_declaration().is_some() != owner.flags().contains(SymbolFlags::VALUE_MODULE)
+        || owner
+            .value_declaration()
+            .is_some_and(|node| !declarations.contains(&node))
+    {
+        return Err(invalid());
+    }
+    let exports = owner.exports();
+    if exports.is_some_and(|exports| store.symbol_table(exports).is_none()) {
+        return Err(invalid());
+    }
+    let mut seen = HashSet::new();
+    let mut merged_declaration = false;
+    let mut expected_parent = None;
+    for &declaration in declarations {
+        let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+        let record = owned_node(arena, bound, store, declaration)?;
+        let NodeData::ModuleDeclaration(module) = &record.data else {
+            return Err(unsupported());
+        };
+        if record.kind != SyntaxKind::ModuleDeclaration
+            || !host.symbol_matches(store, declaration, symbol)
+            || !seen.insert(declaration)
+            || module.asterisk_token.is_some()
+            || module.symbol.is_some()
+            || module.local_symbol.is_some()
+            || module.flow_node.is_some()
+            || module.end_flow_node.is_some()
+            || module.facts != 0
+        {
+            return Err(invalid());
+        }
+        let parent = module_value_declaration_parent(store, arena, bound, declaration)?;
+        if expected_parent.is_some_and(|expected| expected != parent)
+            || owner
+                .parent()
+                .and_then(|parent| store.get_merged_symbol(parent))
+                != parent
+            || store.get_parent_of_symbol(symbol) != parent
+        {
+            return Err(invalid());
+        }
+        expected_parent = Some(parent);
+        merged_declaration |= bound
+            .symbol(declaration)
+            .is_some_and(|raw| raw != symbol && store.get_merged_symbol(raw) == Some(symbol));
+        modifier_flags(arena, bound, store, declaration, module.modifiers.as_ref())?;
+        let name = child(declaration, module.name);
+        let name_record = owned_node(arena, bound, store, name)?;
+        let expected_name = match (&name_record.data, module.keyword) {
+            (NodeData::Identifier(identifier), SyntaxKind::GlobalKeyword)
+                if identifier.text == "global" =>
+            {
+                EscapedName::internal(InternalSymbolName::Global)
+            }
+            (
+                NodeData::Identifier(identifier),
+                SyntaxKind::NamespaceKeyword | SyntaxKind::ModuleKeyword,
+            ) if !identifier.text.is_empty() => EscapedName::source(&identifier.text),
+            (NodeData::StringLiteral(literal), SyntaxKind::ModuleKeyword) => {
+                EscapedName::source(format!("\"{}\"", literal.text))
+            }
+            _ => return Err(unsupported()),
+        };
+        if name_record.parent != Some(declaration.node) || owner.name() != expected_name.as_ref() {
+            return Err(invalid());
+        }
+        let body = module
+            .body
+            .map(|body| child(declaration, body))
+            .ok_or_else(unsupported)?;
+        let body_record = owned_node(arena, bound, store, body)?;
+        if body_record.parent != Some(declaration.node)
+            || !matches!(
+                body_record.data,
+                NodeData::ModuleBlock(_) | NodeData::ModuleDeclaration(_)
+            )
+        {
+            return Err(invalid());
+        }
+    }
+    if owner.flags().contains(SymbolFlags::TRANSIENT) && !merged_declaration {
+        return Err(invalid());
+    }
+    let export_members = module_value_exports(store, host, symbol, declarations, exports)?;
+    Ok(ModuleValuePlan {
+        symbol,
+        flags: owner.flags(),
+        declarations: declarations.into(),
+        value_declaration: owner.value_declaration(),
+        exports,
+        export_members,
+        parent: expected_parent.flatten(),
+    })
+}
+
+fn module_value_node_caches_match(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &ModuleValuePlan,
+    expected: Option<TypeId>,
+) -> bool {
+    plan.declarations.iter().all(|&declaration| {
+        let Some(NodeData::ModuleDeclaration(module)) =
+            host.node(declaration).map(|node| &node.data)
+        else {
+            return false;
+        };
+        [declaration, child(declaration, module.name)]
+            .into_iter()
+            .all(|node| {
+                store.type_node_links(node).is_none_or(|links| {
+                    links.outer_type_parameters.is_none()
+                        && links
+                            .resolved_type
+                            .is_none_or(|type_| Some(type_) == expected)
+                })
+            })
+    })
+}
+
+fn module_value_type_matches(
+    store: &CanonicalTypeMapperStore,
+    plan: &ModuleValuePlan,
+    type_: TypeId,
+) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let TypeData::Object(object) = record.data() else {
+        return false;
+    };
+    if record.flags() != TypeFlags::OBJECT
+        || record.symbol() != Some(plan.symbol)
+        || record.alias().is_some()
+    {
+        return false;
+    }
+    if record.object_flags() == ObjectFlags::ANONYMOUS {
+        return object == &ObjectTypeData::default();
+    }
+    if record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+        || object.structured.members != plan.exports
+        || object
+            .structured
+            .constrained
+            .resolved_base_constraint
+            .is_some()
+        || object.structured.signatures.is_some()
+        || object.structured.call_signature_count != 0
+        || object.structured.index_infos.is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+    {
+        return false;
+    }
+    let properties = plan
+        .export_members
+        .iter()
+        .filter(|export| export.flags.intersects(SymbolFlags::VALUE))
+        .map(|export| export.symbol)
+        .collect::<Vec<_>>();
+    object.structured.properties.as_deref().unwrap_or_default() == properties
+}
+
+/// Validates a module type without resolving the types of its exports.
+pub(super) fn validate_module_value_identity(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+) -> Result<SemanticSymbolId, SourceCheckError> {
+    let symbol = store
+        .type_payload(type_)
+        .and_then(TypeRecord::symbol)
+        .ok_or(SourceCheckError::RelationUnavailable(
+            super::RelationUnavailable::Type(type_),
+        ))?;
+    let invalid = || SourceCheckError::Variable(VariableInvariant::InvalidValueLinks(symbol));
+    let identity = store.module_value_identity(symbol).ok_or_else(invalid)?;
+    let plan = plan_module_value(store, host, symbol)?;
+    let expected = ValueSymbolLinks {
+        resolved_type: Some(type_),
+        ..ValueSymbolLinks::default()
+    };
+    let links_match = if identity.published {
+        store.value_symbol_links(symbol) == Some(&expected)
+    } else {
+        store
+            .value_symbol_links(symbol)
+            .is_none_or(|links| links == &ValueSymbolLinks::default())
+    };
+    if identity.type_ != type_
+        || identity.plan != plan
+        || !links_match
+        || !module_value_node_caches_match(store, host, &plan, Some(type_))
+        || !module_value_type_matches(store, &plan, type_)
+    {
+        return Err(invalid());
+    }
+    Ok(symbol)
+}
+
+/// Prepares the shared module identity before a source check publishes values.
+pub(super) fn prepare_module_value_identity(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<TypeId, SourceCheckError> {
+    let symbol = store
+        .get_merged_symbol(symbol)
+        .ok_or(SourceCheckError::Variable(
+            VariableInvariant::InvalidSymbol(symbol),
+        ))?;
+    let plan = plan_module_value(store, host, symbol)?;
+    let invalid = || SourceCheckError::Variable(VariableInvariant::InvalidValueLinks(symbol));
+    if let Some(identity) = store.module_value_identity(symbol) {
+        let type_ = identity.type_;
+        validate_module_value_identity(store, host, type_)?;
+        return Ok(type_);
+    }
+    if store
+        .value_symbol_links(symbol)
+        .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return Err(invalid());
+    }
+    if !plan.flags.contains(SymbolFlags::VALUE_MODULE) {
+        let error_type = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.error_type)
+            .ok_or_else(invalid)?;
+        return if module_value_node_caches_match(store, host, &plan, Some(error_type)) {
+            Ok(error_type)
+        } else {
+            Err(invalid())
+        };
+    }
+    if !module_value_node_caches_match(store, host, &plan, None) {
+        return Err(invalid());
+    }
+    if !store.try_reserve_types(1)
+        || !store
+            .try_reserve_value_symbol_links(usize::from(store.value_symbol_links(symbol).is_none()))
+        || !store.try_reserve_module_value_identities(1)
+    {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::ValueTypePublication(symbol),
+        ));
+    }
+    let type_ = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(symbol))
+        .ok_or_else(invalid)?;
+    assert!(store.record_module_value_identity(ModuleValueIdentity {
+        plan,
+        type_,
+        published: false
+    }));
+    Ok(type_)
+}
+
+/// Publishes or reuses the anonymous value identity of a pure declared module.
+pub(super) fn get_type_of_module_value(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<TypeId, SourceCheckError> {
+    let symbol = store
+        .get_merged_symbol(symbol)
+        .ok_or(SourceCheckError::Variable(
+            VariableInvariant::InvalidSymbol(symbol),
+        ))?;
+    let type_ = prepare_module_value_identity(store, host, symbol)?;
+    if store
+        .module_value_identity(symbol)
+        .is_some_and(|identity| !identity.published)
+    {
+        if !store
+            .try_reserve_value_symbol_links(usize::from(store.value_symbol_links(symbol).is_none()))
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::ValueTypePublication(symbol),
+            ));
+        }
+        assert!(store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+    }
+    Ok(type_)
 }
 
 #[derive(Clone, Copy)]
@@ -9555,15 +10132,18 @@ fn plan_recursive_namespace_class(
         receiver,
         property,
     };
-    recursive_namespace_class_state(store, namespace_symbol, &plan)?;
+    let host = DeclaredTypeHost::new([(arena, bound)]).ok()?;
+    recursive_namespace_class_state(store, &host, namespace_symbol, &plan)?;
     Some(plan)
 }
 
 fn recursive_namespace_class_state(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     namespace: SemanticSymbolId,
     class: &SourceNamespaceRecursiveClassPlan,
 ) -> Option<RecursiveNamespaceClassCacheState> {
+    let namespace_plan = plan_module_value(store, host, namespace).ok()?;
     let exact_value = |symbol| {
         let Some(links) = store.value_symbol_links(symbol) else {
             return Some(None);
@@ -9602,7 +10182,7 @@ fn recursive_namespace_class_state(
         variable_type,
         instance,
     ) {
-        (None, None, None, None, None) => {
+        (namespace_type, None, None, None, None) => {
             if [class.receiver, class.initializer].iter().any(|node| {
                 store
                     .type_node_links(*node)
@@ -9613,7 +10193,25 @@ fn recursive_namespace_class_state(
             }) {
                 return None;
             }
-            return Some(RecursiveNamespaceClassCacheState::Cold);
+            return match store.module_value_identity(namespace) {
+                None if namespace_type.is_none()
+                    && module_value_node_caches_match(store, host, &namespace_plan, None) =>
+                {
+                    Some(RecursiveNamespaceClassCacheState::Cold)
+                }
+                Some(identity)
+                    if namespace_type.is_none_or(|type_| type_ == identity.type_)
+                        && store.type_payload(identity.type_).is_some_and(|record| {
+                            record.object_flags() == ObjectFlags::ANONYMOUS
+                        }) =>
+                {
+                    validate_module_value_identity(store, host, identity.type_).ok()?;
+                    Some(RecursiveNamespaceClassCacheState::NamespaceIdentityOnly(
+                        identity.type_,
+                    ))
+                }
+                _ => None,
+            };
         }
         (Some(namespace_type), Some(class_type), Some(local), Some(variable), Some(instance))
             if local == class_type && variable == class_type =>
@@ -9624,6 +10222,7 @@ fn recursive_namespace_class_state(
     };
 
     let namespace_exports = store.symbol(namespace)?.exports()?;
+    validate_module_value_identity(store, host, namespace_type).ok()?;
     let namespace_record = store.type_payload(namespace_type)?;
     let TypeData::Object(namespace_data) = namespace_record.data() else {
         return None;
@@ -11780,8 +12379,8 @@ fn execute_recursive_namespace_class(
     {
         return Err(invalid());
     }
-    let state =
-        recursive_namespace_class_state(store, namespace.symbol, class).ok_or_else(invalid)?;
+    let state = recursive_namespace_class_state(store, host, namespace.symbol, class)
+        .ok_or_else(invalid)?;
     if matches!(state, RecursiveNamespaceClassCacheState::Warm(_)) {
         return Ok(());
     }
@@ -11821,11 +12420,16 @@ fn execute_recursive_namespace_class(
         .iter()
         .filter(|node| store.symbol_node_links(**node).is_none())
         .count();
-    if !store.try_reserve_types(4)
+    let namespace_exists = matches!(
+        state,
+        RecursiveNamespaceClassCacheState::NamespaceIdentityOnly(_)
+    );
+    if !store.try_reserve_types(if namespace_exists { 3 } else { 4 })
         || !store.try_reserve_signatures(1)
         || !store.try_reserve_value_symbol_links(missing_values)
         || !store.try_reserve_type_node_links(missing_types)
         || !store.try_reserve_symbol_node_links(missing_symbols)
+        || !store.try_reserve_module_value_identities(usize::from(!namespace_exists))
     {
         return Err(invalid());
     }
@@ -11834,9 +12438,12 @@ fn execute_recursive_namespace_class(
     let class_type = store
         .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(class.class_symbol))
         .ok_or_else(invalid)?;
-    let namespace_type = store
-        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(namespace.symbol))
-        .ok_or_else(invalid)?;
+    let namespace_type = prepare_module_value_identity(store, host, namespace.symbol)?;
+    if let RecursiveNamespaceClassCacheState::NamespaceIdentityOnly(expected) = state
+        && namespace_type != expected
+    {
+        return Err(invalid());
+    }
     let signature = store
         .alloc_signature(
             SignatureFlags::CONSTRUCT,
@@ -11914,7 +12521,7 @@ fn execute_recursive_namespace_class(
         }
     }
 
-    (recursive_namespace_class_state(store, namespace.symbol, class)
+    (recursive_namespace_class_state(store, host, namespace.symbol, class)
         == Some(RecursiveNamespaceClassCacheState::Warm(
             SourceNamespaceRecursiveClassState {
                 instance,
@@ -12897,6 +13504,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, TypeAliasLinks,
+        artifact_queries::CanonicalArtifactQueryError,
         instantiate::{InstantiationLimits, InstantiationSession},
         module_resolution::{
             CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
@@ -13018,6 +13626,16 @@ mod tests {
         plan_source_namespace(arena, bound, fixture.context.store(), declaration).unwrap()
     }
 
+    fn recursive_state(
+        fixture: &Fixture,
+        namespace: SemanticSymbolId,
+        class: &SourceNamespaceRecursiveClassPlan,
+    ) -> Option<RecursiveNamespaceClassCacheState> {
+        let (arena, bound) = fixture.context.file(fixture.file)?;
+        let host = DeclaredTypeHost::new([(arena, bound)]).ok()?;
+        recursive_namespace_class_state(fixture.context.store(), &host, namespace, class)
+    }
+
     fn execute(
         fixture: &mut Fixture,
         plan: &SourceNamespacePlan,
@@ -13096,6 +13714,780 @@ mod tests {
     }
 
     #[test]
+    fn lazy_module_values_keep_cold_and_warm_identity_without_export_types() {
+        for (source, display) in [
+            (
+                "declare namespace Values { var ready: number; var untouched: Missing; }",
+                "typeof Values",
+            ),
+            (
+                "declare module 'values' { export const ready: number; const untouched: Missing; }",
+                "typeof import(\"values\")",
+            ),
+            ("declare module 'empty' {}", "typeof import(\"empty\")"),
+        ] {
+            let mut fixture = declaration_fixture(source, CanonicalModuleState::Script);
+            let declaration = declaration(&fixture, 0);
+            let symbol = fixture
+                .context
+                .get_symbol_at_location(declaration)
+                .unwrap()
+                .unwrap();
+            let NodeData::ModuleDeclaration(module) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!("the fixture contains a module declaration")
+            };
+            let name = child(declaration, module.name);
+            let before_types = fixture.context.store().type_len();
+            let before_diagnostics = fixture.context.diagnostics().len();
+            let type_ = fixture.context.get_type_at_location(name).unwrap();
+            assert_eq!(fixture.context.store().type_len(), before_types + 1);
+            assert_eq!(fixture.context.type_to_string(type_).unwrap(), display);
+            let record = fixture.context.store().type_payload(type_).unwrap();
+            assert_eq!(record.symbol(), Some(symbol));
+            assert_eq!(record.object_flags(), ObjectFlags::ANONYMOUS);
+            assert!(
+                matches!(record.data(), TypeData::Object(data) if data == &ObjectTypeData::default())
+            );
+            assert_ne!(type_, fixture.context.global_types().global_this_value_type);
+
+            for node in [declaration, name] {
+                assert!(fixture.context.store_mut_for_test().set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    fixture.context.get_type_of_module_value(symbol).unwrap(),
+                    type_
+                );
+                assert_eq!(fixture.context.get_type_at_location(name).unwrap(), type_);
+                assert_eq!(
+                    fixture.context.get_type_at_location(declaration).unwrap(),
+                    type_
+                );
+                assert_eq!(fixture.context.type_to_string(type_).unwrap(), display);
+                assert_eq!(fixture.context.store().type_len(), before_types + 1);
+            }
+            for (node, record) in fixture.parsed.arena.iter() {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    continue;
+                };
+                let declaration = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+                let variable_symbol = fixture
+                    .context
+                    .file(fixture.file)
+                    .unwrap()
+                    .1
+                    .symbol(declaration)
+                    .unwrap();
+                let annotation = child(declaration, variable.type_.unwrap());
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .value_symbol_links(variable_symbol)
+                        .is_none()
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .type_node_links(annotation)
+                        .is_none()
+                );
+            }
+            assert_eq!(fixture.context.diagnostics().len(), before_diagnostics);
+        }
+    }
+
+    #[test]
+    fn lazy_module_values_are_shared_with_source_namespace_reads() {
+        for queried_first in [false, true] {
+            let mut fixture = fixture(
+                "declare namespace Values { export const ready = 'ready'; } Values.ready;",
+                CanonicalModuleState::Script,
+            );
+            let declaration = declaration(&fixture, 0);
+            let symbol = fixture
+                .context
+                .file(fixture.file)
+                .unwrap()
+                .1
+                .symbol(declaration)
+                .unwrap();
+            let before =
+                queried_first.then(|| fixture.context.get_type_of_module_value(symbol).unwrap());
+            let before_diagnostics = fixture.context.diagnostics().len();
+            fixture.context.check_source_file(fixture.file).unwrap();
+            let type_ = fixture.context.get_type_of_module_value(symbol).unwrap();
+            if let Some(before) = before {
+                assert_eq!(type_, before);
+            }
+            assert_eq!(
+                fixture.context.type_to_string(type_).unwrap(),
+                "typeof Values"
+            );
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .type_payload(type_)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            );
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .module_value_identity(symbol)
+                    .unwrap()
+                    .published
+            );
+            assert_eq!(fixture.context.diagnostics().len(), before_diagnostics);
+        }
+    }
+
+    #[test]
+    fn lazy_module_values_prepare_without_publishing_and_reject_cleared_publications() {
+        let mut fixture = declaration_fixture(
+            "declare namespace Values { var ready: number; }",
+            CanonicalModuleState::Script,
+        );
+        let declaration = declaration(&fixture, 0);
+        let bound = fixture.context.file(fixture.file).unwrap().1.clone();
+        let symbol = bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &bound)]).unwrap();
+        let type_ =
+            prepare_module_value_identity(fixture.context.store_mut_for_test(), &host, symbol)
+                .unwrap();
+        assert!(fixture.context.store().value_symbol_links(symbol).is_none());
+        assert!(
+            !fixture
+                .context
+                .store()
+                .module_value_identity(symbol)
+                .unwrap()
+                .published
+        );
+        assert_eq!(
+            fixture.context.type_to_string(type_).unwrap(),
+            "typeof Values"
+        );
+        assert_eq!(
+            prepare_module_value_identity(fixture.context.store_mut_for_test(), &host, symbol)
+                .unwrap(),
+            type_
+        );
+        assert_eq!(
+            fixture.context.get_type_of_module_value(symbol).unwrap(),
+            type_
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .module_value_identity(symbol)
+                .unwrap()
+                .published
+        );
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_value_symbol_links(symbol, ValueSymbolLinks::default())
+        );
+        let before = fixture.context.store().type_len();
+        assert_eq!(
+            fixture.context.get_type_of_module_value(symbol),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(symbol)
+            ))
+        );
+        assert_eq!(fixture.context.store().type_len(), before);
+    }
+
+    #[test]
+    fn lazy_module_values_reject_cold_export_table_substitution_and_correlated_edits() {
+        for warm in [false, true] {
+            let mut fixture = declaration_fixture(
+                "declare namespace Left { export const same: Missing; } declare namespace Right { export const same: string; }",
+                CanonicalModuleState::Script,
+            );
+            let declarations = [declaration(&fixture, 0), declaration(&fixture, 1)];
+            let symbols = declarations.map(|node| {
+                fixture
+                    .context
+                    .get_symbol_at_location(node)
+                    .unwrap()
+                    .unwrap()
+            });
+            let tables = symbols.map(|symbol| {
+                fixture
+                    .context
+                    .store()
+                    .symbol(symbol)
+                    .unwrap()
+                    .exports()
+                    .unwrap()
+            });
+            let members = tables.map(|table| {
+                fixture
+                    .context
+                    .store()
+                    .symbol_table(table)
+                    .unwrap()
+                    .get_source("same")
+                    .unwrap()
+            });
+            let type_ = warm.then(|| {
+                fixture
+                    .context
+                    .get_type_of_module_value(symbols[0])
+                    .unwrap()
+            });
+            if let Some(type_) = type_ {
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_structured_type_members(
+                            type_,
+                            Some(tables[0]),
+                            Some(vec![members[0]]),
+                            None,
+                            None,
+                            None
+                        )
+                );
+                assert_eq!(
+                    fixture
+                        .context
+                        .get_type_of_module_value(symbols[0])
+                        .unwrap(),
+                    type_
+                );
+                assert_eq!(
+                    fixture.context.store_mut_for_test().insert_symbol(
+                        tables[0],
+                        EscapedName::source("same"),
+                        members[1]
+                    ),
+                    Some(Some(members[0]))
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_structured_type_members(
+                            type_,
+                            Some(tables[0]),
+                            Some(vec![members[1]]),
+                            None,
+                            None,
+                            None
+                        )
+                );
+            } else {
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_symbol_relationships(symbols[0], None, Some(tables[1]), None, None)
+                );
+            }
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            assert!(
+                fixture
+                    .context
+                    .get_type_of_module_value(symbols[0])
+                    .is_err()
+            );
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+            if let Some(type_) = type_ {
+                assert_eq!(
+                    fixture.context.store_mut_for_test().insert_symbol(
+                        tables[0],
+                        EscapedName::source("same"),
+                        members[0]
+                    ),
+                    Some(Some(members[1]))
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_structured_type_members(
+                            type_,
+                            Some(tables[0]),
+                            Some(vec![members[0]]),
+                            None,
+                            None,
+                            None
+                        )
+                );
+                assert_eq!(
+                    fixture
+                        .context
+                        .get_type_of_module_value(symbols[0])
+                        .unwrap(),
+                    type_
+                );
+            } else {
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .module_value_identity(symbols[0])
+                        .is_none()
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_symbol_relationships(symbols[0], None, Some(tables[0]), None, None)
+                );
+                fixture
+                    .context
+                    .get_type_of_module_value(symbols[0])
+                    .unwrap();
+            }
+            for (node, record) in fixture.parsed.arena.iter() {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    continue;
+                };
+                let annotation = NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    variable.type_.unwrap(),
+                );
+                let declaration = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+                let member = fixture
+                    .context
+                    .file(fixture.file)
+                    .unwrap()
+                    .1
+                    .symbol(declaration)
+                    .unwrap();
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .type_node_links(annotation)
+                        .is_none()
+                );
+                assert!(fixture.context.store().value_symbol_links(member).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_module_values_authenticate_exported_namespace_parents_before_publication() {
+        let mut fixture = declaration_fixture(
+            "declare namespace A { export namespace B { export const value: Missing; } }",
+            CanonicalModuleState::Script,
+        );
+        let declaration = fixture.parsed.arena.iter().find_map(|(node, record)| {
+            let NodeData::ModuleDeclaration(module) = &record.data else { return None; };
+            matches!(&fixture.parsed.arena.get(module.name)?.data, NodeData::Identifier(name) if name.text == "B")
+                .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+        }).unwrap();
+        let symbol = fixture
+            .context
+            .get_symbol_at_location(declaration)
+            .unwrap()
+            .unwrap();
+        let record = fixture.context.store().symbol(symbol).unwrap().clone();
+        assert!(record.parent().is_some());
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_symbol_relationships(
+                    symbol,
+                    record.members(),
+                    record.exports(),
+                    None,
+                    record.export_symbol()
+                )
+        );
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(fixture.context.get_type_of_module_value(symbol).is_err());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .module_value_identity(symbol)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_symbol_relationships(
+                    symbol,
+                    record.members(),
+                    record.exports(),
+                    record.parent(),
+                    record.export_symbol()
+                )
+        );
+        let type_ = fixture.context.get_type_of_module_value(symbol).unwrap();
+        assert_eq!(fixture.context.type_to_string(type_).unwrap(), "typeof A.B");
+    }
+
+    #[test]
+    fn lazy_module_values_reject_cold_and_warm_paired_cache_replacement() {
+        for warm in [false, true] {
+            let mut fixture = declaration_fixture(
+                "declare namespace Values { var ready: number; }",
+                CanonicalModuleState::Script,
+            );
+            let declaration = declaration(&fixture, 0);
+            let symbol = fixture
+                .context
+                .get_symbol_at_location(declaration)
+                .unwrap()
+                .unwrap();
+            let NodeData::ModuleDeclaration(module) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!("the fixture contains a module declaration")
+            };
+            let name = child(declaration, module.name);
+            let authentic = warm.then(|| fixture.context.get_type_of_module_value(symbol).unwrap());
+            let any = fixture
+                .context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .any_type;
+            assert!(fixture.context.store_mut_for_test().set_type_node_links(
+                name,
+                TypeNodeLinks {
+                    resolved_type: Some(any),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            let before_types = fixture.context.store().type_len();
+            assert!(fixture.context.get_type_at_location(name).is_err());
+            assert_eq!(fixture.context.store().type_len(), before_types);
+            assert!(
+                fixture
+                    .context
+                    .store_mut_for_test()
+                    .set_type_node_links(name, TypeNodeLinks::default())
+            );
+            let forged = fixture
+                .context
+                .store_mut_for_test()
+                .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(symbol))
+                .unwrap();
+            let forged_links = ValueSymbolLinks {
+                resolved_type: Some(forged),
+                ..ValueSymbolLinks::default()
+            };
+            assert!(
+                fixture
+                    .context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(symbol, forged_links.clone())
+            );
+            for node in [declaration, name] {
+                assert!(fixture.context.store_mut_for_test().set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(forged),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+            }
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            let error = SourceCheckError::Variable(VariableInvariant::InvalidValueLinks(symbol));
+            assert_eq!(fixture.context.get_type_of_module_value(symbol), Err(error));
+            assert_eq!(
+                fixture.context.get_type_at_location(name),
+                Err(CanonicalArtifactQueryError::SourceCheck(error))
+            );
+            assert_eq!(
+                fixture.context.type_to_string(forged),
+                Err(crate::semantic::TypeDisplayUnavailable::MalformedType(
+                    forged
+                ))
+            );
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+            assert_eq!(
+                fixture.context.store().value_symbol_links(symbol),
+                Some(&forged_links)
+            );
+            if let Some(authentic) = authentic {
+                assert!(fixture.context.store_mut_for_test().set_value_symbol_links(
+                    symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(authentic),
+                        ..ValueSymbolLinks::default()
+                    }
+                ));
+                for node in [declaration, name] {
+                    assert!(
+                        fixture
+                            .context
+                            .store_mut_for_test()
+                            .set_type_node_links(node, TypeNodeLinks::default())
+                    );
+                }
+                assert_eq!(
+                    fixture.context.get_type_of_module_value(symbol).unwrap(),
+                    authentic
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_module_values_reject_cross_file_declarations_and_value_types() {
+        let first = parse_source_file("export {}; declare global { var first: number; }");
+        let second = parse_source_file("export {}; declare global { var other: number; }");
+        let first_file = FileId::new(7_470);
+        let second_file = FileId::new(7_471);
+        let mut context = ambient_module_context(
+            &[
+                (first_file, &first, CanonicalModuleState::External),
+                (second_file, &second, CanonicalModuleState::External),
+            ],
+            None,
+        );
+        let declarations =
+            [(first_file, &first), (second_file, &second)].map(|(file, parsed)| {
+                parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        matches!(record.data, NodeData::ModuleDeclaration(_))
+                            .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                    })
+                    .unwrap()
+            });
+        assert_eq!(declarations[0].node, declarations[1].node);
+        let symbols = declarations.map(|declaration| {
+            context
+                .get_symbol_at_location(declaration)
+                .unwrap()
+                .unwrap()
+        });
+        let types = symbols.map(|symbol| context.get_type_of_module_value(symbol).unwrap());
+        assert_ne!(symbols[0], symbols[1]);
+        assert_ne!(types[0], types[1]);
+        for type_ in types {
+            assert_ne!(type_, context.global_types().global_this_value_type);
+            assert_eq!(context.type_to_string(type_).unwrap(), "typeof global");
+        }
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            symbols[0],
+            ValueSymbolLinks {
+                resolved_type: Some(types[1]),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let before = context.store().type_len();
+        assert!(context.get_type_of_module_value(symbols[0]).is_err());
+        assert_eq!(context.store().type_len(), before);
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            symbols[0],
+            ValueSymbolLinks {
+                resolved_type: Some(types[0]),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            symbols[0],
+            Some(vec![declarations[1]]),
+            Some(declarations[1])
+        ));
+        assert!(context.get_type_of_module_value(symbols[0]).is_err());
+        assert_eq!(context.store().type_len(), before);
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            symbols[0],
+            Some(vec![declarations[0]]),
+            Some(declarations[0])
+        ));
+        assert_eq!(
+            context.get_type_of_module_value(symbols[0]).unwrap(),
+            types[0]
+        );
+        assert_eq!(
+            context.get_type_of_module_value(symbols[1]).unwrap(),
+            types[1]
+        );
+    }
+
+    #[test]
+    fn lazy_module_values_share_cross_file_merged_namespace_identity() {
+        let first = parse_source_file("declare namespace Shared { var first: number; }");
+        let second = parse_source_file("declare namespace Shared { var other: Missing; }");
+        let files = [(FileId::new(7_472), &first), (FileId::new(7_473), &second)];
+        let mut context = ambient_module_context(
+            &files.map(|(file, parsed)| (file, parsed, CanonicalModuleState::Script)),
+            None,
+        );
+        let declarations =
+            files.map(|(file, parsed)| {
+                parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        matches!(record.data, NodeData::ModuleDeclaration(_))
+                            .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                    })
+                    .unwrap()
+            });
+        let raw = declarations.map(|declaration| {
+            context
+                .file(declaration.file)
+                .unwrap()
+                .1
+                .symbol(declaration)
+                .unwrap()
+        });
+        let first_type = context.get_type_of_module_value(raw[0]).unwrap();
+        assert_eq!(
+            context.get_type_of_module_value(raw[1]).unwrap(),
+            first_type
+        );
+        assert_eq!(context.type_to_string(first_type).unwrap(), "typeof Shared");
+        let owner = context
+            .store()
+            .type_payload(first_type)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .symbol(owner)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .len(),
+            2
+        );
+        let before = context.store().type_len();
+        for _ in 0..2 {
+            assert_eq!(
+                context.get_type_of_module_value(raw[0]).unwrap(),
+                first_type
+            );
+            assert_eq!(
+                context.get_type_of_module_value(raw[1]).unwrap(),
+                first_type
+            );
+            assert_eq!(context.store().type_len(), before);
+        }
+    }
+
+    #[test]
+    fn lazy_module_values_keep_namespace_only_and_merged_value_boundaries() {
+        for source in [
+            "declare namespace Types { interface Item {} }",
+            "declare namespace Empty {}",
+        ] {
+            let mut fixture = declaration_fixture(source, CanonicalModuleState::Script);
+            let type_only_declaration = declaration(&fixture, 0);
+            let symbol = fixture
+                .context
+                .get_symbol_at_location(type_only_declaration)
+                .unwrap()
+                .unwrap();
+            let before = fixture.context.store().type_len();
+            assert_eq!(
+                fixture.context.get_type_of_module_value(symbol).unwrap(),
+                fixture
+                    .context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .error_type
+            );
+            assert_eq!(fixture.context.store().type_len(), before);
+            assert!(fixture.context.store().value_symbol_links(symbol).is_none());
+        }
+
+        for source in [
+            "declare function M(): void; declare namespace M { var ready: number; }",
+            "declare class M {} declare namespace M { var ready: number; }",
+            "declare enum M { A } declare namespace M { var ready: number; }",
+            "declare module 'shorthand';",
+        ] {
+            let mut fixture = declaration_fixture(source, CanonicalModuleState::Script);
+            let declaration = declaration(&fixture, 0);
+            let symbol = fixture
+                .context
+                .get_symbol_at_location(declaration)
+                .unwrap()
+                .unwrap();
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            assert!(
+                matches!(
+                    fixture.context.get_type_of_module_value(symbol),
+                    Err(SourceCheckError::Unsupported(_))
+                ),
+                "{source}"
+            );
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .module_value_identity(symbol)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn empty_namespace_plans_without_checker_publication() {
         let mut fixture = fixture("namespace Values {}", CanonicalModuleState::Script);
         let plan = plan(&fixture, 0);
@@ -13131,6 +14523,274 @@ mod tests {
         assert!(leaf.members.is_empty());
         assert_ne!(outer.symbol, middle.symbol);
         assert_ne!(middle.symbol, leaf.symbol);
+    }
+
+    #[test]
+    fn recursive_exported_namespace_classes_share_module_identity_in_both_query_orders() {
+        for queried_first in [false, true] {
+            let mut fixture = fixture(
+                "namespace M { export class C {} export namespace C { export var C = M.C; } }",
+                CanonicalModuleState::Script,
+            );
+            let namespace = plan(&fixture, 0);
+            let class = namespace.recursive_class.as_ref().unwrap().clone();
+            let first = queried_first.then(|| {
+                fixture
+                    .context
+                    .get_type_of_module_value(namespace.symbol)
+                    .unwrap()
+            });
+            if let Some(first) = first {
+                assert_eq!(
+                    recursive_state(&fixture, namespace.symbol, &class),
+                    Some(RecursiveNamespaceClassCacheState::NamespaceIdentityOnly(
+                        first
+                    ))
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .declared_type_links(class.class_symbol)
+                        .is_none()
+                );
+            }
+            fixture.context.check_source_file(fixture.file).unwrap();
+            let type_ = fixture
+                .context
+                .get_type_of_module_value(namespace.symbol)
+                .unwrap();
+            if let Some(first) = first {
+                assert_eq!(type_, first);
+            }
+            let Some(RecursiveNamespaceClassCacheState::Warm(state)) =
+                recursive_state(&fixture, namespace.symbol, &class)
+            else {
+                panic!("the recursive namespace must retain its complete graph")
+            };
+            assert_eq!(type_, state.namespace_type);
+            assert_eq!(fixture.context.type_to_string(type_).unwrap(), "typeof M");
+            for symbol in [class.class_symbol, class.class_local, class.variable_symbol] {
+                assert_eq!(
+                    fixture
+                        .context
+                        .store()
+                        .value_symbol_links(symbol)
+                        .unwrap()
+                        .resolved_type,
+                    Some(state.class_type)
+                );
+            }
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .declared_type_links(class.class_symbol)
+                    .unwrap()
+                    .declared_type,
+                Some(state.instance)
+            );
+            assert!(matches!(
+                fixture.context.get_type_of_module_value(class.class_symbol),
+                Err(SourceCheckError::Unsupported(_))
+            ));
+            let warm = (
+                fixture.context.store().type_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            for _ in 0..2 {
+                fixture.context.recheck_source_file(fixture.file).unwrap();
+                assert_eq!(
+                    fixture
+                        .context
+                        .get_type_of_module_value(namespace.symbol)
+                        .unwrap(),
+                    type_
+                );
+                assert_eq!(
+                    recursive_state(&fixture, namespace.symbol, &class),
+                    Some(RecursiveNamespaceClassCacheState::Warm(state))
+                );
+                assert_eq!(
+                    (
+                        fixture.context.store().type_len(),
+                        fixture.context.store().signature_len(),
+                        fixture.context.store().checker_link_allocated_lengths()
+                    ),
+                    warm
+                );
+            }
+            assert!(fixture.context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn recursive_exported_namespace_classes_reject_cold_namespace_node_caches_before_allocation() {
+        for poison_name in [false, true] {
+            let mut fixture = fixture(
+                "namespace M { export class C {} export namespace C { export var C = M.C; } }",
+                CanonicalModuleState::Script,
+            );
+            let namespace = plan(&fixture, 0);
+            let class = namespace.recursive_class.as_ref().unwrap().clone();
+            let node = if poison_name {
+                namespace.name
+            } else {
+                namespace.declaration
+            };
+            let poisoned = TypeNodeLinks {
+                resolved_type: Some(
+                    fixture
+                        .context
+                        .store()
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .any_type,
+                ),
+                ..TypeNodeLinks::default()
+            };
+            assert!(
+                fixture
+                    .context
+                    .store_mut_for_test()
+                    .set_type_node_links(node, poisoned.clone())
+            );
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+                fixture.context.diagnostics().len(),
+            );
+            for _ in 0..2 {
+                assert_eq!(recursive_state(&fixture, namespace.symbol, &class), None);
+                assert!(fixture.context.check_source_file(fixture.file).is_err());
+                assert_eq!(
+                    (
+                        fixture.context.store().type_len(),
+                        fixture.context.store().symbol_len(),
+                        fixture.context.store().signature_len(),
+                        fixture.context.store().checker_link_allocated_lengths(),
+                        fixture.context.diagnostics().len(),
+                    ),
+                    before
+                );
+                assert_eq!(
+                    fixture.context.store().type_node_links(node),
+                    Some(&poisoned)
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .declared_type_links(class.class_symbol)
+                        .is_none()
+                );
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .module_value_identity(namespace.symbol)
+                        .is_none()
+                );
+                for symbol in [
+                    namespace.symbol,
+                    class.class_symbol,
+                    class.class_local,
+                    class.variable_symbol,
+                ] {
+                    assert!(fixture.context.store().value_symbol_links(symbol).is_none());
+                }
+            }
+            assert!(
+                fixture
+                    .context
+                    .store_mut_for_test()
+                    .set_type_node_links(node, TypeNodeLinks::default())
+            );
+            assert_eq!(
+                recursive_state(&fixture, namespace.symbol, &class),
+                Some(RecursiveNamespaceClassCacheState::Cold)
+            );
+            fixture.context.check_source_file(fixture.file).unwrap();
+            let Some(RecursiveNamespaceClassCacheState::Warm(state)) =
+                recursive_state(&fixture, namespace.symbol, &class)
+            else {
+                panic!("clearing the poisoned node must permit a cold retry")
+            };
+            assert_eq!(
+                fixture
+                    .context
+                    .get_type_of_module_value(namespace.symbol)
+                    .unwrap(),
+                state.namespace_type
+            );
+            let warm = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            fixture.context.recheck_source_file(fixture.file).unwrap();
+            assert_eq!(
+                recursive_state(&fixture, namespace.symbol, &class),
+                Some(RecursiveNamespaceClassCacheState::Warm(state))
+            );
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().signature_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                ),
+                warm
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_exported_namespace_classes_reject_unproven_namespace_identities() {
+        let mut fixture = fixture(
+            "namespace M { export class C {} export namespace C { export var C = M.C; } }",
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let class = namespace.recursive_class.as_ref().unwrap().clone();
+        let forged = fixture
+            .context
+            .store_mut_for_test()
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(namespace.symbol))
+            .unwrap();
+        assert!(fixture.context.store_mut_for_test().set_value_symbol_links(
+            namespace.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(forged),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert_eq!(recursive_state(&fixture, namespace.symbol, &class), None);
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().signature_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(fixture.context.check_source_file(fixture.file).is_err());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .module_value_identity(namespace.symbol)
+                .is_none()
+        );
     }
 
     #[test]
@@ -13195,7 +14855,7 @@ mod tests {
         assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
 
         let Some(RecursiveNamespaceClassCacheState::Warm(state)) =
-            recursive_namespace_class_state(fixture.context.store(), namespace.symbol, &class)
+            recursive_state(&fixture, namespace.symbol, &class)
         else {
             panic!("the completed recursive class must retain its exact warm graph");
         };
@@ -13425,7 +15085,7 @@ mod tests {
         let namespace = plan(&fixture, 0);
         let class = namespace.recursive_class.as_ref().unwrap();
         assert!(matches!(
-            recursive_namespace_class_state(fixture.context.store(), namespace.symbol, class,),
+            recursive_state(&fixture, namespace.symbol, class),
             Some(RecursiveNamespaceClassCacheState::Warm(_)),
         ));
         let warm = (

@@ -1766,6 +1766,29 @@ fn display_validated_module_namespace(
     let TypeData::Object(object) = record.data() else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     };
+    if let Some(&declaration) = owner_record.declarations().and_then(|nodes| nodes.first())
+        && let Some(NodeData::ModuleDeclaration(module)) =
+            host.node(declaration).map(|node| &node.data)
+    {
+        super::source_namespaces::validate_module_value_identity(store, host, type_id)
+            .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+        let name = NodeRef::new(declaration.arena, declaration.file, module.name);
+        let name = match host.node(name).map(|node| &node.data) {
+            Some(NodeData::Identifier(identifier))
+                if module.keyword == SyntaxKind::GlobalKeyword =>
+            {
+                identifier.text.clone()
+            }
+            Some(NodeData::Identifier(_)) => namespace_qualified_alias_name(store, host, owner)
+                .map_err(|()| TypeDisplayUnavailable::MalformedType(type_id))?,
+            Some(NodeData::StringLiteral(literal)) => {
+                format!("import({})", quote_string_literal(&literal.text, '"'))
+            }
+            _ => return Err(TypeDisplayUnavailable::MalformedType(type_id)),
+        };
+        state.add(name.len().saturating_add(7));
+        return Ok(Some(format!("typeof {name}")));
+    }
     let [declaration] = owner_record.declarations().unwrap_or_default() else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     };
@@ -3957,7 +3980,7 @@ fn validate_merged_interface_member_owners(
     let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
     let table = store
         .symbol(owner)
-        .and_then(|symbol| symbol.members())
+        .and_then(ts_binder::semantic::Symbol::members)
         .map(|table| store.symbol_table(table).ok_or_else(invalid))
         .transpose()?;
     let mut members = HashMap::<SemanticSymbolId, (SymbolFlags, bool)>::new();
@@ -4068,7 +4091,7 @@ fn validate_merged_interface_member_owners(
             }
         }
     }
-    if table.map_or(0, |table| table.len()) != named_count {
+    if table.map_or(0, ts_binder::semantic::SymbolTable::len) != named_count {
         return Err(invalid());
     }
     Ok(())
@@ -6284,8 +6307,8 @@ fn truncate_display(
 mod tests {
     use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
     use ts_binder::{
-        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName, SymbolData, SymbolFlags,
+        CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName, SymbolData, SymbolFlags,
     };
     use ts_diagnostics::{Diagnostic, message_by_code};
     use ts_jsnum::{Number, PseudoBigInt};
@@ -6621,7 +6644,7 @@ mod tests {
             .collect::<Vec<_>>();
         let host = DeclaredTypeHost::new_after_global_merge(
             retained.iter().map(|(arena, bound)| (*arena, bound)),
-            GlobalMergeCompletion::for_test(Default::default()),
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
         )
         .unwrap();
         context
@@ -7196,7 +7219,7 @@ mod tests {
         let store = context.store();
         let property = store
             .symbol(owner)
-            .and_then(|symbol| symbol.members())
+            .and_then(ts_binder::semantic::Symbol::members)
             .and_then(|table| store.symbol_table(table))
             .and_then(|table| table.get_source("value"))
             .unwrap();
@@ -7239,7 +7262,7 @@ mod tests {
             let store = context.store();
             let property = store
                 .symbol(owner)
-                .and_then(|symbol| symbol.members())
+                .and_then(ts_binder::semantic::Symbol::members)
                 .and_then(|table| store.symbol_table(table))
                 .and_then(|table| table.get_source("value"))
                 .unwrap();
@@ -7338,7 +7361,7 @@ mod tests {
             let store = context.store();
             let property = store
                 .symbol(owner)
-                .and_then(|symbol| symbol.members())
+                .and_then(ts_binder::semantic::Symbol::members)
                 .and_then(|table| store.symbol_table(table))
                 .and_then(|table| table.get_source("value"))
                 .unwrap();

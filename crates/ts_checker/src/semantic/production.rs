@@ -1148,6 +1148,47 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         .get_declared_type_of_symbol(symbol)
     }
 
+    pub(super) fn preflight_enum_type(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )?;
+        super::enums::preflight_enum(&self.store, &host, symbol).map_err(DeclaredTypeError::from)
+    }
+
+    /// Returns a declared module's value type without checking its exports.
+    ///
+    /// Pure modules retain one anonymous identity. Namespace-only declarations
+    /// return the canonical error type, as in the upstream value-symbol query.
+    /// Source-file modules and bodyless ambient modules are not supported here.
+    ///
+    /// # Errors
+    ///
+    /// Rejects foreign declarations, changed caches, and modules merged with
+    /// class, function, or enum values that require another value provider.
+    pub fn get_type_of_module_value(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<TypeId, SourceCheckError> {
+        let Self {
+            options,
+            files,
+            store,
+            ..
+        } = self;
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?;
+        super::source_namespaces::get_type_of_module_value(store, &host, symbol)
+    }
+
     /// Installs or validates the exact instance and static identities for one
     /// local nongeneric class declaration.
     ///
@@ -1738,6 +1779,30 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// Returns the same typed failures as [`Self::check_source_file`], or a
     /// provenance error when `file` is not retained by this context.
     pub fn recheck_source_file(&mut self, file: FileId) -> Result<(), SourceCheckError> {
+        self.clear_source_file_completion(file)?;
+        self.check_source_file(file)
+    }
+
+    /// Forces source checking with the compiler's original JSX runtime facts.
+    ///
+    /// This retains canonical caches but clears the source completion flag.
+    /// Automatic module symbols and classic factory names use the same checks
+    /// as [`Self::check_source_file_with_jsx_runtime`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::check_source_file_with_jsx_runtime`]
+    /// or a provenance error when `file` is not retained by this context.
+    pub fn recheck_source_file_with_jsx_runtime(
+        &mut self,
+        file: FileId,
+        runtime: CanonicalJsxRuntimeEvidence<'_>,
+    ) -> Result<(), SourceCheckError> {
+        self.clear_source_file_completion(file)?;
+        self.check_source_file_with_jsx_runtime(file, runtime)
+    }
+
+    fn clear_source_file_completion(&mut self, file: FileId) -> Result<(), SourceCheckError> {
         let source = self.source_file(file).ok_or(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingFile(file),
         ))?;
@@ -1754,7 +1819,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
                 SourceCheckProvenanceError::StoreSourceMismatch(source),
             ));
         }
-        self.check_source_file(file)
+        Ok(())
     }
 
     /// Quoted ambient-module symbols deferred until global library types exist.
@@ -3581,6 +3646,102 @@ mod tests {
             "MyLib",
         );
         assert_eq!(context.options(), options);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn runtime_recheck_bypasses_completion_and_validates_retained_cache() {
+        let source = parsed("const value: any = { nested: { missing: undefined } };");
+        let file = FileId::new(8_405);
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let object = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::VariableDeclaration(declaration) => declaration
+                    .initializer
+                    .map(|node| node_ref(&source, file, node)),
+                _ => None,
+            })
+            .unwrap();
+        let runtime = CanonicalJsxRuntimeEvidence::Preserve;
+        context
+            .check_source_file_with_jsx_runtime(file, runtime)
+            .unwrap();
+        let source_ref = context.source_file(file).unwrap();
+        let type_id = context
+            .store()
+            .type_node_links(object)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let flags = context
+            .store()
+            .type_payload(type_id)
+            .unwrap()
+            .object_flags();
+        assert!(flags.contains(ObjectFlags::CONTAINS_WIDENING_TYPE));
+        let lengths = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_object_flags(type_id, flags & !ObjectFlags::CONTAINS_WIDENING_TYPE)
+        );
+        context
+            .check_source_file_with_jsx_runtime(file, runtime)
+            .unwrap();
+
+        assert!(matches!(
+            context.recheck_source_file_with_jsx_runtime(file, runtime),
+            Err(SourceCheckError::ObjectLiteral(
+                crate::semantic::SourceObjectLiteralError::InvalidCache { node, type_: Some(cached) }
+            )) if node == object && cached == type_id
+        ));
+        assert!(
+            !context
+                .store()
+                .source_file_links(source_ref)
+                .unwrap()
+                .type_checked
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_object_flags(type_id, flags)
+        );
+        context
+            .recheck_source_file_with_jsx_runtime(file, runtime)
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .source_file_links(source_ref)
+                .unwrap()
+                .type_checked
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(object)
+                .and_then(|links| links.resolved_type),
+            Some(type_id),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            lengths,
+        );
         assert!(context.diagnostics().is_empty());
     }
 

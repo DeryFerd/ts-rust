@@ -23,6 +23,7 @@ use xxhash_rust::xxh3::xxh3_128;
 
 mod artifacts;
 mod oracle;
+pub mod project;
 
 use artifacts::{GeneratedSemanticArtifacts, SemanticArtifactKind};
 
@@ -3430,7 +3431,7 @@ fn baseline_diagnostic_file_name(case: &Case, file_name: &str) -> String {
 }
 
 fn remove_test_path_prefixes(text: &str) -> String {
-    [
+    let replacements = [
         ("/.ts/", ""),
         ("/.lib/", ""),
         ("/.src/", ""),
@@ -3438,11 +3439,23 @@ fn remove_test_path_prefixes(text: &str) -> String {
         ("file:///./ts/", "file:///"),
         ("file:///./lib/", "file:///"),
         ("file:///./src/", "file:///"),
-    ]
-    .into_iter()
-    .fold(text.to_owned(), |text, (prefix, replacement)| {
-        text.replace(prefix, replacement)
-    })
+    ];
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+    // The pinned Go replacer preserves pattern order and never scans its output.
+    while let Some(character) = remaining.chars().next() {
+        if let Some((prefix, replacement)) = replacements
+            .iter()
+            .find(|(prefix, _)| remaining.starts_with(*prefix))
+        {
+            output.push_str(replacement);
+            remaining = &remaining[prefix.len()..];
+        } else {
+            output.push(character);
+            remaining = &remaining[character.len_utf8()..];
+        }
+    }
+    output
 }
 
 fn is_default_library_file(file_name: &str) -> bool {
@@ -8427,6 +8440,24 @@ mod tests {
                 .contains(&DiagnosticArtifactMismatchKind::UnsupportedDetail)
         );
         assert!(!comparison.unsupported_details.is_empty());
+    }
+
+    #[test]
+    fn normalizes_upstream_prefixes_in_one_pass_without_rewriting_output() {
+        for (input, expected) in [
+            ("/.s/.ts/rc/value", "/.src/value"),
+            ("\u{03c0}/.s/.ts/rc/\u{1f642}", "\u{03c0}/.src/\u{1f642}"),
+            (
+                "/.ts/a /.lib/b /.src/c bundled:///libs/d file:///./ts/e file:///./lib/f file:///./src/g",
+                "a b c d file:///e file:///f file:///g",
+            ),
+        ] {
+            assert_eq!(
+                super::remove_test_path_prefixes(input),
+                expected,
+                "{input:?}"
+            );
+        }
     }
 
     #[test]

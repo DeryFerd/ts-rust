@@ -185,8 +185,14 @@ fn canonical_queries_display_shared_module_types_through_the_local_alias() {
             let local = identifiers(program, "/project/input.ts", "Local");
             let default = identifiers(program, "/project/input.ts", "default")[0];
             let type_ = queries.get_type_at_location(default).unwrap();
+            let cold = queries.cold_diagnostic_snapshot();
+            let store = queries.semantic_store_id();
             for location in [default, local[0], local[1]] {
-                for _ in 0..2 {
+                for replay in [false, true] {
+                    if replay {
+                        assert_eq!(queries.replay_sources().unwrap(), cold);
+                        assert_eq!(queries.semantic_store_id(), store);
+                    }
                     assert_eq!(queries.get_type_at_location(location).unwrap(), type_);
                     assert_eq!(
                         queries

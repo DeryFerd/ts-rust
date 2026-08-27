@@ -36673,10 +36673,40 @@ fn materialize_referenced_ambient_namespace(
         .get_return_type_of_signature(signature)?;
     }
 
-    if let Some(type_) = current.or(cached) {
+    let shared_identity = store.symbol(read.namespace).is_some_and(|record| {
+        super::source_namespaces::has_pure_module_flags(record.flags())
+            && record.flags().contains(SymbolFlags::VALUE_MODULE)
+    }) && (store.module_value_identity(read.namespace).is_some()
+        || current.is_none() && cached.is_none());
+    let prepared = if shared_identity {
+        Some(super::source_namespaces::prepare_module_value_identity(
+            store,
+            host,
+            read.namespace,
+        )?)
+    } else {
+        None
+    };
+    if let Some(type_) = prepared.or(current).or(cached) {
+        if current.or(cached).is_some_and(|existing| existing != type_) {
+            return Err(SourceCheckError::Property(read.node));
+        }
         let Some(record) = store.type_payload(type_) else {
             return Err(SourceCheckError::Property(read.node));
         };
+        if shared_identity && record.object_flags() == ObjectFlags::ANONYMOUS {
+            if !store.set_structured_type_members(
+                type_,
+                Some(exports),
+                Some(properties),
+                None,
+                None,
+                None,
+            ) {
+                return Err(SourceCheckError::Property(read.node));
+            }
+            return Ok(type_);
+        }
         let Some(structured) = record.data().structured() else {
             return Err(SourceCheckError::Property(read.node));
         };

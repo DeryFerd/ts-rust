@@ -192,9 +192,9 @@ impl CanonicalCheckerContext<'_> {
         &mut self,
         node: NodeRef,
     ) -> Result<TypeId, CanonicalArtifactQueryError> {
-        let class = self.prepare_artifact_type_location(node)?;
+        let declaration = self.prepare_artifact_type_location(node)?;
 
-        if let Some(symbol) = class {
+        if let Some(symbol) = declaration {
             let type_ = self.get_declared_type_of_symbol(symbol)?;
             if let Some(cached) = self.cached_artifact_type(node)?
                 && cached != type_
@@ -215,6 +215,21 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        let (kind, is_type_node, parent) = {
+            let (arena, bound, record) = self.validated_artifact_node(node)?;
+            (
+                record.kind,
+                is_type_syntax(&record.data),
+                location_parent(arena, bound, node, record)?,
+            )
+        };
+
+        if let Some(LocationParent::Declaration(declaration)) = parent
+            && let Some(type_) = self.module_declaration_artifact_type(node, declaration)?
+        {
+            return Ok(type_);
+        }
+
         if let Some(type_) = self.declaration_method_artifact_type(node)? {
             return Ok(type_);
         }
@@ -227,21 +242,6 @@ impl CanonicalCheckerContext<'_> {
 
         if let Some((type_, _)) = self.heritage_artifact_target(node)? {
             return self.validate_artifact_type(node, type_);
-        }
-
-        let (kind, is_type_node, parent) = {
-            let (arena, bound, record) = self.validated_artifact_node(node)?;
-            (
-                record.kind,
-                is_type_syntax(&record.data),
-                location_parent(arena, bound, node, record)?,
-            )
-        };
-
-        if let Some(LocationParent::Declaration(declaration)) = parent
-            && let Some(type_) = self.global_augmentation_artifact_type(node, declaration)?
-        {
-            return Ok(type_);
         }
 
         if is_type_node {
@@ -346,6 +346,17 @@ impl CanonicalCheckerContext<'_> {
                 supports_symbol_location(&record.data),
             )
         };
+
+        if matches!(parent, Some(LocationParent::TypeReference(_)))
+            && let Some(symbol) =
+                self.lexical_artifact_symbol(node, SymbolFlags::TYPE | SymbolFlags::ALIAS)?
+            && self
+                .store()
+                .symbol(symbol)
+                .is_some_and(|record| record.flags().contains(SymbolFlags::ALIAS))
+        {
+            return Ok(Some(symbol));
+        }
 
         if bound_symbol.is_none()
             && !matches!(
@@ -781,10 +792,10 @@ impl CanonicalCheckerContext<'_> {
                 kind: record.kind,
             });
         }
-        let class = self.class_declaration_artifact_symbol(node)?;
+        let declaration = self.type_declaration_artifact_symbol(node)?;
         self.preflight_literal_annotation_nodes(node)?;
         self.prepare_artifact_location(node)?;
-        Ok(class)
+        Ok(declaration)
     }
 
     fn prepare_artifact_location(
@@ -910,21 +921,26 @@ impl CanonicalCheckerContext<'_> {
         Ok(Some(type_))
     }
 
-    fn class_declaration_artifact_symbol(
+    fn type_declaration_artifact_symbol(
         &self,
         node: NodeRef,
     ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
-        let symbol = {
+        let (symbol, declaration, is_enum) = {
             let (arena, bound, record) = self.validated_artifact_node(node)?;
-            let declaration = if matches!(record.data, NodeData::ClassDeclaration(_)) {
+            let declaration = if matches!(
+                record.data,
+                NodeData::ClassDeclaration(_) | NodeData::EnumDeclaration(_)
+            ) {
                 node
             } else if let Some(parent) = record.parent {
-                let Some(NodeData::ClassDeclaration(class)) =
-                    arena.get(parent).map(|record| &record.data)
-                else {
+                let Some(parent_record) = arena.get(parent) else {
                     return Ok(None);
                 };
-                if class.name != Some(node.node) {
+                if !matches!(
+                    parent_record.data,
+                    NodeData::ClassDeclaration(_) | NodeData::EnumDeclaration(_)
+                ) || declaration_name(&parent_record.data) != Some(node.node)
+                {
                     return Ok(None);
                 }
                 NodeRef::new(node.arena, node.file, parent)
@@ -938,9 +954,51 @@ impl CanonicalCheckerContext<'_> {
                         node,
                         kind: record.kind,
                     })?;
-            self.merged_artifact_symbol(node, symbol)?
+            (
+                self.merged_artifact_symbol(node, symbol)?,
+                declaration,
+                matches!(
+                    self.validated_artifact_node(declaration)?.2.data,
+                    NodeData::EnumDeclaration(_)
+                ),
+            )
         };
-        if let Some(cached) = self.cached_artifact_type(node)?
+        let cached = self.cached_artifact_type(node)?;
+        if is_enum {
+            if self.store().get_merged_symbol(symbol) != Some(symbol) {
+                return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+            }
+            let owner = self
+                .store()
+                .symbol(symbol)
+                .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?;
+            let declarations = owner.declarations().unwrap_or_default();
+            if !declarations.contains(&declaration)
+                || !owner
+                    .value_declaration()
+                    .is_some_and(|value| declarations.contains(&value))
+            {
+                return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+            }
+            self.preflight_enum_type(symbol)?;
+            let declared = self
+                .store()
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type);
+            if self
+                .store()
+                .type_node_links(node)
+                .is_some_and(|links| links.outer_type_parameters.is_some())
+                || cached.is_some() && cached != declared
+            {
+                return Err(
+                    DeclaredTypeError::Enum(super::enums::EnumTypeError::Invariant(
+                        super::enums::EnumTypeInvariant::InvalidCache(symbol),
+                    ))
+                    .into(),
+                );
+            }
+        } else if let Some(cached) = cached
             && super::declared::cached_class_type(self.store(), symbol)? != Some(cached)
         {
             return Err(CanonicalArtifactQueryError::InvalidType {
@@ -1165,8 +1223,8 @@ impl CanonicalCheckerContext<'_> {
             .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })
     }
 
-    fn global_augmentation_artifact_type(
-        &self,
+    fn module_declaration_artifact_type(
+        &mut self,
         node: NodeRef,
         declaration: NodeRef,
     ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
@@ -1174,7 +1232,7 @@ impl CanonicalCheckerContext<'_> {
         let NodeData::ModuleDeclaration(module) = &record.data else {
             return Ok(None);
         };
-        if module.keyword != SyntaxKind::GlobalKeyword || module.name != node.node {
+        if module.name != node.node || module.body.is_none() {
             return Ok(None);
         }
         let Some(symbol) = bound.symbol(declaration) else {
@@ -1185,13 +1243,16 @@ impl CanonicalCheckerContext<'_> {
             .store()
             .symbol(symbol)
             .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?;
-        if record.name() != InternalSymbolName::Global.as_ref() {
+        if module.keyword == SyntaxKind::GlobalKeyword
+            && record.name() != InternalSymbolName::Global.as_ref()
+        {
             return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
         }
-        self.store()
-            .intrinsic_bootstrap()
-            .map(|bootstrap| self.validate_artifact_type(node, bootstrap.any_type))
-            .transpose()
+        if !super::source_namespaces::has_pure_module_flags(record.flags()) {
+            return Ok(None);
+        }
+        let type_ = self.get_type_of_module_value(symbol)?;
+        self.validate_artifact_type(node, type_).map(Some)
     }
 
     fn shorthand_artifact_symbol(
@@ -1834,6 +1895,20 @@ impl CanonicalCheckerContext<'_> {
             .map(|record| (record.flags(), record.export_symbol()))
             .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?;
 
+        if super::source_namespaces::has_pure_module_flags(flags)
+            && let Some(declaration) = self
+                .store()
+                .symbol(symbol)
+                .and_then(|record| record.declarations())
+                .and_then(|declarations| declarations.first())
+                .copied()
+            && matches!(&self.validated_artifact_node(declaration)?.2.data,
+                NodeData::ModuleDeclaration(module) if module.body.is_some())
+        {
+            let type_ = self.get_type_of_module_value(symbol)?;
+            return self.validate_artifact_type(node, type_).map(Some);
+        }
+
         if let Some(type_) = self
             .store()
             .value_symbol_links(symbol)
@@ -2472,6 +2547,7 @@ mod tests {
         CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
         CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, IntrinsicBootstrapOptions,
         ModuleSymbolLinks, SymbolNodeLinks, TypeData, TypeNodeLinks, ValueSymbolLinks,
+        types::ObjectFlags,
     };
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -3003,6 +3079,382 @@ mod tests {
                 ),
                 poisoned,
                 "{poison}",
+            );
+        }
+    }
+
+    #[test]
+    fn enum_declaration_queries_keep_declared_and_value_types_distinct() {
+        for (source, has_reference) in [
+            ("enum Kind {}", false),
+            (
+                "enum Kind { First = 1, Second = 2, Third = Kind.First }",
+                true,
+            ),
+            ("declare namespace Names { enum Kind {} }", false),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(6_068);
+            let mut context = context(&parsed, file);
+            let (declaration, name) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, enumeration.name),
+                    ))
+                })
+                .unwrap();
+            let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let declared = context.get_type_at_location(name).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .declared_type_links(owner)
+                    .unwrap()
+                    .declared_type,
+                Some(declared),
+            );
+            let value = context
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_ne!(declared, value);
+            let reference = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (node != name.node
+                        && matches!(&record.data, NodeData::Identifier(identifier) if identifier.text == "Kind"))
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                });
+            assert_eq!(reference.is_some(), has_reference);
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            for _ in 0..2 {
+                assert_eq!(context.get_type_at_location(declaration), Ok(declared));
+                assert_eq!(context.get_type_at_location(name), Ok(declared));
+                assert_eq!(
+                    context.type_of_artifact_symbol(name, owner),
+                    Ok(Some(value))
+                );
+                if let Some(reference) = reference {
+                    assert_eq!(context.get_type_at_location(reference), Ok(value));
+                }
+                assert_eq!(context.get_symbol_at_location(name), Ok(Some(owner)));
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn enum_declaration_queries_reject_bad_caches_before_source_checking() {
+        let parsed = parse_source_file("declare enum Kind { First = 1 }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_069);
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, enumeration.name),
+                ))
+            })
+            .unwrap();
+        for declaration_file in [false, true] {
+            for warm in [false, true] {
+                for location in [declaration, name] {
+                    for metadata_only in [false, true] {
+                        let mut context = context_with_source_kind(
+                            &parsed,
+                            file,
+                            CanonicalCheckerOptions::default(),
+                            declaration_file,
+                        );
+                        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+                        if warm {
+                            context.get_type_at_location(name).unwrap();
+                        }
+                        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+                        let links = TypeNodeLinks {
+                            resolved_type: (!metadata_only).then_some(wrong),
+                            outer_type_parameters: metadata_only.then(|| vec![wrong]),
+                        };
+                        assert!(
+                            context
+                                .store_mut_for_test()
+                                .set_type_node_links(location, links.clone())
+                        );
+                        let source = context.source_file(file).unwrap();
+                        let before = (
+                            context.store().type_len(),
+                            context.store().symbol_len(),
+                            context.store().checker_link_allocated_lengths(),
+                            context.store().source_file_links(source).cloned(),
+                            context.diagnostics().len(),
+                        );
+                        for _ in 0..2 {
+                            assert_eq!(
+                                context.get_type_at_location(location),
+                                Err(CanonicalArtifactQueryError::DeclaredType(
+                                    crate::semantic::DeclaredTypeError::Enum(
+                                        crate::semantic::enums::EnumTypeError::Invariant(
+                                            crate::semantic::enums::EnumTypeInvariant::InvalidCache(
+                                                owner
+                                            ),
+                                        ),
+                                    ),
+                                )),
+                            );
+                        }
+                        assert_eq!(context.store().type_node_links(location), Some(&links));
+                        assert_eq!(
+                            (
+                                context.store().type_len(),
+                                context.store().symbol_len(),
+                                context.store().checker_link_allocated_lengths(),
+                                context.store().source_file_links(source).cloned(),
+                                context.diagnostics().len(),
+                            ),
+                            before,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn enum_declaration_queries_reject_unrelated_merge_redirects() {
+        let parsed = parse_source_file("declare enum First {} declare enum Second { Value = 1 }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_070);
+        let declarations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, enumeration.name),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [(first, first_name), (second, second_name)] = declarations.as_slice() else {
+            panic!("expected two enum declarations");
+        };
+        for declaration_file in [false, true] {
+            for warm in [false, true] {
+                let mut context = context_with_source_kind(
+                    &parsed,
+                    file,
+                    CanonicalCheckerOptions::default(),
+                    declaration_file,
+                );
+                let first_owner = context.file(file).unwrap().1.symbol(*first).unwrap();
+                let second_owner = context.file(file).unwrap().1.symbol(*second).unwrap();
+                if warm {
+                    context.get_type_at_location(*first_name).unwrap();
+                    context.get_type_at_location(*second_name).unwrap();
+                }
+                context
+                    .store_mut_for_test()
+                    .record_merged_symbol(second_owner, first_owner)
+                    .unwrap();
+                let source = context.source_file(file).unwrap();
+                let before = (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().source_file_links(source).cloned(),
+                    context.store().declared_type_links(second_owner).cloned(),
+                    context.diagnostics().len(),
+                );
+                for node in [*first, *first_name] {
+                    assert_eq!(
+                        context.get_type_at_location(node),
+                        Err(CanonicalArtifactQueryError::InvalidSymbol {
+                            node,
+                            symbol: second_owner,
+                        }),
+                    );
+                }
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.store().source_file_links(source).cloned(),
+                        context.store().declared_type_links(second_owner).cloned(),
+                        context.diagnostics().len(),
+                    ),
+                    before,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enum_declaration_queries_reject_changed_dispatch_flags() {
+        let parsed = parse_source_file("declare enum Kind { First = 1 }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_071);
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, enumeration.name),
+                ))
+            })
+            .unwrap();
+        for flags in [
+            SymbolFlags::PROPERTY,
+            SymbolFlags::TYPE_ALIAS,
+            SymbolFlags::REGULAR_ENUM | SymbolFlags::INTERFACE,
+        ] {
+            for warm in [false, true] {
+                let mut context = declaration_context(&parsed, file);
+                let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+                if warm {
+                    context.get_type_at_location(name).unwrap();
+                }
+                assert!(context.store_mut_for_test().set_symbol_flags(
+                    owner,
+                    flags,
+                    CheckFlags::NONE,
+                ));
+                let before = (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                );
+                for location in [declaration, name] {
+                    assert_eq!(
+                        context.get_type_at_location(location),
+                        Err(CanonicalArtifactQueryError::DeclaredType(
+                            crate::semantic::DeclaredTypeError::Enum(
+                                crate::semantic::enums::EnumTypeError::Invariant(
+                                    crate::semantic::enums::EnumTypeInvariant::InvalidOwnerSymbol(
+                                        owner
+                                    ),
+                                ),
+                            ),
+                        )),
+                    );
+                }
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.diagnostics().len(),
+                    ),
+                    before,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enum_declaration_queries_reject_chained_owner_redirects() {
+        let parsed = parse_source_file(concat!(
+            "declare enum First {} declare enum Bridge {} ",
+            "declare enum Last { Value = 1 }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_072);
+        for warm in [false, true] {
+            let mut context = declaration_context(&parsed, file);
+            let owners = parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                        return None;
+                    };
+                    let declaration = NodeRef::new(parsed.arena.id(), file, node);
+                    Some((
+                        declaration,
+                        NodeRef::new(parsed.arena.id(), file, enumeration.name),
+                        context.file(file).unwrap().1.symbol(declaration).unwrap(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let [first, bridge, last] = owners.as_slice() else {
+                panic!("expected three enum declarations");
+            };
+            if warm {
+                for (_, name, _) in &owners {
+                    context.get_type_at_location(*name).unwrap();
+                }
+            }
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                bridge.2,
+                Some(vec![first.0]),
+                Some(first.0),
+            ));
+            context
+                .store_mut_for_test()
+                .record_merged_symbol(bridge.2, first.2)
+                .unwrap();
+            context
+                .store_mut_for_test()
+                .record_merged_symbol(last.2, bridge.2)
+                .unwrap();
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().declared_type_links(last.2).cloned(),
+                context.diagnostics().len(),
+            );
+            for node in [first.0, first.1] {
+                assert_eq!(
+                    context.get_type_at_location(node),
+                    Err(CanonicalArtifactQueryError::InvalidSymbol {
+                        node,
+                        symbol: bridge.2,
+                    }),
+                );
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().declared_type_links(last.2).cloned(),
+                    context.diagnostics().len(),
+                ),
+                before,
             );
         }
     }
@@ -4141,7 +4593,7 @@ mod tests {
     }
 
     #[test]
-    fn global_augmentation_names_use_their_public_spelling_and_canonical_any_type() {
+    fn namespace_only_global_augmentation_names_use_the_canonical_error_type() {
         let parsed = parse_source_file(concat!(
             "export {};\n",
             "declare global { interface Marker { value: string; } }\n",
@@ -4190,8 +4642,100 @@ mod tests {
         assert_eq!(context.symbol_to_string(symbol).unwrap(), "global");
         assert_eq!(
             context.get_type_at_location(name).unwrap(),
-            context.store().intrinsic_bootstrap().unwrap().any_type
+            context.store().intrinsic_bootstrap().unwrap().error_type
         );
+    }
+
+    #[test]
+    fn global_augmentation_value_queries_keep_identity_without_resolving_exports() {
+        let parsed = parse_source_file(concat!(
+            "export {};\n",
+            "declare global { var marker: 'ready'; var unrelated: Missing; }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_062);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/global.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return None;
+                };
+                (module.keyword == SyntaxKind::GlobalKeyword).then_some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, module.name),
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        assert!(
+            context
+                .store()
+                .symbol(symbol)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::VALUE_MODULE)
+        );
+
+        let before_types = context.store().type_len();
+        let before_diagnostics = context.diagnostics().len();
+        let type_ = context.get_type_at_location(name).unwrap();
+        assert_eq!(context.store().type_len(), before_types + 1);
+        let record = context.store().type_payload(type_).unwrap();
+        assert_eq!(record.symbol(), Some(symbol));
+        assert_eq!(record.object_flags(), ObjectFlags::ANONYMOUS);
+        assert_ne!(type_, context.global_types().global_this_value_type);
+        assert_eq!(context.type_to_string(type_).unwrap(), "typeof global");
+        for _ in 0..2 {
+            assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(symbol));
+            assert_eq!(context.get_type_at_location(name).unwrap(), type_);
+            assert_eq!(context.get_type_at_location(declaration).unwrap(), type_);
+            assert_eq!(context.get_type_of_module_value(symbol).unwrap(), type_);
+            assert_eq!(context.store().type_len(), before_types + 1);
+            assert!(context.store().type_node_links(name).is_none());
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(type_)
+            );
+        }
+        for (node, record) in parsed.arena.iter() {
+            let NodeData::VariableDeclaration(variable) = &record.data else {
+                continue;
+            };
+            let declaration = NodeRef::new(parsed.arena.id(), file, node);
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let annotation = NodeRef::new(parsed.arena.id(), file, variable.type_.unwrap());
+            assert!(context.store().value_symbol_links(symbol).is_none());
+            assert!(context.store().type_node_links(annotation).is_none());
+        }
+        assert_eq!(context.diagnostics().len(), before_diagnostics);
     }
 
     #[test]
@@ -4522,6 +5066,176 @@ mod tests {
             assert_eq!(context.get_symbol_at_location(root).unwrap(), Some(alias));
             assert_eq!(context.get_symbol_at_location(name).unwrap(), expected);
             assert_eq!(context.get_symbol_at_location(member).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn imported_type_reference_names_preserve_alias_identity_cold_and_warm() {
+        for (import, local_name, declaration_file) in [
+            ("Item", "Item", false),
+            ("Item as Local", "Local", false),
+            ("Item", "Item", true),
+            ("Item as Local", "Local", true),
+        ] {
+            let declaration = if declaration_file {
+                format!("declare const result: {local_name};")
+            } else {
+                format!("const result: {local_name} = {{ value: 'ready' }};")
+            };
+            let importer = parse_source_file(&format!(
+                "import type {{ {import} }} from './target';\n{declaration}\n"
+            ));
+            let target = parse_source_file("export interface Item { value: string; }\n");
+            assert!(
+                importer.diagnostics.is_empty(),
+                "{:?}",
+                importer.diagnostics
+            );
+            assert!(target.diagnostics.is_empty(), "{:?}", target.diagnostics);
+            let importer_file = FileId::new(6_060);
+            let target_file = FileId::new(6_061);
+            let mut binder = CanonicalBinder::new();
+            let importer_path = if declaration_file {
+                "\"/project/importer.d.ts\""
+            } else {
+                "\"/project/importer.ts\""
+            };
+            for (file, parsed, path, declaration_file) in [
+                (importer_file, &importer, importer_path, declaration_file),
+                (target_file, &target, "\"/project/target.d.ts\"", true),
+            ] {
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(path),
+                            CanonicalSourceLanguage::TypeScript,
+                            declaration_file,
+                            CanonicalModuleState::External,
+                        ),
+                    )
+                    .unwrap();
+            }
+            for (file, parsed) in [(importer_file, &importer), (target_file, &target)] {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let specifier = importer
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::ImportDeclaration(import) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(
+                        importer.arena.id(),
+                        importer_file,
+                        import.module_specifier,
+                    ))
+                })
+                .unwrap();
+            let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+                binder.finish(),
+                vec![
+                    (importer_file, &importer.arena),
+                    (target_file, &target.arena),
+                ],
+                CanonicalCheckerOptions::default(),
+                CanonicalModuleResolutionManifestInput::new([
+                    CanonicalModuleResolutionEntry::resolved(
+                        specifier,
+                        CanonicalResolvedModuleInput::new(
+                            target_file,
+                            CanonicalModuleResolutionMode::Esm,
+                            CanonicalModuleResolutionMode::Esm,
+                        ),
+                    ),
+                ]),
+            )
+            .unwrap();
+            let import_declaration = importer
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::ImportSpecifier(_)).then_some(NodeRef::new(
+                        importer.arena.id(),
+                        importer_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let target_declaration = target
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::InterfaceDeclaration(_))
+                        .then_some(NodeRef::new(target.arena.id(), target_file, node))
+                })
+                .unwrap();
+            let alias = context
+                .file(importer_file)
+                .unwrap()
+                .1
+                .symbol(import_declaration)
+                .unwrap();
+            let target_symbol = context
+                .file(target_file)
+                .unwrap()
+                .1
+                .symbol(target_declaration)
+                .unwrap();
+            let (reference, name) = importer
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeReferenceNode(reference) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(importer.arena.id(), importer_file, node),
+                        NodeRef::new(importer.arena.id(), importer_file, reference.type_name),
+                    ))
+                })
+                .unwrap();
+
+            assert_ne!(alias, target_symbol);
+            assert!(context.store().type_node_links(reference).is_none());
+            assert!(context.store().symbol_node_links(reference).is_none());
+            assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(alias));
+            if declaration_file {
+                assert!(context.store().type_node_links(reference).is_none());
+                assert!(context.store().symbol_node_links(reference).is_none());
+                assert!(context.store().symbol_node_links(name).is_none());
+                continue;
+            }
+            let expected = context.get_declared_type_of_symbol(target_symbol).unwrap();
+            assert_eq!(context.get_type_at_location(reference).unwrap(), expected);
+            assert_eq!(context.get_type_at_location(name).unwrap(), expected);
+            let type_links = context.store().type_node_links(reference).cloned();
+            let symbol_links = context.store().symbol_node_links(reference).cloned();
+            assert_eq!(
+                symbol_links
+                    .as_ref()
+                    .and_then(|links| links.resolved_symbol),
+                Some(target_symbol)
+            );
+            assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(alias));
+            assert_eq!(
+                context.get_symbol_declarations(alias).unwrap(),
+                &[import_declaration]
+            );
+            assert_eq!(
+                context.store().type_node_links(reference),
+                type_links.as_ref()
+            );
+            assert_eq!(
+                context.store().symbol_node_links(reference),
+                symbol_links.as_ref()
+            );
+            assert!(context.store().symbol_node_links(name).is_none());
         }
     }
 

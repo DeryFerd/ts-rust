@@ -1,5 +1,14 @@
 //! Compiler Program and source-file graph foundations.
 
+mod project_graph;
+
+pub use project_graph::{
+    ProgramGraphConfig, ProgramGraphMissingEvidence, ProgramGraphReference,
+    ProgramGraphReferenceKind, ProgramGraphReferenceTarget, ProgramGraphResolution,
+    ProgramGraphResolutionKind, ProgramGraphResolutionRequest, ProgramGraphRoot,
+    ProgramGraphSnapshot, ProgramGraphSource, ProgramGraphTarget,
+};
+
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -1095,6 +1104,7 @@ struct ProgramConfigInputs {
     has_project_references: bool,
     options: CompilerOptions,
     diagnostics: Vec<ProgramDiagnostic>,
+    graph_config: ProgramGraphConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1384,7 +1394,12 @@ pub struct Program {
     source_files: Vec<SourceFile>,
     file_index: BTreeMap<String, usize>,
     root_file_names: BTreeSet<String>,
+    ordered_root_file_names: Vec<String>,
     resolved_modules: BTreeMap<(String, String), String>,
+    graph_resolution_options: Option<ResolutionOptions>,
+    graph_resolutions: Vec<ProgramGraphResolution>,
+    graph_references: Vec<ProgramGraphReference>,
+    graph_config: Option<ProgramGraphConfig>,
     module_resolution_diagnostics: Vec<ProgramDiagnostic>,
     package_export_specifiers: BTreeMap<String, Vec<String>>,
     package_display_specifiers: BTreeMap<(FileId, String), String>,
@@ -1399,19 +1414,62 @@ pub struct Program {
 /// Scoped access to the original canonical checker graph of one Program.
 ///
 /// The checker borrows the Program's AST arenas, so this value can be used
-/// only inside [`Program::try_new_with_canonical_checker_and_queries`]. Query
-/// results must be converted to owned data before the callback returns.
+/// only inside Program's canonical query callbacks. Query results must be
+/// converted to owned data before the callback returns.
 #[derive(Debug)]
 pub struct CanonicalProgramQueries<'arena> {
     context: CanonicalCheckerContext<'arena>,
+    program: &'arena Program,
+    checked_sources: Vec<CanonicalCheckedSource<'arena>>,
+    bind_diagnostics: Vec<ProgramDiagnostic>,
+    cold_diagnostics: Vec<ProgramDiagnostic>,
     has_diagnostics: bool,
 }
 
 impl CanonicalProgramQueries<'_> {
-    /// Reports whether program diagnostics remain after comment suppression.
+    /// Reports whether diagnostics remain after the last completed check.
     #[must_use]
     pub fn has_diagnostics(&self) -> bool {
         self.has_diagnostics
+    }
+
+    /// Returns all cold Program diagnostics in their final output order.
+    ///
+    /// This includes loader, config, bind, and checker diagnostics with their
+    /// related records. Comment directives use the normal Program rules.
+    /// The owned snapshot does not change after queries or source replay.
+    #[must_use]
+    pub fn cold_diagnostic_snapshot(&self) -> Vec<ProgramDiagnostic> {
+        self.cold_diagnostics.clone()
+    }
+
+    /// Forces the original checked sources through the same checker again.
+    ///
+    /// Each source bypasses its completion flag and uses its original JSX
+    /// runtime facts. Files retain their original order and canonical graph.
+    /// The result owns the complete, sorted Program diagnostics after replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original source-checking or diagnostic conversion failure.
+    /// A failed replay does not return a partial diagnostic snapshot.
+    pub fn replay_sources(&mut self) -> Result<Vec<ProgramDiagnostic>, CanonicalProgramCheckError> {
+        for checked in &self.checked_sources {
+            self.context
+                .recheck_source_file_with_jsx_runtime(checked.source.id, checked.runtime.evidence())
+                .map_err(|error| CanonicalProgramCheckError::SourceCheck {
+                    file_name: checked.source.file_name.clone(),
+                    error,
+                })?;
+        }
+        let diagnostics = self.program.canonical_checker_diagnostics(
+            &self.context,
+            &self.bind_diagnostics,
+            &self.checked_sources,
+        )?;
+        let snapshot = self.program.canonical_diagnostic_snapshot(&diagnostics);
+        self.has_diagnostics = !snapshot.is_empty();
+        Ok(snapshot)
     }
 
     /// Returns the canonical type recorded for an exact Program node.
@@ -1540,6 +1598,79 @@ impl CanonicalProgramQueries<'_> {
     }
 }
 
+#[derive(Debug)]
+struct CanonicalCheckedSource<'arena> {
+    source: &'arena SourceFile,
+    runtime: CanonicalReplayJsxRuntime,
+}
+
+#[derive(Debug)]
+enum CanonicalReplayJsxRuntime {
+    Preserve,
+    Classic {
+        factory_namespace: String,
+        fragment_factory_namespace: String,
+        fragment_factory_required: bool,
+        fragment_factory_pragma_required: bool,
+    },
+    Automatic {
+        module_specifier: String,
+        resolved_module: Option<CanonicalSymbolId>,
+    },
+}
+
+impl CanonicalReplayJsxRuntime {
+    fn evidence(&self) -> CanonicalJsxRuntimeEvidence<'_> {
+        match self {
+            Self::Preserve => CanonicalJsxRuntimeEvidence::Preserve,
+            Self::Classic {
+                factory_namespace,
+                fragment_factory_namespace,
+                fragment_factory_required,
+                fragment_factory_pragma_required,
+            } => CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace,
+                fragment_factory_namespace,
+                fragment_factory_required: *fragment_factory_required,
+                fragment_factory_pragma_required: *fragment_factory_pragma_required,
+            },
+            Self::Automatic {
+                module_specifier,
+                resolved_module,
+            } => CanonicalJsxRuntimeEvidence::Automatic {
+                module_specifier,
+                resolved_module: *resolved_module,
+            },
+        }
+    }
+}
+
+impl From<CanonicalJsxRuntimeEvidence<'_>> for CanonicalReplayJsxRuntime {
+    fn from(runtime: CanonicalJsxRuntimeEvidence<'_>) -> Self {
+        match runtime {
+            CanonicalJsxRuntimeEvidence::Preserve => Self::Preserve,
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace,
+                fragment_factory_namespace,
+                fragment_factory_required,
+                fragment_factory_pragma_required,
+            } => Self::Classic {
+                factory_namespace: factory_namespace.to_owned(),
+                fragment_factory_namespace: fragment_factory_namespace.to_owned(),
+                fragment_factory_required,
+                fragment_factory_pragma_required,
+            },
+            CanonicalJsxRuntimeEvidence::Automatic {
+                module_specifier,
+                resolved_module,
+            } => Self::Automatic {
+                module_specifier: module_specifier.to_owned(),
+                resolved_module,
+            },
+        }
+    }
+}
+
 impl Program {
     /// Creates a Program from explicit root file names.
     #[must_use]
@@ -1596,6 +1727,7 @@ impl Program {
         let current_directory = ts_path::normalize_path(current_directory);
         let mut program = Self {
             current_directory: current_directory.clone(),
+            ordered_root_file_names: root_names.to_vec(),
             case_sensitivity,
             options,
             checker,
@@ -1658,6 +1790,7 @@ impl Program {
         file_system: &dyn FileSystem,
         resolution_options: ResolutionOptions,
     ) {
+        self.graph_resolution_options = Some(resolution_options.clone());
         let resolver = Resolver::new(file_system, resolution_options);
         let mut ambient_modules = BTreeMap::new();
         for source_file in &self.source_files {
@@ -1701,63 +1834,86 @@ impl Program {
                 })
             }
             .flatten();
-            if let Some(specifier) = implicit_jsx_runtime
-                && let Some(resolved) = resolver
-                    .resolve_with_mode(&specifier, &containing_file, ModuleFormat::Esm)
-                    .resolved
-            {
-                if let Some(package_json) = resolved.package_json.as_deref() {
-                    self.register_package_export_specifiers(
-                        file_system,
-                        &resolver,
-                        package_json,
+            if let Some(specifier) = implicit_jsx_runtime {
+                let result =
+                    resolver.resolve_with_mode(&specifier, &containing_file, ModuleFormat::Esm);
+                self.record_graph_resolution(
+                    ProgramGraphResolutionRequest {
+                        kind: ProgramGraphResolutionKind::JsxRuntime,
+                        containing_file: containing_file.clone(),
+                        range: None,
+                        specifier: specifier.clone(),
+                        mode: Some(ModuleFormat::Esm),
+                    },
+                    &result,
+                    None,
+                );
+                if let Some(resolved) = result.resolved {
+                    if let Some(package_json) = resolved.package_json.as_deref() {
+                        self.register_package_export_specifiers(
+                            file_system,
+                            &resolver,
+                            package_json,
+                            &containing_file,
+                            CanonicalModuleResolutionMode::Esm,
+                        );
+                    }
+                    let containing = canonicalize(
                         &containing_file,
-                        CanonicalModuleResolutionMode::Esm,
+                        &self.current_directory,
+                        self.case_sensitivity,
                     );
+                    let target = canonicalize(
+                        &resolved.resolved_file_name,
+                        &self.current_directory,
+                        self.case_sensitivity,
+                    );
+                    self.resolved_modules
+                        .insert((containing, specifier), target);
+                    self.load_file(file_system, &resolved.resolved_file_name, false);
                 }
-                let containing = canonicalize(
-                    &containing_file,
-                    &self.current_directory,
-                    self.case_sensitivity,
-                );
-                let target = canonicalize(
-                    &resolved.resolved_file_name,
-                    &self.current_directory,
-                    self.case_sensitivity,
-                );
-                self.resolved_modules
-                    .insert((containing, specifier), target);
-                self.load_file(file_system, &resolved.resolved_file_name, false);
             }
             if !self
                 .canonical_commonjs_import_helpers(&self.source_files[file_index])
                 .is_empty()
-                && let Some(resolved) = resolver
-                    .resolve_with_mode("tslib", &containing_file, ModuleFormat::CommonJs)
-                    .resolved
             {
-                if let Some(package_json) = resolved.package_json.as_deref() {
-                    self.register_package_export_specifiers(
-                        file_system,
-                        &resolver,
-                        package_json,
+                let result =
+                    resolver.resolve_with_mode("tslib", &containing_file, ModuleFormat::CommonJs);
+                self.record_graph_resolution(
+                    ProgramGraphResolutionRequest {
+                        kind: ProgramGraphResolutionKind::ImportHelpers,
+                        containing_file: containing_file.clone(),
+                        range: None,
+                        specifier: "tslib".to_owned(),
+                        mode: Some(ModuleFormat::CommonJs),
+                    },
+                    &result,
+                    None,
+                );
+                if let Some(resolved) = result.resolved {
+                    if let Some(package_json) = resolved.package_json.as_deref() {
+                        self.register_package_export_specifiers(
+                            file_system,
+                            &resolver,
+                            package_json,
+                            &containing_file,
+                            CanonicalModuleResolutionMode::CommonJs,
+                        );
+                    }
+                    let containing = canonicalize(
                         &containing_file,
-                        CanonicalModuleResolutionMode::CommonJs,
+                        &self.current_directory,
+                        self.case_sensitivity,
                     );
+                    let target = canonicalize(
+                        &resolved.resolved_file_name,
+                        &self.current_directory,
+                        self.case_sensitivity,
+                    );
+                    self.resolved_modules
+                        .insert((containing, "tslib".to_owned()), target);
+                    self.load_file(file_system, &resolved.resolved_file_name, false);
                 }
-                let containing = canonicalize(
-                    &containing_file,
-                    &self.current_directory,
-                    self.case_sensitivity,
-                );
-                let target = canonicalize(
-                    &resolved.resolved_file_name,
-                    &self.current_directory,
-                    self.case_sensitivity,
-                );
-                self.resolved_modules
-                    .insert((containing, "tslib".to_owned()), target);
-                self.load_file(file_system, &resolved.resolved_file_name, false);
             }
             let source_mode = self.canonical_emit_module_mode(&self.source_files[file_index]);
             let usage_modes = canonical_static_module_specifiers(&self.source_files[file_index])
@@ -1793,6 +1949,29 @@ impl Program {
                         resolver.resolve(&specifier, &containing_file)
                     }
                 };
+                let ambient_target = if result.resolved.is_none()
+                    && can_resolve_ambient
+                    && !module_name_is_relative(&specifier)
+                {
+                    ambient_modules.get(&specifier).cloned()
+                } else {
+                    None
+                };
+                self.record_graph_resolution(
+                    ProgramGraphResolutionRequest {
+                        kind: ProgramGraphResolutionKind::Module,
+                        containing_file: containing_file.clone(),
+                        range: Some(range),
+                        specifier: specifier.clone(),
+                        mode: match mode {
+                            CanonicalModuleResolutionMode::CommonJs => Some(ModuleFormat::CommonJs),
+                            CanonicalModuleResolutionMode::Esm => Some(ModuleFormat::Esm),
+                            CanonicalModuleResolutionMode::None => None,
+                        },
+                    },
+                    &result,
+                    ambient_target.as_deref(),
+                );
                 if let Some(resolved) = result.resolved {
                     if self.checker == ProgramChecker::Canonical
                         && !self.options.no_check
@@ -1846,17 +2025,14 @@ impl Program {
                             &mut ambient_modules,
                         );
                     }
-                } else if can_resolve_ambient
-                    && !module_name_is_relative(&specifier)
-                    && let Some(target) = ambient_modules.get(&specifier)
-                {
+                } else if let Some(target) = ambient_target {
                     let containing = canonicalize(
                         &containing_file,
                         &self.current_directory,
                         self.case_sensitivity,
                     );
                     self.resolved_modules
-                        .insert((containing, specifier.clone()), target.clone());
+                        .insert((containing, specifier.clone()), target);
                 } else if !(self.options.no_check
                     || side_effect_only && !self.options.no_unchecked_side_effect_imports
                     || self.options.skip_lib_check
@@ -2430,6 +2606,7 @@ impl Program {
             has_project_references,
             options,
             mut diagnostics,
+            graph_config,
         } = match Self::load_config_inputs(
             file_system,
             config_path,
@@ -2460,6 +2637,7 @@ impl Program {
             ProgramChecker::Canonical,
         );
         program.config_file_path = Some(config_path);
+        program.graph_config = Some(graph_config);
         program.load_remaining_program_graph(file_system);
         if let Some(diagnostic) = program.common_source_directory_diagnostic(file_system) {
             diagnostics.push(diagnostic);
@@ -2492,6 +2670,7 @@ impl Program {
             root_names,
             options,
             mut diagnostics,
+            graph_config,
             ..
         } = match Self::load_config_inputs(file_system, config_path, overrides, command_line) {
             Ok(inputs) => inputs,
@@ -2506,6 +2685,7 @@ impl Program {
         let mut program =
             Self::new_with_options(file_system, &current_directory, &root_names, options);
         program.config_file_path = Some(config_path);
+        program.graph_config = Some(graph_config);
         if let Some(diagnostic) = program.common_source_directory_diagnostic(file_system) {
             diagnostics.push(diagnostic);
         }
@@ -2531,6 +2711,10 @@ impl Program {
             .map_or(".", |(directory, _)| directory);
         let mut options_result = parse_project_options(&config);
         let config_source = file_system.read_file(&config.path).ok();
+        let graph_config = ProgramGraphConfig {
+            source_text: config_source.clone(),
+            resolved: config.clone(),
+        };
         let empty_files = config
             .raw
             .get("files")
@@ -2667,6 +2851,7 @@ impl Program {
             has_project_references: !config.references.is_empty(),
             options: options_result.options,
             diagnostics: config_diagnostics,
+            graph_config,
         })
     }
 
@@ -4331,7 +4516,7 @@ impl Program {
             })?;
         }
 
-        let mut diagnostics = Vec::new();
+        let mut bind_diagnostics = Vec::new();
         for source in &sources {
             // Keep declaration files bound so their symbols remain available
             // to importers, but mirror pinned SkipTypeChecking by suppressing
@@ -4348,7 +4533,7 @@ impl Program {
                 }
             })?;
             for diagnostic in bound.diagnostics() {
-                diagnostics.push(
+                bind_diagnostics.push(
                     self.canonical_program_diagnostic(
                         Some(diagnostic.node),
                         None,
@@ -4364,7 +4549,7 @@ impl Program {
                 .source_facts()
                 .is_some_and(CanonicalSourceFileFacts::is_external_or_common_js_module)
             {
-                diagnostics.extend(self.canonical_commonjs_object_collisions(source)?);
+                bind_diagnostics.extend(self.canonical_commonjs_object_collisions(source)?);
             }
         }
 
@@ -4497,14 +4682,70 @@ impl Program {
             context
                 .check_source_file_with_jsx_runtime(file, runtime)
                 .map_err(|error| CanonicalProgramCheckError::SourceCheck { file_name, error })?;
-            self.add_missing_jsx_option_diagnostics(source, &mut diagnostics);
-            self.add_erasable_import_assignment_diagnostics(source, &mut diagnostics);
-            self.add_missing_commonjs_import_helper_diagnostics(
+            checked_sources.push(CanonicalCheckedSource {
                 source,
-                &context,
+                runtime: runtime.into(),
+            });
+        }
+
+        let diagnostics =
+            self.canonical_checker_diagnostics(&context, &bind_diagnostics, &checked_sources)?;
+        let cold_diagnostics = self.canonical_diagnostic_snapshot(&diagnostics);
+        for ((enclosing, target), specifier) in &self.package_display_specifiers {
+            if let Some(source) = self
+                .source_file(target)
+                .filter(|source| source_is_external_module(source))
+                && let Some(enclosing) = self.source_file_by_id(*enclosing)
+            {
+                context
+                    .set_module_display_specifier(
+                        NodeRef::new(
+                            enclosing.parse.arena.id(),
+                            enclosing.id,
+                            enclosing.parse.source_file,
+                        ),
+                        NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file),
+                        specifier.clone(),
+                    )
+                    .map_err(|error| CanonicalProgramCheckError::SourceCheck {
+                        file_name: source.file_name.clone(),
+                        error: SourceCheckError::TypeDisplayUnavailable(
+                            TypeDisplayUnavailable::SymbolDisplay(error),
+                        ),
+                    })?;
+            }
+        }
+        let mut canonical_queries = CanonicalProgramQueries {
+            context,
+            program: self,
+            checked_sources,
+            bind_diagnostics,
+            has_diagnostics: !cold_diagnostics.is_empty(),
+            cold_diagnostics,
+        };
+        let result = queries(self, &mut canonical_queries);
+        Ok((diagnostics, result))
+    }
+
+    fn canonical_checker_diagnostics(
+        &self,
+        context: &CanonicalCheckerContext<'_>,
+        bind_diagnostics: &[ProgramDiagnostic],
+        checked_sources: &[CanonicalCheckedSource<'_>],
+    ) -> Result<Vec<ProgramDiagnostic>, CanonicalProgramCheckError> {
+        let mut diagnostics = bind_diagnostics.to_vec();
+        let checked_files = checked_sources
+            .iter()
+            .map(|checked| checked.source.id)
+            .collect::<Vec<_>>();
+        for checked in checked_sources {
+            self.add_missing_jsx_option_diagnostics(checked.source, &mut diagnostics);
+            self.add_erasable_import_assignment_diagnostics(checked.source, &mut diagnostics);
+            self.add_missing_commonjs_import_helper_diagnostics(
+                checked.source,
+                context,
                 &mut diagnostics,
             )?;
-            checked_sources.push(file);
         }
 
         // Program.GetGlobalDiagnostics skips checker diagnostics without source files.
@@ -4535,7 +4776,7 @@ impl Program {
             && (self.options.declaration || self.options.composite)
         {
             for source in &self.source_files {
-                if checked_sources.contains(&source.id) {
+                if checked_files.contains(&source.id) {
                     self.add_isolated_declaration_function_diagnostics(source, &mut diagnostics)?;
                 }
             }
@@ -4549,43 +4790,26 @@ impl Program {
                         .file_name
                         .as_deref()
                         .and_then(|file_name| self.source_file(file_name))
-                        .is_some_and(|source| checked_sources.contains(&source.id))
+                        .is_some_and(|source| checked_files.contains(&source.id))
                 })
                 .cloned(),
         );
-        self.apply_comment_directives(&mut diagnostics, &checked_sources);
+        self.apply_comment_directives(&mut diagnostics, &checked_files);
+        Ok(diagnostics)
+    }
 
-        for ((enclosing, target), specifier) in &self.package_display_specifiers {
-            if let Some(source) = self
-                .source_file(target)
-                .filter(|source| source_is_external_module(source))
-                && let Some(enclosing) = self.source_file_by_id(*enclosing)
-            {
-                context
-                    .set_module_display_specifier(
-                        NodeRef::new(
-                            enclosing.parse.arena.id(),
-                            enclosing.id,
-                            enclosing.parse.source_file,
-                        ),
-                        NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file),
-                        specifier.clone(),
-                    )
-                    .map_err(|error| CanonicalProgramCheckError::SourceCheck {
-                        file_name: source.file_name.clone(),
-                        error: SourceCheckError::TypeDisplayUnavailable(
-                            TypeDisplayUnavailable::SymbolDisplay(error),
-                        ),
-                    })?;
-            }
-        }
-
-        let mut canonical_queries = CanonicalProgramQueries {
-            context,
-            has_diagnostics: !self.diagnostics.is_empty() || !diagnostics.is_empty(),
-        };
-        let result = queries(self, &mut canonical_queries);
-        Ok((diagnostics, result))
+    fn canonical_diagnostic_snapshot(
+        &self,
+        checker_diagnostics: &[ProgramDiagnostic],
+    ) -> Vec<ProgramDiagnostic> {
+        let mut diagnostics = self
+            .diagnostics
+            .iter()
+            .chain(checker_diagnostics)
+            .cloned()
+            .collect::<Vec<_>>();
+        diagnostics.sort_by(compare_program_diagnostics);
+        diagnostics
     }
 
     fn add_isolated_declaration_function_diagnostics(
@@ -5694,10 +5918,19 @@ impl Program {
         let containing_file =
             resolve_path(&self.current_directory, &["__inferred type names__.ts"]);
         for name in names {
-            if let Some(resolved) = resolver
-                .resolve_type_reference(&name, &containing_file)
-                .resolved
-            {
+            let result = resolver.resolve_type_reference(&name, &containing_file);
+            self.record_graph_resolution(
+                ProgramGraphResolutionRequest {
+                    kind: ProgramGraphResolutionKind::AutomaticTypeDirective,
+                    containing_file: containing_file.clone(),
+                    range: None,
+                    specifier: name.clone(),
+                    mode: None,
+                },
+                &result,
+                None,
+            );
+            if let Some(resolved) = result.resolved {
                 self.load_file(file_system, &resolved.resolved_file_name, false);
             } else if resolution_options
                 .types
@@ -5719,7 +5952,17 @@ impl Program {
         let directives = reference_directives(&self.source_files[file_index].source_text);
         for directive in directives {
             match directive.kind {
-                ReferenceKind::Path | ReferenceKind::Types if self.options.no_resolve => {}
+                ReferenceKind::Path if self.options.no_resolve => {
+                    self.graph_references.push(ProgramGraphReference {
+                        containing_file: containing_file.clone(),
+                        range: directive.range,
+                        specifier: directive.value,
+                        kind: ProgramGraphReferenceKind::Path,
+                        skipped: true,
+                        targets: Vec::new(),
+                    });
+                }
+                ReferenceKind::Types if self.options.no_resolve => {}
                 ReferenceKind::Path => {
                     let unresolved_file_name = resolve_path(
                         &directory_path(&containing_file),
@@ -5731,13 +5974,34 @@ impl Program {
                         self.options.allow_js,
                     )
                     .unwrap_or(unresolved_file_name);
+                    self.graph_references.push(ProgramGraphReference {
+                        containing_file: containing_file.clone(),
+                        range: directive.range,
+                        specifier: directive.value,
+                        kind: ProgramGraphReferenceKind::Path,
+                        skipped: false,
+                        targets: vec![ProgramGraphReferenceTarget {
+                            file_name: file_name.clone(),
+                            file_id: None,
+                        }],
+                    });
                     self.load_file(file_system, &file_name, true);
                 }
                 ReferenceKind::Types => {
-                    if let Some(resolved) = resolver
-                        .resolve_type_reference(&directive.value, &containing_file)
-                        .resolved
-                    {
+                    let result =
+                        resolver.resolve_type_reference(&directive.value, &containing_file);
+                    self.record_graph_resolution(
+                        ProgramGraphResolutionRequest {
+                            kind: ProgramGraphResolutionKind::TypeReference,
+                            containing_file: containing_file.clone(),
+                            range: Some(directive.range),
+                            specifier: directive.value.clone(),
+                            mode: None,
+                        },
+                        &result,
+                        None,
+                    );
+                    if let Some(resolved) = result.resolved {
                         self.load_file(file_system, &resolved.resolved_file_name, false);
                     } else if !source_ignores_processing_diagnostic(
                         &self.source_files[file_index],
@@ -5751,7 +6015,22 @@ impl Program {
                 }
                 ReferenceKind::Lib => {
                     let library_name = bundled_library_name(&directive.value);
-                    for dependency in ts_bundled::library_closure(&library_name) {
+                    let dependencies = ts_bundled::library_closure(&library_name);
+                    self.graph_references.push(ProgramGraphReference {
+                        containing_file: containing_file.clone(),
+                        range: directive.range,
+                        specifier: directive.value,
+                        kind: ProgramGraphReferenceKind::Library,
+                        skipped: false,
+                        targets: dependencies
+                            .iter()
+                            .map(|dependency| ProgramGraphReferenceTarget {
+                                file_name: format!("/__typescript/lib/{dependency}"),
+                                file_id: None,
+                            })
+                            .collect(),
+                    });
+                    for dependency in dependencies {
                         self.load_bundled_library(dependency);
                     }
                 }
@@ -11566,6 +11845,91 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn canonical_project_replay_keeps_source_order_and_cache_lengths() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/z.tsx",
+            concat!(
+                "/** @jsxRuntime classic */\n",
+                "/** @jsx Custom.h */\n",
+                "declare const Custom: any;\n",
+                "const first = <div />;\n",
+                "const bad: string = null;\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/a.tsx",
+            "/** @jsxImportSource absent */\nconst second = <div />;\n",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/ignored.ts",
+            "// @ts-nocheck\nconst ignored: string = null;\n",
+        )
+        .unwrap();
+        let (program, cold) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &[
+                "z.tsx".to_owned(),
+                "a.tsx".to_owned(),
+                "ignored.ts".to_owned(),
+            ],
+            CompilerOptions {
+                strict: true,
+                no_implicit_any: false,
+                no_implicit_any_specified: true,
+                jsx: ts_options::JsxEmit::ReactJsx,
+                module: ModuleKind::EsNext,
+                module_specified: true,
+                module_resolution: ModuleResolutionKind::Bundler,
+                lib: Some(vec!["es5".to_owned()]),
+                no_emit: true,
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                assert_eq!(
+                    queries
+                        .checked_sources
+                        .iter()
+                        .map(|checked| checked.source.file_name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["/project/z.tsx", "/project/a.tsx"],
+                );
+                let lengths = |queries: &super::CanonicalProgramQueries<'_>| {
+                    (
+                        queries.context.store().type_len(),
+                        queries.context.store().symbol_len(),
+                        queries.context.store().signature_len(),
+                        queries.context.store().mapper_len(),
+                        queries.context.store().type_resolution_len(),
+                        queries.context.diagnostics().len(),
+                    )
+                };
+                let before = lengths(queries);
+                let cold = queries.cold_diagnostic_snapshot();
+                for _ in 0..2 {
+                    assert_eq!(queries.replay_sources().unwrap(), cold);
+                    assert_eq!(lengths(queries), before);
+                }
+                let ignored = program.source_file("/project/ignored.ts").unwrap().id;
+                let ignored = queries.context.source_file(ignored).unwrap();
+                assert!(
+                    queries
+                        .context
+                        .store()
+                        .source_file_links(ignored)
+                        .is_none_or(|links| !links.type_checked)
+                );
+                cold
+            },
+        )
+        .unwrap();
+        assert_eq!(program.diagnostics(), cold.unwrap());
     }
 
     #[test]

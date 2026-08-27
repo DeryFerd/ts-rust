@@ -4577,7 +4577,7 @@ fn check_jsx_closing_tag(
             options,
             diagnostics,
         )?;
-        publish_namespace_component_tag_links(store, member, &closing.tag, component)?;
+        publish_namespace_component_tag_links(store, host, member, &closing.tag, component)?;
         return Ok(());
     }
 
@@ -5137,7 +5137,7 @@ fn resolve_component_tag(
     let (symbol, component) = if let Some(member) = &tag.namespace_member {
         let component =
             resolve_namespace_component_type(store, host, member, tag.node, options, diagnostics)?;
-        publish_namespace_component_tag_links(store, member, tag, component)?;
+        publish_namespace_component_tag_links(store, host, member, tag, component)?;
         (member.member, component)
     } else {
         let Some(symbol) = resolve_source_value_symbol(store, bound, &tag.name) else {
@@ -6221,11 +6221,12 @@ fn legacy_react_fragment_attributes(
 
 fn publish_namespace_component_tag_links(
     store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     member: &JsxNamespaceMemberPlan,
     tag: &JsxTagPlan,
     component: TypeId,
 ) -> Result<(), SourceCheckError> {
-    let namespace = jsx_namespace_value_type(store, member.namespace, member.namespace_node)?;
+    let namespace = jsx_namespace_value_type(store, host, member.namespace, member.namespace_node)?;
     publish_symbol_links(store, member.namespace_node, member.namespace)?;
     publish_type_links(store, member.namespace_node, namespace)?;
     publish_symbol_links(store, member.member_node, member.member)?;
@@ -6236,6 +6237,7 @@ fn publish_namespace_component_tag_links(
 
 fn jsx_namespace_value_type(
     store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     namespace: SemanticSymbolId,
     location: NodeRef,
 ) -> Result<TypeId, SourceCheckError> {
@@ -6256,6 +6258,31 @@ fn jsx_namespace_value_type(
                 .map(|_| symbol)
         })
         .collect::<Vec<_>>();
+    let shared_identity = super::source_namespaces::has_pure_module_flags(owner.flags())
+        && owner.flags().contains(SymbolFlags::VALUE_MODULE)
+        && owner.declarations().and_then(|nodes| nodes.first()).is_some_and(|node| {
+            matches!(host.node(*node).map(|node| &node.data), Some(NodeData::ModuleDeclaration(module)) if module.body.is_some())
+        })
+        && (store.module_value_identity(namespace).is_some()
+            || store.value_symbol_links(namespace).is_none_or(|links| links == &ValueSymbolLinks::default()));
+    if shared_identity {
+        let type_ = super::source_namespaces::get_type_of_module_value(store, host, namespace)?;
+        if store
+            .type_payload(type_)
+            .is_some_and(|record| record.object_flags() == ObjectFlags::ANONYMOUS)
+            && !store.set_structured_type_members(
+                type_,
+                Some(exports),
+                Some(properties),
+                None,
+                None,
+                None,
+            )
+        {
+            return Err(SourceCheckError::Property(location));
+        }
+        return Ok(type_);
+    }
     if let Some(links) = store.value_symbol_links(namespace)
         && links != &ValueSymbolLinks::default()
     {

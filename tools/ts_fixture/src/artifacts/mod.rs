@@ -3,7 +3,12 @@
 use std::{error::Error, fmt, fmt::Write as _};
 
 use ts_ast::{Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
-use ts_compiler::{CanonicalProgramQueries, CanonicalTypeFormatFlags, Program, SourceFile};
+use ts_checker::semantic::TypeDisplayUnavailable;
+use ts_compiler::{
+    CanonicalArtifactQueryError, CanonicalProgramCheckError, CanonicalProgramCheckFailureClass,
+    CanonicalProgramQueries, CanonicalSymbolId, CanonicalTypeFormatFlags, CanonicalTypeId, Program,
+    SourceFile,
+};
 
 use crate::{
     Case, Unit, baseline_unit_name, is_default_library_file, pinned_project_config,
@@ -11,6 +16,7 @@ use crate::{
     unit_uses_implicit_references, virtual_unit_path,
 };
 
+pub(crate) mod project;
 pub(crate) mod symbols;
 pub(crate) mod types;
 
@@ -81,6 +87,98 @@ struct ArtifactLine {
     source_text: String,
     value: String,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactIdentity {
+    Type(CanonicalTypeId),
+    Symbol(Option<CanonicalSymbolId>),
+}
+
+struct QueriedArtifactLine {
+    line: Option<ArtifactLine>,
+    identity: ArtifactIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactRenderError {
+    pub(crate) class: CanonicalProgramCheckFailureClass,
+    pub(crate) detail: String,
+}
+
+impl ArtifactRenderError {
+    fn invariant(code: &'static str, detail: String) -> Self {
+        Self {
+            class: CanonicalProgramCheckFailureClass::Fatal {
+                invariant_code: code,
+            },
+            detail,
+        }
+    }
+
+    fn query(operation: &str, file_name: &str, error: CanonicalArtifactQueryError) -> Self {
+        let class = match error {
+            CanonicalArtifactQueryError::UnsupportedNode { .. } => {
+                CanonicalProgramCheckFailureClass::Unsupported {
+                    capability_code: "ARTIFACT.UNSUPPORTED_NODE",
+                }
+            }
+            CanonicalArtifactQueryError::MissingType { .. } => {
+                CanonicalProgramCheckFailureClass::Unsupported {
+                    capability_code: "ARTIFACT.MISSING_TYPE",
+                }
+            }
+            CanonicalArtifactQueryError::SourceCheck(error) => {
+                CanonicalProgramCheckError::SourceCheck {
+                    file_name: file_name.to_owned(),
+                    error,
+                }
+                .failure_class()
+            }
+            CanonicalArtifactQueryError::DeclaredType(error) => {
+                CanonicalProgramCheckError::SourceCheck {
+                    file_name: file_name.to_owned(),
+                    error: error.into(),
+                }
+                .failure_class()
+            }
+            CanonicalArtifactQueryError::SymbolDisplay(error) => {
+                CanonicalProgramCheckError::SourceCheck {
+                    file_name: file_name.to_owned(),
+                    error: TypeDisplayUnavailable::SymbolDisplay(error).into(),
+                }
+                .failure_class()
+            }
+            // Alias failures include provenance checks. Until the compiler
+            // exposes a typed alias classifier, keep them fatal.
+            CanonicalArtifactQueryError::Alias(_) => CanonicalProgramCheckFailureClass::Fatal {
+                invariant_code: "INV.ARTIFACT.UNCLASSIFIED_ALIAS",
+            },
+            CanonicalArtifactQueryError::MissingFile(_)
+            | CanonicalArtifactQueryError::ForeignNode(_)
+            | CanonicalArtifactQueryError::StaleFile { .. }
+            | CanonicalArtifactQueryError::InvalidType { .. }
+            | CanonicalArtifactQueryError::InvalidSymbol { .. }
+            | CanonicalArtifactQueryError::ForeignSymbol(_)
+            | CanonicalArtifactQueryError::ForeignDeclaration { .. } => {
+                CanonicalProgramCheckFailureClass::Fatal {
+                    invariant_code: "INV.ARTIFACT.QUERY",
+                }
+            }
+        };
+        Self {
+            class,
+            detail: format!("{operation}: {error}"),
+        }
+    }
+}
+
+impl fmt::Display for ArtifactRenderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl Error for ArtifactRenderError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ArtifactWalkError {
@@ -220,8 +318,10 @@ fn render_baseline(
             .copied()
             .filter(|node| node.file == source.id)
             .map(|node| artifact_line(program, queries, source, node, kind, has_diagnostics))
+            .map(|result| result.map(|result| result.line))
             .filter_map(Result::transpose)
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
         render_source_section(
             &mut sections,
             &baseline_unit_name(case, unit, index),
@@ -248,36 +348,37 @@ fn artifact_line(
     reference: NodeRef,
     kind: SemanticArtifactKind,
     has_diagnostics: bool,
-) -> Result<Option<ArtifactLine>, String> {
-    let node = program
-        .node(reference)
-        .ok_or_else(|| format!("semantic baseline references foreign node {reference:?}"))?;
-    let start = usize::try_from(node.range.start.get())
-        .map_err(|_| format!("semantic baseline position exceeds usize at {reference:?}"))?;
-    let end = usize::try_from(node.range.end.get())
-        .map_err(|_| format!("semantic baseline position exceeds usize at {reference:?}"))?;
-    let source_text = source
-        .source_text
-        .get(start..end)
-        .ok_or_else(|| format!("semantic baseline node {reference:?} has an invalid source range"))?
-        .replace("\r\n", "")
-        .replace('\n', "");
+) -> Result<QueriedArtifactLine, ArtifactRenderError> {
+    let node = program.node(reference).ok_or_else(|| {
+        ArtifactRenderError::invariant(
+            "INV.ARTIFACT.NODE",
+            format!("semantic baseline references foreign node {reference:?}"),
+        )
+    })?;
+    let (start, source_text) = artifact_source_text(source, reference, node)?;
 
-    let value = match kind {
+    let (value, identity) = match kind {
         SemanticArtifactKind::Types => {
-            let type_id = queries
-                .get_type_at_location(reference)
-                .map_err(|error| format!("semantic .types query failed: {error}"))?;
+            let type_id = queries.get_type_at_location(reference).map_err(|error| {
+                ArtifactRenderError::query("semantic .types query failed", &source.file_name, error)
+            })?;
             let intrinsic_name = if !has_diagnostics
                 && uses_intrinsic_any_name(source, reference.node, node, &source_text)
             {
                 queries
                     .intrinsic_any_name(type_id)
-                    .map_err(|error| format!("semantic intrinsic type query failed: {error}"))?
+                    .map_err(|error| ArtifactRenderError {
+                        class: CanonicalProgramCheckError::SourceCheck {
+                            file_name: source.file_name.clone(),
+                            error: error.into(),
+                        }
+                        .failure_class(),
+                        detail: format!("semantic intrinsic type query failed: {error}"),
+                    })?
             } else {
                 None
             };
-            if let Some(name) = intrinsic_name {
+            let value = if let Some(name) = intrinsic_name {
                 name.to_owned()
             } else {
                 queries
@@ -289,32 +390,85 @@ fn artifact_line(
                         CanonicalTypeFormatFlags::NO_TRUNCATION
                             | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE,
                     )
-                    .map_err(|error| format!("semantic .types formatting failed: {error}"))?
-            }
+                    .map_err(|error| ArtifactRenderError {
+                        class: CanonicalProgramCheckError::SourceCheck {
+                            file_name: source.file_name.clone(),
+                            error: error.into(),
+                        }
+                        .failure_class(),
+                        detail: format!("semantic .types formatting failed: {error}"),
+                    })?
+            };
+            (value, ArtifactIdentity::Type(type_id))
         }
         SemanticArtifactKind::Symbols => {
-            let Some(symbol) = queries
-                .get_symbol_at_location(reference)
-                .map_err(|error| format!("semantic .symbols query failed: {error}"))?
+            let Some(symbol) = queries.get_symbol_at_location(reference).map_err(|error| {
+                ArtifactRenderError::query(
+                    "semantic .symbols query failed",
+                    &source.file_name,
+                    error,
+                )
+            })?
             else {
-                return Ok(None);
+                return Ok(QueriedArtifactLine {
+                    line: None,
+                    identity: ArtifactIdentity::Symbol(None),
+                });
             };
-            render_symbol(
-                program,
-                queries,
-                symbol,
-                node.parent.map_or(reference, |parent| {
-                    NodeRef::new(reference.arena, reference.file, parent)
-                }),
-            )?
+            (
+                render_symbol(
+                    program,
+                    queries,
+                    &source.file_name,
+                    symbol,
+                    node.parent.map_or(reference, |parent| {
+                        NodeRef::new(reference.arena, reference.file, parent)
+                    }),
+                )?,
+                ArtifactIdentity::Symbol(Some(symbol)),
+            )
         }
     };
 
-    Ok(Some(ArtifactLine {
-        line: ecma_line_and_utf16_column(&source.source_text, start).0,
-        source_text,
-        value,
-    }))
+    Ok(QueriedArtifactLine {
+        line: Some(ArtifactLine {
+            line: ecma_line_and_utf16_column(&source.source_text, start).0,
+            source_text,
+            value,
+        }),
+        identity,
+    })
+}
+
+fn artifact_source_text(
+    source: &SourceFile,
+    reference: NodeRef,
+    node: &Node,
+) -> Result<(usize, String), ArtifactRenderError> {
+    let start = usize::try_from(node.range.start.get()).map_err(|_| {
+        ArtifactRenderError::invariant(
+            "INV.ARTIFACT.RANGE",
+            format!("semantic baseline position exceeds usize at {reference:?}"),
+        )
+    })?;
+    let end = usize::try_from(node.range.end.get()).map_err(|_| {
+        ArtifactRenderError::invariant(
+            "INV.ARTIFACT.RANGE",
+            format!("semantic baseline position exceeds usize at {reference:?}"),
+        )
+    })?;
+    let source_text = source
+        .source_text
+        .get(start..end)
+        .ok_or_else(|| {
+            ArtifactRenderError::invariant(
+                "INV.ARTIFACT.RANGE",
+                format!("semantic baseline node {reference:?} has an invalid source range"),
+            )
+        })?
+        .replace("\r\n", "")
+        .replace('\n', "");
+    Ok((start, source_text))
 }
 
 fn uses_intrinsic_any_name(
@@ -363,15 +517,18 @@ fn uses_intrinsic_any_name(
 fn render_symbol(
     program: &Program,
     queries: &mut CanonicalProgramQueries<'_>,
+    file_name: &str,
     symbol: ts_compiler::CanonicalSymbolId,
     enclosing: NodeRef,
-) -> Result<String, String> {
+) -> Result<String, ArtifactRenderError> {
     let name = queries
         .symbol_to_string_at_location(symbol, enclosing)
-        .map_err(|error| format!("semantic .symbols formatting failed: {error}"))?;
-    let declarations = queries
-        .get_symbol_declarations(symbol)
-        .map_err(|error| format!("semantic .symbols declarations failed: {error}"))?;
+        .map_err(|error| {
+            ArtifactRenderError::query("semantic .symbols formatting failed", file_name, error)
+        })?;
+    let declarations = queries.get_symbol_declarations(symbol).map_err(|error| {
+        ArtifactRenderError::query("semantic .symbols declarations failed", file_name, error)
+    })?;
     let mut result = format!("Symbol({name}");
     for (index, declaration) in declarations.iter().enumerate() {
         if index == 5 {
@@ -380,10 +537,16 @@ fn render_symbol(
             break;
         }
         let source = program.source_file_by_id(declaration.file).ok_or_else(|| {
-            format!("semantic .symbols declaration has no source file: {declaration:?}")
+            ArtifactRenderError::invariant(
+                "INV.ARTIFACT.DECLARATION",
+                format!("semantic .symbols declaration has no source file: {declaration:?}"),
+            )
         })?;
         let record = program.node(*declaration).ok_or_else(|| {
-            format!("semantic .symbols declaration is foreign to its Program: {declaration:?}")
+            ArtifactRenderError::invariant(
+                "INV.ARTIFACT.DECLARATION",
+                format!("semantic .symbols declaration is foreign to its Program: {declaration:?}"),
+            )
         })?;
         let file_name = source
             .file_name
@@ -398,7 +561,12 @@ fn render_symbol(
         let position = declaration_full_start(
             &source.source_text,
             usize::try_from(record.range.start.get()).map_err(|_| {
-                format!("semantic .symbols declaration position exceeds usize: {declaration:?}")
+                ArtifactRenderError::invariant(
+                    "INV.ARTIFACT.RANGE",
+                    format!(
+                        "semantic .symbols declaration position exceeds usize: {declaration:?}"
+                    ),
+                )
             })?,
         );
         let (line, column) = ecma_line_and_utf16_column(&source.source_text, position);
@@ -867,15 +1035,16 @@ pub(super) fn declaration_name(parent: &Node) -> Option<NodeId> {
 #[cfg(test)]
 mod tests {
     use ts_ast::{NodeData, SyntaxKind};
-    use ts_compiler::Program;
+    use ts_checker::semantic::SymbolDisplayError;
+    use ts_compiler::{CanonicalArtifactQueryError, CanonicalProgramCheckFailureClass, Program};
     use ts_options::CompilerOptions;
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
     use crate::{Case, fixture_case_sensitive, virtual_harness_path, virtual_unit_path};
 
     use super::{
-        SemanticArtifactWalk, declaration_full_start, ecma_line_and_utf16_column, render_program,
-        source_files, walk_program,
+        ArtifactRenderError, SemanticArtifactWalk, declaration_full_start,
+        ecma_line_and_utf16_column, render_program, source_files, walk_program,
     };
 
     fn fixture_filesystem(case: &Case) -> MemoryFileSystem {
@@ -941,6 +1110,63 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(sections, expected);
         }
+    }
+
+    #[test]
+    fn symbol_display_errors_keep_compiler_failure_classes() {
+        let filesystem = MemoryFileSystem::new(true);
+        filesystem
+            .write_file("/project/main.ts", "const value = 1;")
+            .unwrap();
+        let (_, result) = Program::try_new_with_canonical_checker_and_queries(
+            &filesystem,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                no_emit: true,
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                let source = program.source_file("/project/main.ts").unwrap();
+                let node = source
+                    .parse
+                    .arena
+                    .iter()
+                    .find_map(|(id, record)| {
+                        matches!(&record.data, NodeData::Identifier(_))
+                            .then(|| source.node_ref(id).unwrap())
+                    })
+                    .unwrap();
+                let symbol = queries.get_symbol_at_location(node).unwrap().unwrap();
+                for (error, expected) in [
+                    (
+                        SymbolDisplayError::MissingModuleSpecifier(symbol),
+                        CanonicalProgramCheckFailureClass::Unsupported {
+                            capability_code: "T07.TYPE_DISPLAY",
+                        },
+                    ),
+                    (
+                        SymbolDisplayError::InvalidSymbol(symbol),
+                        CanonicalProgramCheckFailureClass::Fatal {
+                            invariant_code: "INV.SOURCE.TYPE_DISPLAY",
+                        },
+                    ),
+                ] {
+                    assert_eq!(
+                        ArtifactRenderError::query(
+                            "symbol display",
+                            &source.file_name,
+                            CanonicalArtifactQueryError::SymbolDisplay(error),
+                        )
+                        .class,
+                        expected,
+                    );
+                }
+            },
+        )
+        .unwrap();
+        result.expect("canonical checker ran");
     }
 
     #[test]
