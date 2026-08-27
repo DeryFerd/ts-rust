@@ -7,8 +7,8 @@ use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, TypeData,
     jsdoc::{
         JsDocCommentError, JsDocIntrinsicType, JsDocTagKind, JsDocType, JsDocTypeResolutionError,
-        leading_jsdoc_comment, parse_jsdoc_comment_at, plan_javascript_source_jsdoc,
-        resolve_intrinsic_jsdoc_type,
+        leading_jsdoc_comment, leading_jsdoc_comments, parse_jsdoc_comment_at,
+        plan_javascript_source_jsdoc, resolve_intrinsic_jsdoc_type,
     },
     signatures::SignatureFlags,
 };
@@ -248,6 +248,126 @@ fn foreign_source_nodes_are_rejected_before_reading_comments() {
         leading_jsdoc_comment(&source.arena, foreign_node),
         Err(JsDocCommentError::InvalidSourceNode(foreign_node))
     );
+}
+
+#[test]
+fn jsdoc_comment_ranges_must_contain_one_complete_block_comment() {
+    for source in [
+        "/** @type {number} */ /* plain */",
+        "/** @type {number} */ const n = 1; /* plain */",
+        "/** @type {number} */ /** @type {string} */",
+        "/** @type {number} */ // line\n/** @returns {void} */",
+    ] {
+        let range = TextRange::new(
+            TextPos::new(0),
+            TextPos::new(source.len().try_into().unwrap()),
+        );
+        assert_eq!(
+            parse_jsdoc_comment_at(source, range),
+            Err(JsDocCommentError::InvalidCommentSyntax(range)),
+            "{source}",
+        );
+        assert!(parse_jsdoc_comment_at(source, comment_range(source)).is_ok());
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Check exact comment ranges and planned ownership together.
+fn leading_jsdoc_comments_stay_within_the_current_trivia() {
+    let cases: &[(&str, &[&str])] = &[
+        ("", &[]),
+        ("/* @type {any} */", &[]),
+        ("/* @satisfies {any} */", &[]),
+        ("/* plain /** @type {any} */", &[]),
+        ("// /** @type {any} */\n", &[]),
+        ("/** @type {number} */ const n = 1; /* plain */", &[]),
+        ("/** @satisfies {number} */ const n = 1; /* plain */", &[]),
+        ("/** @type {number} */ const n = 1; // plain\n", &[]),
+        ("const n = '/** @type {any} */'; /* plain */", &[]),
+        ("const n = /[/** @type {any} */]/; /* plain */", &[]),
+        (
+            "const n = `prefix ${1} /** @type {any} */`; /* plain */",
+            &[],
+        ),
+        ("/** @type {any} */", &["/** @type {any} */"]),
+        ("/** @type {any} */ /* plain */", &["/** @type {any} */"]),
+        ("/** @type {any} */ // plain\n", &["/** @type {any} */"]),
+        (
+            "const n = 1\n/** @type {any} */ /* plain */",
+            &["/** @type {any} */"],
+        ),
+        (
+            "const n = `prefix ${1} /** ignored */`;\n/** @type {any} */",
+            &["/** @type {any} */"],
+        ),
+        (
+            "/** @typedef {number} Count */\n/** @type {any} */",
+            &["/** @typedef {number} Count */", "/** @type {any} */"],
+        ),
+        (
+            "/** @callback Callback\n * @returns {void}\n */\n/* plain */\n/** @type {Callback} */",
+            &[
+                "/** @callback Callback\n * @returns {void}\n */",
+                "/** @type {Callback} */",
+            ],
+        ),
+        (
+            "/** @returns {void} */ /* plain */ /** @satisfies {any} */ // line\n",
+            &["/** @returns {void} */", "/** @satisfies {any} */"],
+        ),
+    ];
+    for (prefix, expected) in cases {
+        let text = format!("{prefix} const f = () => {{}};");
+        let parsed = parse_javascript_source_file(&text);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{text}: {:?}",
+            parsed.diagnostics
+        );
+        let file = FileId::new(37);
+        let source = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let NodeData::SourceFile(root) = &parsed.arena.get(source.node).unwrap().data else {
+            panic!("expected source file")
+        };
+        let statement = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            *root.statements.nodes.last().unwrap(),
+        );
+        let comments = leading_jsdoc_comments(&parsed.arena, statement).unwrap();
+        assert_eq!(
+            comments
+                .iter()
+                .map(|comment| &text
+                    [comment.range().start.get() as usize..comment.range().end.get() as usize])
+                .collect::<Vec<_>>(),
+            *expected,
+            "{text}",
+        );
+        assert_eq!(
+            leading_jsdoc_comment(&parsed.arena, statement).unwrap(),
+            comments.last().cloned(),
+            "{text}",
+        );
+        let variable = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                let NodeData::VariableDeclaration(variable) = &node.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
+                    return None;
+                };
+                (name.text == "f").then_some(NodeRef::new(parsed.arena.id(), file, id))
+            })
+            .unwrap();
+        let plan = plan_javascript_source_jsdoc(&parsed.arena, source).unwrap();
+        let context = plan.declaration(variable).is_some_and(|declaration| {
+            declaration.type_().is_some() || declaration.satisfies().is_some()
+        });
+        assert_eq!(context, !expected.is_empty(), "{text}");
+    }
 }
 
 #[test]

@@ -2766,6 +2766,17 @@ fn plan_source_callable_with_owner_shape(
         && bound
             .source_facts()
             .is_some_and(CanonicalSourceFileFacts::is_javascript_file);
+    let javascript_direct_zero_parameter_arrow = record.kind == SyntaxKind::ArrowFunction
+        && view.parameters.nodes.is_empty()
+        && !view.parameters.has_trailing_comma
+        && view.return_type.is_none()
+        && type_parameters.is_empty()
+        && body_mode == SourceCallableBodyMode::Present
+        && bound
+            .source_facts()
+            .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
+        && is_direct_noncontextual_source_arrow(store, host, declaration)?
+        && !source_arrow_has_owned_jsdoc_context(store, host, declaration)?;
     let javascript_jsdoc_function_parameter = if view.family
         == SourceCallableFamily::FunctionDeclaration
         && view.parameters.nodes.len() == 1
@@ -2779,27 +2790,28 @@ fn plan_source_callable_with_owner_shape(
     } else {
         None
     };
-    let untyped_javascript_signature = bound
-        .source_facts()
-        .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
-        && (view.parameters.nodes.len() == 1 || javascript_documented_multi_arrow)
-        && type_parameters.is_empty()
-        && body_mode == SourceCallableBodyMode::Present
-        && (view.family == SourceCallableFamily::FunctionDeclaration
-            || javascript_object_implicit_any_arrow
-            || javascript_direct_implicit_any_arrow)
-        && javascript_jsdoc_function_parameter.is_none()
-        && view.parameters.nodes.iter().all(|parameter| {
-            host.node(NodeRef::new(
-                declaration.arena,
-                declaration.file,
-                *parameter,
-            ))
-            .is_some_and(|record| {
-                matches!(&record.data, NodeData::ParameterDeclaration(parameter)
+    let untyped_javascript_signature = javascript_direct_zero_parameter_arrow
+        || bound
+            .source_facts()
+            .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
+            && (view.parameters.nodes.len() == 1 || javascript_documented_multi_arrow)
+            && type_parameters.is_empty()
+            && body_mode == SourceCallableBodyMode::Present
+            && (view.family == SourceCallableFamily::FunctionDeclaration
+                || javascript_object_implicit_any_arrow
+                || javascript_direct_implicit_any_arrow)
+            && javascript_jsdoc_function_parameter.is_none()
+            && view.parameters.nodes.iter().all(|parameter| {
+                host.node(NodeRef::new(
+                    declaration.arena,
+                    declaration.file,
+                    *parameter,
+                ))
+                .is_some_and(|record| {
+                    matches!(&record.data, NodeData::ParameterDeclaration(parameter)
                         if parameter.type_.is_none())
-            })
-        });
+                })
+            });
 
     let mut parameters = Vec::with_capacity(view.parameters.nodes.len());
     let mut previous_end = view.parameters.range.start;
@@ -4482,6 +4494,36 @@ fn stored_array_sort_argument_arrow_is_exact(
             .type_node_links(property)
             .and_then(|links| links.resolved_type)
             .is_some()
+}
+
+/// Only annotations on this variable supply context to its initializer.
+fn source_arrow_has_owned_jsdoc_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> Result<bool, SourceCallableError> {
+    let invalid = || invariant(SourceCallableInvariant::InvalidSyntax(declaration));
+    let Some((arena, bound)) = host.source(declaration) else {
+        return Err(invalid());
+    };
+    let Some(SourceNodeParent::Parent(variable)) = store.source_node_parent(declaration) else {
+        return Err(invalid());
+    };
+    let variable_record = preflight_node(store, host, variable)?;
+    if variable_record.kind != SyntaxKind::VariableDeclaration
+        || !matches!(
+            &variable_record.data,
+            NodeData::VariableDeclaration(variable)
+                if variable.initializer == Some(declaration.node)
+        )
+    {
+        return Err(invalid());
+    }
+    let comments =
+        plan_javascript_source_jsdoc(arena, bound.source_file()).map_err(|_| invalid())?;
+    Ok(comments.declaration(variable).is_some_and(|declaration| {
+        declaration.type_().is_some() || declaration.satisfies().is_some()
+    }))
 }
 
 fn is_direct_noncontextual_source_arrow(
@@ -8195,6 +8237,7 @@ pub(super) fn source_callable_state(
         owner_parent: plan.owner_parent,
         export_local: plan.export_local,
         signature,
+        flags: plan.flags,
         return_provenance: plan.return_type.provenance(),
         array_targets: plan.array_targets,
         generic_return_type_parameter,
@@ -9357,6 +9400,7 @@ fn publish_prepared_contextual_source_callable(
             owner_parent: None,
             export_local: None,
             signature,
+            flags: prepared.flags,
             return_provenance: SourceCallableReturnProvenance::Inferred,
             array_targets: None,
             generic_return_type_parameter: None,
@@ -9685,6 +9729,7 @@ pub(super) fn begin_source_callable(
             owner_parent: plan.owner_parent,
             export_local: plan.export_local,
             signature,
+            flags: plan.flags,
             return_provenance: plan.return_type.provenance(),
             array_targets: plan.array_targets,
             generic_return_type_parameter: None,
@@ -10894,6 +10939,7 @@ pub(super) fn validate_stored_source_callable(
             owner_parent: provenance.owner_parent,
             export_local: provenance.export_local,
             signature: provenance.signature,
+            flags: provenance.flags,
             return_provenance: provenance.return_provenance,
             array_targets: provenance.array_targets,
             generic_return_type_parameter: provenance.generic_return_type_parameter,
@@ -10922,12 +10968,14 @@ pub(super) fn validate_stored_source_callable(
     let Some(signature_record) = store.signature(signature) else {
         return StoredSourceCallableValidation::Malformed;
     };
+    if signature_record.flags() != provenance.flags {
+        return StoredSourceCallableValidation::Malformed;
+    }
     let untyped_javascript = signature_record
         .flags()
         .contains(SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE);
-    let direct_multi_untyped_arrow = family == SourceCallableFamily::ArrowFunction
+    let direct_untyped_arrow = family == SourceCallableFamily::ArrowFunction
         && store.source_node_kind(declaration) == Some(SyntaxKind::ArrowFunction)
-        && signature_record.parameters().len() > 1
         && matches!(
             store.source_node_parent(declaration),
             Some(SourceNodeParent::Parent(variable))
@@ -10935,7 +10983,7 @@ pub(super) fn validate_stored_source_callable(
         );
     if untyped_javascript
         && (signature_record.flags() != SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
-            || signature_record.parameters().len() != 1 && !direct_multi_untyped_arrow
+            || signature_record.parameters().len() != 1 && !direct_untyped_arrow
             || !signature_record.type_parameters().is_empty()
             || signature_record.min_argument_count()
                 != i32::try_from(signature_record.parameters().len()).unwrap_or(-1)
@@ -15074,6 +15122,7 @@ mod tests {
                         owner_parent: staged.owner_parent,
                         export_local: staged.export_local,
                         signature: poison_signature,
+                        flags: SignatureFlags::NONE,
                         return_provenance: SourceCallableReturnProvenance::Annotated,
                         array_targets: None,
                         generic_return_type_parameter: staged.generic_return_type_parameter,
@@ -17402,10 +17451,24 @@ mod tests {
     }
 
     #[test]
-    fn javascript_direct_arrows_accept_parenthesized_untyped_parameters_cold_and_warm() {
-        for (index, (source, parenthesized)) in [
-            ("const callback = name => {};", false),
-            ("const callback = (name) => {};", true),
+    #[allow(clippy::too_many_lines)] // Keep planning, publication, and stale-cache checks together.
+    fn javascript_direct_arrows_publish_untyped_signatures_cold_and_warm() {
+        for (index, (source, parenthesized, parameter_count)) in [
+            ("const callback = name => {};", false, 1),
+            ("const callback = (name) => {};", true, 1),
+            ("const callback = () => {};", true, 0),
+            ("/** Documentation. */ const callback = () => {};", true, 0),
+            ("/** @returns {void} */ const callback = () => {};", true, 0),
+            (
+                "/** @type {number} */ const count = 1; const callback = () => {};",
+                true,
+                0,
+            ),
+            (
+                "/** @satisfies {number} */ const count = 1; const callback = () => {};",
+                true,
+                0,
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -17441,17 +17504,26 @@ mod tests {
             else {
                 panic!("the JavaScript fixture must retain its direct arrow")
             };
-            let parameter = fixture.parsed.arena.get(arrow.parameters.nodes[0]).unwrap();
-            if parenthesized {
-                assert!(arrow.parameters.range.start < parameter.range.start);
-                assert!(arrow.parameters.range.end > parameter.range.end);
-            } else {
-                assert_eq!(arrow.parameters.range, parameter.range);
+            if let Some(parameter) = arrow.parameters.nodes.first() {
+                let parameter = fixture.parsed.arena.get(*parameter).unwrap();
+                if parenthesized {
+                    assert!(arrow.parameters.range.start < parameter.range.start);
+                    assert!(arrow.parameters.range.end > parameter.range.end);
+                } else {
+                    assert_eq!(arrow.parameters.range, parameter.range);
+                }
             }
             assert_eq!(plan.flags, SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE,);
-            assert_eq!(plan.parameters.len(), 1);
-            assert!(plan.parameters[0].is_implicit_any());
-            assert_eq!(plan.min_argument_count, 1);
+            assert_eq!(plan.parameters.len(), parameter_count);
+            assert!(
+                plan.parameters
+                    .iter()
+                    .all(|parameter| parameter.is_implicit_any())
+            );
+            assert_eq!(
+                plan.min_argument_count,
+                i32::try_from(parameter_count).unwrap()
+            );
             assert_eq!(publication_state(&fixture.store), before);
             drop(host);
 
@@ -17482,6 +17554,27 @@ mod tests {
             );
             assert_eq!(publication_state(&fixture.store), warm);
             assert!(diagnostics.is_empty());
+
+            assert!(
+                fixture
+                    .store
+                    .set_signature_flags(signature, SignatureFlags::NONE)
+            );
+            assert_eq!(
+                validate_stored_source_callable(&fixture.store, callable),
+                StoredSourceCallableValidation::Malformed,
+            );
+            let stale = generic_transaction_state(&fixture.store);
+            assert!(
+                fixture
+                    .query_callable(declaration, owner, &mut diagnostics)
+                    .is_err()
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), stale);
+            assert_eq!(
+                fixture.store.signature(signature).unwrap().flags(),
+                SignatureFlags::NONE
+            );
         }
     }
 
@@ -20778,6 +20871,7 @@ mod tests {
                 owner_parent: None,
                 export_local: None,
                 signature,
+                flags: SignatureFlags::NONE,
                 return_provenance: SourceCallableReturnProvenance::Annotated,
                 array_targets: None,
                 generic_return_type_parameter: None,
