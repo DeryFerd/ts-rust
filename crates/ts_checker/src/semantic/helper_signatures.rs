@@ -310,11 +310,14 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        AliasTargetState, CanonicalCheckerContext, TypeNodeLinks, ValueSymbolLinks,
+        AliasTargetState, CanonicalCheckerContext, CanonicalModuleResolutionEntry,
+        CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
+        CanonicalResolvedModuleInput, TypeNodeLinks, ValueSymbolLinks,
     };
 
     const LIBRARY: FileId = FileId::new(24_000);
     const SOURCE: FileId = FileId::new(24_001);
+    const ENTRY: FileId = FileId::new(24_002);
 
     fn parsed(source: &str) -> ParseResult {
         let parsed = parse_source_file(source);
@@ -408,6 +411,68 @@ mod tests {
             matches!(source.arena.get(name_node).map(|node| &node.data), Some(NodeData::Identifier(identifier)) if identifier.text == name)
                 .then_some(node)
         }).unwrap()
+    }
+
+    fn context_with_helper_exports<'a>(
+        library: &'a ParseResult,
+        entry: &'a ParseResult,
+        helpers: &'a ParseResult,
+    ) -> CanonicalCheckerContext<'a> {
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, is_library) in [
+            (LIBRARY, library, true),
+            (SOURCE, helpers, false),
+            (ENTRY, entry, false),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/project/{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        is_library,
+                        if is_library {
+                            CanonicalModuleState::Script
+                        } else {
+                            CanonicalModuleState::External
+                        },
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let specifier = entry
+            .arena
+            .iter()
+            .find_map(|(_, node)| match &node.data {
+                NodeData::ExportDeclaration(export) => export.module_specifier,
+                _ => None,
+            })
+            .unwrap();
+        let resolution = CanonicalModuleResolutionEntry::resolved(
+            NodeRef::new(entry.arena.id(), ENTRY, specifier),
+            CanonicalResolvedModuleInput::new(
+                SOURCE,
+                CanonicalModuleResolutionMode::CommonJs,
+                CanonicalModuleResolutionMode::CommonJs,
+            ),
+        );
+        CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            vec![
+                (LIBRARY, &library.arena),
+                (SOURCE, &helpers.arena),
+                (ENTRY, &entry.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new([resolution]),
+        )
+        .unwrap()
     }
 
     fn symbol(
@@ -516,6 +581,96 @@ mod tests {
         );
         assert_eq!(counts(&context), before);
         assert_unchecked(&context);
+    }
+
+    #[test]
+    fn module_exports_aliases_and_helper_arity_compose_without_source_checks() {
+        let lib = library();
+        let helpers = parsed(concat!(
+            "declare class Unchecked { value: MissingClassType; }\n",
+            "export declare function get(a: number, b: number, c: number, d: number): MissingReturnType;\n",
+            "export declare function oldGet(a: number, b: number, c: number): void;\n",
+            "export declare const scalar: number;\n",
+            "export declare const variable: (a: number, b: number, c: number, d: number) => MissingReturnType;\n",
+        ));
+        for entry_text in [
+            "export * from './helpers';",
+            "export type * from './helpers';",
+            "export type { get, oldGet, scalar, variable } from './helpers';",
+        ] {
+            let entry = parsed(entry_text);
+            let mut context = context_with_helper_exports(&lib, &entry, &helpers);
+            let (_, bound) = context.file(ENTRY).unwrap();
+            let module = bound.symbol(bound.source_file()).unwrap();
+            for (name, expected) in [
+                ("get", true),
+                ("oldGet", false),
+                ("scalar", false),
+                ("variable", true),
+            ] {
+                let export = context
+                    .get_module_export_by_name(module, name)
+                    .unwrap()
+                    .unwrap();
+                let alias = context
+                    .store()
+                    .symbol(export)
+                    .unwrap()
+                    .flags()
+                    .contains(SymbolFlags::ALIAS);
+                let target = if alias {
+                    let resolution = context.resolve_alias(export).unwrap();
+                    assert!(resolution.events.is_empty());
+                    let AliasTargetState::Resolved(target) = resolution.target else {
+                        panic!("the helper alias must resolve to its source value")
+                    };
+                    target
+                } else {
+                    export
+                };
+                assert_eq!(target, symbol(&context, &helpers, name));
+                assert_eq!(
+                    context.has_call_signature_with_arity_greater_than(target, 3),
+                    Ok(expected),
+                    "{entry_text}: {name}"
+                );
+                let before = (
+                    counts(&context),
+                    context.store().checker_link_allocated_lengths(),
+                );
+                assert_eq!(
+                    context.get_module_export_by_name(module, name),
+                    Ok(Some(export))
+                );
+                if alias {
+                    let resolution = context.resolve_alias(export).unwrap();
+                    assert_eq!(resolution.target, AliasTargetState::Resolved(target));
+                    assert!(resolution.events.is_empty());
+                }
+                assert_eq!(
+                    context.has_call_signature_with_arity_greater_than(target, 3),
+                    Ok(expected)
+                );
+                assert_eq!(
+                    (
+                        counts(&context),
+                        context.store().checker_link_allocated_lengths()
+                    ),
+                    before
+                );
+            }
+            assert_eq!(
+                context.get_module_export_by_name(module, "absent"),
+                Ok(None)
+            );
+            assert_unchecked(&context);
+            assert!(
+                context
+                    .store()
+                    .source_file_links(context.source_file(ENTRY).unwrap())
+                    .is_none_or(|links| !links.type_checked)
+            );
+        }
     }
 
     #[test]
