@@ -10216,20 +10216,44 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(node))
         })?;
         let mut callback_host = self.host.name_resolver_host(self.store)?;
-        let resolved = CanonicalNameResolver::new(
+        let mut name_lookup = CanonicalNameResolver::new(
             arena,
             bound,
             self.store.symbol_store(),
             &mut callback_host,
-        )?
-        .resolve(
+        )?;
+        let value_meaning = SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE;
+        // Namespace imports must reach their manifest check even with invalid alias caches.
+        let mut resolved = name_lookup.resolve(
             Some(CanonicalResolutionLocation::Bound(name)),
             &identifier.text,
-            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE | SymbolFlags::ALIAS,
+            value_meaning | SymbolFlags::ALIAS,
             None,
             false,
             false,
         );
+        if let Ok(Some(candidate)) = &resolved {
+            let candidate = self
+                .store
+                .get_merged_symbol(*candidate)
+                .ok_or_else(invalid)?;
+            let candidate_record = self.store.symbol(candidate).ok_or_else(invalid)?;
+            let namespace_import = candidate_record.declarations().is_some_and(|declarations| {
+                declarations.iter().any(|declaration| {
+                    self.store.source_node_kind(*declaration) == Some(SyntaxKind::NamespaceImport)
+                })
+            });
+            if candidate_record.flags().intersects(SymbolFlags::ALIAS) && !namespace_import {
+                resolved = name_lookup.resolve(
+                    Some(CanonicalResolutionLocation::Bound(name)),
+                    &identifier.text,
+                    value_meaning,
+                    None,
+                    false,
+                    false,
+                );
+            }
+        }
         let symbol = match resolved {
             Ok(Some(symbol))
             | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(symbol)) => {
@@ -46965,6 +46989,131 @@ mod tests {
         assert_eq!(literal_state(&fixture.store), before);
         assert!(fixture.store.type_alias_links(alias).is_none());
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Compare cold and warm admission with the same real namespace provider.
+    fn namespace_type_query_rejects_nonvalue_alias_caches() {
+        use crate::semantic::{
+            AliasTargetState, CanonicalModuleResolutionEntry,
+            CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
+            CanonicalResolvedModuleInput,
+            alias::{CanonicalAliasResolutionError, CanonicalAliasTargetUnavailable},
+        };
+
+        for warm in [false, true] {
+            for unknown in [false, true] {
+                let parsed = parse_source_file(concat!(
+                    "import * as ns from './self'; interface Wrong {} ",
+                    "export type Copy = typeof ns; export const marker = 1;",
+                ));
+                assert!(parsed.diagnostics.is_empty());
+                let file = FileId::new(13_604);
+                let find = |kind| {
+                    parsed
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            (record.kind == kind).then_some(NodeRef::new(
+                                parsed.arena.id(),
+                                file,
+                                node,
+                            ))
+                        })
+                        .unwrap()
+                };
+                let import = find(SyntaxKind::ImportDeclaration);
+                let NodeData::ImportDeclaration(data) =
+                    &parsed.arena.get(import.node).unwrap().data
+                else {
+                    panic!("the control contains a namespace import")
+                };
+                let specifier = NodeRef::new(parsed.arena.id(), file, data.module_specifier);
+                let mut binder = CanonicalBinder::new();
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source("\"/self.ts\""),
+                            CanonicalSourceLanguage::TypeScript,
+                            false,
+                            CanonicalModuleState::External,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+                let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+                    binder.finish(),
+                    [(file, &parsed.arena)].into_iter().collect(),
+                    CanonicalCheckerOptions::default(),
+                    CanonicalModuleResolutionManifestInput::new([
+                        CanonicalModuleResolutionEntry::resolved(
+                            specifier,
+                            CanonicalResolvedModuleInput::new(
+                                file,
+                                CanonicalModuleResolutionMode::Esm,
+                                CanonicalModuleResolutionMode::Esm,
+                            ),
+                        ),
+                    ]),
+                )
+                .unwrap();
+                let bound = context.file(file).unwrap().1;
+                let alias = bound.symbol(find(SyntaxKind::NamespaceImport)).unwrap();
+                let unrelated = bound
+                    .symbol(find(SyntaxKind::InterfaceDeclaration))
+                    .unwrap();
+                let module = bound.symbol(bound.source_file()).unwrap();
+                let resolution = context.resolve_alias(alias).unwrap();
+                assert_eq!(resolution.target, AliasTargetState::Resolved(module));
+                assert!(resolution.events.is_empty());
+                let query = find(SyntaxKind::TypeQuery);
+                let expected = warm.then(|| context.get_type_from_type_node(query).unwrap());
+                let original = context.store().alias_symbol_links(alias).cloned().unwrap();
+                let mut changed = original.clone();
+                changed.alias_target = if unknown {
+                    AliasTargetState::Unknown
+                } else {
+                    AliasTargetState::Resolved(unrelated)
+                };
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_alias_symbol_links(alias, changed.clone())
+                );
+                let before = store_state(context.store());
+                let error = context.get_type_from_type_node(query).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::NamespaceAlias {
+                            node,
+                            error: CanonicalAliasResolutionError::TargetUnavailable {
+                                reason: CanonicalAliasTargetUnavailable::InvalidAliasLinks(invalid),
+                                ..
+                            },
+                        }) if node == query && invalid == alias
+                    ),
+                    "warm={warm}, unknown={unknown}: {error:?}",
+                );
+                assert_eq!(store_state(context.store()), before);
+                assert_eq!(context.store().alias_symbol_links(alias), Some(&changed));
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_alias_symbol_links(alias, original)
+                );
+                let recovered = context.get_type_from_type_node(query).unwrap();
+                if let Some(expected) = expected {
+                    assert_eq!(recovered, expected);
+                }
+                assert_eq!(context.get_type_from_type_node(query), Ok(recovered));
+            }
+        }
     }
 
     #[test]
