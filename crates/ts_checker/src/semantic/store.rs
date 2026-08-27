@@ -926,6 +926,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         })
     }
 
+    /// Reads original binder flags after canonical symbol merges.
+    #[must_use]
+    pub(super) fn source_symbol_flags(&self, symbol: SemanticSymbolId) -> Option<SymbolFlags> {
+        std::iter::once(symbol)
+            .chain(self.merged_symbols.keys().copied())
+            .filter(|source| self.get_merged_symbol(*source) == Some(symbol))
+            .filter_map(|source| self.source_symbol_declarations.get(&source))
+            .map(|source| source.flags.without(SymbolFlags::TRANSIENT))
+            .reduce(|left, right| left | right)
+    }
+
     /// Checks complete binder declarations and flags after canonical symbol merges.
     #[must_use]
     pub(super) fn source_merged_symbol_declarations_match(&self, symbol: SemanticSymbolId) -> bool {

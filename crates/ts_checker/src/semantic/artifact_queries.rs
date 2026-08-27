@@ -10,8 +10,8 @@ use std::collections::HashSet;
 
 use ts_ast::{FileId, Node, NodeArena, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
-    BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, InternalSymbolName,
-    SemanticSymbolId, SymbolFlags,
+    BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, EscapedNameRef,
+    InternalSymbolName, SemanticSymbolId, SymbolFlags,
 };
 use ts_jsnum::PseudoBigInt;
 
@@ -2422,9 +2422,9 @@ impl CanonicalCheckerContext<'_> {
         node: NodeRef,
     ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
         let (_, _, record) = self.validated_artifact_node(node)?;
-        if !matches!(record.data, NodeData::Identifier(_)) {
+        let NodeData::Identifier(identifier) = &record.data else {
             return Ok(None);
-        }
+        };
         let Some(parent) = record.parent else {
             return Ok(None);
         };
@@ -2443,26 +2443,55 @@ impl CanonicalCheckerContext<'_> {
         else {
             return Ok(None);
         };
-        let flags = self
+        let owner = self
             .store()
             .symbol(symbol)
-            .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?
-            .flags();
-        if !flags.intersects(SymbolFlags::CLASS | SymbolFlags::ENUM)
-            || self
-                .store()
-                .value_symbol_links(symbol)
-                .and_then(|links| links.resolved_type)
-                .is_none()
-        {
+            .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?;
+        let source_flags = self
+            .store()
+            .source_symbol_flags(symbol)
+            .unwrap_or(SymbolFlags::NONE);
+        if !(owner.flags() | source_flags).intersects(SymbolFlags::CLASS | SymbolFlags::ENUM) {
             return Ok(None);
         }
-        if !self.store().source_symbol_declarations_match(symbol)
+        if owner.name() != EscapedNameRef::source(&identifier.text)
+            || !self.store().source_symbol_declarations_match(symbol)
+            || !self.store().source_merged_symbol_declarations_match(symbol)
             || self
                 .cached_artifact_symbol(node)?
                 .is_some_and(|cached| cached != symbol)
         {
             return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
+        if self
+            .store()
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .is_none()
+        {
+            let source = self
+                .source_file(node.file)
+                .ok_or(CanonicalArtifactQueryError::MissingFile(node.file))?;
+            let untouched = self
+                .store()
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .is_none()
+                && self.cached_artifact_symbol(node)?.is_none()
+                && self.cached_artifact_type(node)?.is_none()
+                && !self
+                    .store()
+                    .source_file_links(source)
+                    .is_some_and(|links| links.type_checked);
+            // A cold declaration has no value to query. A checked class cannot fall through.
+            return if untouched {
+                Ok(None)
+            } else {
+                Err(CanonicalArtifactQueryError::MissingType {
+                    node,
+                    kind: record.kind,
+                })
+            };
         }
         let type_ = self
             .store()
@@ -2472,8 +2501,11 @@ impl CanonicalCheckerContext<'_> {
                 node,
                 kind: record.kind,
             })?;
-        if flags.intersects(SymbolFlags::CLASS) {
-            if super::declared::cached_class_type(self.store(), symbol)? != Some(type_) {
+        if source_flags.intersects(SymbolFlags::CLASS) {
+            if super::declared::cached_class_type(self.store(), symbol)? != Some(type_)
+                || super::classes::validate_class_heritage_members(self.store(), type_)
+                    != super::classes::ClassHeritageMembersValidation::Valid
+            {
                 return Err(CanonicalArtifactQueryError::InvalidType { node, type_ });
             }
         } else {
@@ -8579,6 +8611,111 @@ mod tests {
             CanonicalCheckerOptions::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the identity, corruption, and restored read together.
+    fn export_equals_class_flags_cannot_select_a_different_cache_route() {
+        let parsed = parse_source_file("declare class Value { value: number; } export = Value;");
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(149_510);
+        let mut context = export_equals_declaration_context(&parsed, file);
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::ClassDeclaration(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let owner = context.store().get_merged_symbol(owner).unwrap();
+        let exported = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ExportAssignment(export) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), file, export.expression))
+            })
+            .unwrap();
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        assert_eq!(
+            context.get_type_at_location(exported),
+            Ok(members.shells.instance_type)
+        );
+        let owner_record = context.store().symbol(owner).unwrap();
+        let flags = owner_record.flags();
+        let check_flags = owner_record.check_flags();
+        let type_links = context
+            .store()
+            .type_node_links(exported)
+            .cloned()
+            .unwrap_or_default();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            owner,
+            SymbolFlags::FUNCTION,
+            check_flags
+        ));
+        assert!(context.store_mut_for_test().set_type_node_links(
+            exported,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            (
+                [
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.declared_type_links(owner).cloned(),
+                store.value_symbol_links(owner).cloned(),
+                store.type_node_links(exported).cloned(),
+                store.symbol_node_links(exported).cloned(),
+                store.relation_state_snapshot(),
+            )
+        };
+        let before = snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(context.store().source_symbol_flags(owner), Some(flags));
+            assert!(
+                context
+                    .export_equals_declared_artifact_type(exported)
+                    .is_err()
+            );
+            assert!(context.get_type_at_location(exported).is_err());
+            assert_eq!(snapshot(&context), before);
+            assert_eq!(
+                context.store().symbol(owner).unwrap().flags(),
+                SymbolFlags::FUNCTION
+            );
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_flags(owner, flags, check_flags)
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(exported, type_links)
+        );
+        assert_eq!(
+            context.get_type_at_location(exported),
+            Ok(members.shells.instance_type)
+        );
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
