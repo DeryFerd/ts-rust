@@ -1217,7 +1217,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             .sources
             .get(resolved.target_file())
             .and_then(|target| target.bound.source_facts())
-            .is_some_and(|facts| facts.is_javascript_file())
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
         {
             return Err(
                 CanonicalAliasTargetUnavailable::JavaScriptModuleUnsupported {
