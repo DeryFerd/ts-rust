@@ -3117,7 +3117,7 @@ mod tests {
         CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
         CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, IntrinsicBootstrapOptions,
         ModuleSymbolLinks, SymbolNodeLinks, TypeData, TypeNodeLinks, ValueSymbolLinks,
-        types::ObjectFlags,
+        types::{ObjectFlags, TypeFlags},
     };
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -5429,11 +5429,7 @@ mod tests {
             };
             assert_eq!(literal.regular_type, type_);
             assert!(payload.symbol().is_none());
-            assert!(
-                !payload
-                    .flags()
-                    .contains(crate::semantic::TypeFlags::ENUM_LITERAL)
-            );
+            assert!(!payload.flags().contains(TypeFlags::ENUM_LITERAL));
             assert_eq!(context.get_symbol_at_location(node).unwrap(), None);
             let fresh = context.store().fresh_type_of_literal_type(type_).unwrap();
             assert!(context.store_mut_for_test().set_type_node_links(
