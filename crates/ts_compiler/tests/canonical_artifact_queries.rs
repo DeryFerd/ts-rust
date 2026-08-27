@@ -536,6 +536,163 @@ fn canonical_queries_preserve_cross_file_identity_and_reject_foreign_nodes() {
     assert_eq!(declarations.len(), 1);
 }
 
+fn merged_export_assignment_files() -> MemoryFileSystem {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/definition.ts",
+            concat!(
+                "export type Shape = { text: string };\n",
+                "export namespace Names { export interface Entry { count: number } }\n",
+                "export = { value: 1, label: 'ok' };\n",
+            ),
+        )
+        .unwrap();
+    filesystem
+        .write_file(
+            "/project/use.ts",
+            concat!(
+                "import api = require('./definition');\n",
+                "const n = api.value;\n",
+                "const s = api.label;\n",
+                "let first: api.Shape = { text: 'x' };\n",
+                "let second: api.Names.Entry = { count: 2 };\n",
+            ),
+        )
+        .unwrap();
+    filesystem
+}
+
+#[test]
+fn merged_export_assignment_symbols_keep_source_and_import_names() {
+    let filesystem = merged_export_assignment_files();
+    let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+        &filesystem,
+        "/project",
+        &["use.ts".to_owned()],
+        CompilerOptions {
+            module: ModuleKind::CommonJs,
+            module_resolution: ModuleResolutionKind::Node10,
+            ..canonical_options()
+        },
+        |program, queries| {
+            let mut actual = Vec::new();
+            let mut expected = Vec::new();
+            for (file, name, display) in [
+                ("/project/use.ts", "api", "api"),
+                ("/project/use.ts", "value", "value"),
+                ("/project/use.ts", "Shape", "api.Shape"),
+                ("/project/use.ts", "Names", "api.Names"),
+                ("/project/use.ts", "Entry", "api.Names.Entry"),
+                ("/project/definition.ts", "Shape", "Shape"),
+                ("/project/definition.ts", "Names", "Names"),
+                ("/project/definition.ts", "Entry", "Entry"),
+                ("/project/definition.ts", "value", "value"),
+            ] {
+                let location = identifiers(program, file, name)[0];
+                let parent = program.node(location).unwrap().parent.unwrap();
+                let parent = NodeRef::new(location.arena, location.file, parent);
+                actual.push(queries.get_symbol_at_location(location).and_then(|symbol| {
+                    symbol
+                        .map(|symbol| queries.symbol_to_string_at_location(symbol, parent))
+                        .transpose()
+                }));
+                expected.push(Ok(Some(display.to_owned())));
+            }
+            assert_eq!(actual, expected);
+        },
+    )
+    .unwrap();
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+    result.expect("canonical checker ran");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Check value, declared-type, and qualifier identities across replay.
+fn merged_export_assignment_type_queries_keep_value_and_namespace_roles() {
+    let filesystem = merged_export_assignment_files();
+    let (program, result) = Program::try_new_with_canonical_checker_and_queries(
+        &filesystem,
+        "/project",
+        &["use.ts".to_owned()],
+        CompilerOptions {
+            module: ModuleKind::CommonJs,
+            module_resolution: ModuleResolutionKind::Node10,
+            ..canonical_options()
+        },
+        |program, queries| {
+            let aliases = identifiers(program, "/project/use.ts", "api");
+            assert_eq!(aliases.len(), 5);
+            let mut actual = Vec::new();
+            for location in &aliases {
+                actual.push(
+                    queries
+                        .get_type_at_location(*location)
+                        .map(|type_| queries.type_to_string(type_).unwrap()),
+                );
+            }
+            let namespace = identifiers(program, "/project/use.ts", "Names")[0];
+            actual.push(
+                queries
+                    .get_type_at_location(namespace)
+                    .map(|type_| queries.type_to_string(type_).unwrap()),
+            );
+            assert_eq!(
+                actual,
+                [
+                    "{ value: number; label: string; }",
+                    "{ value: number; label: string; }",
+                    "{ value: number; label: string; }",
+                    "any",
+                    "any",
+                    "any",
+                ]
+                .map(|text| Ok(text.to_owned())),
+            );
+            let alias = queries.get_symbol_at_location(aliases[0]).unwrap().unwrap();
+            for reference in &aliases[1..] {
+                assert_eq!(
+                    queries.get_symbol_at_location(*reference).unwrap(),
+                    Some(alias)
+                );
+            }
+            let value = queries.get_type_at_location(aliases[0]).unwrap();
+            for reference in &aliases[1..3] {
+                assert_eq!(queries.get_type_at_location(*reference).unwrap(), value);
+            }
+            let qualifier = queries.get_type_at_location(aliases[3]).unwrap();
+            assert_ne!(value, qualifier);
+            assert_eq!(queries.get_type_at_location(namespace).unwrap(), qualifier);
+            let source = identifiers(program, "/project/definition.ts", "Shape")[0];
+            let named = identifiers(program, "/project/use.ts", "first")[0];
+            let declared = queries.get_type_at_location(source).unwrap();
+            assert_eq!(queries.get_type_at_location(named).unwrap(), declared);
+            assert_ne!(declared, value);
+            assert_ne!(declared, qualifier);
+            let diagnostics = queries.cold_diagnostic_snapshot();
+            assert_eq!(queries.replay_sources().unwrap(), diagnostics);
+            assert_eq!(queries.get_type_at_location(aliases[0]).unwrap(), value);
+            assert_eq!(queries.get_type_at_location(aliases[3]).unwrap(), qualifier);
+            assert_eq!(queries.get_type_at_location(named).unwrap(), declared);
+            assert_eq!(
+                queries.get_symbol_at_location(aliases[4]).unwrap(),
+                Some(alias)
+            );
+        },
+    )
+    .unwrap();
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+    result.expect("canonical checker ran");
+}
+
 #[test]
 fn no_check_does_not_construct_or_query_a_canonical_graph() {
     let filesystem = MemoryFileSystem::new(true);

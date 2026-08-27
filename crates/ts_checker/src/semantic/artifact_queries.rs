@@ -216,6 +216,10 @@ impl CanonicalCheckerContext<'_> {
             return self.validate_artifact_type(node, type_);
         }
 
+        if let Some(type_) = self.type_reference_qualifier_artifact_type(node)? {
+            return Ok(type_);
+        }
+
         if let Some(type_) = self.literal_annotation_artifact_type(node)? {
             return Ok(type_);
         }
@@ -805,6 +809,7 @@ impl CanonicalCheckerContext<'_> {
             });
         }
         let declaration = self.type_declaration_artifact_symbol(node)?;
+        self.type_reference_qualifier_artifact_type(node)?;
         self.preflight_literal_annotation_nodes(node)?;
         self.prepare_artifact_location(node)?;
         Ok(declaration)
@@ -1085,6 +1090,66 @@ impl CanonicalCheckerContext<'_> {
             }
         }
         Ok(Some(type_))
+    }
+
+    fn type_reference_qualifier_artifact_type(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (_, _, record) = self.validated_artifact_node(node)?;
+        if !matches!(
+            record.data,
+            NodeData::Identifier(_) | NodeData::QualifiedName(_)
+        ) {
+            return Ok(None);
+        }
+        let kind = record.kind;
+        let mut current = node;
+        let mut is_qualifier = false;
+        loop {
+            let (_, _, record) = self.validated_artifact_node(current)?;
+            let Some(parent) = record.parent else {
+                return Ok(None);
+            };
+            let parent = NodeRef::new(node.arena, node.file, parent);
+            let (_, _, record) = self.validated_artifact_node(parent)?;
+            match &record.data {
+                NodeData::QualifiedName(name)
+                    if name.left == current.node || name.right == current.node =>
+                {
+                    is_qualifier |= name.left == current.node;
+                    current = parent;
+                }
+                NodeData::TypeReferenceNode(reference)
+                    if is_qualifier && reference.type_name == current.node =>
+                {
+                    break;
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        // Pinned getTypeOfNode treats only the final name as a type node.
+        // Namespace prefixes are neither type nodes nor expressions.
+        let type_ = self
+            .store()
+            .intrinsic_bootstrap()
+            .ok_or(CanonicalArtifactQueryError::MissingType { node, kind })?
+            .error_type;
+        if self.store().type_node_links(node).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|cached| cached != type_)
+        }) {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: self
+                    .store()
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap_or(type_),
+            });
+        }
+        self.validate_artifact_type(node, type_).map(Some)
     }
 
     fn arrow_artifact_type(
@@ -1964,24 +2029,12 @@ impl CanonicalCheckerContext<'_> {
             NodeData::QualifiedName(_) => self.qualified_artifact_symbol(left)?,
             _ => None,
         };
-        let Some(mut owner) = owner else {
+        let Some(owner) = owner else {
             return Ok(None);
         };
-
-        let flags = self
-            .store()
-            .symbol(owner)
-            .map(ts_binder::semantic::Symbol::flags)
-            .ok_or(CanonicalArtifactQueryError::InvalidSymbol {
-                node,
-                symbol: owner,
-            })?;
-        if flags.contains(SymbolFlags::ALIAS) {
-            owner = match self.resolve_alias(owner)?.target {
-                AliasTargetState::Resolved(target) => self.merged_artifact_symbol(node, target)?,
-                AliasTargetState::Unknown | AliasTargetState::Unresolved => return Ok(None),
-            };
-        }
+        let Some(owner) = self.qualified_artifact_namespace(node, left, owner)? else {
+            return Ok(None);
+        };
 
         let record =
             self.store()
@@ -2019,6 +2072,60 @@ impl CanonicalCheckerContext<'_> {
             return Ok(None);
         }
         Ok(Some(symbol))
+    }
+
+    fn qualified_artifact_namespace(
+        &mut self,
+        node: NodeRef,
+        left: NodeRef,
+        mut owner: SemanticSymbolId,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
+        let flags = self
+            .store()
+            .symbol(owner)
+            .map(ts_binder::semantic::Symbol::flags)
+            .ok_or(CanonicalArtifactQueryError::InvalidSymbol {
+                node,
+                symbol: owner,
+            })?;
+        if flags.contains(SymbolFlags::ALIAS) {
+            owner = match self.resolve_alias(owner)?.target {
+                AliasTargetState::Resolved(target) => self.merged_artifact_symbol(node, target)?,
+                AliasTargetState::Unknown | AliasTargetState::Unresolved => return Ok(None),
+            };
+        }
+
+        if self
+            .store()
+            .symbol(owner)
+            .is_some_and(|record| !record.flags().intersects(SymbolFlags::NAMESPACE))
+        {
+            let mut resolver = self
+                .name_resolver_host(self.options().name_resolution)
+                .map_err(DeclaredTypeError::from)?;
+            let Some(namespace) = resolver
+                .resolve_entity_name(left, SymbolFlags::NAMESPACE)
+                .map_err(DeclaredTypeError::from)?
+            else {
+                return Ok(None);
+            };
+            if self.store().get_parent_of_symbol(owner) != Some(namespace)
+                || self
+                    .store()
+                    .symbol(namespace)
+                    .and_then(ts_binder::semantic::Symbol::exports)
+                    .and_then(|exports| self.store().symbol_table(exports))
+                    .and_then(|exports| exports.get(InternalSymbolName::ExportEquals.as_ref()))
+                    != Some(owner)
+            {
+                return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                    node,
+                    symbol: owner,
+                });
+            }
+            owner = self.merged_artifact_symbol(node, namespace)?;
+        }
+        Ok(Some(owner))
     }
 
     fn heritage_artifact_target(
@@ -2805,6 +2912,74 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    #[test]
+    fn type_reference_qualifiers_do_not_change_type_query_expressions() {
+        let parsed = parse_source_file(concat!(
+            "declare namespace Scope { interface Item {} const value: number; }\n",
+            "declare let item: Scope.Item;\n",
+            "type Value = typeof Scope.value;\n",
+        ));
+        let file = FileId::new(6_075);
+        let mut context = context(&parsed, file);
+        let names = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                matches!(&record.data, NodeData::Identifier(identifier) if identifier.text == "Scope")
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .collect::<Vec<_>>();
+        let [declaration, qualifier, expression] = names.as_slice() else {
+            panic!("expected a declaration, type-reference qualifier, and type-query expression")
+        };
+        let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+        assert_eq!(
+            context.type_reference_qualifier_artifact_type(*declaration),
+            Ok(None)
+        );
+        assert_eq!(
+            context.type_reference_qualifier_artifact_type(*qualifier),
+            Ok(Some(error))
+        );
+        assert_eq!(
+            context.type_reference_qualifier_artifact_type(*expression),
+            Ok(None)
+        );
+        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            *qualifier,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let source = context.source_file(file).unwrap();
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.store().source_file_links(source).cloned(),
+            context.diagnostics().len(),
+        );
+        assert_eq!(
+            context.get_type_at_location(*qualifier),
+            Err(CanonicalArtifactQueryError::InvalidType {
+                node: *qualifier,
+                type_: wrong
+            }),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().source_file_links(source).cloned(),
+                context.diagnostics().len(),
+            ),
+            before,
+        );
     }
 
     fn context_with_source_kind(

@@ -179,7 +179,7 @@ impl SymbolDisplayContext {
                     );
                 }
                 if let Ok(target) = result
-                    && let Some(table) = display_alias_exports(store, target)?
+                    && let Some(table) = display_alias_exports(store, host, alias, target)?
                 {
                     tables.push(table);
                 }
@@ -532,7 +532,7 @@ impl SymbolDisplayContext {
                     }
                     continue;
                 }
-                if let Some(exports) = display_alias_exports(store, imported)? {
+                if let Some(exports) = display_alias_exports(store, host, alias, imported)? {
                     let mut child = self.chain_in_table(
                         store,
                         host,
@@ -593,7 +593,13 @@ impl SymbolDisplayContext {
             let candidate = if candidate_record.flags().intersects(SymbolFlags::ALIAS)
                 && !has_declaration_kind(store, host, candidate, SyntaxKind::ExportSpecifier)?
             {
-                self.alias_target(candidate)?.exports_owner()
+                let target = self.alias_target(candidate)?.exports_owner();
+                if meaning == SymbolFlags::NAMESPACE {
+                    merged_export_assignment_namespace(store, host, candidate, target)?
+                        .unwrap_or(target)
+                } else {
+                    target
+                }
             } else {
                 candidate
             };
@@ -924,10 +930,21 @@ fn checked_alias_target(
 
 fn display_alias_exports(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    alias: SemanticSymbolId,
     target: DisplayAliasTarget,
 ) -> Result<Option<SymbolTableId>, SymbolDisplayError> {
     match target {
-        DisplayAliasTarget::Symbol(symbol) => exports(store, symbol),
+        DisplayAliasTarget::Symbol(symbol) => {
+            if let Some(table) = exports(store, symbol)? {
+                return Ok(Some(table));
+            }
+            let Some(namespace) = merged_export_assignment_namespace(store, host, alias, symbol)?
+            else {
+                return Ok(None);
+            };
+            exports(store, namespace)
+        }
         DisplayAliasTarget::Namespace(symbol) => {
             let table = store
                 .symbol(symbol)
@@ -941,6 +958,79 @@ fn display_alias_exports(
             Ok(table)
         }
     }
+}
+
+/// Reads the type-export namespace without changing an import's value target.
+fn merged_export_assignment_namespace(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    alias: SemanticSymbolId,
+    target: SemanticSymbolId,
+) -> Result<Option<SemanticSymbolId>, SymbolDisplayError> {
+    let invalid = || SymbolDisplayError::InvalidSymbol(alias);
+    let target_record = store.symbol(target).ok_or_else(invalid)?;
+    if target_record.name() != InternalSymbolName::ExportEquals.as_ref()
+        || target_record.flags() != SymbolFlags::PROPERTY
+            && target_record.flags() != SymbolFlags::PROPERTY | SymbolFlags::NAMESPACE_MODULE
+    {
+        return Ok(None);
+    }
+    let alias_record = store.symbol(alias).ok_or_else(invalid)?;
+    let Some([declaration]) = alias_record.declarations() else {
+        return Ok(None);
+    };
+    let Some(NodeData::ImportEqualsDeclaration(import)) =
+        host.node(*declaration).map(|record| &record.data)
+    else {
+        return Ok(None);
+    };
+    if alias_record.flags() != SymbolFlags::ALIAS
+        || store.get_merged_symbol(alias) != Some(alias)
+        || !host.symbol_matches(store, *declaration, alias)
+    {
+        return Err(invalid());
+    }
+    let reference = NodeRef::new(declaration.arena, declaration.file, import.module_reference);
+    if !matches!(
+        host.node(reference).map(|record| &record.data),
+        Some(NodeData::ExternalModuleReference(_))
+    ) {
+        return Ok(None);
+    }
+    let name = NodeRef::new(declaration.arena, declaration.file, import.name);
+    let mut resolver = host.name_resolver_host(store).map_err(|_| invalid())?;
+    let Some(namespace) = resolver
+        .resolve_entity_name(name, SymbolFlags::NAMESPACE)
+        .map_err(|_| invalid())?
+    else {
+        return Ok(None);
+    };
+    if store.get_parent_of_symbol(target) != Some(namespace) {
+        return Ok(None);
+    }
+    validate_symbol(store, host, namespace)?;
+    let Some(table) = exports(store, namespace)? else {
+        return Ok(None);
+    };
+    let members = store
+        .symbol_table(table)
+        .ok_or(SymbolDisplayError::InvalidTable(table))?;
+    if members.get(InternalSymbolName::ExportEquals.as_ref()) != Some(target)
+        || members.iter().any(|(name, member)| {
+            if name == InternalSymbolName::ExportEquals.as_ref() {
+                return member != target;
+            }
+            store.symbol(member).is_none_or(|record| {
+                !record
+                    .flags()
+                    .intersects(SymbolFlags::TYPE | SymbolFlags::NAMESPACE)
+                    || record.flags().intersects(SymbolFlags::ASSIGNMENT)
+            })
+        })
+    {
+        return Ok(None);
+    }
+    Ok(Some(namespace))
 }
 
 fn same_reference(
@@ -1061,13 +1151,60 @@ fn validate_symbol(
     let canonical = store
         .get_merged_symbol(symbol)
         .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
-    for declaration in record.declarations().unwrap_or_default() {
-        if host.node(*declaration).is_none() || !host.symbol_matches(store, *declaration, canonical)
-        {
-            return Err(SymbolDisplayError::InvalidSymbol(symbol));
-        }
+    if record
+        .declarations()
+        .unwrap_or_default()
+        .iter()
+        .all(|declaration| {
+            host.node(*declaration).is_some() && host.symbol_matches(store, *declaration, canonical)
+        })
+        || object_literal_property_source(store, host, symbol).is_some()
+    {
+        Ok(())
+    } else {
+        Err(SymbolDisplayError::InvalidSymbol(symbol))
     }
-    Ok(())
+}
+
+/// Object-literal value members retain the binder property through their target link.
+fn object_literal_property_source(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Option<SemanticSymbolId> {
+    let record = store.symbol(symbol)?;
+    let [declaration] = record.declarations()? else {
+        return None;
+    };
+    let declaration_record = host.node(*declaration)?;
+    let owner = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        declaration_record.parent?,
+    );
+    if store.source_node_kind(owner) != Some(SyntaxKind::ObjectLiteralExpression)
+        || !record
+            .flags()
+            .contains(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+    {
+        return None;
+    }
+    let plan = super::object_members::plan_object_literal(store, host, owner).ok()?;
+    let state = super::object_members::object_literal_state(store, &plan).ok()??;
+    if !state.is_resolved() {
+        return None;
+    }
+    let members = store.type_payload(state.type_id())?.data().structured()?;
+    if !members.properties.as_ref()?.contains(&symbol)
+        || store.symbol_table(members.members?)?.get(record.name()) != Some(symbol)
+    {
+        return None;
+    }
+    let target = store.value_symbol_links(symbol)?.target?;
+    plan.properties
+        .iter()
+        .any(|property| property.symbol == target && property.declaration == *declaration)
+        .then_some(target)
 }
 
 fn validated_parent(
@@ -1085,6 +1222,7 @@ fn validated_parent(
     let owner = store
         .symbol(parent)
         .ok_or(SymbolDisplayError::InvalidSymbol(parent))?;
+    let source = object_literal_property_source(store, host, symbol).unwrap_or(symbol);
     let member = [owner.members(), owner.exports()]
         .into_iter()
         .flatten()
@@ -1092,7 +1230,7 @@ fn validated_parent(
             store
                 .symbol_table(table)
                 .and_then(|table| table.get(record.name()))
-                .is_some_and(|candidate| same_reference(store, candidate, symbol).unwrap_or(false))
+                .is_some_and(|candidate| same_reference(store, candidate, source).unwrap_or(false))
         });
     if !member {
         return Err(SymbolDisplayError::InvalidSymbol(symbol));
@@ -1332,6 +1470,117 @@ mod tests {
                 .name()
                 .as_utf8(),
             Some("Shape")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the clone's valid, changed, and restored states together.
+    fn export_assignment_artifact_property_clones_retain_display_ownership() {
+        let parsed = parse_source_file("export = { first: 1, second: 2 };");
+        let file = FileId::new(41_020);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/export.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        let object = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let type_ = context.get_type_at_location(object).unwrap();
+        let members = context
+            .store()
+            .type_payload(type_)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .members
+            .unwrap();
+        let [first, second] = ["first", "second"].map(|name| {
+            context
+                .store()
+                .symbol_table(members)
+                .unwrap()
+                .get_source(name)
+                .unwrap()
+        });
+        let original = context.store().value_symbol_links(first).unwrap().clone();
+        let source = original.target.unwrap();
+        assert_ne!(source, first);
+        assert_eq!(
+            context.get_symbol_declarations(first).unwrap(),
+            context.get_symbol_declarations(source).unwrap(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                context.symbol_to_string_at_location(first, object).unwrap(),
+                "first",
+            );
+        }
+        let other_source = context.store().value_symbol_links(second).unwrap().target;
+        let mut changed = original.clone();
+        changed.target = other_source;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(first, changed)
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                context.symbol_to_string_at_location(first, object),
+                Err(crate::semantic::CanonicalArtifactQueryError::SymbolDisplay(
+                    SymbolDisplayError::InvalidSymbol(symbol)
+                )) if symbol == first
+            ));
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(first, original)
+        );
+        assert_eq!(
+            context.symbol_to_string_at_location(first, object).unwrap(),
+            "first",
         );
     }
 
