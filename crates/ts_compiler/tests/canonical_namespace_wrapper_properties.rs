@@ -1,5 +1,5 @@
 use ts_ast::{NodeData, NodeRef};
-use ts_compiler::Program;
+use ts_compiler::{CanonicalTypeFormatFlags, Program};
 use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind};
 use ts_vfs::{FileSystem, MemoryFileSystem};
 
@@ -82,16 +82,43 @@ fn nodenext_namespace_wrapper_properties_retain_public_types_and_symbols() {
             assert_ne!(default, value);
             assert!(queries.get_symbol_declarations(default).unwrap().is_empty());
             let before = [direct, nested, bare, copied, commonjs_direct].map(|node| {
+                let type_ = queries.get_type_at_location(node).unwrap();
+                let expected = if node == bare {
+                    "typeof import(\"./producer.cjs\")"
+                } else if node == copied {
+                    "typeof ns"
+                } else {
+                    "number"
+                };
+                let display = queries
+                    .type_to_string_at_location_with_flags(
+                        type_,
+                        node,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION,
+                    )
+                    .unwrap();
+                assert_eq!(display, expected);
                 (
                     node,
-                    queries.get_type_at_location(node).unwrap(),
+                    type_,
                     queries.get_symbol_at_location(node).unwrap(),
+                    display,
                 )
             });
             assert!(queries.replay_sources().unwrap().is_empty());
-            for (node, type_, symbol) in before {
+            for (node, type_, symbol, display) in before {
                 assert_eq!(queries.get_type_at_location(node), Ok(type_));
                 assert_eq!(queries.get_symbol_at_location(node), Ok(symbol));
+                assert_eq!(
+                    queries
+                        .type_to_string_at_location_with_flags(
+                            type_,
+                            node,
+                            CanonicalTypeFormatFlags::NO_TRUNCATION,
+                        )
+                        .unwrap(),
+                    display,
+                );
             }
         },
     )
