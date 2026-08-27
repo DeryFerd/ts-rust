@@ -16488,6 +16488,67 @@ mod tests {
     }
 
     #[test]
+    fn canonical_private_helpers_reject_callable_variables_and_type_only_aliases() {
+        for (declarations, helper_file) in [
+            (
+                concat!(
+                    "export declare const __classPrivateFieldGet: (a: unknown, b: unknown, c: unknown, d: unknown) => unknown;\n",
+                    "export declare const __classPrivateFieldSet: (a: unknown, b: unknown, c: unknown, d: unknown, e: unknown) => unknown;\n",
+                ),
+                None,
+            ),
+            (
+                "export type { get as __classPrivateFieldGet, set as __classPrivateFieldSet } from './helpers';",
+                Some(concat!(
+                    "export declare const get: (a: unknown, b: unknown, c: unknown, d: unknown) => unknown;\n",
+                    "export declare const set: (a: unknown, b: unknown, c: unknown, d: unknown, e: unknown) => unknown;\n",
+                )),
+            ),
+        ] {
+            let additional =
+                helper_file.map(|text| ("/project/node_modules/tslib/helpers.d.ts", text));
+            let program = private_helper_composition_program(
+                PRIVATE_HELPER_COMPOUND_SOURCE,
+                declarations,
+                additional.as_slice(),
+            );
+            let source = program.source_file("/project/input.ts").unwrap();
+            let mut context = private_write_helper_context(&program);
+            for _ in 0..2 {
+                let mut diagnostics = Vec::new();
+                program
+                    .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
+                    .unwrap_or_else(|error| panic!("{declarations}: {error:?}"));
+                let sorted = program.canonical_diagnostic_snapshot(&diagnostics);
+                assert_eq!(sorted.len(), 2, "{declarations}: {sorted:?}");
+                for (diagnostic, (helper, arity)) in sorted
+                    .iter()
+                    .zip([("__classPrivateFieldGet", 4), ("__classPrivateFieldSet", 5)])
+                {
+                    assert_eq!(diagnostic.code, Some(2807));
+                    assert_eq!(diagnostic.file_name.as_deref(), Some("/project/input.ts"));
+                    assert_eq!(
+                        diagnostic.range,
+                        Some(TextRange::new(TextPos::new(33), TextPos::new(44)))
+                    );
+                    assert_eq!(
+                        diagnostic.message,
+                        format!(
+                            concat!(
+                                "This syntax requires an imported helper named '{0}' with {1} ",
+                                "parameters, which is not compatible with the one in 'tslib'. ",
+                                "Consider upgrading your version of 'tslib'.",
+                            ),
+                            helper, arity,
+                        )
+                    );
+                }
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
     fn canonical_private_helpers_preserve_provider_failures_atomically() {
         for declarations in [
             "export * from './missing';",
