@@ -2,7 +2,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{PoisonError, RwLock},
+    io,
+    sync::{Arc, PoisonError, RwLock},
 };
 
 use serde_json::Value;
@@ -108,6 +109,145 @@ pub struct ResolutionResult {
     /// The import or require condition selected for this resolution attempt.
     /// A synthetic default result has no observed mode.
     pub effective_mode: Option<ModuleFormat>,
+    /// Inputs from the worker that produced this result. Cache hits reuse this
+    /// evidence without accessing the filesystem. A synthetic result has none.
+    pub package_json_inputs: Option<PackageJsonInputs>,
+}
+
+/// Bounds retained package JSON events and UTF-8 string bytes per worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackageJsonInputLimits {
+    pub max_events: usize,
+    pub max_string_bytes: usize,
+}
+
+impl Default for PackageJsonInputLimits {
+    fn default() -> Self {
+        Self {
+            max_events: 256,
+            max_string_bytes: 256 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackageJsonInputPurpose {
+    DefaultMode,
+    PackageResolution,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageJsonInputReadError {
+    pub kind: io::ErrorKind,
+    pub message: String,
+}
+
+/// One existing package metadata access, in worker execution order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PackageJsonInputEvent {
+    FileExists {
+        path: String,
+        exists: bool,
+    },
+    /// Success retains the exact VFS text passed to package JSON parsing.
+    ReadFile {
+        path: String,
+        purpose: PackageJsonInputPurpose,
+        result: Result<String, PackageJsonInputReadError>,
+    },
+}
+
+/// An ordered prefix of one worker's package metadata accesses, without deduplication.
+///
+/// Repeated reads remain separate. Once a limit is reached, all later events
+/// are counted as omitted. Cache clones share the retained event storage.
+/// This excludes `file_module_facts` and automatic type directive discovery.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PackageJsonInputs {
+    pub events: Arc<[PackageJsonInputEvent]>,
+    pub omitted_events: usize,
+}
+
+impl PackageJsonInputs {
+    /// Whether all worker package JSON events were retained. This does not
+    /// prove full package identity, peer context, or complete graph evidence.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.omitted_events == 0
+    }
+}
+
+struct PackageJsonInputRecorder {
+    limits: PackageJsonInputLimits,
+    string_bytes: usize,
+    events: Vec<PackageJsonInputEvent>,
+    omitted_events: usize,
+}
+
+impl PackageJsonInputRecorder {
+    fn new(limits: PackageJsonInputLimits) -> Self {
+        Self {
+            limits,
+            string_bytes: 0,
+            events: Vec::new(),
+            omitted_events: 0,
+        }
+    }
+
+    fn finish(self) -> PackageJsonInputs {
+        PackageJsonInputs {
+            events: self.events.into(),
+            omitted_events: self.omitted_events,
+        }
+    }
+
+    fn retain(
+        &mut self,
+        string_bytes: Option<usize>,
+        event: impl FnOnce() -> PackageJsonInputEvent,
+    ) {
+        let total = string_bytes.and_then(|bytes| self.string_bytes.checked_add(bytes));
+        if self.omitted_events != 0
+            || self.events.len() >= self.limits.max_events
+            || total.is_none_or(|bytes| bytes > self.limits.max_string_bytes)
+        {
+            self.omitted_events = self.omitted_events.saturating_add(1);
+            return;
+        }
+        self.string_bytes = total.expect("the retained string bytes fit the limit");
+        self.events.push(event());
+    }
+
+    fn file_exists(&mut self, path: &str, exists: bool) {
+        self.retain(Some(path.len()), || PackageJsonInputEvent::FileExists {
+            path: path.to_owned(),
+            exists,
+        });
+    }
+
+    fn read_text(&mut self, path: &str, purpose: PackageJsonInputPurpose, contents: &str) {
+        self.retain(path.len().checked_add(contents.len()), || {
+            PackageJsonInputEvent::ReadFile {
+                path: path.to_owned(),
+                purpose,
+                result: Ok(contents.to_owned()),
+            }
+        });
+    }
+
+    fn read_error(&mut self, path: &str, purpose: PackageJsonInputPurpose, error: &io::Error) {
+        let message = error.to_string();
+        self.retain(path.len().checked_add(message.len()), || {
+            PackageJsonInputEvent::ReadFile {
+                path: path.to_owned(),
+                purpose,
+                result: Err(PackageJsonInputReadError {
+                    kind: error.kind(),
+                    message,
+                }),
+            }
+        });
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -127,15 +267,32 @@ type ResolutionCacheKey = (String, String, Option<ModuleFormat>);
 pub struct Resolver<'a, F: FileSystem + ?Sized> {
     file_system: &'a F,
     options: ResolutionOptions,
+    package_json_input_limits: PackageJsonInputLimits,
     cache: RwLock<BTreeMap<ResolutionCacheKey, ResolutionResult>>,
 }
 
 impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
     #[must_use]
     pub fn new(file_system: &'a F, options: ResolutionOptions) -> Self {
+        Self::new_with_package_json_input_limits(
+            file_system,
+            options,
+            PackageJsonInputLimits::default(),
+        )
+    }
+
+    /// Sets one input observation limit for each uncached resolver operation.
+    /// Limits change retained evidence, not resolution decisions or cache keys.
+    #[must_use]
+    pub fn new_with_package_json_input_limits(
+        file_system: &'a F,
+        options: ResolutionOptions,
+        limits: PackageJsonInputLimits,
+    ) -> Self {
         Self {
             file_system,
             options,
+            package_json_input_limits: limits,
             cache: RwLock::new(BTreeMap::new()),
         }
     }
@@ -241,6 +398,7 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         let mut state = ResolutionState {
             resolver: self,
             failed_lookups: Vec::new(),
+            package_json_inputs: PackageJsonInputRecorder::new(self.package_json_input_limits),
             import_condition: false,
             extension_priority: ExtensionPriority::All,
             specifier_uses_ts_extension: is_typescript_extension(specifier),
@@ -288,6 +446,7 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             } else {
                 ModuleFormat::CommonJs
             }),
+            package_json_inputs: Some(state.package_json_inputs.finish()),
         };
         self.cache
             .write()
@@ -303,6 +462,7 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         let mut state = ResolutionState {
             resolver: self,
             failed_lookups: Vec::new(),
+            package_json_inputs: PackageJsonInputRecorder::new(self.package_json_input_limits),
             import_condition: false,
             extension_priority: ExtensionPriority::Types,
             specifier_uses_ts_extension: is_typescript_extension(name),
@@ -322,6 +482,7 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             } else {
                 ModuleFormat::CommonJs
             }),
+            package_json_inputs: Some(state.package_json_inputs.finish()),
         }
     }
 
@@ -336,6 +497,7 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
 struct ResolutionState<'a, 'fs, F: FileSystem + ?Sized> {
     resolver: &'a Resolver<'fs, F>,
     failed_lookups: Vec<FailedLookup>,
+    package_json_inputs: PackageJsonInputRecorder,
     import_condition: bool,
     extension_priority: ExtensionPriority,
     specifier_uses_ts_extension: bool,
@@ -369,7 +531,7 @@ struct PackageMapMatch<'a> {
 }
 
 impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
-    fn use_import_condition(&self, containing_file: &str) -> bool {
+    fn use_import_condition(&mut self, containing_file: &str) -> bool {
         match self.resolver.options.mode {
             ResolutionMode::Bundler => true,
             ResolutionMode::Node16 | ResolutionMode::NodeNext => {
@@ -382,11 +544,11 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                     .into_iter()
                     .find_map(|directory| {
                         let package_json = join(&directory, "package.json");
-                        self.resolver
-                            .file_system
-                            .read_file(&package_json)
-                            .ok()
-                            .and_then(|contents| parse_package_json(&contents).ok())
+                        self.read_package_json_contents(
+                            &package_json,
+                            PackageJsonInputPurpose::DefaultMode,
+                        )
+                        .and_then(|contents| parse_package_json(&contents).ok())
                     })
                     .is_some_and(|package| package.package_type.as_deref() == Some("module"))
             }
@@ -505,9 +667,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
             .into_iter()
             .find_map(|directory| {
                 let package_json = join(&directory, "package.json");
-                self.resolver
-                    .file_system
-                    .file_exists(&package_json)
+                self.package_json_exists(&package_json)
                     .then_some((directory, package_json))
             })
             .and_then(|(directory, package_json)| {
@@ -639,7 +799,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         if !rest.is_empty() {
             let nested_directory = join(&package_directory, rest);
             let nested_package_json = join(&nested_directory, "package.json");
-            if self.resolver.file_system.file_exists(&nested_package_json)
+            if self.package_json_exists(&nested_package_json)
                 && !self.package_exports_apply(&package_directory)
                 && let Some(resolved) = self.resolve_candidate(&nested_directory, true)
             {
@@ -669,7 +829,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         rest: &str,
     ) -> PackageMetadataResolution {
         let package_json_path = join(package_directory, "package.json");
-        if !self.resolver.file_system.file_exists(&package_json_path) {
+        if !self.package_json_exists(&package_json_path) {
             return PackageMetadataResolution::NotApplicable;
         }
         let Some(package) = self.read_package_json(&package_json_path) else {
@@ -1079,12 +1239,36 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
     }
 
     fn read_package_json(&mut self, path: &str) -> Option<PackageJson> {
-        if !self.resolver.file_system.file_exists(path) {
+        if !self.package_json_exists(path) {
             self.failed(FailedLookupKind::PackageJson, path);
             return None;
         }
-        let contents = self.resolver.file_system.read_file(path).ok()?;
+        let contents =
+            self.read_package_json_contents(path, PackageJsonInputPurpose::PackageResolution)?;
         parse_package_json(&contents).ok()
+    }
+
+    fn package_json_exists(&mut self, path: &str) -> bool {
+        let exists = self.resolver.file_system.file_exists(path);
+        self.package_json_inputs.file_exists(path, exists);
+        exists
+    }
+
+    fn read_package_json_contents(
+        &mut self,
+        path: &str,
+        purpose: PackageJsonInputPurpose,
+    ) -> Option<String> {
+        match self.resolver.file_system.read_file(path) {
+            Ok(contents) => {
+                self.package_json_inputs.read_text(path, purpose, &contents);
+                Some(contents)
+            }
+            Err(error) => {
+                self.package_json_inputs.read_error(path, purpose, &error);
+                None
+            }
+        }
     }
 
     fn failed(&mut self, kind: FailedLookupKind, path: &str) {
