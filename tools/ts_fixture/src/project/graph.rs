@@ -389,6 +389,7 @@ fn manifest_failure(
         | CanonicalProgramCheckError::DeclarationBind { .. }
         | CanonicalProgramCheckError::Context(_)
         | CanonicalProgramCheckError::SourceCheck { .. }
+        | CanonicalProgramCheckError::ImportHelper { .. }
         | CanonicalProgramCheckError::MissingBoundFile { .. }
         | CanonicalProgramCheckError::InvalidDiagnosticNode(_)
         | CanonicalProgramCheckError::InvalidDiagnosticRange { .. }
@@ -772,6 +773,60 @@ mod tests {
                 expected["targetFile"] = json!(target);
             }
             assert_eq!(serde_json::from_str::<Value>(detail).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn manifest_import_helper_errors_remain_unexpected_failures() {
+        use ts_ast::NodeRef;
+        use ts_checker::semantic::{
+            CanonicalModuleExportQueryError, alias::CanonicalAliasTargetUnavailable,
+        };
+        use ts_compiler::{CanonicalImportHelperError, CanonicalProgramCheckError};
+
+        let filesystem = MemoryFileSystem::new(true);
+        filesystem
+            .write_file("/project/main.ts", "export {};")
+            .unwrap();
+        let program = Program::new_with_options(
+            &filesystem,
+            "/project",
+            &["main.ts".to_owned()],
+            graph_options(),
+        );
+        let source = &program.source_files()[0];
+        let node = NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file);
+        for (helper, compiler_code) in [
+            (
+                CanonicalImportHelperError::ModuleSymbolUnavailable {
+                    file_name: "/project/node_modules/tslib/index.d.ts".to_owned(),
+                },
+                "M00.IMPORT_HELPER_MODULE",
+            ),
+            (
+                CanonicalImportHelperError::Export(CanonicalModuleExportQueryError::Target(
+                    CanonicalAliasTargetUnavailable::MalformedDeclaration(node),
+                )),
+                "INV.PROGRAM.IMPORT_HELPER",
+            ),
+        ] {
+            let error = CanonicalProgramCheckError::ImportHelper {
+                file_name: source.file_name.clone(),
+                node,
+                error: Box::new(helper),
+            };
+            assert_eq!(error.failure_class().code(), compiler_code);
+            assert_eq!(
+                super::manifest_failure(&program, &error),
+                ProjectStage::Invariant {
+                    code: "INV.PROJECT.MANIFEST_FAILURE_KIND".to_owned(),
+                    detail: json!({
+                        "kind": "unhandled_manifest_failure",
+                        "compilerFailureCode": compiler_code,
+                    })
+                    .to_string(),
+                },
+            );
         }
     }
 
