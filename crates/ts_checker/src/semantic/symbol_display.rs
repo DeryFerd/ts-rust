@@ -1173,7 +1173,7 @@ fn validate_symbol(
     }
 }
 
-/// Proves an object-literal clone through its original binder property.
+/// Proves an object-literal clone against the source retained at publication.
 fn object_literal_property_source(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1182,31 +1182,32 @@ fn object_literal_property_source(
     let record = store
         .symbol(symbol)
         .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
-    let Some(owner) = record
-        .declarations()
-        .unwrap_or_default()
-        .iter()
-        .find_map(|declaration| {
-            // Raw binder identity does not change with flags or merge redirects.
-            if host.bound_file(*declaration)?.symbol(*declaration)? == symbol {
-                return None;
-            }
-            let owner = NodeRef::new(
-                declaration.arena,
-                declaration.file,
-                host.node(*declaration)?.parent?,
-            );
-            (store.source_node_kind(owner) == Some(SyntaxKind::ObjectLiteralExpression))
-                .then_some(owner)
-        })
-    else {
-        return Ok(None);
+    let Some(origin) = store.object_literal_property_clone_origin(symbol) else {
+        let object_declaration =
+            record
+                .declarations()
+                .unwrap_or_default()
+                .iter()
+                .find_map(|declaration| {
+                    if host.bound_file(*declaration)?.symbol(*declaration)? == symbol {
+                        return None;
+                    }
+                    let owner = NodeRef::new(
+                        declaration.arena,
+                        declaration.file,
+                        host.node(*declaration)?.parent?,
+                    );
+                    (store.source_node_kind(owner) == Some(SyntaxKind::ObjectLiteralExpression))
+                        .then_some(owner)
+                });
+        return if object_declaration.is_some() {
+            Err(SymbolDisplayError::InvalidSymbol(symbol))
+        } else {
+            Ok(None)
+        };
     };
     let source = (|| {
-        let [declaration] = record.declarations()? else {
-            return None;
-        };
-        let plan = super::object_members::plan_object_literal(store, host, owner).ok()?;
+        let plan = super::object_members::plan_object_literal(store, host, origin.owner()).ok()?;
         let state = super::object_members::object_literal_state(store, &plan).ok()??;
         if !state.is_resolved() {
             return None;
@@ -1218,10 +1219,12 @@ fn object_literal_property_source(
             return None;
         }
         let target = store.value_symbol_links(symbol)?.target?;
-        plan.properties
-            .iter()
-            .any(|property| property.symbol == target && property.declaration == *declaration)
-            .then_some(target)
+        (target == origin.source()
+            && plan
+                .properties
+                .iter()
+                .any(|property| property.symbol == origin.source()))
+        .then_some(origin.source())
     })();
     source
         .map(Some)
@@ -1553,6 +1556,13 @@ mod tests {
             });
             let original = context.store().value_symbol_links(first).unwrap().clone();
             let source = original.target.unwrap();
+            let origin = *context
+                .store()
+                .object_literal_property_clone_origin(first)
+                .unwrap();
+            assert_eq!(origin.symbol(), first);
+            assert_eq!(origin.source(), source);
+            assert_eq!(origin.owner(), object);
             assert_ne!(source, first);
             assert_eq!(
                 context.get_symbol_declarations(first).unwrap(),
@@ -1620,32 +1630,47 @@ mod tests {
                     .record_merged_symbol(target, redirected),
                 Ok(None),
             );
-            for flags in [
-                SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
-                SymbolFlags::PROPERTY,
-            ] {
-                assert!(context.store_mut_for_test().set_symbol_flags(
+            let declaration = context.get_symbol_declarations(first).unwrap()[0];
+            for clear_declarations in [false, true] {
+                assert!(context.store_mut_for_test().set_symbol_declarations(
                     first,
-                    flags,
-                    ts_binder::CheckFlags::NONE,
+                    (!clear_declarations).then(|| vec![declaration]),
+                    (!clear_declarations).then_some(declaration),
                 ));
-                for queried in [first, source] {
-                    for _ in 0..2 {
-                        let result = context.symbol_to_string_at_location(queried, object);
-                        if queried == source && !redirect_to_clone {
-                            assert_eq!(result.unwrap(), "first");
-                        } else {
-                            assert!(
-                                matches!(
-                                    &result,
-                                    Err(crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
-                                        SymbolDisplayError::InvalidSymbol(symbol)
-                                    )) if *symbol == first
-                                ),
-                                "unexpected display result: {result:?}"
-                            );
+                for flags in [
+                    SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+                    SymbolFlags::PROPERTY,
+                ] {
+                    assert!(context.store_mut_for_test().set_symbol_flags(
+                        first,
+                        flags,
+                        ts_binder::CheckFlags::NONE,
+                    ));
+                    let poisoned_symbol = context.store().symbol(first).unwrap().clone();
+                    let poisoned_links = context.store().value_symbol_links(first).unwrap().clone();
+                    for queried in [first, source] {
+                        for _ in 0..2 {
+                            let result = context.symbol_to_string_at_location(queried, object);
+                            if queried == source && !redirect_to_clone {
+                                assert_eq!(result.unwrap(), "first");
+                            } else {
+                                assert!(
+                                    matches!(
+                                        &result,
+                                        Err(crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
+                                            SymbolDisplayError::InvalidSymbol(symbol)
+                                        )) if *symbol == first
+                                    ),
+                                    "unexpected display result: {result:?}"
+                                );
+                            }
                         }
                     }
+                    assert_eq!(context.store().symbol(first), Some(&poisoned_symbol));
+                    assert_eq!(
+                        context.store().value_symbol_links(first),
+                        Some(&poisoned_links)
+                    );
                 }
             }
             assert_eq!(
@@ -1656,11 +1681,15 @@ mod tests {
                 ),
                 before,
             );
+            assert_eq!(
+                context.store().object_literal_property_clone_origin(first),
+                Some(&origin)
+            );
         }
     }
 
     #[test]
-    fn location_display_accepts_merged_source_properties() {
+    fn location_display_accepts_merged_source_and_synthetic_properties() {
         let first = parse_source_file("interface Shape { value: number; }");
         let second = parse_source_file("interface Shape { value: number; }");
         let files = [
@@ -1719,6 +1748,29 @@ mod tests {
                     .symbol_to_string_at_location(property, enclosing)
                     .unwrap(),
                 "Shape.value",
+            );
+        }
+        let synthetic = context.store_mut_for_test().alloc_transient_symbol(
+            SymbolFlags::PROPERTY,
+            EscapedName::source("synthetic"),
+            ts_binder::CheckFlags::NONE,
+        );
+        assert_eq!(
+            context.store().symbol(synthetic).unwrap().declarations(),
+            None
+        );
+        assert!(
+            context
+                .store()
+                .object_literal_property_clone_origin(synthetic)
+                .is_none()
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .symbol_to_string_at_location(synthetic, enclosing)
+                    .unwrap(),
+                "synthetic",
             );
         }
     }

@@ -1805,6 +1805,28 @@ pub(super) struct PlannedProperty {
     pub name: String,
 }
 
+/// The source chosen when this provider publishes an object-literal property clone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ObjectLiteralPropertyCloneOrigin {
+    symbol: SemanticSymbolId,
+    owner: NodeRef,
+    source: SemanticSymbolId,
+}
+
+impl ObjectLiteralPropertyCloneOrigin {
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.symbol
+    }
+
+    pub(super) const fn owner(&self) -> NodeRef {
+        self.owner
+    }
+
+    pub(super) const fn source(&self) -> SemanticSymbolId {
+        self.source
+    }
+}
+
 /// One unbound object spread and its position among source-owned properties.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PlannedObjectSpread {
@@ -17511,6 +17533,7 @@ pub(super) fn publish_object_literal(
     if !store.try_reserve_types(1)
         || !store.try_reserve_checker_symbol_allocations(plan.properties.len(), 1)
         || !store.try_reserve_value_symbol_links(plan.properties.len())
+        || !store.try_reserve_object_literal_property_clone_origins(plan.properties.len())
         || !store
             .try_reserve_type_node_links(usize::from(store.type_node_links(plan.node).is_none()))
     {
@@ -17537,6 +17560,13 @@ pub(super) fn publish_object_literal(
             store.insert_symbol(members, EscapedName::source(&property.name), cloned),
             Some(None)
         );
+        assert!(store.record_object_literal_property_clone_origin(
+            ObjectLiteralPropertyCloneOrigin {
+                symbol: cloned,
+                owner: plan.node,
+                source: property.symbol,
+            },
+        ));
         cloned_properties.push(cloned);
     }
     let type_ = store
@@ -21586,6 +21616,47 @@ mod generic_publication_tests {
             bootstrap.string_type,
         ];
         let type_ = publish_object_literal(&mut fixture.store, &plan, &property_types).unwrap();
+        let properties = fixture
+            .store
+            .type_payload(type_)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .properties
+            .as_ref()
+            .unwrap();
+        let first = properties[0];
+        for (symbol, property) in properties.iter().zip(&plan.properties) {
+            assert_eq!(
+                fixture.store.object_literal_property_clone_origin(*symbol),
+                Some(&ObjectLiteralPropertyCloneOrigin {
+                    symbol: *symbol,
+                    owner: object,
+                    source: property.symbol,
+                }),
+            );
+            assert!(
+                fixture
+                    .store
+                    .object_literal_property_clone_origin(property.symbol)
+                    .is_none()
+            );
+        }
+        let origin = *fixture
+            .store
+            .object_literal_property_clone_origin(first)
+            .unwrap();
+        assert!(!fixture.store.record_object_literal_property_clone_origin(
+            ObjectLiteralPropertyCloneOrigin {
+                source: plan.properties[1].symbol,
+                ..origin
+            },
+        ));
+        assert_eq!(
+            fixture.store.object_literal_property_clone_origin(first),
+            Some(&origin)
+        );
         assert_eq!(
             publish_object_literal(&mut fixture.store, &plan, &property_types),
             Ok(type_)

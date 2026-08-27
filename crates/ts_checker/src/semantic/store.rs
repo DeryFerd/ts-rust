@@ -44,6 +44,7 @@ use super::{
         TypeResolutionCheckpoint, TypeResolutionStack, TypeResolutionTarget,
         TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
     },
+    object_members::ObjectLiteralPropertyCloneOrigin,
     relation::{RelationCaches, RelationComparisonResult, RelationKind, RelationStateSnapshot},
     signatures::{
         CompositeSignature, ElementFlags, IndexFlags, IndexInfo, IndexInfoArena, Signature,
@@ -537,6 +538,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_callable_type_parameters:
         HashMap<SignatureId, Box<[SourceCallableTypeParameterProvenance]>>,
     module_value_identities: HashMap<SemanticSymbolId, ModuleValueIdentity>,
+    object_literal_property_clone_origins:
+        HashMap<SemanticSymbolId, ObjectLiteralPropertyCloneOrigin>,
     source_overload_provenance: HashMap<TypeId, SourceOverloadProvenance>,
     source_overload_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_overload_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
@@ -671,6 +674,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_types_by_signature: HashMap::new(),
             source_callable_type_parameters: HashMap::new(),
             module_value_identities: HashMap::new(),
+            object_literal_property_clone_origins: HashMap::new(),
             source_overload_provenance: HashMap::new(),
             source_overload_types_by_declaration: HashMap::new(),
             source_overload_types_by_owner: HashMap::new(),
@@ -2924,6 +2928,45 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         type_: TypeId,
     ) -> Option<&CanonicalUnionCreationProof> {
         self.canonical_union_creations.get(&type_)
+    }
+
+    pub(super) fn object_literal_property_clone_origin(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&ObjectLiteralPropertyCloneOrigin> {
+        self.object_literal_property_clone_origins.get(&symbol)
+    }
+
+    pub(super) fn try_reserve_object_literal_property_clone_origins(
+        &mut self,
+        additional: usize,
+    ) -> bool {
+        self.object_literal_property_clone_origins
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    pub(super) fn record_object_literal_property_clone_origin(
+        &mut self,
+        origin: ObjectLiteralPropertyCloneOrigin,
+    ) -> bool {
+        if origin.symbol() == origin.source()
+            || self.symbol(origin.symbol()).is_none()
+            || self.symbol(origin.source()).is_none()
+            || self.source_node_kind(origin.owner()) != Some(SyntaxKind::ObjectLiteralExpression)
+        {
+            return false;
+        }
+        match self
+            .object_literal_property_clone_origins
+            .entry(origin.symbol())
+        {
+            std::collections::hash_map::Entry::Occupied(existing) => existing.get() == &origin,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(origin);
+                true
+            }
+        }
     }
 
     pub(super) fn module_value_identity(
