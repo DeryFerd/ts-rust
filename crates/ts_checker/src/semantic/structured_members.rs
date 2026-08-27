@@ -17,6 +17,7 @@ use ts_binder::{
 use super::{
     CanonicalTypeMapperStore, IndexInfoId, SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
+    declared::cached_ordinary_type_parameter_owner,
     instantiated_members::validate_generic_interface_members,
     links::{
         MembersOrExportsResolutionKind, ResolvedSignatureState, SignatureLinks, ValueSymbolLinks,
@@ -32,7 +33,7 @@ use super::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
     },
     relater::ResolvedOwnProperty,
-    signatures::SignatureFlags,
+    signatures::{IndexInfo, SignatureFlags},
     store::{DirectInterfaceHeritageProvenance, SourceNodeParent},
     type_records::{ConstrainedTypeData, InterfaceTypeData, TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
@@ -139,6 +140,31 @@ fn matching_inherited_property_contract(
         && (first_type == second_type
             || first_record.flags().contains(SymbolFlags::METHOD)
                 && matching_interface_method_contract(store, first, second))
+}
+
+/// The callers authenticate the property key and retained index before this check.
+/// Applicable properties keep the required-property and exact-type boundary.
+fn inherited_index_property_compatible(
+    store: &CanonicalTypeMapperStore,
+    index: IndexInfoId,
+    name: EscapedNameRef<'_>,
+    property_type: TypeId,
+    optional: bool,
+) -> Option<bool> {
+    let info = store.index_info(index)?;
+    let bootstrap = store.intrinsic_bootstrap()?;
+    store.type_payload(property_type)?;
+    store.type_payload(info.value_type())?;
+    let string_index = info.key_type() == bootstrap.string_type;
+    if !string_index && info.key_type() != bootstrap.number_type {
+        return Some(false);
+    }
+    let applies = match name.as_utf8() {
+        Some(name) => string_index || ts_jsnum::from_string(name).to_string() == name,
+        None if name.is_late_bound() => false,
+        None => return None,
+    };
+    Some(!applies || !optional && property_type == info.value_type())
 }
 
 /// Resolves and publishes one or two direct interface bases.
@@ -249,28 +275,6 @@ pub(super) fn resolve_direct_interface_members_with_array_targets(
         .filter(|_| second_base.is_none())
         .map(|surface| surface.index_infos.as_slice())
         .unwrap_or_default();
-    if !plan.properties.is_empty()
-        && inherited_index_infos.iter().any(|index| {
-            let Some(info) = store.index_info(*index) else {
-                return true;
-            };
-            let Some(bootstrap) = store.intrinsic_bootstrap() else {
-                return true;
-            };
-            info.key_type() != bootstrap.string_type
-                || plan
-                    .properties
-                    .iter()
-                    .zip(property_types)
-                    .any(|(property, type_)| property.optional || *type_ != info.value_type())
-        })
-    {
-        return Err(PropertyObjectError::UnsupportedMember {
-            node: plan.node,
-            kind: SyntaxKind::InterfaceDeclaration,
-        });
-    }
-
     let declared_state =
         prepare_direct_interface_declared_properties(store, plan, type_, property_types)?;
     let total_properties = base_surfaces
@@ -296,14 +300,35 @@ pub(super) fn resolve_direct_interface_members_with_array_targets(
         .try_reserve(total_properties)
         .map_err(|_| capacity(plan))?;
 
-    for property in &plan.properties {
+    for (property, property_type) in plan.properties.iter().zip(property_types) {
         let record = store
             .symbol(property.symbol)
             .ok_or_else(|| invalid(plan, type_))?;
         if record.name().as_utf8() != Some(property.name.as_str())
             || record.parent() != Some(plan.symbol)
+            || !inherited_index_infos.is_empty()
+                && (record.flags().contains(SymbolFlags::OPTIONAL) != property.optional
+                    || record.flags().contains(SymbolFlags::METHOD)
+                        && valid_interface_method_value(store, property.symbol, *property_type)
+                            .is_none())
         {
             return Err(invalid(plan, type_));
+        }
+        for &index in inherited_index_infos {
+            if !inherited_index_property_compatible(
+                store,
+                index,
+                record.name(),
+                *property_type,
+                property.optional,
+            )
+            .ok_or_else(|| invalid(plan, type_))?
+            {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: plan.node,
+                    kind: SyntaxKind::InterfaceDeclaration,
+                });
+            }
         }
         let name = record.name().to_owned();
         if !seen_names.insert(name.clone()) {
@@ -1139,27 +1164,20 @@ fn validate_property_interface_worker(
             expected.push(*property);
         }
     }
-    if !declared.properties.is_empty()
-        && inherited_index_infos.iter().any(|index| {
-            let Some(info) = store.index_info(*index) else {
-                return true;
-            };
-            let Some(bootstrap) = store.intrinsic_bootstrap() else {
-                return true;
-            };
-            info.key_type() != bootstrap.string_type
-                || declared.properties.iter().any(|property| {
-                    store
-                        .symbol(*property)
-                        .is_none_or(|record| record.flags().contains(SymbolFlags::OPTIONAL))
-                        || store
-                            .value_symbol_links(*property)
-                            .and_then(|links| links.resolved_type)
-                            != Some(info.value_type())
-                })
-        })
-    {
-        return None;
+    for &index in &inherited_index_infos {
+        for &property in &declared.properties {
+            let record = store.symbol(property)?;
+            let property_type = store.value_symbol_links(property)?.resolved_type?;
+            if !inherited_index_property_compatible(
+                store,
+                index,
+                record.name(),
+                property_type,
+                record.flags().contains(SymbolFlags::OPTIONAL),
+            )? {
+                return None;
+            }
+        }
     }
     let expected_index_infos = if requires_direct_base {
         inherited_index_infos
@@ -1394,6 +1412,22 @@ pub(super) fn valid_index_symbol(
     symbol: SemanticSymbolId,
     indexes: &[IndexInfoId],
 ) -> bool {
+    valid_index_symbol_shape(store, owner, owner_declarations, symbol, indexes)
+        && indexes.iter().all(|index| {
+            store
+                .index_info(*index)
+                .is_some_and(|info| source_index_info_is_exact(store, owner, info))
+        })
+}
+
+/// Checks index metadata. Instantiated callers must also prove their source and mapping.
+pub(super) fn valid_index_symbol_shape(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declarations: &[NodeRef],
+    symbol: SemanticSymbolId,
+    indexes: &[IndexInfoId],
+) -> bool {
     let Some(record) = store.symbol(symbol) else {
         return false;
     };
@@ -1450,6 +1484,206 @@ pub(super) fn valid_index_symbol(
                 && info.index_symbol().is_none()
                 && info.components().is_empty()
         })
+}
+
+fn source_index_info_is_exact(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    info: &IndexInfo,
+) -> bool {
+    let Some(declaration) = info.declaration() else {
+        return false;
+    };
+    let Some(children) = store.source_direct_children(declaration) else {
+        return false;
+    };
+    let readonly_count = children
+        .iter()
+        .filter(|child| store.source_node_kind(**child) == Some(SyntaxKind::ReadonlyKeyword))
+        .count();
+    let Some(parameter) = children
+        .iter()
+        .copied()
+        .find(|child| store.source_node_kind(*child) == Some(SyntaxKind::Parameter))
+    else {
+        return false;
+    };
+    if readonly_count > 1
+        || children.len() != 2 + readonly_count
+        || info.is_readonly() != (readonly_count == 1)
+    {
+        return false;
+    }
+    let Some(parameter_children) = store.source_direct_children(parameter) else {
+        return false;
+    };
+    if parameter_children.len() != 2 {
+        return false;
+    }
+    let Some(name) = parameter_children
+        .iter()
+        .copied()
+        .find(|child| store.source_node_kind(*child) == Some(SyntaxKind::Identifier))
+    else {
+        return false;
+    };
+    if store
+        .source_identifier_text(name)
+        .is_none_or(|name| name.is_empty() || name == "this")
+    {
+        return false;
+    }
+    let Some(key) = parameter_children
+        .iter()
+        .copied()
+        .find(|child| *child != name)
+    else {
+        return false;
+    };
+    let Some(value) = children.iter().copied().find(|child| {
+        *child != parameter && store.source_node_kind(*child) != Some(SyntaxKind::ReadonlyKeyword)
+    }) else {
+        return false;
+    };
+    matches!(
+        store.source_node_kind(key),
+        Some(
+            SyntaxKind::StringKeyword
+                | SyntaxKind::NumberKeyword
+                | SyntaxKind::SymbolKeyword
+                | SyntaxKind::TemplateLiteralType
+        )
+    ) && source_index_annotation_is_exact(store, owner, declaration, key, info.key_type())
+        && source_index_annotation_is_exact(store, owner, declaration, value, info.value_type())
+}
+
+fn source_index_annotation_is_exact(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    mut annotation: NodeRef,
+    type_: TypeId,
+) -> bool {
+    while store.source_node_kind(annotation) == Some(SyntaxKind::ParenthesizedType) {
+        if store.type_node_links(annotation).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|cached| cached != type_)
+        }) {
+            return false;
+        }
+        let Some(children) = store.source_direct_children(annotation) else {
+            return false;
+        };
+        let [inner] = children.as_slice() else {
+            return false;
+        };
+        annotation = *inner;
+    }
+    let Some(kind) = store.source_node_kind(annotation) else {
+        return false;
+    };
+    if !kind.is_keyword_type()
+        && !(SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
+            .contains(&(kind as u16))
+    {
+        return false;
+    }
+    // Source parameters require the same proof before and after node links are published.
+    let Some((source_parameter, text)) =
+        source_index_type_parameter(store, declaration, annotation)
+    else {
+        return store.source_direct_type_annotation_is_exact(annotation, type_);
+    };
+    if store.type_node_links(annotation).is_some_and(|links| {
+        links.resolved_type.is_some_and(|cached| cached != type_)
+            || links.outer_type_parameters.is_some()
+    }) {
+        return false;
+    }
+    let Some([Some(raw_parameter), _]) = store
+        .symbol_store()
+        .source_binding_symbols(source_parameter)
+    else {
+        return false;
+    };
+    let Some(parameter) = store.get_merged_symbol(raw_parameter) else {
+        return false;
+    };
+    if cached_ordinary_type_parameter_owner(store, type_) != Some(parameter) {
+        return false;
+    }
+    let Some(record) = store.symbol(parameter) else {
+        return false;
+    };
+    store.get_parent_of_symbol(parameter) == Some(owner)
+        && record.name().as_utf8() == Some(text)
+        && store.symbol_node_links(annotation).is_none_or(|links| {
+            links
+                .resolved_symbol
+                .is_none_or(|symbol| store.get_merged_symbol(symbol) == Some(parameter))
+        })
+        && record.declarations().is_some_and(|declarations| {
+            declarations.contains(&source_parameter)
+                && declarations.iter().all(|declaration| {
+                    store.source_node_kind(*declaration) == Some(SyntaxKind::TypeParameter)
+                        && source_binding_matches(store, *declaration, parameter)
+                        && matches!(
+                            store.source_node_parent(*declaration),
+                            Some(SourceNodeParent::Parent(parent))
+                                if source_binding_matches(store, parent, owner)
+                        )
+                        && store
+                            .source_child_with_kind(*declaration, SyntaxKind::Identifier)
+                            .and_then(|name| store.source_identifier_text(name))
+                            == Some(text)
+                })
+        })
+}
+
+fn source_binding_matches(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> bool {
+    store
+        .symbol_store()
+        .source_binding_symbols(declaration)
+        .is_some_and(|symbols| {
+            symbols
+                .into_iter()
+                .flatten()
+                .any(|bound| store.get_merged_symbol(bound) == Some(symbol))
+        })
+}
+
+/// Finds the actual owner parameter before checking any mutable type links.
+fn source_index_type_parameter(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    annotation: NodeRef,
+) -> Option<(NodeRef, &str)> {
+    if store.source_node_kind(annotation) != Some(SyntaxKind::TypeReference) {
+        return None;
+    }
+    let children = store.source_direct_children(annotation)?;
+    let [name] = children.as_slice() else {
+        return None;
+    };
+    let text = store.source_identifier_text(*name)?;
+    let SourceNodeParent::Parent(owner_declaration) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    let parameter = store
+        .source_direct_children(owner_declaration)?
+        .into_iter()
+        .find(|parameter| {
+            store.source_node_kind(*parameter) == Some(SyntaxKind::TypeParameter)
+                && store
+                    .source_child_with_kind(*parameter, SyntaxKind::Identifier)
+                    .and_then(|name| store.source_identifier_text(name))
+                    == Some(text)
+        })?;
+    Some((parameter, text))
 }
 
 fn valid_call_symbol(
@@ -1934,7 +2168,94 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
                     && store.type_payload(write_type).is_some()
             })
             && (!method || valid_interface_method_value(store, property, read_type).is_some())
+            && (method
+                || accessor
+                || late
+                || valid_ordinary_property_source_contract(store, property, read_type))
     })
+}
+
+fn valid_ordinary_property_source_contract(
+    store: &CanonicalTypeMapperStore,
+    property: SemanticSymbolId,
+    type_: TypeId,
+) -> bool {
+    let Some(record) = store.symbol(property) else {
+        return false;
+    };
+    let Some(declarations) = record.declarations() else {
+        return false;
+    };
+    let Some(declaration) = record.value_declaration() else {
+        return false;
+    };
+    let optional = record.flags().contains(SymbolFlags::OPTIONAL);
+    let readonly = record.check_flags().contains(CheckFlags::READONLY);
+    let annotation_matches = match store.source_direct_type_annotation(declaration) {
+        Some(annotation) => ordinary_property_annotation_is_exact(store, annotation, type_),
+        None => {
+            store
+                .intrinsic_bootstrap()
+                .is_some_and(|bootstrap| type_ == bootstrap.any_type)
+                && store.source_direct_children(declaration).is_some_and(|children| {
+                    if children.len() != 1 + usize::from(optional) + usize::from(readonly) {
+                        return false;
+                    }
+                    // The source flag checks below authenticate these modifier tokens.
+                    let mut meaningful = children.into_iter().filter(|child| {
+                        !matches!(
+                            store.source_node_kind(*child),
+                            Some(SyntaxKind::QuestionToken | SyntaxKind::ReadonlyKeyword)
+                        )
+                    });
+                    matches!(
+                        (meaningful.next(), meaningful.next()),
+                        (Some(name), None) if store.source_identifier_text(name).is_some_and(|text| record.name().as_utf8() == Some(text))
+                    )
+                })
+        }
+    };
+    declarations.iter().all(|declaration| {
+        store
+            .source_child_with_kind(*declaration, SyntaxKind::QuestionToken)
+            .is_some()
+            == optional
+            && store
+                .source_child_with_kind(*declaration, SyntaxKind::ReadonlyKeyword)
+                .is_some()
+                == readonly
+    }) && annotation_matches
+        && store
+            .declared_value_provenance(property)
+            .is_none_or(|provenance| {
+                provenance.readonly == Some(readonly) && provenance.is_current(store, property)
+            })
+}
+
+fn ordinary_property_annotation_is_exact(
+    store: &CanonicalTypeMapperStore,
+    mut annotation: NodeRef,
+    type_: TypeId,
+) -> bool {
+    while store.source_node_kind(annotation) == Some(SyntaxKind::ParenthesizedType) {
+        if store.type_node_links(annotation).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|cached| cached != type_)
+        }) || store
+            .symbol_node_links(annotation)
+            .is_some_and(|links| links.resolved_symbol.is_some())
+        {
+            return false;
+        }
+        let Some(children) = store.source_direct_children(annotation) else {
+            return false;
+        };
+        let [inner] = children.as_slice() else {
+            return false;
+        };
+        annotation = *inner;
+    }
+    store.source_direct_type_annotation_is_exact(annotation, type_)
 }
 
 pub(super) fn valid_interface_method_value(
@@ -2368,6 +2689,8 @@ mod tests {
         relation::{IntersectionState, RelationComparisonResult, RelationKind},
     };
 
+    include!("../../../../tests/reviews/index_warm_source_final_invariants.rs");
+
     const SOURCE: &str = concat!(
         "interface Base { first: number; second: number }\n",
         "interface Other { other: number }\n",
@@ -2505,6 +2828,659 @@ mod tests {
             .symbol(declaration)
             .unwrap();
         fixture.store.get_merged_symbol(raw).unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold proof, paired cache changes, and retries together.
+    fn review_index_source_proof_rejects_matching_warm_type_parameter_caches() {
+        use crate::semantic::TypeNodeLinks;
+
+        let mut accepted = Vec::new();
+        for annotation_text in ["T", "(T)", "((T))"] {
+            let mut fixture = fixture_with_source(
+                &format!("interface Base<T> {{ [index: number]: {annotation_text}; }}"),
+                14_501,
+            );
+            let owner = interface_symbol(&fixture, "Base");
+            let source_host = host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let flags = fixture.store.symbol(owner).unwrap().flags();
+            let target = get_declared_class_interface_or_type_parameter(
+                &mut fixture.store,
+                &source_host,
+                owner,
+                flags,
+            )
+            .unwrap()
+            .unwrap();
+            let TypeData::Interface(interface) = fixture.store.type_payload(target).unwrap().data()
+            else {
+                panic!("Base retains its real generic interface target")
+            };
+            let parameter = interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .unwrap()[0];
+            assert!(cached_ordinary_type_parameter_owner(&fixture.store, parameter).is_some());
+            let owner_record = fixture.store.symbol(owner).unwrap();
+            let declarations = owner_record.declarations().unwrap().to_vec();
+            let symbol = owner_record
+                .members()
+                .and_then(|members| fixture.store.symbol_table(members))
+                .and_then(|members| members.get(InternalSymbolName::Index.as_ref()))
+                .unwrap();
+            let declaration = fixture
+                .store
+                .symbol(symbol)
+                .unwrap()
+                .declarations()
+                .unwrap()[0];
+            let NodeData::IndexSignatureDeclaration(index_source) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("the index retains its registered source declaration")
+            };
+            let mut annotation =
+                NodeRef::new(declaration.arena, declaration.file, index_source.type_);
+            let mut annotations = Vec::new();
+            loop {
+                annotations.push(annotation);
+                if fixture.store.source_node_kind(annotation) != Some(SyntaxKind::ParenthesizedType)
+                {
+                    break;
+                }
+                let children = fixture.store.source_direct_children(annotation).unwrap();
+                assert_eq!(children.len(), 1);
+                annotation = children[0];
+            }
+            assert_eq!(
+                fixture.store.source_node_kind(annotation),
+                Some(SyntaxKind::TypeReference)
+            );
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            let original = fixture
+                .store
+                .alloc_index_info(number, parameter, false, Some(declaration), Vec::new())
+                .unwrap();
+            let state = |store: &CanonicalTypeMapperStore| {
+                (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                    annotations
+                        .iter()
+                        .map(|node| store.type_node_links(*node).cloned())
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let validate = |store: &CanonicalTypeMapperStore, index| {
+                valid_index_symbol(store, owner, &declarations, symbol, &[index])
+            };
+            let before = state(&fixture.store);
+            assert!(validate(&fixture.store, original), "cold {annotation_text}");
+            assert_eq!(state(&fixture.store), before);
+            for node in &annotations {
+                assert!(fixture.store.set_type_node_links(
+                    *node,
+                    TypeNodeLinks {
+                        resolved_type: Some(parameter),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+            }
+            let warm = state(&fixture.store);
+            assert!(validate(&fixture.store, original), "warm {annotation_text}");
+            assert_eq!(state(&fixture.store), warm);
+            let wrong = fixture
+                .store
+                .alloc_index_info(number, string, false, Some(declaration), Vec::new())
+                .unwrap();
+            let before = state(&fixture.store);
+            assert!(
+                !validate(&fixture.store, wrong),
+                "index-only {annotation_text}"
+            );
+            assert_eq!(state(&fixture.store), before);
+            for node in &annotations {
+                assert!(fixture.store.set_type_node_links(
+                    *node,
+                    TypeNodeLinks {
+                        resolved_type: Some(string),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+            }
+            let poisoned = state(&fixture.store);
+            assert!(
+                !validate(&fixture.store, original),
+                "annotation-only {annotation_text}"
+            );
+            assert_eq!(state(&fixture.store), poisoned);
+            for _ in 0..2 {
+                accepted.push((annotation_text, validate(&fixture.store, wrong)));
+                assert_eq!(state(&fixture.store), poisoned);
+            }
+            for node in &annotations {
+                assert!(fixture.store.set_type_node_links(
+                    *node,
+                    TypeNodeLinks {
+                        resolved_type: Some(parameter),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+            }
+            let restored = state(&fixture.store);
+            assert!(
+                validate(&fixture.store, original),
+                "restored {annotation_text}"
+            );
+            assert_eq!(state(&fixture.store), restored);
+        }
+        assert!(
+            accepted.iter().all(|(_, accepted)| !accepted),
+            "matching mutable caches replaced the source type parameter: {accepted:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep source, cache changes, and retries in one fixture.
+    fn index_source_proof_preserves_parenthesized_annotations() {
+        use crate::semantic::TypeNodeLinks;
+
+        for annotation_text in ["number", "(number)", "((number))"] {
+            for readonly in [false, true] {
+                let modifier = if readonly { "readonly " } else { "" };
+                let mut fixture = fixture_with_source(
+                    &format!("interface Base {{ {modifier}[index: number]: {annotation_text}; }}"),
+                    8_149,
+                );
+                let owner = interface_symbol(&fixture, "Base");
+                let owner_record = fixture.store.symbol(owner).unwrap();
+                let declarations = owner_record.declarations().unwrap().to_vec();
+                let symbol = owner_record
+                    .members()
+                    .and_then(|members| fixture.store.symbol_table(members))
+                    .and_then(|members| members.get(InternalSymbolName::Index.as_ref()))
+                    .unwrap();
+                let declaration = fixture
+                    .store
+                    .symbol(symbol)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()[0];
+                let NodeData::IndexSignatureDeclaration(index_source) =
+                    &fixture.parsed.arena.get(declaration.node).unwrap().data
+                else {
+                    panic!("the index retains its source declaration")
+                };
+                let mut annotation =
+                    NodeRef::new(declaration.arena, declaration.file, index_source.type_);
+                let mut annotations = Vec::new();
+                loop {
+                    annotations.push(annotation);
+                    let NodeData::ParenthesizedTypeNode(parenthesized) =
+                        &fixture.parsed.arena.get(annotation.node).unwrap().data
+                    else {
+                        break;
+                    };
+                    annotation =
+                        NodeRef::new(annotation.arena, annotation.file, parenthesized.type_);
+                }
+                assert_eq!(
+                    fixture.store.source_node_kind(annotation),
+                    Some(SyntaxKind::NumberKeyword)
+                );
+                let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+                let original = fixture
+                    .store
+                    .alloc_index_info(number, number, readonly, Some(declaration), Vec::new())
+                    .unwrap();
+                let state = |store: &CanonicalTypeMapperStore| {
+                    (
+                        store.type_len(),
+                        store.mapper_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.index_info_len(),
+                        store.checker_link_allocated_lengths(),
+                        store.relation_state_snapshot(),
+                        annotations
+                            .iter()
+                            .map(|node| store.type_node_links(*node).cloned())
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let before = state(&fixture.store);
+                assert!(valid_index_symbol(
+                    &fixture.store,
+                    owner,
+                    &declarations,
+                    symbol,
+                    &[original]
+                ));
+                assert_eq!(state(&fixture.store), before);
+
+                for (value, changed_readonly, change_nodes) in [
+                    (number, !readonly, false),
+                    (string, readonly, false),
+                    (string, readonly, true),
+                ] {
+                    let changed = fixture
+                        .store
+                        .alloc_index_info(
+                            number,
+                            value,
+                            changed_readonly,
+                            Some(declaration),
+                            Vec::new(),
+                        )
+                        .unwrap();
+                    if change_nodes {
+                        for node in &annotations {
+                            assert!(fixture.store.set_type_node_links(
+                                *node,
+                                TypeNodeLinks {
+                                    resolved_type: Some(value),
+                                    ..TypeNodeLinks::default()
+                                }
+                            ));
+                        }
+                    }
+                    let before = state(&fixture.store);
+                    for _ in 0..2 {
+                        assert!(
+                            !valid_index_symbol(
+                                &fixture.store,
+                                owner,
+                                &declarations,
+                                symbol,
+                                &[changed]
+                            ),
+                            "{annotation_text}, readonly={readonly}, change_nodes={change_nodes}"
+                        );
+                        assert_eq!(state(&fixture.store), before);
+                    }
+                    if change_nodes {
+                        for node in &annotations {
+                            assert!(
+                                fixture
+                                    .store
+                                    .set_type_node_links(*node, TypeNodeLinks::default())
+                            );
+                        }
+                    }
+                    let restored = state(&fixture.store);
+                    assert!(valid_index_symbol(
+                        &fixture.store,
+                        owner,
+                        &declarations,
+                        symbol,
+                        &[original]
+                    ));
+                    assert_eq!(state(&fixture.store), restored);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_source_proof_validates_warm_reference_symbols() {
+        use crate::semantic::links::{SymbolNodeLinks, TypeNodeLinks};
+
+        let mut fixture = fixture_with_source(
+            "interface Base<T, U> { readonly [index: number]: T; }",
+            14_601,
+        );
+        let owner = interface_symbol(&fixture, "Base");
+        let source_host = host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let flags = fixture.store.symbol(owner).unwrap().flags();
+        let target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &source_host,
+            owner,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(target).unwrap().data()
+        else {
+            panic!("Base retains its source type parameters")
+        };
+        let parameters = interface.reference.resolved_type_arguments.clone().unwrap();
+        let parameter = parameters[0];
+        let other = parameters[1];
+        let symbol = cached_ordinary_type_parameter_owner(&fixture.store, parameter).unwrap();
+        let other_symbol = cached_ordinary_type_parameter_owner(&fixture.store, other).unwrap();
+        let annotation = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeReference).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let Some(SourceNodeParent::Parent(declaration)) =
+            fixture.store.source_node_parent(annotation)
+        else {
+            panic!("the reference belongs to the source index")
+        };
+        assert!(source_index_annotation_is_exact(
+            &fixture.store,
+            owner,
+            declaration,
+            annotation,
+            parameter
+        ));
+        let state = |store: &CanonicalTypeMapperStore| {
+            (
+                store.checker_link_allocated_lengths(),
+                store.type_node_links(annotation).cloned(),
+                store.symbol_node_links(annotation).cloned(),
+                store.relation_state_snapshot(),
+            )
+        };
+        for (type_, resolved_symbol, expected) in [
+            (parameter, None, true),
+            (parameter, Some(other_symbol), false),
+            (other, Some(other_symbol), false),
+            (parameter, Some(symbol), true),
+        ] {
+            assert!(fixture.store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(type_),
+                    outer_type_parameters: None,
+                }
+            ));
+            assert!(
+                fixture
+                    .store
+                    .set_symbol_node_links(annotation, SymbolNodeLinks { resolved_symbol })
+            );
+            let before = state(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    source_index_annotation_is_exact(
+                        &fixture.store,
+                        owner,
+                        declaration,
+                        annotation,
+                        type_
+                    ),
+                    expected
+                );
+                assert_eq!(state(&fixture.store), before);
+            }
+        }
+    }
+
+    #[test]
+    fn index_source_proof_preserves_warm_named_reference_values() {
+        use crate::semantic::TypeNodeLinks;
+
+        let mut fixture = fixture_with_source(
+            "interface Result { value: number; } interface Base<T> { [index: number]: Result; }",
+            14_602,
+        );
+        let owner = interface_symbol(&fixture, "Base");
+        let result = interface_symbol(&fixture, "Result");
+        let source_host = host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let flags = fixture.store.symbol(result).unwrap().flags();
+        let result_type = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &source_host,
+            result,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let annotation = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeReference).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let Some(SourceNodeParent::Parent(declaration)) =
+            fixture.store.source_node_parent(annotation)
+        else {
+            panic!("the named reference belongs to the source index")
+        };
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(result_type),
+                outer_type_parameters: None,
+            }
+        ));
+        let before = fixture.store.checker_link_allocated_lengths();
+        for _ in 0..2 {
+            assert!(source_index_annotation_is_exact(
+                &fixture.store,
+                owner,
+                declaration,
+                annotation,
+                result_type
+            ));
+            assert_eq!(fixture.store.checker_link_allocated_lengths(), before);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the real cross-file merge and cache checks together.
+    fn index_source_proof_preserves_merged_parameter_bindings() {
+        use crate::semantic::links::{SymbolNodeLinks, TypeNodeLinks};
+
+        for annotation_text in ["T", "(T)", "((T))"] {
+            let first = parse_source_file("interface Base<T> {}");
+            let second = parse_source_file(&format!(
+                "interface Base<T> {{ readonly [index: number]: {annotation_text}; }}"
+            ));
+            let sources = [
+                (FileId::new(14_716), &first),
+                (FileId::new(14_717), &second),
+            ];
+            let mut binder = CanonicalBinder::new();
+            for &(file, parsed) in &sources {
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(format!("\"/merged-index-{}.ts\"", file.index())),
+                            CanonicalSourceLanguage::TypeScript,
+                            false,
+                            CanonicalModuleState::Script,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let (symbols, files) = binder.finish().try_into_parts().unwrap();
+            let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+            store
+                .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+                .unwrap();
+            let globals = store.intrinsic_bootstrap().unwrap().globals;
+            let mut raw_parameters = Vec::new();
+            for &(file, parsed) in &sources {
+                assert!(
+                    store
+                        .register_source_file(&parsed.arena, parsed.source_file, file)
+                        .is_some()
+                );
+                let bound = files.get(&file).unwrap();
+                let owner = store
+                    .symbol_table(bound.locals(bound.source_file()).unwrap())
+                    .unwrap()
+                    .get_source("Base")
+                    .unwrap();
+                store.merge_global_symbol(globals, owner).unwrap();
+                let parameter = bound
+                    .traversal_order()
+                    .find(|node| store.source_node_kind(*node) == Some(SyntaxKind::TypeParameter))
+                    .unwrap();
+                let raw = bound.symbol(parameter).unwrap();
+                assert_eq!(
+                    store.symbol_store().source_binding_symbols(parameter),
+                    Some([Some(raw), None])
+                );
+                raw_parameters.push(raw);
+            }
+            assert_ne!(raw_parameters[0], raw_parameters[1]);
+            let parameter_symbol = store.get_merged_symbol(raw_parameters[0]).unwrap();
+            assert_ne!(parameter_symbol, raw_parameters[0]);
+            assert_ne!(parameter_symbol, raw_parameters[1]);
+            assert_eq!(
+                store.get_merged_symbol(raw_parameters[1]),
+                Some(parameter_symbol)
+            );
+            let source_host = DeclaredTypeHost::new_after_global_merge(
+                sources
+                    .iter()
+                    .map(|(file, parsed)| (&parsed.arena, files.get(file).unwrap())),
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let owner = store
+                .symbol_table(globals)
+                .unwrap()
+                .get_source("Base")
+                .unwrap();
+            let flags = store.symbol(owner).unwrap().flags();
+            let target = get_declared_class_interface_or_type_parameter(
+                &mut store,
+                &source_host,
+                owner,
+                flags,
+            )
+            .unwrap()
+            .unwrap();
+            let TypeData::Interface(interface) = store.type_payload(target).unwrap().data() else {
+                panic!("Base retains its merged generic interface")
+            };
+            let parameters = interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .unwrap();
+            assert_eq!(parameters.len(), 1);
+            let parameter = parameters[0];
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(&store, parameter),
+                Some(parameter_symbol)
+            );
+            let record = store.symbol(owner).unwrap();
+            let declarations = record.declarations().unwrap().to_vec();
+            assert_eq!(declarations.len(), 2);
+            let symbol = store
+                .symbol_table(record.members().unwrap())
+                .unwrap()
+                .get(InternalSymbolName::Index.as_ref())
+                .unwrap();
+            let declaration = store.symbol(symbol).unwrap().declarations().unwrap()[0];
+            let NodeData::IndexSignatureDeclaration(index_source) =
+                &second.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("the second file retains the index declaration")
+            };
+            let mut annotation =
+                NodeRef::new(declaration.arena, declaration.file, index_source.type_);
+            let mut annotations = vec![annotation];
+            while store.source_node_kind(annotation) == Some(SyntaxKind::ParenthesizedType) {
+                let children = store.source_direct_children(annotation).unwrap();
+                let [inner] = children.as_slice() else {
+                    panic!("a parenthesized type has one annotation")
+                };
+                annotation = *inner;
+                annotations.push(annotation);
+            }
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let index = store
+                .alloc_index_info(number, parameter, true, Some(declaration), Vec::new())
+                .unwrap();
+            for (warm, resolved_symbol) in [
+                (false, None),
+                (true, None),
+                (true, Some(raw_parameters[0])),
+                (true, Some(raw_parameters[1])),
+                (true, Some(parameter_symbol)),
+            ] {
+                if warm {
+                    for node in &annotations {
+                        assert!(store.set_type_node_links(
+                            *node,
+                            TypeNodeLinks {
+                                resolved_type: Some(parameter),
+                                outer_type_parameters: None,
+                            }
+                        ));
+                    }
+                    assert!(
+                        store
+                            .set_symbol_node_links(annotation, SymbolNodeLinks { resolved_symbol })
+                    );
+                } else {
+                    assert!(
+                        annotations
+                            .iter()
+                            .all(|node| store.type_node_links(*node).is_none())
+                    );
+                    assert!(store.symbol_node_links(annotation).is_none());
+                }
+                let state = |store: &CanonicalTypeMapperStore| {
+                    (
+                        store.type_len(),
+                        store.mapper_len(),
+                        store.symbol_len(),
+                        store.index_info_len(),
+                        store.checker_link_allocated_lengths(),
+                        store.relation_state_snapshot(),
+                        annotations
+                            .iter()
+                            .map(|node| store.type_node_links(*node).cloned())
+                            .collect::<Vec<_>>(),
+                        store.symbol_node_links(annotation).cloned(),
+                    )
+                };
+                let before = state(&store);
+                for _ in 0..2 {
+                    assert!(
+                        valid_index_symbol(&store, owner, &declarations, symbol, &[index]),
+                        "{annotation_text}, warm={warm}, symbol={resolved_symbol:?}"
+                    );
+                    assert_eq!(state(&store), before);
+                }
+            }
+        }
     }
 
     #[test]
@@ -3033,12 +4009,34 @@ mod tests {
         else {
             panic!("the derived symbol must retain its interface declaration")
         };
+        let heritage = plan_direct_interface_heritage(
+            &fixture.store,
+            host,
+            declaration,
+            symbol,
+            interface.heritage_clauses.as_ref().unwrap(),
+        )
+        .unwrap();
+        let mut plan = template.clone();
+        plan.node = declaration;
+        plan.declarations = vec![declaration];
+        plan.symbol = symbol;
+        plan.members = owner.members();
+        plan.properties.clear();
+        plan.spreads.clear();
+        plan.indexes.clear();
+        plan.call_signatures.clear();
+        plan.alias_symbol = None;
+        plan.heritage = Some(heritage);
+        if interface.members.nodes.is_empty() {
+            return plan;
+        }
         let [property_node] = interface.members.nodes.as_slice() else {
             panic!("the derived interface has one source property")
         };
         let property_declaration =
             NodeRef::new(declaration.arena, declaration.file, *property_node);
-        let (property_name, property_type, postfix_token, modifiers) = match &fixture
+        let (property_name, property_type, postfix_token) = match &fixture
             .parsed
             .arena
             .get(property_declaration.node)
@@ -3051,57 +4049,43 @@ mod tests {
                     .type_
                     .expect("the derived source property has a type annotation"),
                 property.postfix_token,
-                property.modifiers.as_ref(),
             ),
-            NodeData::PropertySignatureDeclaration(property) => (
-                property.name,
-                property.type_,
-                property.postfix_token,
-                property.modifiers.as_ref(),
-            ),
+            NodeData::PropertySignatureDeclaration(property) => {
+                (property.name, property.type_, property.postfix_token)
+            }
             _ => panic!("the derived source member must be an interface property"),
         };
-        assert!(postfix_token.is_none());
-        assert!(modifiers.is_none());
+        assert!(postfix_token.is_none_or(|token| {
+            fixture.parsed.arena.get(token).unwrap().kind == SyntaxKind::QuestionToken
+        }));
         let name_node = NodeRef::new(declaration.arena, declaration.file, property_name);
-        let NodeData::Identifier(name) = &fixture.parsed.arena.get(name_node.node).unwrap().data
-        else {
-            panic!("the derived source property has an identifier name")
-        };
         let bound = fixture.files.get(&fixture.file).unwrap();
         let property_symbol = bound.symbol(property_declaration).unwrap();
         assert_eq!(
             fixture.store.get_merged_symbol(property_symbol),
             Some(property_symbol)
         );
-        let heritage = plan_direct_interface_heritage(
-            &fixture.store,
-            host,
-            declaration,
-            symbol,
-            interface.heritage_clauses.as_ref().unwrap(),
-        )
-        .unwrap();
-
-        let mut plan = template.clone();
-        plan.node = declaration;
-        plan.declarations = vec![declaration];
-        plan.symbol = symbol;
-        plan.members = owner.members();
+        let name = fixture
+            .store
+            .symbol(property_symbol)
+            .unwrap()
+            .name()
+            .as_utf8()
+            .unwrap()
+            .to_owned();
         plan.properties = vec![PlannedProperty {
             declaration: property_declaration,
             symbol: property_symbol,
             name_node,
             type_node: NodeRef::new(declaration.arena, declaration.file, property_type),
-            optional: false,
-            readonly: false,
-            name: name.text.clone(),
+            optional: postfix_token.is_some(),
+            readonly: ts_binder::canonical_has_syntactic_modifier(
+                &fixture.parsed.arena,
+                property_declaration.node,
+                SyntaxKind::ReadonlyKeyword,
+            ),
+            name,
         }];
-        plan.spreads.clear();
-        plan.indexes.clear();
-        plan.call_signatures.clear();
-        plan.alias_symbol = None;
-        plan.heritage = Some(heritage);
         plan
     }
 
@@ -3159,7 +4143,18 @@ mod tests {
         for (plan, type_) in [(&base_plan, base_type), (&other_plan, other_type)] {
             let state = object_members::interface_state(&fixture.store, plan, type_).unwrap();
             assert_eq!(state, PropertyObjectState::Shell(type_));
-            let indexes = vec![(string_type, number_type); plan.indexes.len()];
+            let indexes = plan
+                .indexes
+                .iter()
+                .map(|index| {
+                    let key = match fixture.store.source_node_kind(index.key_type_node) {
+                        Some(SyntaxKind::StringKeyword) => string_type,
+                        Some(SyntaxKind::NumberKeyword) => number_type,
+                        _ => panic!("the index fixture uses string or number keys"),
+                    };
+                    (key, number_type)
+                })
+                .collect::<Vec<_>>();
             object_members::publish_declared_members(
                 &mut fixture.store,
                 plan,
@@ -3793,6 +4788,1264 @@ mod tests {
             ),
             warm_state
         );
+    }
+
+    fn prepare_indexed_reader() -> PreparedFixture {
+        let mut prepared = prepare_indexed();
+        resolve_direct_interface_members(
+            &mut prepared.fixture.store,
+            &prepared.derived_plan,
+            prepared.derived_type,
+            &[prepared.number_type],
+            &[prepared.base_type],
+        )
+        .unwrap();
+        prepared
+    }
+
+    #[test]
+    fn inherited_index_reader_preserves_own_and_inherited_tables_cold_and_warm() {
+        let mut prepared = prepare_indexed_reader();
+        let base = prepared
+            .fixture
+            .store
+            .type_payload(prepared.base_type)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .clone();
+        let derived = prepared
+            .fixture
+            .store
+            .type_payload(prepared.derived_type)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .clone();
+        assert_eq!(base.index_infos, derived.index_infos);
+        assert!(
+            prepared
+                .fixture
+                .store
+                .symbol_table(base.members.unwrap())
+                .unwrap()
+                .get(InternalSymbolName::Index.as_ref())
+                .is_some()
+        );
+        assert!(
+            prepared
+                .fixture
+                .store
+                .symbol_table(derived.members.unwrap())
+                .unwrap()
+                .get(InternalSymbolName::Index.as_ref())
+                .is_none()
+        );
+        let own = prepared.derived_plan.properties[0].symbol;
+        let first = prepared
+            .fixture
+            .store
+            .symbol_table(base.members.unwrap())
+            .unwrap()
+            .get_source("first")
+            .unwrap();
+        let before = (
+            derived_state(&prepared.fixture.store, prepared.derived_type, own),
+            prepared.fixture.store.type_len(),
+            prepared.fixture.store.index_info_len(),
+            prepared.fixture.store.relation_state_snapshot(),
+        );
+        for _ in 0..2 {
+            for (receiver, name, symbol) in [
+                (prepared.base_type, "first", first),
+                (prepared.derived_type, "own", own),
+                (prepared.derived_type, "first", first),
+            ] {
+                let property = prepared
+                    .fixture
+                    .store
+                    .resolved_own_property(receiver, name)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(property.symbol, symbol);
+                assert_eq!(property.type_, prepared.number_type);
+            }
+            assert_eq!(
+                prepared
+                    .fixture
+                    .store
+                    .resolved_own_property(prepared.derived_type, "missing"),
+                Ok(None),
+            );
+            assert_eq!(
+                (
+                    derived_state(&prepared.fixture.store, prepared.derived_type, own),
+                    prepared.fixture.store.type_len(),
+                    prepared.fixture.store.index_info_len(),
+                    prepared.fixture.store.relation_state_snapshot(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_index_reader_accepts_an_empty_inherited_property_table() {
+        let mut prepared = prepare_fixture(fixture_with_source(
+            "interface Base { [key: string]: number; } interface Other { other: number; } \
+             interface Derived extends Base {}",
+            32_181,
+        ));
+        resolve_direct_interface_members(
+            &mut prepared.fixture.store,
+            &prepared.derived_plan,
+            prepared.derived_type,
+            &[],
+            &[prepared.base_type],
+        )
+        .unwrap();
+        let structured = prepared
+            .fixture
+            .store
+            .type_payload(prepared.derived_type)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap();
+        assert!(structured.members.is_none());
+        assert!(structured.properties.is_none());
+        assert_eq!(structured.index_infos.as_deref().unwrap().len(), 1);
+        for _ in 0..2 {
+            assert_eq!(
+                prepared
+                    .fixture
+                    .store
+                    .resolved_own_property(prepared.derived_type, "missing"),
+                Ok(None),
+            );
+        }
+    }
+
+    fn assert_index_reader_rejected(
+        prepared: &mut PreparedFixture,
+        receiver: TypeId,
+        name: &str,
+        damage: &str,
+    ) {
+        let state = |store: &CanonicalTypeMapperStore| {
+            let structured = store
+                .type_payload(receiver)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap();
+            let property = structured.properties.as_ref().unwrap()[0];
+            let entries = store
+                .symbol_table(structured.members.unwrap())
+                .unwrap()
+                .iter()
+                .map(|(name, symbol)| (name.to_owned(), symbol))
+                .collect::<Vec<_>>();
+            let indexes = structured
+                .index_infos
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|index| {
+                    let info = store.index_info(*index).unwrap();
+                    (
+                        *index,
+                        info.key_type(),
+                        info.value_type(),
+                        info.is_readonly(),
+                        info.declaration(),
+                        info.index_symbol(),
+                        info.components().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                derived_state(store, receiver, property),
+                [
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                    store.symbol_store().symbol_table_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                entries,
+                indexes,
+            )
+        };
+        let before = state(&prepared.fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                prepared.fixture.store.resolved_own_property(receiver, name),
+                Err(RelationUnavailable::InvalidStructuredMembers(receiver)),
+                "{damage}",
+            );
+            assert_eq!(state(&prepared.fixture.store), before, "{damage}");
+        }
+    }
+
+    #[test]
+    fn inherited_index_reader_rejects_wrong_inherited_entries_and_table_counts() {
+        for warm in [false, true] {
+            for damage in [
+                "index-copy",
+                "index-metadata",
+                "local-index",
+                "extra-property",
+                "missing-property",
+            ] {
+                let mut prepared = prepare_indexed_reader();
+                let receiver = prepared.derived_type;
+                if warm {
+                    assert!(
+                        prepared
+                            .fixture
+                            .store
+                            .resolved_own_property(receiver, "own")
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                let structured = prepared
+                    .fixture
+                    .store
+                    .type_payload(receiver)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .clone();
+                let members = structured.members.unwrap();
+                let index = structured.index_infos.as_ref().unwrap()[0];
+                let base = prepared
+                    .fixture
+                    .store
+                    .type_payload(prepared.base_type)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap();
+                let index_symbol = prepared
+                    .fixture
+                    .store
+                    .symbol_table(base.members.unwrap())
+                    .unwrap()
+                    .get(InternalSymbolName::Index.as_ref())
+                    .unwrap();
+                match damage {
+                    "index-copy" => {
+                        let info = prepared.fixture.store.index_info(index).unwrap();
+                        let (key, value, readonly, declaration) = (
+                            info.key_type(),
+                            info.value_type(),
+                            info.is_readonly(),
+                            info.declaration(),
+                        );
+                        let wrong = prepared
+                            .fixture
+                            .store
+                            .alloc_index_info(key, value, readonly, declaration, Vec::new())
+                            .unwrap();
+                        assert!(prepared.fixture.store.set_structured_type_members(
+                            receiver,
+                            Some(members),
+                            structured.properties,
+                            None,
+                            None,
+                            Some(vec![wrong]),
+                        ));
+                    }
+                    "index-metadata" => assert!(prepared.fixture.store.set_index_info_symbol(
+                        index,
+                        Some(prepared.derived_plan.properties[0].symbol),
+                    )),
+                    "local-index" => assert_eq!(
+                        prepared.fixture.store.insert_symbol(
+                            members,
+                            EscapedName::internal(InternalSymbolName::Index),
+                            index_symbol,
+                        ),
+                        Some(None),
+                    ),
+                    "extra-property" => {
+                        let other = prepared
+                            .fixture
+                            .store
+                            .type_payload(prepared.other_type)
+                            .unwrap()
+                            .data()
+                            .structured()
+                            .unwrap()
+                            .properties
+                            .as_ref()
+                            .unwrap()[0];
+                        assert_eq!(
+                            prepared.fixture.store.insert_symbol(
+                                members,
+                                EscapedName::source("other"),
+                                other,
+                            ),
+                            Some(None)
+                        );
+                    }
+                    "missing-property" => {
+                        let entries = prepared
+                            .fixture
+                            .store
+                            .symbol_table(members)
+                            .unwrap()
+                            .iter()
+                            .filter(|(name, _)| name.as_utf8() != Some("first"))
+                            .map(|(name, symbol)| (name.to_owned(), symbol))
+                            .collect::<Vec<_>>();
+                        let wrong = prepared.fixture.store.alloc_symbol_table();
+                        for (name, symbol) in entries {
+                            assert_eq!(
+                                prepared.fixture.store.insert_symbol(wrong, name, symbol),
+                                Some(None)
+                            );
+                        }
+                        assert!(prepared.fixture.store.set_structured_type_members(
+                            receiver,
+                            Some(wrong),
+                            structured.properties,
+                            None,
+                            None,
+                            structured.index_infos,
+                        ));
+                    }
+                    _ => unreachable!(),
+                }
+                assert_index_reader_rejected(&mut prepared, receiver, "own", damage);
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_index_reader_keeps_own_index_slots_and_exact_own_tables_required() {
+        for warm in [false, true] {
+            for damage in [
+                "missing-index",
+                "wrong-index",
+                "extra-property",
+                "wrong-property",
+            ] {
+                let mut prepared = prepare_indexed_reader();
+                let receiver = prepared.base_type;
+                if warm {
+                    assert!(
+                        prepared
+                            .fixture
+                            .store
+                            .resolved_own_property(receiver, "first")
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                let structured = prepared
+                    .fixture
+                    .store
+                    .type_payload(receiver)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .clone();
+                let members = structured.members.unwrap();
+                let first = prepared
+                    .fixture
+                    .store
+                    .symbol_table(members)
+                    .unwrap()
+                    .get_source("first")
+                    .unwrap();
+                match damage {
+                    "missing-index" => {
+                        let entries = prepared
+                            .fixture
+                            .store
+                            .symbol_table(members)
+                            .unwrap()
+                            .iter()
+                            .filter(|(name, _)| *name != InternalSymbolName::Index.as_ref())
+                            .map(|(name, symbol)| (name.to_owned(), symbol))
+                            .collect::<Vec<_>>();
+                        let wrong = prepared.fixture.store.alloc_symbol_table();
+                        for (name, symbol) in entries {
+                            assert_eq!(
+                                prepared.fixture.store.insert_symbol(wrong, name, symbol),
+                                Some(None)
+                            );
+                        }
+                        let owner = prepared
+                            .fixture
+                            .store
+                            .type_payload(receiver)
+                            .unwrap()
+                            .symbol()
+                            .unwrap();
+                        assert!(prepared.fixture.store.set_symbol_relationships(
+                            owner,
+                            Some(wrong),
+                            None,
+                            None,
+                            None
+                        ));
+                        assert!(prepared.fixture.store.set_interface_declared_members(
+                            receiver,
+                            true,
+                            Some(wrong),
+                            None,
+                            None,
+                            structured.index_infos.clone(),
+                        ));
+                        assert!(prepared.fixture.store.set_structured_type_members(
+                            receiver,
+                            Some(wrong),
+                            structured.properties,
+                            None,
+                            None,
+                            structured.index_infos,
+                        ));
+                    }
+                    "wrong-index" => {
+                        assert!(
+                            prepared
+                                .fixture
+                                .store
+                                .insert_symbol(
+                                    members,
+                                    EscapedName::internal(InternalSymbolName::Index),
+                                    first,
+                                )
+                                .unwrap()
+                                .is_some()
+                        );
+                    }
+                    "extra-property" => {
+                        let other = prepared
+                            .fixture
+                            .store
+                            .type_payload(prepared.other_type)
+                            .unwrap()
+                            .data()
+                            .structured()
+                            .unwrap()
+                            .properties
+                            .as_ref()
+                            .unwrap()[0];
+                        assert_eq!(
+                            prepared.fixture.store.insert_symbol(
+                                members,
+                                EscapedName::source("other"),
+                                other,
+                            ),
+                            Some(None)
+                        );
+                    }
+                    "wrong-property" => {
+                        let second = prepared
+                            .fixture
+                            .store
+                            .symbol_table(members)
+                            .unwrap()
+                            .get_source("second")
+                            .unwrap();
+                        assert_eq!(
+                            prepared.fixture.store.insert_symbol(
+                                members,
+                                EscapedName::source("first"),
+                                second,
+                            ),
+                            Some(Some(first))
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                assert_index_reader_rejected(&mut prepared, receiver, "first", damage);
+            }
+        }
+    }
+
+    fn prepare_inherited_index_property(key: &str, property: &str) -> PreparedFixture {
+        prepare_fixture(fixture_with_source(
+            &format!(
+                "interface Base {{ [key: {key}]: number; first: number; second: number }} \
+                 interface Other {{ other: number }} \
+                 interface Derived extends Base {{ {property} }}",
+            ),
+            32_180,
+        ))
+    }
+
+    #[test]
+    fn inherited_index_properties_keep_applicable_values_required_and_exact() {
+        for (key, property, compatible) in [
+            ("string", "own: number", true),
+            ("string", "own: string", false),
+            ("string", "own?: number", false),
+            ("number", "own: string", true),
+            ("number", "own?: string", true),
+            ("number", "readonly own: string", true),
+            ("number", "0: number", true),
+            ("number", "0: string", false),
+            ("number", "0?: number", false),
+            ("number", "\"01\": string", true),
+            ("number", "\"-1\": number", true),
+            ("number", "\"-1\": string", false),
+        ] {
+            let mut prepared = prepare_inherited_index_property(key, property);
+            let own = &prepared.derived_plan.properties[0];
+            let property_type = match prepared.fixture.store.source_node_kind(own.type_node) {
+                Some(SyntaxKind::NumberKeyword) => prepared.number_type,
+                Some(SyntaxKind::StringKeyword) => {
+                    prepared
+                        .fixture
+                        .store
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .string_type
+                }
+                _ => unreachable!(),
+            };
+            let own = own.symbol;
+            let expected = if compatible {
+                Ok(prepared.derived_type)
+            } else {
+                Err(PropertyObjectError::UnsupportedMember {
+                    node: prepared.derived_plan.node,
+                    kind: SyntaxKind::InterfaceDeclaration,
+                })
+            };
+            let mut before = derived_state(&prepared.fixture.store, prepared.derived_type, own);
+            for attempt in 0..2 {
+                assert_eq!(
+                    resolve_direct_interface_members(
+                        &mut prepared.fixture.store,
+                        &prepared.derived_plan,
+                        prepared.derived_type,
+                        &[property_type],
+                        &[prepared.base_type],
+                    ),
+                    expected,
+                    "{key}: {property}",
+                );
+                let after = derived_state(&prepared.fixture.store, prepared.derived_type, own);
+                if !compatible || attempt != 0 {
+                    assert_eq!(after, before, "{key}: {property}");
+                }
+                before = after;
+                if compatible {
+                    assert_eq!(
+                        validate_interface_heritage_members(
+                            &prepared.fixture.store,
+                            prepared.derived_type,
+                        ),
+                        InterfaceHeritageMembersValidation::Valid,
+                        "{key}: {property}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_numeric_index_rejects_invalid_own_proofs_before_publication() {
+        for damage in ["name", "optional", "foreign-type", "missing-type"] {
+            let mut prepared = prepare_inherited_index_property("number", "own?: string");
+            let own = prepared.derived_plan.properties[0].symbol;
+            let mut types = vec![
+                prepared
+                    .fixture
+                    .store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .string_type,
+            ];
+            match damage {
+                "name" => prepared.derived_plan.properties[0].name = String::from("01"),
+                "optional" => prepared.derived_plan.properties[0].optional = false,
+                "foreign-type" => {
+                    types[0] = fixture().store.intrinsic_bootstrap().unwrap().string_type;
+                }
+                "missing-type" => types.clear(),
+                _ => unreachable!(),
+            }
+            let before = (
+                derived_state(&prepared.fixture.store, prepared.derived_type, own),
+                prepared.fixture.store.type_len(),
+                prepared.fixture.store.index_info_len(),
+                prepared.fixture.store.checker_link_allocated_lengths(),
+                prepared.fixture.store.relation_state_snapshot(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    resolve_direct_interface_members(
+                        &mut prepared.fixture.store,
+                        &prepared.derived_plan,
+                        prepared.derived_type,
+                        &types,
+                        &[prepared.base_type],
+                    ),
+                    Err(invalid(&prepared.derived_plan, prepared.derived_type)),
+                    "{damage}",
+                );
+                assert_eq!(
+                    (
+                        derived_state(&prepared.fixture.store, prepared.derived_type, own),
+                        prepared.fixture.store.type_len(),
+                        prepared.fixture.store.index_info_len(),
+                        prepared.fixture.store.checker_link_allocated_lengths(),
+                        prepared.fixture.store.relation_state_snapshot(),
+                    ),
+                    before,
+                    "{damage}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_index_construction_review_rejects_warm_own_property_mismatches() {
+        let mut observations = Vec::new();
+        for damage in ["value", "optional"] {
+            let mut prepared = prepare_inherited_index_property("number", "own: string");
+            let own = prepared.derived_plan.properties[0].symbol;
+            let string = prepared
+                .fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .string_type;
+            assert_eq!(
+                resolve_direct_interface_members(
+                    &mut prepared.fixture.store,
+                    &prepared.derived_plan,
+                    prepared.derived_type,
+                    &[string],
+                    &[prepared.base_type],
+                ),
+                Ok(prepared.derived_type)
+            );
+            assert_eq!(
+                validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+                InterfaceHeritageMembersValidation::Valid
+            );
+            if damage == "value" {
+                let mut links = prepared
+                    .fixture
+                    .store
+                    .value_symbol_links(own)
+                    .unwrap()
+                    .clone();
+                links.resolved_type = Some(prepared.number_type);
+                assert!(prepared.fixture.store.set_value_symbol_links(own, links));
+            } else {
+                let record = prepared.fixture.store.symbol(own).unwrap();
+                let (flags, checks) = (record.flags(), record.check_flags());
+                assert!(prepared.fixture.store.set_symbol_flags(
+                    own,
+                    flags | SymbolFlags::OPTIONAL,
+                    checks
+                ));
+            }
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    derived_state(store, prepared.derived_type, own),
+                    store.symbol(own).unwrap().flags(),
+                    store.type_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                )
+            };
+            let before = snapshot(&prepared.fixture.store);
+            for _ in 0..2 {
+                let validation = validate_interface_heritage_members(
+                    &prepared.fixture.store,
+                    prepared.derived_type,
+                );
+                let replay = resolve_direct_interface_members(
+                    &mut prepared.fixture.store,
+                    &prepared.derived_plan,
+                    prepared.derived_type,
+                    &[string],
+                    &[prepared.base_type],
+                );
+                assert_eq!(snapshot(&prepared.fixture.store), before);
+                assert_eq!(
+                    replay,
+                    Err(invalid(&prepared.derived_plan, prepared.derived_type))
+                );
+                observations.push((damage, validation));
+            }
+        }
+        assert!(observations.iter().all(|(_, validation)| *validation == InterfaceHeritageMembersValidation::Malformed), "{observations:#?}");
+    }
+
+    #[test]
+    fn inherited_index_construction_review_rejects_cloned_retained_index_identity() {
+        let mut prepared = prepare_inherited_index_property("number", "own: string");
+        let own = prepared.derived_plan.properties[0].symbol;
+        let string = prepared
+            .fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .string_type;
+        resolve_direct_interface_members(
+            &mut prepared.fixture.store,
+            &prepared.derived_plan,
+            prepared.derived_type,
+            &[string],
+            &[prepared.base_type],
+        )
+        .unwrap();
+        let TypeData::Interface(derived) = prepared
+            .fixture
+            .store
+            .type_payload(prepared.derived_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("the derived type remains an interface")
+        };
+        let structured = &derived.reference.object.structured;
+        let (members, properties, inherited) = (
+            structured.members,
+            structured.properties.clone(),
+            structured.index_infos.as_ref().unwrap()[0],
+        );
+        assert!(derived.declared_index_infos.is_none());
+        let info = prepared.fixture.store.index_info(inherited).unwrap();
+        let (key, value, readonly, declaration, components, symbol) = (
+            info.key_type(),
+            info.value_type(),
+            info.is_readonly(),
+            info.declaration(),
+            info.components().to_vec(),
+            info.index_symbol(),
+        );
+        let copied = prepared
+            .fixture
+            .store
+            .alloc_index_info(key, value, readonly, declaration, components)
+            .unwrap();
+        assert_ne!(copied, inherited);
+        assert!(prepared.fixture.store.set_index_info_symbol(copied, symbol));
+        assert!(prepared.fixture.store.set_structured_type_members(
+            prepared.derived_type,
+            members,
+            properties,
+            None,
+            None,
+            Some(vec![copied]),
+        ));
+        let before = (
+            derived_state(&prepared.fixture.store, prepared.derived_type, own),
+            prepared.fixture.store.type_len(),
+            prepared.fixture.store.index_info_len(),
+            prepared.fixture.store.checker_link_allocated_lengths(),
+            prepared.fixture.store.relation_state_snapshot(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+                InterfaceHeritageMembersValidation::Malformed
+            );
+            assert_eq!(
+                resolve_direct_interface_members(
+                    &mut prepared.fixture.store,
+                    &prepared.derived_plan,
+                    prepared.derived_type,
+                    &[string],
+                    &[prepared.base_type],
+                ),
+                Err(invalid(&prepared.derived_plan, prepared.derived_type))
+            );
+            assert_eq!(
+                (
+                    derived_state(&prepared.fixture.store, prepared.derived_type, own),
+                    prepared.fixture.store.type_len(),
+                    prepared.fixture.store.index_info_len(),
+                    prepared.fixture.store.checker_link_allocated_lengths(),
+                    prepared.fixture.store.relation_state_snapshot(),
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_property_source_contract_rejects_forged_flags_and_annotation_links() {
+        use crate::semantic::TypeNodeLinks;
+
+        for (key, property, damage) in [
+            ("number", "own: string", "readonly"),
+            ("number", "readonly own: string", "readonly"),
+            ("number", "own?: string", "optional"),
+            ("number", "own: string", "annotation"),
+            ("number", "own: string", "annotation-and-value"),
+            ("string", "own: number", "annotation-and-value"),
+            ("none", "readonly own: number", "readonly"),
+            ("none", "own?: number", "optional"),
+            ("none", "own: number", "annotation-and-value"),
+        ] {
+            let mut prepared = if key == "none" {
+                prepare_fixture(fixture_with_source(
+                    &format!(
+                        "interface Base {{ first: number; second: number }} \
+                         interface Other {{ other: number }} \
+                         interface Derived extends Base {{ {property} }}",
+                    ),
+                    32_181,
+                ))
+            } else {
+                prepare_inherited_index_property(key, property)
+            };
+            let own = prepared.derived_plan.properties[0].symbol;
+            let annotation = prepared.derived_plan.properties[0].type_node;
+            let type_ =
+                object_members::cached_planned_type_identity(&prepared.fixture.store, annotation)
+                    .unwrap();
+            let other_type = if type_ == prepared.number_type {
+                prepared
+                    .fixture
+                    .store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .string_type
+            } else {
+                prepared.number_type
+            };
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                &prepared.derived_plan,
+                prepared.derived_type,
+                &[type_],
+                &[prepared.base_type],
+            )
+            .unwrap();
+            assert_eq!(
+                validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+                InterfaceHeritageMembersValidation::Valid,
+                "{key}: {property}",
+            );
+            let record = prepared.fixture.store.symbol(own).unwrap();
+            let (flags, checks) = (record.flags(), record.check_flags());
+            match damage {
+                "readonly" => {
+                    assert!(
+                        prepared.fixture.store.set_source_property_readonly(
+                            own,
+                            !checks.contains(CheckFlags::READONLY),
+                        )
+                    );
+                }
+                "optional" => {
+                    assert!(prepared.fixture.store.set_symbol_flags(
+                        own,
+                        flags.without(SymbolFlags::OPTIONAL),
+                        checks,
+                    ));
+                }
+                "annotation" | "annotation-and-value" => {
+                    assert!(prepared.fixture.store.set_type_node_links(
+                        annotation,
+                        TypeNodeLinks {
+                            resolved_type: Some(other_type),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    if damage == "annotation-and-value" {
+                        assert!(prepared.fixture.store.set_value_symbol_links(
+                            own,
+                            ValueSymbolLinks {
+                                resolved_type: Some(other_type),
+                                ..ValueSymbolLinks::default()
+                            },
+                        ));
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    derived_state(store, prepared.derived_type, own),
+                    store.symbol(own).unwrap().flags(),
+                    store.symbol(own).unwrap().check_flags(),
+                    store.type_node_links(annotation).cloned(),
+                    store.type_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                )
+            };
+            let before = snapshot(&prepared.fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_interface_heritage_members(
+                        &prepared.fixture.store,
+                        prepared.derived_type,
+                    ),
+                    InterfaceHeritageMembersValidation::Malformed,
+                    "{key}: {property}: {damage}",
+                );
+                assert!(
+                    validated_interface_property_by_key(
+                        &prepared.fixture.store,
+                        prepared.derived_type,
+                        EscapedNameRef::source("own"),
+                        None,
+                    )
+                    .is_none()
+                );
+                assert_eq!(snapshot(&prepared.fixture.store), before);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_property_source_contract_checks_retained_value_provenance() {
+        use crate::semantic::{
+            CanonicalCheckerDiagnostics, CanonicalCheckerOptions, TypeNodeLinks,
+            type_nodes::CanonicalTypeQuery,
+        };
+
+        for annotation_source in ["Other", "number | string"] {
+            let mut prepared =
+                prepare_inherited_index_property("number", &format!("own: {annotation_source}"));
+            let own = prepared.derived_plan.properties[0].symbol;
+            let annotation = prepared.derived_plan.properties[0].type_node;
+            let host = host(
+                &prepared.fixture.parsed.arena,
+                prepared.fixture.files.get(&prepared.fixture.file).unwrap(),
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let type_ = CanonicalTypeQuery::new(
+                &mut prepared.fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(annotation)
+            .unwrap();
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                &prepared.derived_plan,
+                prepared.derived_type,
+                &[type_],
+                &[prepared.base_type],
+            )
+            .unwrap();
+            assert_eq!(
+                validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+                InterfaceHeritageMembersValidation::Valid,
+                "{annotation_source}",
+            );
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut prepared.fixture.store,
+                    &host,
+                    CanonicalCheckerOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_of_declared_value(own)
+                .unwrap(),
+                type_,
+            );
+            let provenance = prepared
+                .fixture
+                .store
+                .declared_value_provenance(own)
+                .unwrap();
+            assert!(provenance.is_current(&prepared.fixture.store, own));
+            assert_eq!(
+                validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+                InterfaceHeritageMembersValidation::Valid,
+            );
+            assert_ne!(type_, prepared.number_type);
+            assert!(prepared.fixture.store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(prepared.number_type),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(prepared.fixture.store.set_value_symbol_links(
+                own,
+                ValueSymbolLinks {
+                    resolved_type: Some(prepared.number_type),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    derived_state(store, prepared.derived_type, own),
+                    store.type_node_links(annotation).cloned(),
+                    store.declared_value_provenance(own),
+                    store.type_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                )
+            };
+            let before = snapshot(&prepared.fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_interface_heritage_members(
+                        &prepared.fixture.store,
+                        prepared.derived_type,
+                    ),
+                    InterfaceHeritageMembersValidation::Malformed,
+                    "{annotation_source}",
+                );
+                assert_eq!(snapshot(&prepared.fixture.store), before);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_property_source_contract_checks_parenthesized_annotations() {
+        use crate::semantic::{
+            CanonicalCheckerDiagnostics, CanonicalCheckerOptions, TypeNodeLinks,
+            type_nodes::CanonicalTypeQuery,
+        };
+
+        for annotation_source in ["(string)", "((number))", "(Other)"] {
+            let mut prepared =
+                prepare_inherited_index_property("number", &format!("own: {annotation_source}"));
+            let own = prepared.derived_plan.properties[0].symbol;
+            let annotation = prepared.derived_plan.properties[0].type_node;
+            let host = host(
+                &prepared.fixture.parsed.arena,
+                prepared.fixture.files.get(&prepared.fixture.file).unwrap(),
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let type_ = CanonicalTypeQuery::new(
+                &mut prepared.fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(annotation)
+            .unwrap();
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                &prepared.derived_plan,
+                prepared.derived_type,
+                &[type_],
+                &[prepared.base_type],
+            )
+            .unwrap();
+            assert!(prepared.fixture.store.type_node_links(annotation).is_none());
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_interface_heritage_members(
+                        &prepared.fixture.store,
+                        prepared.derived_type,
+                    ),
+                    InterfaceHeritageMembersValidation::Valid,
+                    "{annotation_source}",
+                );
+            }
+            let wrong = prepared
+                .fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .boolean_type;
+            assert!(prepared.fixture.store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(prepared.fixture.store.set_value_symbol_links(
+                own,
+                ValueSymbolLinks {
+                    resolved_type: Some(wrong),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    derived_state(store, prepared.derived_type, own),
+                    store.type_node_links(annotation).cloned(),
+                    store.type_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                )
+            };
+            let before = snapshot(&prepared.fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_interface_heritage_members(
+                        &prepared.fixture.store,
+                        prepared.derived_type,
+                    ),
+                    InterfaceHeritageMembersValidation::Malformed,
+                    "{annotation_source}",
+                );
+                assert_eq!(snapshot(&prepared.fixture.store), before);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_property_source_contract_preserves_unannotated_any() {
+        let mut fixture = fixture_with_source("interface Base { own; }", 32_182);
+        let owner = interface_symbol(&fixture, "Base");
+        let own = fixture
+            .store
+            .symbol(owner)
+            .and_then(|owner| owner.members())
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("own"))
+            .unwrap();
+        let (any, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.any_type, bootstrap.number_type)
+        };
+        for (type_, valid) in [(any, true), (number, false)] {
+            assert!(fixture.store.set_value_symbol_links(
+                own,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            assert_eq!(valid_property_symbol(&fixture.store, own), valid);
+        }
+    }
+
+    #[test]
+    fn ordinary_property_semantic_review_preserves_unannotated_any_flags() {
+        let mut rejected = Vec::new();
+        for (member, optional, readonly) in [
+            ("own;", false, false),
+            ("own?;", true, false),
+            ("readonly own;", false, true),
+            ("readonly own?;", true, true),
+        ] {
+            let mut fixture =
+                fixture_with_source(&format!("interface Base {{ {member} }}"), 32_186);
+            let owner = interface_symbol(&fixture, "Base");
+            let own = fixture
+                .store
+                .symbol(owner)
+                .and_then(|owner| owner.members())
+                .and_then(|members| fixture.store.symbol_table(members))
+                .and_then(|members| members.get_source("own"))
+                .unwrap();
+            let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+            assert!(fixture.store.set_source_property_readonly(own, readonly));
+            assert!(fixture.store.set_value_symbol_links(
+                own,
+                ValueSymbolLinks {
+                    resolved_type: Some(any),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let record = fixture.store.symbol(own).unwrap();
+            assert_eq!(record.flags().contains(SymbolFlags::OPTIONAL), optional);
+            assert_eq!(
+                record.check_flags().contains(CheckFlags::READONLY),
+                readonly
+            );
+            assert!(
+                fixture
+                    .store
+                    .source_direct_type_annotation(record.value_declaration().unwrap(),)
+                    .is_none()
+            );
+            if !valid_property_symbol(&fixture.store, own) {
+                rejected.push(member);
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "healthy unannotated properties rejected: {rejected:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_property_source_contract_rejects_unannotated_cache_changes() {
+        for (member, optional, readonly, wrong_type) in [
+            ("own;", true, false, false),
+            ("own?;", false, false, false),
+            ("own;", false, true, false),
+            ("readonly own;", false, false, false),
+            ("readonly own?;", false, true, false),
+            ("readonly own?;", true, false, false),
+            ("readonly own?;", true, true, true),
+        ] {
+            let mut fixture =
+                fixture_with_source(&format!("interface Base {{ {member} }}"), 32_187);
+            let owner = interface_symbol(&fixture, "Base");
+            let own = fixture
+                .store
+                .symbol(owner)
+                .and_then(|owner| owner.members())
+                .and_then(|members| fixture.store.symbol_table(members))
+                .and_then(|members| members.get_source("own"))
+                .unwrap();
+            let flags = SymbolFlags::PROPERTY
+                | if optional {
+                    SymbolFlags::OPTIONAL
+                } else {
+                    SymbolFlags::NONE
+                };
+            assert!(fixture.store.set_symbol_flags(own, flags, CheckFlags::NONE));
+            assert!(fixture.store.set_source_property_readonly(own, readonly));
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let type_ = if wrong_type {
+                bootstrap.number_type
+            } else {
+                bootstrap.any_type
+            };
+            assert!(fixture.store.set_value_symbol_links(
+                own,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let state = |store: &CanonicalTypeMapperStore| {
+                (
+                    store.symbol(own).unwrap().flags(),
+                    store.symbol(own).unwrap().check_flags(),
+                    store.value_symbol_links(own).cloned(),
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                )
+            };
+            let before = state(&fixture.store);
+            for _ in 0..2 {
+                assert!(
+                    !valid_property_symbol(&fixture.store, own),
+                    "{member}: optional={optional}, readonly={readonly}, wrong_type={wrong_type}",
+                );
+                assert_eq!(state(&fixture.store), before);
+            }
+        }
     }
 
     #[test]

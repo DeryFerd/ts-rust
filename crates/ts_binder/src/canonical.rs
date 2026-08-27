@@ -768,10 +768,18 @@ impl CanonicalProgramBindings {
     ///
     /// Returns [`CanonicalExtractionError::DeclarationsIncomplete`] while any
     /// file remains in the traversal-only phase.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a completed binding does not belong to its symbol store.
     pub fn try_into_parts(
-        self,
+        mut self,
     ) -> Result<(SymbolStore, BTreeMap<FileId, BoundFile>), CanonicalExtractionError> {
         if self.declarations_complete() {
+            assert!(
+                self.symbols.retain_source_bindings(&self.files),
+                "completed source bindings belong to the canonical symbol store"
+            );
             Ok((self.symbols, self.files))
         } else {
             Err(CanonicalExtractionError::DeclarationsIncomplete)
@@ -11339,6 +11347,112 @@ Merged.fresh = 1;
         let (symbols, files) = program.try_into_parts().unwrap();
         assert_eq!(symbols.id(), store_id);
         assert_eq!(files.len(), 3);
+    }
+
+    #[test]
+    fn extraction_retains_source_symbols_with_exact_node_provenance() {
+        let mut parsed =
+            parse_source_file("export interface Box<T> { value: T; } interface Detached<U> {}");
+        let file = FileId::new(14_711);
+        let interfaces = nodes_of_kind(&parsed.arena, SyntaxKind::InterfaceDeclaration);
+        let declaration = node_ref(&parsed.arena, file, interfaces[0]);
+        let detached = node_ref(&parsed.arena, file, interfaces[1]);
+        let NodeData::SourceFile(source) =
+            &mut parsed.arena.get_mut(parsed.source_file).unwrap().data
+        else {
+            unreachable!()
+        };
+        source.statements.nodes.truncate(1);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/source-bindings.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let program = binder.finish();
+        assert_eq!(
+            program.symbol_store().source_binding_symbols(declaration),
+            None
+        );
+        let (symbols, files) = program.try_into_parts().unwrap();
+        let bound = files.get(&file).unwrap();
+        let pair = [bound.symbol(declaration), bound.local_symbol(declaration)];
+        assert!(pair.iter().all(Option::is_some));
+        assert_ne!(pair[0], pair[1]);
+        assert_eq!(symbols.source_binding_symbols(declaration), Some(pair));
+        for node in bound.traversal_order() {
+            let pair = [bound.symbol(node), bound.local_symbol(node)];
+            assert_eq!(
+                symbols.source_binding_symbols(node),
+                pair.iter().any(Option::is_some).then_some(pair)
+            );
+        }
+
+        let other = parse_source_file("interface Box<T> { value: T; }");
+        for invalid in [
+            detached,
+            NodeRef::new(parsed.arena.id(), FileId::new(14_712), declaration.node),
+            NodeRef::new(other.arena.id(), file, declaration.node),
+            NodeRef::new(
+                parsed.arena.id(),
+                file,
+                NodeId::new(u32::try_from(parsed.arena.len()).unwrap()),
+            ),
+        ] {
+            assert_eq!(symbols.source_binding_symbols(invalid), None);
+        }
+    }
+
+    #[test]
+    fn source_binding_extraction_requires_all_files_to_complete() {
+        let first = parse_source_file("interface First<T> {}");
+        let second = parse_source_file("interface Second<T> {}");
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in [
+            (FileId::new(14_713), &first),
+            (FileId::new(14_714), &second),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/incomplete-bindings.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        binder
+            .bind_typescript_declaration_slice(&first.arena, FileId::new(14_713))
+            .unwrap();
+        let program = binder.finish();
+        assert!(!program.declarations_complete());
+        let first = program.file(FileId::new(14_713)).unwrap();
+        assert!(first.declarations_complete());
+        assert!(
+            first
+                .traversal_order()
+                .any(|node| first.symbol(node).is_some())
+        );
+        for node in first.traversal_order() {
+            assert_eq!(program.symbol_store().source_binding_symbols(node), None);
+        }
+        assert!(program.try_into_parts().is_err());
     }
 
     #[test]

@@ -399,6 +399,7 @@ pub struct SymbolStore {
     tables: Vec<SymbolTable>,
     ast_scopes: BTreeMap<FileId, AstScope>,
     ast_files: BTreeMap<NodeArenaId, FileId>,
+    source_bindings: Option<HashMap<NodeRef, [Option<SemanticSymbolId>; 2]>>,
 }
 
 impl Default for SymbolStore {
@@ -418,6 +419,7 @@ impl SymbolStore {
             tables: Vec::new(),
             ast_scopes: BTreeMap::new(),
             ast_files: BTreeMap::new(),
+            source_bindings: None,
         }
     }
 
@@ -522,6 +524,55 @@ impl SymbolStore {
         self.ast_scopes
             .get(&node.file)
             .is_some_and(|scope| scope.contains(node))
+    }
+
+    /// Returns `[declaration, local]` from completed canonical binding.
+    /// Unbound nodes and nodes without either symbol have no entry.
+    #[must_use]
+    pub fn source_binding_symbols(&self, node: NodeRef) -> Option<[Option<SemanticSymbolId>; 2]> {
+        if !self.contains_node_ref(node) {
+            return None;
+        }
+        let symbols = *self.source_bindings.as_ref()?.get(&node)?;
+        symbols
+            .iter()
+            .flatten()
+            .all(|symbol| self.contains_symbol(*symbol))
+            .then_some(symbols)
+    }
+
+    /// Captures only actual bound symbol slots, once, at checker handoff.
+    pub(crate) fn retain_source_bindings(
+        &mut self,
+        files: &BTreeMap<FileId, crate::canonical::BoundFile>,
+    ) -> bool {
+        if self.source_bindings.is_some()
+            || files.values().any(|file| !file.declarations_complete())
+        {
+            return false;
+        }
+        let mut retained = HashMap::new();
+        for (id, file) in files {
+            if *id != file.file_id() || !self.contains_node_ref(file.source_file()) {
+                return false;
+            }
+            for node in file.traversal_order() {
+                let symbols = [file.symbol(node), file.local_symbol(node)];
+                if !self.contains_node_ref(node)
+                    || symbols
+                        .iter()
+                        .flatten()
+                        .any(|symbol| !self.contains_symbol(*symbol))
+                {
+                    return false;
+                }
+                if symbols.iter().any(Option::is_some) {
+                    retained.insert(node, symbols);
+                }
+            }
+        }
+        self.source_bindings = Some(retained);
+        true
     }
 
     /// Allocates a symbol only after validating every embedded reference.
@@ -856,6 +907,78 @@ mod tests {
                 EscapedName::source(name),
             ))
             .unwrap()
+    }
+
+    #[test]
+    fn retained_source_bindings_check_ownership_and_cannot_be_replaced() {
+        use crate::{
+            CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts,
+            CanonicalSourceLanguage,
+        };
+
+        let parsed =
+            parse_source_file("export interface Box<T> { value: T; } interface Other<U> {}");
+        let file = FileId::new(14_715);
+        let scope = AstScope::new(file, &parsed.arena);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/retained-bindings.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        let incomplete =
+            std::collections::BTreeMap::from([(file, binder.file(file).unwrap().clone())]);
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (mut symbols, files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.get(&file).unwrap();
+        let expected = bound
+            .traversal_order()
+            .filter_map(|node| {
+                let pair = [bound.symbol(node), bound.local_symbol(node)];
+                pair.iter().any(Option::is_some).then_some((node, pair))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(symbols.source_bindings.as_ref(), Some(&expected));
+        assert!(expected.len() < parsed.arena.len());
+
+        let mut foreign = SymbolStore::new();
+        assert!(foreign.register_ast_scope(scope));
+        for _ in 0..symbols.symbol_len() {
+            alloc_source_symbol(&mut foreign, "foreign");
+        }
+        assert!(!foreign.retain_source_bindings(&incomplete));
+        assert!(foreign.source_bindings.is_none());
+        assert!(!foreign.retain_source_bindings(&files));
+        assert!(foreign.source_bindings.is_none());
+        assert!(!symbols.retain_source_bindings(&files));
+        assert!(symbols.register_ast_scope(scope));
+
+        let parameters = bound
+            .traversal_order()
+            .filter(|node| parsed.arena.get(node.node).unwrap().kind == SyntaxKind::TypeParameter)
+            .collect::<Vec<_>>();
+        assert_eq!(parameters.len(), 2);
+        let first = bound.symbol(parameters[0]).unwrap();
+        let second = bound.symbol(parameters[1]).unwrap();
+        let other_parent = symbols.symbol(second).unwrap().parent();
+        assert!(symbols.set_symbol_declarations(first, Some(vec![parameters[1]]), None));
+        assert!(symbols.set_symbol_relationships(first, None, None, other_parent, None));
+        for (node, pair) in expected {
+            assert_eq!(symbols.source_binding_symbols(node), Some(pair));
+            assert_eq!(foreign.source_binding_symbols(node), None);
+        }
+        assert_eq!(bound.symbol(parameters[0]), Some(first));
+        assert_eq!(bound.symbol(parameters[1]), Some(second));
     }
 
     #[test]

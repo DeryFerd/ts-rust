@@ -5517,15 +5517,16 @@ impl<'store> RelaterSession<'store> {
         }))
     }
 
+    /// The flag requires a local index-symbol slot, not merely an index record.
     fn validated_declared_index_infos(
         &mut self,
         type_id: TypeId,
         owner: Option<SemanticSymbolId>,
         structured: &StructuredTypeData,
-    ) -> Result<Vec<IndexInfoId>, RelationUnavailable> {
+    ) -> Result<(Vec<IndexInfoId>, bool), RelationUnavailable> {
         let indexes = structured.index_infos.as_deref().unwrap_or_default();
         if indexes.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         let [index] = indexes else {
             return Err(RelationUnavailable::StructuredIndexInfos(type_id));
@@ -5549,6 +5550,37 @@ impl<'store> RelaterSession<'store> {
                 !info.components().is_empty(),
             )
         };
+        let symbol_key = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?
+            .es_symbol_type;
+        let supported_key = key_type == self.bootstrap.string_type
+            || key_type == self.bootstrap.number_type
+            || key_type == symbol_key
+            || is_template_pattern_index_key(self.store, key_type);
+        if self.store.source_node_kind(declaration) != Some(SyntaxKind::IndexSignature)
+            || !supported_key
+            || self.store.type_payload(value_type).is_none()
+            || has_index_symbol
+            || has_components
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+        }
+        if let Some(heritage) = self.store.direct_interface_heritage_provenance(type_id) {
+            if heritage.owner_symbol != owner
+                || self
+                    .store
+                    .type_payload(type_id)
+                    .and_then(|record| record.data().structured())
+                    != Some(structured)
+                || validate_interface_heritage_members(self.store, type_id)
+                    != InterfaceHeritageMembersValidation::Valid
+            {
+                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+            }
+            return Ok((vec![*index], false));
+        }
         let (owner_flags, owner_members, owner_declarations) = {
             let owner_record = self
                 .store
@@ -5587,28 +5619,14 @@ impl<'store> RelaterSession<'store> {
             .store
             .symbol(index_symbol)
             .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
-        let symbol_key = self
-            .store
-            .intrinsic_bootstrap()
-            .ok_or(RelationUnavailable::MissingBootstrap)?
-            .es_symbol_type;
         let declaration_parent = self.store.source_node_parent(declaration);
-        let supported_key = key_type == self.bootstrap.string_type
-            || key_type == self.bootstrap.number_type
-            || key_type == symbol_key
-            || is_template_pattern_index_key(self.store, key_type);
         if !validated_class
             && owner_flags != SymbolFlags::TYPE_LITERAL
             && owner_flags & SymbolFlags::TYPE != SymbolFlags::INTERFACE
             || owner_members != Some(members)
-            || self.store.source_node_kind(declaration) != Some(SyntaxKind::IndexSignature)
             || !owner_declarations.iter().any(|owner_declaration| {
                 declaration_parent == Some(SourceNodeParent::Parent(*owner_declaration))
             })
-            || !supported_key
-            || self.store.type_payload(value_type).is_none()
-            || has_index_symbol
-            || has_components
             || index_record.flags() != SymbolFlags::SIGNATURE
             || index_record.check_flags() != CheckFlags::NONE
             || index_record.name() != InternalSymbolName::Index.as_ref()
@@ -5624,7 +5642,7 @@ impl<'store> RelaterSession<'store> {
         {
             return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
         }
-        Ok(vec![*index])
+        Ok((vec![*index], true))
     }
 
     fn resolved_object_members(
@@ -5811,7 +5829,7 @@ impl<'store> RelaterSession<'store> {
         {
             return Err(RelationUnavailable::UnsupportedProperty(readonly));
         }
-        let index_infos =
+        let (index_infos, has_index_member) =
             self.validated_declared_index_infos(type_id, record_symbol, &structured)?;
         let class_members = if property_origin.is_declared() {
             validate_class_heritage_members(self.store, type_id)
@@ -5934,7 +5952,13 @@ impl<'store> RelaterSession<'store> {
         match structured.members {
             None if properties.is_empty()
                 && (property_origin.is_declared()
-                    || matches!(property_origin, ObjectPropertyOrigin::GenericReference(_))) => {}
+                    || matches!(property_origin, ObjectPropertyOrigin::GenericReference(_))
+                    || !has_index_member
+                        && !index_infos.is_empty()
+                        && matches!(
+                            property_origin,
+                            ObjectPropertyOrigin::InterfaceHeritage(_)
+                        )) => {}
             None => return Err(RelationUnavailable::InvalidStructuredMembers(type_id)),
             Some(members) => {
                 self.observe_symbol_table(members);
@@ -5942,11 +5966,11 @@ impl<'store> RelaterSession<'store> {
                     .store
                     .symbol_table(members)
                     .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
-                if table.len() != properties.len() + usize::from(!index_infos.is_empty()) {
+                if table.len() != properties.len() + usize::from(has_index_member) {
                     return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                 }
                 for (name, property) in table.iter() {
-                    if !index_infos.is_empty() && name == InternalSymbolName::Index.as_ref() {
+                    if has_index_member && name == InternalSymbolName::Index.as_ref() {
                         continue;
                     }
                     if property_names
