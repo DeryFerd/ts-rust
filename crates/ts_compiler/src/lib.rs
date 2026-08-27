@@ -16648,6 +16648,150 @@ mod tests {
     }
 
     #[test]
+    fn review_helper_compiler_callable_variables_keep_public_diagnostic_ownership() {
+        let callable = "(a: unknown, b: unknown, c: unknown, d: unknown) => Missing";
+        for through_type_only_alias in [false, true] {
+            let declarations = if through_type_only_alias {
+                "export type { helper as __classPrivateFieldGet } from './helpers';".to_owned()
+            } else {
+                format!("export declare const __classPrivateFieldGet: {callable};")
+            };
+            let fs = private_write_helper_files(PRIVATE_HELPER_READ_SOURCE, Some(&declarations));
+            fs.write_file("/project/globals.d.ts", PRIVATE_HELPER_GLOBALS)
+                .unwrap();
+            let helper_path = if through_type_only_alias {
+                let path = "/project/node_modules/tslib/helpers.d.ts";
+                fs.write_file(path, &format!("export declare const helper: {callable};"))
+                    .unwrap();
+                path
+            } else {
+                "/project/node_modules/tslib/tslib.d.ts"
+            };
+            let start =
+                u32::try_from(PRIVATE_HELPER_READ_SOURCE.find("this.#value").unwrap()).unwrap();
+            let expected_range = TextRange::new(TextPos::new(start), TextPos::new(start + 11));
+            let (program, snapshot) = Program::try_new_with_canonical_checker_and_queries(
+                &fs,
+                "/project",
+                &["globals.d.ts".to_owned(), "input.ts".to_owned()],
+                CompilerOptions {
+                    no_emit: true,
+                    skip_lib_check: true,
+                    ..private_write_helper_options()
+                },
+                |program, queries| {
+                    let helper = program.source_file(helper_path).unwrap();
+                    let annotation = helper
+                        .parse
+                        .arena
+                        .iter()
+                        .find_map(|(_, record)| {
+                            let NodeData::VariableDeclaration(variable) = &record.data else {
+                                return None;
+                            };
+                            variable.type_.and_then(|node| helper.node_ref(node))
+                        })
+                        .unwrap();
+                    assert!(
+                        queries
+                            .context
+                            .store()
+                            .type_node_links(annotation)
+                            .is_none()
+                    );
+                    let cold = queries.cold_diagnostic_snapshot();
+                    assert_eq!(cold.len(), 1, "{declarations}: {cold:?}");
+                    assert_eq!(cold[0].code, Some(2807));
+                    assert_eq!(cold[0].file_name.as_deref(), Some("/project/input.ts"));
+                    assert_eq!(cold[0].range, Some(expected_range));
+                    assert_eq!(
+                        cold[0].message,
+                        concat!(
+                            "This syntax requires an imported helper named '__classPrivateFieldGet' with 4 ",
+                            "parameters, which is not compatible with the one in 'tslib'. ",
+                            "Consider upgrading your version of 'tslib'.",
+                        )
+                    );
+                    assert_eq!(queries.replay_sources().unwrap(), cold);
+                    assert_eq!(queries.cold_diagnostic_snapshot(), cold);
+                    assert!(
+                        queries
+                            .context
+                            .store()
+                            .type_node_links(annotation)
+                            .is_none()
+                    );
+                    cold
+                },
+            )
+            .unwrap();
+            assert_eq!(snapshot.as_deref(), Some(program.diagnostics()));
+        }
+    }
+
+    #[test]
+    fn review_helper_compiler_incompatible_values_do_not_publish_partial_diagnostics() {
+        let program = private_helper_composition_program(
+            PRIVATE_HELPER_COMPOUND_SOURCE,
+            concat!(
+                "export declare const __classPrivateFieldSet: ",
+                "(a: unknown, b: unknown, c: unknown, d: unknown, e: unknown) => Missing; ",
+                "export declare function __classPrivateFieldGet(this: object, ",
+                "a: unknown, b: unknown, c: unknown, d: unknown): unknown;",
+            ),
+            &[],
+        );
+        let source = program.source_file("/project/input.ts").unwrap();
+        let target = program
+            .source_file("/project/node_modules/tslib/tslib.d.ts")
+            .unwrap();
+        let requirements = program.canonical_external_helper_requirements(source);
+        assert_eq!(requirements[0].1, "__classPrivateFieldSet");
+        assert_eq!(requirements[1].1, "__classPrivateFieldGet");
+        let mut context = private_write_helper_context(&program);
+        let (_, bound) = context.file(target.id).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let negative = program
+            .private_import_helper_diagnostic(
+                source,
+                requirements[0].0,
+                super::PrivateImportHelper::Set,
+                module,
+                &mut context,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(negative.code, Some(2807));
+        let sentinel = super::ProgramDiagnostic {
+            file_name: None,
+            range: None,
+            code: Some(1234),
+            category: ts_diagnostics::Category::Error,
+            message: "existing diagnostic".to_owned(),
+            related_information: Vec::new(),
+        };
+        for _ in 0..2 {
+            let mut diagnostics = vec![sentinel.clone()];
+            let error = program
+                .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
+                .unwrap_err();
+            assert!(matches!(
+                &error,
+                super::CanonicalProgramCheckError::ImportHelper { error, .. }
+                    if matches!(error.as_ref(), super::CanonicalImportHelperError::Signature(_))
+            ));
+            assert_eq!(
+                error.failure_class(),
+                super::CanonicalProgramCheckFailureClass::Unsupported {
+                    capability_code: "T06.IMPORT_HELPER_SIGNATURE",
+                }
+            );
+            assert_eq!(diagnostics, [sentinel.clone()]);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
     fn canonical_private_helpers_retain_alias_cycle_events() {
         let program = private_helper_composition_program(
             PRIVATE_HELPER_COMPOUND_SOURCE,
