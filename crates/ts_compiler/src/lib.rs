@@ -14550,7 +14550,7 @@ mod tests {
                 "/project",
                 &roots,
                 CompilerOptions {
-                    allow_js: input.ends_with(".js"),
+                    allow_js: input == "input.js",
                     ..canonical_source_order_options()
                 },
                 super::ProgramChecker::Canonical,
