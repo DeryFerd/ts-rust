@@ -54,7 +54,7 @@ use super::{
         validate_stored_source_callable,
     },
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
-    store::SourceNodeParent,
+    store::{SourceCallableFamily, SourceNodeParent},
     structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
     symbol_display::{self, SymbolDisplayContext, SymbolDisplayError},
     tuple_types::TupleShape,
@@ -1762,24 +1762,34 @@ fn display_validated_module_namespace(
     record: &TypeRecord,
     state: &mut DisplayState,
 ) -> Result<Option<String>, TypeDisplayUnavailable> {
+    let source_function = store
+        .source_callable_provenance(type_id)
+        .is_some_and(|provenance| provenance.family == SourceCallableFamily::FunctionDeclaration);
     let Some(owner) = record.symbol() else {
-        return Ok(None);
+        return if source_function {
+            Err(TypeDisplayUnavailable::MalformedType(type_id))
+        } else {
+            Ok(None)
+        };
     };
     let owner_record = store
         .symbol(owner)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-    if !owner_record.flags().intersects(SymbolFlags::MODULE) {
+    let module_owner = owner_record.flags().intersects(SymbolFlags::MODULE);
+    if !module_owner && !source_function {
         return Ok(None);
     }
     let TypeData::Object(object) = record.data() else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     };
-    // Type-only namespace merges retain the source function's validated display.
-    if owner_record.flags() == SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE
-        && single_callable_family(store, type_id) == Some(CallableFamily::FunctionDeclaration)
-    {
-        validate_type_only_namespace_function_owner(store, host, type_id, owner, owner_record)?;
-        return Ok(None);
+    if source_function {
+        // The retained origin survives removal of namespace flags and declarations.
+        validate_source_function_namespace_origin(store, host, type_id, owner, owner_record)?;
+        if !module_owner
+            || owner_record.flags() == SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE
+        {
+            return Ok(None);
+        }
     }
     if let Some(&declaration) = owner_record.declarations().and_then(|nodes| nodes.first())
         && let Some(NodeData::ModuleDeclaration(module)) =
@@ -1920,7 +1930,7 @@ fn display_validated_module_namespace(
     )))
 }
 
-fn validate_type_only_namespace_function_owner(
+fn validate_source_function_namespace_origin(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     type_id: TypeId,
@@ -7877,6 +7887,12 @@ mod tests {
     #[test]
     fn type_only_namespace_function_display_preserves_signature_and_identity() {
         for (index, (source, external, expected)) in [
+            ("declare function callable(): void;", false, "() => void"),
+            (
+                "declare function callable(value: string): number;",
+                false,
+                "(value: string) => number",
+            ),
             (
                 "declare function callable(): void; declare namespace callable {}",
                 false,
@@ -8035,7 +8051,8 @@ mod tests {
             let file = FileId::new(235 + u32::try_from(index).unwrap());
             let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
             context.check_source_file(file).unwrap();
-            let (_, owner, callable) = namespace_function_display_parts(&context, &parsed, file);
+            let (declaration, owner, callable) =
+                namespace_function_display_parts(&context, &parsed, file);
             assert_eq!(
                 context.store().symbol(owner).unwrap().flags(),
                 SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
@@ -8050,6 +8067,56 @@ mod tests {
             assert_malformed_display_without_writes(&context, callable);
             hide_namespace_value_exports(&mut context, owner);
             assert_malformed_display_without_writes(&context, callable);
+            assert!(context.store_mut_for_test().set_symbol_flags(
+                owner,
+                SymbolFlags::FUNCTION,
+                CheckFlags::NONE,
+            ));
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                owner,
+                Some(vec![declaration]),
+                Some(declaration),
+            ));
+            assert_malformed_display_without_writes(&context, callable);
+        }
+    }
+
+    #[test]
+    fn namespace_origin_display_rejects_changed_callable_caches() {
+        for source in [
+            "declare function callable(): void;",
+            "declare function callable(): void; declare namespace callable {}",
+        ] {
+            for corrupt_signature in [false, true] {
+                let parsed = parse_source_file(source);
+                let file = FileId::new(240);
+                let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+                context.check_source_file(file).unwrap();
+                let (_, _, callable) = namespace_function_display_parts(&context, &parsed, file);
+                assert_eq!(context.type_to_string(callable).unwrap(), "() => void");
+                let signature = context
+                    .store()
+                    .source_callable_provenance(callable)
+                    .unwrap()
+                    .signature;
+                if corrupt_signature {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_flags(signature, SignatureFlags::CONSTRUCT)
+                    );
+                } else {
+                    assert!(context.store_mut_for_test().set_structured_type_members(
+                        callable,
+                        None,
+                        Some(Vec::new()),
+                        Some(vec![signature]),
+                        None,
+                        None,
+                    ));
+                }
+                assert_malformed_display_without_writes(&context, callable);
+            }
         }
     }
 
