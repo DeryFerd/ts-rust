@@ -177,7 +177,6 @@ fn default_mode_records_direct_reads_without_new_existence_probes() {
             FsCall::ReadFile("/app/src/package.json".to_owned()),
             FsCall::ReadFile("/app/package.json".to_owned()),
             FsCall::FileExists("/app/src/value.ts".to_owned()),
-            FsCall::Realpath("/app/src/value.ts".to_owned()),
         ]
     );
 }
