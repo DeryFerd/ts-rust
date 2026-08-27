@@ -28,6 +28,7 @@ fn write_files(filesystem: &MemoryFileSystem, files: &[(&str, &str)]) {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep raw-route, ambient-identity, and replay checks together.
 fn canonical_module_targets_prefer_ambient_node_types_over_an_elided_javascript_package() {
     let filesystem = MemoryFileSystem::new(true);
     write_files(
