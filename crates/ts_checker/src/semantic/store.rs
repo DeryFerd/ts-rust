@@ -51,10 +51,13 @@ use super::{
         TypePredicateArena, TypePredicateKind,
     },
     source_callables::{
+        SourceCallableAliasAnnotation, SourceCallableAliasSnapshot,
         SourceCallableTypeParameterSyntaxProof, source_type_parameter_default_is_assignable,
     },
     source_namespaces::ModuleValueIdentity,
-    type_nodes::{ConstructorAnnotationProof, UnionAliasInstantiationProof},
+    type_nodes::{
+        ConstructorAnnotationProof, SourceCallableAliasResolution, UnionAliasInstantiationProof,
+    },
     type_records::{
         CacheHashKey, ConditionalRoot, ConstrainedTypeData, LiteralValue, TypeAlias,
         TypeCacheState, TypeData, TypeRecord, type_list_key,
@@ -518,6 +521,14 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     constructor_annotation_bindings: HashMap<NodeRef, SemanticSymbolId>,
     declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
+    source_callable_alias_annotations: HashMap<
+        NodeRef,
+        (
+            SourceCallableAliasAnnotation,
+            Option<SourceCallableAliasResolution>,
+        ),
+    >,
+    source_callable_alias_owners: HashMap<SemanticSymbolId, NodeRef>,
     source_jsdoc_typedefs: HashMap<TypeId, SourceJsDocTypedefIdentity>,
     source_jsdoc_callbacks: HashMap<TypeId, SourceJsDocCallbackIdentity>,
     source_callable_types_by_declaration: HashMap<NodeRef, TypeId>,
@@ -651,6 +662,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             constructor_annotation_bindings: HashMap::new(),
             declared_value_provenance: HashMap::new(),
             source_callable_provenance: HashMap::new(),
+            source_callable_alias_annotations: HashMap::new(),
+            source_callable_alias_owners: HashMap::new(),
             source_jsdoc_typedefs: HashMap::new(),
             source_jsdoc_callbacks: HashMap::new(),
             source_callable_types_by_declaration: HashMap::new(),
@@ -2669,6 +2682,51 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     ) -> Option<SourceCallableProvenance> {
         self.observe_relation_type_read(type_);
         self.source_callable_provenance.get(&type_).copied()
+    }
+
+    pub(super) fn source_callable_alias_annotation(
+        &self,
+        annotation: NodeRef,
+    ) -> Option<&SourceCallableAliasAnnotation> {
+        self.observe_relation_node_read(annotation);
+        self.source_callable_alias_annotations
+            .get(&annotation)
+            .map(|(proof, _)| proof)
+    }
+
+    pub(super) fn source_callable_alias_parameter_annotation(
+        &self,
+        parameter: SemanticSymbolId,
+    ) -> Option<NodeRef> {
+        self.observe_relation_symbol_read(parameter);
+        self.source_callable_alias_owners.get(&parameter).copied()
+    }
+
+    pub(super) fn source_callable_alias_resolution_matches(
+        &self,
+        proof: &SourceCallableAliasAnnotation,
+        resolution: &SourceCallableAliasSnapshot,
+    ) -> bool {
+        self.observe_relation_node_read(proof.annotation());
+        self.source_callable_alias_annotations
+            .get(&proof.annotation())
+            .is_none_or(|(expected, recorded)| {
+                expected == proof
+                    && recorded
+                        .as_ref()
+                        .is_none_or(|recorded| recorded.snapshot() == resolution)
+            })
+    }
+
+    pub(super) fn source_callable_alias_resolution(
+        &self,
+        annotation: NodeRef,
+    ) -> Option<&SourceCallableAliasResolution> {
+        self.observe_relation_node_read(annotation);
+        self.source_callable_alias_annotations
+            .get(&annotation)?
+            .1
+            .as_ref()
     }
 
     #[cfg(test)]
@@ -7661,6 +7719,31 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 }
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
+    pub(super) fn record_source_callable_alias_resolution(
+        &mut self,
+        annotation: NodeRef,
+        resolution: SourceCallableAliasResolution,
+    ) -> bool {
+        if resolution.annotation() != annotation || !resolution.is_exact(self) {
+            return false;
+        }
+        let Some((proof, recorded)) = self.source_callable_alias_annotations.get_mut(&annotation)
+        else {
+            return false;
+        };
+        if proof != resolution.proof() {
+            return false;
+        }
+        if let Some(recorded) = recorded {
+            return recorded == &resolution;
+        }
+        *recorded = Some(resolution);
+        if self.relation_observable_nodes.contains(&annotation) {
+            self.mark_relation_inputs_dirty();
+        }
+        true
+    }
+
     /// Publishes the canonical late-bound symbol for one computed property or method.
     ///
     /// The declaration must retain its binder-owned `__computed` property,
@@ -8743,6 +8826,52 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                         .is_some_and(|bootstrap| self.types.get(bootstrap.void_type).is_some())
             }
         };
+        let mut alias_nodes = HashSet::new();
+        let mut alias_owners = HashSet::new();
+        let alias_annotations_valid = prepared.syntax.alias_annotations().iter().all(|alias| {
+            alias_nodes.insert(alias.annotation())
+                && alias_owners.insert(alias.owner())
+                && alias.source_is_exact(self)
+                && !self
+                    .source_callable_alias_annotations
+                    .contains_key(&alias.annotation())
+                && !self
+                    .source_callable_alias_owners
+                    .contains_key(&alias.owner())
+                && (prepared.return_annotation == Some(alias.annotation())
+                    || prepared.parameters.iter().any(|parameter| {
+                        self.symbol(*parameter)
+                            .and_then(Symbol::value_declaration)
+                            .is_some_and(|declaration| {
+                                self.source_return_annotation_belongs_to(
+                                    declaration,
+                                    alias.annotation(),
+                                )
+                            })
+                    }))
+                && (alias.owner() == prepared.owner_symbol && alias.has_cold_value(self)
+                    || prepared
+                        .syntax
+                        .alias_resolutions()
+                        .iter()
+                        .any(|resolution| resolution.proof() == alias && resolution.is_exact(self)))
+        });
+        let alias_resolutions_valid =
+            prepared
+                .syntax
+                .alias_resolutions()
+                .iter()
+                .all(|resolution| {
+                    prepared
+                        .syntax
+                        .alias_annotations()
+                        .contains(resolution.proof())
+                        && resolution.is_exact(self)
+                        && resolution.parameters().iter().copied().eq(prepared
+                            .type_parameters
+                            .iter()
+                            .map(|parameter| parameter.provenance.type_parameter))
+                });
         let has_rest_parameter = prepared.flags == SignatureFlags::HAS_REST_PARAMETER;
         let minimum_argument_count_valid =
             usize::try_from(prepared.min_argument_count).is_ok_and(|minimum| {
@@ -8783,6 +8912,8 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             || !owner_links_cold
             || !signature_links_cold
             || !return_annotation_valid
+            || !alias_annotations_valid
+            || !alias_resolutions_valid
             || !generic_return_type_parameter_valid
             || prepared
                 .export_local
@@ -8824,6 +8955,8 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             .iter()
             .map(|row| row.provenance)
             .collect::<Box<[_]>>();
+        let alias_annotations = prepared.syntax.alias_annotations().to_vec();
+        let alias_resolutions = prepared.syntax.alias_resolutions().to_vec();
         let type_parameter_ids = prepared
             .type_parameters
             .iter()
@@ -8838,6 +8971,14 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             ))
             || !self.links.signature.try_reserve(1)
             || !self.links.value_symbol.try_reserve(value_link_reservations)
+            || self
+                .source_callable_alias_annotations
+                .try_reserve(alias_annotations.len())
+                .is_err()
+            || self
+                .source_callable_alias_owners
+                .try_reserve(alias_annotations.len())
+                .is_err()
         {
             return None;
         }
@@ -8877,6 +9018,22 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .insert(signature, provenance_rows)
                 .is_none()
         );
+        for alias in alias_annotations {
+            let resolution = alias_resolutions
+                .iter()
+                .find(|resolution| resolution.annotation() == alias.annotation())
+                .cloned();
+            assert!(
+                self.source_callable_alias_owners
+                    .insert(alias.owner(), alias.annotation())
+                    .is_none()
+            );
+            assert!(
+                self.source_callable_alias_annotations
+                    .insert(alias.annotation(), (alias, resolution))
+                    .is_none()
+            );
+        }
         let provenance = SourceCallableProvenance {
             family: prepared.family,
             declaration: prepared.declaration,
@@ -8964,7 +9121,11 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             syntax.generic_fixed_return_is_exact(),
         ) {
             (None, None, true) => {
-                self.source_node_kind(annotation) != Some(SyntaxKind::TypeReference)
+                syntax
+                    .alias_annotations()
+                    .iter()
+                    .any(|alias| alias.annotation() == annotation && alias.source_is_exact(self))
+                    || self.source_node_kind(annotation) != Some(SyntaxKind::TypeReference)
                     || self.source_named_generic_return_annotation_is_exact(annotation, resolved)
             }
             (Some(declaration), Some(type_parameter), false) => {

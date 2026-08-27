@@ -199,6 +199,220 @@ pub(super) struct SourceCallableTypeParameterSyntaxProof {
     generic_return_type_parameter_declaration: Option<NodeRef>,
     generic_fixed_return_is_exact: bool,
     inferred_empty_body_is_exact: bool,
+    alias_annotations: Box<[SourceCallableAliasAnnotation]>,
+    alias_resolutions: Box<[super::type_nodes::SourceCallableAliasResolution]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceCallableAliasDeclaration {
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    body: NodeRef,
+    parent: Option<SemanticSymbolId>,
+    parameters: Box<[(NodeRef, SemanticSymbolId)]>,
+}
+
+/// Source-owned alias edges. Canonical type queries resolve the alias bodies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableAliasAnnotation {
+    annotation: NodeRef,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    declarations: Box<[SourceCallableAliasDeclaration]>,
+    arguments: Box<[(NodeRef, SemanticSymbolId)]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableAliasSnapshot {
+    result: TypeId,
+    declarations: Box<[(TypeId, Box<[TypeId]>)]>,
+    arguments: Box<[TypeId]>,
+}
+
+impl SourceCallableAliasSnapshot {
+    pub(super) const fn result(&self) -> TypeId {
+        self.result
+    }
+}
+
+impl SourceCallableAliasAnnotation {
+    pub(super) const fn annotation(&self) -> NodeRef {
+        self.annotation
+    }
+
+    pub(super) const fn owner(&self) -> SemanticSymbolId {
+        self.owner
+    }
+
+    pub(super) fn has_cold_value<MapperPayload>(
+        &self,
+        store: &SemanticStore<TypeRecord, MapperPayload>,
+    ) -> bool {
+        store
+            .type_node_links(self.annotation)
+            .is_none_or(|links| links == &TypeNodeLinks::default())
+            && store
+                .symbol_node_links(self.annotation)
+                .is_none_or(|links| {
+                    links == &SymbolNodeLinks::default()
+                        || links.resolved_symbol
+                            == self.declarations.first().map(|alias| alias.symbol)
+                })
+    }
+
+    pub(super) fn source_is_exact<MapperPayload>(
+        &self,
+        store: &SemanticStore<TypeRecord, MapperPayload>,
+    ) -> bool {
+        !self.declarations.is_empty()
+            && store.source_node_kind(self.annotation) == Some(SyntaxKind::TypeReference)
+            && store.symbol(self.owner).is_some_and(|owner| {
+                owner.declarations() == Some(&[self.owner_declaration])
+                    && owner.value_declaration() == Some(self.owner_declaration)
+                    && store.get_merged_symbol(self.owner) == Some(self.owner)
+            })
+            && self.declarations.iter().all(|alias| {
+                store.symbol(alias.symbol).is_some_and(|symbol| {
+                    symbol.flags() == SymbolFlags::TYPE_ALIAS
+                        && symbol.check_flags() == CheckFlags::NONE
+                        && symbol.declarations() == Some(&[alias.declaration])
+                        && symbol.value_declaration().is_none()
+                        && symbol.parent() == alias.parent
+                        && symbol.members().is_none()
+                        && symbol.exports().is_none()
+                        && symbol.export_symbol().is_none()
+                        && store.get_merged_symbol(alias.symbol) == Some(alias.symbol)
+                        && store.source_node_kind(alias.declaration)
+                            == Some(SyntaxKind::TypeAliasDeclaration)
+                        && store.source_node_parent(alias.body)
+                            == Some(SourceNodeParent::Parent(alias.declaration))
+                }) && alias.parameters.iter().all(|(declaration, symbol)| {
+                    store.symbol(*symbol).is_some_and(|record| {
+                        record.flags() == SymbolFlags::TYPE_PARAMETER
+                            && record.check_flags() == CheckFlags::NONE
+                            && record.declarations() == Some(&[*declaration])
+                            && store.get_merged_symbol(*symbol) == Some(*symbol)
+                            && store.source_node_parent(*declaration)
+                                == Some(SourceNodeParent::Parent(alias.declaration))
+                    })
+                })
+            })
+    }
+
+    pub(super) fn snapshot<MapperPayload>(
+        &self,
+        store: &SemanticStore<TypeRecord, MapperPayload>,
+        type_parameters: &[TypeId],
+    ) -> Option<SourceCallableAliasSnapshot> {
+        if !self.source_is_exact(store) {
+            return None;
+        }
+        let mut declarations = Vec::with_capacity(self.declarations.len());
+        for alias in &self.declarations {
+            let links = store.type_alias_links(alias.symbol)?;
+            let declared = links.declared_type?;
+            let parameters = links.type_parameters.as_deref().unwrap_or_default();
+            if links.is_constructor_declared_property
+                || if alias.parameters.is_empty() {
+                    links.type_parameters.is_some() || links.instantiations.is_some()
+                } else {
+                    links
+                        .instantiations
+                        .as_ref()
+                        .and_then(|entries| entries.get(&type_list_key(parameters)))
+                        != Some(&declared)
+                }
+                || parameters.len() != alias.parameters.len()
+                || parameters
+                    .iter()
+                    .zip(&alias.parameters)
+                    .any(|(type_, (_, symbol))| {
+                        !source_alias_parameter_identity_is_exact(store, *type_, *symbol)
+                    })
+                || store.type_node_links(alias.body)
+                    != Some(&TypeNodeLinks {
+                        resolved_type: Some(declared),
+                        outer_type_parameters: None,
+                    })
+                    && !store.source_type_node_result_is_exact(alias.body, declared, &[])
+            {
+                return None;
+            }
+            declarations.push((declared, parameters.to_vec().into_boxed_slice()));
+        }
+        let arguments = self
+            .arguments
+            .iter()
+            .map(|(node, symbol)| {
+                let type_ = store.declared_type_links(*symbol)?.declared_type?;
+                (type_parameters.contains(&type_)
+                    && source_alias_parameter_identity_is_exact(store, type_, *symbol)
+                    && source_type_parameter_annotation_links_are_fully_warm(
+                        store, *node, *symbol, type_,
+                    ))
+                .then_some(type_)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let result = store.type_node_links(self.annotation)?.resolved_type?;
+        let root = &self.declarations[0];
+        if store.type_node_links(self.annotation)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(result),
+                outer_type_parameters: None,
+            })
+            || store.symbol_node_links(self.annotation)
+                != Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(root.symbol),
+                })
+            || store
+                .type_alias_links(root.symbol)
+                .and_then(|links| links.instantiations.as_ref())
+                .and_then(|entries| {
+                    entries.get(&super::type_nodes::type_alias_instantiation_cache_key(
+                        &arguments, None,
+                    ))
+                })
+                != Some(&result)
+        {
+            return None;
+        }
+        Some(SourceCallableAliasSnapshot {
+            result,
+            declarations: declarations.into_boxed_slice(),
+            arguments: arguments.into_boxed_slice(),
+        })
+    }
+}
+
+fn source_alias_parameter_identity_is_exact<MapperPayload>(
+    store: &SemanticStore<TypeRecord, MapperPayload>,
+    type_: TypeId,
+    symbol: SemanticSymbolId,
+) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let TypeData::TypeParameter(parameter) = record.data() else {
+        return false;
+    };
+    let computed = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED;
+    record.flags() == TypeFlags::TYPE_PARAMETER
+        && (record.object_flags() == ObjectFlags::NONE || record.object_flags() == computed)
+        && record.symbol() == Some(symbol)
+        && record.alias().is_none()
+        && !parameter.is_this_type
+        && parameter.target.is_none()
+        && parameter.mapper.is_none()
+        && store.symbol(symbol).is_some_and(|symbol| {
+            symbol.flags() == SymbolFlags::TYPE_PARAMETER
+                && symbol.check_flags() == CheckFlags::NONE
+        })
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            == Some(type_)
 }
 
 /// Exact return ownership retained by source planning.
@@ -283,6 +497,14 @@ impl SourceCallableTypeParameterSyntaxProof {
     pub(super) const fn inferred_empty_body_is_exact(&self) -> bool {
         self.inferred_empty_body_is_exact
     }
+
+    pub(super) fn alias_annotations(&self) -> &[SourceCallableAliasAnnotation] {
+        &self.alias_annotations
+    }
+
+    pub(super) fn alias_resolutions(&self) -> &[super::type_nodes::SourceCallableAliasResolution] {
+        &self.alias_resolutions
+    }
 }
 
 /// Binder/syntax proof retained across source-callable publication.
@@ -312,6 +534,29 @@ pub(super) struct SourceCallablePlan {
 }
 
 impl SourceCallablePlan {
+    pub(super) fn alias_annotations(&self) -> &[SourceCallableAliasAnnotation] {
+        self.type_parameter_syntax.alias_annotations()
+    }
+
+    pub(super) fn alias_resolutions(&self) -> &[super::type_nodes::SourceCallableAliasResolution] {
+        self.type_parameter_syntax.alias_resolutions()
+    }
+
+    pub(super) fn set_alias_resolutions(
+        &mut self,
+        resolutions: Vec<super::type_nodes::SourceCallableAliasResolution>,
+    ) -> bool {
+        if resolutions.iter().enumerate().any(|(index, resolution)| {
+            !self.alias_annotations().contains(resolution.proof())
+                || resolutions[..index]
+                    .iter()
+                    .any(|previous| previous.annotation() == resolution.annotation())
+        }) {
+            return false;
+        }
+        self.type_parameter_syntax.alias_resolutions = resolutions.into_boxed_slice();
+        true
+    }
     /// Installs a callable `JSDoc` annotation on its authenticated source parameter.
     pub(super) fn set_jsdoc_function_parameter_type(
         &mut self,
@@ -3116,6 +3361,25 @@ fn plan_source_callable_with_owner_shape(
         && !plan.type_parameters.is_empty()
         && plan.generic_return_type_parameter_index.is_none();
     plan.type_parameter_syntax.inferred_empty_body_is_exact = inferred_empty_body_is_exact;
+    if !plan.type_parameters.is_empty() {
+        let mut aliases = Vec::new();
+        for annotation in plan
+            .parameters
+            .iter()
+            .map(|parameter| parameter.identity_node)
+            .chain(plan.return_type.annotation_identity().map(|(node, _)| node))
+        {
+            if let Some(alias) = plan_source_generic_alias_annotation(
+                store,
+                host,
+                annotation,
+                &plan.type_parameters,
+            )? {
+                aliases.push(alias);
+            }
+        }
+        plan.type_parameter_syntax.alias_annotations = aliases.into_boxed_slice();
+    }
     match owner_shape {
         SourceCallableOwnerShape::Unique => {
             let contextual_source_arrow = (object_property_arrow || direct_call_argument_arrow)
@@ -4697,6 +4961,8 @@ fn prove_source_type_parameter_syntax(
         generic_return_type_parameter_declaration: None,
         generic_fixed_return_is_exact: false,
         inferred_empty_body_is_exact: false,
+        alias_annotations: Box::new([]),
+        alias_resolutions: Box::new([]),
     })
 }
 
@@ -6588,6 +6854,10 @@ fn is_exact_source_generic_interface_reference(
     let Some(declarations) = owner.declarations() else {
         return Ok(false);
     };
+    if owner.flags() == SymbolFlags::TYPE_ALIAS {
+        return plan_source_generic_alias_annotation(store, host, annotation, type_parameters)
+            .map(|plan| plan.is_some());
+    }
     if !owner.flags().contains(SymbolFlags::INTERFACE)
         || owner
             .flags()
@@ -6705,6 +6975,247 @@ fn is_exact_source_generic_interface_reference(
     Ok(true)
 }
 
+fn source_alias_reference_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceCallableError> {
+    let record = preflight_node(store, host, node)?;
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return Ok(None);
+    };
+    let name = NodeRef::new(node.arena, node.file, reference.type_name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Ok(None);
+    };
+    let (arena, bound) = host
+        .source(node)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidSyntax(node)))?;
+    let mut callback = match host.name_resolver_host(store) {
+        Ok(callback) => callback,
+        Err(DeclaredTypeError::Unavailable(
+            DeclaredTypeUnavailable::PostGlobalNameResolutionUnavailable,
+        )) => {
+            return Ok(enclosing_namespace_type_symbol(
+                store,
+                host,
+                node,
+                &identifier.text,
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback)
+            .map_err(DeclaredTypeError::from)?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(name)),
+                &identifier.text,
+                SymbolFlags::TYPE,
+                None,
+                true,
+                false,
+            )
+            .map_err(DeclaredTypeError::from)?
+            .and_then(|symbol| store.get_merged_symbol(symbol)),
+    )
+}
+
+/// Only dependency ownership is checked here. `TypeQueryPlanner` owns body admission.
+fn collect_source_alias_declarations(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declarations: &mut Vec<SourceCallableAliasDeclaration>,
+) -> Result<bool, SourceCallableError> {
+    let mut active = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut pending = vec![(symbol, false)];
+    while let Some((symbol, leaving)) = pending.pop() {
+        if leaving {
+            active.remove(&symbol);
+            continue;
+        }
+        if active.contains(&symbol) {
+            return Ok(false);
+        }
+        if !seen.insert(symbol) {
+            continue;
+        }
+        let Some(owner) = store.symbol(symbol) else {
+            return Ok(false);
+        };
+        let Some([declaration]) = owner.declarations() else {
+            return Ok(false);
+        };
+        let declaration = *declaration;
+        let record = preflight_node(store, host, declaration)?;
+        let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::TypeAliasDeclaration
+            || owner.flags() != SymbolFlags::TYPE_ALIAS
+            || owner.check_flags() != CheckFlags::NONE
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || !host.symbol_matches(store, declaration, symbol)
+        {
+            return Ok(false);
+        }
+        let body = NodeRef::new(declaration.arena, declaration.file, alias.type_);
+        let symbols = explicit_type_parameter_symbols(
+            store,
+            host,
+            declaration,
+            alias.type_parameters.as_ref(),
+            &mut HashSet::new(),
+        )?;
+        let mut parameters = Vec::new();
+        for (node, symbol) in alias
+            .type_parameters
+            .iter()
+            .flat_map(|parameters| &parameters.nodes)
+            .copied()
+            .zip(symbols)
+        {
+            let node = NodeRef::new(declaration.arena, declaration.file, node);
+            let record = preflight_node(store, host, node)?;
+            let NodeData::TypeParameterDeclaration(parameter) = &record.data else {
+                return Ok(false);
+            };
+            if parameter.modifiers.is_some()
+                || parameter.constraint.is_some()
+                || parameter.default_type.is_some()
+            {
+                return Ok(false);
+            }
+            parameters.push((node, symbol));
+        }
+        declarations.push(SourceCallableAliasDeclaration {
+            symbol,
+            declaration,
+            body,
+            parent: owner.parent(),
+            parameters: parameters.into_boxed_slice(),
+        });
+        active.insert(symbol);
+        pending.push((symbol, true));
+        let mut dependencies = Vec::new();
+        let mut nodes = vec![body];
+        let mut visited_nodes = HashSet::new();
+        while let Some(node) = nodes.pop() {
+            if !visited_nodes.insert(node) {
+                return Err(invariant(SourceCallableInvariant::InvalidSyntax(node)));
+            }
+            let record = preflight_node(store, host, node)?;
+            if record.kind == SyntaxKind::TypeReference {
+                let Some(target) = source_alias_reference_symbol(store, host, node)? else {
+                    return Ok(false);
+                };
+                if store
+                    .symbol(target)
+                    .is_some_and(|symbol| symbol.flags() == SymbolFlags::TYPE_ALIAS)
+                {
+                    dependencies.push((target, false));
+                }
+            }
+            record.for_each_child(|child| nodes.push(NodeRef::new(node.arena, node.file, child)));
+        }
+        pending.extend(dependencies.into_iter().rev());
+    }
+    Ok(true)
+}
+
+fn plan_source_generic_alias_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    annotation: NodeRef,
+    type_parameters: &[SourceCallableTypeParameterPlan],
+) -> Result<Option<SourceCallableAliasAnnotation>, SourceCallableError> {
+    let record = preflight_node(store, host, annotation)?;
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return Ok(None);
+    };
+    let Some(arguments) = reference.type_arguments.as_ref() else {
+        return Ok(None);
+    };
+    let Some(symbol) = source_alias_reference_symbol(store, host, annotation)? else {
+        return Ok(None);
+    };
+    if store
+        .symbol(symbol)
+        .is_none_or(|symbol| symbol.flags() != SymbolFlags::TYPE_ALIAS)
+    {
+        return Ok(None);
+    }
+    let invalid = || invariant(SourceCallableInvariant::InvalidTypeCache(annotation));
+    let mut declarations = Vec::new();
+    if !collect_source_alias_declarations(store, host, symbol, &mut declarations)?
+        || arguments.nodes.is_empty()
+        || arguments.has_trailing_comma
+        || declarations[0].parameters.len() != arguments.nodes.len()
+    {
+        return Ok(None);
+    }
+    let mut planned_arguments = Vec::with_capacity(arguments.nodes.len());
+    for argument in &arguments.nodes {
+        let argument = NodeRef::new(annotation.arena, annotation.file, *argument);
+        let mut selected = None;
+        for parameter in type_parameters {
+            if is_naked_source_type_parameter_annotation(store, host, argument, parameter)? {
+                selected = Some(parameter.symbol);
+                break;
+            }
+        }
+        let Some(symbol) = selected else {
+            return Ok(None);
+        };
+        planned_arguments.push((argument, symbol));
+    }
+    let mut owner_declaration = annotation;
+    loop {
+        let parent = preflight_node(store, host, owner_declaration)?
+            .parent
+            .ok_or_else(invalid)?;
+        owner_declaration = NodeRef::new(annotation.arena, annotation.file, parent);
+        if store.source_node_kind(owner_declaration) != Some(SyntaxKind::ParenthesizedType) {
+            break;
+        }
+    }
+    if !matches!(
+        store.source_node_kind(owner_declaration),
+        Some(SyntaxKind::Parameter | SyntaxKind::FunctionDeclaration)
+    ) {
+        return Ok(None);
+    }
+    let proof = SourceCallableAliasAnnotation {
+        annotation,
+        owner: host
+            .bound_file(owner_declaration)
+            .and_then(|bound| bound.symbol(owner_declaration))
+            .ok_or_else(invalid)?,
+        owner_declaration,
+        declarations: declarations.into_boxed_slice(),
+        arguments: planned_arguments.into_boxed_slice(),
+    };
+    if !proof.source_is_exact(store) {
+        return Err(invalid());
+    }
+    if store.source_callable_alias_resolution(annotation).is_some() || !proof.has_cold_value(store)
+    {
+        let parameters = type_parameters
+            .iter()
+            .map(|parameter| store.declared_type_links(parameter.symbol)?.declared_type)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(invalid)?;
+        let resolution = proof.snapshot(store, &parameters).ok_or_else(invalid)?;
+        if !store.source_callable_alias_resolution_matches(&proof, &resolution) {
+            return Err(invalid());
+        }
+    }
+    Ok(Some(proof))
+}
+
 fn is_naked_source_type_parameter_annotation(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -6792,8 +7303,8 @@ fn validate_source_type_parameter_annotation_links(
     Ok(())
 }
 
-fn source_type_parameter_annotation_links_are_fully_warm(
-    store: &CanonicalTypeMapperStore,
+fn source_type_parameter_annotation_links_are_fully_warm<MapperPayload>(
+    store: &SemanticStore<TypeRecord, MapperPayload>,
     annotation: NodeRef,
     symbol: SemanticSymbolId,
     declared_type: TypeId,
@@ -9466,6 +9977,12 @@ pub(super) fn publish_source_callable_parameter_types(
                             callable.plan.array_targets,
                             supplied_base,
                             type_parameters,
+                        ) || valid_source_callable_alias_type(
+                            store,
+                            parameter.identity_node,
+                            supplied_base,
+                            type_parameters,
+                            callable.plan.array_targets,
                         ) || !parameter.rest
                             && valid_fixed_generic_source_parameter_type(store, supplied_base)
                             || callable.plan.family == SourceCallableFamily::ArrowFunction
@@ -9690,8 +10207,9 @@ pub(super) fn publish_lazy_source_callable_return(
         || annotation != Some(return_type)
         || !plan.type_parameters.is_empty()
             && !planned_type_parameter_ids(store, plan).is_some_and(|type_parameters| {
-                valid_source_generic_mapper_type(
+                valid_source_generic_return_type(
                     store,
+                    return_identity_node,
                     return_type,
                     &type_parameters,
                     plan.array_targets,
@@ -10834,8 +11352,9 @@ pub(super) fn validate_stored_source_callable(
             cached_annotation_identity(store, return_identity_node, return_null_literal_identity);
         let valid_return = if !type_parameter_edges.is_empty()
             && (store.circular_return_annotation_type(signature).is_some()
-                || !valid_source_generic_mapper_type(
+                || !valid_source_generic_return_type(
                     store,
+                    return_identity_node,
                     return_type,
                     &type_parameter_edges,
                     provenance.array_targets,
@@ -10904,6 +11423,25 @@ fn valid_stored_generic_source_signature(
         && parameter_types.is_none_or(|types| {
             types.len() == signature.parameters().len()
                 && types.iter().enumerate().all(|(index, type_)| {
+                    if let Some(annotation) = store
+                        .source_callable_alias_parameter_annotation(signature.parameters()[index])
+                    {
+                        let Some(base) = store
+                            .type_node_links(annotation)
+                            .and_then(|links| links.resolved_type)
+                        else {
+                            return false;
+                        };
+                        return valid_source_callable_alias_type(
+                            store,
+                            annotation,
+                            base,
+                            type_parameters,
+                            array_targets,
+                        ) && (*type_ == base
+                            || index >= minimum_argument_count
+                                && valid_optional_type(store, array_targets, *type_, base));
+                    }
                     valid_generic_source_parameter_type(
                         store,
                         array_targets,
@@ -11209,6 +11747,26 @@ fn valid_stored_source_generic_return_provenance(
     let Some((annotation, _)) = store.function_signature_return_annotation(signature) else {
         return false;
     };
+    if let Some(proof) = store.source_callable_alias_annotation(annotation) {
+        if expected.is_some() || !proof.source_is_exact(store) {
+            return false;
+        }
+        let cold = store.source_callable_alias_resolution(annotation).is_none()
+            && proof.has_cold_value(store);
+        return cold
+            || store
+                .type_node_links(annotation)
+                .and_then(|links| links.resolved_type)
+                .is_some_and(|type_| {
+                    valid_source_callable_alias_type(
+                        store,
+                        annotation,
+                        type_,
+                        type_parameters,
+                        None,
+                    )
+                });
+    }
     match expected {
         Some(type_parameter) => {
             let Some(symbol) = cached_ordinary_type_parameter_owner(store, type_parameter) else {
@@ -11366,6 +11924,37 @@ fn valid_source_generic_mapper_type(
     }
 }
 
+fn valid_source_callable_alias_type(
+    store: &CanonicalTypeMapperStore,
+    annotation: NodeRef,
+    result: TypeId,
+    type_parameters: &[TypeId],
+    _array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    store
+        .source_callable_alias_resolution(annotation)
+        .is_some_and(|resolution| {
+            resolution.snapshot().result() == result
+                && resolution.parameters() == type_parameters
+                && resolution.is_exact(store)
+                && store.source_callable_alias_annotation(annotation) == Some(resolution.proof())
+        })
+}
+
+fn valid_source_generic_return_type(
+    store: &CanonicalTypeMapperStore,
+    annotation: NodeRef,
+    result: TypeId,
+    type_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    if store.source_callable_alias_annotation(annotation).is_some() {
+        valid_source_callable_alias_type(store, annotation, result, type_parameters, array_targets)
+    } else {
+        valid_source_generic_mapper_type(store, result, type_parameters, array_targets)
+    }
+}
+
 fn valid_stored_source_generic_return_annotation(
     store: &CanonicalTypeMapperStore,
     annotation: NodeRef,
@@ -11375,6 +11964,16 @@ fn valid_stored_source_generic_return_annotation(
     type_parameters: &[TypeId],
     array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
+    if store.source_callable_alias_annotation(annotation).is_some() {
+        return expected.is_none()
+            && valid_source_callable_alias_type(
+                store,
+                annotation,
+                return_type,
+                type_parameters,
+                array_targets,
+            );
+    }
     if let Some(expected) = expected {
         let Some(symbol) = cached_ordinary_type_parameter_owner(store, expected) else {
             return false;
@@ -11894,8 +12493,9 @@ fn validate_cached_return_type(
     let valid = if !plan.type_parameters.is_empty()
         && (circular_annotation.is_some()
             || !planned_type_parameter_ids(store, plan).is_some_and(|type_parameters| {
-                valid_source_generic_mapper_type(
+                valid_source_generic_return_type(
                     store,
+                    return_identity_node,
                     resolved,
                     &type_parameters,
                     plan.array_targets,
@@ -12788,6 +13388,214 @@ mod tests {
                 ),
                 warm,
             );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn generic_alias_annotations_reject_changed_query_identity_and_cache() {
+        for warm in [false, true] {
+            for mutation in 0..4 {
+                if !warm && mutation >= 2 {
+                    continue;
+                }
+                let mut fixture = QueryFixture::with_source_language(
+                    concat!(
+                        "type First<Value> = Value; type Second<Value> = Value; ",
+                        "declare function select<T>(left: First<T>, right: Second<T>): First<T>; export {};",
+                    ),
+                    FileId::new(95_110),
+                    false,
+                    CanonicalModuleState::External,
+                    CanonicalSourceLanguage::TypeScript,
+                );
+                let declaration =
+                    fixture
+                        .parsed
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            (record.kind == SyntaxKind::FunctionDeclaration).then_some(
+                                NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                            )
+                        })
+                        .unwrap();
+                let owner = fixture.bound.symbol(declaration).unwrap();
+                let NodeData::FunctionDeclaration(function) =
+                    &fixture.parsed.arena.get(declaration.node).unwrap().data
+                else {
+                    unreachable!()
+                };
+                let NodeData::ParameterDeclaration(parameter) = &fixture
+                    .parsed
+                    .arena
+                    .get(function.parameters.nodes[0])
+                    .unwrap()
+                    .data
+                else {
+                    unreachable!()
+                };
+                let annotation = NodeRef::new(
+                    declaration.arena,
+                    declaration.file,
+                    parameter.type_.unwrap(),
+                );
+                let aliases = fixture
+                    .parsed
+                    .arena
+                    .iter()
+                    .filter(|(_, record)| record.kind == SyntaxKind::TypeAliasDeclaration)
+                    .map(|(node, _)| {
+                        fixture
+                            .bound
+                            .symbol(NodeRef::new(declaration.arena, declaration.file, node))
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let callable = if warm {
+                    let callable = fixture
+                        .query_callable(declaration, owner, &mut diagnostics)
+                        .unwrap();
+                    let signature = fixture
+                        .store
+                        .source_callable_provenance(callable)
+                        .unwrap()
+                        .signature;
+                    fixture.query_return(signature, &mut diagnostics).unwrap();
+                    Some(callable)
+                } else {
+                    None
+                };
+                match mutation {
+                    0 => assert!(fixture.store.set_symbol_node_links(
+                        annotation,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(aliases[1]),
+                        }
+                    )),
+                    1 => assert!(fixture.store.set_type_node_links(
+                        annotation,
+                        TypeNodeLinks {
+                            resolved_type: None,
+                            outer_type_parameters: Some(Vec::new()),
+                        }
+                    )),
+                    2 => {
+                        let mut links = fixture.store.type_alias_links(aliases[0]).unwrap().clone();
+                        links.instantiations.as_mut().unwrap().clear();
+                        assert!(fixture.store.set_type_alias_links(aliases[0], links));
+                    }
+                    3 => assert!(
+                        fixture
+                            .store
+                            .set_type_node_links(annotation, TypeNodeLinks::default())
+                    ),
+                    _ => unreachable!(),
+                }
+                let before = generic_transaction_state(&fixture.store);
+                assert!(
+                    fixture
+                        .query_callable(declaration, owner, &mut diagnostics)
+                        .is_err()
+                );
+                if let Some(callable) = callable {
+                    assert_eq!(
+                        validate_stored_source_callable(&fixture.store, callable),
+                        StoredSourceCallableValidation::Malformed
+                    );
+                }
+                assert_eq!(generic_transaction_state(&fixture.store), before);
+                assert!(diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn generic_alias_parenthesized_queries_reject_changed_identity_and_caches() {
+        for (query_inner, clear_result) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut fixture = QueryFixture::with_source_language(
+                concat!(
+                    "type First<Value> = Value; type Second<Value> = Value; ",
+                    "declare function select<T>(): (First<T>); export {};",
+                ),
+                FileId::new(95_111),
+                false,
+                CanonicalModuleState::External,
+                CanonicalSourceLanguage::TypeScript,
+            );
+            let (declaration, outer, inner) = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::FunctionDeclaration(function) = &record.data else {
+                        return None;
+                    };
+                    let outer = function.type_?;
+                    let NodeData::ParenthesizedTypeNode(parenthesized) =
+                        &fixture.parsed.arena.get(outer)?.data
+                    else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                        NodeRef::new(fixture.parsed.arena.id(), fixture.file, outer),
+                        NodeRef::new(fixture.parsed.arena.id(), fixture.file, parenthesized.type_),
+                    ))
+                })
+                .unwrap();
+            let other_alias = fixture
+                .parsed
+                .arena
+                .iter()
+                .filter(|(_, record)| record.kind == SyntaxKind::TypeAliasDeclaration)
+                .map(|(node, _)| {
+                    fixture
+                        .bound
+                        .symbol(NodeRef::new(declaration.arena, declaration.file, node))
+                        .unwrap()
+                })
+                .nth(1)
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap();
+            let signature = fixture
+                .store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let result = fixture.query_return(signature, &mut diagnostics).unwrap();
+            assert_eq!(
+                fixture.query_type_node(outer, &mut diagnostics).unwrap(),
+                result
+            );
+            if clear_result {
+                assert!(
+                    fixture
+                        .store
+                        .set_type_node_links(inner, TypeNodeLinks::default())
+                );
+            } else {
+                assert!(fixture.store.set_symbol_node_links(
+                    inner,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(other_alias),
+                    }
+                ));
+            }
+            let before = generic_transaction_state(&fixture.store);
+            assert!(
+                fixture
+                    .query_type_node(if query_inner { inner } else { outer }, &mut diagnostics)
+                    .is_err()
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), before);
             assert!(diagnostics.is_empty());
         }
     }

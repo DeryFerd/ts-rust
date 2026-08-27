@@ -81,7 +81,8 @@ use super::{
     reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
     signatures::{ElementFlags, Signature, SignatureFlags, TypePredicateKind},
     source_callables::{
-        self, CallableTypePredicatePlan, PendingSourceCallableParameterTypes, SourceCallableError,
+        self, CallableTypePredicatePlan, PendingSourceCallableParameterTypes,
+        SourceCallableAliasAnnotation, SourceCallableAliasSnapshot, SourceCallableError,
         SourceCallableFamily,
     },
     source_namespaces::authenticated_merged_namespace_interface,
@@ -1248,6 +1249,39 @@ struct TypeQueryPlan {
     pending_function_proofs: Vec<PendingFunctionTypeProof>,
 }
 
+/// Created only after a canonical query resolves a source callable annotation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableAliasResolution {
+    proof: SourceCallableAliasAnnotation,
+    snapshot: SourceCallableAliasSnapshot,
+    parameters: Box<[TypeId]>,
+}
+
+impl SourceCallableAliasResolution {
+    pub(super) fn proof(&self) -> &SourceCallableAliasAnnotation {
+        &self.proof
+    }
+
+    pub(super) const fn annotation(&self) -> NodeRef {
+        self.proof.annotation()
+    }
+
+    pub(super) fn snapshot(&self) -> &SourceCallableAliasSnapshot {
+        &self.snapshot
+    }
+
+    pub(super) fn parameters(&self) -> &[TypeId] {
+        &self.parameters
+    }
+
+    pub(super) fn is_exact<MapperPayload>(
+        &self,
+        store: &super::store::SemanticStore<TypeRecord, MapperPayload>,
+    ) -> bool {
+        self.proof.snapshot(store, &self.parameters).as_ref() == Some(&self.snapshot)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PlannedUniqueSymbolType {
     owner: Option<SemanticSymbolId>,
@@ -1363,7 +1397,7 @@ struct CachedTypeAlias {
     missing_generic_metadata: bool,
 }
 
-fn type_alias_instantiation_cache_key(
+pub(super) fn type_alias_instantiation_cache_key(
     type_arguments: &[TypeId],
     alias: Option<(u64, &[TypeId])>,
 ) -> CacheHashKey {
@@ -2372,6 +2406,7 @@ struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     function_indirection_depth: usize,
     intersection_planning_depth: usize,
     lazy_interface_values: bool,
+    source_callable_alias_planning: bool,
 }
 
 impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
@@ -2403,6 +2438,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             function_indirection_depth: 0,
             intersection_planning_depth: 0,
             lazy_interface_values: false,
+            source_callable_alias_planning: false,
         }
     }
 
@@ -11004,6 +11040,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         alias_owner: Option<SemanticSymbolId>,
         union_constituent: bool,
     ) -> Result<(), DeclaredTypeError> {
+        if let Some(proof) = self.store.source_callable_alias_annotation(node) {
+            self.source_callable_alias_planning = true;
+            let valid = match self.store.source_callable_alias_resolution(node) {
+                Some(resolution) => resolution.is_exact(self.store),
+                None => proof.source_is_exact(self.store) && proof.has_cold_value(self.store),
+            };
+            if !valid {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+        }
         let record = preflight_node(self.store, self.host, node)?;
         if let Some(cached) = self
             .store
@@ -11195,6 +11243,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if !self.replay_cached_annotations
             && !union_constituent
             && !self.lazy_interface_values
+            && !self.source_callable_alias_planning
             && self.intersection_planning_depth == 0
             && exact_import.is_none()
             && cached_type.is_some()
@@ -11296,9 +11345,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
             }
             canonical
-        } else if let Some(symbol) =
-            cached_symbol.filter(|_| !source_parameter_constraint && !self.lazy_interface_values)
-        {
+        } else if let Some(symbol) = cached_symbol.filter(|_| {
+            !source_parameter_constraint
+                && !self.lazy_interface_values
+                && !self.source_callable_alias_planning
+        }) {
             self.store.get_merged_symbol(symbol).ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidCachedSymbol { node, symbol })
             })?
@@ -19120,6 +19171,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         if self.replay_cached_annotations
             || self.intersection_planning_depth != 0
+            || self.source_callable_alias_planning
             || cached.is_none()
             || cached_array_capability_missing
             || cached_pending_function
@@ -20170,7 +20222,59 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 None => self.execute_type_node(node, &plan, &mut prepared),
             }
         })();
-        self.complete_type_query(result, &plan, &mut prepared)
+        let result = self.complete_type_query(result, &plan, &mut prepared)?;
+        self.record_source_callable_alias_query_results(&plan)?;
+        Ok(result)
+    }
+
+    fn record_source_callable_alias_query_results(
+        &mut self,
+        plan: &TypeQueryPlan,
+    ) -> Result<(), DeclaredTypeError> {
+        for annotation in plan.references.keys() {
+            let Some(proof) = self
+                .store
+                .source_callable_alias_annotation(*annotation)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(callable) = self.store.source_callable_type_for_owner(proof.owner()) else {
+                continue;
+            };
+            let signature = self
+                .store
+                .source_callable_provenance(callable)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(*annotation))
+                })?
+                .signature;
+            let parameters = self
+                .store
+                .signature(signature)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+                })?
+                .type_parameters()
+                .to_vec();
+            if let Some(resolved) = self
+                .store
+                .type_node_links(*annotation)
+                .and_then(|links| links.resolved_type)
+            {
+                let resolution =
+                    self.source_callable_alias_resolution(&proof, resolved, &parameters)?;
+                if !self
+                    .store
+                    .record_source_callable_alias_resolution(*annotation, resolution)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionType(*annotation),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Checks one annotated value without resolving interface member types.
@@ -20645,6 +20749,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         )
         .map_err(|error| source_callable_error(error, family))?;
         self.require_source_callable_alias_capabilities(&callable)?;
+        self.preflight_source_callable_alias_annotations(&callable)?;
         match source_callables::source_callable_state(self.store, &callable, true)
             .map_err(|error| source_callable_error(error, callable.family))?
         {
@@ -20717,7 +20822,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 ));
             }
         };
-        let callable = source_callables::plan_source_callable(
+        let mut callable = source_callables::plan_source_callable(
             self.store,
             self.host,
             declaration,
@@ -20726,6 +20831,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         )
         .map_err(|error| source_callable_error(error, family))?;
         self.require_source_callable_alias_capabilities(&callable)?;
+        self.preflight_source_callable_alias_annotations(&callable)?;
         match source_callables::source_callable_state(self.store, &callable, true)
             .map_err(|error| source_callable_error(error, callable.family))?
         {
@@ -20755,6 +20861,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 planner.plan_type_node(type_node)?;
             }
         }
+        for proof in callable.alias_annotations().iter().filter(|proof| {
+            proof.owner() == callable.owner_symbol
+                && self
+                    .store
+                    .type_node_links(proof.annotation())
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+        }) {
+            planner.plan_type_node(proof.annotation())?;
+        }
         let plan = planner.finish();
         let (cold_source_types, source_optional_unions) =
             source_callables::reserve_source_callable_capacities(self.store, &[&callable])
@@ -20782,8 +20898,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ))?
             .no_constraint_type;
         let mut resolved_type_parameters = Vec::with_capacity(callable.type_parameters.len());
-        for (type_parameter, type_parameter_id) in
-            callable.type_parameters.iter().zip(type_parameter_ids)
+        for (type_parameter, type_parameter_id) in callable
+            .type_parameters
+            .iter()
+            .zip(type_parameter_ids.iter().copied())
         {
             let constraint = match type_parameter.constraint {
                 Some(node) => match self.execute_type_node(node, &plan, &mut prepared) {
@@ -20818,6 +20936,49 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 constraint,
                 default_type,
             });
+        }
+        let alias_resolutions = (|| {
+            let mut resolutions = Vec::new();
+            let annotations = callable
+                .alias_annotations()
+                .iter()
+                .filter(|proof| {
+                    callable
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.symbol == proof.owner())
+                        || self
+                            .store
+                            .type_node_links(proof.annotation())
+                            .and_then(|links| links.resolved_type)
+                            .is_some()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for proof in &annotations {
+                let resolved = self.execute_type_node(proof.annotation(), &plan, &mut prepared)?;
+                resolutions.push(self.source_callable_alias_resolution(
+                    proof,
+                    resolved,
+                    &type_parameter_ids,
+                )?);
+            }
+            Ok::<_, DeclaredTypeError>(resolutions)
+        })();
+        let alias_resolutions = match alias_resolutions {
+            Ok(resolutions) => resolutions,
+            Err(error) => {
+                self.pending_function_parameters.clear();
+                prepared.clear_pending_function_types();
+                return Err(error);
+            }
+        };
+        if !callable.set_alias_resolutions(alias_resolutions) {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(declaration),
+            ));
         }
         let pending = match source_callables::begin_source_callable(
             self.store,
@@ -20861,6 +21022,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
 
         let mut base_types = Vec::with_capacity(callable.parameters.len());
         for parameter in &callable.parameters {
+            if let Some(resolution) = callable
+                .alias_resolutions()
+                .iter()
+                .find(|resolution| resolution.proof().owner() == parameter.symbol)
+            {
+                if !resolution.is_exact(self.store) {
+                    self.pending_function_parameters.clear();
+                    prepared.clear_pending_function_types();
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionType(declaration),
+                    ));
+                }
+                base_types.push(resolution.snapshot().result());
+                continue;
+            }
             let Some(type_node) = parameter.explicit_type_node() else {
                 let any_type = self
                     .store
@@ -21450,6 +21626,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.store, &callable, signature,
         )
         .map_err(|error| source_callable_signature_error(error, callable.family, signature))?;
+        self.preflight_source_callable_alias_annotations(&callable)?;
         if callable.return_type.is_inferred() {
             self.reject_type_reference_alias_capabilities()?;
             if let Some(return_type) = source_callables::validate_inferred_source_callable_return(
@@ -21580,6 +21757,32 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.pending_function_parameters.clear();
         prepared.clear_pending_function_types();
         if cycle_free {
+            if let Some(proof) = callable
+                .alias_annotations()
+                .iter()
+                .find(|proof| proof.owner() == callable.owner_symbol)
+            {
+                let parameters = self
+                    .store
+                    .signature(signature)
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                            signature,
+                        ))
+                    })?
+                    .type_parameters()
+                    .to_vec();
+                let resolution =
+                    self.source_callable_alias_resolution(proof, resolved, &parameters)?;
+                if !self
+                    .store
+                    .record_source_callable_alias_resolution(proof.annotation(), resolution)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                    ));
+                }
+            }
             source_callables::publish_lazy_source_callable_return(
                 self.store, &callable, signature, resolved,
             )
@@ -21597,6 +21800,70 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             );
             Ok(return_type)
         }
+    }
+
+    /// Alias admission uses the same planner, options, and source capabilities as execution.
+    fn preflight_source_callable_alias_annotations(
+        &self,
+        callable: &source_callables::SourceCallablePlan,
+    ) -> Result<(), DeclaredTypeError> {
+        if callable.alias_annotations().is_empty() {
+            return Ok(());
+        }
+        let mut planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        )
+        .with_jsdoc_import_type_target(self.jsdoc_import_type_target);
+        planner.source_callable_alias_planning = true;
+        for annotation in callable.alias_annotations() {
+            planner.plan_type_node(annotation.annotation())?;
+        }
+        // Value queries can depend on the callable that has not been published yet.
+        if !planner.plan.recursive_indexed_aliases.is_empty()
+            || !planner.plan.recursive_mapped_aliases.is_empty()
+            || !planner.plan.type_queries.is_empty()
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node: callable.declaration,
+                    kind: SyntaxKind::FunctionDeclaration,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn source_callable_alias_resolution(
+        &self,
+        proof: &SourceCallableAliasAnnotation,
+        result: TypeId,
+        parameters: &[TypeId],
+    ) -> Result<SourceCallableAliasResolution, DeclaredTypeError> {
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(
+                proof.annotation(),
+            ))
+        };
+        let snapshot = proof.snapshot(self.store, parameters).ok_or_else(invalid)?;
+        if snapshot.result() != result
+            || !self
+                .store
+                .source_callable_alias_resolution_matches(proof, &snapshot)
+        {
+            return Err(invalid());
+        }
+        Ok(SourceCallableAliasResolution {
+            proof: proof.clone(),
+            snapshot,
+            parameters: parameters.to_vec().into_boxed_slice(),
+        })
     }
 
     /// Resolves the declared type identity of one symbol.
