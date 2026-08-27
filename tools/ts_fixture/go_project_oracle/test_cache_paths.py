@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check module-cache rejection before the oracle helper can invoke Go."""
+"""Check output and module-cache paths before the oracle helper can invoke Go."""
 
 import argparse
 import json
@@ -23,7 +23,9 @@ class CachePathTests(unittest.TestCase):
         self.directory = Path(directory.name)
         self.output = self.directory / "output"
 
-    def run_helper(self, cache: str | None) -> subprocess.CompletedProcess[str]:
+    def run_helper(
+        self, cache: str | None, *, config: Path | None = None, output: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.pop("GOMODCACHE", None)
         environment["TS_GO_ORACLE_DOWNLOAD_PINNED"] = "0"
@@ -32,16 +34,43 @@ class CachePathTests(unittest.TestCase):
         return subprocess.run(
             [
                 "bash", str(self.helper), "/go-must-not-run", str(self.upstream),
-                str(self.config), str(self.output), "prepare",
+                str(config or self.config), str(output or self.output), "prepare",
             ],
             env=environment, text=True, capture_output=True, check=False,
         )
 
-    def assert_rejected(self, cache: str, message: str) -> None:
-        result = self.run_helper(cache)
+    def assert_rejected(
+        self, cache: str | None, message: str, *,
+        config: Path | None = None, output: Path | None = None,
+    ) -> None:
+        result = self.run_helper(cache, config=config, output=output)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn(message, result.stderr)
-        self.assertFalse(self.output.exists())
+        self.assertFalse((output or self.output).exists())
+
+    def config_link(
+        self, *, requested_git: bool = False, physical_git: bool = False,
+    ) -> tuple[Path, Path, Path, Path]:
+        requested_root = self.directory / "requested-project"
+        physical_root = self.directory / "physical-project"
+        link = requested_root / "configs" / "tsconfig.json"
+        target = physical_root / "configs" / "tsconfig.json"
+        link.parent.mkdir(parents=True)
+        target.parent.mkdir(parents=True)
+        target.write_text('{"compilerOptions":{"noEmit":true},"files":[]}\n', encoding="utf-8")
+        link.symlink_to(os.path.relpath(target, link.parent))
+        for root, enabled in [(requested_root, requested_git), (physical_root, physical_git)]:
+            if enabled:
+                subprocess.run(["git", "-C", str(root), "init", "-q"], check=True, capture_output=True)
+                subprocess.run(
+                    [
+                        "git", "-C", str(root), "-c", "user.name=Path control",
+                        "-c", "user.email=path-control@example.invalid",
+                        "commit", "-q", "--allow-empty", "-m", "Initialize path control",
+                    ],
+                    check=True, capture_output=True,
+                )
+        return link, target, requested_root, physical_root
 
     def test_inherited_upstream_cache_is_rejected(self) -> None:
         self.assert_rejected(
@@ -92,6 +121,74 @@ class CachePathTests(unittest.TestCase):
             f"GOMODCACHE={self.output / 'go-mod-cache'}",
             manifest["build"]["environment"],
         )
+        self.assertIsNone(manifest["executable"])
+
+    def test_config_symlink_protects_both_config_directories_from_output(self) -> None:
+        link, target, _, _ = self.config_link()
+        for directory in [link.parent, target.parent]:
+            with self.subTest(directory=directory):
+                self.assert_rejected(
+                    None, "Output must be outside the upstream and config directories",
+                    config=link, output=directory / "oracle-output",
+                )
+
+    def test_config_symlink_protects_both_git_roots_from_output(self) -> None:
+        link, _, requested_root, physical_root = self.config_link(requested_git=True, physical_git=True)
+        for root in [requested_root, physical_root]:
+            with self.subTest(root=root):
+                self.assert_rejected(
+                    None, "Output must be outside the project checkout",
+                    config=link, output=root / "oracle-output",
+                )
+
+    def test_config_symlink_protects_both_config_directories_from_cache(self) -> None:
+        link, target, _, _ = self.config_link()
+        for directory in [link.parent, target.parent]:
+            with self.subTest(directory=directory):
+                self.assert_rejected(
+                    str(directory / "module-cache"),
+                    "Module cache must be outside upstream and project sources", config=link,
+                )
+
+    def test_config_symlink_protects_both_git_roots_from_cache(self) -> None:
+        link, _, requested_root, physical_root = self.config_link(requested_git=True, physical_git=True)
+        for root in [requested_root, physical_root]:
+            with self.subTest(root=root):
+                self.assert_rejected(
+                    str(root / "module-cache"),
+                    "Module cache must be outside upstream and project sources", config=link,
+                )
+
+    def test_cache_must_not_contain_the_physical_config_directory(self) -> None:
+        link, _, _, physical_root = self.config_link()
+        self.assert_rejected(
+            str(physical_root), "Module cache must not contain upstream or project sources",
+            config=link,
+        )
+
+    def test_safe_config_symlink_keeps_requested_config_and_project(self) -> None:
+        link, target, requested_root, _ = self.config_link(requested_git=True, physical_git=True)
+        original = target.read_bytes()
+        result = self.run_helper(None, config=link)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((self.output / "build.json").read_text())
+        self.assertEqual(manifest["project"]["config_path"], str(link))
+        self.assertEqual(manifest["project"]["root"], str(requested_root))
+        self.assertEqual(manifest["state"], "prepared")
+        self.assertEqual(manifest["go"]["executable"], "/go-must-not-run")
+        self.assertIsNone(manifest["go"]["version"])
+        self.assertIsNone(manifest["executable"])
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(link.resolve(), target)
+
+    def test_safe_config_symlink_does_not_replace_an_unset_requested_project(self) -> None:
+        link, _, _, _ = self.config_link(physical_git=True)
+        result = self.run_helper(None, config=link)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((self.output / "build.json").read_text())
+        self.assertEqual(manifest["project"]["config_path"], str(link))
+        self.assertIsNone(manifest["project"]["root"])
+        self.assertIsNone(manifest["go"]["version"])
         self.assertIsNone(manifest["executable"])
 
 

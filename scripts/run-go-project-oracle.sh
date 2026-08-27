@@ -26,8 +26,11 @@ fi
 out_real="$(realpath -m -- "$out")"
 upstream_real="$(realpath -- "$upstream")"
 config_directory="$(realpath -m -- "$(dirname -- "$config")")"
+# Keep the requested config for Go. Resolve its file target only for path guards.
+physical_config="$(realpath -m -- "$config")"
+physical_config_directory="$(dirname -- "$physical_config")"
 case "$out_real/" in
-  "$upstream_real/"*|"$config_directory/"*)
+  "$upstream_real/"*|"$config_directory/"*|"$physical_config_directory/"*)
     printf 'Output must be outside the upstream and config directories.\n' >&2
     exit 2
     ;;
@@ -38,6 +41,11 @@ if project_dir="$(git -C "$(dirname -- "$config")" rev-parse --show-toplevel 2>/
   project_real="$(realpath -- "$project_dir")"
   case "$out_real/" in "$project_real/"*) printf 'Output must be outside the project checkout.\n' >&2; exit 2 ;; esac
 fi
+physical_project_real=""
+if physical_project_dir="$(git -C "$physical_config_directory" rev-parse --show-toplevel 2>/dev/null)"; then
+  physical_project_real="$(realpath -- "$physical_project_dir")"
+  case "$out_real/" in "$physical_project_real/"*) printf 'Output must be outside the project checkout.\n' >&2; exit 2 ;; esac
+fi
 gomodcache_requested="${GOMODCACHE:-$out/go-mod-cache}"
 out_parent_real="$(dirname -- "$out_real")"
 validate_module_cache() {
@@ -46,7 +54,8 @@ validate_module_cache() {
     exit 2
   fi
   gomodcache_real="$(realpath -m -- "$gomodcache_requested")"
-  for protected in "$upstream_real" "$config_directory" "${project_real:-}"; do
+  for protected in "$upstream_real" "$config_directory" "${project_real:-}" \
+    "$physical_config_directory" "$physical_project_real"; do
     if [[ -z "$protected" ]]; then continue; fi
     case "$gomodcache_real/" in "$protected/"*)
       printf 'Module cache must be outside upstream and project sources.\n' >&2
