@@ -5419,6 +5419,7 @@ mod tests {
         InternalSymbolName,
     };
     use ts_parser::{ParseResult, parse_source_file};
+    include!("instantiated_members/wave148_heritage_method_invariants.rs");
 
     fn checker_context(
         parsed: &ParseResult,
