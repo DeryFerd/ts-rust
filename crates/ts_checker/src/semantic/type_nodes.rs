@@ -23603,12 +23603,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
             if interface.heritage.is_some() {
                 return if call_types.is_empty() {
-                    structured_members::resolve_direct_interface_members(
+                    structured_members::resolve_direct_interface_members_with_array_targets(
                         self.store,
                         &interface,
                         declared_type,
                         &types,
                         &base_types,
+                        self.global_types
+                            .as_ref()
+                            .map(CanonicalArrayTargets::from_global_types),
                     )
                 } else {
                     structured_members::resolve_direct_interface_callable_members(

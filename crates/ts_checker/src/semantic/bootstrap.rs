@@ -54,7 +54,7 @@ use super::{
     store::{SemanticStore, SourceNodeParent},
     structured_members::{
         InterfaceHeritageMembersValidation, inherited_generic_property_reference,
-        validate_interface_heritage_members,
+        validate_interface_heritage_members_with_array_targets,
     },
     tuple_types::PreparedCanonicalTupleType,
     type_records::{
@@ -2540,7 +2540,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 if let TypeData::Interface(interface) = record.data()
                     && self.direct_interface_heritage_provenance(type_).is_some()
                 {
-                    match validate_interface_heritage_members(self, type_) {
+                    match validate_interface_heritage_members_with_array_targets(
+                        self, type_, array_validation.targets(),
+                    ) {
                         InterfaceHeritageMembersValidation::Valid => {
                             for property in interface
                                 .reference
@@ -3498,7 +3500,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     ClassHeritageMembersValidation::NotClass => {}
                 }
                 if self.direct_interface_heritage_provenance(type_).is_some() {
-                    if validate_interface_heritage_members(self, type_)
+                    if validate_interface_heritage_members_with_array_targets(
+                        self, type_, array_validation.targets(),
+                    )
                         != InterfaceHeritageMembersValidation::Valid
                     {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
@@ -6020,6 +6024,107 @@ mod tests {
             .and_then(|members| members.get_source("value"))
             .unwrap();
         (derived, base, value)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both bodies must preserve cold array targets through source replay.
+    fn inherited_index_callables_preserve_cold_array_targets() {
+        let declarations = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Base<T> { value: T; [index: number]: Array<number>; }",
+        ));
+        assert!(declarations.diagnostics.is_empty(), "{:?}", declarations.diagnostics);
+        for (body, reads_inherited) in [("return 1;", false), ("return value.value;", true)] {
+            let parsed = parse_source_file(&format!(
+                "interface Derived extends Base<number> {{}} \
+                 function read(value: Derived): number {{ {body} }}",
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(198);
+            let library_file = FileId::new(199);
+            let mut binder = CanonicalBinder::new();
+            for (file, source, is_declaration) in [
+                (library_file, &declarations, true),
+                (file, &parsed, false),
+            ] {
+                binder.bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(if is_declaration {
+                            "\"/project/cold-index-base.d.ts\""
+                        } else {
+                            "\"/project/cold-index-callable.ts\""
+                        }),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                ).unwrap();
+                binder.bind_typescript_declaration_slice(&source.arena, file).unwrap();
+            }
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                [(library_file, &declarations.arena), (file, &parsed.arena)].into_iter().collect(),
+                CanonicalCheckerOptions::default(),
+            ).unwrap();
+            let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+            let assert_cold_arrays = |store: &TestStore| {
+                for target in [targets.array_type(), targets.readonly_array_type()] {
+                    assert!(matches!(
+                        store.type_payload(target).map(TypeRecord::data),
+                        Some(TypeData::Interface(interface)) if !interface.declared_members_resolved
+                    ));
+                }
+            };
+            assert_cold_arrays(context.store());
+            context.check_source_file(file).unwrap_or_else(|error| panic!("{body}: {error:?}"));
+            assert!(context.diagnostics().is_empty());
+            assert_cold_arrays(context.store());
+            let store = context.store();
+            let (derived, _, value) = inherited_graph_property(store);
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let index = store.type_payload(derived).unwrap().data().structured().unwrap()
+                .index_infos.as_ref().unwrap()[0];
+            let array = store.index_info(index).unwrap().value_type();
+            assert_eq!(
+                store.canonical_array_reference_with_targets(targets, array)
+                    .unwrap().unwrap().element_type,
+                number,
+            );
+            assert_eq!(
+                store.value_symbol_links(value).unwrap().resolved_type,
+                reads_inherited.then_some(number),
+            );
+            let snapshot = |store: &TestStore| {
+                (
+                    store.type_len(), store.symbol_len(), store.mapper_len(),
+                    store.signature_len(), store.index_info_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(), store.relation_state_snapshot(),
+                )
+            };
+            let warm = snapshot(store);
+            assert_eq!(
+                store.validate_cached_array_capability_with_array_targets(targets, derived),
+                Ok(()),
+            );
+            assert_eq!(snapshot(store), warm);
+            assert_cold_arrays(store);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap_or_else(|error| panic!("warm {body}: {error:?}"));
+                let store = context.store();
+                assert_eq!(snapshot(store), warm);
+                assert_cold_arrays(store);
+                assert!(context.diagnostics().is_empty());
+                assert_eq!(store.index_info(index).unwrap().value_type(), array);
+                assert_eq!(
+                    store.value_symbol_links(value).unwrap().resolved_type,
+                    reads_inherited.then_some(number),
+                );
+            }
+        }
     }
 
     #[test]

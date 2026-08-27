@@ -154,6 +154,20 @@ pub(super) fn resolve_direct_interface_members(
     property_types: &[TypeId],
     base_types: &[TypeId],
 ) -> Result<TypeId, PropertyObjectError> {
+    resolve_direct_interface_members_with_array_targets(
+        store, plan, type_, property_types, base_types, None,
+    )
+}
+
+/// Keeps the caller's array targets while validating direct bases.
+pub(super) fn resolve_direct_interface_members_with_array_targets(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    type_: TypeId,
+    property_types: &[TypeId],
+    base_types: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<TypeId, PropertyObjectError> {
     let Some(heritage) = plan.heritage.as_ref() else {
         return Err(invalid(plan, type_));
     };
@@ -206,11 +220,11 @@ pub(super) fn resolve_direct_interface_members(
         }
         let inherited_base = store.direct_interface_heritage_provenance(base).is_some();
         let surface = if !planned.type_arguments.is_empty() {
-            validate_generic_base_property_interface(store, base)
+            validate_generic_base_property_interface(store, base, array_targets)
         } else if inherited_base {
-            validate_direct_heritage_property_interface(store, base)
+            validate_direct_heritage_property_interface(store, base, array_targets)
         } else {
-            validate_no_heritage_property_interface(store, base)
+            validate_no_heritage_property_interface(store, base, array_targets)
         }
         .ok_or_else(|| invalid(plan, type_))?;
         if surface.owner != planned.symbol {
@@ -363,7 +377,9 @@ pub(super) fn resolve_direct_interface_members(
             return Err(invalid(plan, type_));
         };
         if interface.resolved_base_types.as_deref() != Some(base_types)
-            || !validate_planned_interface_heritage_members(store, plan, type_)
+            || !validate_planned_interface_heritage_members_with_array_targets(
+                store, plan, type_, array_targets,
+            )
             || interface.reference.object.structured.properties.as_deref()
                 != (!expected_properties.is_empty()).then_some(expected_properties.as_slice())
             || interface.reference.object.structured.index_infos.as_deref()
@@ -650,6 +666,15 @@ pub(super) fn validate_planned_interface_heritage_members(
     plan: &PropertyObjectPlan,
     type_: TypeId,
 ) -> bool {
+    validate_planned_interface_heritage_members_with_array_targets(store, plan, type_, None)
+}
+
+fn validate_planned_interface_heritage_members_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
     let Some(heritage) = plan.heritage.as_ref() else {
         return false;
     };
@@ -692,7 +717,9 @@ pub(super) fn validate_planned_interface_heritage_members(
     {
         return false;
     }
-    let Some(surface) = validate_direct_heritage_property_interface(store, type_) else {
+    let Some(surface) =
+        validate_direct_heritage_property_interface(store, type_, array_targets)
+    else {
         return false;
     };
     let planned_properties = plan
@@ -733,6 +760,14 @@ pub(super) fn validate_interface_heritage_members(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> InterfaceHeritageMembersValidation {
+    validate_interface_heritage_members_with_array_targets(store, type_, None)
+}
+
+pub(super) fn validate_interface_heritage_members_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> InterfaceHeritageMembersValidation {
     let retained_provenance = store.direct_interface_heritage_provenance(type_).is_some();
     let Some(TypeData::Interface(interface)) = store
         .type_payload(type_)
@@ -751,7 +786,7 @@ pub(super) fn validate_interface_heritage_members(
             InterfaceHeritageMembersValidation::NotHeritage
         };
     }
-    if validate_direct_heritage_property_interface(store, type_).is_some() {
+    if validate_direct_heritage_property_interface(store, type_, array_targets).is_some() {
         InterfaceHeritageMembersValidation::Valid
     } else {
         InterfaceHeritageMembersValidation::Malformed
@@ -761,16 +796,18 @@ pub(super) fn validate_interface_heritage_members(
 fn validate_no_heritage_property_interface(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<ValidatedInterfaceSurface> {
-    validate_property_interface(store, type_, false)
+    validate_property_interface(store, type_, false, array_targets)
 }
 
 fn validate_generic_base_property_interface(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<ValidatedInterfaceSurface> {
     let reference = validate_direct_generic_reference(store, type_).ok()?;
-    let members = validate_generic_interface_members(store, type_, None).ok()??;
+    let members = validate_generic_interface_members(store, type_, array_targets).ok()??;
     let record = store.type_payload(type_)?;
     let owner = record.symbol()?;
     let structured = record.data().structured()?;
@@ -798,7 +835,7 @@ pub(super) fn inherited_generic_property_reference(
     property: SemanticSymbolId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<TypeId> {
-    if validate_interface_heritage_members(store, receiver)
+    if validate_interface_heritage_members_with_array_targets(store, receiver, array_targets)
         != InterfaceHeritageMembersValidation::Valid
         || store
             .type_payload(receiver)?
@@ -857,16 +894,20 @@ pub(super) fn inherited_generic_property_reference(
 fn validate_direct_heritage_property_interface(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<ValidatedInterfaceSurface> {
-    validate_property_interface(store, type_, true)
+    validate_property_interface(store, type_, true, array_targets)
 }
 
 fn validate_property_interface(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     requires_direct_base: bool,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<ValidatedInterfaceSurface> {
-    validate_property_interface_worker(store, type_, requires_direct_base, &mut HashSet::new())
+    validate_property_interface_worker(
+        store, type_, requires_direct_base, array_targets, &mut HashSet::new(),
+    )
 }
 
 /// Reads a key only after the complete nongeneric interface has been validated.
@@ -874,9 +915,10 @@ pub(super) fn validated_interface_property_by_key(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     name: EscapedNameRef<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<Option<ResolvedOwnProperty>> {
     let inherited = store.direct_interface_heritage_provenance(type_).is_some();
-    let view = validate_property_interface(store, type_, inherited)?;
+    let view = validate_property_interface(store, type_, inherited, array_targets)?;
     let members = store.type_payload(type_)?.data().structured()?.members;
     let Some(members) = members else {
         return Some(None);
@@ -900,6 +942,7 @@ fn validate_property_interface_worker(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     requires_direct_base: bool,
+    array_targets: Option<CanonicalArrayTargets>,
     active: &mut HashSet<TypeId>,
 ) -> Option<ValidatedInterfaceSurface> {
     if !active.insert(type_) {
@@ -909,7 +952,7 @@ fn validate_property_interface_worker(
     let reference_identity =
         requires_direct_base && validate_nongeneric_interface_argument_origin(store, type_).is_ok();
     if record.object_flags().contains(ObjectFlags::REFERENCE) && !reference_identity {
-        let result = validate_generic_base_property_interface(store, type_);
+        let result = validate_generic_base_property_interface(store, type_, array_targets);
         assert!(active.remove(&type_));
         return result;
     }
@@ -1028,7 +1071,9 @@ fn validate_property_interface_worker(
         let inherited_base = store
             .direct_interface_heritage_provenance(base_type)
             .is_some();
-        let base = validate_property_interface_worker(store, base_type, inherited_base, active)?;
+        let base = validate_property_interface_worker(
+            store, base_type, inherited_base, array_targets, active,
+        )?;
         let expected_owner = if index == 0 {
             heritage_provenance.base_symbol
         } else {

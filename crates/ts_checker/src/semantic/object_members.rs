@@ -127,15 +127,36 @@ pub(super) fn resolve_object_property_by_key(
         }
         _ => None,
     };
-    if target.is_some_and(|target| {
-        store.type_payload(target).is_some_and(|target| {
+    let inherited_reference = if store.direct_interface_heritage_provenance(receiver).is_some() {
+        store.type_payload(receiver)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(name))
+            .filter(|property| {
+                store.value_symbol_links(*property).is_some_and(|links| links.target.is_some())
+            })
+            .map(|property| {
+                super::structured_members::inherited_generic_property_reference(
+                    store, receiver, property,
+                    global_types.map(CanonicalArrayTargets::from_global_types),
+                )
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let reference = inherited_reference.or_else(|| target.filter(|target| {
+        store.type_payload(*target).is_some_and(|target| {
             matches!(target.data(), TypeData::Interface(_))
                 && !target.object_flags().contains(ObjectFlags::CLASS)
         })
-    }) {
+    }).map(|_| receiver));
+    if let Some(reference) = reference {
         return resolve_property_with_array_targets_and_session(
             store,
-            receiver,
+            reference,
             name,
             global_types.map(CanonicalArrayTargets::from_global_types),
             session,
@@ -178,6 +199,7 @@ pub(super) fn resolve_object_property_by_key(
         StoredDeclaredCallSetValidation::NotDeclaredCallSet => {
             if let Some(property) = super::structured_members::validated_interface_property_by_key(
                 store, receiver, name,
+                global_types.map(CanonicalArrayTargets::from_global_types),
             ) {
                 return Ok(property);
             }
