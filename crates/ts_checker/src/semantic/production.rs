@@ -1054,6 +1054,32 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         self.module_resolutions.lookup(specifier)
     }
 
+    /// Looks up a source module export without resolving aliases or value types.
+    ///
+    /// Type-only aliases remain aliases. `None` requires a complete export search.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for unavailable star targets, unsupported module
+    /// families, stale sources, or export tables that disagree with their sources.
+    pub fn get_module_export_by_name(
+        &self,
+        module: SemanticSymbolId,
+        name: &str,
+    ) -> Result<Option<SemanticSymbolId>, super::CanonicalModuleExportQueryError> {
+        let aliases = ProductionAliasTargetHost::from_registry(
+            &self.store,
+            &self.files,
+            &self.module_resolutions,
+        )?;
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )?;
+        super::module_exports::get_module_export_by_name(&self.store, &host, &aliases, module, name)
+    }
+
     /// General checker diagnostics in raw issuance order.
     #[must_use]
     pub const fn diagnostics(&self) -> &CanonicalCheckerDiagnostics {
@@ -1115,6 +1141,39 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         CanonicalSymbolFlagsResolver::new(store, &mut host)
             .get_symbol_flags(symbol)
             .map_err(Into::into)
+    }
+
+    /// Tests the effective call arity of a symbol's own function-like declarations.
+    ///
+    /// Cold declaration-file functions use the installed callable providers.
+    /// Variables have no helper declaration signatures, even if their types
+    /// are callable. This query does not read their annotations, check a source
+    /// body, or demand a signature return.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed provider, provenance, or cache error instead of a
+    /// negative answer when the exact callable set is unavailable.
+    pub fn has_call_signature_with_arity_greater_than(
+        &mut self,
+        symbol: SemanticSymbolId,
+        arity: usize,
+    ) -> Result<bool, super::CanonicalHelperSignatureError> {
+        self.instantiation_session.reset_query();
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )?;
+        super::helper_signatures::HelperSignatureQuery {
+            store: &mut self.store,
+            host: &host,
+            global_types: &self.global_types,
+            options: self.options,
+            session: &mut self.instantiation_session,
+            diagnostics: &mut self.diagnostics,
+        }
+        .has_arity_greater_than(symbol, arity)
     }
 
     /// Resolves one declared type through the context-owned query session.

@@ -106,7 +106,6 @@ pub(super) fn plan_declared_value(
                 && variable_flags != SymbolFlags::FUNCTION_SCOPED_VARIABLE
                 || !flags.contains(SymbolFlags::INTERFACE) && record.members().is_some()
                 || record.check_flags() != CheckFlags::NONE
-                || record.parent().is_some()
                 || variable.initializer.is_some()
                 || variable.exclamation_token.is_some()
                 || variable.symbol.is_some()
@@ -155,6 +154,7 @@ pub(super) fn plan_declared_value(
             };
             let bound = host.bound_file(declaration).ok_or_else(invalid)?;
             let block_scoped = list_node.flags.0 & 3 != 0;
+            plan_variable_owner(store, host, symbol, declaration, statement)?;
             if list_node.kind != SyntaxKind::VariableDeclarationList
                 || list_node.flags.0 & !3 != 0
                 || declarations
@@ -284,6 +284,141 @@ pub(super) fn plan_declared_value(
         readonly,
         cached_type: links.resolved_type,
     })
+}
+
+fn plan_variable_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    statement: NodeRef,
+) -> Result<(), DeclaredTypeError> {
+    let invalid = || invalid_value(symbol);
+    let unsupported = || unsupported_value(declaration, SyntaxKind::VariableDeclaration);
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let value = store.symbol(symbol).ok_or_else(invalid)?;
+    let Some(local) = bound.local_symbol(declaration) else {
+        return if value.parent().is_none() {
+            Ok(())
+        } else {
+            Err(unsupported())
+        };
+    };
+    let facts = bound.source_facts().ok_or_else(invalid)?;
+    if !facts.is_external_module()
+        || facts.is_javascript_file()
+        || facts.is_common_js_module()
+        || bound.container(declaration) != Some(bound.source_file())
+        || !matches!(
+            value.flags(),
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE
+        )
+        || value.declarations() != Some(&[declaration])
+    {
+        return Err(unsupported());
+    }
+    let statement_node = preflight_node(store, host, statement)?;
+    let NodeData::VariableStatement(variable_statement) = &statement_node.data else {
+        return Err(invalid());
+    };
+    if statement_node.flags.0 != 0
+        || variable_statement.flow_node.is_some()
+        || variable_statement.facts != 0
+    {
+        return Err(invalid());
+    }
+    let mut exported = false;
+    let mut declared = false;
+    if let Some(modifiers) = &variable_statement.modifiers {
+        if modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifiers.list.nodes.is_empty()
+        {
+            return Err(invalid());
+        }
+        let mut previous_end = statement_node.range.start;
+        for modifier in &modifiers.list.nodes {
+            let modifier = NodeRef::new(statement.arena, statement.file, *modifier);
+            let node = preflight_node(store, host, modifier)?;
+            let spelling = match node.kind {
+                SyntaxKind::ExportKeyword if !exported && !declared => {
+                    exported = true;
+                    "export"
+                }
+                SyntaxKind::DeclareKeyword if !declared => {
+                    declared = true;
+                    "declare"
+                }
+                _ => return Err(unsupported()),
+            };
+            if !matches!(node.data, NodeData::Token(_))
+                || node.flags.0 != 0
+                || node.parent != Some(statement.node)
+                || node.range.start < previous_end
+                || node.range.end > statement_node.range.end
+                || arena.source_text().is_some_and(|source| {
+                    source.get(node.range.start.get() as usize..node.range.end.get() as usize)
+                        != Some(spelling)
+                })
+            {
+                return Err(invalid());
+            }
+            previous_end = node.range.end;
+        }
+    }
+    if !facts.is_declaration_file() && (!exported || !declared) {
+        return Err(unsupported());
+    }
+
+    let source = bound.source_file();
+    let source_node = preflight_node(store, host, source)?;
+    let module = bound.symbol(source).ok_or_else(invalid)?;
+    let module_record = store.symbol(module).ok_or_else(invalid)?;
+    let local_record = store.symbol(local).ok_or_else(invalid)?;
+    if source_node.kind != SyntaxKind::SourceFile
+        || source_node.parent.is_some()
+        || bound.container(declaration) != Some(source)
+        || bound.symbol(declaration) != Some(symbol)
+        || value.parent() != Some(module)
+        || !store.source_symbol_declarations_match(symbol)
+        || module_record.flags() != SymbolFlags::VALUE_MODULE
+        || module_record.check_flags() != CheckFlags::NONE
+        || module_record.name() != facts.source_file_symbol_name()
+        || module_record.declarations() != Some(&[source])
+        || module_record.value_declaration() != Some(source)
+        || module_record.parent().is_some()
+        || module_record.members().is_some()
+        || module_record.export_symbol().is_some()
+        || store.get_merged_symbol(module) != Some(module)
+        || !store.source_symbol_declarations_match(module)
+        || module_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(value.name()))
+            != Some(symbol)
+        || local_record.flags() != SymbolFlags::EXPORT_VALUE
+        || local_record.check_flags() != CheckFlags::NONE
+        || local_record.name() != value.name()
+        || local_record.declarations() != Some(&[declaration])
+        || local_record.value_declaration().is_some()
+        || local_record.parent().is_some()
+        || local_record.members().is_some()
+        || local_record.exports().is_some()
+        || local_record.export_symbol() != Some(symbol)
+        || store.get_merged_symbol(local) != Some(local)
+        || !store.source_symbol_declarations_match(local)
+        || bound
+            .locals(source)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get(value.name()))
+            != Some(local)
+        || store
+            .value_symbol_links(local)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn plan_property_owner(

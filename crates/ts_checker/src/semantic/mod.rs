@@ -31,6 +31,7 @@ pub mod formatter;
 mod functions;
 mod generic_calls;
 mod global_types;
+mod helper_signatures;
 pub mod ids;
 mod indexed_access_types;
 mod inference;
@@ -51,6 +52,7 @@ mod mapped_types;
 pub mod mapper;
 mod member_resolution;
 mod merge;
+mod module_exports;
 pub mod module_resolution;
 pub mod name_resolution;
 mod object_diagnostics;
@@ -123,6 +125,7 @@ pub use formatter::{
 pub use global_types::{
     CanonicalGlobalTypeDiagnostic, CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes,
 };
+pub use helper_signatures::CanonicalHelperSignatureError;
 pub use ids::{
     ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId, TypePredicateId,
 };
@@ -153,6 +156,7 @@ pub use merge::{
     CheckerDiagnosticMergeHost, FailClosedSymbolMergeHost, SymbolMergeDiagnostic,
     SymbolMergeDiagnosticKind, SymbolMergeError, SymbolMergeHost, get_excluded_symbol_flags,
 };
+pub use module_exports::CanonicalModuleExportQueryError;
 pub use module_resolution::{
     CanonicalModuleResolutionEntry, CanonicalModuleResolutionInput,
     CanonicalModuleResolutionLookup, CanonicalModuleResolutionManifest,

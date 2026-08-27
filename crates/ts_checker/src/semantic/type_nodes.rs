@@ -218,15 +218,23 @@ impl ConstructorAnnotationProof {
         host: &DeclaredTypeHost<'_>,
         global_types: Option<&CanonicalGlobalTypes>,
     ) -> Result<Option<TypeId>, DeclaredTypeError> {
-        self.node_type(store, host, global_types, self.node, &mut HashSet::new())
+        self.plan.cached_annotation_type(
+            store,
+            host,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+            self.node,
+            &mut HashSet::new(),
+        )
     }
+}
 
+impl TypeQueryPlan {
     #[allow(clippy::too_many_lines)] // Checks each admitted source shape against its own provider.
-    fn node_type(
+    fn cached_annotation_type(
         &self,
         store: &CanonicalTypeMapperStore,
         host: &DeclaredTypeHost<'_>,
-        global_types: Option<&CanonicalGlobalTypes>,
+        array_targets: Option<CanonicalArrayTargets>,
         node: NodeRef,
         active: &mut HashSet<NodeRef>,
     ) -> Result<Option<TypeId>, DeclaredTypeError> {
@@ -235,7 +243,7 @@ impl ConstructorAnnotationProof {
             return Err(invalid());
         }
         let bootstrap = store.intrinsic_bootstrap().ok_or_else(&invalid)?;
-        let expected = if let Some(reference) = self.plan.references.get(&node) {
+        let expected = if let Some(reference) = self.references.get(&node) {
             let cached_symbol = store
                 .symbol_node_links(node)
                 .and_then(|links| links.resolved_symbol);
@@ -251,9 +259,14 @@ impl ConstructorAnnotationProof {
             {
                 return Err(invalid());
             }
-            if let Some(alias) = self.plan.aliases.get(&reference.symbol) {
-                let expected =
-                    self.node_type(store, host, global_types, alias.type_node, active)?;
+            if let Some(alias) = self.aliases.get(&reference.symbol) {
+                let expected = self.cached_annotation_type(
+                    store,
+                    host,
+                    array_targets,
+                    alias.type_node,
+                    active,
+                )?;
                 if store
                     .type_alias_links(reference.symbol)
                     .is_some_and(|links| {
@@ -281,11 +294,13 @@ impl ConstructorAnnotationProof {
                     .declared_type_links(reference.symbol)
                     .and_then(|links| links.declared_type)
             }
-        } else if let Some(union) = self.plan.unions.get(&node) {
+        } else if let Some(union) = self.unions.get(&node) {
             let mut constituents = Vec::with_capacity(union.types.len());
             let mut complete = true;
             for child in &union.types {
-                if let Some(type_) = self.node_type(store, host, global_types, *child, active)? {
+                if let Some(type_) =
+                    self.cached_annotation_type(store, host, array_targets, *child, active)?
+                {
                     constituents.push(type_);
                 } else {
                     complete = false;
@@ -301,13 +316,13 @@ impl ConstructorAnnotationProof {
                     .cached_literal_union_type_with_alias(
                         &constituents,
                         union.alias_symbol.map(|symbol| (symbol, &[][..])),
-                        global_types.map(CanonicalArrayTargets::from_global_types),
+                        array_targets,
                     )
                     .map_err(type_construction_error)?
             } else {
                 None
             }
-        } else if let Some(literal) = self.plan.literals.get(&node) {
+        } else if let Some(literal) = self.literals.get(&node) {
             match literal {
                 PlannedLiteralType::Null => Some(bootstrap.null_type),
                 PlannedLiteralType::String(value) => bootstrap.cached_string_literal_type(value),
@@ -326,10 +341,10 @@ impl ConstructorAnnotationProof {
         } else {
             let record = preflight_node(store, host, node)?;
             if let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data {
-                self.node_type(
+                self.cached_annotation_type(
                     store,
                     host,
-                    global_types,
+                    array_targets,
                     NodeRef::new(node.arena, node.file, parenthesized.type_),
                     active,
                 )?
@@ -355,7 +370,7 @@ impl ConstructorAnnotationProof {
                 && (links.outer_type_parameters.is_some()
                     || links.resolved_type.is_none()
                     || links.resolved_type != expected)
-        }) || !self.plan.references.contains_key(&node)
+        }) || !self.references.contains_key(&node)
             && store
                 .symbol_node_links(node)
                 .is_some_and(|links| links != &SymbolNodeLinks::default())
@@ -363,10 +378,9 @@ impl ConstructorAnnotationProof {
             return Err(invalid());
         }
         active.remove(&node);
-        let needs_node_cache = self.plan.references.contains_key(&node)
-            || self.plan.unions.contains_key(&node)
+        let needs_node_cache = self.references.contains_key(&node)
+            || self.unions.contains_key(&node)
             || self
-                .plan
                 .literals
                 .get(&node)
                 .is_some_and(|literal| !matches!(literal, PlannedLiteralType::Null));
@@ -2463,6 +2477,111 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         self.plan
     }
 
+    fn plan_source_callable_inputs(
+        &mut self,
+        callable: &source_callables::SourceCallablePlan,
+    ) -> Result<(), DeclaredTypeError> {
+        let replay_cached_annotations = self.replay_cached_annotations;
+        self.replay_cached_annotations = true;
+        for parameter in &callable.type_parameters {
+            if let Some(constraint) = parameter.constraint {
+                self.plan_type_node(constraint)?;
+            }
+            if let Some(default_type) = parameter.default_type {
+                self.plan_type_node(default_type)?;
+            }
+        }
+        for parameter in &callable.parameters {
+            if let Some(annotation) = parameter.explicit_type_node() {
+                self.plan_type_node(annotation)?;
+            }
+        }
+        self.replay_cached_annotations = replay_cached_annotations;
+        Ok(())
+    }
+
+    fn validate_replayed_annotation_cache(&self, node: NodeRef) -> Result<(), DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let record = preflight_node(self.store, self.host, node)?;
+        let links = self.store.type_node_links(node);
+        if links.is_some_and(|links| links.outer_type_parameters.is_some())
+            || matches!(
+                record.kind,
+                SyntaxKind::ArrayType | SyntaxKind::TupleType | SyntaxKind::ParenthesizedType
+            ) && self
+                .store
+                .symbol_node_links(node)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return Err(invalid());
+        }
+        if let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data
+            && let Some(cached) = links.and_then(|links| links.resolved_type)
+            && self.cached_array_element_identity(NodeRef::new(
+                node.arena,
+                node.file,
+                parenthesized.type_,
+            ))? != Some(cached)
+        {
+            return Err(invalid());
+        }
+        if !planned_constructor_annotation_shape(
+            self.store,
+            self.host,
+            &self.plan,
+            node,
+            &mut HashSet::new(),
+            &mut Vec::new(),
+        ) {
+            if let Some(reference) = self.plan.references.get(&node)
+                && reference.arity == PlannedTypeReferenceArity::Valid
+                && reference.type_arguments.is_empty()
+                && let Some(alias) = self.plan.aliases.get(&reference.symbol)
+                && alias.type_parameters.is_empty()
+            {
+                // The type-specific planner checked the RHS. An alias cache
+                // must retain that result, including array and tuple types.
+                let declared = self
+                    .store
+                    .type_alias_links(reference.symbol)
+                    .and_then(|links| links.declared_type);
+                let rhs = self.cached_array_element_identity(alias.type_node)?;
+                if declared.is_some_and(|declared| {
+                    rhs.is_none_or(|rhs| {
+                        !valid_type_alias_identity_seed(
+                            self.store,
+                            reference.symbol,
+                            declared,
+                            rhs,
+                            self.strict_builtin_iterator_return,
+                        )
+                    })
+                }) || self.store.type_node_links(node).is_some_and(|links| {
+                    links != &TypeNodeLinks::default()
+                        && (links.outer_type_parameters.is_some()
+                            || links.resolved_type.is_none()
+                            || links.resolved_type != declared
+                            || self
+                                .store
+                                .symbol_node_links(node)
+                                .and_then(|links| links.resolved_symbol)
+                                != Some(reference.symbol))
+                }) {
+                    return Err(invalid());
+                }
+            }
+            return Ok(());
+        }
+        self.plan.cached_annotation_type(
+            self.store,
+            self.host,
+            self.array_targets,
+            node,
+            &mut HashSet::new(),
+        )?;
+        Ok(())
+    }
+
     fn plan_type_node(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
         if let Some(alias) = self.direct_type_alias_owner(node)? {
             self.plan_type_alias(alias, false).map(|_| ())
@@ -2588,6 +2707,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     record.kind,
                     SyntaxKind::FunctionType | SyntaxKind::TypeReference
                 )
+                && !alias_owner.is_some_and(|owner| {
+                    self.plan
+                        .aliases
+                        .get(&owner)
+                        .is_some_and(|alias| !alias.type_parameters.is_empty())
+                })
             {
                 match self.validate_cached_union_result(cached, None) {
                     Ok(()) => {}
@@ -2735,6 +2860,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.validate_cached_union_result(cached, None)
                     .map_err(type_construction_error)?;
             }
+        }
+        if self.replay_cached_annotations {
+            self.validate_replayed_annotation_cache(node)?;
         }
         Ok(())
     }
@@ -11601,6 +11729,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             !source_parameter_constraint
                 && !self.lazy_interface_values
                 && !self.source_callable_alias_planning
+                && !self.replay_cached_annotations
         }) {
             self.store.get_merged_symbol(symbol).ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidCachedSymbol { node, symbol })
@@ -19127,9 +19256,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             symbol,
             self.strict_builtin_iterator_return,
         )?;
+        // A generic alias cache stores its template. Its instantiated reference
+        // is checked separately as the union constituent.
+        let cached_union_constituent =
+            union_constituent && cached.is_none_or(|cached| cached.type_parameter_count == 0);
         if let Some(plan) = self.plan.aliases.get(&symbol) {
             if let Some(cached) = cached {
-                self.validate_cached_type_alias_identity(symbol, cached, union_constituent)?;
+                self.validate_cached_type_alias_identity(symbol, cached, cached_union_constituent)?;
             }
             return Ok(cached.map_or(plan.type_parameters.len(), |cached| {
                 cached.type_parameter_count
@@ -19138,7 +19271,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
         let mut cached_pending_function = false;
         if let Some(cached) = cached {
-            match self.validate_cached_type_alias_identity(symbol, cached, union_constituent) {
+            match self.validate_cached_type_alias_identity(symbol, cached, cached_union_constituent)
+            {
                 Ok(()) => {}
                 Err(DeclaredTypeError::TypeNodeUnavailable(
                     TypeNodeUnavailable::InvalidCachedUnionType(type_),
@@ -19175,7 +19309,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .first()
                 .is_some_and(|declaration| self.host.source(*declaration).is_none())
         {
-            self.validate_cached_type_alias_identity(symbol, cached_alias, union_constituent)?;
+            self.validate_cached_type_alias_identity(
+                symbol,
+                cached_alias,
+                cached_union_constituent,
+            )?;
             return Ok(cached_alias.type_parameter_count);
         }
 
@@ -19485,7 +19623,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             ));
         }
         if cached_pending_function && let Some(cached) = cached {
-            self.validate_cached_type_alias_identity(symbol, cached, union_constituent)?;
+            self.validate_cached_type_alias_identity(symbol, cached, cached_union_constituent)?;
         }
         Ok(type_parameter_count)
     }
@@ -21059,14 +21197,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         .map_err(|error| source_callable_error(error, family))?;
         self.require_source_callable_alias_capabilities(&callable)?;
         self.preflight_source_callable_alias_annotations(&callable)?;
-        match source_callables::source_callable_state(self.store, &callable, true)
-            .map_err(|error| source_callable_error(error, callable.family))?
-        {
-            source_callables::SourceCallableState::AwaitingInferredReturn { .. }
-            | source_callables::SourceCallableState::Resolved { .. } => return Ok(()),
-            _ => {}
-        }
-
         let mut planner = TypeQueryPlanner::new(
             self.store,
             self.host,
@@ -21075,19 +21205,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
         );
-        for type_parameter in &callable.type_parameters {
-            if let Some(constraint) = type_parameter.constraint {
-                planner.plan_type_node(constraint)?;
-            }
-            if let Some(default_type) = type_parameter.default_type {
-                planner.plan_type_node(default_type)?;
-            }
+        planner.plan_source_callable_inputs(&callable)?;
+        match source_callables::source_callable_state(self.store, &callable, true)
+            .map_err(|error| source_callable_error(error, callable.family))?
+        {
+            source_callables::SourceCallableState::AwaitingInferredReturn { .. }
+            | source_callables::SourceCallableState::Resolved { .. } => return Ok(()),
+            _ => {}
         }
-        for parameter in &callable.parameters {
-            if let Some(type_node) = parameter.explicit_type_node() {
-                planner.plan_type_node(type_node)?;
-            }
-        }
+
         if let Some(return_type) = callable.return_type.type_node() {
             planner.plan_type_node(return_type)?;
         }
@@ -21141,14 +21267,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         .map_err(|error| source_callable_error(error, family))?;
         self.require_source_callable_alias_capabilities(&callable)?;
         self.preflight_source_callable_alias_annotations(&callable)?;
-        match source_callables::source_callable_state(self.store, &callable, true)
-            .map_err(|error| source_callable_error(error, callable.family))?
-        {
-            source_callables::SourceCallableState::AwaitingInferredReturn { type_, .. }
-            | source_callables::SourceCallableState::Resolved { type_, .. } => return Ok(type_),
-            _ => {}
-        }
-
         let mut planner = TypeQueryPlanner::new(
             self.store,
             self.host,
@@ -21157,18 +21275,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
         );
-        for type_parameter in &callable.type_parameters {
-            if let Some(constraint) = type_parameter.constraint {
-                planner.plan_type_node(constraint)?;
-            }
-            if let Some(default_type) = type_parameter.default_type {
-                planner.plan_type_node(default_type)?;
-            }
-        }
-        for parameter in &callable.parameters {
-            if let Some(type_node) = parameter.explicit_type_node() {
-                planner.plan_type_node(type_node)?;
-            }
+        planner.plan_source_callable_inputs(&callable)?;
+        match source_callables::source_callable_state(self.store, &callable, true)
+            .map_err(|error| source_callable_error(error, callable.family))?
+        {
+            source_callables::SourceCallableState::AwaitingInferredReturn { type_, .. }
+            | source_callables::SourceCallableState::Resolved { type_, .. } => return Ok(type_),
+            _ => {}
         }
         for proof in callable.alias_annotations().iter().filter(|proof| {
             proof.owner() == callable.owner_symbol
@@ -48242,6 +48355,536 @@ mod tests {
             diagnostics,
         )?
         .get_type_of_declared_value(symbol)
+    }
+
+    fn exported_declared_value_fixture(
+        source: &str,
+        declaration_file: bool,
+    ) -> (Fixture, crate::semantic::SourceFileRef) {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(24_035);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(if declaration_file {
+                        "\"/declared-values.d.ts\""
+                    } else {
+                        "\"/declared-values.ts\""
+                    }),
+                    CanonicalSourceLanguage::TypeScript,
+                    declaration_file,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        let source = store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        (
+            Fixture {
+                parsed,
+                file,
+                files,
+                store,
+            },
+            source,
+        )
+    }
+
+    #[test]
+    fn exported_declared_values_keep_scalar_identity_and_leave_siblings_unchecked() {
+        for (declaration_file, prefix) in [
+            (false, "export declare"),
+            (true, "export declare"),
+            (true, "export"),
+            (true, "declare"),
+        ] {
+            for binding in ["const", "let", "var"] {
+                let (mut fixture, source) = exported_declared_value_fixture(
+                    &format!(
+                        "{prefix} {binding} get: number; export declare const ignored: Missing;"
+                    ),
+                    declaration_file,
+                );
+                let declaration = named_node(&fixture, SyntaxKind::VariableDeclaration, "get");
+                let symbol = node_symbol(&fixture, declaration);
+                let bound = fixture.files.get(&fixture.file).unwrap();
+                let local = bound.local_symbol(declaration).unwrap();
+                let annotation = fixture
+                    .store
+                    .source_direct_type_annotation(declaration)
+                    .unwrap();
+                let ignored = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "ignored");
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let before = (
+                    union_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len(),
+                );
+                {
+                    let host = post_global_host(&fixture.parsed.arena, bound);
+                    let query = CanonicalTypeQuery::new(
+                        &mut fixture.store,
+                        &host,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .unwrap();
+                    query.preflight_type_of_declared_value(symbol).unwrap();
+                }
+                assert_eq!(
+                    (
+                        union_state(&fixture.store),
+                        fixture.store.symbol_len(),
+                        fixture.store.signature_len()
+                    ),
+                    before
+                );
+                assert!(fixture.store.value_symbol_links(symbol).is_none());
+                assert!(fixture.store.declared_value_provenance(symbol).is_none());
+                let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                assert_eq!(
+                    query_declared_value(&mut fixture, symbol, &mut diagnostics),
+                    Ok(number)
+                );
+                assert_eq!(
+                    validate_stored_callable_set(&fixture.store, number),
+                    StoredCallableSetValidation::NotCallable
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_direct_type_annotation_is_exact(annotation, number)
+                );
+                assert!(
+                    fixture
+                        .store
+                        .declared_value_provenance(symbol)
+                        .unwrap()
+                        .is_current(&fixture.store, symbol)
+                );
+                assert_ne!(local, symbol);
+                assert_eq!(
+                    fixture.store.symbol(local).unwrap().flags(),
+                    SymbolFlags::EXPORT_VALUE
+                );
+                assert!(fixture.store.value_symbol_links(local).is_none());
+                assert!(fixture.store.value_symbol_links(ignored).is_none());
+                let before = (
+                    union_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len(),
+                );
+                assert_eq!(
+                    query_declared_value(&mut fixture, symbol, &mut diagnostics),
+                    Ok(number)
+                );
+                assert!(query_declared_value(&mut fixture, local, &mut diagnostics).is_err());
+                assert_eq!(
+                    (
+                        union_state(&fixture.store),
+                        fixture.store.symbol_len(),
+                        fixture.store.signature_len()
+                    ),
+                    before
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_file_links(source)
+                        .is_none_or(|links| !links.type_checked)
+                );
+                assert!(diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn exported_declared_values_reject_callable_cache_poison_and_retry() {
+        let (mut fixture, source) = exported_declared_value_fixture(
+            "export declare const get: (a: number, b: number, c: number, d: number) => void; export declare const ignored: Missing;",
+            true,
+        );
+        let declaration = named_node(&fixture, SyntaxKind::VariableDeclaration, "get");
+        let symbol = node_symbol(&fixture, declaration);
+        let annotation = fixture
+            .store
+            .source_direct_type_annotation(declaration)
+            .unwrap();
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(fixture.store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let before = (
+            union_state(&fixture.store),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+        );
+        assert!(query_declared_value(&mut fixture, symbol, &mut diagnostics).is_err());
+        assert_eq!(
+            (
+                union_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len()
+            ),
+            before
+        );
+        assert!(fixture.store.type_node_links(annotation).is_none());
+        assert!(fixture.store.declared_value_provenance(symbol).is_none());
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(symbol, ValueSymbolLinks::default())
+        );
+
+        let type_ = query_declared_value(&mut fixture, symbol, &mut diagnostics).unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, type_)
+        else {
+            panic!("the declared value must retain its validated callable");
+        };
+        let [callable] = projection.call_signatures.as_ref() else {
+            panic!("expected one call signature");
+        };
+        assert_eq!(
+            crate::semantic::calls::get_parameter_count(&fixture.store, None, callable),
+            Ok(4)
+        );
+        assert!(
+            fixture
+                .store
+                .signature(callable.signature)
+                .unwrap()
+                .resolved_return_type()
+                .is_none()
+        );
+        let value_links = fixture.store.value_symbol_links(symbol).cloned().unwrap();
+        let node_links = fixture.store.type_node_links(annotation).cloned().unwrap();
+        let provenance = fixture.store.declared_value_provenance(symbol);
+        let before = (
+            union_state(&fixture.store),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+        );
+        assert_eq!(
+            query_declared_value(&mut fixture, symbol, &mut diagnostics),
+            Ok(type_)
+        );
+        assert_eq!(
+            (
+                union_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len()
+            ),
+            before
+        );
+
+        for paired_annotation in [false, true] {
+            assert!(fixture.store.set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(wrong),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            if paired_annotation {
+                assert!(fixture.store.set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+            }
+            let before = (
+                union_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+            );
+            assert!(query_declared_value(&mut fixture, symbol, &mut diagnostics).is_err());
+            assert_eq!(
+                (
+                    union_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len()
+                ),
+                before
+            );
+            assert_eq!(fixture.store.declared_value_provenance(symbol), provenance);
+            assert!(
+                fixture
+                    .store
+                    .set_type_node_links(annotation, node_links.clone())
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_value_symbol_links(symbol, value_links.clone())
+            );
+            assert_eq!(
+                query_declared_value(&mut fixture, symbol, &mut diagnostics),
+                Ok(type_)
+            );
+        }
+        assert!(
+            fixture
+                .store
+                .source_file_links(source)
+                .is_none_or(|links| !links.type_checked)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn exported_declared_values_validate_local_and_export_edges_cold_and_warm() {
+        #[derive(Clone, Copy, Debug)]
+        enum Corruption {
+            LocalTarget,
+            ValueParent,
+            ExportEntry,
+            LocalEntry,
+            LocalFlags,
+            LocalDeclaration,
+            LocalValueCache,
+        }
+        for warm in [false, true] {
+            for corruption in [
+                Corruption::LocalTarget,
+                Corruption::ValueParent,
+                Corruption::ExportEntry,
+                Corruption::LocalEntry,
+                Corruption::LocalFlags,
+                Corruption::LocalDeclaration,
+                Corruption::LocalValueCache,
+            ] {
+                let (mut fixture, source_handle) = exported_declared_value_fixture(
+                    "export declare const get: number; export declare const other: string;",
+                    true,
+                );
+                let declaration = named_node(&fixture, SyntaxKind::VariableDeclaration, "get");
+                let symbol = node_symbol(&fixture, declaration);
+                let other_declaration =
+                    named_node(&fixture, SyntaxKind::VariableDeclaration, "other");
+                let other = node_symbol(&fixture, other_declaration);
+                let bound = fixture.files.get(&fixture.file).unwrap();
+                let source = bound.source_file();
+                let module = bound.symbol(source).unwrap();
+                let local = bound.local_symbol(declaration).unwrap();
+                let other_local = bound.local_symbol(other_declaration).unwrap();
+                let locals = bound.locals(source).unwrap();
+                let exports = fixture.store.symbol(module).unwrap().exports().unwrap();
+                let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                if warm {
+                    assert_eq!(
+                        query_declared_value(&mut fixture, symbol, &mut diagnostics),
+                        Ok(number)
+                    );
+                }
+                match corruption {
+                    Corruption::LocalTarget => assert!(fixture.store.set_symbol_relationships(
+                        local,
+                        None,
+                        None,
+                        None,
+                        Some(other)
+                    )),
+                    Corruption::ValueParent => assert!(
+                        fixture
+                            .store
+                            .set_symbol_relationships(symbol, None, None, None, None)
+                    ),
+                    Corruption::ExportEntry => assert_eq!(
+                        fixture
+                            .store
+                            .insert_symbol(exports, EscapedName::source("get"), other),
+                        Some(Some(symbol))
+                    ),
+                    Corruption::LocalEntry => assert_eq!(
+                        fixture.store.insert_symbol(
+                            locals,
+                            EscapedName::source("get"),
+                            other_local
+                        ),
+                        Some(Some(local))
+                    ),
+                    Corruption::LocalFlags => assert!(fixture.store.set_symbol_flags(
+                        local,
+                        SymbolFlags::ALIAS,
+                        CheckFlags::NONE
+                    )),
+                    Corruption::LocalDeclaration => assert!(fixture.store.set_symbol_declarations(
+                        local,
+                        Some(vec![declaration]),
+                        Some(declaration)
+                    )),
+                    Corruption::LocalValueCache => assert!(fixture.store.set_value_symbol_links(
+                        local,
+                        ValueSymbolLinks {
+                            resolved_type: Some(number),
+                            ..ValueSymbolLinks::default()
+                        }
+                    )),
+                }
+                let before = (
+                    union_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len(),
+                );
+                let value_links = fixture.store.value_symbol_links(symbol).cloned();
+                let provenance = fixture.store.declared_value_provenance(symbol);
+                assert!(
+                    query_declared_value(&mut fixture, symbol, &mut diagnostics).is_err(),
+                    "{warm:?} {corruption:?}"
+                );
+                assert_eq!(
+                    (
+                        union_state(&fixture.store),
+                        fixture.store.symbol_len(),
+                        fixture.store.signature_len()
+                    ),
+                    before,
+                    "{warm:?} {corruption:?}"
+                );
+                assert_eq!(
+                    fixture.store.value_symbol_links(symbol),
+                    value_links.as_ref()
+                );
+                assert_eq!(fixture.store.declared_value_provenance(symbol), provenance);
+                match corruption {
+                    Corruption::LocalTarget => assert!(fixture.store.set_symbol_relationships(
+                        local,
+                        None,
+                        None,
+                        None,
+                        Some(symbol)
+                    )),
+                    Corruption::ValueParent => assert!(fixture.store.set_symbol_relationships(
+                        symbol,
+                        None,
+                        None,
+                        Some(module),
+                        None
+                    )),
+                    Corruption::ExportEntry => assert_eq!(
+                        fixture
+                            .store
+                            .insert_symbol(exports, EscapedName::source("get"), symbol),
+                        Some(Some(other))
+                    ),
+                    Corruption::LocalEntry => assert_eq!(
+                        fixture
+                            .store
+                            .insert_symbol(locals, EscapedName::source("get"), local),
+                        Some(Some(other_local))
+                    ),
+                    Corruption::LocalFlags => assert!(fixture.store.set_symbol_flags(
+                        local,
+                        SymbolFlags::EXPORT_VALUE,
+                        CheckFlags::NONE
+                    )),
+                    Corruption::LocalDeclaration => assert!(fixture.store.set_symbol_declarations(
+                        local,
+                        Some(vec![declaration]),
+                        None
+                    )),
+                    Corruption::LocalValueCache => assert!(
+                        fixture
+                            .store
+                            .set_value_symbol_links(local, ValueSymbolLinks::default())
+                    ),
+                }
+                assert_eq!(
+                    query_declared_value(&mut fixture, symbol, &mut diagnostics),
+                    Ok(number)
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_file_links(source_handle)
+                        .is_none_or(|links| !links.type_checked)
+                );
+                assert!(diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn exported_declared_values_keep_unsupported_and_foreign_inputs_unpublished() {
+        for (source, declaration_file) in [
+            ("export let get: number;", false),
+            ("export declare const get: number = 1;", true),
+            ("export declare const get;", true),
+            ("export declare namespace N { const get: number; }", true),
+        ] {
+            let (mut fixture, _) = exported_declared_value_fixture(source, declaration_file);
+            let declaration = named_node(&fixture, SyntaxKind::VariableDeclaration, "get");
+            let symbol = node_symbol(&fixture, declaration);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let before = (
+                union_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+            );
+            assert_eq!(
+                query_declared_value(&mut fixture, symbol, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: declaration,
+                        kind: SyntaxKind::VariableDeclaration,
+                    }
+                )),
+                "{source}"
+            );
+            assert_eq!(
+                (
+                    union_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                    fixture.store.signature_len()
+                ),
+                before
+            );
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+            assert!(diagnostics.is_empty());
+        }
+        let source = "export declare const get: number;";
+        let (mut fixture, _) = exported_declared_value_fixture(source, true);
+        let (foreign, _) = exported_declared_value_fixture(source, true);
+        let symbol = named_symbol(&foreign, SyntaxKind::VariableDeclaration, "get");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = (
+            union_state(&fixture.store),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+        );
+        assert!(query_declared_value(&mut fixture, symbol, &mut diagnostics).is_err());
+        assert_eq!(
+            (
+                union_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len()
+            ),
+            before
+        );
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

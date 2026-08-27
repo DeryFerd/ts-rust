@@ -455,6 +455,17 @@ fn module_value_export_declaration(
     ))
 }
 
+/// Checks the complete direct table without resolving export value types.
+pub(super) fn validate_module_export_table(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declarations: &[NodeRef],
+    exports: Option<SymbolTableId>,
+) -> Result<(), SourceCheckError> {
+    module_value_exports(store, host, owner, declarations, exports).map(|_| ())
+}
+
 fn module_value_exports(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
